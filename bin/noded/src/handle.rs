@@ -362,7 +362,7 @@ impl NodeHandle {
     }
 
     /// the volatile service signaling catalog (always present).
-    pub(crate) fn services(&self) -> &crate::services::ServiceCatalog {
+    pub fn services(&self) -> &crate::services::ServiceCatalog {
         &self.services
     }
 

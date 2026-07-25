@@ -55,7 +55,7 @@ use tasks::Tasks;
 /// composes the same ids over native module structs.
 const MODULE_IDS: &[&str] = host::topology::SIM_BASE;
 
-mod oracle_pool;
+mod echo_oracle;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: SocketAddr = "127.0.0.1:8844".parse()?;
@@ -77,13 +77,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // http git upload-pack (clone) lane must agree on it, so both are handed the
     // same path — the actor to materialize into, the http handle to serve from.
     let forge_repo = storage.join("forge-git");
-    // the forge worktree lane's push rendezvous: agent run pushes dial THIS
-    // daemon's own http surface at loopback (a wildcard bind is rewritten to
-    // 127.0.0.1), where receive-pack submits the ref move to the actor.
-    let forge_push_base = noded::agent_provision::forge_push_base(Some(&listen.to_string()));
-    // the same surface, bare (no /forge): the base an agent run's tool plane
-    // dials back as DUCKTAPE_NODE.
-    let node_http_base = noded::agent_provision::node_http_base(Some(&listen.to_string()));
 
     // the per-module derived index: one fluent31 database per module under
     // <storage>/index/<module>/, with each module's view mapper registered.
@@ -121,12 +114,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor_forge_repo = forge_repo.clone();
     let actor_index = index.clone();
     let blobs = handle.blob_handle();
-    // the oracle pool's re-entry lane: completed provider runs inject their
-    // results as Submit commands, exactly as the http layer does.
-    let oracle_cmds = handle.command_sender();
-    // a full handle clone for the portable-agent-run provisioner: it drives
-    // duckfs checkout/commit over this SAME actor lane (the /v1/fs/workspaces
-    // transport). cheap — NodeHandle is a command-lane sender + a few Arcs.
+    // a full handle clone for the actor loop's own surfaces (status, blobs,
+    // the stream hub). The agent-run provisioner is NOT here any more: it lives
+    // in the compute daemon and reaches this node over /v1.
     let actor_handle = handle.clone();
 
     // the node-local, off-chain interactive terminal-session plane (lives in the
@@ -164,11 +154,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_node(
                 actor_storage,
                 actor_forge_repo,
-                forge_push_base,
-                node_http_base,
                 actor_index,
                 blobs,
-                oracle_cmds,
                 actor_handle,
                 cmd_rx,
                 stream_hub,
@@ -197,18 +184,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// own the host for the process lifetime: genesis the module set, then apply
 /// commands in arrival order — every submit is its own block.
 // the actor thread's entry point threads every daemon-owned root/lane in by
-// value (storage, forge, index, blobs, the oracle re-entry lane, the actor
-// handle the provisioner drives, the command receiver, the event fan-out);
-// bundling them into a struct would only rename the same list.
+// value (storage, forge, index, blobs, the actor handle, the command receiver,
+// the event fan-out); bundling them into a struct would only rename the list.
 #[allow(clippy::too_many_arguments)]
 fn run_node(
     storage: PathBuf,
     forge_repo: PathBuf,
-    forge_push_base: Option<String>,
-    node_http_base: Option<String>,
     index: Arc<IndexStore>,
     blobs: noded::blobs::BlobHandle,
-    oracle_cmds: mpsc::Sender<NodeCommand>,
     node_handle: noded::NodeHandle,
     mut cmds: mpsc::Receiver<NodeCommand>,
     stream_hub: StreamHub,
@@ -222,9 +205,6 @@ fn run_node(
     // override — see capability-host. host-local only, never consensus.
     // Persistent agent workspaces stay under <storage>; portable run mounts
     // live under agent_runs_root outside it.
-    let agent_dirs = provider_host::AgentDirs::under(&storage);
-    // keys the portable run-root's per-node salt + D7 validation (oracle_workers).
-    let storage_for_runs = storage.clone();
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
@@ -367,20 +347,11 @@ fn run_node(
         let exposition_context = context.child("exposition");
         status.wire_exposition(move || exposition_context.encode());
 
-        // OFF-LOOP execution: the pool gates effects inline but runs the
-        // provider CLI on spawned tasks; a completed run re-enters as a
-        // Submit command on `oracle_cmds`, so this serial command loop
-        // never awaits a provider and Query/Status stay responsive while
-        // runs are in flight.
-        let workers = oracle_pool::oracle_workers(
-            &context,
-            oracle_cmds,
-            node_handle,
-            agent_dirs,
-            &storage_for_runs,
-            forge_push_base,
-            node_http_base,
-        );
+        // NO in-process compute plane: dispatch work is executed by the
+        // standalone compute daemon, which reaches this node over its own /v1
+        // surface like any other client. What is left here is the reactor seam
+        // itself (plus the debug echo the e2e drives).
+        let workers = echo_oracle::workers();
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would
         // re-use indexed heights — every new block silently skipped.

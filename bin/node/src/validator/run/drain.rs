@@ -1169,7 +1169,7 @@ impl ValidatorRuntime<'_> {
                 Ok(_) => tracing::info!(
                     target: "ducktape::modules",
                     node = %label,
-                    capabilities = ?announcer.capabilities,
+                    capabilities = ?announcer.offered(),
                     "capabilities announced"
                 ),
                 Err(e) => {

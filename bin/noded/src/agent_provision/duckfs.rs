@@ -1,13 +1,13 @@
 //! the duckfs lane: materialize / commit / clean a per-run duckfs checkout
-//! over the in-daemon actor lane — moved VERBATIM from the pre-split
-//! `agent_provision.rs` (behavior-identical; only the source match moved up
-//! to the dispatching provisioner).
+//! over the node's `/v1` surface.
 //!
 //! it runs the exact `checkout_with`/`commit` primitives the
 //! `/v1/fs/workspaces` RPC does ([`crate::workspaces`]), on `spawn_blocking`
-//! (the engine is sync std::fs + `block_on` of the actor — NEVER an
-//! axum/tokio worker), and drives them through [`ActorNodeApi`] so there is
-//! no self-dial.
+//! (the engine is sync std::fs + blocking http — NEVER an axum/tokio worker),
+//! and drives them through [`NodeLink::files`]. The node's own RPC keeps its
+//! in-process `ActorNodeApi` (a daemon dialing its own surface would deadlock
+//! the single actor); this runs in the COMPUTE DAEMON, a different process, so
+//! the http lane is the direct one, not a self-dial.
 //!
 //! LIVE, not dormant: both binaries wire the files module unconditionally, so
 //! the runs composer emits v1 for
@@ -24,8 +24,7 @@ use compute_service::{
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 use duckfs_client::commit::{CommitError, commit};
 
-use crate::NodeHandle;
-use crate::actor_api::ActorNodeApi;
+use crate::node_link::NodeLink;
 
 /// materialize the duckfs source at `dir` (plus W6 skill ro mounts under the
 /// sibling `ro_root`) and hand back the live workspace. mount names arrive
@@ -34,7 +33,7 @@ use crate::actor_api::ActorNodeApi;
 /// the run as `DUCKTAPE_NODE` so its tool plane can dial back.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn provision(
-    handle: NodeHandle,
+    node: NodeLink,
     dir: PathBuf,
     ro_root: PathBuf,
     prefix: String,
@@ -42,7 +41,7 @@ pub(super) async fn provision(
     node_url: Option<String>,
     spec: &WorkspaceSpec,
 ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
-    let api = ActorNodeApi::new(handle.clone());
+    let checkout_node = node.clone();
     let checkout_dir = dir.clone();
     // the engine call is blocking std::fs + block_on(actor) — MUST be
     // spawn_blocking (never an async worker), exactly like
@@ -50,7 +49,7 @@ pub(super) async fn provision(
     // url (its commits ride the actor lane).
     tokio::task::spawn_blocking(move || {
         checkout_with(
-            &api,
+            &checkout_node.files(),
             &checkout_dir,
             &prefix,
             snapshot.as_deref(),
@@ -85,14 +84,14 @@ pub(super) async fn provision(
             Some(assemble_context_doc(&[], spec.library_readable)?),
         )
     } else {
-        let mount_handle = handle.clone();
+        let mount_node = node.clone();
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
         let checkout_rw = dir.clone();
         // the committed library grant (consensus said it; the assembler obeys).
         let library_readable = spec.library_readable;
         let context_doc = tokio::task::spawn_blocking(move || {
-            super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts, library_readable)
+            super::checkout_ro_mounts(&mount_node, &checkout_ro, &mounts, library_readable)
                 .inspect_err(|_| {
                     // W5 again: the run never gets a workspace handle on a
                     // failed provision, so the already-materialized rw checkout
@@ -107,7 +106,7 @@ pub(super) async fn provision(
     // the workspace EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an
     // op on a run that never starts.
-    let session = super::session::open(&handle, spec).await;
+    let session = super::session::open(&node, spec).await;
     let env = super::run_env(
         &dir,
         ro_dir.as_deref(),
@@ -116,7 +115,7 @@ pub(super) async fn provision(
         session.as_ref(),
     );
     Ok(Box::new(NodedWorkspace {
-        handle,
+        node,
         dir,
         ro_dir,
         source: spec.source.clone(),
@@ -127,9 +126,9 @@ pub(super) async fn provision(
 }
 
 /// one live materialized workspace: its on-disk dir, the source the receipt
-/// echoes, and the actor handle its commit rides.
+/// echoes, and the node lane its commit rides.
 struct NodedWorkspace {
-    handle: NodeHandle,
+    node: NodeLink,
     dir: PathBuf,
     /// the W6 skill ro root (`<slug>-ro`), `Some` iff the run had mounts —
     /// tracked ONLY so cleanup can remove it; commit never looks at it.
@@ -183,14 +182,14 @@ impl ProvisionedWorkspace for NodedWorkspace {
         audit_message: &str,
         _proposal: Option<&str>,
     ) -> Result<WorkspaceReceipt, String> {
-        let api = ActorNodeApi::new(self.handle.clone());
+        let node = self.node.clone();
         let dir = self.dir.clone();
         let message = audit_message.to_string();
         let result = tokio::task::spawn_blocking(move || {
             // Provider HOME/auth/temp/build state is reserved runtime debris,
             // never an agent output facet. Remove it before duckfs scans.
             let _ = std::fs::remove_dir_all(dir.join(provider_host::RUN_RUNTIME_DIR));
-            commit(&api, &dir, &message)
+            commit(&node.files(), &dir, &message)
         })
         .await
         .map_err(|_| "workspace commit task panicked".to_string())?;

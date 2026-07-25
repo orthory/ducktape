@@ -7,6 +7,7 @@
 //! the forge-lane W6 tests share) — the mount bracket is exercised for real,
 //! without booting a node.
 
+use crate::NodeHandle;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -267,7 +268,7 @@ async fn a_run_gets_the_node_base_its_agent_id_and_the_tool_bin_dir_on_path() {
     let tmp = tempfile::tempdir().unwrap();
     let (handle, rx, _hub) = NodeHandle::channel();
     let _actor = spawn_files_actor(rx, skill_tree(), false);
-    let prov = NodedProvisioner::new(handle, tmp.path())
+    let prov = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
         .with_node_url(Some("http://127.0.0.1:8844".into()));
 
     let ws = prov
@@ -325,7 +326,7 @@ async fn an_unreachable_node_or_an_anonymous_run_omits_the_var_rather_than_guess
     let (handle, rx, _hub) = NodeHandle::channel();
     let _actor = spawn_files_actor(rx, skill_tree(), false);
     // no with_node_url (a node serving no http surface) and no agent_id.
-    let ws = NodedProvisioner::new(handle, tmp.path())
+    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
         .provision(&duckfs_spec(None, Vec::new()))
         .await
         .expect("provision");
@@ -357,7 +358,7 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
     let (handle, rx, _hub) = NodeHandle::channel();
     let (_actor, binds, actions) = spawn_session_actor(rx, Ok(()));
 
-    let ws = NodedProvisioner::new(handle, tmp.path())
+    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
         .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
         .await
         .expect("provision");
@@ -509,7 +510,7 @@ async fn a_run_with_no_agent_opens_no_session_and_submits_no_bind() {
     let (handle, rx, _hub) = NodeHandle::channel();
     let (_actor, binds, _actions) = spawn_session_actor(rx, Ok(()));
 
-    let ws = NodedProvisioner::new(handle, tmp.path())
+    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
         .provision(&duckfs_spec(None, Vec::new()))
         .await
         .expect("provision");
@@ -538,7 +539,7 @@ async fn an_envelope_with_no_consensus_run_id_opens_no_session_and_submits_no_bi
         consensus_run_id: None,
         ..duckfs_spec(Some("quackbot"), Vec::new())
     };
-    let ws = NodedProvisioner::new(handle, tmp.path())
+    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
         .provision(&spec)
         .await
         .expect("a run without a consensus id still gets its workspace");
@@ -567,7 +568,7 @@ async fn a_refused_bind_degrades_to_a_read_only_plane_and_never_fails_the_run() 
 
     // the run STILL provisions: a session is an additive capability, and losing
     // it must never cost the run its workspace (it can still return a response).
-    let ws = NodedProvisioner::new(handle, tmp.path())
+    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
         .with_node_url(Some("http://127.0.0.1:8844".into()))
         .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
         .await

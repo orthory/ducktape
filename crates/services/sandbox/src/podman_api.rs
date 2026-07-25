@@ -1104,15 +1104,7 @@ impl PodmanService {
     /// they carry the managed label. Best-effort: a reap failure is logged by
     /// the caller, never fatal (a fresh node has none).
     pub async fn reap_orphans(&self, label: &str) -> Result<usize, String> {
-        let client = self.client();
-        let ids = client.list_by_label(label).await?;
-        let mut removed = 0;
-        for id in &ids {
-            if client.remove(id).await.is_ok() {
-                removed += 1;
-            }
-        }
-        Ok(removed)
+        reap_by_label(&self.socket, label).await
     }
 
     /// wait until the service is answering on its socket (bounded). The service
@@ -1139,6 +1131,26 @@ impl PodmanService {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
     }
+}
+
+/// Remove every container on `socket` carrying `label`, returning how many went.
+///
+/// Split out of [`PodmanService::reap_orphans`] because the process that OWNS
+/// the podman service is no longer the process that owns the containers: the
+/// node runs the service (its pty plane needs it), while the compute daemon
+/// creates and reaps its own label-scoped set over the same socket. Both call
+/// this. Best-effort by construction — a container that refuses to go is left
+/// for the operator, never an error that stops a boot.
+pub async fn reap_by_label(socket: &Path, label: &str) -> Result<usize, String> {
+    let client = Podman::new(socket.to_path_buf());
+    let ids = client.list_by_label(label).await?;
+    let mut removed = 0;
+    for id in &ids {
+        if client.remove(id).await.is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]

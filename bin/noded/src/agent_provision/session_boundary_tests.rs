@@ -26,6 +26,7 @@
 //! traffic is answered by the same stand-in the plane tests use. the `runs` ops
 //! are the ones that reach real consensus.
 
+use crate::NodeHandle;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -314,7 +315,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             // a bare node's ledger fits the demandless jobs it dispatches.
             Default::default(),
             Arc::new(
-                NodedProvisioner::new(handle, &runs_root)
+                NodedProvisioner::new(crate::agent_provision::test_link(handle).await, &runs_root)
                     .with_node_url(Some("http://127.0.0.1:8844".into())),
             ),
         );

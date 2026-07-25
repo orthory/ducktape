@@ -1062,7 +1062,17 @@ pub fn discover_interactive(
     dirs: AgentDirs,
     backend: SandboxBackend,
 ) -> Option<ProviderSet> {
-    match provider_host::discover(node_identity, dirs, None, backend) {
+    // the pty plane is still in-node (the agent carve is a later step), so it
+    // has no minted service instance — but its containers must carry an owner
+    // tag of their OWN, or the compute daemon's reaper would sweep live pty
+    // sessions.
+    match provider_host::discover(
+        node_identity,
+        dirs,
+        None,
+        backend,
+        provider_host::NODE_TERM_OWNER,
+    ) {
         Ok(set) => Some(set),
         Err(err) => {
             tracing::error!(target: "ducktape::term", error = %err, "interactive_discovery_failed");

@@ -60,8 +60,6 @@ pub(crate) struct BootEnv {
     pub(crate) sync_index: bool,
     /// the capability tags the user's compute grant consented to; the
     /// announce is these INTERSECTED with what this host discovers. Empty =
-    /// announce nothing. See `Resolved::granted_capabilities`.
-    pub(crate) granted_capabilities: Vec<String>,
     /// the compute plane (`node.toml [sandbox]`) — threaded to both
     /// `provider_host::discover` call sites (validator + resident). `None`
     /// = consensus-only: no discovery, no announce, no oracle pool.
@@ -108,7 +106,6 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         invite_wireguard,
         invite_fronts,
         sync_index,
-        granted_capabilities,
         coordination,
         coord_cap,
         workspace,
@@ -116,6 +113,8 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         coordinator_relay,
         wireguard_advertised,
         sandbox,
+        // read per announce tick from `services.toml`, never latched here.
+        granted_capabilities: _,
         compute_backend,
         sandbox_capacity,
     } = resolved;
@@ -348,7 +347,6 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         checkpoint_blocks,
         dev_demo,
         sync_index,
-        granted_capabilities,
         sandbox,
         compute_backend,
         sandbox_capacity,

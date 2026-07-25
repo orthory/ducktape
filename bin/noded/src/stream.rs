@@ -72,6 +72,24 @@ pub enum ClientMsg {
         text: String,
         origin: String,
     },
+    /// one live output line from a run this node's COMPUTE DAEMON is executing.
+    ///
+    /// The daemon runs out of process, so the in-process `OutputSink` that used
+    /// to feed [`RunOutputRegistry`] cannot reach it any more; this is that sink
+    /// across the process boundary, on the ws connection the daemon already
+    /// holds for work-intake hints. It is a publish, not a subscription, which
+    /// is why it is a `ClientMsg` and not a topic.
+    ///
+    /// Trust: the same trusted-local convention as [`Self::TermInput`] — the ws
+    /// surface is unauthenticated because a local process can already read the
+    /// node's key off disk, and a run-output ring is a DISPLAY buffer that no
+    /// consensus decision reads. The registry's own caps (`RUN_OUTPUT_MAX_RUNS`
+    /// / `RUN_OUTPUT_MAX_LINES`) bound what a chatty publisher can occupy.
+    RunOutput {
+        id: String,
+        stream: RunStream,
+        line: String,
+    },
 }
 
 // Serialize-only: the node SENDS frames and never parses its own, so there is
@@ -718,6 +736,13 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                             Ok(ClientMsg::TermCommand { session, text, origin }) => {
                                 handle_term_command(&handle, &topics, &session, origin, text);
                             }
+                            // a compute daemon's live run tail: append to the
+                            // same ring the in-process sink used to feed, so
+                            // `run-output:<id>` subscribers cannot tell which
+                            // process produced the line.
+                            Ok(ClientMsg::RunOutput { id, stream, line }) => {
+                                hub.run_output().append(id, stream, line);
+                            }
                             Ok(msg) => {
                                 let frames = handle_client_msg(&handle, &mut topics, msg);
                                 if !send_frames(&mut socket, frames).await {
@@ -822,7 +847,8 @@ fn handle_client_msg(
         // match stays exhaustive.
         ClientMsg::TermInput { .. }
         | ClientMsg::TermResize { .. }
-        | ClientMsg::TermCommand { .. } => Vec::new(),
+        | ClientMsg::TermCommand { .. }
+        | ClientMsg::RunOutput { .. } => Vec::new(),
     }
 }
 

@@ -78,10 +78,32 @@ const PODMAN_CID_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PODMAN_RETRY_MIN: Duration = Duration::from_millis(250);
 const PODMAN_RETRY_MAX: Duration = Duration::from_secs(1);
 // used by the socket run path (`podman_create_and_start`), which compiles on
-// every unix — so this label must not be gated to linux the way the old CLI
+// every unix — so these must not be gated to linux the way the old CLI
 // reaper's consts were, or macOS (a Tart host) fails to build.
-const PODMAN_MANAGED_LABEL: &str = "io.ducktape.managed=capability-host";
+/// the ownership label key every ducktape-created container carries. Its VALUE
+/// names the owning service instance, so two service daemons sharing one node's
+/// podman reap only their own containers ([`managed_label`]).
+pub const PODMAN_MANAGED_KEY: &str = "io.ducktape.managed";
+/// the pre-daemonization flat label, when one node process owned every
+/// container. Nothing writes it any more; the compute daemon sweeps it ONCE at
+/// boot. Disposable runtime-state cleanup, not a compat arm — delete it once no
+/// host can still be carrying pre-daemon containers.
+pub const RETIRED_FLAT_MANAGED_LABEL: &str = "io.ducktape.managed=capability-host";
+/// the owner tag the node's own interactive terminal plane stamps. Not a
+/// service instance id: the pty plane is still in-node (the agent carve is a
+/// later step), so it has no grant and no minted id — but it MUST be distinct
+/// from compute's, or one reaper would kill the other's containers.
+pub const NODE_TERM_OWNER: &str = "node-term";
+/// the owner tag for a provider built outside [`discover`] — tests and
+/// embedders. Deliberately matches no service instance, so nothing reaps it.
+const UNSCOPED_OWNER: &str = "unscoped";
 const PODMAN_NODE_LABEL: &str = "io.ducktape.node";
+
+/// the full `key=value` ownership label for one owner tag — what a service
+/// stamps on create and the ONLY label it reaps by.
+pub fn managed_label(owner: &str) -> String {
+    format!("{PODMAN_MANAGED_KEY}={owner}")
+}
 const TART_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 const TART_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -165,7 +187,7 @@ mod interactive;
 #[cfg(unix)]
 pub(crate) use sandbox_host::podman_api;
 #[cfg(unix)]
-pub use sandbox_host::podman_api::{PodmanService, egress_nftables, run_egress_hook};
+pub use sandbox_host::podman_api::{PodmanService, egress_nftables, reap_by_label, run_egress_hook};
 pub(crate) use sandbox_host::sandbox;
 mod session;
 mod spec;
@@ -543,6 +565,11 @@ pub(crate) struct CliProvider {
     /// how the child is spawned: rootless `Podman` or an ephemeral
     /// Tart VM. set once at discovery for the whole provider set.
     backend: SandboxBackend,
+    /// which service instance OWNS the containers this provider creates —
+    /// the value half of [`PODMAN_MANAGED_KEY`]. Set once at discovery, so a
+    /// compute daemon and (later) an agent daemon sharing one node's podman
+    /// each reap only their own.
+    managed_owner: String,
 }
 
 impl CliProvider {
@@ -565,6 +592,7 @@ impl CliProvider {
             dirs: AgentDirs::default(),
             output_sink: None,
             backend,
+            managed_owner: UNSCOPED_OWNER.to_string(),
         }
     }
 
@@ -586,6 +614,13 @@ impl CliProvider {
 
     pub fn with_output_sink(mut self, output_sink: OutputSink) -> Self {
         self.output_sink = Some(output_sink);
+        self
+    }
+
+    /// name the service instance that owns this provider's containers — see
+    /// [`CliProvider::managed_owner`]. Set by [`discover`] for the whole set.
+    pub(crate) fn with_managed_owner(mut self, owner: &str) -> Self {
+        self.managed_owner = owner.to_string();
         self
     }
 
@@ -755,7 +790,7 @@ impl CliProvider {
 
         let executing_node = ctx.executing_node.as_deref().unwrap_or("unknown");
         let labels = vec![
-            PODMAN_MANAGED_LABEL.to_string(),
+            managed_label(&self.managed_owner),
             format!("{PODMAN_NODE_LABEL}={executing_node}"),
         ];
 
@@ -3366,13 +3401,17 @@ fn excerpt(s: &str) -> String {
 /// `DUCKTAPE_AGENT_SESSIONS` override the wired roots. `output_sink`
 /// installs a live tail on every discovered CLI provider.
 /// `node_identity` is the verified local signer/origin bytes, kept for the run
-/// labels. Crash-orphan cleanup is the node's [`PodmanService::reap_orphans`]
-/// (its podman store is node-private), not this discovery path.
+/// labels. `managed_owner` names the SERVICE INSTANCE that owns every container
+/// this set creates ([`managed_label`]) — `compute#deadbeef` for the compute
+/// daemon, [`NODE_TERM_OWNER`] for the node's own pty plane. Crash-orphan
+/// cleanup reaps exactly that label ([`reap_by_label`]), so one
+/// service can never sweep another's containers.
 pub fn discover(
     node_identity: &[u8],
     dirs: AgentDirs,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
+    managed_owner: &str,
 ) -> Result<ProviderSet, String> {
     let specs = SpecSet::load(operator_spec_dir().as_deref())?;
     let _executing_node = execution_node_id(node_identity);
@@ -3388,6 +3427,7 @@ pub fn discover(
         dirs.resolved(&|k| std::env::var_os(k)),
         output_sink,
         backend,
+        managed_owner,
     ))
 }
 
@@ -3427,6 +3467,7 @@ fn discover_with(
         dirs,
         None,
         SandboxBackend::Bare,
+        UNSCOPED_OWNER,
     )
 }
 
@@ -3439,6 +3480,7 @@ fn discover_with_sink(
     dirs: AgentDirs,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
+    managed_owner: &str,
 ) -> ProviderSet {
     let mut groups: BTreeMap<(&str, Option<&str>), Vec<&CapabilitySpec>> = BTreeMap::new();
     for spec in specs.iter() {
@@ -3454,7 +3496,8 @@ fn discover_with_sink(
         };
         for spec in group {
             let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone(), backend.clone())
-                .with_agent_dirs(dirs.clone());
+                .with_agent_dirs(dirs.clone())
+                .with_managed_owner(managed_owner);
             if let Some(t) = global_timeout {
                 provider = provider.with_timeout(t);
             }

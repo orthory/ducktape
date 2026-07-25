@@ -19,7 +19,7 @@ pub mod podman_api;
 pub mod sandbox;
 
 #[cfg(unix)]
-pub use podman_api::{PodmanService, egress_nftables, run_egress_hook};
+pub use podman_api::{PodmanService, egress_nftables, reap_by_label, run_egress_hook};
 pub use sandbox::{SandboxBackend, TART_MAX_CONCURRENT, TART_MIN_CORES, tart_semaphore};
 
 /// whether `p` is a file this process could exec. the shared predicate behind

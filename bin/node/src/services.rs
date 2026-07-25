@@ -230,22 +230,6 @@ fn save(workspace: &Path, services: &Services) -> Result<(), String> {
     Ok(())
 }
 
-/// The tags a node may announce: what the user's compute grant consented to,
-/// INTERSECTED with what this host actually discovered.
-///
-/// Neither side may widen the other. The grant cannot make a host advertise an
-/// executor it does not have, and discovery cannot advertise a tag the user
-/// never reviewed. An empty result — no grant, a grant carrying no tags, or a
-/// host that discovered nothing — means announce nothing, which is also how
-/// the accept-lane-only provider is expressed. There is deliberately no second
-/// switch: a bool in node.toml could disagree with the grant, and this cannot.
-pub(crate) fn announceable(granted: &[String], discovered: Vec<String>) -> Vec<String> {
-    discovered
-        .into_iter()
-        .filter(|tag| granted.iter().any(|allowed| allowed == tag))
-        .collect()
-}
-
 // ============================================================================
 // list/status state derivation
 // ============================================================================
@@ -861,10 +845,10 @@ const HEARTBEAT: std::time::Duration =
 /// `ducktape service run <kind>` — the first-party launcher.
 ///
 /// It discovers what this host can actually execute, signals that to the node,
-/// offers to enable itself, and then keeps the signal alive. It deliberately
-/// does NOT execute work: the node still runs the compute plane in-process at
-/// this step, so this is the SURFACE arriving ahead of the move, not a second
-/// executor racing the first.
+/// offers to enable itself, and then SERVES: for `compute` the process becomes
+/// the node's whole compute plane (see [`crate::compute`]). A kind with no
+/// granted standing keeps signaling and executes nothing — enable is the
+/// consent boundary, and a daemon can never grant itself one.
 fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // a foreground daemon logs; it is not a one-shot verb printing a value.
     noded::log::init(None, None);
@@ -890,7 +874,62 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     ))?;
 
     offer_enable(&workspace, &kind, args.offer())?;
-    heartbeat(&base, &hello)
+
+    // the heartbeat must outlive this call: for compute it runs BESIDE the
+    // execution loop, so a long run never lets the node's catalog entry lapse
+    // and report the daemon absent.
+    let beat_base = base.clone();
+    std::thread::Builder::new()
+        .name("service-hello".into())
+        .spawn(move || heartbeat(&beat_base, &hello))?;
+
+    match serve_kind(&kind, &workspace, resolved, &base)? {
+        // nothing to execute (an ungranted kind, or a kind with no first-party
+        // daemon): the signal IS the whole job, so park on it.
+        Served::SignalOnly => loop {
+            std::thread::park();
+        },
+        Served::Stopped => Ok(()),
+    }
+}
+
+/// What `run` did beyond signaling. ONE discriminant so the caller never has to
+/// infer "did it serve?" from a bool or an Option.
+enum Served {
+    /// no execution plane for this kind on this node — keep signaling.
+    SignalOnly,
+    /// the daemon served and its loop returned.
+    Stopped,
+}
+
+/// Dispatch a signaling daemon to its execution plane, when it has one.
+fn serve_kind(
+    kind: &str,
+    workspace: &Path,
+    resolved: config::Resolved,
+    base: &str,
+) -> Result<Served, Box<dyn std::error::Error>> {
+    if kind != COMPUTE_KIND {
+        // every other kind is recorded, listed and signaled — and executes
+        // nothing, because no first-party daemon exists for it yet.
+        return Ok(Served::SignalOnly);
+    }
+    let Some(grant) = load(workspace)?.grant(kind).cloned() else {
+        // signaling without standing is the designed resting state, not an
+        // error: the operator reviews the hello and enables when ready.
+        write_err(&format!(
+            "  {} — nothing will execute until it is enabled
+",
+            paint(YELLOW, "not enabled")
+        ))?;
+        return Ok(Served::SignalOnly);
+    };
+    crate::compute::serve(crate::compute::Compute {
+        grant,
+        resolved,
+        http_base: base.to_string(),
+    })?;
+    Ok(Served::Stopped)
 }
 
 /// Build this host's hello: what it IS, and what it can actually run.
@@ -911,11 +950,16 @@ fn discover_hello(
     // the same precondition the node's own boot enforces — a daemon must not
     // advertise tags it has no runnable sandbox for.
     backend.probe().map_err(|error| format!("sandbox: {error}"))?;
+    // discovery for the HELLO only — this set spawns nothing, so it is named
+    // for the kind rather than an instance id (there may be no grant yet: the
+    // hello is what the user reviews before minting one). The serving set is
+    // rediscovered under `compute#hex8` once a grant exists.
     let providers = provider_host::discover(
         resolved.signer.public_key().as_ref(),
         provider_host::AgentDirs::under(&resolved.storage_dir),
         None,
         backend,
+        kind,
     )?;
     let build = noded::services::build_identity()
         .ok_or("this binary has no build identity; rebuild it from a git checkout")?;
@@ -970,7 +1014,6 @@ fn offer_enable(
         paint(GREEN, ServiceState::Enabled.glyph()),
         grant.display_id()
     ))?;
-    write_err("  restart the node to start its compute plane: ducktape node run\n")?;
     Ok(())
 }
 
@@ -980,7 +1023,7 @@ fn offer_enable(
 /// ages out and returns. Logged on the first failure and every 30th after it,
 /// carrying the attempt count — an unconditional warn here would be a log bomb
 /// on a node that stays down.
-fn heartbeat(base: &str, hello: &noded::services::Hello) -> Result<(), Box<dyn std::error::Error>> {
+fn heartbeat(base: &str, hello: &noded::services::Hello) -> ! {
     const LOG_EVERY: u64 = 30;
     let mut failures: u64 = 0;
     loop {
@@ -1029,7 +1072,10 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
         grant.display_id()
     ))?;
     if plan.kind == COMPUTE_KIND {
-        write_err("  restart the node to start its compute plane: ducktape node run\n")?;
+        // the daemon, not the node, is what has to be running — and the node
+        // needs no restart at all: it reads the offered set from the live
+        // signaling catalog every announce tick.
+        write_err("  start it with: ducktape service run compute\n")?;
     }
     Ok(())
 }
@@ -1050,14 +1096,14 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
         "disabled {kind}; {} is retired (a re-enable mints a fresh id)\n",
         retired.display_id()
     ))?;
-    // the grant is read once, at boot. Until the node restarts it is still
-    // running this service and still announcing what the grant used to say —
-    // so the revocation is NOT in effect yet. `enable` says the same thing
-    // about starting; saying it only there would imply revocation is instant.
+    // the node retracts its announce on the next tick (the grant is re-read
+    // there), but a RUNNING daemon keeps executing the work it already holds:
+    // it read its grant once, at its own boot. Stopping it is the operator's
+    // act, so say so rather than implying revocation is instant.
     if kind == COMPUTE_KIND {
         write_err(
-            "  restart the node to stop its compute plane: until then it keeps \
-             running work and announcing\n",
+            "  stop the daemon too: a running `service run compute` keeps \
+             executing work it already holds\n",
         )?;
     }
     Ok(())
@@ -1337,37 +1383,6 @@ mod tests {
             hello.validate().is_ok(),
             "a real host's tag set must be admitted, not refused as malformed"
         );
-    }
-
-    #[test]
-    fn the_announce_set_is_granted_intersect_discovered() {
-        let discovered = || vec!["agent.claude".to_string(), "agent.codex".to_string()];
-
-        // the ordinary case: the grant consented to what the host provides.
-        assert_eq!(
-            announceable(&["agent.claude".into(), "agent.codex".into()], discovered()),
-            discovered()
-        );
-
-        // a grant cannot widen the host: consenting to a tag this host does
-        // not provide announces nothing extra.
-        assert_eq!(
-            announceable(&["agent.claude".into(), "nope".into()], discovered()),
-            vec!["agent.claude".to_string()]
-        );
-
-        // the host cannot widen the grant: discovering more than was reviewed
-        // never advertises the surplus.
-        assert_eq!(
-            announceable(&["agent.codex".into()], discovered()),
-            vec!["agent.codex".to_string()]
-        );
-
-        // no grant, and a grant announcing nothing, both announce nothing —
-        // the accept-lane-only provider. There is no second switch that could
-        // disagree, because the empty set IS the switch.
-        assert!(announceable(&[], discovered()).is_empty());
-        assert!(announceable(&["agent.claude".into()], vec![]).is_empty());
     }
 
     #[test]
