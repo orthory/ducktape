@@ -235,15 +235,21 @@ fn save(workspace: &Path, services: &Services) -> Result<(), String> {
 /// What one service's standing is on this node. Exactly three states, because
 /// presence and consent are independent: a daemon may signal without a grant,
 /// hold a grant while absent, or both.
+/// The serde spellings are written out rather than derived from a rename rule:
+/// they must equal [`ServiceState::label`] exactly, so `--json` and the table
+/// never name one state two ways. `state_tokens_match_the_rendered_labels`
+/// pins that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum ServiceState {
     /// signaling, no grant — visible to the user, authorized for nothing.
+    #[serde(rename = "signaling")]
     Signaling,
     /// granted and signaling — the working state.
+    #[serde(rename = "enabled")]
     Enabled,
     /// granted but not signaling. An operational warning, never an error: the
     /// daemon is down, restarting, or was never started.
+    #[serde(rename = "enabled-but-absent")]
     EnabledAbsent,
 }
 
@@ -258,6 +264,14 @@ pub struct ServiceRow {
     pub version: Option<String>,
     pub capabilities: Vec<String>,
     pub scopes: Vec<String>,
+    /// service kinds this daemon declared it wants present, and the subset of
+    /// them that nothing on this node provides.
+    ///
+    /// Rendered as an informational warning and NOTHING else: an unmet need
+    /// never blocks enabling, never orders startup and never gates readiness.
+    /// A service whose need is unmet still enables, still runs, still serves.
+    pub needs: Vec<String>,
+    pub unmet_needs: Vec<String>,
 }
 
 /// Fold the volatile catalog and the durable grants into one kind-sorted view.
@@ -267,11 +281,26 @@ pub struct ServiceRow {
 /// grant recorded at consent time, so an absent service still shows what it
 /// was enabled for.
 pub fn rows(signaling: &[noded::services::Signaling], grants: &[ServiceGrant]) -> Vec<ServiceRow> {
+    // a need is met when SOME service of that kind is enabled here. Local
+    // grant state only — resolving "is there capacity anywhere in the network"
+    // would mean a registry query on a display path, and a readiness signal is
+    // exactly what this must not become.
+    let enabled_kinds: std::collections::BTreeSet<&str> =
+        grants.iter().map(|grant| grant.kind.as_str()).collect();
+    let unmet = |needs: &[String]| -> Vec<String> {
+        needs
+            .iter()
+            .filter(|need| !enabled_kinds.contains(need.as_str()))
+            .cloned()
+            .collect()
+    };
     let mut rows: Vec<ServiceRow> = signaling
         .iter()
         .map(|live| {
             let granted = grants.iter().find(|grant| grant.kind == live.kind);
             ServiceRow {
+                needs: live.needs.clone(),
+                unmet_needs: unmet(&live.needs),
                 kind: live.kind.clone(),
                 state: match granted {
                     Some(_) => ServiceState::Enabled,
@@ -294,6 +323,9 @@ pub fn rows(signaling: &[noded::services::Signaling], grants: &[ServiceGrant]) -
             version: None,
             capabilities: grant.capabilities.clone(),
             scopes: grant.scopes.clone(),
+            // needs are live hello metadata; an absent daemon declares none.
+            needs: Vec::new(),
+            unmet_needs: Vec::new(),
         });
     rows.extend(absent);
     rows.sort_by(|a, b| a.kind.cmp(&b.kind));
@@ -384,8 +416,24 @@ fn render_list(rows: &[ServiceRow]) -> String {
             column(row.state.label(), STATE_WIDTH, row.state.style()),
             row.instance.as_deref().unwrap_or("-"),
         ));
+        if let Some(hint) = unmet_hint(row) {
+            out.push_str(&format!("  {}\n", paint(YELLOW, &hint)));
+        }
     }
     out
+}
+
+/// The informational line for a service whose declared needs nothing here
+/// meets. Purely advisory — see [`ServiceRow::unmet_needs`].
+fn unmet_hint(row: &ServiceRow) -> Option<String> {
+    if row.unmet_needs.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "wants {} — not enabled on this node (informational; {} still serves)",
+        row.unmet_needs.join(", "),
+        row.kind
+    ))
 }
 
 /// `service status` — a readable block per service rather than a flat dump.
@@ -409,15 +457,29 @@ fn render_status(rows: &[ServiceRow]) -> String {
             ("version", row.version.as_deref().unwrap_or("-").to_string()),
             ("offers", join_or_dash(&row.capabilities)),
             ("scopes", join_or_dash(&row.scopes)),
+            ("needs", join_or_dash(&row.needs)),
         ];
         for (name, value) in fields {
             out.push_str(&format!("    {} {value}\n", column(name, 10, DIM)));
         }
         if row.state == ServiceState::EnabledAbsent {
+            // a daemon refused for build skew never reaches the catalog, so it
+            // looks identical to one that is simply down. Name both causes
+            // here — it is the only place an operator would look.
             out.push_str(&format!(
                 "    {}\n",
-                paint(YELLOW, "enabled but not signaling — is its daemon running?")
+                paint(
+                    YELLOW,
+                    &format!(
+                        "enabled but not signaling — is its daemon running, and on build {}? \
+                         (a different build is refused: reason build_mismatch)",
+                        noded::services::build_identity()
+                    )
+                )
             ));
+        }
+        if let Some(hint) = unmet_hint(row) {
+            out.push_str(&format!("    {}\n", paint(YELLOW, &hint)));
         }
     }
     out
@@ -567,6 +629,7 @@ fn signaling_now(workspace: &Path) -> Vec<noded::services::Signaling> {
     };
     serde_json::from_value(body["signaling"].clone()).unwrap_or_default()
 }
+
 
 fn view(args: &ReadArgs) -> Result<Vec<ServiceRow>, Box<dyn std::error::Error>> {
     let workspace = args.workspace.dir()?;
@@ -809,6 +872,7 @@ mod tests {
             version: "1.2.3".into(),
             capabilities: vec!["agent.codex".into()],
             scopes: vec![],
+            needs: vec![],
         }
     }
 
@@ -1019,6 +1083,108 @@ mod tests {
         assert!(crate::tty::confirm("Enable compute?", false, false).unwrap());
         assert!(crate::tty::confirm("Enable compute?", false, true).unwrap());
         assert!(crate::tty::confirm("Enable compute?", true, true).unwrap());
+    }
+
+    #[test]
+    fn state_tokens_match_the_rendered_labels() {
+        // one state, one name: a script keying on the `--json` token and a
+        // human reading the table must never see two different spellings.
+        for state in [
+            ServiceState::Signaling,
+            ServiceState::Enabled,
+            ServiceState::EnabledAbsent,
+        ] {
+            let json = serde_json::to_string(&state).expect("serialize state");
+            assert_eq!(
+                json,
+                format!("\"{}\"", state.label()),
+                "the json token and the printed label must agree"
+            );
+        }
+    }
+
+    #[test]
+    fn the_instance_id_survives_a_daemon_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        // enabling mints the id ONCE and writes it down ...
+        let minted = grant("compute", mint_instance(&NODE_A, "compute", &NONCE));
+        save(
+            dir.path(),
+            &Services {
+                version: FORMAT_VERSION,
+                grants: vec![minted.clone()],
+            },
+        )
+        .unwrap();
+        let first = minted.display_id();
+
+        // ... so every later read — a daemon restart, a node restart, a fresh
+        // CLI process — resolves the SAME kind#hex8. The id's lifetime is the
+        // grant's, not the process's.
+        for _ in 0..3 {
+            let reloaded = grant_for(dir.path(), COMPUTE_KIND).unwrap().unwrap();
+            assert_eq!(reloaded.display_id(), first);
+            assert_eq!(reloaded, minted, "the whole grant round-trips unchanged");
+            // and it is reproducible from the record alone.
+            let nonce = (0..GRANT_NONCE_LEN)
+                .map(|i| {
+                    u8::from_str_radix(&reloaded.nonce[i * 2..i * 2 + 2], 16).expect("hex nonce")
+                })
+                .collect::<Vec<u8>>();
+            assert_eq!(
+                config::hex_bytes(&mint_instance(&NODE_A, "compute", &nonce)),
+                reloaded.instance,
+                "the id re-derives from node + kind + the recorded nonce"
+            );
+        }
+
+        // disable retires it; a re-enable must NOT resurrect the same id.
+        save(dir.path(), &Services::default()).unwrap();
+        assert!(grant_for(dir.path(), COMPUTE_KIND).unwrap().is_none());
+        let fresh = mint_instance(&NODE_A, "compute", &[0xab; GRANT_NONCE_LEN]);
+        assert_ne!(
+            config::hex_bytes(&fresh),
+            minted.instance,
+            "a fresh grant nonce means a fresh consent epoch"
+        );
+    }
+
+    #[test]
+    fn an_unmet_declared_need_is_a_warning_and_nothing_more() {
+        let mut agent = signaling("agent");
+        agent.needs = vec!["compute".into()];
+        let agent_grant = grant("agent", mint_instance(&NODE_A, "agent", &NONCE));
+
+        // nothing named `compute` is enabled here, so the need is unmet ...
+        let unmet_rows = rows(&[agent.clone()], std::slice::from_ref(&agent_grant));
+        assert_eq!(unmet_rows[0].unmet_needs, vec!["compute".to_string()]);
+        // ... and yet the service is fully enabled: a need gates NOTHING.
+        assert_eq!(unmet_rows[0].state, ServiceState::Enabled);
+        assert!(unmet_rows[0].instance.is_some());
+
+        let hint = unmet_hint(&unmet_rows[0]).expect("an unmet need is surfaced");
+        assert!(hint.contains("compute"));
+        assert!(hint.contains("informational"));
+        assert!(
+            through_anstream(&render_list(&unmet_rows), anstream::ColorChoice::Never)
+                .contains("compute"),
+            "the warning reaches the rendered list"
+        );
+
+        // enable a compute service and the need is met — same states, no hint.
+        let with_compute = rows(
+            &[agent],
+            &[
+                agent_grant,
+                grant("compute", mint_instance(&NODE_A, "compute", &NONCE)),
+            ],
+        );
+        let agent_row = with_compute
+            .iter()
+            .find(|row| row.kind == "agent")
+            .expect("agent row");
+        assert!(agent_row.unmet_needs.is_empty());
+        assert_eq!(unmet_hint(agent_row), None);
     }
 
     #[test]

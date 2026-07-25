@@ -57,12 +57,39 @@ pub struct Hello {
     pub kind: String,
     /// the daemon's own version. Metadata only — never part of identity.
     pub version: String,
+    /// the daemon's BUILD identity, which must equal the node's own. See
+    /// [`build_identity`]: a mismatch is refused, never negotiated.
+    pub build: String,
     /// the capability tags this daemon offers to run.
     #[serde(default)]
     pub capabilities: Vec<String>,
     /// the grant scopes this daemon says it needs.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// service kinds this daemon says it wants present to be fully useful
+    /// (an agent daemon wanting `compute` capacity, say).
+    ///
+    /// INFORMATIONAL ONLY, and deliberately so: an unmet need is rendered as a
+    /// warning by `ducktape service list`/`status` and changes nothing else. No
+    /// dependency graph, no startup ordering, no readiness gate, no
+    /// plug-to-plug call — a service whose need is unmet still enables, still
+    /// runs and still serves. That is a standing non-goal, not a gap.
+    #[serde(default)]
+    pub needs: Vec<String>,
+}
+
+/// This binary's build identity — the string a daemon must present in its
+/// hello and the node compares against its own.
+///
+/// The node and a service daemon are separate processes with independent
+/// restart timing, so skew is real even when one binary is on disk: an
+/// operator upgrades and restarts the node while yesterday's daemon is still
+/// running. Per the repo's no-versioning doctrine, a mismatch is REFUSED with
+/// a nameable reason rather than tolerated — there is no negotiation, no
+/// compat arm and no minimum-version window. One function so the two sides
+/// cannot drift in how they spell it.
+pub fn build_identity() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 /// A kind tag is lowercase alphanumeric plus `-`. This is a trust boundary:
@@ -94,8 +121,11 @@ impl Hello {
         if self.version.len() > MAX_VERSION_LEN || !item_is_well_formed(&self.version) {
             return Err("version must be 1..32 printable ascii chars");
         }
-        if self.capabilities.len() > MAX_LIST_LEN || self.scopes.len() > MAX_LIST_LEN {
-            return Err("at most 32 capabilities and 32 scopes");
+        let lists_ok = self.capabilities.len() <= MAX_LIST_LEN
+            && self.scopes.len() <= MAX_LIST_LEN
+            && self.needs.len() <= MAX_LIST_LEN;
+        if !lists_ok {
+            return Err("at most 32 capabilities, 32 scopes and 32 needs");
         }
         let items_ok = self
             .capabilities
@@ -104,6 +134,11 @@ impl Hello {
             .all(|item| item_is_well_formed(item));
         if !items_ok {
             return Err("each capability/scope must be 1..64 printable ascii chars");
+        }
+        // a need names a KIND, so it obeys the kind grammar — that is what
+        // makes it comparable against the grants without any normalizing.
+        if !self.needs.iter().all(|need| kind_is_well_formed(need)) {
+            return Err("each need must be a service kind (1..32 chars of [a-z0-9-])");
         }
         Ok(())
     }
@@ -116,6 +151,9 @@ pub struct Signaling {
     pub version: String,
     pub capabilities: Vec<String>,
     pub scopes: Vec<String>,
+    /// the kinds this daemon declared it wants present. Display only.
+    #[serde(default)]
+    pub needs: Vec<String>,
 }
 
 /// the deadline-carrying catalog entry.
@@ -138,6 +176,17 @@ impl ServiceCatalog {
     /// starve the daemons already in it.
     pub fn hello(&self, hello: Hello, now: Instant) -> Result<Duration, &'static str> {
         hello.validate()?;
+        // the refusal is loud and total: a daemon built against a different
+        // node does not get to signal, let alone be enabled.
+        if hello.build != build_identity() {
+            tracing::warn!(
+                target: "ducktape::service",
+                kind = %hello.kind,
+                reason = "build_mismatch",
+                "service hello refused"
+            );
+            return Err("build_mismatch");
+        }
         let mut entries = self.0.lock().expect("service catalog lock poisoned");
         expire(&mut entries, now);
         let kind = hello.kind.clone();
@@ -177,6 +226,7 @@ impl ServiceCatalog {
                 version: entry.hello.version.clone(),
                 capabilities: entry.hello.capabilities.clone(),
                 scopes: entry.hello.scopes.clone(),
+                needs: entry.hello.needs.clone(),
             })
             .collect();
         live.sort_by(|a, b| a.kind.cmp(&b.kind));
@@ -218,9 +268,23 @@ pub async fn hello(
             axum::Json(serde_json::json!({ "ttl_secs": ttl.as_secs() })),
         )
             .into_response(),
+        // a build mismatch is the node refusing a peer it cannot trust to be
+        // the same software, so it answers 409 (conflict) and names the reason
+        // as a stable token the CLI turns into "restart the daemon".
+        Err("build_mismatch") => (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "error": format!(
+                    "this node runs build {}; restart the service daemon from the same build",
+                    build_identity()
+                ),
+                "reason": "build_mismatch",
+            })),
+        )
+            .into_response(),
         Err(reason) => (
             axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({ "error": reason })),
+            axum::Json(serde_json::json!({ "error": reason, "reason": "malformed_hello" })),
         )
             .into_response(),
     }
@@ -249,8 +313,10 @@ mod tests {
         Hello {
             kind: kind.into(),
             version: "1.2.3".into(),
+            build: build_identity().into(),
             capabilities: vec!["agent.claude".into()],
             scopes: vec!["cred:read".into()],
+            needs: Vec::new(),
         }
     }
 
@@ -338,5 +404,63 @@ mod tests {
 
         // nothing malformed ever landed.
         assert!(catalog.live(now).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod build_gate_tests {
+    use super::*;
+
+    fn hello_from_build(build: &str) -> Hello {
+        Hello {
+            kind: "compute".into(),
+            version: "1.2.3".into(),
+            build: build.into(),
+            capabilities: vec![],
+            scopes: vec![],
+            needs: vec![],
+        }
+    }
+
+    #[test]
+    fn a_hello_from_a_different_build_is_refused_and_never_enters_the_catalog() {
+        let catalog = ServiceCatalog::default();
+        let now = Instant::now();
+
+        // skew in either direction is refused — there is no minimum-version
+        // window and no negotiation, only equality.
+        for skewed in ["0.0.0-ancient", "99.99.99", ""] {
+            assert_eq!(
+                catalog.hello(hello_from_build(skewed), now),
+                Err("build_mismatch"),
+                "build {skewed:?} must be refused"
+            );
+        }
+        assert!(
+            catalog.live(now).is_empty(),
+            "a refused hello leaves nothing behind"
+        );
+
+        // the node's own build is what passes.
+        catalog
+            .hello(hello_from_build(build_identity()), now)
+            .expect("matching build is admitted");
+        assert_eq!(catalog.live(now).len(), 1);
+    }
+
+    #[test]
+    fn declared_needs_ride_the_hello_through_to_the_catalog() {
+        let catalog = ServiceCatalog::default();
+        let now = Instant::now();
+        let mut hello = hello_from_build(build_identity());
+        hello.kind = "agent".into();
+        hello.needs = vec!["compute".into()];
+        catalog.hello(hello, now).unwrap();
+        assert_eq!(catalog.live(now)[0].needs, vec!["compute".to_string()]);
+
+        // a need is a KIND, so a malformed one is refused like any other.
+        let mut bad = hello_from_build(build_identity());
+        bad.needs = vec!["Not A Kind".into()];
+        assert!(catalog.hello(bad, now).is_err());
     }
 }
