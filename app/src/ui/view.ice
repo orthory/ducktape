@@ -21,8 +21,8 @@ view
     chat_sidebar:
       col width=fill height=fill spacing=7.0
         row width=fill padding-left=7.0 padding-right=7.0 spacing=6.0 align=center
-          text "CHANNELS" width=fill size=11.0 font=medium @text-muted
-          text len(channels) size=11.0 @text-muted
+          text "CHANNELS" width=fill size=12.0 font=medium @text-muted
+          text len(channels) size=12.0 @text-muted
           if !channel_create_open
             button label="New channel" disabled=(loading || mutation_phase != "idle" || !connected) width=28.0 height=28.0 padding=0.0 -> toggle_channel_create
               container width=fill height=fill align-x=center align-y=center
@@ -59,7 +59,7 @@ view
                   text "☑" size=13.0 @text-primary
                 if !channel_create_members_only
                   text "☐" size=13.0 @text-muted
-                text "Members-only posting" width=fill size=11.0 wrapping=none @text-muted
+                text "Members-only posting" width=fill size=12.0 wrapping=none @text-muted
               active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
               hovered bg=fg/5 text=fg
               pressed bg=fg/8
@@ -70,8 +70,8 @@ view
     pages_sidebar:
       col width=fill height=fill spacing=7.0
         row width=fill padding-left=7.0 padding-right=7.0 spacing=6.0 align=center
-          text "PAGES" width=fill size=11.0 font=medium @text-muted
-          text len(pages) size=11.0 @text-muted
+          text "PAGES" width=fill size=12.0 font=medium @text-muted
+          text len(pages) size=12.0 @text-muted
           if !page_create_open
             button label="New page" disabled=(loading || mutation_phase != "idle" || !connected) width=28.0 height=28.0 padding=0.0 -> toggle_page_create
               container width=fill height=fill align-x=center align-y=center
@@ -112,7 +112,7 @@ view
             container width=fill padding=8.0 bg=elevated border=fg/18 border-w=1.0 r=12.0 shadow=black/12 shadow-y=2.0 shadow-blur=12.0
               row width=fill spacing=8.0 align=center
                 container width=20.0 height=20.0 align-x=center align-y=center bg=fg/12 border=fg/20 border-w=1.0 r=10.0
-                  text "!" size=11.0 font=medium @text-fg
+                  text "!" size=12.0 font=medium @text-fg
                 text error width=fill size=13.0 @text-fg
                 button "Dismiss" height=26.0 padding=5.0 -> dismiss_error
                   active bg=transparent text=muted r=7.0
@@ -125,17 +125,17 @@ view
             if !empty(active_channel)
               col width=fill spacing=12.0
                 row width=fill height=32.0 spacing=9.0 align=center
-                  text "#" size=18.0 wrapping=none font=display @text-primary
-                  text active_channel_name size=16.0 wrapping=none font=display @text-fg
+                  text "#" size=17.0 wrapping=none font=display @text-primary
+                  text active_channel_name size=17.0 wrapping=none font=display @text-fg
                   if active_channel_archived
                     container padding=2.0 padding-left=7.0 padding-right=7.0 bg=fg/6 border=fg/13 border-w=1.0 r=6.0
-                      text "Archived" size=11.0 wrapping=none font=medium @text-muted
+                      text "Archived" size=12.0 wrapping=none font=medium @text-muted
                   if active_channel_members_only
                     container padding=2.0 padding-left=7.0 padding-right=7.0 bg=primary/14 border=primary/26 border-w=1.0 r=6.0
-                      text "Members only" size=11.0 wrapping=none font=medium @text-primary
+                      text "Members only" size=12.0 wrapping=none font=medium @text-primary
                   if active_channel_huddle_count > 0
                     container padding=2.0 padding-left=7.0 padding-right=7.0 bg=success/16 border=success/26 border-w=1.0 r=6.0
-                      text active_channel_huddle_count size=11.0 wrapping=none font=medium @text-success
+                      text active_channel_huddle_count size=12.0 wrapping=none font=medium @text-success
                   space width=fill
                   input "" #chat-search label="Search messages" <-> chat_search_draft hint="Search messages" disabled=(!connected || chat_searching) submit=search_chat_submit width=190.0 padding=6.2 text-size=13.0 line-height=1.2
                     active bg=fg/4 border=fg/11 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
@@ -170,7 +170,7 @@ view
             if connected && !empty(messages) && history_view
               container width=fill height=32.0 padding-left=10.0 padding-right=6.0 bg=primary/12 border=primary/26 border-w=1.0 r=9.0
                 row width=fill height=fill spacing=8.0 align=center
-                  text "Viewing history" width=fill size=11.0 wrapping=none font=medium @text-primary
+                  text "Viewing history" width=fill size=12.0 wrapping=none font=medium @text-primary
                   button "Jump to latest" height=24.0 padding=5.0 -> choose_channel(active_channel)
                     active bg=primary/16 text=fg border=primary/30 border-w=1.0 r=7.0
                     hovered bg=primary/24 text=fg
@@ -193,7 +193,7 @@ view
                               row width=fill spacing=8.0 align=center padding-top=8.0 padding-bottom=2.0
                                 container width=fill height=1.0 bg=primary/40
                                   text ""
-                                text "New messages" size=11.0 wrapping=none font=medium @text-primaryhi
+                                text "New messages" size=12.0 wrapping=none font=medium @text-primaryhi
                                 container width=fill height=1.0 bg=primary/40
                                   text ""
                             if message.show_author
@@ -211,7 +211,7 @@ view
                             input "" #message-action-focus label="Message action focus" <-> message_action_focus width=1.0 padding=0.0 text-size=1.0 line-height=1.0
                               active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                               focused bg=transparent border=transparent value=transparent border-w=0.0
-                            container width=190.0 padding=4.0 bg=popover border=fg/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                            container width=190.0 padding=4.0 style=raised_style()
                               col width=fill spacing=1.0
                                 button "React" label="Manage reactions" disabled=active_channel_archived width=fill height=28.0 padding=6.0 -> open_message_reactions(selected_message_seq, message_edit_draft, selected_message_rev)
                                   active bg=transparent text=muted r=6.0
@@ -238,7 +238,7 @@ view
                             input "" #message-reaction-focus label="Message reaction focus" <-> message_action_focus width=1.0 padding=0.0 text-size=1.0 line-height=1.0
                               active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                               focused bg=transparent border=transparent value=transparent border-w=0.0
-                            container padding=3.0 bg=popover border=fg/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                            container padding=3.0 style=raised_style()
                               row spacing=2.0 align=center
                                 button "+ 👍" label="Add thumbs up reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_submit("👍")
                                   active bg=transparent text=fg r=6.0
@@ -269,7 +269,7 @@ view
                                     for reaction in message.reactions
                                       if reaction.reacted_by_me
                                         button label="Remove my reaction" description=reaction.emoji disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> remove_reaction_submit(reaction.emoji)
-                                          text reaction.emoji size=11.0 @text-fg
+                                          text reaction.emoji size=12.0 @text-fg
                                           active bg=fg/7 text=fg r=6.0
                                           hovered bg=fg/12
                                           pressed bg=fg/17
@@ -278,7 +278,7 @@ view
                                   hovered bg=fg/10 text=fg
                                   pressed bg=fg/15
                         if message_action == "editing"
-                          container width=fill max-width=520.0 padding=3.0 bg=popover border=fg/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                          container width=fill max-width=520.0 padding=3.0 style=raised_style()
                             row width=fill spacing=4.0 align=center
                               input "" #message-edit label="Edit message" <-> message_edit_draft hint="Edit message" disabled=(mutation_phase != "idle") submit=edit_message_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
                                 active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
@@ -300,9 +300,9 @@ view
                             input "" #message-delete-focus label="Message delete focus" <-> message_action_focus width=1.0 padding=0.0 text-size=1.0 line-height=1.0
                               active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                               focused bg=transparent border=transparent value=transparent border-w=0.0
-                            container padding=3.0 bg=popover border=fg/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                            container padding=3.0 style=raised_style()
                               row spacing=5.0 align=center
-                                text "Delete this message?" size=11.0 @text-muted
+                                text "Delete this message?" size=12.0 @text-muted
                                 button "Delete" disabled=(mutation_phase != "idle") height=26.0 padding=5.0 -> delete_message_submit
                                   active bg=fg/12 text=fg r=6.0
                                   hovered bg=fg/17
@@ -324,7 +324,7 @@ view
                   active bg=transparent text=muted r=7.0
                   hovered bg=fg/10 text=fg
                   pressed bg=fg/15
-            container width=fill padding=8.0 bg=surface border=fg/13 border-w=1.0 r=13.0 shadow=black/24 shadow-y=3.0 shadow-blur=18.0
+            container width=fill padding=8.0 style=raised_style()
               flex width=fill gap=8.0 align-items=end
                 editor #message <-> message_editor placeholder="Message the channel…" disabled=(loading || !connected || empty(active_channel) || active_channel_archived) min-height=44.0 max-height=150.0 size=14.0 line-height=1.3 padding=6.6 wrapping=word key-binding=composer_keys() -> send_message_submit
                   active bg=transparent border=transparent value=fg placeholder=muted selection=primary/40 border-w=0.0 r=9.0
@@ -342,7 +342,7 @@ view
             container width=300.0 height=fill padding=12.0 bg=surface
               col width=fill height=fill spacing=8.0
                 row width=fill height=28.0 spacing=6.0 align=center
-                  text "Channel details" width=fill size=13.0 font=medium @text-fg
+                  text "Channel details" width=fill size=15.0 font=medium @text-fg
                   button label="Close channel details" width=28.0 height=28.0 padding=0.0 -> toggle_channel_settings
                     container width=fill height=fill align-x=center align-y=center
                       text "×" size=14.0
@@ -382,9 +382,9 @@ view
                       hovered bg=fg/10 text=fg
                       pressed bg=fg/15
                   space width=fill
-                  text len(channel_members) size=11.0 @text-muted
+                  text len(channel_members) size=12.0 @text-muted
                 row width=fill spacing=5.0 align=center
-                  input "" #member-key label="Member public key" <-> member_key_draft hint="64-character member key" disabled=(mutation_phase != "idle") submit=add_channel_member_submit width=fill padding=7.4 text-size=11.0 line-height=1.2 font=mono
+                  input "" #member-key label="Member public key" <-> member_key_draft hint="64-character member key" disabled=(mutation_phase != "idle") submit=add_channel_member_submit width=fill padding=7.4 text-size=12.0 line-height=1.2 font=mono
                     active bg=transparent border=fg/10 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                     hovered bg=fg/4 border=fg/14
                     focused bg=fg/7 border=fg/12
@@ -408,10 +408,10 @@ view
                     col width=fill height=fill spacing=8.0
                       row width=fill height=28.0 spacing=6.0 align=center
                         if thread_target_seq <= 0
-                          text "Thread" width=fill size=13.0 font=medium @text-fg
+                          text "Thread" width=fill size=15.0 font=medium @text-fg
                         if thread_target_seq > 0
-                          text "Thread result" width=fill size=13.0 font=medium @text-fg
-                        text len(thread_messages) size=11.0 @text-muted
+                          text "Thread result" width=fill size=15.0 font=medium @text-fg
+                        text len(thread_messages) size=12.0 @text-muted
                         button label="Close thread" disabled=(mutation_phase != "idle") width=28.0 height=28.0 padding=0.0 -> close_thread
                           container width=fill height=fill align-x=center align-y=center
                             text "×" size=14.0
@@ -431,7 +431,7 @@ view
                               pressed bg=selection
                       if !empty(failed_reply_draft)
                         row width=fill spacing=6.0 align=center
-                          text "Unsent reply" width=fill size=11.0 @text-muted
+                          text "Unsent reply" width=fill size=12.0 @text-muted
                           button "Restore" disabled=(!empty(trim(editor_text(reply_editor)))) height=26.0 padding=5.0 -> restore_failed_reply
                             active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
                             hovered bg=fg/14
@@ -463,7 +463,7 @@ view
                             input "" #thread-action-focus label="Thread action focus" <-> message_action_focus width=1.0 padding=0.0 text-size=1.0 line-height=1.0
                               active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                               focused bg=transparent border=transparent value=transparent border-w=0.0
-                            container width=190.0 padding=4.0 bg=popover border=fg/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                            container width=190.0 padding=4.0 style=raised_style()
                               col width=fill spacing=1.0
                                 button "React" label="Manage reactions" disabled=active_channel_archived width=fill height=28.0 padding=6.0 -> open_thread_message_reactions(thread_selected_seq, thread_edit_draft, thread_selected_rev)
                                   active bg=transparent text=muted r=6.0
@@ -486,7 +486,7 @@ view
                             input "" #thread-reaction-focus label="Thread reaction focus" <-> message_action_focus width=1.0 padding=0.0 text-size=1.0 line-height=1.0
                               active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                               focused bg=transparent border=transparent value=transparent border-w=0.0
-                            container padding=3.0 bg=popover border=fg/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                            container padding=3.0 style=raised_style()
                               row spacing=2.0 align=center
                                 button "+ 👍" label="Add thumbs up reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_at(thread_selected_seq, "👍")
                                   active bg=transparent text=fg r=6.0
@@ -517,7 +517,7 @@ view
                                     for reaction in thread_message.reactions
                                       if reaction.reacted_by_me
                                         button label="Remove my reaction" description=reaction.emoji disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> remove_reaction_at(thread_selected_seq, reaction.emoji)
-                                          text reaction.emoji size=11.0 @text-fg
+                                          text reaction.emoji size=12.0 @text-fg
                                           active bg=fg/7 text=fg r=6.0
                                           hovered bg=fg/12
                                           pressed bg=fg/17
@@ -526,7 +526,7 @@ view
                                   hovered bg=fg/10 text=fg
                                   pressed bg=fg/15
                         if thread_message_action == "editing"
-                          container width=fill max-width=520.0 padding=3.0 bg=popover border=fg/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                          container width=fill max-width=520.0 padding=3.0 style=raised_style()
                             row width=fill spacing=4.0 align=center
                               input "" #thread-edit label="Edit message" <-> thread_edit_draft hint="Edit message" disabled=(mutation_phase != "idle") submit=edit_thread_message_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
                                 active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
@@ -548,9 +548,9 @@ view
                             input "" #thread-delete-focus label="Thread delete focus" <-> message_action_focus width=1.0 padding=0.0 text-size=1.0 line-height=1.0
                               active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                               focused bg=transparent border=transparent value=transparent border-w=0.0
-                            container padding=3.0 bg=popover border=fg/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                            container padding=3.0 style=raised_style()
                               row spacing=5.0 align=center
-                                text "Delete this message?" size=11.0 @text-muted
+                                text "Delete this message?" size=12.0 @text-muted
                                 button "Delete" disabled=(mutation_phase != "idle") height=26.0 padding=5.0 -> delete_thread_message_submit
                                   active bg=fg/12 text=fg r=6.0
                                   hovered bg=fg/17
@@ -594,7 +594,7 @@ view
                   col width=fill spacing=8.0
                     row width=fill height=28.0 spacing=5.0 align=center
                       if !empty(active_page_parent)
-                        text active_page_parent width=fill size=11.0 wrapping=none @text-muted
+                        text active_page_parent width=fill size=12.0 wrapping=none @text-muted
                       if empty(active_page_parent)
                         space width=fill
                       input "" #page-search label="Search pages" <-> page_search_draft hint="Search pages…" disabled=(!connected || page_searching) submit=search_pages_submit width=190.0 padding=6.2 text-size=13.0 line-height=1.2
@@ -632,7 +632,7 @@ view
                     if !empty(orphaned_block_drafts) || !empty(orphaned_comment_drafts)
                       container width=fill padding=7.0 bg=elevated border=fg/9 border-w=1.0 r=9.0
                         col width=fill spacing=5.0
-                          text "Recovered drafts" size=11.0 font=medium @text-fg
+                          text "Recovered drafts" size=12.0 font=medium @text-fg
                           for recovered_block in orphaned_block_drafts
                             row width=fill spacing=5.0 align=center
                               text recovered_block width=fill size=13.0 @text-muted
@@ -749,11 +749,11 @@ view
                 container width=300.0 height=380.0 padding=8.0 bg=popover border=fg/15 border-w=1.0 r=11.0 shadow=black/24 shadow-y=4.0 shadow-blur=16.0
                   col width=fill height=fill spacing=6.0
                     row width=fill spacing=6.0 align=center
-                      text "Comments" width=fill size=13.0 font=medium @text-fg
+                      text "Comments" width=fill size=15.0 font=medium @text-fg
                       if block_comment_thread_total > 0
-                        text block_comment_thread_total size=11.0 @text-muted
+                        text block_comment_thread_total size=12.0 @text-muted
                       if block_comment_threads_loading || block_thread_comments_loading
-                        text "Loading…" size=11.0 @text-muted
+                        text "Loading…" size=12.0 @text-muted
                       button "×" label="Close comments" disabled=(mutation_phase != "idle") width=24.0 height=24.0 padding=4.0 -> close_block_comments
                         active bg=transparent text=muted r=6.0
                         hovered bg=fg/10 text=fg
@@ -762,7 +762,7 @@ view
                       scroll direction=vertical width=fill height=fill
                         col width=fill spacing=1.0
                           if empty(block_comment_threads) && !block_comment_threads_loading
-                            text "No comments yet" width=fill size=11.0 align-x=center @text-muted
+                            text "No comments yet" width=fill size=12.0 align-x=center @text-muted
                           for comment_thread in block_comment_threads
                             PageCommentThreadButton thread=comment_thread
                           if block_comment_threads_has_more
@@ -811,7 +811,7 @@ view
             pressed bg=fg/14
           text fs_path width=fill size=13.0 wrapping=none font=mono @text-fg
           if fs_loading
-            text "Loading…" size=11.0 font=mono @text-muted
+            text "Loading…" size=12.0 @text-muted
           input "" #fs-new label="New entry name" <-> fs_new_name change=fs_new_name_changed hint="new name…" disabled=fs_loading width=140.0 padding=5.0 text-size=13.0 line-height=1.2
             active bg=surface border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
             hovered bg=elevated border=fg/21
@@ -844,8 +844,8 @@ view
                         if entry.kind == "dir"
                           button label="Open directory" width=fill padding=6.0 -> fs_open_dir(entry.path)
                             row width=fill height=fill spacing=8.0 align=center
-                              text "▸" width=14.0 size=11.0 align-x=center @text-muted
-                              text entry.name width=fill size=13.0 wrapping=none font=medium @text-fg
+                              text "▸" width=14.0 size=12.0 align-x=center @text-muted
+                              text entry.name width=fill size=14.0 wrapping=none font=medium @text-fg
                             active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
                             hovered bg=primary/10 text=fg
                             pressed bg=primary/16
@@ -853,9 +853,9 @@ view
                           row width=fill spacing=2.0 align=center
                             button label="Preview file" width=fill padding=6.0 -> fs_open_file(entry.path)
                               row width=fill height=fill spacing=8.0 align=center
-                                text "·" width=14.0 size=11.0 align-x=center @text-muted
+                                text "·" width=14.0 size=12.0 align-x=center @text-muted
                                 text entry.name width=fill size=13.0 wrapping=none @text-fg
-                                text entry.size size=11.0 wrapping=none font=mono @text-muted
+                                text entry.size size=12.0 wrapping=none font=mono @text-muted
                               active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
                               hovered bg=primary/10 text=fg
                               pressed bg=primary/16
@@ -875,11 +875,11 @@ view
                 scroll direction=vertical width=fill height=fill
                   col width=fill spacing=4.0
                     container width=fill padding-left=4.0
-                      text "SNAPSHOTS" size=11.0 font=medium @text-muted
+                      text "SNAPSHOTS" size=12.0 font=medium @text-muted
                     if !empty(fs_diff_from)
                       col width=fill spacing=3.0
                         row width=fill spacing=8.0 align=center
-                          text "Changes vs head" width=fill size=11.0 font=medium @text-muted
+                          text "Changes vs head" width=fill size=12.0 font=medium @text-muted
                           button "Back" height=22.0 padding=4.0 -> fs_close_diff
                             active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=6.0
                             hovered bg=fg/10 text=fg
@@ -888,7 +888,7 @@ view
                           text "No differences." size=13.0 @text-muted
                         for entry in fs_diff
                           row width=fill spacing=8.0 align=center
-                            text entry.kind width=64.0 size=11.0 wrapping=none font=mono @text-primary
+                            text entry.kind width=64.0 size=12.0 wrapping=none font=mono @text-primary
                             text entry.path width=fill size=13.0 wrapping=none font=mono @text-fg
                     if empty(fs_diff_from)
                       col width=fill spacing=4.0
@@ -896,10 +896,10 @@ view
                           container width=fill padding=7.0 bg=popover border=fg/10 border-w=1.0 r=8.0
                             col width=fill spacing=2.0
                               row width=fill spacing=8.0 align=center
-                                text snapshot.short_id size=11.0 wrapping=none font=mono @text-primary
-                                text snapshot.height size=11.0 wrapping=none font=mono @text-muted
+                                text snapshot.short_id size=12.0 wrapping=none font=mono @text-primary
+                                text snapshot.height size=12.0 wrapping=none font=mono @text-muted
                                 space width=fill
-                                text snapshot.author size=11.0 wrapping=none font=mono @text-muted
+                                text snapshot.author size=12.0 wrapping=none font=mono @text-muted
                                 button "Diff" height=20.0 padding=3.0 -> fs_show_diff(snapshot.id)
                                   active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=6.0
                                   hovered bg=fg/10 text=fg
@@ -911,9 +911,9 @@ view
               if !fs_history_open && !empty(fs_preview_path)
                 col width=fill height=fill spacing=6.0
                   row width=fill spacing=8.0 align=center
-                    text fs_preview_path width=fill size=11.0 wrapping=none font=mono @text-muted
+                    text fs_preview_path width=fill size=12.0 wrapping=none font=mono @text-muted
                     if fs_preview_truncated
-                      text "first 64 KiB" size=11.0 wrapping=none font=mono @text-muted
+                      text "first 64 KiB" size=12.0 wrapping=none @text-muted
                     if !fs_preview_binary && !fs_editing && !fs_preview_truncated
                       button "Edit" height=22.0 padding=4.0 -> fs_begin_edit
                         active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=6.0
@@ -945,12 +945,12 @@ view
     members:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=10.0 align=center
-          text "Network members" size=14.0 font=display @text-fg
+          text "Network members" size=17.0 font=display @text-fg
           space width=fill
           text members_validators size=13.0 wrapping=none font=mono @text-primary
-          text "validators" size=11.0 wrapping=none @text-muted
+          text "validators" size=12.0 wrapping=none @text-muted
           text members_residents size=13.0 wrapping=none font=mono @text-primary
-          text "residents" size=11.0 wrapping=none @text-muted
+          text "residents" size=12.0 wrapping=none @text-muted
         if empty(members_rows)
           EmptyState title="No members yet" detail="Validators and residents appear as they join."
         if !empty(members_rows)
@@ -960,16 +960,16 @@ view
                 container width=fill padding=8.0 bg=surface border=fg/8 border-w=1.0 r=9.0
                   row width=fill spacing=10.0 align=center
                     text member.label size=13.0 wrapping=none font=mono @text-fg
-                    text member.role size=11.0 wrapping=none font=mono @text-primary
+                    AccentChip label=member.role
                     if member.is_this_node
                       container height=18.0 padding-left=6.0 padding-right=6.0 align-y=center bg=primary/14 border=primary/30 border-w=1.0 r=9.0
-                        text "this node" size=11.0 wrapping=none @text-primary
+                        text "this node" size=12.0 wrapping=none @text-primary
                     space width=fill
-                    text member.key size=11.0 wrapping=none font=mono @text-muted
+                    text member.key size=12.0 wrapping=none font=mono @text-muted
     agents:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center
-          text "Agents" size=14.0 font=display @text-fg
+          text "Agents" size=17.0 font=display @text-fg
           space width=fill
         if empty(agents_rows)
           EmptyState title="No agents registered" detail="Registered agents appear here with their capability and grants."
@@ -977,23 +977,23 @@ view
           scroll direction=vertical width=fill height=fill
             col width=fill spacing=4.0
               for agent in agents_rows
-                container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                container width=fill padding=11.0 style=card_style()
                   col width=fill spacing=3.0
                     row width=fill spacing=8.0 align=center
-                      text agent.name size=13.0 wrapping=none font=medium @text-fg
-                      text agent.id size=11.0 wrapping=none font=mono @text-muted
+                      text agent.name size=14.0 wrapping=none font=medium @text-fg
+                      text agent.id size=12.0 wrapping=none font=mono @text-muted
                       space width=fill
-                      text agent.status size=11.0 wrapping=none font=mono @text-primary
+                      AccentChip label=agent.status
                     row width=fill spacing=8.0 align=center
-                      text agent.capability size=11.0 wrapping=none font=mono @text-muted
-                      text "·" size=11.0 wrapping=none @text-muted
-                      text agent.owner size=11.0 wrapping=none font=mono @text-muted
+                      text agent.capability size=12.0 wrapping=none font=mono @text-muted
+                      text "·" size=12.0 wrapping=none @text-muted
+                      text agent.owner size=12.0 wrapping=none font=mono @text-muted
                     if !empty(agent.actions)
-                      text agent.actions size=11.0 font=mono @text-muted
+                      text agent.actions size=12.0 font=mono @text-muted
     forge:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center
-          text "Forge" size=14.0 font=display @text-fg
+          text "Forge" size=17.0 font=display @text-fg
           if !empty(forge_repo)
             text forge_repo size=13.0 wrapping=none font=mono @text-primary
           space width=fill
@@ -1005,8 +1005,8 @@ view
               for repo in forge_repos
                 button label="Open repo" width=fill padding=8.0 -> forge_open_repo(repo.name)
                   row width=fill height=fill spacing=8.0 align=center
-                    text repo.name width=fill size=13.0 wrapping=none font=medium @text-fg
-                    text repo.head size=11.0 wrapping=none font=mono @text-muted
+                    text repo.name width=fill size=14.0 wrapping=none font=medium @text-fg
+                    text repo.head size=12.0 wrapping=none font=mono @text-muted
                   active bg=surface text=fg border=fg/8 border-w=1.0 r=9.0
                   hovered bg=primary/10 text=fg
                   pressed bg=primary/16
@@ -1017,7 +1017,7 @@ view
                 row height=fill spacing=4.0 align=center
                   for branch in forge_branches
                     container height=20.0 padding-left=7.0 padding-right=7.0 align-y=center bg=surface border=fg/10 border-w=1.0 r=10.0
-                      text branch size=11.0 wrapping=none font=mono @text-muted
+                      text branch size=12.0 wrapping=none font=mono @text-muted
             if empty(forge_items)
               EmptyState title="No issues or PRs" detail="The tracker is empty for this repo."
             if !empty(forge_items)
@@ -1026,10 +1026,10 @@ view
                   for item in forge_items
                     button label="Open item" width=fill padding=7.0 -> forge_open_item(item.number)
                       row width=fill height=fill spacing=8.0 align=center
-                        text item.number size=11.0 wrapping=none font=mono @text-muted
-                        text item.kind size=11.0 wrapping=none font=mono @text-primary
-                        text item.title width=fill size=13.0 wrapping=none @text-fg
-                        text item.state size=11.0 wrapping=none font=mono @text-muted
+                        text item.number size=12.0 wrapping=none font=mono @text-muted
+                        AccentChip label=item.kind
+                        text item.title width=fill size=14.0 wrapping=none @text-fg
+                        Chip label=item.state
                       active bg=surface text=fg border=fg/8 border-w=1.0 r=8.0
                       hovered bg=primary/10 text=fg
                       pressed bg=primary/16
@@ -1040,38 +1040,38 @@ view
                 active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=7.0
                 hovered bg=fg/10 text=fg
                 pressed bg=fg/14
-              text forge_item_title width=fill size=13.0 wrapping=none font=medium @text-fg
-              text forge_item_kind size=11.0 wrapping=none font=mono @text-primary
-              text forge_item_state size=11.0 wrapping=none font=mono @text-muted
+              text forge_item_title width=fill size=15.0 wrapping=none font=medium @text-fg
+              AccentChip label=forge_item_kind
+              Chip label=forge_item_state
             row width=fill spacing=8.0 align=center
               if !empty(forge_item_author)
-                text forge_item_author size=11.0 wrapping=none @text-muted
+                text forge_item_author size=12.0 wrapping=none @text-muted
               if !empty(forge_item_branches)
-                text forge_item_branches size=11.0 wrapping=none font=mono @text-muted
+                text forge_item_branches size=12.0 wrapping=none font=mono @text-muted
               if forge_item_files_changed > 0
-                text forge_stats(forge_item_files_changed, forge_item_additions, forge_item_deletions) size=11.0 wrapping=none font=mono @text-muted
+                text forge_stats(forge_item_files_changed, forge_item_additions, forge_item_deletions) size=12.0 wrapping=none font=mono @text-muted
               space width=fill
             scroll direction=vertical width=fill height=fill
               col width=fill spacing=8.0
                 if !empty(forge_item_body)
-                  container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
-                    text forge_item_body size=13.0 @text-fg
+                  container width=fill padding=11.0 style=card_style()
+                    text forge_item_body size=14.0 @text-fg
                 if !empty(forge_item_diff)
-                  container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                  container width=fill padding=11.0 style=card_style()
                     col width=fill spacing=5.0
                       if forge_item_diff_truncated
-                        text "Patch truncated — the statistics cover the full diff." size=11.0 @text-muted
-                      text forge_item_diff size=11.0 font=mono @text-fg
+                        text "Patch truncated — the statistics cover the full diff." size=12.0 @text-muted
+                      text forge_item_diff size=13.0 font=mono @text-fg
                 if forge_item_kind == "pr"
-                  container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                  container width=fill padding=11.0 style=card_style()
                     col width=fill spacing=6.0
                       row width=fill spacing=6.0 align=center
-                        text "Merge" width=fill size=13.0 font=medium @text-fg
-                        text forge_item_approvals size=11.0 wrapping=none font=mono @text-primary
-                        text "approvals" size=11.0 wrapping=none @text-muted
-                        text "·" size=11.0 wrapping=none @text-muted
-                        text forge_item_change_requests size=11.0 wrapping=none font=mono @text-muted
-                        text "change requests" size=11.0 wrapping=none @text-muted
+                        text "Merge" width=fill size=15.0 font=medium @text-fg
+                        text forge_item_approvals size=12.0 wrapping=none font=mono @text-primary
+                        text "approvals" size=12.0 wrapping=none @text-muted
+                        text "·" size=12.0 wrapping=none @text-muted
+                        text forge_item_change_requests size=12.0 wrapping=none font=mono @text-muted
+                        text "change requests" size=12.0 wrapping=none @text-muted
                       if forge_item_state == "merged"
                         text forge_merge_note(forge_item_merge_oid, forge_item_branches) size=13.0 font=mono @text-primary
                       if forge_item_state == "closed"
@@ -1079,9 +1079,9 @@ view
                       if forge_item_state == "open"
                         if !empty(forge_merge_conflicts)
                           col width=fill spacing=3.0
-                            text "Merge conflicts — resolve on the branch and push again:" size=11.0 @text-muted
+                            text "Merge conflicts — resolve on the branch and push again:" size=12.0 @text-muted
                             for conflict_path in forge_merge_conflicts
-                              text conflict_path size=11.0 font=mono @text-fg
+                              text conflict_path size=12.0 font=mono @text-fg
                         row width=fill spacing=8.0 align=center
                           if !forge_merge_busy
                             button "Merge pull request" disabled=(!connected || empty(forge_item_source_oid)) height=28.0 padding=6.0 -> forge_merge_submit
@@ -1093,46 +1093,46 @@ view
                             button "Merging…" disabled=true height=28.0 padding=6.0 -> forge_merge_submit
                               active bg=fg/8 text=muted border=fg/10 border-w=1.0 r=9.0
                               disabled bg=fg/8 text=muted
-                          text "Approvals are advisory — merging is never gated." size=11.0 wrapping=none @text-muted
+                          text "Approvals are advisory — merging is never gated." size=12.0 wrapping=none @text-muted
                 if forge_item_kind == "pr"
-                  container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                  container width=fill padding=11.0 style=card_style()
                     col width=fill spacing=6.0
-                      text "Reviews" size=13.0 font=medium @text-fg
+                      text "Reviews" size=15.0 font=medium @text-fg
                       if empty(forge_item_reviews)
                         text "No reviews yet." size=13.0 @text-muted
                       for review in forge_item_reviews
                         container width=fill padding=8.0 bg=elevated border=fg/8 border-w=1.0 r=8.0
                           col width=fill spacing=4.0
                             row width=fill spacing=7.0 align=center
-                              text review.author_name size=13.0 wrapping=none font=medium @text-fg
+                              text review.author_name size=14.0 wrapping=none font=medium @text-fg
                               if review.verdict == "approve"
-                                text verdict_label(review.verdict) size=11.0 wrapping=none font=mono @text-primary
+                                text verdict_label(review.verdict) size=12.0 wrapping=none font=medium @text-primary
                               if review.verdict != "approve"
-                                text verdict_label(review.verdict) size=11.0 wrapping=none font=mono @text-muted
-                              text review.commit size=11.0 wrapping=none font=mono @text-muted
+                                text verdict_label(review.verdict) size=12.0 wrapping=none font=medium @text-muted
+                              text review.commit size=12.0 wrapping=none font=mono @text-muted
                               if review.outdated
-                                text "outdated" size=11.0 wrapping=none font=mono @text-muted
+                                text "outdated" size=12.0 wrapping=none @text-muted
                               space width=fill
                             if !empty(review.body)
-                              text review.body size=13.0 @text-fg
+                              text review.body size=14.0 @text-fg
                             for comment in review.comments
                               container width=fill padding=6.0 bg=surface border=fg/8 border-w=1.0 r=7.0
                                 col width=fill spacing=2.0
-                                  text comment.anchor size=11.0 font=mono @text-muted
-                                  text comment.body size=13.0 @text-fg
+                                  text comment.anchor size=12.0 font=mono @text-muted
+                                  text comment.body size=14.0 @text-fg
                       row width=fill spacing=6.0 align=center
                         button label="Pick comment verdict" height=24.0 padding=5.0 -> forge_review_pick("comment")
-                          text verdict_pick_label(forge_review_verdict, "comment", "Comment") size=11.0
+                          text verdict_pick_label(forge_review_verdict, "comment", "Comment") size=13.0
                           active bg=fg/6 text=fg border=fg/10 border-w=1.0 r=7.0
                           hovered bg=fg/10 text=fg
                           pressed bg=fg/14
                         button label="Pick approve verdict" height=24.0 padding=5.0 -> forge_review_pick("approve")
-                          text verdict_pick_label(forge_review_verdict, "approve", "Approve") size=11.0
+                          text verdict_pick_label(forge_review_verdict, "approve", "Approve") size=13.0
                           active bg=primary/14 text=fg border=primary/26 border-w=1.0 r=7.0
                           hovered bg=primary/22 text=fg
                           pressed bg=primary/30
                         button label="Pick request-changes verdict" height=24.0 padding=5.0 -> forge_review_pick("request_changes")
-                          text verdict_pick_label(forge_review_verdict, "request_changes", "Request changes") size=11.0
+                          text verdict_pick_label(forge_review_verdict, "request_changes", "Request changes") size=13.0
                           active bg=danger/10 text=fg border=danger/26 border-w=1.0 r=7.0
                           hovered bg=danger/18 text=fg
                           pressed bg=danger/24
@@ -1148,9 +1148,9 @@ view
                           hovered bg=primary/24 text=fg
                           pressed bg=primary/30
                           disabled bg=fg/8 text=muted
-                container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                container width=fill padding=11.0 style=card_style()
                   col width=fill spacing=6.0
-                    text "Discussion" size=13.0 font=medium @text-fg
+                    text "Discussion" size=15.0 font=medium @text-fg
                     if empty(forge_discussion)
                       text "No discussion yet." size=13.0 @text-muted
                     for message in forge_discussion
@@ -1160,7 +1160,7 @@ view
                         col width=fill spacing=2.0
                           row width=fill spacing=7.0 align=center
                             text message.author size=13.0 wrapping=none font=display @text-fg
-                            text message.meta size=11.0 wrapping=none @text-muted
+                            text message.meta size=12.0 wrapping=none @text-muted
                             space width=fill
                           MessageBody message=message
                     flex width=fill gap=8.0 align-items=end
@@ -1177,7 +1177,7 @@ view
     governance:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center
-          text "Governance" size=14.0 font=display @text-fg
+          text "Governance" size=17.0 font=display @text-fg
           space width=fill
         if empty(gov_rows)
           EmptyState title="No proposals" detail="Membership and share actions appear here as proposals."
@@ -1185,22 +1185,22 @@ view
           scroll direction=vertical width=fill height=fill
             col width=fill spacing=4.0
               for proposal in gov_rows
-                container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                container width=fill padding=11.0 style=card_style()
                   col width=fill spacing=4.0
                     row width=fill spacing=8.0 align=center
-                      text proposal.id size=13.0 wrapping=none font=medium @text-fg
-                      text proposal.action size=11.0 wrapping=none font=mono @text-primary
-                      text proposal.status size=11.0 wrapping=none font=mono @text-muted
+                      text proposal.id size=14.0 wrapping=none font=medium @text-fg
+                      AccentChip label=proposal.action
+                      Chip label=proposal.status
                       space width=fill
-                      text proposal.proposer size=11.0 wrapping=none font=mono @text-muted
+                      text proposal.proposer size=12.0 wrapping=none font=mono @text-muted
                     row width=fill spacing=8.0 align=center
-                      text proposal.approvals size=11.0 wrapping=none font=mono @text-primary
-                      text "for" size=11.0 wrapping=none @text-muted
-                      text proposal.rejections size=11.0 wrapping=none font=mono @text-muted
-                      text "against" size=11.0 wrapping=none @text-muted
-                      text "·" size=11.0 wrapping=none @text-muted
-                      text proposal.electorate size=11.0 wrapping=none font=mono @text-muted
-                      text "electorate" size=11.0 wrapping=none @text-muted
+                      text proposal.approvals size=12.0 wrapping=none font=mono @text-primary
+                      text "for" size=12.0 wrapping=none @text-muted
+                      text proposal.rejections size=12.0 wrapping=none font=mono @text-muted
+                      text "against" size=12.0 wrapping=none @text-muted
+                      text "·" size=12.0 wrapping=none @text-muted
+                      text proposal.electorate size=12.0 wrapping=none font=mono @text-muted
+                      text "electorate" size=12.0 wrapping=none @text-muted
                       space width=fill
                       if proposal.open
                         button "Approve" disabled=(!empty(gov_voting)) height=22.0 padding=4.0 -> gov_vote(proposal.id, true)
@@ -1220,7 +1220,7 @@ view
     node:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center
-          text "Node" size=14.0 font=display @text-fg
+          text "Node" size=17.0 font=display @text-fg
           space width=fill
           input "" #log-filter label="Filter logs" <-> node_log_filter change=node_log_filter_changed hint="filter…" width=180.0 padding=5.0 text-size=13.0 line-height=1.2
             active bg=surface border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
@@ -1229,7 +1229,7 @@ view
         if !empty(node_peers)
           container width=fill padding=8.0 bg=surface border=fg/8 border-w=1.0 r=9.0
             col width=fill spacing=3.0
-              text "PEERS" size=11.0 font=medium @text-muted
+              text "PEERS" size=12.0 font=medium @text-muted
               for peer in node_peers
                 row width=fill spacing=8.0 align=center
                   if peer.live
@@ -1239,7 +1239,7 @@ view
                     container width=7.0 height=7.0 bg=fg/30 r=3.5
                       text ""
                   text peer.key width=fill size=13.0 wrapping=none font=mono @text-fg
-                  text peer.height size=11.0 wrapping=none font=mono @text-muted
+                  text peer.height size=12.0 wrapping=none font=mono @text-muted
         container width=fill height=fill padding=8.0 bg=surface border=fg/8 border-w=1.0 r=9.0
           stack width=fill height=fill
             if empty(node_log_lines)
@@ -1248,7 +1248,7 @@ view
               scroll direction=vertical width=fill height=fill
                 col width=fill spacing=1.0
                   for line in filter_log_lines(node_log_lines, node_log_filter)
-                    text line.line size=11.0 font=mono @text-fg
+                    text line.line size=12.0 font=mono @text-fg
     settings:
       scroll direction=vertical width=fill height=fill
         container width=fill max-width=640.0 margin-x=auto padding=20.0
@@ -1256,7 +1256,7 @@ view
             text "Settings" size=15.0 font=display @text-fg
             container width=fill padding=10.0 bg=surface border=fg/8 border-w=1.0 r=10.0
               col width=fill spacing=6.0
-                text "ACCOUNT" size=11.0 font=medium @text-muted
+                text "ACCOUNT" size=12.0 font=medium @text-muted
                 if !account_bound
                   text "This node is not bound to an account yet." size=13.0 @text-muted
                 if account_bound
@@ -1264,7 +1264,7 @@ view
                     row width=fill spacing=8.0 align=center
                       text "Display name" width=120.0 size=13.0 @text-muted
                       if !empty(account_name)
-                        text account_name width=fill size=13.0 wrapping=none font=medium @text-fg
+                        text account_name width=fill size=14.0 wrapping=none font=medium @text-fg
                       if empty(account_name)
                         text "(unnamed)" width=fill size=13.0 wrapping=none @text-muted
                     row width=fill spacing=8.0 align=center
@@ -1281,14 +1281,14 @@ view
                     row width=fill spacing=8.0 align=center
                       text "Account" width=120.0 size=13.0 @text-muted
                       text account_id size=13.0 wrapping=none font=mono @text-muted
-                      text "·" size=11.0 wrapping=none @text-muted
+                      text "·" size=12.0 wrapping=none @text-muted
                       text account_members size=13.0 wrapping=none font=mono @text-muted
-                      text "keys" size=11.0 wrapping=none @text-muted
+                      text "keys" size=12.0 wrapping=none @text-muted
                       text account_nodes size=13.0 wrapping=none font=mono @text-muted
-                      text "nodes" size=11.0 wrapping=none @text-muted
+                      text "nodes" size=12.0 wrapping=none @text-muted
             container width=fill padding=10.0 bg=surface border=fg/8 border-w=1.0 r=10.0
               col width=fill spacing=6.0
-                text "CONNECTION" size=11.0 font=medium @text-muted
+                text "CONNECTION" size=12.0 font=medium @text-muted
                 row width=fill spacing=8.0 align=center
                   text "Endpoint" width=120.0 size=13.0 @text-muted
                   text settings_endpoint width=fill size=13.0 wrapping=none font=mono @text-fg
@@ -1298,19 +1298,19 @@ view
                 row width=fill spacing=8.0 align=center
                   text "Block height" width=120.0 size=13.0 @text-muted
                   text settings_height width=fill size=13.0 wrapping=none font=mono @text-fg
-                text "Change the endpoint from the sidebar's Connection panel." size=11.0 @text-muted
+                text "Change the endpoint from the sidebar's Connection panel." size=12.0 @text-muted
             container width=fill padding=10.0 bg=surface border=fg/8 border-w=1.0 r=10.0
               col width=fill spacing=6.0
-                text "IDENTITY" size=11.0 font=medium @text-muted
+                text "IDENTITY" size=12.0 font=medium @text-muted
                 row width=fill spacing=8.0 align=center
                   text "User key" width=120.0 size=13.0 @text-muted
                   text settings_key_state width=fill size=13.0 wrapping=none font=mono @text-primary
                 row width=fill spacing=8.0 align=center
                   text "Key path" width=120.0 size=13.0 @text-muted
-                  text settings_key_path width=fill size=11.0 wrapping=none font=mono @text-muted
+                  text settings_key_path width=fill size=12.0 wrapping=none font=mono @text-muted
             container width=fill padding=10.0 bg=surface border=fg/8 border-w=1.0 r=10.0
               col width=fill spacing=6.0
-                text "THIS DEVICE" size=11.0 font=medium @text-muted
+                text "THIS DEVICE" size=12.0 font=medium @text-muted
                 row width=fill spacing=8.0 align=center
                   text "Open page tabs" width=120.0 size=13.0 @text-muted
                   text settings_open_tabs size=13.0 wrapping=none font=mono @text-fg
@@ -1319,14 +1319,14 @@ view
                     active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=7.0
                     hovered bg=fg/10 text=fg
                     pressed bg=fg/14
-                text "Preferences persist per endpoint in app-prefs.json beside the user key." size=11.0 @text-muted
+                text "Preferences persist per endpoint in app-prefs.json beside the user key." size=12.0 @text-muted
     explorer:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center
-          text "Block explorer" size=14.0 font=display @text-fg
+          text "Block explorer" size=17.0 font=display @text-fg
           space width=fill
           if explorer_loading
-            text "Loading…" size=11.0 font=mono @text-muted
+            text "Loading…" size=12.0 @text-muted
           button "Refresh" disabled=explorer_loading height=26.0 padding=5.0 -> refresh_explorer
             active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=7.0
             hovered bg=fg/10 text=fg border=fg/14
@@ -1342,8 +1342,8 @@ view
                     button label="Inspect block" width=fill padding=6.0 -> select_explorer_block(block.height)
                       row width=fill height=fill spacing=8.0 align=center
                         text block.height size=13.0 wrapping=none font=mono @text-primary
-                        text block.hash width=fill size=11.0 wrapping=none font=mono @text-muted
-                        text block.op_count size=11.0 wrapping=none font=mono @text-muted
+                        text block.hash width=fill size=12.0 wrapping=none font=mono @text-muted
+                        text block.op_count size=12.0 wrapping=none font=mono @text-muted
                       active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
                       hovered bg=primary/10 text=fg
                       pressed bg=primary/16
@@ -1358,15 +1358,15 @@ view
                         container width=fill padding=8.0 bg=popover border=fg/10 border-w=1.0 r=9.0
                           col width=fill spacing=3.0
                             row width=fill spacing=8.0 align=center
-                              text op.target size=13.0 wrapping=none font=medium @text-fg
-                              text op.disposition size=11.0 wrapping=none font=mono @text-primary
+                              text op.target size=14.0 wrapping=none font=medium @text-fg
+                              AccentChip label=op.disposition
                               space width=fill
-                              text op.op_hash size=11.0 wrapping=none font=mono @text-muted
+                              text op.op_hash size=12.0 wrapping=none font=mono @text-muted
                             row width=fill spacing=8.0 align=center
-                              text "by" size=11.0 wrapping=none @text-muted
-                              text op.proposer size=11.0 wrapping=none font=mono @text-muted
+                              text "by" size=12.0 wrapping=none @text-muted
+                              text op.proposer size=12.0 wrapping=none font=mono @text-muted
                             if !empty(op.trace)
-                              text op.trace size=11.0 font=mono @text-muted
+                              text op.trace size=12.0 font=mono @text-muted
                             text op.payload size=13.0 @text-fg
     palette:
       stack width=fill height=fill
@@ -1379,31 +1379,31 @@ view
                   hovered bg=elevated border=fg/21
                   focused bg=elevated border=fg/45 border-w=1.0
                 if palette_searching
-                  text "Searching…" size=11.0 @text-muted
+                  text "Searching…" size=12.0 @text-muted
                 if !empty(palette_chat_hits) || !empty(palette_page_hits)
                   scroll direction=vertical width=fill height=380.0
                     col width=fill spacing=4.0
                       if !empty(palette_chat_hits)
                         container width=fill padding-left=4.0
-                          text "MESSAGES" size=11.0 font=medium @text-muted
+                          text "MESSAGES" size=12.0 font=medium @text-muted
                         col width=fill spacing=1.0
                           for hit in palette_chat_hits
                             button label="Open message" width=fill padding=6.0 -> open_chat_search_hit(hit.channel_id, hit.root_seq, hit.seq)
                               col width=fill spacing=1.0
                                 text hit.text size=13.0 wrapping=none @text-fg
-                                text hit.meta size=11.0 wrapping=none font=mono @text-muted
+                                text hit.meta size=12.0 wrapping=none @text-muted
                               active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                               hovered bg=primary/12 text=fg
                               pressed bg=primary/18
                       if !empty(palette_page_hits)
                         container width=fill padding-left=4.0
-                          text "PAGES" size=11.0 font=medium @text-muted
+                          text "PAGES" size=12.0 font=medium @text-muted
                         col width=fill spacing=1.0
                           for hit in palette_page_hits
                             button label="Open page" width=fill padding=6.0 -> open_page_search_hit(hit.page_id, hit.block_id)
                               col width=fill spacing=1.0
                                 text hit.text size=13.0 wrapping=none @text-fg
-                                text hit.kind size=11.0 wrapping=none font=mono @text-muted
+                                text hit.kind size=12.0 wrapping=none font=mono @text-muted
                               active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                               hovered bg=primary/12 text=fg
                               pressed bg=primary/18
@@ -1417,7 +1417,7 @@ view
           container width=fill height=fill align-x=end align-y=start padding-top=48.0 padding-right=120.0
             container width=360.0 padding=8.0 bg=popover border=fg/14 border-w=1.0 r=10.0 shadow=shadow shadow-y=6.0 shadow-blur=18.0
               col width=fill spacing=4.0
-                text "Notifications" size=13.0 font=medium @text-fg
+                text "Notifications" size=15.0 font=medium @text-fg
                 if empty(bell_items)
                   text "Nothing yet — mentions and deliveries land here." size=13.0 @text-muted
                 if !empty(bell_items)
@@ -1427,7 +1427,7 @@ view
                         container width=fill padding=7.0 bg=surface border=fg/8 border-w=1.0 r=8.0
                           col width=fill spacing=2.0
                             row width=fill spacing=8.0 align=center
-                              text item.kind size=11.0 wrapping=none font=mono @text-primary
+                              AccentChip label=item.kind
                               space width=fill
-                              text item.source size=11.0 wrapping=none font=mono @text-muted
+                              text item.source size=12.0 wrapping=none font=mono @text-muted
                             text item.body size=13.0 @text-fg

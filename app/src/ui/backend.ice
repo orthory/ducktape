@@ -45,6 +45,10 @@ extern crate::backend
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)
   HydrationError(generation:i64, message:str)
   container-style avatar_style(r:f64, g:f64, b:f64)
+  container-style card_style()
+  container-style raised_style()
+  container-style well_style()
+  container-style inset_style()
   editor-binding composer_keys() -> ComposerCmd
   connect(rpc:str) -> WorkspaceData ! AppError
   stream live_events(rpc:str) -> LiveUpdate

@@ -40,3 +40,20 @@ translucency.
 - Ice theme tokens are compile-time constants, so the app ships one palette;
   the design source's dark palette and the accent presets return with the
   module-UI runtime lane, where tokens become runtime values.
+
+## Design system (`crates/design`)
+
+Font identity, the type scale, and the depth recipes live in the `design`
+crate — the app's `.ice` sources consume them through `style=` externs, the
+shared `ice/kit.ice` components, and drift-guard tests that hold every
+`size=` / `family=` literal to the crate's exports. Swap a face or a scale
+step there, never inline in a view.
+
+- Faces: **Geist** (UI), **Geist Mono** (data — hashes, seqs, diffs, logs;
+  never a label), **Noto Sans KR** as the per-glyph CJK fallback. The files
+  are embedded from `crates/design/assets/fonts/` at build time.
+- Scale: 12 caption · 13 label · 14 body (the default text size) ·
+  15 emphasis · 17 title · 20 display, plus 34 for a page's own title.
+- Depth: `card` (paper + tight warm shadow), `raised` (floating paper),
+  `well`/`inset` (recessed steps) — opaque surfaces always, shadow never
+  translucency.

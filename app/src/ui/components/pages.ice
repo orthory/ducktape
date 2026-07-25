@@ -36,7 +36,7 @@ component PageTitleEditor(rpc:str, password:str, page_id:str, title:str, disable
         focused bg=fg/5 border=fg/9 border-w=1.0
         disabled value=muted
     if !empty(local_error)
-      text local_error size=11.0 @text-muted
+      text local_error size=12.0 @text-muted
 
 component PageButton(page:PageItem, selected:bool)
   col width=fill
@@ -44,10 +44,10 @@ component PageButton(page:PageItem, selected:bool)
       button label=page.title width=fill height=34.0 padding=7.0 -> choose_page(page.id)
         row width=fill height=fill spacing=9.0 align=center
           text "▤" width=18.0 size=13.0 align-x=center @text-fg
-          text page.prefix size=11.0 wrapping=none @text-muted
+          text page.prefix size=12.0 wrapping=none @text-muted
           text page.title width=fill size=13.0 wrapping=none font=medium @text-fg
           if page.child_count > 0
-            text page.child_count size=11.0 @text-muted
+            text page.child_count size=12.0 @text-muted
         active bg=fg/8 text=fg border=fg/11 border-w=1.0 r=8.0
         hovered bg=fg/11 text=fg border=fg/14
         pressed bg=fg/14 text=fg border=fg/16
@@ -55,10 +55,10 @@ component PageButton(page:PageItem, selected:bool)
       button label=page.title width=fill height=34.0 padding=7.0 -> choose_page(page.id)
         row width=fill height=fill spacing=9.0 align=center
           text "▤" width=18.0 size=13.0 align-x=center @text-muted
-          text page.prefix size=11.0 wrapping=none @text-muted
+          text page.prefix size=12.0 wrapping=none @text-muted
           text page.title width=fill size=13.0 wrapping=none @text-muted
           if page.child_count > 0
-            text page.child_count size=11.0 @text-muted
+            text page.child_count size=12.0 @text-muted
         active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
         hovered bg=fg/6 text=fg border=fg/8
         pressed bg=fg/10 text=fg border=fg/12
@@ -67,8 +67,8 @@ component PageSearchResult(hit:PageSearchHit)
   button label=hit.text width=fill padding=7.0 -> open_page_search_hit(hit.page_id, hit.block_id)
     col width=fill spacing=2.0
       row width=fill spacing=7.0 align=center
-        text hit.kind width=fill size=11.0 font=medium @text-muted
-        text hit.block_id size=11.0 wrapping=none @text-muted
+        text hit.kind width=fill size=12.0 font=medium @text-muted
+        text hit.block_id size=12.0 wrapping=none @text-muted
       text hit.text width=fill size=13.0 wrapping=word @text-fg
     active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
     hovered bg=fg/6 text=fg border=fg/8
@@ -78,7 +78,7 @@ component PageCommentThreadButton(thread:PageCommentThread)
   button label=thread.author description=thread.meta width=fill padding=6.0 -> open_block_comment_thread(thread.id)
     row width=fill spacing=7.0 align=center
       text thread.author width=fill size=13.0 wrapping=none font=medium @text-fg
-      text thread.meta size=11.0 wrapping=none @text-muted
+      text thread.meta size=12.0 wrapping=none @text-muted
       text "›" size=13.0 @text-muted
     active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
     hovered bg=fg/6 text=fg border=fg/8
@@ -89,7 +89,7 @@ component PageCommentCard(comment:PageComment)
     col width=fill spacing=3.0
       row width=fill spacing=7.0 align=center
         text comment.author width=fill size=13.0 wrapping=none font=medium @text-fg
-        text comment.meta size=11.0 wrapping=none @text-muted
+        text comment.meta size=12.0 wrapping=none @text-muted
       text comment.text width=fill size=13.0 wrapping=word @text-fg
 
 component BlockLine(block:PageBlock)
@@ -100,10 +100,10 @@ component BlockLine(block:PageBlock)
       "Bullet"
         text "•" width=16.0 size=13.0 align-x=center @text-muted
       "Number"
-        text "1." width=16.0 size=11.0 align-x=center @text-muted
+        text "1." width=16.0 size=12.0 align-x=center @text-muted
       "Todo"
         if block.checked
-          text "✓" width=16.0 size=11.0 align-x=center font=medium @text-fg
+          text "✓" width=16.0 size=12.0 align-x=center font=medium @text-fg
         if !block.checked
           text "○" width=16.0 size=13.0 align-x=center @text-muted
       "Toggle"
@@ -111,9 +111,9 @@ component BlockLine(block:PageBlock)
       "Quote"
         text "│" width=16.0 size=14.0 align-x=center @text-muted
       "Code"
-        text "{}" width=16.0 size=11.0 align-x=center font=mono @text-muted
+        text "{}" width=16.0 size=12.0 align-x=center font=mono @text-muted
       "Callout"
-        text "!" width=16.0 size=11.0 align-x=center font=medium @text-muted
+        text "!" width=16.0 size=12.0 align-x=center font=medium @text-muted
       _
         space width=0.0
     slot
@@ -137,7 +137,7 @@ component BlockContents(block:PageBlock)
           text block.text width=fill size=15.0 wrapping=word font=medium @text-fg
         "Code"
           container width=fill padding=7.0 bg=fg/7 border=fg/9 border-w=1.0 r=7.0
-            text block.text width=fill size=11.0 wrapping=word font=mono @text-fg
+            text block.text width=fill size=12.0 wrapping=word font=mono @text-fg
         "Divider"
           container width=fill height=1.0 bg=separator
             text ""
@@ -176,7 +176,7 @@ component BlockActionsMenu(block_id:str, kind:str, disabled:bool, delete_armed:b
   container width=172.0 padding=5.0 bg=popover border=fg/13 border-w=1.0 r=10.0 shadow=black/24 shadow-y=4.0 shadow-blur=14.0
     col width=fill spacing=3.0
       if kind != "Page"
-        pick editable_kinds some(kind) placeholder="Block type" width=fill menu-height=210.0 padding=6.0 text-size=11.0 line-height=1.2 -> selected_block_kind_changed _
+        pick editable_kinds some(kind) placeholder="Block type" width=fill menu-height=210.0 padding=6.0 text-size=12.0 line-height=1.2 -> selected_block_kind_changed _
           active text=fg placeholder=muted handle=muted bg=transparent border=transparent border-w=0.0 r=6.0
           hovered text=fg placeholder=muted handle=fg bg=fg/8 border=fg/10 border-w=1.0 r=6.0
           opened text=fg placeholder=muted handle=fg bg=fg/11 border=fg/13 border-w=1.0 r=6.0
@@ -237,7 +237,7 @@ component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)
     container width=fill align-x=end align-y=start padding-right=4.0
       container padding=2.0 bg=popover border=fg/12 border-w=1.0 r=8.0 shadow=black/14 shadow-y=2.0 shadow-blur=7.0
         row spacing=1.0 align=center
-          pick kinds some(kind) placeholder="Type" width=82.0 menu-height=210.0 padding=4.0 text-size=11.0 line-height=1.2 -> new_block_kind_changed _
+          pick kinds some(kind) placeholder="Type" width=82.0 menu-height=210.0 padding=4.0 text-size=12.0 line-height=1.2 -> new_block_kind_changed _
             active text=fg placeholder=muted handle=muted bg=transparent border=transparent border-w=0.0 r=6.0
             hovered text=fg placeholder=muted handle=fg bg=fg/8 border=fg/10 border-w=1.0 r=6.0
             opened text=fg placeholder=muted handle=fg bg=fg/11 border=fg/13 border-w=1.0 r=6.0
