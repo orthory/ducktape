@@ -1,9 +1,9 @@
-font ui family="Inter" weight=normal stretch=normal style=normal default=true
-font medium family="Inter" weight=medium stretch=normal style=normal
-font display family="Inter" weight=bold stretch=normal style=normal
-font italic family="Inter" weight=normal stretch=normal style=italic
-font strongitalic family="Inter" weight=bold stretch=normal style=italic
-font mono family=mono weight=normal stretch=normal style=normal
+font ui family="Geist" weight=normal stretch=normal style=normal default=true
+font medium family="Geist" weight=medium stretch=normal style=normal
+font display family="Geist" weight=bold stretch=normal style=normal
+font italic family="Geist" weight=normal stretch=normal style=italic
+font strongitalic family="Geist" weight=bold stretch=normal style=italic
+font mono family="Geist Mono" weight=normal stretch=normal style=normal
 
 theme
   bg #fcfcfc

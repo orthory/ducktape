@@ -37,6 +37,8 @@ pub use inbox::client::{
     BellDelta, BellItem, apply_bell_items as fold_bell_items,
 };
 pub use pages::client::PagesDelta;
+// the design system's depth recipes — the `.ice` `style=` externs.
+pub use design::{card_style, inset_style, raised_style, well_style};
 
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 const MAX_SIGNED_PAYLOAD_BYTES: usize = 23 * 1024;

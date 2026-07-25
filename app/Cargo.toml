@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 chat.workspace = true
+design.workspace = true
 ducktape-rpc.workspace = true
 forge.workspace = true
 # the client-computed merge lane: a bare mirror fetched over the node's

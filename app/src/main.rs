@@ -786,7 +786,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(!toolbar.contains("hovered || selected"));
         assert_eq!(toolbar.matches("width=26.0 height=26.0").count(), 4);
         assert!(components.contains(
-            "text message.author size=14.0 wrapping=none font=display @text-fg\n          text message.meta size=11.0 wrapping=none @text-muted\n          space width=fill"
+            "text message.author size=15.0 wrapping=none font=display @text-fg\n          text message.meta size=12.0 wrapping=none @text-muted\n          space width=fill"
         ));
         // Slack-style grouping: the colored avatar + author header only renders
         // for a run's first message; continuations keep the body aligned via a
@@ -802,7 +802,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(components.contains("for block in message.blocks"));
         assert!(components.contains("if block.kind == \"code\""));
         assert!(components.contains("flex width=fill wrap"));
-        assert!(toolbar.contains("bg=popover"));
+        // the hover toolbar floats on the design crate's raised paper recipe
+        // (opaque popover fill + warm shadow) instead of inline materials.
+        assert!(toolbar.contains("style=raised_style()"));
         for label in ["Open thread", "Manage reactions", "More message actions"] {
             assert!(toolbar.contains(&format!("label=\"{label}\"")));
         }
@@ -1252,11 +1254,11 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(!app.contains("\n    blur true"));
         assert!(app.contains("titlebar-transparent true"));
         assert!(app.contains("fullsize-content-view true"));
-        assert!(app.contains("font \"../../assets/InterVariable.ttf\""));
+        assert!(app.contains("font \"../../../crates/design/assets/fonts/Geist[wght].ttf\""));
         assert!(!ui.contains("white/"));
 
         let theme = include_str!("ui/theme.ice");
-        assert!(theme.contains("font ui family=\"Inter\" weight=normal"));
+        assert!(theme.contains("font ui family=\"Geist\" weight=normal"));
         for material in [
             "bg #fcfcfc",
             "surface #f5f5f5",
@@ -1331,9 +1333,77 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             assert!(line.contains("width="), "{line}");
             assert!(line.contains("height="), "{line}");
         }
-        for obsolete_size in ["size=10.0", "size=12.0", "text-size=12.0"] {
-            assert!(!view.contains(obsolete_size), "{obsolete_size}");
-            assert!(!components.contains(obsolete_size), "{obsolete_size}");
+    }
+
+    /// Every text size in every `.ice` source must be a step of the design
+    /// crate's type scale — the crate is the contract, this test is the
+    /// leash. A new size is a design-system change, made in `design`, never
+    /// an inline exception.
+    #[test]
+    fn ice_sources_hold_to_the_design_crate() {
+        let sources = [
+            ("view.ice", include_str!("ui/view.ice")),
+            ("shell.ice", include_str!("ui/components/shell.ice")),
+            ("chat.ice", include_str!("ui/components/chat.ice")),
+            ("pages.ice", include_str!("ui/components/pages.ice")),
+            ("kit.ice", include_str!("../../crates/design/ice/kit.ice")),
+        ];
+        for (name, source) in sources {
+            for line in source.lines() {
+                for token in line.split_whitespace() {
+                    let Some(value) = token
+                        .strip_prefix("size=")
+                        .or_else(|| token.strip_prefix("text-size="))
+                    else {
+                        continue;
+                    };
+                    let size: f64 = value.parse().unwrap_or_else(|_| {
+                        panic!("{name}: unparseable size literal {token:?} in {line:?}")
+                    });
+                    assert!(
+                        design::type_scale::ALL.contains(&size),
+                        "{name}: {size} is off the design scale — change design::type_scale, not the view: {line:?}"
+                    );
+                }
+            }
+        }
+
+        // the font identity: theme roles bind to the design crate's families,
+        // and the app embeds exactly the crate's font assets.
+        let theme = include_str!("ui/theme.ice");
+        assert!(theme.contains(&format!("family=\"{}\"", design::fonts::FAMILY_UI)));
+        assert!(theme.contains(&format!("family=\"{}\"", design::fonts::FAMILY_MONO)));
+        let app = include_str!("ui/app.ice");
+        for asset in design::fonts::ASSETS {
+            assert!(
+                app.contains(&format!("font \"../../../crates/design/{asset}\"")),
+                "app.ice must embed {asset}"
+            );
+        }
+        assert!(app.contains(&format!(
+            "default-text-size {}",
+            design::type_scale::BODY as i64
+        )));
+
+        // the palette leash: theme.ice literals mirror design::palette.
+        for (token, rgb) in [
+            ("bg", design::palette::BG),
+            ("surface", design::palette::SURFACE),
+            ("popover", design::palette::POPOVER),
+            ("sidebar", design::palette::SIDEBAR),
+            ("elevated", design::palette::ELEVATED),
+            ("fg", design::palette::FG),
+            ("muted", design::palette::MUTED),
+            ("primary", design::palette::PRIMARY),
+            ("primaryhi", design::palette::PRIMARY_HI),
+            ("danger", design::palette::DANGER),
+            ("success", design::palette::SUCCESS),
+            ("border", design::palette::BORDER),
+        ] {
+            assert!(
+                theme.contains(&format!("{token} #{rgb:06x}")),
+                "theme.ice {token} drifted from design::palette"
+            );
         }
     }
 
@@ -2280,7 +2350,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         ));
         assert!(
             view.contains(
-                "text \"New messages\" size=11.0 wrapping=none font=medium @text-primaryhi"
+                "text \"New messages\" size=12.0 wrapping=none font=medium @text-primaryhi"
             )
         );
 
