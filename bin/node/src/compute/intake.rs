@@ -77,6 +77,20 @@ pub(crate) struct WorkPump {
     /// the identity `/v1/submit` stamps on every op this pump sends.
     me: Vec<u8>,
     work: HashMap<AttemptKey, Entry>,
+    /// announcements this pump has already submitted an `Accept` for.
+    ///
+    /// SEPARATE from `work`, and that separation is load-bearing: `Accept`
+    /// keeps the announcement's `(saga_id, attempt)` and merely fills in the
+    /// assignee, so the attempt this node WINS arrives in the lease projection
+    /// under the exact same key. Sharing one latch would leave the winner's
+    /// entry settled-by-the-claim and the run would never execute — a silent
+    /// no-op, which is the worst possible shape for this bug.
+    claimed: HashSet<AttemptKey>,
+    /// whether the last lease read failed. Latched so an unreachable node says
+    /// so ONCE and again when it recovers: a silent return would make a node
+    /// that cannot be read look exactly like an idle one, which is the single
+    /// most misleading thing this pump could do.
+    unreadable: bool,
 }
 
 impl WorkPump {
@@ -86,6 +100,8 @@ impl WorkPump {
             control,
             me,
             work: HashMap::new(),
+            claimed: HashSet::new(),
+            unreadable: false,
         }
     }
 
@@ -95,12 +111,36 @@ impl WorkPump {
         self.work.len()
     }
 
-    /// one intake pass: read the committed projection, offer new assignments,
-    /// submit what is due.
+    /// one intake pass: read the committed projections, offer new work, submit
+    /// what is due.
+    ///
+    /// TWO lanes, deliberately independent. The LEASE lane executes work this
+    /// node holds; the CLAIM lane only bids for announcements nobody holds yet.
+    /// The saga's own projections are disjoint (an accepted announcement leaves
+    /// one and enters the other), so running both cannot double-execute.
     pub(crate) async fn tick(&mut self, node: &NodeLink) {
-        let Some(assigned) = assigned_pending(node, &self.me).await else {
+        self.tick_leases(node).await;
+        self.tick_claims(node).await;
+    }
+
+    /// the LEASE lane: work assigned to this node.
+    async fn tick_leases(&mut self, node: &NodeLink) {
+        let Some(assigned) = pending(node, &self.me, Lane::Assigned).await else {
+            if !self.unreadable {
+                self.unreadable = true;
+                tracing::warn!(
+                    target: "ducktape::saga",
+                    reason = "assigned_pending_unreadable",
+                    "compute intake cannot read its node's committed work; \
+                     execution is paused until it answers"
+                );
+            }
             return;
         };
+        if self.unreadable {
+            self.unreadable = false;
+            tracing::info!(target: "ducktape::saga", "compute intake reading committed work again");
+        }
         let live: HashSet<AttemptKey> = assigned
             .iter()
             .map(|request| (request.saga_id.clone(), request.attempt))
@@ -128,6 +168,66 @@ impl WorkPump {
         let due = self.plan(assigned, &retired, &active).await;
         for (key, msg) in due {
             self.send(node, &key, msg).await;
+        }
+    }
+
+    /// the CLAIM lane: announcements no node holds a lease on.
+    ///
+    /// The gate answers an announcement with an `Accept` bid when this host can
+    /// both run the capability and seat its demands, and with a silent skip
+    /// otherwise — it NEVER answers one with an execution, so this lane cannot
+    /// start a run. The saga's first-accept-wins rule settles who executes, and
+    /// the winner picks the work up through the lease lane on a later pass.
+    async fn tick_claims(&mut self, node: &NodeLink) {
+        let Some(announcements) = pending(node, &self.me, Lane::Unassigned).await else {
+            // the lease lane already logged an unreadable node; a claim is pure
+            // upside, so a failed read here is simply a pass that does nothing.
+            return;
+        };
+        let live: HashSet<AttemptKey> = announcements
+            .iter()
+            .map(|request| (request.saga_id.clone(), request.attempt))
+            .collect();
+        // an announcement that left the projection was claimed (by us or by
+        // someone else) or retired: either way the bid latch is spent.
+        self.claimed.retain(|key| live.contains(key));
+
+        for request in announcements {
+            let key = (request.saga_id.clone(), request.attempt);
+            if self.claimed.contains(&key) {
+                continue;
+            }
+            // a skip (no provider, no capacity) is deliberately NOT latched:
+            // capacity frees up, and re-gating is a pure, cheap decision.
+            let Some(bid) = self.bid(request, &key).await else {
+                continue;
+            };
+            if node.submit(&bid.target, &bid.payload).await.is_ok() {
+                self.claimed.insert(key);
+            }
+        }
+    }
+
+    /// offer one announcement to the gate. `Some` is the `Accept` op to submit.
+    async fn bid(&self, request: WorkerRequest, key: &AttemptKey) -> Option<Msg> {
+        let event = Event {
+            source: "saga".into(),
+            payload: saga::encode_worker_request(&request),
+        };
+        match self.pool.run(&event).await {
+            Ok(WorkOutcome::Handled(Some(msg))) => Some(msg),
+            // a skip this host cannot serve, or a foreign spec shape.
+            Ok(WorkOutcome::Handled(None)) | Ok(WorkOutcome::NotMine) => None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "ducktape::saga",
+                    attempt = ?key,
+                    error = %error,
+                    reason = "worker_error",
+                    "compute claim skipped"
+                );
+                None
+            }
         }
     }
 
@@ -296,21 +396,32 @@ impl WorkPump {
     }
 }
 
-/// the committed saga projection of this node's leased pending attempts.
+/// which committed projection a read wants. ONE discriminant, because the two
+/// reads differ only in the query and the reply variant they accept.
+#[derive(Clone, Copy)]
+enum Lane {
+    /// work leased to this node — the execute lane.
+    Assigned,
+    /// announcements nobody holds — the claim lane.
+    Unassigned,
+}
+
+/// the committed saga projection for one lane.
+///
 /// `None` when the node is unreachable, the module absent, or the reply
-/// unreadable — a failed read must NEVER masquerade as an empty projection.
-async fn assigned_pending(node: &NodeLink, me: &[u8]) -> Option<Vec<WorkerRequest>> {
-    let reply = node
-        .query(
-            "saga",
-            &saga::encode_query(&SagaQuery::AssignedPending {
-                assignee: me.to_vec(),
-            }),
-        )
-        .await
-        .ok()?;
-    match saga::decode_reply(&reply) {
-        Ok(SagaReply::AssignedPending(requests)) => Some(requests),
+/// unreadable — a failed read must NEVER masquerade as an empty projection:
+/// emptiness retires entries, and retiring a live attempt re-runs it.
+async fn pending(node: &NodeLink, me: &[u8], lane: Lane) -> Option<Vec<WorkerRequest>> {
+    let query = match lane {
+        Lane::Assigned => SagaQuery::AssignedPending {
+            assignee: me.to_vec(),
+        },
+        Lane::Unassigned => SagaQuery::UnassignedPending,
+    };
+    let reply = node.query("saga", &saga::encode_query(&query)).await.ok()?;
+    match (lane, saga::decode_reply(&reply)) {
+        (Lane::Assigned, Ok(SagaReply::AssignedPending(requests))) => Some(requests),
+        (Lane::Unassigned, Ok(SagaReply::UnassignedPending(requests))) => Some(requests),
         _ => None,
     }
 }
@@ -408,6 +519,37 @@ mod tests {
     }
 
     const ME: &[u8] = b"compute-node-key";
+
+    /// the real gate's shape: an ANNOUNCEMENT (no assignee) is answered with an
+    /// `Accept` bid and never executed; an own LEASE is spawned.
+    struct LaneAwareWorker {
+        offers: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Worker for LaneAwareWorker {
+        async fn run(&self, event: &Event) -> Result<WorkOutcome, host::worker::Error> {
+            self.offers.fetch_add(1, Ordering::SeqCst);
+            let request = saga::decode_worker_request(&event.payload).expect("a work request");
+            match request.assignee {
+                None => Ok(WorkOutcome::Handled(Some(Msg {
+                    target: "saga".into(),
+                    payload: saga::encode_msg(&SagaMsg::Accept {
+                        saga_id: request.saga_id,
+                        attempt: request.attempt,
+                    }),
+                }))),
+                Some(_) => Ok(WorkOutcome::Handled(None)),
+            }
+        }
+    }
+
+    fn announcement(saga_id: &str, attempt: u32) -> WorkerRequest {
+        WorkerRequest {
+            assignee: None,
+            ..request(saga_id, attempt)
+        }
+    }
 
     fn result_msg(saga_id: &str, attempt: u32) -> Msg {
         Msg {
@@ -530,6 +672,67 @@ mod tests {
         pump.completed("gone".into(), 7, result_msg("gone", 7));
         let due = pump.plan(vec![request("s", 0)], &empty, &empty).await;
         assert_eq!(due.len(), 1, "the unknown result added nothing");
+    }
+
+    #[tokio::test]
+    async fn a_claimed_announcement_still_executes_when_its_lease_arrives() {
+        // THE regression this lane exists to prevent. `Accept` keeps the
+        // announcement's (saga_id, attempt) and only fills in the assignee, so
+        // the attempt this node WINS arrives in the lease projection under the
+        // exact same key. If the claim latch and the execute latch were one
+        // map, the winner's entry would already be settled-by-the-claim and the
+        // run would silently never happen.
+        let offers = Arc::new(AtomicUsize::new(0));
+        let pool = Box::new(LaneAwareWorker {
+            offers: offers.clone(),
+        });
+        let (mut pump, _) = new_pump(true);
+        pump.pool = pool;
+
+        // the claim lane bids on the announcement ...
+        let bid = pump
+            .bid(announcement("s", 0), &("s".into(), 0))
+            .await
+            .expect("a capable host bids on an announcement");
+        assert!(matches!(
+            saga::decode_msg(&bid.payload),
+            Ok(SagaMsg::Accept { .. })
+        ));
+        // ... and latches it, exactly as a successful submit would.
+        pump.claimed.insert(("s".to_string(), 0));
+
+        // now the SAME key comes back as this node's lease. It must still be
+        // offered to the pool and reach Executing.
+        let empty = HashSet::new();
+        let due = pump.plan(vec![request("s", 0)], &empty, &empty).await;
+        assert!(due.is_empty(), "a spawned lease has nothing to send yet");
+        assert_eq!(pump.tracked(), 1, "the won lease is tracked for execution");
+        assert_eq!(
+            offers.load(Ordering::SeqCst),
+            2,
+            "offered once as an announcement and once as the won lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_that_cannot_serve_an_announcement_never_bids_and_never_latches() {
+        // a skip must not latch: capacity frees up, and re-gating is a pure,
+        // cheap decision. Latching a skip would make one busy moment permanent.
+        let (pump, _) = new_pump(true);
+        struct SkipWorker;
+        #[async_trait::async_trait(?Send)]
+        impl Worker for SkipWorker {
+            async fn run(&self, _event: &Event) -> Result<WorkOutcome, host::worker::Error> {
+                Ok(WorkOutcome::Handled(None))
+            }
+        }
+        let mut pump = pump;
+        pump.pool = Box::new(SkipWorker);
+        assert!(
+            pump.bid(announcement("s", 0), &("s".into(), 0)).await.is_none(),
+            "an unservable announcement produces no bid"
+        );
+        assert!(pump.claimed.is_empty(), "a skip is never latched");
     }
 
     #[test]

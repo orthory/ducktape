@@ -560,6 +560,9 @@ pub(crate) enum ServiceCmd {
 /// `--workspace` wins, else `-n/--network` resolves through the registry.
 #[derive(Debug, clap::Args)]
 pub(crate) struct WorkspaceArgs {
+    /// this node's config file (`ducktape node run --config`'s twin)
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
     /// explicit workspace dir (wins over -n)
     #[arg(long, value_name = "DIR")]
     workspace: Option<PathBuf>,
@@ -569,7 +572,26 @@ pub(crate) struct WorkspaceArgs {
 }
 
 impl WorkspaceArgs {
+    /// the node config this service's node is described by.
+    ///
+    /// `--config` exists because a workspace dir does not always CONTAIN its
+    /// config: the dev shape's workspace is its `storage_dir`, named BY a
+    /// config that lives elsewhere. `ducktape node run --config` has always
+    /// taken the file directly; a daemon serving that node needs the same.
+    fn config_file(&self) -> Result<PathBuf, String> {
+        match &self.config {
+            Some(file) => Ok(file.clone()),
+            None => Ok(self.dir()?.join("node.toml")),
+        }
+    }
+
+    /// where this node's `services.toml` lives — the config's own answer, so
+    /// the CLI and the node can never disagree about which file carries the
+    /// grant.
     fn dir(&self) -> Result<PathBuf, String> {
+        if let Some(file) = &self.config {
+            return Ok(config::resolve(file)?.workspace);
+        }
         if let Some(dir) = &self.workspace {
             return Ok(dir.clone());
         }
@@ -577,7 +599,7 @@ impl WorkspaceArgs {
             let (dir, _http) = config::resolve_network(needle)?;
             return Ok(dir);
         }
-        Err("service command needs --workspace <dir> or -n/--network <id>".into())
+        Err("service command needs --config <file>, --workspace <dir> or -n/--network <id>".into())
     }
 }
 
@@ -857,8 +879,14 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("{kind:?} is not a service kind (1..32 chars of [a-z0-9-])").into());
     }
     let workspace = args.workspace.dir()?;
-    let resolved = config::resolve(&workspace.join("node.toml"))?;
-    let base = config::http_base_in(&workspace)?;
+    let resolved = config::resolve(&args.workspace.config_file()?)?;
+    // the base comes from the SAME resolved config as everything else, rather
+    // than a second read of a node.toml the workspace may not contain.
+    let base = resolved
+        .http_listen
+        .as_deref()
+        .map(config::http_base_of)
+        .ok_or("this node serves no http surface, so a service daemon has nothing to signal to")?;
 
     let hello = discover_hello(&kind, &resolved)?;
     // the FIRST hello must land: a daemon that cannot signal has nothing to

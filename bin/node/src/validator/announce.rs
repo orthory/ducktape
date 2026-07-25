@@ -43,6 +43,9 @@ pub(crate) struct CapabilityAnnouncer {
     /// the (tags, resources) pair we last SUBMITTED (not yet observed
     /// committed), latched so an in-flight announce is not re-sent every tick.
     pub(crate) announced: Option<(Vec<String>, BTreeMap<String, u64>)>,
+    /// whether the last grant read failed — latched so a corrupt
+    /// `services.toml` is reported once, not once per drain tick.
+    grant_unreadable: bool,
 }
 
 impl CapabilityAnnouncer {
@@ -58,28 +61,57 @@ impl CapabilityAnnouncer {
             services,
             resources,
             announced: None,
+            grant_unreadable: false,
         }
     }
 
-    /// the tags the user's compute grant consents to right now. An unreadable
-    /// or absent record announces NOTHING — consent that cannot be read is not
-    /// consent, and the failure direction has to be silence.
-    fn granted(&self) -> Vec<String> {
-        crate::services::grant_for(&self.workspace, crate::services::COMPUTE_KIND)
-            .ok()
-            .flatten()
-            .map(|grant| grant.capabilities)
-            .unwrap_or_default()
+    /// the tags the user's compute grant consents to right now.
+    ///
+    /// An absent record grants nothing — the ordinary un-enabled node. An
+    /// UNREADABLE one also announces nothing (consent that cannot be read is
+    /// not consent), but it says so: silently retracting a live node's whole
+    /// announce because someone corrupted a toml is exactly the failure that
+    /// must not be quiet. Latched, because this runs on the drain tick.
+    fn granted(&mut self) -> Vec<String> {
+        match crate::services::grant_for(&self.workspace, crate::services::COMPUTE_KIND) {
+            Ok(grant) => {
+                if self.grant_unreadable {
+                    self.grant_unreadable = false;
+                    tracing::info!(target: "ducktape::service", "compute grant readable again");
+                }
+                grant.map(|grant| grant.capabilities).unwrap_or_default()
+            }
+            Err(error) => {
+                if !self.grant_unreadable {
+                    self.grant_unreadable = true;
+                    tracing::warn!(
+                        target: "ducktape::service",
+                        reason = "grant_unreadable",
+                        "compute grant cannot be read; this node announces nothing until it is \
+                         repaired: {error}"
+                    );
+                }
+                Vec::new()
+            }
+        }
     }
 
     /// what this node may truthfully announce right now: the user's grant
     /// INTERSECTED with what a daemon is currently offering over its hello.
-    pub(crate) fn offered(&self) -> Vec<String> {
+    ///
+    /// The live half is read FIRST and short-circuits: with nothing signaling
+    /// the intersection is empty whatever the grant says, so the common case (a
+    /// node with no compute daemon) never touches the disk — this runs on the
+    /// async drain tick at ~10 Hz.
+    pub(crate) fn offered(&mut self) -> Vec<String> {
         let signaling = self.services.live(std::time::Instant::now());
         let live: std::collections::BTreeSet<&str> = signaling
             .iter()
             .flat_map(|entry| entry.capabilities.iter().map(String::as_str))
             .collect();
+        if live.is_empty() {
+            return Vec::new();
+        }
         self.granted()
             .into_iter()
             .filter(|tag| live.contains(tag.as_str()))
@@ -157,8 +189,8 @@ impl CapabilityAnnouncer {
         let CapabilityReply::Resources(committed_resources) = decode_reply(&res_reply).ok()? else {
             return None;
         };
-        let (capabilities, resources) =
-            self.decide(&self.offered(), &committed_tags, &committed_resources)?;
+        let offered = self.offered();
+        let (capabilities, resources) = self.decide(&offered, &committed_tags, &committed_resources)?;
         Some(Msg {
             target: "capability".into(),
             payload: encode_msg(&CapabilityMsg::Announce {
@@ -283,8 +315,9 @@ mod capability_announcer_tests {
         // point of the transition: the node discovers nothing itself, so a
         // grant alone is not evidence that anything can run.
         assert!(a.offered().is_empty(), "a grant without a hello offers nothing");
+        let offered = a.offered();
         assert_eq!(
-            a.decide(&a.offered(), &[], &BTreeMap::new()),
+            a.decide(&offered, &[], &BTreeMap::new()),
             None,
             "nothing offered and nothing recorded: silence"
         );
@@ -300,7 +333,7 @@ mod capability_announcer_tests {
         // ... and the grant cannot widen the daemon either.
         let catalog = noded::services::ServiceCatalog::default();
         let workspace = granted_workspace(&["agent.claude", "never-offered"]);
-        let a = CapabilityAnnouncer::new(
+        let mut a = CapabilityAnnouncer::new(
             vec![9u8; 32],
             workspace.path().to_path_buf(),
             catalog.clone(),
@@ -313,7 +346,7 @@ mod capability_announcer_tests {
         // daemon signals: consent is the switch, and an unreadable record is
         // not consent.
         let ungranted = tempfile::tempdir().expect("scratch workspace");
-        let a = CapabilityAnnouncer::new(
+        let mut a = CapabilityAnnouncer::new(
             vec![9u8; 32],
             ungranted.path().to_path_buf(),
             catalog.clone(),
@@ -333,8 +366,9 @@ mod capability_announcer_tests {
             caps(4),
         );
         signal(&catalog, &["agent.claude"]);
+        let offered = a.offered();
         assert_eq!(
-            a.decide(&a.offered(), &[], &BTreeMap::new()),
+            a.decide(&offered, &[], &BTreeMap::new()),
             Some((tags(&["agent.claude"]), caps(4)))
         );
 
@@ -345,8 +379,9 @@ mod capability_announcer_tests {
         let expired = noded::services::ServiceCatalog::default();
         let mut a =
             CapabilityAnnouncer::new(vec![7u8; 32], workspace.path().to_path_buf(), expired, caps(4));
+        let offered = a.offered();
         assert_eq!(
-            a.decide(&a.offered(), &tags(&["agent.claude"]), &caps(4)),
+            a.decide(&offered, &tags(&["agent.claude"]), &caps(4)),
             Some((Vec::new(), BTreeMap::new())),
             "an absent daemon retracts both the tags and the capacity"
         );

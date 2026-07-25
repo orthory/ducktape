@@ -44,8 +44,6 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) gateway_listen: Option<String>,
     pub(crate) gateway_enabled: bool,
     pub(crate) log_ring: noded::LogRing,
-    /// this node's signer identity — the COMMITTER on every forge run commit
-    /// (D2: author is the agent, committer is the node).
     /// this node's consensus public key — the `BindNode` subject the owner-gated
     /// admin namespace resolves ownership against (ADR A5).
     pub(crate) node_key: Vec<u8>,

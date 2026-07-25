@@ -52,7 +52,7 @@ impl ResidentAnnouncer {
 
     /// the tag set this pump would announce right now (`grant ∩ live hello`)
     /// — for log lines.
-    pub(crate) fn capabilities(&self) -> Vec<String> {
+    pub(crate) fn capabilities(&mut self) -> Vec<String> {
         self.announcer.offered()
     }
 

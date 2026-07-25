@@ -666,9 +666,12 @@ pub(super) async fn park(
     });
     // ---- the RESIDENT-tier pumps -----------------------------------
     //
-    // the state-driven twins of the validator loop's announce pump and
-    // reactor seam, adapted to a node that installs boundaries instead
-    // of executing blocks (see resident_announce.rs /
+    // the state-driven twin of the validator loop's announce pump, adapted to a
+    // node that installs boundaries instead of executing blocks (see
+    // resident_announce.rs). There is no resident dispatch pump any more: the
+    // compute daemon serves this node's assigned work and its announcements
+    // over /v1, on both tiers alike.
+    //
     // the node-private podman service, up before the terminal plane needs it
     // and held for the node's life (see the validator boot for the rationale).
     // Fail-closed. Keyed on the `[sandbox]` TABLE, not the compute grant — the

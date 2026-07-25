@@ -26,7 +26,7 @@ _ducktape() {
     local fs_verbs="ls cat stat history diff checkout status commit pin help"
     local fs_flags="-n --network --json --node --message -m --no-rebase --snapshot --limit --prefix"
     local service_verbs="run list enable disable status help"
-    local service_flags="--workspace -n --network --json --yes -y --enable --no-enable"
+    local service_flags="--config --workspace -n --network --json --yes -y --enable --no-enable"
     local agent_verbs="pty sched help"
     local agent_flags="-n --network --node --cred --cpu --mem"
 

@@ -236,27 +236,6 @@ pub struct DispatchPool {
 }
 
 impl DispatchPool {
-    /// the production constructor: concurrency cap from the environment, no
-    /// announced capacity (a bare ledger — demandless jobs only) until a
-    /// later task wires the operator's real numbers in.
-    pub fn new(
-        providers: Arc<ProviderSet>,
-        node_key: Vec<u8>,
-        spawn: SpawnFn,
-        deliver: DeliverFn,
-        provisioner: SharedProvisioner,
-    ) -> Self {
-        Self::with_limit(
-            providers,
-            node_key,
-            spawn,
-            deliver,
-            max_concurrent_runs_from_env(),
-            Default::default(),
-            provisioner,
-        )
-    }
-
     /// an explicit concurrency cap (tests; embedders with their own policy)
     /// and announced resource capacity. an empty `capacity` is the direct
     /// (bare) node: only demandless jobs ever fit its ledger.

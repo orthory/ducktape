@@ -1138,16 +1138,17 @@ impl ValidatorRuntime<'_> {
         }
     }
 
-    // CAPABILITY ANNOUNCE: a current member whose discovered
-    // provider set differs from the committed registry
+    // CAPABILITY ANNOUNCE: a current member whose offerable set
+    // (`grant ∩ live hello`) differs from the committed registry
     // self-submits ONE declarative `Announce`. member-gated (the
     // module rejects non-members) and idempotent (committed-read
-    // + local latch). inert on a host with no executor CLIs and on
-    // one whose compute grant announces no tags (the accept-lane-only
-    // provider: it still executes what it can by claiming unassigned
-    // announcements, but never enters a tag's rendezvous pool). Both
-    // collapse to an EMPTY announce set — there is no separate switch
-    // that could disagree with the grant.
+    // + local latch). Inert with no compute daemon signaling, and
+    // inert on a grant that consents to no tags — the accept-lane-only
+    // provider, which announces nothing yet still executes work it
+    // CLAIMS from the announcement lane (the daemon's claim pump, see
+    // `compute::intake`), so it never enters a tag's rendezvous pool.
+    // Both collapse to an EMPTY announce set — there is no separate
+    // switch that could disagree with the grant.
     async fn pump_capability_announce(&mut self) {
         let Self {
             node,
