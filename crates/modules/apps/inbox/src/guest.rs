@@ -48,9 +48,12 @@ use crate::Inbox;
 const MODULE_ID: &str = "inbox";
 
 // whole-state port: the shell loads/saves the canonical snapshot and runs the
-// native module per dispatch (see `guest_adapter::snapshot_guest!`).
-guest_adapter::snapshot_guest! {
+use guest_adapter::WitStore;
+
+// store-backed port: no snapshot — the host owns the real qmdb store and the
+// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+guest_adapter::store_guest! {
     id: MODULE_ID,
     module: Inbox,
-    new: Inbox::new(MODULE_ID),
+    new: Inbox::new(MODULE_ID, Box::new(WitStore)),
 }

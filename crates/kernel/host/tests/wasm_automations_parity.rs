@@ -67,7 +67,10 @@ async fn siblings(
     vec![
         Box::new(Chat::new("chat", Box::new(store))),
         Box::new(Tasks::new("tasks")),
-        Box::new(Inbox::new("inbox")),
+        Box::new(Inbox::new(
+            "inbox",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
     ]
 }
 

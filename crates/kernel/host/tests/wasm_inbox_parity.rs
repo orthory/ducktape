@@ -1,36 +1,38 @@
-//! the adapter-port equivalence proof for the inbox cutover: the `inbox` guest
-//! component (the NATIVE `inbox` crate compiled to wasm behind `guest-adapter`)
-//! and the native `Inbox` module answer the SAME op sequence with the SAME
-//! committed state, and their roots move in lockstep (move on commit, hold on
-//! no-ops and abort). the module serves NO queries (its read surface is the
-//! index guest's job on the derived tier), so the equivalence claim is
-//! ROOT-SHAPED: the port persists the native canonical snapshot as one host-KV
-//! value (`__state`, with its 32-byte root under `__root`), which makes the
-//! wasm root a PURE FUNCTION of the native committed bytes — after every block
-//! the wasm root must equal that derivation recomputed from the native host's
-//! snapshot. the roots THEMSELVES differ — the host-KV wrapping is a declared
-//! state-schema break (revision 2) — and this proof pins that difference so it
-//! can never be mistaken for accidental compatibility.
+//! the STORE-BACKED cutover-continuity proof for inbox: the `inbox` guest
+//! component over `WasmModule::with_store(QmdbStore)` and the native `Inbox`
+//! over the same store shape are ROOT-CONTINUOUS — the same op sequence
+//! commits the IDENTICAL qmdb merkle root after every block (both roots ARE
+//! the store's root). the module serves NO queries (its read surface is the
+//! index guest's job on the derived tier), so root equality IS the whole
+//! equivalence claim.
 //!
 //! the inbox's primary writer is a SIBLING module's follow-up (`emit_msg`), so
 //! the op matrix includes a delivery emitted by a stub producer module — the
 //! cross-module path the native inbox tests exercise — asserting the wasm port
 //! derives the same Module-origin `source`.
 
-use std::collections::BTreeMap;
-
-use host::{BlockContext, FinalizedBlock, Host, MemberOutcome, SubmitError};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use inbox::{Inbox, InboxMsg, MAX_BODY_BYTES, MAX_KIND_BYTES, MAX_MEMBER_BYTES, encode_msg};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
-use sha2::{Digest, Sha256};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
+use statesync::qmdb::QmdbStore;
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `inbox` module's guest port by
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const INBOX_WASM: &[u8] = include_bytes!("fixtures/inbox.component.wasm");
 
-fn wasm_inbox() -> WasmModule {
-    WasmModule::from_bytes("inbox", INBOX_WASM).expect("load component")
+/// a fresh qmdb store. `label` doubles as the store id (the deterministic
+/// runtime keys storage partitions by id alone).
+async fn inbox_store(
+    context: &deterministic::Context,
+    label: &'static str,
+) -> QmdbStore<deterministic::Context> {
+    QmdbStore::init(context.child(label), label).await
+}
+
+fn wasm_inbox(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store("inbox", INBOX_WASM, store).expect("load component")
 }
 
 /// a stand-in producer module that, on any op, emits an inbox `Deliver`
@@ -60,12 +62,19 @@ impl Module for Producer {
     }
 }
 
-fn native_host() -> Host {
-    Host::genesis(vec![Box::new(Inbox::new("inbox")), Box::new(Producer)]).expect("genesis")
+async fn native_host(context: &deterministic::Context) -> Host {
+    let store = inbox_store(context, "native_inbox").await;
+    Host::genesis(vec![
+        Box::new(Inbox::new("inbox", Box::new(store))),
+        Box::new(Producer),
+    ])
+    .expect("genesis")
 }
 
-fn wasm_host_() -> Host {
-    Host::genesis(vec![Box::new(wasm_inbox()), Box::new(Producer)]).expect("genesis")
+async fn wasm_host_(context: &deterministic::Context) -> Host {
+    let store = inbox_store(context, "wasm_inbox").await;
+    Host::genesis(vec![Box::new(wasm_inbox(Box::new(store))), Box::new(Producer)])
+        .expect("genesis")
 }
 
 /// a 32-byte submitter key (the ordered lane hands modules verified ed25519
@@ -102,106 +111,25 @@ fn root_of(h: &Host) -> StateRoot {
     h.module_root("inbox").expect("inbox registered")
 }
 
-/// the NATIVE host's committed inbox snapshot bytes, captured through the
-/// finalized-checkpoint lane (committed state only, never a staged overlay).
-fn native_snapshot(h: &Host, height: u64) -> Vec<u8> {
-    let snap = h
-        .capture_finalized_snapshot(FinalizedBlock {
-            height,
-            root_hash: h.root_hash(),
-        })
-        .expect("capture finalized snapshot");
-    let module = snap.module("inbox").expect("inbox registered");
-    match &module.state_sync {
-        StateSyncHandle::SnapshotBytes(bytes) => bytes.clone(),
-        other => panic!("inbox must be snapshot-backed: {other:?}"),
-    }
-}
-
-/// the adapter port's root, recomputed from the native canonical state: the
-/// port persists the snapshot under `__state` with its 32-byte root under
-/// `__root`, and the wasm root is the host-KV hash over exactly those two
-/// pairs. equality against this value proves the wasm committed state is
-/// BYTE-IDENTICAL to the native committed state — the old query-matrix
-/// equivalence claim, root-shaped.
-fn ported_root(native_root: StateRoot, snapshot: &[u8]) -> StateRoot {
-    let committed = BTreeMap::from([
-        (b"__root".to_vec(), native_root.0.to_vec()),
-        (b"__state".to_vec(), snapshot.to_vec()),
-    ]);
-    StateRoot(Sha256::digest(sdk::hash::encode_pairs(&committed)).into())
-}
-
-/// the cross-runtime equivalence at a committed boundary: the wasm root must
-/// be the ported derivation of the native committed bytes.
-fn assert_state_parity(native: &Host, wasm: &Host, height: u64) {
-    let snapshot = native_snapshot(native, height);
-    assert_eq!(
-        root_of(wasm),
-        ported_root(root_of(native), &snapshot),
-        "wasm committed state diverged from the native canonical state at block {height}"
-    );
-}
-
-// ---- hand-encoded expected images ------------------------------------------
-//
-// the native module's canonical byte layout (the exact root preimage AND the
-// snapshot wire): member count, then per member (id, next_seq, item count,
-// items ascending by seq), length-prefixed strings and LE u64s throughout.
-// spot checks build the EXPECTED committed image and compare it against the
-// captured native snapshot — with `assert_state_parity` pinning the wasm side
-// to those same bytes, this replaces the old decoded query spot checks.
-
-fn push_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_str(out: &mut Vec<u8>, value: &str) {
-    push_u64(out, value.len() as u64);
-    out.extend_from_slice(value.as_bytes());
-}
-
-/// one item as `(seq, kind, body, source, created_at, read)`.
-type ItemBytes<'a> = (u64, &'a str, &'a str, &'a str, u64, bool);
-
-/// the full canonical image for a committed state (members ascending by id).
-fn snapshot_bytes(members: &[(&str, u64, &[ItemBytes])]) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_u64(&mut out, members.len() as u64);
-    for (member, next_seq, items) in members {
-        push_str(&mut out, member);
-        push_u64(&mut out, *next_seq);
-        push_u64(&mut out, items.len() as u64);
-        for (seq, kind, body, source, created_at, read) in *items {
-            push_u64(&mut out, *seq);
-            push_str(&mut out, kind);
-            push_str(&mut out, body);
-            push_str(&mut out, source);
-            push_u64(&mut out, *created_at);
-            out.push(*read as u8);
-        }
-    }
-    out
-}
-
 #[test]
-fn same_ops_same_state_roots_in_lockstep_schema_break_pinned() {
-    futures::executor::block_on(same_ops_inner());
+fn same_ops_same_state_roots_in_lockstep_and_continuous() {
+    deterministic::Runner::default().start(|context| async move {
+        same_ops_inner(&context).await;
+    });
 }
 
-async fn same_ops_inner() {
-    let mut native = native_host();
-    let mut wasm = wasm_host_();
+async fn same_ops_inner(context: &deterministic::Context) {
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
     let (alice, bob) = (key(0xA1), key(0xB2));
 
-    // at GENESIS the roots coincide: this module's native encoding of empty
-    // state is the same empty canonical map the wasm host store hashes. the
-    // declared schema break manifests on the FIRST WRITE (asserted per block
-    // below), which is what the revision-2 fence actually guards.
+    // ROOT-CONTINUITY from GENESIS: both roots are the (empty) store's merkle
+    // root, identical across the runtimes — and they stay identical after
+    // every block (asserted per block below).
     assert_eq!(
         root_of(&native),
         root_of(&wasm),
-        "empty-state roots coincide by construction"
+        "genesis roots must be continuous across the runtimes"
     );
 
     // every op family, in one deterministic sequence: deliveries from every
@@ -300,9 +228,6 @@ async fn same_ops_inner() {
             .await
             .expect("wasm submit");
 
-        // the equivalence claim after every block: the wasm committed store
-        // is exactly {__root, __state} of the native canonical state.
-        assert_state_parity(&native, &wasm, height);
         // roots move in LOCKSTEP: a state-changing op moves both commit
         // boundaries, a no-op holds both...
         if moves {
@@ -312,39 +237,14 @@ async fn same_ops_inner() {
             assert_eq!(root_of(&native), n_before, "native root moved at {height}");
             assert_eq!(root_of(&wasm), w_before, "wasm root moved at {height}");
         }
-        // ...and the roots themselves always differ (the pinned schema break).
-        assert_ne!(root_of(&native), root_of(&wasm));
+        // THE continuity property: both roots ARE the same store root.
+        assert_eq!(
+            root_of(&native),
+            root_of(&wasm),
+            "the two runtimes diverged at {height}"
+        );
     }
-
-    // byte-level spot check on the shared final state (parity above pins the
-    // wasm side to these same bytes): seq 1 was cleared; seq 2 is read; the
-    // producer follow-up carries the EMITTING module as source and the
-    // causing block's consensus time; the anonymous external reads "ext:";
-    // the post-clear delivery took seq 5 (next_seq never rewinds); bob's
-    // source is ext: + lowercase hex of the submitter key.
-    let bob_source = format!("ext:{}", "b2".repeat(32));
-    let expected = snapshot_bytes(&[
-        (
-            "alice",
-            6,
-            &[
-                (2, "reply", "yo", "system", 1_002, true),
-                (3, "event", "produced", "producer", 1_004, false),
-                (4, "note", "self-note", "ext:", 1_005, false),
-                (5, "followup", "after clear", "system", 1_011, false),
-            ],
-        ),
-        (
-            "bob",
-            2,
-            &[(1, "mention", "sup", bob_source.as_str(), 1_003, false)],
-        ),
-    ]);
-    assert_eq!(
-        native_snapshot(&native, final_height),
-        expected,
-        "the committed image diverged from the op sequence's expected state"
-    );
+    let _ = final_height;
 
     // the read surface is GONE on both runtimes alike: the native module
     // answers QueryUnsupported and the port refuses too (its wit rendering is
@@ -368,12 +268,14 @@ async fn same_ops_inner() {
 
 #[test]
 fn rejections_match_and_leave_no_trace() {
-    futures::executor::block_on(rejections_inner());
+    deterministic::Runner::default().start(|context| async move {
+        rejections_inner(&context).await;
+    });
 }
 
-async fn rejections_inner() {
-    let mut native = native_host();
-    let mut wasm = wasm_host_();
+async fn rejections_inner(context: &deterministic::Context) {
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
     let alice = key(0xA1);
 
     for host in [&mut native, &mut wasm] {
@@ -384,7 +286,7 @@ async fn rejections_inner() {
         .await
         .expect("seed deliver");
     }
-    assert_state_parity(&native, &wasm, 1);
+    assert_eq!(root_of(&native), root_of(&wasm));
 
     // the rejection matrix: every cap-violation family the native module
     // rejects at execute, plus a malformed payload (the decode seam). each
@@ -441,24 +343,25 @@ async fn rejections_inner() {
             "wasm reason must carry the native reason: {w_msg}"
         );
 
-        // abort leaves no trace: both roots byte-identical to pre-block, and
-        // the wasm store still the ported derivation of the native bytes.
+        // abort leaves no trace: both roots byte-identical to pre-block and
+        // continuous across the runtimes.
         assert_eq!(root_of(&native), n_before, "native root moved on reject");
         assert_eq!(root_of(&wasm), w_before, "wasm root moved on reject");
-        assert_state_parity(&native, &wasm, height);
+        assert_eq!(root_of(&native), root_of(&wasm));
     }
 }
 
 #[test]
 fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
-    futures::executor::block_on(multi_dispatch_inner());
+    deterministic::Runner::default().start(|context| async move {
+        multi_dispatch_inner(&context).await;
+    });
 }
 
-async fn multi_dispatch_inner() {
-    let mut native = native_host();
-    let mut wasm = wasm_host_();
+async fn multi_dispatch_inner(context: &deterministic::Context) {
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
     let (alice, carol) = (key(0xA1), key(0xC3));
-    let alice_source = format!("ext:{}", "a1".repeat(32));
 
     // ONE block, three ops: the second delivery's seq assignment READS the
     // first op's staged write (next_seq only exists in this block's overlay),
@@ -499,19 +402,11 @@ async fn multi_dispatch_inner() {
             out.members
         );
     }
-    // the committed image pins the staged read-your-writes: the second
-    // dispatch saw the staged next_seq (seq 2, not a reused 1) and the third
-    // acked the item that only existed staged (seq 1 read) — identically on
-    // the wasm side via the ported-root derivation.
-    let alice_items: &[ItemBytes] = &[
-        (1, "k", "first", alice_source.as_str(), 1_001, true),
-        (2, "k", "second", alice_source.as_str(), 1_001, false),
-    ];
-    assert_eq!(
-        native_snapshot(&native, 1),
-        snapshot_bytes(&[("alice", 3, alice_items)])
-    );
-    assert_state_parity(&native, &wasm, 1);
+    // the read-your-writes seam decided identically on both runtimes: the
+    // second dispatch saw the staged next_seq and the third acked the item
+    // that only existed staged — root continuity is the whole claim (the
+    // record-level pins live in the module's own tests).
+    assert_eq!(root_of(&native), root_of(&wasm));
 
     // ONE block where the SECOND member rejects: the runtime aborts the staged
     // overlay and replays the accepted member — committed state must equal the
@@ -536,21 +431,9 @@ async fn multi_dispatch_inner() {
         assert!(matches!(out.members[0], MemberOutcome::Applied { .. }));
         assert!(matches!(out.members[1], MemberOutcome::Rejected { .. }));
     }
-    // the accepted member landed (roots moved), the rejected one left nothing:
-    // bob holds exactly the accepted "ok" delivery.
+    // the accepted member landed (roots moved), the rejected one left
+    // nothing — identically on both runtimes.
     assert_ne!(root_of(&native), n_before);
     assert_ne!(root_of(&wasm), w_before);
-    assert_eq!(
-        native_snapshot(&native, 2),
-        snapshot_bytes(&[
-            ("alice", 3, alice_items),
-            (
-                "bob",
-                2,
-                &[(1, "k", "ok", alice_source.as_str(), 1_002, false)]
-            ),
-        ]),
-        "a rejected member must leave no trace"
-    );
-    assert_state_parity(&native, &wasm, 2);
+    assert_eq!(root_of(&native), root_of(&wasm));
 }

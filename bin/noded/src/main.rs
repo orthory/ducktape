@@ -249,7 +249,10 @@ fn run_node(
         )
         .with_direct_owner("runs");
         let tasks = Tasks::new("tasks");
-        let inbox = Inbox::new("inbox");
+        let inbox = Inbox::new(
+            "inbox",
+            Box::new(QmdbStore::init(context.child("inbox"), "inbox").await),
+        );
         let automations = Automations::new(
             "automations",
             Box::new(QmdbStore::init(context.child("automations"), "automations").await),

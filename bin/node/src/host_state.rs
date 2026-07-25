@@ -81,7 +81,10 @@ const DIRECTORY_WASM_COMPONENT: &[u8] =
 /// the genesis-constant id the directory module registers under.
 const DIRECTORY_MODULE_ID: &str = "directory";
 
-/// inbox / tasks GENESIS components. `tasks` hosts the task and job boards.
+/// inbox — a STORE-BACKED tenant like pages/chat: per-member queues ride a
+/// host-constructed qmdb store (nothing enumerates members; the read surface
+/// is the index tier). tasks GENESIS component: `tasks` hosts the task and
+/// job boards.
 const INBOX_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/inbox/component.wasm");
 const INBOX_MODULE_ID: &str = "inbox";
@@ -367,11 +370,10 @@ fn genesis_directory_wasm() -> WasmModule {
         .expect("embedded directory component loads")
 }
 
-/// inbox at its GENESIS code. The adapter persists the canonical snapshot
-/// under the host-KV encoding. Same boot-time code reconciliation story as
-/// [`genesis_hello_wasm`].
-fn genesis_inbox_wasm() -> WasmModule {
-    WasmModule::from_bytes(INBOX_MODULE_ID, INBOX_WASM_COMPONENT)
+/// inbox at its GENESIS code over the host-constructed store (same three
+/// store lifecycles as [`pages_wasm`]).
+fn inbox_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(INBOX_MODULE_ID, INBOX_WASM_COMPONENT, store)
         .expect("embedded inbox component loads")
 }
 
@@ -656,6 +658,9 @@ pub(super) async fn genesis_host(
         QmdbStore::init(context.child("lifecycle"), "lifecycle").await,
     ))
     .await;
+    let inbox = inbox_wasm(Box::new(
+        QmdbStore::init(context.child("inbox"), "inbox").await,
+    ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
@@ -726,7 +731,8 @@ pub(super) async fn genesis_host(
         gateway,
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
-        inbox: genesis_inbox_wasm(),
+        // store-backed over the host-constructed qmdb store.
+        inbox,
         // the ROOT-CONTINUOUS files tenant: a wasm guest over the host-side
         // duckfs odb + refs backing (`files_wasm`). `("files", 1)` stays and the
         // cutover moves no root — pinned by `wasm_files_parity`.
@@ -830,6 +836,9 @@ pub(super) async fn restore_host(
         Box::new(QmdbStore::init(context.child("lifecycle"), "lifecycle").await),
         "valset",
     );
+    let inbox = inbox_wasm(Box::new(
+        QmdbStore::init(context.child("inbox"), "inbox").await,
+    ));
 
     let mut hello_wasm = genesis_hello_wasm();
     let (bytes, root) = snapshot_of(HELLO_WASM_MODULE_ID)?;
@@ -853,12 +862,6 @@ pub(super) async fn restore_host(
     tasks
         .install(bytes, root)
         .map_err(|e| format!("tasks install: {e}"))?;
-
-    let mut inbox = genesis_inbox_wasm();
-    let (bytes, root) = snapshot_of(INBOX_MODULE_ID)?;
-    inbox
-        .install(bytes, root)
-        .map_err(|e| format!("inbox install: {e}"))?;
 
     // files is a duckfs-odb resolver module — NOT in the checkpoint's snapshot
     // set (like the qmdb modules above, which `init` from their own on-disk
@@ -1161,6 +1164,17 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     // network's committed active hash differs, and the joiner's first code
     // reconciliation (before it applies any block) swaps them to the committed
     // components, fetched off the blob plane.
+    let (target, resolver) = fetch_target("inbox").await?;
+    let inbox = inbox_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("inbox")),
+            "inbox",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
+
     let (target, resolver) = fetch_target(host::LIFECYCLE_MODULE_ID).await?;
     let lifecycle = Lifecycle::new(
         host::LIFECYCLE_MODULE_ID,
@@ -1187,12 +1201,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     tasks
         .install(&bytes, root)
         .map_err(|e| format!("tasks install: {e}"))?;
-
-    let (bytes, root) = snapshot_of(INBOX_MODULE_ID).await?;
-    let mut inbox = genesis_inbox_wasm();
-    inbox
-        .install(&bytes, root)
-        .map_err(|e| format!("inbox install: {e}"))?;
 
     // files is a duckfs-odb resolver module: its refs image AND its
     // content-addressed objects both ride the Module/`serve_sync` lane. a fresh
