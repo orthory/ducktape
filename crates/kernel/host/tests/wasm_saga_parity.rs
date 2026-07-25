@@ -119,7 +119,11 @@ fn native_host(members: &[Vec<u8>]) -> Host {
     Host::genesis(vec![
         Box::new(native_saga()),
         Box::new(seeded_valset(members)),
-        Box::new(CapabilityRegistry::new("capability", Some("valset".into()))),
+        Box::new(CapabilityRegistry::new(
+            "capability",
+            Box::new(sdk_testkit::MemStore::new()),
+            Some("valset".into()),
+        )),
         Box::new(Recorder::new()),
     ])
     .expect("genesis")
@@ -129,7 +133,11 @@ fn wasm_host_(members: &[Vec<u8>]) -> Host {
     Host::genesis(vec![
         Box::new(wasm_saga()),
         Box::new(seeded_valset(members)),
-        Box::new(CapabilityRegistry::new("capability", Some("valset".into()))),
+        Box::new(CapabilityRegistry::new(
+            "capability",
+            Box::new(sdk_testkit::MemStore::new()),
+            Some("valset".into()),
+        )),
         Box::new(Recorder::new()),
     ])
     .expect("genesis")
