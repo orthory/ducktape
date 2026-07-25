@@ -60,11 +60,12 @@ fn native_capability(store: Box<dyn sdk::MerkleStore>) -> CapabilityRegistry {
 
 /// a REAL valset sibling, genesis-seeded with `validators` — the module whose
 /// live Validators/Residents projections every announce is gated on.
-fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset");
+async fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
+    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
     for v in validators {
-        valset.insert(v.clone());
+        valset.seed(v.clone()).await.expect("seed valset");
     }
+    valset.finish_seed().await.expect("seed valset");
     valset
 }
 
@@ -72,7 +73,7 @@ async fn native_host(context: &deterministic::Context, validators: &[Vec<u8>]) -
     let store = cap_store(context, "native_cap").await;
     Host::genesis(vec![
         Box::new(native_capability(Box::new(store))),
-        Box::new(seeded_valset(validators)),
+        Box::new(seeded_valset(validators).await),
     ])
     .expect("genesis")
 }
@@ -81,7 +82,7 @@ async fn wasm_host_(context: &deterministic::Context, validators: &[Vec<u8>]) ->
     let store = cap_store(context, "wasm_cap").await;
     Host::genesis(vec![
         Box::new(wasm_capability(Box::new(store))),
-        Box::new(seeded_valset(validators)),
+        Box::new(seeded_valset(validators).await),
     ])
     .expect("genesis")
 }

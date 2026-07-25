@@ -139,13 +139,14 @@ impl Module for IdentityStub {
     }
 }
 
-fn share_host() -> (Host, [Vec<u8>; 4], [Vec<u8>; 3]) {
+async fn share_host() -> (Host, [Vec<u8>; 4], [Vec<u8>; 3]) {
     let nodes = [key(1), key(2), key(3), key(4)];
     let accounts = [key(11), key(12), key(13)];
-    let mut valset = Valset::new("valset");
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
     for node in &nodes[..3] {
-        valset.insert(node.clone());
+        valset.seed(node.clone()).await.expect("seed valset");
     }
+    valset.finish_seed().await.expect("seed valset");
     let identity = IdentityStub::new(vec![
         (
             accounts[0].clone(),
@@ -214,7 +215,7 @@ async fn shares(host: &Host) -> governance::SharesView {
 #[test]
 fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
     block_on(async {
-        let (mut host, nodes, accounts) = share_host();
+        let (mut host, nodes, accounts) = share_host().await;
         let defaults = shares(&host).await;
         assert!(!defaults.active, "validator ballots are the default mode");
         assert!(defaults.allocations.is_empty());
@@ -622,7 +623,7 @@ fn an_account_member_key_proposes_and_its_vote_casts_all_its_bound_node_ballots(
         // validators = nodes[0..3]; account[0] owns nodes[0]+nodes[1],
         // account[1] owns nodes[2]. Default (validator) mode: N validators = N
         // votes, ballots node-keyed.
-        let (mut host, nodes, accounts) = share_host();
+        let (mut host, nodes, accounts) = share_host().await;
 
         // account[0] (a member KEY, never a node key) opens a proposal.
         submit(
@@ -714,7 +715,7 @@ fn a_key_with_no_bound_member_node_is_refused() {
     block_on(async {
         // account[2] owns nodes[3], which is NOT in the validator set — so it
         // holds no governance standing and cannot open a proposal.
-        let (mut host, _nodes, accounts) = share_host();
+        let (mut host, _nodes, accounts) = share_host().await;
         let err = submit(
             &mut host,
             &accounts[2],
@@ -767,7 +768,7 @@ fn a_key_with_no_bound_member_node_is_refused() {
 fn an_account_revote_overwrites_its_node_ballots_not_doubles_them() {
     block_on(async {
         // account[0] owns validator nodes[0] + nodes[1].
-        let (mut host, _nodes, accounts) = share_host();
+        let (mut host, _nodes, accounts) = share_host().await;
         submit(
             &mut host,
             &accounts[0],
@@ -823,7 +824,7 @@ fn an_account_revote_overwrites_its_node_ballots_not_doubles_them() {
 #[test]
 fn an_account_vote_overwrites_its_nodes_direct_ballot() {
     block_on(async {
-        let (mut host, nodes, accounts) = share_host();
+        let (mut host, nodes, accounts) = share_host().await;
         submit(
             &mut host,
             &nodes[0],
@@ -897,10 +898,11 @@ fn two_member_keys_of_one_account_share_the_same_node_ballots() {
             (accounts[2].clone(), vec![nodes[3].clone()]),
         ]);
         identity.add_member(&accounts[0], second_key.clone());
-        let mut valset = Valset::new("valset");
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
         for node in &nodes[..3] {
-            valset.insert(node.clone());
+            valset.seed(node.clone()).await.expect("seed valset");
         }
+        valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
             Box::new(valset),
             Box::new(Governance::new(

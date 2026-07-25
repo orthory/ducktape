@@ -854,10 +854,14 @@ fn run_sim(
         // valset_keys => the default set, byte-identical.
         if !valset_keys.is_empty() {
             let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
-            let mut valset = Valset::new("valset");
+            let mut valset = Valset::new(
+                "valset",
+                Box::new(QmdbStore::init(context.child("valset"), "valset").await),
+            );
             for key in &valset_keys {
-                valset.insert(key.clone());
+                valset.seed(key.clone()).await.expect("seed sim valset");
             }
+            valset.finish_seed().await.expect("seed sim valset");
             // a redeemed role=Client invite records a key in identity's client
             // ACL (governance emits an `IdentityMsg::GrantClient` follow-up);
             // identity is already in the default module set above. store-backed

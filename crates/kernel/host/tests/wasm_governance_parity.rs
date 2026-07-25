@@ -115,11 +115,12 @@ fn native_identity() -> Identity {
     )
 }
 
-fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset");
+async fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
+    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
     for v in validators {
-        valset.insert(v.clone());
+        valset.seed(v.clone()).await.expect("seed valset");
     }
+    valset.finish_seed().await.expect("seed valset");
     valset
 }
 
@@ -143,7 +144,7 @@ async fn seeded_lifecycle() -> Lifecycle {
 /// (account shares), lifecycle (node upgrades + code swaps).
 async fn siblings(validators: &[Vec<u8>]) -> Vec<Box<dyn sdk::Module>> {
     vec![
-        Box::new(seeded_valset(validators)),
+        Box::new(seeded_valset(validators).await),
         Box::new(native_identity()),
         Box::new(seeded_lifecycle().await),
     ]

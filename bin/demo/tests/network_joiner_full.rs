@@ -100,13 +100,17 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
         // ---- SOURCE: the full module set behind one Host, real op path ------
         let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("source_kv"), "kv").await));
         let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("source_chat"), "chat").await));
+        let valset = Valset::new(
+            "valset",
+            Box::new(QmdbStore::init(context.child("source_valset"), "valset").await),
+        );
         let forge = Forge::init("forge", source_dir.clone()).expect("forge init");
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(chat),
             Box::new(forge),
             Box::new(Directory::new("directory")),
-            Box::new(Valset::new("valset")),
+            Box::new(valset),
             Box::new(SagaModule::new("saga")),
             Box::new(Greeter::new("greeter")),
         ])
@@ -282,7 +286,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
             );
             assert_eq!(join_chat.root(), chat_root);
 
-            // --- snapshot lane: directory, valset, saga, forge ----------------
+            // --- snapshot lane: directory, saga, forge ------------------------
             let entry = manifest.entry("directory").unwrap();
             assert_eq!(entry.kind, PayloadKind::Snapshot);
             let bytes = fetch_snapshot(&client, boundary, "directory")
@@ -293,14 +297,26 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
                 .install(&bytes, entry.root)
                 .expect("directory install");
 
-            let entry = manifest.entry("valset").unwrap();
-            let bytes = fetch_snapshot(&client, boundary, "valset")
-                .await
-                .expect("valset snapshot");
-            let mut join_valset = Valset::new("valset");
-            join_valset
-                .install(&bytes, entry.root)
-                .expect("valset install");
+            // valset rides the resolver lane like kv/chat (store-backed).
+            let valset_entry = manifest.entry("valset").unwrap();
+            let valset_root = valset_entry.root;
+            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "valset");
+            let target = pinned_target(valset_entry);
+            assert_eq!(StateRoot(target.root.0), valset_root);
+            let join_valset = Valset::new(
+                "valset",
+                Box::new(
+                    QmdbStore::sync_from(
+                        joiner_ctx.child("joiner_valset"),
+                        "valset-rebuilt",
+                        target,
+                        resolver,
+                    )
+                    .await
+                    .expect("sync_from"),
+                ),
+            );
+            assert_eq!(join_valset.root(), valset_root);
 
             let entry = manifest.entry("saga").unwrap();
             let bytes = fetch_snapshot(&client, boundary, "saga")

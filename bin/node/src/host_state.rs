@@ -667,13 +667,25 @@ pub(super) async fn genesis_host(
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .expect("forge init")
         .with_chat("chat");
-    let mut valset = Valset::new("valset");
+    // the membership registry is NATIVE but store-backed like lifecycle:
     // genesis-seed the validator set from config — deterministic and identical
     // on every node, so membership is IN consensus state from block zero (the
-    // substrate epoch cutover + governance will drive).
+    // substrate epoch cutover + governance will drive) — committed into its
+    // store in one idempotent batch.
+    let mut valset = Valset::new(
+        "valset",
+        Box::new(QmdbStore::init(context.child("valset"), "valset").await),
+    );
     for v in genesis_validators {
-        valset.insert(v.as_ref().to_vec());
+        valset
+            .seed(v.as_ref().to_vec())
+            .await
+            .expect("genesis validator keys are well-formed ed25519");
     }
+    valset
+        .finish_seed()
+        .await
+        .expect("genesis valset seed commits");
     ProductionModules {
         pages,
         chat,
@@ -820,11 +832,12 @@ pub(super) async fn restore_host(
         Ok((bytes, root))
     };
 
-    let mut valset = Valset::new("valset");
-    let (bytes, root) = snapshot_of("valset")?;
-    valset
-        .install(bytes, root)
-        .map_err(|e| format!("valset install: {e}"))?;
+    // the membership registry reopens like the other store-backed tenants
+    // (its store carries the genesis seed and every committed membership op).
+    let valset = Valset::new(
+        "valset",
+        Box::new(QmdbStore::init(context.child("valset"), "valset").await),
+    );
 
     // the lifecycle module-code registry reopens like the other store-backed
     // tenants (its store carries the genesis seeds and every committed swap);
@@ -1141,11 +1154,22 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("directory install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("valset").await?;
-    let mut valset = Valset::new("valset");
-    valset
-        .install(&bytes, root)
-        .map_err(|e| format!("valset install: {e}"))?;
+    // the membership registry joins like the other store-backed tenants:
+    // rebuild the store at the manifest's pinned target (merkle-verified
+    // against the committed root), then wrap the module around it.
+    let (target, resolver) = fetch_target("valset").await?;
+    let valset = Valset::new(
+        "valset",
+        Box::new(
+            QmdbStore::sync_from(
+                scratch_context.child(child_label("valset")),
+                "valset",
+                target,
+                resolver,
+            )
+            .await?,
+        ),
+    );
 
     let (bytes, root) = snapshot_of(SAGA_MODULE_ID).await?;
     let mut saga = genesis_saga_wasm();

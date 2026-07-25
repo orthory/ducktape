@@ -35,10 +35,11 @@ fn member_key(seed: u8) -> Vec<u8> {
 }
 
 /// a host with governance gating a valset seeded with members 1 and 2.
-fn gov_host() -> Host {
-    let mut valset = Valset::new("valset");
-    valset.insert(member_key(1));
-    valset.insert(member_key(2));
+async fn gov_host() -> Host {
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+    valset.seed(member_key(1)).await.expect("seed valset");
+    valset.seed(member_key(2)).await.expect("seed valset");
+    valset.finish_seed().await.expect("seed valset");
     Host::genesis(vec![
         Box::new(valset),
         Box::new(Governance::new(
@@ -115,7 +116,7 @@ async fn proposal_status(host: &Host, id: &str) -> Option<ProposalStatus> {
 #[test]
 fn a_passing_proposal_admits_the_validator_and_direct_writes_are_refused() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (m1, m2, newcomer) = (member_key(1), member_key(2), member_key(9));
 
         // DIRECT external valset writes are refused — the old one-message
@@ -207,7 +208,7 @@ fn an_add_resident_proposal_grants_resident_standing_at_v0() {
     // Grant follow-up — resident standing lands with no protocol upgrade.
     // before this change the Propose itself rejected below protocol version 3.
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (m1, m2, friend) = (member_key(1), member_key(2), member_key(9));
 
         submit_as(
@@ -271,7 +272,7 @@ fn an_add_resident_proposal_grants_resident_standing_at_v0() {
 #[test]
 fn a_passing_proposal_removes_the_validator_and_emits_leave() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (m1, m2) = (member_key(1), member_key(2));
         assert_eq!(validators(&host).await.len(), 2, "seeded with two members");
 
@@ -357,7 +358,7 @@ fn a_passing_proposal_removes_the_validator_and_emits_leave() {
 #[test]
 fn a_member_leaves_by_removing_itself_pending_the_remaining_majority() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (m1, m2) = (member_key(1), member_key(2));
         assert_eq!(validators(&host).await.len(), 2, "seeded with two members");
 
@@ -460,8 +461,9 @@ fn a_single_member_ballot_is_a_deciding_majority() {
     block_on(async {
         let founder = member_key(1);
         let friend = member_key(9);
-        let mut valset = Valset::new("valset");
-        valset.insert(founder.clone());
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        valset.seed(founder.clone()).await.expect("seed valset");
+        valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
             Box::new(valset),
             Box::new(Governance::new(
@@ -551,8 +553,9 @@ fn a_single_member_ballot_is_a_deciding_majority() {
 fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
     block_on(async {
         let founder = member_key(1);
-        let mut valset = Valset::new("valset");
-        valset.insert(founder.clone());
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        valset.seed(founder.clone()).await.expect("seed valset");
+        valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
             Box::new(valset),
             Box::new(Governance::new(
@@ -629,8 +632,9 @@ fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
 fn a_direct_module_origin_leave_of_the_last_validator_is_refused() {
     block_on(async {
         let founder = member_key(1);
-        let mut valset = Valset::new("valset");
-        valset.insert(founder.clone());
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        valset.seed(founder.clone()).await.expect("seed valset");
+        valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![Box::new(valset)]).expect("genesis");
 
         // a System-origin op (genesis orchestration shape) that would empty the
@@ -666,7 +670,7 @@ fn a_direct_module_origin_leave_of_the_last_validator_is_refused() {
 #[test]
 fn non_members_cannot_propose_or_vote_and_minority_rejects() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (m1, m2, outsider) = (member_key(1), member_key(2), member_key(7));
 
         // an outsider cannot propose...
@@ -764,7 +768,7 @@ fn non_members_cannot_propose_or_vote_and_minority_rejects() {
 #[test]
 fn votes_close_at_the_deadline_and_ballots_are_per_member() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (m1, m2) = (member_key(1), member_key(2));
 
         submit_as(
