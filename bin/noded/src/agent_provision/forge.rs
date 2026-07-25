@@ -41,7 +41,7 @@ use compute_service::{
     ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec, assemble_context_doc,
 };
 
-use crate::NodeHandle;
+use crate::node_link::NodeLink;
 
 /// the synthetic domain for agent authorship and attribution. DELIBERATELY in
 /// the network's own `.duck` namespace (duckdns), not a registerable TLD: no
@@ -71,20 +71,20 @@ pub(super) struct ForgeLane {
 }
 
 impl ForgeLane {
-    /// decide the lane ONCE: all three legs (repo base on the handle, a push
+    /// decide the lane ONCE: all three legs (repo base on the link, a push
     /// base, a worktree-capable host git) must hold, else the lane is
     /// `Err(reason)` — permanent for this provisioner's lifetime. the probe
     /// runs only when the config legs are present (no point probing git on a
     /// node that serves no http surface).
     pub(super) fn configure(
-        handle: &NodeHandle,
+        node: &NodeLink,
         push_base: Option<String>,
         committer_name: String,
         probe: impl FnOnce() -> Result<(), String>,
     ) -> Result<Self, String> {
-        let Some(repo_base) = handle.forge_repo.clone() else {
+        let Some(repo_base) = node.forge_repo().map(Path::to_path_buf) else {
             return Err(
-                "this node handle carries no forge repo base — the forge module's \
+                "this node link carries no forge repo base — the forge module's \
                  materialized repos are not reachable here"
                     .into(),
             );
@@ -302,12 +302,12 @@ fn validate_coords(repo: &str, commit: &str, branch: &str) -> Result<(), String>
 /// provision one forge run: verify the repo + pinned commit are materialized
 /// on THIS node, clone it without hardlinks under
 /// the (already D7-validated) run dir, then materialize the W6 skill mounts
-/// beside it. `handle` is the actor lane those mounts check out over (they are
+/// beside it. `node` is the `/v1` lane those mounts check out over (they are
 /// duckfs subtrees whatever the rw source is); `node_url` is this node's http
 /// base, handed to the run as `DUCKTAPE_NODE`.
 pub(super) async fn provision(
     lane: &ForgeLane,
-    handle: NodeHandle,
+    node: NodeLink,
     run_dir: PathBuf,
     ro_root: PathBuf,
     node_url: Option<String>,
@@ -354,15 +354,15 @@ pub(super) async fn provision(
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
         let run_dir = workspace_args.run_dir.clone();
-        // the handle outlives the mounts: the session bind below rides the same
+        // the link outlives the mounts: the session bind below rides the same
         // actor lane.
-        let mount_handle = handle.clone();
+        let mount_node = node.clone();
         // the committed library grant (consensus said it; the assembler obeys).
         let library_readable = spec.library_readable;
         // the same step assembles the run's SOUL from the mounts it just
         // materialized — the only place holding both the curation and the bodies.
         let context_doc = tokio::task::spawn_blocking(move || {
-            super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts, library_readable)
+            super::checkout_ro_mounts(&mount_node, &checkout_ro, &mounts, library_readable)
                 .inspect_err(|_| {
                     // W5: a failed provision removes ALL its own debris. the mount
                     // helper dropped its partial ro tree; the clone goes here.
@@ -377,7 +377,7 @@ pub(super) async fn provision(
     // the clone EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an
     // op on a run that never starts.
-    let session = super::session::open(&handle, spec).await;
+    let session = super::session::open(&node, spec).await;
     let mut env = super::run_env(
         &workspace_args.run_dir,
         ro_dir.as_deref(),

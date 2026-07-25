@@ -62,7 +62,7 @@ mod constants;
 mod cred_cli;
 mod node_http;
 mod tty;
-mod cred_resolve;
+mod compute;
 mod drain_actions;
 mod explorer;
 mod first_contact_join;
@@ -78,7 +78,6 @@ mod lobby;
 #[cfg(test)]
 mod main_tests;
 mod mcp;
-mod oracle_pool;
 mod overlay_book;
 mod plane_metrics;
 mod reachability_plane;
@@ -88,7 +87,6 @@ mod relay;
 mod relay_runtime;
 mod replica;
 mod resident_announce;
-mod resident_dispatch;
 mod resource_limits;
 mod rpc;
 mod services;
@@ -326,7 +324,6 @@ fn run_node(
         // promotion exec-reboot; the serve side and the config key await
         // the follow-up sweep.
         sync_index: _,
-        granted_capabilities,
         sandbox,
         compute_backend,
         sandbox_capacity,
@@ -381,8 +378,7 @@ fn run_node(
         voice_requests,
         code_stage_requests,
         blobs,
-        agent_provisioner,
-        cred_resolver,
+        services,
         gateway_requests,
         gateway_commands,
         terminals,
@@ -403,7 +399,6 @@ fn run_node(
         // the forge worktree lane's committer identity (agent-dogfood M1):
         // every run commit is authored by this node's signer (D2 — the author
         // is the agent).
-        forge_committer: config::hex_bytes(signer.public_key().as_ref()),
         // the owner-gated admin namespace resolves ownership against this node's
         // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice (ADR A2/A4).
         node_key: signer.public_key().as_ref().to_vec(),
@@ -424,7 +419,6 @@ fn run_node(
     // override — see capability-host. host-local only, never consensus.
     // Persistent agent workspaces stay under <storage>; portable run mounts
     // live under agent_runs_root outside it.
-    let agent_dirs = provider_host::AgentDirs::under(&storage);
     // 15s instead of commonware's 60s default: this read/write deadline is
     // the mesh's only half-open detector — see `constants::MESH_IO_TIMEOUT`.
     let rt_cfg = commonware_runtime::tokio::Config::default()
@@ -599,9 +593,7 @@ fn run_node(
                 chain_id.clone(),
                 mesh_state_file.clone(),
                 checkpoint_blocks,
-                granted_capabilities.clone(),
                 sandbox.clone(),
-                compute_backend.clone(),
                 sandbox_capacity.clone(),
                 rpc_listener,
                 http_cmds,
@@ -616,9 +608,7 @@ fn run_node(
                 status.clone(),
                 voice_requests,
                 blobs.clone(),
-                &agent_provisioner,
-                &cred_resolver,
-                &agent_dirs,
+                services.clone(),
                 overlay_slot.clone(),
                 bulk_pacer.clone(),
                 plane_monitor.clone(),
@@ -656,17 +646,13 @@ fn run_node(
                 advertised_reach,
                 checkpoint_blocks,
                 dev_demo,
-                granted_capabilities,
                 sandbox,
-                compute_backend,
                 sandbox_capacity,
                 stream_hub,
                 index,
                 code_stage_requests,
                 blobs,
-                agent_provisioner,
-                cred_resolver,
-                agent_dirs,
+                services,
                 overlay_slot,
                 bulk_pacer,
                 plane_monitor,
@@ -704,9 +690,7 @@ fn run_node(
             checkpoint_blocks,
             promoted,
             dev_demo,
-            granted_capabilities,
             sandbox,
-            compute_backend,
             sandbox_capacity,
             rpc_listener,
             http_cmds,
@@ -720,9 +704,7 @@ fn run_node(
             voice_requests,
             code_stage_requests,
             blobs,
-            agent_provisioner,
-            cred_resolver,
-            agent_dirs,
+            services,
             overlay_slot,
             bulk_pacer,
             plane_monitor,

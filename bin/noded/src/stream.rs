@@ -32,6 +32,19 @@ pub const FILES_SCAN_BUDGET: usize = STREAM_CATCHUP_BUDGET * 4;
 pub const LOG_RING_CAPACITY: usize = 4_096;
 pub const RUN_OUTPUT_MAX_RUNS: usize = 32;
 pub const RUN_OUTPUT_MAX_LINES: usize = 2_048;
+/// the exact width of a run-output id: `runs::dispatch_id_for` is a hex
+/// sha256, and the agent data plane's `valid_event` enforces the same 64-hex
+/// shape before forwarding a line to a peer. This is NOT cosmetic — see
+/// [`ClientMsg::RunOutput`].
+const RUN_OUTPUT_ID_LEN: usize = 64;
+/// the longest run-output line accepted from a ws publisher.
+///
+/// The agent data plane refuses to write a serialized event over 64 KiB, so
+/// this must stay comfortably under that: a line admitted here but refused
+/// there would be the same stream teardown, one layer later. 16 KiB is far
+/// above any real provider line while leaving room for the peer forwarder's
+/// `[node xxxxxxxx] ` prefix and the json envelope.
+const MAX_RUN_OUTPUT_LINE: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -71,6 +84,39 @@ pub enum ClientMsg {
         session: String,
         text: String,
         origin: String,
+    },
+    /// one live output line from a run this node's COMPUTE DAEMON is executing.
+    ///
+    /// The daemon runs out of process, so the in-process `OutputSink` that used
+    /// to feed [`RunOutputRegistry`] cannot reach it any more; this is that sink
+    /// across the process boundary, on the ws connection the daemon already
+    /// holds for work-intake hints. It is a publish, not a subscription, which
+    /// is why it is a `ClientMsg` and not a topic.
+    ///
+    /// Trust: the ws surface is unauthenticated by the trusted-local convention
+    /// (a local process can already read the node's key off disk), and a
+    /// run-output ring is a DISPLAY buffer no consensus decision reads. There is
+    /// deliberately NO entitlement check equivalent to `term_entitled`: a
+    /// terminal session has a node-local id this connection can be checked
+    /// against, while a run id names consensus state a publisher legitimately
+    /// learns from the chain — so subscription is not evidence of authorship and
+    /// gating on it would refuse the daemon its own runs. Spoofing a line into
+    /// another run's DISPLAY ring is the accepted residual risk of the
+    /// trusted-local surface.
+    ///
+    /// What is NOT accepted is an unbounded or malformed one. `id` must be the
+    /// 64-hex shape the agent data plane's `valid_event` enforces, because a
+    /// line that reaches the ring is broadcast to every overlay peer and a
+    /// rejected write there tears the peer's stream down — one bad frame would
+    /// otherwise be a remote, repeatable denial of service against every peer's
+    /// telemetry. `line` is capped for the same reason. Both are checked at this
+    /// boundary and dropped with a stable reason; the ring's own
+    /// `RUN_OUTPUT_MAX_RUNS`/`RUN_OUTPUT_MAX_LINES` bound line COUNT, never
+    /// bytes, so they are no substitute.
+    RunOutput {
+        id: String,
+        stream: RunStream,
+        line: String,
     },
 }
 
@@ -718,6 +764,13 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                             Ok(ClientMsg::TermCommand { session, text, origin }) => {
                                 handle_term_command(&handle, &topics, &session, origin, text);
                             }
+                            // a compute daemon's live run tail: append to the
+                            // same ring the in-process sink used to feed, so
+                            // `run-output:<id>` subscribers cannot tell which
+                            // process produced the line.
+                            Ok(ClientMsg::RunOutput { id, stream, line }) => {
+                                handle_run_output(&hub, id, stream, line);
+                            }
                             Ok(msg) => {
                                 let frames = handle_client_msg(&handle, &mut topics, msg);
                                 if !send_frames(&mut socket, frames).await {
@@ -822,8 +875,37 @@ fn handle_client_msg(
         // match stays exhaustive.
         ClientMsg::TermInput { .. }
         | ClientMsg::TermResize { .. }
-        | ClientMsg::TermCommand { .. } => Vec::new(),
+        | ClientMsg::TermCommand { .. }
+        | ClientMsg::RunOutput { .. } => Vec::new(),
     }
+}
+
+/// Admit one published run-output line, or drop it with a named reason.
+///
+/// The two checks are a trust boundary, not tidiness: see [`ClientMsg::RunOutput`].
+/// Dropping is deliberate — a malformed line is not worth closing an otherwise
+/// healthy publisher's connection over, and the `warn` carries the counter.
+fn handle_run_output(hub: &StreamHub, id: String, stream: RunStream, line: String) {
+    let id_well_formed =
+        id.len() == RUN_OUTPUT_ID_LEN && id.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !id_well_formed {
+        tracing::warn!(
+            target: "ducktape::agent",
+            reason = "malformed_run_id",
+            "run output dropped"
+        );
+        return;
+    }
+    if line.len() > MAX_RUN_OUTPUT_LINE {
+        tracing::warn!(
+            target: "ducktape::agent",
+            bytes = line.len(),
+            reason = "run_output_line_too_long",
+            "run output dropped"
+        );
+        return;
+    }
+    hub.run_output().append(id, stream, line);
 }
 
 /// a ws connection may drive a terminal session only if it has SUBSCRIBED to
@@ -1963,6 +2045,71 @@ mod tests {
                 .frames
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn published_run_output_is_bounded_and_shaped_before_it_reaches_the_ring() {
+        // the guard exists because a line that reaches the ring is broadcast to
+        // every overlay peer, and the agent data plane REFUSES to write an event
+        // whose id is not 64-hex — treating that refusal as fatal to the peer
+        // stream. One malformed frame would otherwise tear down and reopen every
+        // peer's telemetry, repeatably, from any local ws client.
+        let hub = StreamHub::new(16);
+        let runs = hub.run_output();
+        let good = "a".repeat(RUN_OUTPUT_ID_LEN);
+
+        // every id shape the peer path would reject is dropped here instead.
+        for bad in [
+            String::from("x"),
+            String::new(),
+            "a".repeat(RUN_OUTPUT_ID_LEN - 1),
+            "a".repeat(RUN_OUTPUT_ID_LEN + 1),
+            "g".repeat(RUN_OUTPUT_ID_LEN),
+            format!("{}-", "a".repeat(RUN_OUTPUT_ID_LEN - 1)),
+        ] {
+            handle_run_output(&hub, bad.clone(), RunStream::Stdout, "hi".into());
+            let mut seq = 0;
+            assert!(
+                catch_up_run_output(&format!("run-output:{bad}"), &bad, &mut seq, &runs)
+                    .frames
+                    .is_empty(),
+                "id {bad:?} must never reach the ring"
+            );
+        }
+
+        // an oversized line is dropped too — the ring's caps bound line COUNT,
+        // never bytes.
+        handle_run_output(
+            &hub,
+            good.clone(),
+            RunStream::Stdout,
+            "x".repeat(MAX_RUN_OUTPUT_LINE + 1),
+        );
+        let mut seq = 0;
+        assert!(
+            catch_up_run_output(&format!("run-output:{good}"), &good, &mut seq, &runs)
+                .frames
+                .is_empty(),
+            "an oversized line must never reach the ring"
+        );
+
+        // the real shape — a hex sha256 run key, an ordinary line — is admitted,
+        // so the guard bounds the surface without refusing the daemon its own
+        // runs.
+        handle_run_output(&hub, good.clone(), RunStream::Stdout, "real output".into());
+        let mut seq = 0;
+        let caught = catch_up_run_output(&format!("run-output:{good}"), &good, &mut seq, &runs);
+        assert_eq!(caught.frames.len(), 1, "a well-formed line is admitted");
+        // and a line exactly AT the cap is still admitted (the bound is not
+        // accidentally off by one against real output).
+        handle_run_output(
+            &hub,
+            good.clone(),
+            RunStream::Stderr,
+            "x".repeat(MAX_RUN_OUTPUT_LINE),
+        );
+        let caught = catch_up_run_output(&format!("run-output:{good}"), &good, &mut seq, &runs);
+        assert_eq!(caught.frames.len(), 1, "a line at the cap is admitted");
     }
 
     #[test]

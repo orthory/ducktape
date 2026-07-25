@@ -90,6 +90,9 @@ commonware-runtime = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
+# the service-daemon lane (`node_link`): a daemon reaches its node over the
+# node's own /v1 surface, never the in-process actor channel.
+reqwest = { workspace = true }
 rand = "0.8"
 async-trait = { workspace = true }
 futures = "0.3"

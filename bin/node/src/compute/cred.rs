@@ -16,17 +16,16 @@
 //! fast refusal before any provider spawns. The owner's gateway remains the
 //! final word, since the traffic terminates there.
 //!
-//! The resolver reads state over the same committed-query lane
-//! (`NodeCommand::Query`) the agent provisioner uses, so it sees exactly what
-//! consensus committed.
+//! The resolver reads state over the same committed-query lane (`/v1/query`)
+//! the agent provisioner uses, so it sees exactly what consensus committed —
+//! and it runs in the COMPUTE DAEMON's process, so "the executing node" is the
+//! node this daemon serves.
 
 use provider_host::{AirlockConfig, CredentialKind, ResolvedCredential};
 use compute_service::{CredentialResolver, Resolved};
-use futures::SinkExt as _;
-use futures::channel::{mpsc, oneshot};
 use gateway::{CredentialRecord, GatewayQuery, GatewayReply, HandleRegistration, credential_use_allowed};
 use identity::{AccountView, IdentityQuery, IdentityReply};
-use noded::{NodeCommand, NodeHandle};
+use noded::node_link::NodeLink;
 use saga::{SagaOrigin, SagaQuery, SagaReply};
 
 /// The gateway route label the co-hosted airlock gateway registers itself under
@@ -35,10 +34,10 @@ use saga::{SagaOrigin, SagaQuery, SagaReply};
 const AIRLOCK_ROUTE: &str = "airlock";
 
 /// Resolves a run's named credential against committed state on the executing
-/// node. Cheap to clone (holds a command-lane sender and the local browser
-/// gateway URL); built once at boot from the node's `http_handle`.
+/// node. Cheap to clone (holds the node lane and the local browser gateway
+/// URL); built once at daemon boot.
 pub(crate) struct NodeCredentialResolver {
-    commands: mpsc::Sender<NodeCommand>,
+    node: NodeLink,
     /// this node's browser-gateway base URL — the `via` a self-host airlock
     /// config routes through onto the overlay gateway plane. `None` on a node
     /// with no browser gateway, which then cannot host a lent-credential run.
@@ -46,28 +45,17 @@ pub(crate) struct NodeCredentialResolver {
 }
 
 impl NodeCredentialResolver {
-    pub(crate) fn new(handle: &NodeHandle) -> Self {
-        Self {
-            commands: handle.command_sender(),
-            via: handle.browser_gateway_url(),
-        }
+    /// `via` is the node's browser-gateway base URL, read once at daemon boot
+    /// from `GET /v1/gateway/browser`. `None` — a node serving no browser
+    /// gateway — cannot host a lent-credential run, and says so at resolve.
+    pub(crate) fn new(node: NodeLink, via: Option<String>) -> Self {
+        Self { node, via }
     }
 
-    /// Run one committed query over the actor lane and return its raw reply
-    /// bytes. The three module reads below each decode their own reply.
+    /// Run one committed query over the node's `/v1` lane and return its raw
+    /// reply bytes. The three module reads below each decode their own reply.
     async fn query(&self, target: &str, req: Vec<u8>) -> Result<Vec<u8>, String> {
-        let (reply, rx) = oneshot::channel();
-        let mut commands = self.commands.clone();
-        commands
-            .send(NodeCommand::Query {
-                target: target.to_string(),
-                req,
-                reply,
-            })
-            .await
-            .map_err(|_| "node actor is gone".to_string())?;
-        rx.await
-            .map_err(|_| "node actor dropped the query reply".to_string())?
+        self.node.query(target, &req).await
     }
 
     async fn credential_record(&self, name: &str) -> Result<Option<CredentialRecord>, String> {

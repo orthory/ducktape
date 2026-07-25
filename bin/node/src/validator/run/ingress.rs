@@ -192,32 +192,6 @@ impl ValidatorRuntime<'_> {
         let _ = reply.send(resp);
     }
 
-    pub(super) async fn on_oracle_result(&mut self, msg: Msg) {
-        let Self {
-            node,
-            next_seq,
-            signer,
-            label,
-            ..
-        } = self;
-
-        // a completed off-loop provider run: its OracleResult op
-        // re-enters the ordered lane as an ordinary signed
-        // submit — the oracle-as-op, unchanged; only WHERE the
-        // provider ran moved.
-        let seq = *next_seq;
-        *next_seq += 1;
-        if let Err(e) = node.submit(signer, seq, msg).await {
-            tracing::warn!(
-                target: "ducktape::saga",
-                node = %label,
-                error = %e,
-                reason = "oracle_result_submit_failed",
-                "oracle result dropped"
-            );
-        }
-    }
-
     /// the join gate (join ADR §4), arriving over the WireGuard-tunnel
     /// doorbell: the reachability plane already OPENED and VERIFIED the sealed
     /// intro (V1–V5 crypto, V4 expiry, V8 role) and installed the tunnel —

@@ -40,7 +40,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use crate::{NodeCommand, NodeHandle, ORACLE_ORIGIN};
+use crate::node_link::NodeLink;
 
 /// the module that owns the session registry.
 const RUNS_MODULE: &str = "runs";
@@ -69,7 +69,7 @@ impl Drop for RunSession {
 }
 
 struct ActionState {
-    handle: NodeHandle,
+    node: NodeLink,
     signer: ed25519::PrivateKey,
     run_id: String,
     token: String,
@@ -90,7 +90,7 @@ struct ActionRequest {
 /// never an `Err`: a session is an ADDITIVE capability, and refusing to
 /// provision a workspace because the tool plane could not be opened would fail
 /// runs that used to work.
-pub(super) async fn open(handle: &NodeHandle, spec: &WorkspaceSpec) -> Option<RunSession> {
+pub(super) async fn open(node: &NodeLink, spec: &WorkspaceSpec) -> Option<RunSession> {
     let agent = spec.agent_id.as_ref()?;
     // the CONSENSUS id or nothing. `spec.run_id` is `{saga_id}:{attempt}` — a
     // host-local dir key that names no run in `runs`, so binding on it would
@@ -119,8 +119,8 @@ pub(super) async fn open(handle: &NodeHandle, spec: &WorkspaceSpec) -> Option<Ru
         run_id: run_id.clone(),
         session_key: key.public_key().as_ref().to_vec(),
     });
-    match submit(handle, payload).await {
-        Ok(()) => match start_action_server(handle.clone(), key, run_id.clone()).await {
+    match submit(node, payload).await {
+        Ok(()) => match start_action_server(node.clone(), key, run_id.clone()).await {
             Ok(session) => Some(session),
             Err(detail) => {
                 tracing::warn!(
@@ -151,7 +151,7 @@ pub(super) async fn open(handle: &NodeHandle, spec: &WorkspaceSpec) -> Option<Ru
 }
 
 async fn start_action_server(
-    handle: NodeHandle,
+    node: NodeLink,
     signer: ed25519::PrivateKey,
     run_id: String,
 ) -> Result<RunSession, String> {
@@ -169,7 +169,7 @@ async fn start_action_server(
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
     let token = duckfs_core::to_hex(&secret);
     let state = Arc::new(ActionState {
-        handle,
+        node,
         signer,
         run_id: run_id.clone(),
         token: token.clone(),
@@ -230,19 +230,9 @@ async fn run_action(
     let mut next_seq = state.seq.lock().await;
     let frame = node::encode_frame(&state.signer, *next_seq, &msg, None);
     *next_seq += 1;
-    let (reply, rx) = oneshot::channel();
-    if state
-        .handle
-        .send(NodeCommand::SubmitFrame { frame, reply })
-        .await
-        .is_err()
-    {
-        return action_response(StatusCode::SERVICE_UNAVAILABLE, "node actor unavailable");
-    }
-    match rx.await {
-        Ok(Ok(_)) => action_response(StatusCode::OK, "ok"),
-        Ok(Err(error)) => action_response(StatusCode::BAD_REQUEST, &error),
-        Err(_) => action_response(StatusCode::SERVICE_UNAVAILABLE, "node actor dropped reply"),
+    match state.node.submit_frame(frame).await {
+        Ok(()) => action_response(StatusCode::OK, "ok"),
+        Err(error) => action_response(StatusCode::BAD_REQUEST, &error),
     }
 }
 
@@ -255,30 +245,14 @@ fn action_response(status: StatusCode, message: &str) -> Response<Body> {
         .expect("static scoped action response")
 }
 
-/// submit the bind on the node's ordinary actor lane.
+/// submit the bind on the node's ordinary submit lane.
 ///
-/// the `origin` here is only ever read by the EMBEDDED daemon, whose executing
-/// identity is that string ([`ORACLE_ORIGIN`] — the same one its dispatch pool
-/// claims runs under, so it IS the assignee `runs` will check against). the real
-/// node discards it and frames the op with its node key, which is the assignee
-/// there. one call, correct on both: the lane's own identity is the right one,
-/// which is exactly why this must NOT sign the bind itself.
-async fn submit(handle: &NodeHandle, payload: Vec<u8>) -> Result<(), String> {
-    let (reply, rx) = oneshot::channel();
-    handle
-        .send(NodeCommand::Submit {
-            target: RUNS_MODULE.into(),
-            payload,
-            origin: ORACLE_ORIGIN.to_vec(),
-            reply,
-        })
-        .await
-        .map_err(|_| "the node actor is gone".to_string())?;
-    match rx.await {
-        Ok(Ok(_block)) => Ok(()),
-        // a module rejection is the interesting case and rides through verbatim
-        // — "not the run's assignee" is the one worth reading in a log.
-        Ok(Err(detail)) => Err(detail),
-        Err(_) => Err("the node actor dropped the reply".into()),
-    }
+/// `/v1/submit` frames the op with the NODE's key, and that node is the run's
+/// committed lease-holder — which is exactly the assignee `runs` checks. That
+/// is why this must NOT sign the bind itself: the lane's own identity is the
+/// right one, and a session key signing its own bind would prove nothing.
+async fn submit(node: &NodeLink, payload: Vec<u8>) -> Result<(), String> {
+    // a module rejection rides through verbatim — "not the run's assignee" is
+    // the one worth reading in a log.
+    node.submit(RUNS_MODULE, &payload).await.map(|_height| ())
 }

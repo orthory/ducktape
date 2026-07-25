@@ -19,7 +19,7 @@ use crate::reachability_plane::GateOutcomes;
 use crate::rpc::{JoinRequestRecord, RpcJob};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
-use crate::{lobby, oracle_pool, relay_runtime, voice_plane};
+use crate::{lobby, relay_runtime, voice_plane};
 
 pub(super) type ValidatorNode = node::OrderedNode<
     consensus::SimplexOrderer,
@@ -127,11 +127,10 @@ pub(super) struct ValidatorLoopState<'a> {
     /// sync retention lease (unix secs of the last served state-sync request)
     /// — the drain defers oplog pruning while it is fresh.
     pub(super) sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub(super) granted_capabilities: Vec<String>,
+    /// the workspace dir whose `services.toml` carries the compute grant —
+    /// re-read by the announce pump, never latched at boot.
+    pub(super) workspace: std::path::PathBuf,
     pub(super) sandbox: Option<provider_host::SandboxBackend>,
-    /// the compute SERVICE's backend: the table gated on the user's
-    /// `services.toml` grant. Drives discovery/pool/announce only.
-    pub(super) compute_backend: Option<provider_host::SandboxBackend>,
     pub(super) sandbox_capacity: std::collections::BTreeMap<String, u64>,
     /// the local rpc bridge's parsed-request queue — the caller owns the
     /// listener spawn (a promoted node's listener pump carries over from
@@ -142,9 +141,10 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) stream_hub: noded::StreamHub,
     pub(super) index: std::sync::Arc<indexer::IndexStore>,
     pub(super) blobs: noded::blobs::BlobHandle,
-    pub(super) agent_provisioner: compute_service::SharedProvisioner,
-    pub(super) cred_resolver: compute_service::SharedCredentialResolver,
-    pub(super) agent_dirs: provider_host::AgentDirs,
+    /// the volatile service-signaling catalog: the live half of the capability
+    /// announce (`grant ∩ hello`). Shared with the http surface's handle, so a
+    /// daemon's hello is visible to the announce pump the moment it lands.
+    pub(super) services: noded::services::ServiceCatalog,
     pub(super) metrics: noded::NodeMetrics,
     pub(super) status: noded::StatusCell,
     pub(super) status_public_key: String,
@@ -265,18 +265,15 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         dev_demo,
         checkpoint_blocks,
         sync_lease,
-        granted_capabilities,
+        workspace,
         sandbox,
-        compute_backend,
         sandbox_capacity,
         rpc_ingress,
         http_cmds,
         stream_hub,
         index,
         blobs,
-        agent_provisioner,
-        cred_resolver,
-        agent_dirs,
+        services,
         metrics,
         status,
         status_public_key,
@@ -359,25 +356,21 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let last_crank = context.current();
     // throttle for the dispatch delivery-nudge pump below.
     let last_nudge = context.current();
-    // the host-owned worker set (reactor seam): effects of finalized
-    // blocks are offered here, and claimed follow-ups re-enter the ordered
-    // lane as their own blocks.
-    // load capability specs and discover this host's installed executor
-    // CLIs (BYO — no credential handling here). the discovered tag set is
-    // BOTH what the oracle worker can run and what this node announces to
-    // the capability registry, so an announce can never claim more than
-    // the host provides, and the user's grant narrows it further —
-    // never the reverse. routing and
-    // default models live in the specs (docs/records/specs/capability-spec.md); a broken
-    // operator spec is a boot error, not a silently dropped executor.
-    // the node-private podman service (own socket + storage + egress hooks) must
-    // be up before anything is discovered or spawned; held for the node's life.
-    // A non-Podman backend yields `None`. Fail-closed: a start failure panics
-    // like a broken spec would, never a silently unsandboxed node.
+    // the host-owned worker set (reactor seam): effects of finalized blocks are
+    // offered here. It is EMPTY — dispatch work is executed by the standalone
+    // compute daemon (`ducktape service run compute`), which discovers its
+    // assignments from committed state and submits results over this node's own
+    // /v1 surface. The node constructs no provider set, no dispatch pool and no
+    // resource ledger; an unclaimed effect still surfaces through the drain's
+    // module notes, which is the honest diagnostic on a node whose daemon is
+    // not running.
     //
-    // keyed on the `[sandbox]` TABLE, not the compute grant: the interactive
-    // terminal plane runs its ptys in this same service, so a node the
-    // operator gave a sandbox but no compute service still needs it up.
+    // the node-private podman service (own socket + storage + egress hooks) is
+    // still the NODE's: its interactive terminal plane spawns ptys through it,
+    // and the compute daemon is a client of the same socket (container
+    // ownership is label-scoped, not socket-scoped). Held for the node's life.
+    // A non-Podman backend yields `None`. Fail-closed: a start failure panics,
+    // never a silently unsandboxed node.
     let self_exe = std::env::current_exe()
         .unwrap_or_else(|e| panic!("cannot resolve this node's own executable: {e}"));
     let _podman_service = match &sandbox {
@@ -386,52 +379,20 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
             .unwrap_or_else(|e| panic!("podman sandbox service failed to start: {e}")),
         None => None,
     };
-    // no compute plane — no `[sandbox]` table, or no `service enable compute`
-    // grant — means nothing is discovered or announced and the pool below has
-    // nothing it could ever spawn. A bare host spawn is unrepresentable.
-    let providers = match compute_backend {
-        Some(backend) => provider_host::discover(
-            signer.public_key().as_ref(),
-            agent_dirs.clone(),
-            Some(stream_hub.run_output().output_sink()),
-            backend,
-        )
-        .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
-        None => provider_host::ProviderSet::empty(),
-    };
-    // never more than the user granted, never more than the host provides.
-    let my_capabilities =
-        crate::services::announceable(&granted_capabilities, providers.capabilities());
-    // OFF-LOOP execution: the pool gates effects inline (lease check —
-    // WorkerRequests leased to another node's key are skipped, not
-    // double-run — under this node's submit key) but runs the provider
-    // CLI on spawned background tasks; completed results come back over
-    // `oracle_results` (an ingress arm below) and re-enter the ordered
-    // lane as ordinary signed submits, so a minutes-long run never
-    // stalls the drain/rpc/heartbeat arms of this loop.
-    let (oracle_worker, _oracle_control, mut oracle_results) = oracle_pool::build(
-        context,
-        providers,
-        signer.public_key().as_ref().to_vec(),
-        agent_provisioner.clone(),
-        // the announced capacity IS the pool's ledger — one source, so the
-        // scheduler never promises what this node can't seat.
-        sandbox_capacity.clone(),
-        Some(cred_resolver.clone()),
-    );
-    let workers: Vec<Box<dyn host::worker::Worker>> = vec![oracle_worker];
+    let workers: Vec<Box<dyn host::worker::Worker>> = Vec::new();
     // the CODE readiness self-signaller for pending code swaps — verifies (or
     // fetches) the committed component bytes and emits one truthful
     // `SignalReady` per swap.
     let code_signaller =
         super::code_announce::CodeReadinessSignaller::new(signer.public_key().as_ref().to_vec());
     let (fetch_done_tx, fetch_done_rx) = tokio::sync::mpsc::unbounded_channel();
-    // the capability self-announcer: publishes this node's discovered
-    // provider set into the capability registry once (state-driven,
-    // idempotent). inert when this host installed no executor CLIs.
+    // the capability self-announcer: publishes `grant ∩ live hello` into the
+    // capability registry (state-driven, idempotent). Inert while no compute
+    // daemon is signaling — a grant alone announces nothing.
     let announcer = CapabilityAnnouncer::new(
         signer.public_key().as_ref().to_vec(),
-        my_capabilities,
+        workspace,
+        services,
         sandbox_capacity,
     );
     // graceful checkpoint on process signals (SIGTERM/SIGINT): the desktop
@@ -587,11 +548,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
             job = rpc_ingress.next() => {
                 if let Some(job) = job {
                     runtime.on_rpc(job).await;
-                }
-            }
-            result = oracle_results.next() => {
-                if let Some(msg) = result {
-                    runtime.on_oracle_result(msg).await;
                 }
             }
             fwd = gate_fwd_rx.recv().fuse() => {

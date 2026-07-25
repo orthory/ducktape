@@ -92,15 +92,6 @@ pub struct Resolved {
     /// shipped-index warm start when joining (default on); see
     /// `NodeToml::sync_index`.
     pub sync_index: bool,
-    /// the capability tags the user consented to when granting the compute
-    /// service (`services.toml`). The announce is the INTERSECTION of these
-    /// with what this host actually discovers, so a node can never advertise
-    /// more than it was granted OR more than it provides. EMPTY = announce
-    /// nothing: either no grant at all, or a grant that deliberately carries
-    /// no tags (the accept-lane-only provider — it still executes claimed
-    /// work, it just never enters a tag's rendezvous pool). There is no
-    /// separate announce switch; the grant IS the switch.
-    pub granted_capabilities: Vec<String>,
     /// the reachability plane's coordination privacy (per-network operational
     /// policy). `Private` (the default) requires a genesis-issued `CoordCap`
     /// for a node outside the genesis validator set; `Public` accepts any
@@ -175,18 +166,19 @@ pub const DEFAULT_TART_IMAGE: &str = "ghcr.io/cirruslabs/macos-sonoma-base:lates
 fn gate_on_compute_grant(
     sandbox: Option<&SandboxBackend>,
     workspace: &Path,
-) -> Result<(Option<SandboxBackend>, Vec<String>), String> {
+) -> Result<Option<SandboxBackend>, String> {
     let Some(backend) = sandbox else {
         // no table at all: a consensus-only node, silently and by choice.
-        return Ok((None, Vec::new()));
+        return Ok(None);
     };
     // This is a pure decision: `resolve` runs for EVERY verb that reads a
     // workspace, so the "you are compute-less" warning belongs at the node
     // boot that actually takes the branch, not here. See `run_node_verb`.
-    let Some(grant) = crate::services::grant_for(workspace, crate::services::COMPUTE_KIND)? else {
-        return Ok((None, Vec::new()));
-    };
-    Ok((Some(backend.clone()), grant.capabilities))
+    let granted = crate::services::grant_for(workspace, crate::services::COMPUTE_KIND)?.is_some();
+    // the grant's TAGS are not carried out of here: the announce re-reads them
+    // per tick (see `validator::announce`), so a copy latched at resolve time
+    // could only ever go stale.
+    Ok(granted.then(|| backend.clone()))
 }
 
 /// resolve the operator's `[sandbox]` table into the compute plane: `None`
@@ -351,7 +343,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     )?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised_value())?;
     let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref(), base)?;
-    let (compute_backend, granted_capabilities) = gate_on_compute_grant(sandbox.as_ref(), base)?;
+    let compute_backend = gate_on_compute_grant(sandbox.as_ref(), base)?;
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -377,7 +369,6 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         invite_wireguard: load_invite_wireguard(base)?,
         invite_fronts: load_invite_fronts(base)?,
         sync_index: raw.sync_index,
-        granted_capabilities,
         coordination: descriptor.coordination(),
         // the reachability plane presents this on every coordinator request; a
         // genesis validator needs none (admitted by membership), a joiner is
@@ -568,8 +559,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref(), &storage_dir)?;
     // the dev shape's per-process state dir stands in as its workspace, so its
     // grant file sits beside its storage — one rule for both shapes.
-    let (compute_backend, granted_capabilities) =
-        gate_on_compute_grant(sandbox.as_ref(), &storage_dir)?;
+    let compute_backend = gate_on_compute_grant(sandbox.as_ref(), &storage_dir)?;
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let invite_listen = resolved_intro_listener(
         raw.advertised.as_deref(),
@@ -667,7 +657,6 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         invite_wireguard: None,
         invite_fronts: Vec::new(),
         sync_index: raw.sync_index.unwrap_or(true),
-        granted_capabilities,
         // the dev shape wires direct sockets only — no real coordinator, so
         // the coordination mode defaults to Private and no cap is presented.
         coordination: Coordination::Private,
@@ -1050,7 +1039,6 @@ mod tests {
         // isolated, never that the user consented to run any.
         std::fs::write(dir.join("node.toml"), format!("{base}{sandbox}")).expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve ungranted");
-        assert!(resolved.granted_capabilities.is_empty());
         assert_eq!(resolved.compute_backend, None, "no grant, no compute plane");
         // the grant lives in the WORKSPACE, which for the dev shape is the
         // per-process state dir rather than the config dir.
@@ -1059,10 +1047,6 @@ mod tests {
         // a grant carrying tags is what opts this node into the pools.
         write_compute_grant(&workspace, &["quack-text", "quack-json"]);
         let resolved = resolve(&dir.join("node.toml")).expect("resolve granted");
-        assert_eq!(
-            resolved.granted_capabilities,
-            vec!["quack-text".to_string(), "quack-json".to_string()]
-        );
         assert!(resolved.compute_backend.is_some());
 
         // a grant carrying NO tags is the accept-lane-only provider: the
@@ -1070,7 +1054,6 @@ mod tests {
         // to express that state — there is no second switch.
         write_compute_grant(&workspace, &[]);
         let resolved = resolve(&dir.join("node.toml")).expect("resolve accept-lane-only");
-        assert!(resolved.granted_capabilities.is_empty());
         assert!(
             resolved.compute_backend.is_some(),
             "an empty grant still runs work, it just never advertises"

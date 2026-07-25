@@ -40,18 +40,20 @@ pub(crate) struct ResidentAnnouncer {
 impl ResidentAnnouncer {
     pub(crate) fn new(
         me: Vec<u8>,
-        capabilities: Vec<String>,
+        workspace: std::path::PathBuf,
+        services: noded::services::ServiceCatalog,
         resources: BTreeMap<String, u64>,
     ) -> Self {
         Self {
-            announcer: CapabilityAnnouncer::new(me, capabilities, resources),
+            announcer: CapabilityAnnouncer::new(me, workspace, services, resources),
             in_flight: None,
         }
     }
 
-    /// the discovered tag set this pump announces — for log lines.
-    pub(crate) fn capabilities(&self) -> &[String] {
-        &self.announcer.capabilities
+    /// the tag set this pump would announce right now (`grant ∩ live hello`)
+    /// — for log lines.
+    pub(crate) fn capabilities(&mut self) -> Vec<String> {
+        self.announcer.offered()
     }
 
     /// query the served boundary's committed registry and decide whether an
@@ -120,10 +122,15 @@ mod tests {
 
     fn pump() -> ResidentAnnouncer {
         // a resident on a direct-spawn host: tags only, no announced capacity.
-        let mut p = ResidentAnnouncer::new(vec![1u8; 32], vec!["codex".into()], BTreeMap::new());
+        let mut p = ResidentAnnouncer::new(
+            vec![1u8; 32],
+            std::path::PathBuf::from("/nonexistent-workspace"),
+            noded::services::ServiceCatalog::default(),
+            BTreeMap::new(),
+        );
         // simulate a decided announce: the decision core latched the set.
         assert_eq!(
-            p.announcer.decide(&[], &BTreeMap::new()),
+            p.announcer.decide(&["codex".to_string()], &[], &BTreeMap::new()),
             Some((vec!["codex".to_string()], BTreeMap::new())),
             "an empty committed registry decides an announce"
         );
@@ -165,7 +172,7 @@ mod tests {
             "rejected: un-latched so the next tick re-decides"
         );
         assert_eq!(
-            p.announcer.decide(&[], &BTreeMap::new()),
+            p.announcer.decide(&["codex".to_string()], &[], &BTreeMap::new()),
             Some((vec!["codex".to_string()], BTreeMap::new())),
             "and the re-decision announces again"
         );

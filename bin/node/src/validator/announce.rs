@@ -5,16 +5,36 @@ use sdk::Msg;
 
 /// the capability self-announcer: it polls the committed
 /// registry each pump tick and, when this node's announced set differs from
-/// what discovery found locally, self-submits ONE declarative
+/// what it can truthfully offer, self-submits ONE declarative
 /// [`CapabilityMsg::Announce`]. state-driven (survives restart/late-join) and
 /// idempotent: once the committed set matches, it stays quiet. a node with no
 /// providers announces nothing.
+///
+/// ## where the offered set comes from
+///
+/// The node discovers nothing any more — the compute plane is a standalone
+/// daemon — so the offered set is `grant ∩ live hello`:
+///
+/// - **grant**: the tags the user reviewed and consented to at `service enable`
+///   (`services.toml`). Consent can only narrow.
+/// - **live hello**: what a daemon is signaling to this node RIGHT NOW
+///   ([`noded::services::ServiceCatalog`]). Truth can only narrow.
+///
+/// Neither side may widen the other, and BOTH are re-read every tick — so a
+/// node holding a grant with no daemon signaling announces NOTHING, a stopped
+/// daemon retracts within the hello TTL, and `service enable`/`disable` take
+/// effect without restarting the node. (Re-reading `services.toml` per tick is
+/// free beside the two committed queries this pump already issues.)
 pub(crate) struct CapabilityAnnouncer {
     /// this node's own validator pubkey bytes — the registry identity.
     me: Vec<u8>,
-    /// the capability tags discovery found on this host, sorted — the truthful
-    /// set to announce. empty means this node provides nothing.
-    pub(crate) capabilities: Vec<String>,
+    /// the workspace whose `services.toml` carries the user's consent. Read
+    /// per tick rather than latched at boot: consent is the operator's live
+    /// decision, and a grant that needed a restart to take effect would make
+    /// `disable` a suggestion rather than a revocation.
+    workspace: std::path::PathBuf,
+    /// the volatile signaling catalog — the live half of the intersection.
+    services: noded::services::ServiceCatalog,
     /// the numeric capacity announced ALONGSIDE the tags: probed host totals
     /// for a Podman node, EMPTY for a direct-spawn one (a direct node makes no
     /// capacity promise). Forced empty whenever `capabilities` is empty —
@@ -23,26 +43,85 @@ pub(crate) struct CapabilityAnnouncer {
     /// the (tags, resources) pair we last SUBMITTED (not yet observed
     /// committed), latched so an in-flight announce is not re-sent every tick.
     pub(crate) announced: Option<(Vec<String>, BTreeMap<String, u64>)>,
+    /// whether the last grant read failed — latched so a corrupt
+    /// `services.toml` is reported once, not once per drain tick.
+    grant_unreadable: bool,
 }
 
 impl CapabilityAnnouncer {
     pub(crate) fn new(
         me: Vec<u8>,
-        capabilities: Vec<String>,
+        workspace: std::path::PathBuf,
+        services: noded::services::ServiceCatalog,
         resources: BTreeMap<String, u64>,
     ) -> Self {
         Self {
             me,
-            capabilities,
+            workspace,
+            services,
             resources,
             announced: None,
+            grant_unreadable: false,
         }
+    }
+
+    /// the tags the user's compute grant consents to right now.
+    ///
+    /// An absent record grants nothing — the ordinary un-enabled node. An
+    /// UNREADABLE one also announces nothing (consent that cannot be read is
+    /// not consent), but it says so: silently retracting a live node's whole
+    /// announce because someone corrupted a toml is exactly the failure that
+    /// must not be quiet. Latched, because this runs on the drain tick.
+    fn granted(&mut self) -> Vec<String> {
+        match crate::services::grant_for(&self.workspace, crate::services::COMPUTE_KIND) {
+            Ok(grant) => {
+                if self.grant_unreadable {
+                    self.grant_unreadable = false;
+                    tracing::info!(target: "ducktape::service", "compute grant readable again");
+                }
+                grant.map(|grant| grant.capabilities).unwrap_or_default()
+            }
+            Err(error) => {
+                if !self.grant_unreadable {
+                    self.grant_unreadable = true;
+                    tracing::warn!(
+                        target: "ducktape::service",
+                        reason = "grant_unreadable",
+                        "compute grant cannot be read; this node announces nothing until it is \
+                         repaired: {error}"
+                    );
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// what this node may truthfully announce right now: the user's grant
+    /// INTERSECTED with what a daemon is currently offering over its hello.
+    ///
+    /// The live half is read FIRST and short-circuits: with nothing signaling
+    /// the intersection is empty whatever the grant says, so the common case (a
+    /// node with no compute daemon) never touches the disk — this runs on the
+    /// async drain tick at ~10 Hz.
+    pub(crate) fn offered(&mut self) -> Vec<String> {
+        let signaling = self.services.live(std::time::Instant::now());
+        let live: std::collections::BTreeSet<&str> = signaling
+            .iter()
+            .flat_map(|entry| entry.capabilities.iter().map(String::as_str))
+            .collect();
+        if live.is_empty() {
+            return Vec::new();
+        }
+        self.granted()
+            .into_iter()
+            .filter(|tag| live.contains(tag.as_str()))
+            .collect()
     }
 
     /// this announce's resources, with the invariant applied: empty tags carry
     /// no resources (resources-without-tags is a module-level reject).
-    fn effective_resources(&self) -> BTreeMap<String, u64> {
-        if self.capabilities.is_empty() {
+    fn effective_resources(&self, offered: &[String]) -> BTreeMap<String, u64> {
+        if offered.is_empty() {
             BTreeMap::new()
         } else {
             self.resources.clone()
@@ -56,28 +135,26 @@ impl CapabilityAnnouncer {
     /// already in flight, or nothing is provided and nothing is recorded.
     pub(crate) fn decide(
         &mut self,
+        offered: &[String],
         committed_tags: &[String],
         committed_resources: &BTreeMap<String, u64>,
     ) -> Option<(Vec<String>, BTreeMap<String, u64>)> {
-        let resources = self.effective_resources();
+        let resources = self.effective_resources(offered);
         // nothing to provide and nothing recorded: stay silent (genesis state).
-        if self.capabilities.is_empty()
-            && committed_tags.is_empty()
-            && committed_resources.is_empty()
-        {
+        if offered.is_empty() && committed_tags.is_empty() && committed_resources.is_empty() {
             return None;
         }
-        // the registry already reflects our providers AND resources.
-        if committed_tags == self.capabilities.as_slice() && committed_resources == &resources {
+        // the registry already reflects what we offer AND our resources.
+        if committed_tags == offered && committed_resources == &resources {
             self.announced = None;
             return None;
         }
         // an announce for this exact pair is already in flight.
-        if self.announced.as_ref() == Some(&(self.capabilities.clone(), resources.clone())) {
+        if self.announced.as_ref() == Some(&(offered.to_vec(), resources.clone())) {
             return None;
         }
-        self.announced = Some((self.capabilities.clone(), resources.clone()));
-        Some((self.capabilities.clone(), resources))
+        self.announced = Some((offered.to_vec(), resources.clone()));
+        Some((offered.to_vec(), resources))
     }
 
     /// query this node's committed capability set AND resources and, when an
@@ -112,7 +189,8 @@ impl CapabilityAnnouncer {
         let CapabilityReply::Resources(committed_resources) = decode_reply(&res_reply).ok()? else {
             return None;
         };
-        let (capabilities, resources) = self.decide(&committed_tags, &committed_resources)?;
+        let offered = self.offered();
+        let (capabilities, resources) = self.decide(&offered, &committed_tags, &committed_resources)?;
         Some(Msg {
             target: "capability".into(),
             payload: encode_msg(&CapabilityMsg::Announce {
@@ -166,27 +244,173 @@ mod capability_announcer_tests {
         BTreeMap::from([("cores".to_string(), cores)])
     }
 
+    /// a workspace whose `services.toml` grants `granted` to compute. The
+    /// announcer reads consent off disk per tick, so a test grant IS a file.
+    fn granted_workspace(granted: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("scratch workspace");
+        let capabilities = granted
+            .iter()
+            .map(|tag| format!("    {tag:?},"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            dir.path().join(crate::services::FILE_NAME),
+            format!(
+                "version = 1\n\n[[service]]\nkind = \"compute\"\n\
+                 instance = {:?}\nnonce = {:?}\ngranted_unix = 1\n\
+                 capabilities = [\n{capabilities}\n]\nscopes = []\n",
+                "aa".repeat(32),
+                "bb".repeat(16),
+            ),
+        )
+        .expect("write the grant");
+        dir
+    }
+
+    /// an announcer whose grant is `granted` and whose catalog is empty.
+    fn announcer(
+        me: u8,
+        workspace: &tempfile::TempDir,
+        resources: BTreeMap<String, u64>,
+    ) -> CapabilityAnnouncer {
+        CapabilityAnnouncer::new(
+            vec![me; 32],
+            workspace.path().to_path_buf(),
+            noded::services::ServiceCatalog::default(),
+            resources,
+        )
+    }
+
+    /// register a live compute hello offering `offered`.
+    fn signal(catalog: &noded::services::ServiceCatalog, offered: &[&str]) {
+        catalog
+            .hello(
+                noded::services::Hello {
+                    kind: "compute".into(),
+                    version: "1".into(),
+                    build: noded::services::build_identity()
+                        .expect("tests run from a git checkout")
+                        .into(),
+                    capabilities: tags(offered),
+                    scopes: Vec::new(),
+                    needs: Vec::new(),
+                },
+                std::time::Instant::now(),
+            )
+            .expect("a matching-build hello is admitted");
+    }
+
+    #[test]
+    fn the_offered_set_is_the_grant_intersected_with_a_live_hello() {
+        let catalog = noded::services::ServiceCatalog::default();
+        let workspace = granted_workspace(&["agent.claude", "agent.codex"]);
+        let mut a = CapabilityAnnouncer::new(
+            vec![9u8; 32],
+            workspace.path().to_path_buf(),
+            catalog.clone(),
+            caps(8),
+        );
+
+        // a grant with NO daemon signaling offers nothing. This is the whole
+        // point of the transition: the node discovers nothing itself, so a
+        // grant alone is not evidence that anything can run.
+        assert!(a.offered().is_empty(), "a grant without a hello offers nothing");
+        let offered = a.offered();
+        assert_eq!(
+            a.decide(&offered, &[], &BTreeMap::new()),
+            None,
+            "nothing offered and nothing recorded: silence"
+        );
+
+        // a daemon signals: the intersection appears.
+        signal(&catalog, &["agent.claude", "agent.codex", "agent.extra"]);
+        assert_eq!(
+            a.offered(),
+            tags(&["agent.claude", "agent.codex"]),
+            "the daemon cannot widen the grant"
+        );
+
+        // ... and the grant cannot widen the daemon either.
+        let catalog = noded::services::ServiceCatalog::default();
+        let workspace = granted_workspace(&["agent.claude", "never-offered"]);
+        let mut a = CapabilityAnnouncer::new(
+            vec![9u8; 32],
+            workspace.path().to_path_buf(),
+            catalog.clone(),
+            caps(8),
+        );
+        signal(&catalog, &["agent.claude"]);
+        assert_eq!(a.offered(), tags(&["agent.claude"]));
+
+        // a workspace with NO grant at all announces nothing, however loudly a
+        // daemon signals: consent is the switch, and an unreadable record is
+        // not consent.
+        let ungranted = tempfile::tempdir().expect("scratch workspace");
+        let mut a = CapabilityAnnouncer::new(
+            vec![9u8; 32],
+            ungranted.path().to_path_buf(),
+            catalog.clone(),
+            caps(8),
+        );
+        assert!(a.offered().is_empty(), "no grant on disk: announce nothing");
+    }
+
+    #[test]
+    fn a_daemon_that_stops_signaling_retracts_the_announce() {
+        let catalog = noded::services::ServiceCatalog::default();
+        let workspace = granted_workspace(&["agent.claude"]);
+        let mut a = CapabilityAnnouncer::new(
+            vec![7u8; 32],
+            workspace.path().to_path_buf(),
+            catalog.clone(),
+            caps(4),
+        );
+        signal(&catalog, &["agent.claude"]);
+        let offered = a.offered();
+        assert_eq!(
+            a.decide(&offered, &[], &BTreeMap::new()),
+            Some((tags(&["agent.claude"]), caps(4)))
+        );
+
+        // the hello ages out (the daemon died / was stopped): the registry
+        // still says we serve it, so the next decision RETRACTS — a node must
+        // never leave capacity advertised that nothing can serve. Empty tags
+        // force empty resources, which is the module's own rule.
+        let expired = noded::services::ServiceCatalog::default();
+        let mut a =
+            CapabilityAnnouncer::new(vec![7u8; 32], workspace.path().to_path_buf(), expired, caps(4));
+        let offered = a.offered();
+        assert_eq!(
+            a.decide(&offered, &tags(&["agent.claude"]), &caps(4)),
+            Some((Vec::new(), BTreeMap::new())),
+            "an absent daemon retracts both the tags and the capacity"
+        );
+    }
+
     #[test]
     fn re_announces_when_only_resources_drift() {
         // a Podman node: tags already committed, but its announced capacity
         // differs from what the registry holds → re-announce the pair.
-        let mut a = CapabilityAnnouncer::new(vec![1u8; 32], tags(&["codex"]), caps(8));
+        let workspace = granted_workspace(&["codex"]);
+        let mut a = announcer(1, &workspace, caps(8));
+        let offered = tags(&["codex"]);
         assert_eq!(
-            a.decide(&tags(&["codex"]), &caps(4)),
+            a.decide(&offered, &tags(&["codex"]), &caps(4)),
             Some((tags(&["codex"]), caps(8))),
             "matching tags but drifted resources still re-announce"
         );
         // once the registry reflects both, it goes quiet.
-        assert_eq!(a.decide(&tags(&["codex"]), &caps(8)), None);
+        assert_eq!(a.decide(&offered, &tags(&["codex"]), &caps(8)), None);
     }
 
     #[test]
     fn a_direct_backend_announcer_carries_no_resources() {
         // empty capacity (direct spawn): the announce is tags-only, and it
         // never emits resources even when told the registry is bare.
-        let mut a = CapabilityAnnouncer::new(vec![2u8; 32], tags(&["codex"]), BTreeMap::new());
+        let workspace = granted_workspace(&["codex"]);
+        let mut a = announcer(2, &workspace, BTreeMap::new());
         let (announced_tags, announced_res) = a
-            .decide(&[], &BTreeMap::new())
+            .decide(&tags(&["codex"]), &[], &BTreeMap::new())
             .expect("a fresh direct node announces its tags");
         assert_eq!(announced_tags, tags(&["codex"]));
         assert!(announced_res.is_empty(), "direct: never any resources");
@@ -197,9 +421,10 @@ mod capability_announcer_tests {
         // resources-without-tags is a consensus-level reject: even if a
         // Podman node somehow discovered no executors, it never emits the
         // resources-only shape (and with nothing recorded, it stays silent).
-        let mut a = CapabilityAnnouncer::new(vec![3u8; 32], Vec::new(), caps(8));
+        let workspace = granted_workspace(&[]);
+        let mut a = announcer(3, &workspace, caps(8));
         assert_eq!(
-            a.decide(&[], &BTreeMap::new()),
+            a.decide(&[], &[], &BTreeMap::new()),
             None,
             "no tags + nothing recorded: genesis silence"
         );
@@ -207,15 +432,17 @@ mod capability_announcer_tests {
 
     #[test]
     fn the_in_flight_latch_covers_the_pair() {
-        let mut a = CapabilityAnnouncer::new(vec![4u8; 32], tags(&["codex"]), caps(8));
+        let workspace = granted_workspace(&["codex"]);
+        let mut a = announcer(4, &workspace, caps(8));
+        let offered = tags(&["codex"]);
         // first decide latches the pair.
         assert_eq!(
-            a.decide(&[], &BTreeMap::new()),
+            a.decide(&offered, &[], &BTreeMap::new()),
             Some((tags(&["codex"]), caps(8)))
         );
         // an identical decision while it is still in flight stays quiet.
         assert_eq!(
-            a.decide(&[], &BTreeMap::new()),
+            a.decide(&offered, &[], &BTreeMap::new()),
             None,
             "the latch dedups the exact (tags, resources) pair"
         );

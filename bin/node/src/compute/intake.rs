@@ -1,0 +1,765 @@
+//! the compute daemon's work intake: the `watch` verb in its cheapest form.
+//!
+//! A daemon executes no blocks, so no effect ever reaches it. It discovers its
+//! node's assigned work the way a synced RESIDENT already does — by asking the
+//! saga module's COMMITTED projection (`SagaQuery::AssignedPending`) for the
+//! exact [`WorkerRequest`]s the effect lane would have carried — except the
+//! query rides `/v1/query` instead of an in-process `Host`.
+//!
+//! Each pass offers new assignments to the off-loop [`compute_service::DispatchPool`]
+//! ONCE and submits whatever follow-up ops are due. A pass NEVER awaits a
+//! provider: the gate verdict is inline and immediate, the CLI runs on a spawned
+//! task, and its result re-enters through [`WorkPump::completed`].
+//!
+//! ## exactly once, across a lossy read
+//!
+//! The chain is the source of truth, so a missed hint DELAYS work but never
+//! loses it. The converse — treating a failed read as an empty projection —
+//! would be far worse: emptiness retires entries, and retiring a live attempt
+//! re-offers it as fresh work (a second child process for the same paid call,
+//! and a computed-but-unsent result silently dropped). So:
+//!
+//! - an unreadable projection is not an empty one: the pass does nothing;
+//! - plain absence needs a CONFIRMING second read before an entry retires;
+//! - authoritative supersession (terminal saga, a higher attempt, a changed
+//!   assignee) retires on the first read, and cancels the local run;
+//! - the pump's own latch — not the pool's in-flight map, which prunes at
+//!   delivery — is what keeps a still-pending attempt from being re-offered.
+//!
+//! A restart re-runs at worst once; the saga module's result singularity
+//! collapses the duplicate.
+
+use std::collections::{HashMap, HashSet};
+
+use compute_service::AttemptControl;
+use host::worker::{WorkOutcome, Worker};
+use noded::node_link::NodeLink;
+use saga::{SagaMsg, SagaQuery, SagaReply, WorkerRequest};
+use sdk::{Event, Msg};
+
+/// one attempt's idempotency key — what the worker echoes into its result.
+type AttemptKey = (String, u32);
+
+/// why an attempt vanished from this daemon's assigned subset.
+enum AttemptProjection {
+    Active,
+    Retired,
+}
+
+/// where one assigned attempt sits in the execute-then-submit lifecycle.
+enum Stage {
+    /// offered to the pool; the provider runs (or queues) on a spawned task.
+    /// Nothing to submit yet, and the attempt must NOT be offered again.
+    Executing,
+    /// the follow-up op is computed and needs a (re)submit.
+    Due(Msg),
+    /// nothing further to send — the op committed, or the request was a
+    /// deliberate skip. Held until committed state retires the attempt, so it
+    /// is never re-offered.
+    Settled,
+}
+
+/// one tracked attempt: its stage plus the retire confirmation. `missed` marks
+/// a read that failed to name the attempt; only a SECOND consecutive miss
+/// retires the entry.
+struct Entry {
+    stage: Stage,
+    missed: bool,
+}
+
+pub(crate) struct WorkPump {
+    /// the off-loop execution pool behind the shared `Worker` seam: gate
+    /// inline, spawn the provider, return immediately.
+    pool: Box<dyn Worker>,
+    /// cancellation for attempts already handed to the pool.
+    control: AttemptControl,
+    /// the node's external submit key — the lease identity queried for, and
+    /// the identity `/v1/submit` stamps on every op this pump sends.
+    me: Vec<u8>,
+    work: HashMap<AttemptKey, Entry>,
+    /// announcements this pump has already submitted an `Accept` for.
+    ///
+    /// SEPARATE from `work`, and that separation is load-bearing: `Accept`
+    /// keeps the announcement's `(saga_id, attempt)` and merely fills in the
+    /// assignee, so the attempt this node WINS arrives in the lease projection
+    /// under the exact same key. Sharing one latch would leave the winner's
+    /// entry settled-by-the-claim and the run would never execute — a silent
+    /// no-op, which is the worst possible shape for this bug.
+    claimed: HashSet<AttemptKey>,
+    /// whether the last lease read failed. Latched so an unreachable node says
+    /// so ONCE and again when it recovers: a silent return would make a node
+    /// that cannot be read look exactly like an idle one, which is the single
+    /// most misleading thing this pump could do.
+    unreadable: bool,
+}
+
+impl WorkPump {
+    pub(crate) fn new(pool: Box<dyn Worker>, control: AttemptControl, me: Vec<u8>) -> Self {
+        Self {
+            pool,
+            control,
+            me,
+            work: HashMap::new(),
+            claimed: HashSet::new(),
+            unreadable: false,
+        }
+    }
+
+    /// how many attempts this pump is tracking.
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.work.len()
+    }
+
+    /// one intake pass: read the committed projections, offer new work, submit
+    /// what is due.
+    ///
+    /// TWO lanes, deliberately independent. The LEASE lane executes work this
+    /// node holds; the CLAIM lane only bids for announcements nobody holds yet.
+    /// The saga's own projections are disjoint (an accepted announcement leaves
+    /// one and enters the other), so running both cannot double-execute.
+    pub(crate) async fn tick(&mut self, node: &NodeLink) {
+        self.tick_leases(node).await;
+        self.tick_claims(node).await;
+    }
+
+    /// the LEASE lane: work assigned to this node.
+    async fn tick_leases(&mut self, node: &NodeLink) {
+        let Some(assigned) = pending(node, &self.me, Lane::Assigned).await else {
+            if !self.unreadable {
+                self.unreadable = true;
+                tracing::warn!(
+                    target: "ducktape::saga",
+                    reason = "assigned_pending_unreadable",
+                    "compute intake cannot read its node's committed work; \
+                     execution is paused until it answers"
+                );
+            }
+            return;
+        };
+        if self.unreadable {
+            self.unreadable = false;
+            tracing::info!(target: "ducktape::saga", "compute intake reading committed work again");
+        }
+        let live: HashSet<AttemptKey> = assigned
+            .iter()
+            .map(|request| (request.saga_id.clone(), request.attempt))
+            .collect();
+        let missing: Vec<AttemptKey> = self
+            .work
+            .keys()
+            .filter(|key| !live.contains(*key))
+            .cloned()
+            .collect();
+        let mut retired = HashSet::new();
+        let mut active = HashSet::new();
+        for key in missing {
+            match attempt_projection(node, &self.me, &key).await {
+                Some(AttemptProjection::Retired) => {
+                    retired.insert(key);
+                }
+                Some(AttemptProjection::Active) => {
+                    active.insert(key);
+                }
+                // inconclusive: preserve the two-read flap tolerance.
+                None => {}
+            }
+        }
+        let due = self.plan(assigned, &retired, &active).await;
+        for (key, msg) in due {
+            self.send(node, &key, msg).await;
+        }
+    }
+
+    /// the CLAIM lane: announcements no node holds a lease on.
+    ///
+    /// The gate answers an announcement with an `Accept` bid when this host can
+    /// both run the capability and seat its demands, and with a silent skip
+    /// otherwise — it NEVER answers one with an execution, so this lane cannot
+    /// start a run. The saga's first-accept-wins rule settles who executes, and
+    /// the winner picks the work up through the lease lane on a later pass.
+    async fn tick_claims(&mut self, node: &NodeLink) {
+        let Some(announcements) = pending(node, &self.me, Lane::Unassigned).await else {
+            // the lease lane already logged an unreadable node; a claim is pure
+            // upside, so a failed read here is simply a pass that does nothing.
+            return;
+        };
+        let live: HashSet<AttemptKey> = announcements
+            .iter()
+            .map(|request| (request.saga_id.clone(), request.attempt))
+            .collect();
+        // an announcement that left the projection was claimed (by us or by
+        // someone else) or retired: either way the bid latch is spent.
+        self.claimed.retain(|key| live.contains(key));
+
+        for request in announcements {
+            let key = (request.saga_id.clone(), request.attempt);
+            if self.claimed.contains(&key) {
+                continue;
+            }
+            // a skip (no provider, no capacity) is deliberately NOT latched:
+            // capacity frees up, and re-gating is a pure, cheap decision.
+            let Some(bid) = self.bid(request, &key).await else {
+                continue;
+            };
+            if node.submit(&bid.target, &bid.payload).await.is_ok() {
+                self.claimed.insert(key);
+            }
+        }
+    }
+
+    /// offer one announcement to the gate. `Some` is the `Accept` op to submit.
+    async fn bid(&self, request: WorkerRequest, key: &AttemptKey) -> Option<Msg> {
+        let event = Event {
+            source: "saga".into(),
+            payload: saga::encode_worker_request(&request),
+        };
+        match self.pool.run(&event).await {
+            Ok(WorkOutcome::Handled(Some(msg))) => Some(msg),
+            // a skip this host cannot serve, or a foreign spec shape.
+            Ok(WorkOutcome::Handled(None)) | Ok(WorkOutcome::NotMine) => None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "ducktape::saga",
+                    attempt = ?key,
+                    error = %error,
+                    reason = "worker_error",
+                    "compute claim skipped"
+                );
+                None
+            }
+        }
+    }
+
+    /// a completed off-loop run arrived on the result lane: queue its op.
+    ///
+    /// An attempt committed state no longer names (pruned while the provider
+    /// ran) is dropped; its op could only be a deterministic no-op anyway.
+    pub(crate) fn completed(&mut self, saga_id: String, attempt: u32, msg: Msg) {
+        let key = (saga_id, attempt);
+        match self.work.get_mut(&key) {
+            Some(Entry {
+                stage: stage @ Stage::Executing,
+                ..
+            }) => *stage = Stage::Due(msg),
+            _ => tracing::debug!(
+                target: "ducktape::saga",
+                attempt = ?key,
+                reason = "retired_attempt",
+                "completed run dropped"
+            ),
+        }
+    }
+
+    /// the pump core, separated from the reads so it is unit-testable: retire
+    /// what committed state proves obsolete, offer newly assigned attempts to
+    /// the pool ONCE, and surface every op that needs sending.
+    async fn plan(
+        &mut self,
+        assigned: Vec<WorkerRequest>,
+        retired: &HashSet<AttemptKey>,
+        active: &HashSet<AttemptKey>,
+    ) -> Vec<(AttemptKey, Msg)> {
+        let live: HashSet<AttemptKey> = assigned
+            .iter()
+            .map(|r| (r.saga_id.clone(), r.attempt))
+            .collect();
+        let newest = assigned.iter().fold(
+            HashMap::<String, u32>::new(),
+            |mut newest, request| {
+                newest
+                    .entry(request.saga_id.clone())
+                    .and_modify(|attempt| *attempt = (*attempt).max(request.attempt))
+                    .or_insert(request.attempt);
+                newest
+            },
+        );
+        let control = self.control.clone();
+        let me = &self.me;
+        self.work.retain(|key, entry| {
+            if live.contains(key) || active.contains(key) {
+                entry.missed = false;
+                return true;
+            }
+            // a higher committed attempt of the same saga — including one
+            // assigned elsewhere and confirmed by `SagaQuery::Get` — is proof
+            // of supersession rather than a flapped projection.
+            let superseded =
+                retired.contains(key) || newest.get(&key.0).is_some_and(|attempt| *attempt > key.1);
+            if !superseded && !entry.missed {
+                entry.missed = true;
+                if !matches!(entry.stage, Stage::Settled) {
+                    tracing::warn!(
+                        target: "ducktape::saga",
+                        attempt = ?key,
+                        reason = "projection_missing_mid_work",
+                        "compute attempt will retire on the next absent read"
+                    );
+                }
+                return true;
+            }
+            if !matches!(entry.stage, Stage::Settled) {
+                control.cancel(&key.0, key.1, me);
+            }
+            false
+        });
+
+        let mut due = Vec::new();
+        for request in assigned {
+            let key = (request.saga_id.clone(), request.attempt);
+            if let Some(entry) = self.work.get_mut(&key) {
+                // named again: whatever absence was seen did not persist.
+                entry.missed = false;
+            }
+            match self.work.get_mut(&key).map(|entry| &entry.stage) {
+                None => {
+                    let stage = self.offer(request, &key, &mut due).await;
+                    self.work.insert(
+                        key,
+                        Entry {
+                            stage,
+                            missed: false,
+                        },
+                    );
+                }
+                // the provider is running off-loop; nothing to do.
+                Some(Stage::Executing) => {}
+                // computed but not successfully submitted yet: offer again.
+                Some(Stage::Due(msg)) => due.push((key.clone(), msg.clone())),
+                Some(Stage::Settled) => {}
+            }
+        }
+        due
+    }
+
+    /// first sighting of an attempt: hand it to the pool exactly once.
+    async fn offer(
+        &self,
+        request: WorkerRequest,
+        key: &AttemptKey,
+        due: &mut Vec<(AttemptKey, Msg)>,
+    ) -> Stage {
+        let event = Event {
+            source: "saga".into(),
+            payload: saga::encode_worker_request(&request),
+        };
+        match self.pool.run(&event).await {
+            // an inline verdict WITH an op (unresolvable capability, non-utf-8
+            // payload): due now.
+            Ok(WorkOutcome::Handled(Some(msg))) => {
+                due.push((key.clone(), msg.clone()));
+                Stage::Due(msg)
+            }
+            // spawned — the result arrives later via `completed`. A deliberate
+            // inline skip maps here too; either way the attempt is latched
+            // against re-offer and the retire sweep decides what happens next.
+            Ok(WorkOutcome::Handled(None)) => Stage::Executing,
+            // not a dispatch WorkSpec: never ours to run.
+            Ok(WorkOutcome::NotMine) => Stage::Settled,
+            Err(error) => {
+                // unreachable for DispatchPool (it never errors) — settle
+                // rather than spin a broken worker.
+                tracing::warn!(
+                    target: "ducktape::saga",
+                    attempt = ?key,
+                    error = %error,
+                    reason = "worker_error",
+                    "compute attempt settled"
+                );
+                Stage::Settled
+            }
+        }
+    }
+
+    /// submit one due op. `/v1/submit` re-signs under the NODE's key, which is
+    /// the assignee the saga's lease gate checks — so this is the same op, from
+    /// the same identity, the in-process pool used to deliver.
+    ///
+    /// A refusal leaves the entry `Due`: the next pass re-sends while committed
+    /// state still names the attempt. Re-sends are duplicate ops at worst — the
+    /// saga's result singularity collapses them deterministically.
+    async fn send(&mut self, node: &NodeLink, key: &AttemptKey, msg: Msg) {
+        match node.submit(&msg.target, &msg.payload).await {
+            Ok(_height) => {
+                if let Some(entry) = self.work.get_mut(key) {
+                    entry.stage = Stage::Settled;
+                }
+            }
+            Err(error) => tracing::debug!(
+                target: "ducktape::saga",
+                attempt = ?key,
+                error = %error,
+                reason = "result_submit_failed",
+                "compute result will be re-sent"
+            ),
+        }
+    }
+}
+
+/// which committed projection a read wants. ONE discriminant, because the two
+/// reads differ only in the query and the reply variant they accept.
+#[derive(Clone, Copy)]
+enum Lane {
+    /// work leased to this node — the execute lane.
+    Assigned,
+    /// announcements nobody holds — the claim lane.
+    Unassigned,
+}
+
+/// the committed saga projection for one lane.
+///
+/// `None` when the node is unreachable, the module absent, or the reply
+/// unreadable — a failed read must NEVER masquerade as an empty projection:
+/// emptiness retires entries, and retiring a live attempt re-runs it.
+async fn pending(node: &NodeLink, me: &[u8], lane: Lane) -> Option<Vec<WorkerRequest>> {
+    let query = match lane {
+        Lane::Assigned => SagaQuery::AssignedPending {
+            assignee: me.to_vec(),
+        },
+        Lane::Unassigned => SagaQuery::UnassignedPending,
+    };
+    let reply = node.query("saga", &saga::encode_query(&query)).await.ok()?;
+    match (lane, saga::decode_reply(&reply)) {
+        (Lane::Assigned, Ok(SagaReply::AssignedPending(requests))) => Some(requests),
+        (Lane::Unassigned, Ok(SagaReply::UnassignedPending(requests))) => Some(requests),
+        _ => None,
+    }
+}
+
+/// Confirm WHY an assigned attempt disappeared. `AssignedPending` cannot show a
+/// retry that moved to another node; the per-saga view can. An unreadable or
+/// older view is inconclusive and preserves the two-read flap tolerance.
+async fn attempt_projection(
+    node: &NodeLink,
+    me: &[u8],
+    key: &AttemptKey,
+) -> Option<AttemptProjection> {
+    let reply = node
+        .query(
+            "saga",
+            &saga::encode_query(&SagaQuery::Get {
+                saga_id: key.0.clone(),
+            }),
+        )
+        .await
+        .ok()?;
+    match saga::decode_reply(&reply).ok()? {
+        SagaReply::Saga(None) => Some(AttemptProjection::Retired),
+        SagaReply::Saga(Some(view))
+            if view.status.is_terminal()
+                || view.attempt > key.1
+                || (view.attempt == key.1 && view.assignee.as_deref() != Some(me)) =>
+        {
+            Some(AttemptProjection::Retired)
+        }
+        SagaReply::Saga(Some(view))
+            if view.attempt == key.1 && view.assignee.as_deref() == Some(me) =>
+        {
+            Some(AttemptProjection::Active)
+        }
+        _ => None,
+    }
+}
+
+/// What the pool handed to the delivery lane. ONE discriminant, because the two
+/// have different fates: a result belongs to a tracked attempt and is RETRIED
+/// until it commits, while a lease heartbeat is fire-and-forget (the next beat
+/// is 10s away and supersedes it).
+pub(crate) enum Delivered {
+    Result {
+        saga_id: String,
+        attempt: u32,
+        msg: Msg,
+    },
+    Heartbeat(Msg),
+}
+
+impl Delivered {
+    /// classify one delivered op.
+    ///
+    /// The pool sends exactly two shapes down this lane. Anything else is wire
+    /// drift, and treating it as a heartbeat (submit once, best effort) is the
+    /// honest fallback: it still reaches consensus, it just is not retried.
+    pub(crate) fn classify(msg: Msg) -> Self {
+        match saga::decode_msg(&msg.payload) {
+            Ok(SagaMsg::OracleResult {
+                saga_id, attempt, ..
+            }) => Delivered::Result {
+                saga_id,
+                attempt,
+                msg,
+            },
+            _ => Delivered::Heartbeat(msg),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// a worker that counts offers and answers with a fixed outcome — the
+    /// observable stand-in for the real pool, with no provider and no node.
+    struct CountingWorker {
+        offers: Arc<AtomicUsize>,
+        spawned: bool,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Worker for CountingWorker {
+        async fn run(&self, _event: &Event) -> Result<WorkOutcome, host::worker::Error> {
+            self.offers.fetch_add(1, Ordering::SeqCst);
+            match self.spawned {
+                true => Ok(WorkOutcome::Handled(None)),
+                false => Ok(WorkOutcome::Handled(Some(result_msg("s", 0)))),
+            }
+        }
+    }
+
+    const ME: &[u8] = b"compute-node-key";
+
+    /// the real gate's shape: an ANNOUNCEMENT (no assignee) is answered with an
+    /// `Accept` bid and never executed; an own LEASE is spawned.
+    struct LaneAwareWorker {
+        offers: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Worker for LaneAwareWorker {
+        async fn run(&self, event: &Event) -> Result<WorkOutcome, host::worker::Error> {
+            self.offers.fetch_add(1, Ordering::SeqCst);
+            let request = saga::decode_worker_request(&event.payload).expect("a work request");
+            match request.assignee {
+                None => Ok(WorkOutcome::Handled(Some(Msg {
+                    target: "saga".into(),
+                    payload: saga::encode_msg(&SagaMsg::Accept {
+                        saga_id: request.saga_id,
+                        attempt: request.attempt,
+                    }),
+                }))),
+                Some(_) => Ok(WorkOutcome::Handled(None)),
+            }
+        }
+    }
+
+    fn announcement(saga_id: &str, attempt: u32) -> WorkerRequest {
+        WorkerRequest {
+            assignee: None,
+            ..request(saga_id, attempt)
+        }
+    }
+
+    fn result_msg(saga_id: &str, attempt: u32) -> Msg {
+        Msg {
+            target: "saga".into(),
+            payload: saga::encode_msg(&SagaMsg::OracleResult {
+                saga_id: saga_id.into(),
+                attempt,
+                outcome: Ok(b"done".to_vec()),
+                usage: None,
+            }),
+        }
+    }
+
+    fn request(saga_id: &str, attempt: u32) -> WorkerRequest {
+        WorkerRequest {
+            saga_id: saga_id.into(),
+            attempt,
+            spec: b"{}".to_vec(),
+            deadline: None,
+            assignee: Some(ME.to_vec()),
+        }
+    }
+
+    fn new_pump(spawned: bool) -> (WorkPump, Arc<AtomicUsize>) {
+        let offers = Arc::new(AtomicUsize::new(0));
+        let worker = CountingWorker {
+            offers: offers.clone(),
+            spawned,
+        };
+        // a control whose node key matches, so cancellation is exercised
+        // against the same identity the pump queries under.
+        let pool = compute_service::DispatchPool::with_limit(
+            Arc::new(provider_host::ProviderSet::empty()),
+            ME.to_vec(),
+            Arc::new(|_, _| {}),
+            Arc::new(|_| Box::pin(async {})),
+            1,
+            Default::default(),
+            Arc::new(NoProvisioner),
+        );
+        let control = pool.attempt_control();
+        (
+            WorkPump::new(Box::new(worker), control, ME.to_vec()),
+            offers,
+        )
+    }
+
+    struct NoProvisioner;
+    #[async_trait::async_trait]
+    impl compute_service::WorkspaceProvisioner for NoProvisioner {
+        async fn provision(
+            &self,
+            _spec: &compute_service::WorkspaceSpec,
+        ) -> Result<Box<dyn compute_service::ProvisionedWorkspace>, String> {
+            Err("no provisioner in this test".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_attempt_is_offered_exactly_once_across_repeated_reads() {
+        let (mut pump, offers) = new_pump(true);
+        let empty = HashSet::new();
+        for _ in 0..5 {
+            let due = pump.plan(vec![request("s", 0)], &empty, &empty).await;
+            assert!(due.is_empty(), "a spawned attempt has nothing to send yet");
+        }
+        assert_eq!(offers.load(Ordering::SeqCst), 1, "offered exactly once");
+        assert_eq!(pump.tracked(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_inline_verdict_is_due_and_stays_due_until_it_is_sent() {
+        let (mut pump, _) = new_pump(false);
+        let empty = HashSet::new();
+        let due = pump.plan(vec![request("s", 0)], &empty, &empty).await;
+        assert_eq!(due.len(), 1, "an inline op is due immediately");
+        // not sent yet: the next pass re-offers the SAME op rather than
+        // re-running the attempt.
+        let again = pump.plan(vec![request("s", 0)], &empty, &empty).await;
+        assert_eq!(again.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn plain_absence_needs_two_reads_but_supersession_retires_at_once() {
+        let (mut pump, offers) = new_pump(true);
+        let empty = HashSet::new();
+        pump.plan(vec![request("s", 0)], &empty, &empty).await;
+        assert_eq!(pump.tracked(), 1);
+
+        // one absent read: retained (a flapped read must not re-run a live
+        // attempt as fresh work).
+        pump.plan(Vec::new(), &empty, &empty).await;
+        assert_eq!(pump.tracked(), 1, "one absence is not proof");
+        // a second: retired.
+        pump.plan(Vec::new(), &empty, &empty).await;
+        assert_eq!(pump.tracked(), 0, "a confirmed absence retires");
+
+        // a higher attempt of the same saga is authoritative supersession —
+        // one read is enough, and the newcomer is offered.
+        let (mut pump, offers2) = new_pump(true);
+        pump.plan(vec![request("s", 0)], &empty, &empty).await;
+        pump.plan(vec![request("s", 1)], &empty, &empty).await;
+        assert_eq!(pump.tracked(), 1, "only the newest attempt is tracked");
+        assert_eq!(offers2.load(Ordering::SeqCst), 2);
+        // the first pump never re-offered after retirement.
+        assert_eq!(offers.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_completed_result_becomes_due_and_a_retired_one_is_dropped() {
+        let (mut pump, _) = new_pump(true);
+        let empty = HashSet::new();
+        pump.plan(vec![request("s", 0)], &empty, &empty).await;
+
+        pump.completed("s".into(), 0, result_msg("s", 0));
+        let due = pump.plan(vec![request("s", 0)], &empty, &empty).await;
+        assert_eq!(due.len(), 1, "a completed run's op is due");
+
+        // an attempt nothing tracks any more drops its late result.
+        pump.completed("gone".into(), 7, result_msg("gone", 7));
+        let due = pump.plan(vec![request("s", 0)], &empty, &empty).await;
+        assert_eq!(due.len(), 1, "the unknown result added nothing");
+    }
+
+    #[tokio::test]
+    async fn a_claimed_announcement_still_executes_when_its_lease_arrives() {
+        // THE regression this lane exists to prevent. `Accept` keeps the
+        // announcement's (saga_id, attempt) and only fills in the assignee, so
+        // the attempt this node WINS arrives in the lease projection under the
+        // exact same key. If the claim latch and the execute latch were one
+        // map, the winner's entry would already be settled-by-the-claim and the
+        // run would silently never happen.
+        let offers = Arc::new(AtomicUsize::new(0));
+        let pool = Box::new(LaneAwareWorker {
+            offers: offers.clone(),
+        });
+        let (mut pump, _) = new_pump(true);
+        pump.pool = pool;
+
+        // the claim lane bids on the announcement ...
+        let bid = pump
+            .bid(announcement("s", 0), &("s".into(), 0))
+            .await
+            .expect("a capable host bids on an announcement");
+        assert!(matches!(
+            saga::decode_msg(&bid.payload),
+            Ok(SagaMsg::Accept { .. })
+        ));
+        // ... and latches it, exactly as a successful submit would.
+        pump.claimed.insert(("s".to_string(), 0));
+
+        // now the SAME key comes back as this node's lease. It must still be
+        // offered to the pool and reach Executing.
+        let empty = HashSet::new();
+        let due = pump.plan(vec![request("s", 0)], &empty, &empty).await;
+        assert!(due.is_empty(), "a spawned lease has nothing to send yet");
+        assert_eq!(pump.tracked(), 1, "the won lease is tracked for execution");
+        assert_eq!(
+            offers.load(Ordering::SeqCst),
+            2,
+            "offered once as an announcement and once as the won lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_that_cannot_serve_an_announcement_never_bids_and_never_latches() {
+        // a skip must not latch: capacity frees up, and re-gating is a pure,
+        // cheap decision. Latching a skip would make one busy moment permanent.
+        let (pump, _) = new_pump(true);
+        struct SkipWorker;
+        #[async_trait::async_trait(?Send)]
+        impl Worker for SkipWorker {
+            async fn run(&self, _event: &Event) -> Result<WorkOutcome, host::worker::Error> {
+                Ok(WorkOutcome::Handled(None))
+            }
+        }
+        let mut pump = pump;
+        pump.pool = Box::new(SkipWorker);
+        assert!(
+            pump.bid(announcement("s", 0), &("s".into(), 0)).await.is_none(),
+            "an unservable announcement produces no bid"
+        );
+        assert!(pump.claimed.is_empty(), "a skip is never latched");
+    }
+
+    #[test]
+    fn delivery_classification_splits_results_from_lease_heartbeats() {
+        let result = Delivered::classify(result_msg("s", 3));
+        match result {
+            Delivered::Result {
+                saga_id, attempt, ..
+            } => {
+                assert_eq!(saga_id, "s");
+                assert_eq!(attempt, 3);
+            }
+            Delivered::Heartbeat(_) => panic!("an oracle result is not a heartbeat"),
+        }
+
+        // the lease heartbeat the pool pushes down the SAME lane: submitted
+        // once, never tracked as an attempt result.
+        let renew = Msg {
+            target: "saga".into(),
+            payload: saga::encode_msg(&SagaMsg::RenewLease {
+                saga_id: "s".into(),
+                attempt: 3,
+            }),
+        };
+        assert!(matches!(
+            Delivered::classify(renew),
+            Delivered::Heartbeat(_)
+        ));
+    }
+}

@@ -15,8 +15,9 @@ pub(crate) struct Surfaces {
     pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     pub(crate) code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     pub(crate) blobs: noded::blobs::BlobHandle,
-    pub(crate) agent_provisioner: compute_service::SharedProvisioner,
-    pub(crate) cred_resolver: compute_service::SharedCredentialResolver,
+    /// the volatile service-signaling catalog shared with the http surface —
+    /// the live half of the capability announce (`grant ∩ hello`).
+    pub(crate) services: noded::services::ServiceCatalog,
     pub(crate) gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     pub(crate) gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     /// the host-side session manager (a clone of the one on the http handle), so
@@ -43,9 +44,6 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) gateway_listen: Option<String>,
     pub(crate) gateway_enabled: bool,
     pub(crate) log_ring: noded::LogRing,
-    /// this node's signer identity — the COMMITTER on every forge run commit
-    /// (D2: author is the agent, committer is the node).
-    pub(crate) forge_committer: String,
     /// this node's consensus public key — the `BindNode` subject the owner-gated
     /// admin namespace resolves ownership against (ADR A5).
     pub(crate) node_key: Vec<u8>,
@@ -68,7 +66,6 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         gateway_listen,
         gateway_enabled,
         log_ring,
-        forge_committer,
         node_key,
         admin_exposure,
         sandbox,
@@ -248,48 +245,13 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // consumes the handle: the role loop publishes into it, the http route
     // reads it without crossing the command lane.
     let status = http_handle.status_cell();
-    // the REAL portable-agent-run provisioner, built from a clone of the http
-    // handle BEFORE the serve/drop match consumes it. portable v1 runs
-    // materialize a per-run duckfs checkout under a root VALIDATED to be
-    // outside <storage> (D7) and drive checkout/commit over this SAME
-    // NodeHandle actor lane the /v1/fs/workspaces RPC already rides here.
-    // LIVE for every agent run: this binary wires the files module
-    // unconditionally, so the runs composer emits v1. a misconfigured
-    // root (inside <storage>) is a boot error, never a silent D7 hole.
-    let agent_provisioner: compute_service::SharedProvisioner = std::sync::Arc::new(
-        noded::agent_provision::NodedProvisioner::new(
-            http_handle.clone(),
-            noded::agent_provision::agent_runs_root(storage)
-                .unwrap_or_else(|e| panic!("agent runs root failed D7 validation: {e}")),
-        )
-        // the forge worktree lane (agent-dogfood M1): repos come off the
-        // handle's forge base (the same <storage>/forge-repo the host
-        // materializes into); pushes dial THIS node's own http surface at
-        // loopback (mirroring the serve condition below — no surface, no push
-        // lane, and forge runs fail loudly at provision); the committer on
-        // every run commit is this node's signer identity (D2 — the author is
-        // the agent).
-        .with_forge(
-            noded::agent_provision::forge_push_base(
-                http_listen.as_deref().filter(|_| !sync_only),
-            ),
-            forge_committer,
-        )
-        // the agent tool plane: the SAME surface, bare (no /forge), handed to
-        // every run as DUCKTAPE_NODE alongside the running binary's dir on
-        // PATH — that is how the MCP server the runner CLI spawns (outside the
-        // agent's sandbox) finds `ducktape mcp` and the node it acts against.
-        // no surface (a sync-only joiner) ⇒ nothing to dial ⇒ the var is unset.
-        .with_node_url(noded::agent_provision::node_http_base(
-            http_listen.as_deref().filter(|_| !sync_only),
-        )),
-    );
-    // the executing-node credential resolver, built from the SAME committed-query
-    // lane the provisioner uses (before the serve/drop match consumes the
-    // handle). A `sched --cred` run's named credential resolves through this into
-    // a self-host airlock source, gated on the run's committed saga origin.
-    let cred_resolver: compute_service::SharedCredentialResolver =
-        std::sync::Arc::new(crate::cred_resolve::NodeCredentialResolver::new(&http_handle));
+    // the volatile signaling catalog, shared with the http surface: a service
+    // daemon's `POST /v1/services/hello` lands here, and the role loop's
+    // capability announce intersects it with the user's grant. There is NO
+    // provisioner and NO credential resolver on this side any more — both moved
+    // into the compute daemon, which reaches this node over /v1 like any other
+    // local client.
+    let services = http_handle.services().clone();
     // the node-local, off-chain interactive terminal-session plane (lives on the
     // http handle like the stream hub — never consensus). Wired wherever the app
     // surface is served: not sync-only, and an http address configured. A parked
@@ -431,8 +393,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         voice_requests,
         code_stage_requests,
         blobs,
-        agent_provisioner,
-        cred_resolver,
+        services,
         gateway_requests: gateway_enabled.then_some(gateway_requests),
         gateway_commands,
         terminals,

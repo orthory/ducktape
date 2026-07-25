@@ -1200,6 +1200,28 @@ impl Module for SagaModule {
                     .collect();
                 Ok(encode_reply(&SagaReply::AssignedPending(requests)))
             }
+            SagaQuery::UnassignedPending => {
+                // the claim lane's read: the announcement requests, which no
+                // node holds a lease on yet. Same projection shape as
+                // `AssignedPending` (and the same `visible_ids` ordering, so
+                // it is deterministic) — only the assignee predicate differs,
+                // and `assignee` rides through as `None` so the worker gate
+                // sees exactly the announcement the effect lane carried.
+                let requests = self
+                    .visible_ids()
+                    .into_iter()
+                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
+                    .filter(|(_, saga)| !saga.status.is_terminal() && saga.assignee.is_none())
+                    .map(|(id, saga)| WorkerRequest {
+                        saga_id: id,
+                        attempt: saga.attempt,
+                        spec: saga.spec.clone(),
+                        deadline: saga.deadline,
+                        assignee: None,
+                    })
+                    .collect();
+                Ok(encode_reply(&SagaReply::UnassignedPending(requests)))
+            }
         }
     }
 
@@ -1422,11 +1444,93 @@ mod tests {
             other => panic!("expected AssignedPending reply, got {other:?}"),
         }
     }
+    fn unassigned_pending(m: &SagaModule) -> Vec<WorkerRequest> {
+        let reply = block_on(m.query(&encode_query(&SagaQuery::UnassignedPending))).unwrap();
+        match decode_reply(&reply).unwrap() {
+            SagaReply::UnassignedPending(v) => v,
+            other => panic!("expected UnassignedPending reply, got {other:?}"),
+        }
+    }
     fn exec(m: &mut SagaModule, ctx: &mut CaptureCtx, op: &Msg) -> Result<(), Error> {
         block_on(m.execute(ctx, op))
     }
     fn commit(m: &mut SagaModule) {
         block_on(m.commit_block()).unwrap();
+    }
+
+    #[test]
+    fn unassigned_pending_projects_announcements_until_one_is_claimed() {
+        // the claim lane's read, and the twin of `assigned_pending`: with an
+        // EMPTY rendezvous pool the trigger cannot pick an assignee, so the
+        // saga goes out as an announcement — which a host that does not
+        // execute blocks can only ever see here.
+        let me = b"claimer-key".to_vec();
+        let mut m =
+            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        assert!(
+            unassigned_pending(&m).is_empty(),
+            "an empty ledger announces nothing"
+        );
+
+        // no providers -> no assignee -> an announcement.
+        let mut ctx = CaptureCtx::new().at(4).with_providers(vec![]);
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
+                saga_id: "job".into(),
+                spec: b"the work spec".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: Some(90),
+                max_attempts: 3,
+                lease_views: Some(10),
+                capability: Some("codex".into()),
+                demands: Default::default(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        // the projection IS the effect's announcement, field for field —
+        // assignee `None` included, which is what makes the worker gate treat
+        // it as a claim rather than a work order.
+        let emitted = ctx.worker_requests();
+        assert_eq!(emitted.len(), 1, "the trigger emitted one announcement");
+        assert_eq!(emitted[0].assignee, None);
+        assert_eq!(unassigned_pending(&m), emitted);
+        assert!(
+            assigned_pending(&m, &me).is_empty(),
+            "an unclaimed announcement is nobody's lease"
+        );
+
+        // a claim moves it across: the SAME attempt is now assigned, so it
+        // leaves the announcement projection and enters the lease one. The two
+        // reads are disjoint by construction, which is what lets a daemon run
+        // both lanes without double-executing.
+        let mut ctx = CaptureCtx::new()
+            .at(5)
+            .with_origin(Origin::External(me.clone()));
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Accept {
+                saga_id: "job".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert!(
+            unassigned_pending(&m).is_empty(),
+            "a claimed announcement is no longer announced"
+        );
+        assert_eq!(
+            assigned_pending(&m, &me).len(),
+            1,
+            "the claimer now holds the lease"
+        );
     }
 
     #[test]

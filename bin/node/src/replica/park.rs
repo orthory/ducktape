@@ -23,12 +23,10 @@ use crate::drain_actions::{CutoverTrigger, EpochActions};
 use crate::explorer::{boundary_block_row, heal_index};
 use crate::host_reads::{joiner_epoch_mesh, read_valset_members, read_valset_residents};
 use crate::host_state::{SyncSubstrates, restore_host, sync_all_modules};
-use crate::oracle_pool;
 use crate::relay;
 use crate::relay_runtime;
 use crate::replica;
 use crate::resident_announce;
-use crate::resident_dispatch;
 use crate::rpc::{JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
 use crate::sync::catchup::{PostRebootCatchupError, catch_up_post_reboot_frames};
 use crate::sync::serve::{
@@ -218,11 +216,9 @@ pub(super) async fn park(
     validators: Vec<ed25519::PublicKey>,
     wireguard_listen: Option<std::net::SocketAddr>,
     checkpoint_blocks: u64,
-    granted_capabilities: Vec<String>,
     sandbox: Option<provider_host::SandboxBackend>,
     // the compute SERVICE's backend: the `[sandbox]` table gated on the
     // user's `services.toml` grant. Drives discovery/pool/announce only.
-    compute_backend: Option<provider_host::SandboxBackend>,
     sandbox_capacity: std::collections::BTreeMap<String, u64>,
     sync_sources: Vec<ed25519::PublicKey>,
     sync_source: Option<ed25519::PublicKey>,
@@ -239,9 +235,9 @@ pub(super) async fn park(
     metrics: noded::NodeMetrics,
     status: noded::StatusCell,
     blobs: noded::blobs::BlobHandle,
-    agent_provisioner: &compute_service::SharedProvisioner,
-    cred_resolver: &compute_service::SharedCredentialResolver,
-    agent_dirs: &provider_host::AgentDirs,
+    // the volatile service-signaling catalog: the live half of the capability
+    // announce (`grant ∩ hello`), shared with the http surface's handle.
+    services: noded::services::ServiceCatalog,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
     planes: data_plane::PlaneMonitor,
@@ -331,6 +327,12 @@ pub(super) async fn park(
         drop(voice_requests);
         None
     };
+    // the announce pump re-reads the grant from this path per tick; the
+    // gateway closure below takes ownership of the original.
+    let grant_workspace = workspace.clone();
+    // handed to the seat if this node is promoted, so the announce keeps its
+    // read-through grant across the transition.
+    let baton_workspace = workspace.clone();
     let gateway_book = gateway_requests.map(|requests| {
         let book = crate::gateway_plane::OverlayBook::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
@@ -664,24 +666,17 @@ pub(super) async fn park(
     });
     // ---- the RESIDENT-tier pumps -----------------------------------
     //
-    // the state-driven twins of the validator loop's announce pump and
-    // reactor seam, adapted to a node that installs boundaries instead
-    // of executing blocks (see resident_announce.rs /
-    // resident_dispatch.rs). discovery here mirrors the validator
-    // boot: the discovered tag set is BOTH what the worker can run and
-    // what this node announces, so a resident announce can never claim
-    // more than the host provides; a broken operator spec is a boot
-    // error, not a silently dropped executor. execution is OFF-LOOP —
-    // the same DispatchPool wiring the validator runs: the gate is
-    // inline, the provider CLI runs on spawned children, completed
-    // results come back over `resident_oracle_results` and are
-    // drained by the park loop's pump pass, so a minutes-long run
-    // never stalls the serve window, boundary follow, or promotion
-    // detection.
-    // node-private podman service up before discovery; held for the node's
-    // life (see the validator boot for the rationale). fail-closed on error.
-    // keyed on the `[sandbox]` TABLE, not the compute grant — the terminal
-    // plane's ptys run in this same service.
+    // the state-driven twin of the validator loop's announce pump, adapted to a
+    // node that installs boundaries instead of executing blocks (see
+    // resident_announce.rs). There is no resident dispatch pump any more: the
+    // compute daemon serves this node's assigned work and its announcements
+    // over /v1, on both tiers alike.
+    //
+    // the node-private podman service, up before the terminal plane needs it
+    // and held for the node's life (see the validator boot for the rationale).
+    // Fail-closed. Keyed on the `[sandbox]` TABLE, not the compute grant — the
+    // pty plane runs in this same service, and the compute DAEMON is a client
+    // of the same socket.
     let self_exe = std::env::current_exe()
         .unwrap_or_else(|e| panic!("cannot resolve this node's own executable: {e}"));
     let _podman_service = match &sandbox {
@@ -690,43 +685,17 @@ pub(super) async fn park(
             .unwrap_or_else(|e| panic!("podman sandbox service failed to start: {e}")),
         None => None,
     };
-    // no compute plane — no `[sandbox]` table, or no `service enable compute`
-    // grant — means nothing discovered, announced or spawnable, exactly as on
-    // the validator boot.
-    let resident_provider_set = match compute_backend {
-        Some(backend) => provider_host::discover(
-            &me_bytes,
-            agent_dirs.clone(),
-            Some(stream_hub.run_output().output_sink()),
-            // the operator's `node.toml [sandbox]` runtime, same as the
-            // validator boot — a resident sandboxes its runs identically.
-            backend,
-        )
-        .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
-        None => provider_host::ProviderSet::empty(),
-    };
-    // never more than the user granted, never more than the host provides.
-    let resident_capabilities = crate::services::announceable(
-        &granted_capabilities,
-        resident_provider_set.capabilities(),
-    );
+    // A resident discovers nothing and executes nothing: the compute daemon
+    // does both, and reaches consensus through this node's own /v1 surface —
+    // which serves a resident's committed queries and relays its submits
+    // exactly as it does for any other local client. What is left here is the
+    // announce, and its offered half now comes from the daemon's live hello.
     let mut resident_announcer = resident_announce::ResidentAnnouncer::new(
         me_bytes.clone(),
-        resident_capabilities,
-        sandbox_capacity.clone(),
-    );
-    let (resident_pool, resident_control, mut resident_oracle_results) = oracle_pool::build(
-        &context,
-        resident_provider_set,
-        me_bytes.clone(),
-        agent_provisioner.clone(),
-        // the announced capacity IS the pool's ledger (one source), same as
-        // the validator path.
+        grant_workspace,
+        services,
         sandbox_capacity,
-        Some(cred_resolver.clone()),
     );
-    let mut resident_dispatch =
-        resident_dispatch::ResidentDispatch::new(resident_pool, resident_control, me_bytes.clone());
 
     // ── THE JOIN GATE rides first contact now (join ADR §4) ────────────────
     // a fresh TOKENED joiner's sealed intro IS its gate request: the wiring
@@ -985,7 +954,7 @@ pub(super) async fn park(
                             continue;
                         };
                         // Unclaimed final replies belong to the
-                        // resident-owned capability/dispatch pumps.
+                        // resident-owned capability announce pump.
                         let applied =
                             matches!(outcome, relay::RelayOutcome::Applied { .. });
                         if let Some(ok) = resident_announcer.on_reply(&frame_id, applied) {
@@ -1003,29 +972,6 @@ pub(super) async fn park(
                                     outcome = ?outcome,
                                     reason = "capability_announce_rejected",
                                     "resident capability announce did not apply; retrying"
-                                );
-                            }
-                        } else if let Some((saga_id, attempt)) =
-                            resident_dispatch.on_reply(&frame_id, applied)
-                        {
-                            if applied {
-                                tracing::info!(
-                                    target: "ducktape::saga",
-                                    node = %label,
-                                    saga_id,
-                                    attempt,
-                                    "resident: dispatch result for saga {saga_id} attempt \
-                                     {attempt} applied"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    target: "ducktape::saga",
-                                    node = %label,
-                                    saga_id,
-                                    attempt,
-                                    outcome = ?outcome,
-                                    reason = "dispatch_result_rejected",
-                                    "resident dispatch result did not apply; retrying while leased"
                                 );
                             }
                         }
@@ -1675,6 +1621,7 @@ pub(super) async fn park(
             );
             return PromotionBaton {
                 context,
+                workspace: baton_workspace,
                 host,
                 recovery,
                 epoch: seat.epoch,
@@ -2170,47 +2117,6 @@ pub(super) async fn park(
                             }
                         }
                     }
-                    // DISPATCH EXECUTION (resident tier): serve the
-                    // saga attempts leased to this key, so an announced
-                    // resident never stalls an assignment. completed
-                    // off-loop runs are drained FIRST (they become due
-                    // relay sends in this same pass); the tick itself
-                    // only gates and spawns — it never awaits a
-                    // provider.
-                    while let Ok(msg) = resident_oracle_results.try_recv() {
-                        resident_dispatch.completed(msg);
-                    }
-                    for (key, msg) in resident_dispatch.tick(host, now).await {
-                        match resident_relay.submit_unheld(
-                            &signer,
-                            &announce_targets,
-                            &mut relay_tx,
-                            msg.target,
-                            msg.payload,
-                        ) {
-                            Ok(id) => {
-                                resident_dispatch.sent(&key, id, now);
-                                tracing::info!(
-                                    target: "ducktape::saga",
-                                    node = %label,
-                                    saga_id = key.0,
-                                    attempt = key.1,
-                                    "resident: dispatch result for saga {} attempt {} relayed",
-                                    key.0,
-                                    key.1
-                                );
-                            }
-                            Err(e) => tracing::warn!(
-                                target: "ducktape::saga",
-                                node = %label,
-                                saga_id = key.0,
-                                attempt = key.1,
-                                error = %e,
-                                reason = "dispatch_result_relay_failed",
-                                "resident dispatch result relay failed"
-                            ),
-                        }
-                    }
                 }
                 continue;
             }
@@ -2447,6 +2353,7 @@ pub(super) async fn park(
     let root_hash = host.root_hash();
     PromotionBaton {
         context,
+        workspace: baton_workspace,
         host,
         recovery,
         epoch: boundary.epoch,

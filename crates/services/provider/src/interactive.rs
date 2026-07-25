@@ -737,6 +737,7 @@ mod tests {
                     std::env::var("DUCKTAPE_PODMAN_SOCKET").unwrap_or_default(),
                 ),
             },
+            crate::NODE_TERM_OWNER,
         )
         .expect("discover codex on Podman");
         let provider = set.resolve("codex").expect("codex provider present");
@@ -786,6 +787,7 @@ mod tests {
                     std::env::var("DUCKTAPE_PODMAN_SOCKET").unwrap_or_default(),
                 ),
             },
+                crate::NODE_TERM_OWNER,
             )
             .expect("discover on Podman"),
         )

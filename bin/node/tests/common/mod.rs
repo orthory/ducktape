@@ -108,6 +108,14 @@ pub struct Cluster {
     /// removing the tempdir under live processes races their qmdb/journal
     /// writes and silently leaks the subtree.
     nodes: Vec<Option<NodeProc>>,
+    /// each node's COMPUTE DAEMON, when `compute_grant` gave it one.
+    ///
+    /// The node process runs no provider work any more — `ducktape service run
+    /// compute` is the compute plane — so a cluster that expects a run to
+    /// EXECUTE must run the daemon beside its node, exactly as an operator
+    /// does. Declared beside `nodes` so drop order reaps them before the
+    /// tempdir goes.
+    daemons: Vec<Option<NodeProc>>,
     dir: tempfile::TempDir,
 }
 
@@ -580,6 +588,7 @@ impl Cluster {
             wireguard: false,
             extra_toml: Vec::new(),
             compute_grant: None,
+            daemons: peer_ids.iter().map(|_| None).collect(),
             env: peer_ids.iter().map(|_| Vec::new()).collect(),
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
@@ -688,11 +697,49 @@ impl Cluster {
             .spawn()
             .expect("spawn ducktape");
         self.nodes[idx] = Some(NodeProc { id, child, log });
+        self.spawn_compute(idx);
+    }
+
+    /// spawn node `idx`'s compute daemon, when it has a grant to act under.
+    ///
+    /// It retries its node internally, so ordering against `spawn` does not
+    /// matter. `--config` points it at the SAME dev-shape config the node
+    /// reads (a dev workspace is its `storage_dir`, which does not contain the
+    /// config file, so `--workspace` cannot name it).
+    fn spawn_compute(&mut self, idx: usize) {
+        if self.compute_grant.is_none() {
+            return;
+        }
+        let id = self.peer_ids[idx];
+        let cfg = self.config_path(idx);
+        let log = self.dir.path().join(format!("compute{id}.log"));
+        let out = std::fs::File::create(&log).expect("create compute log");
+        let err = out.try_clone().expect("clone compute log handle");
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("service")
+            .arg("run")
+            .arg("compute")
+            .arg("--config")
+            .arg(&cfg)
+            // the grant is already on disk (`write_service_grants`), so the
+            // daemon must never try to mint one — there is no tty here.
+            .arg("--no-enable")
+            .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .expect("spawn compute daemon");
+        self.daemons[idx] = Some(NodeProc { id, child, log });
     }
 
     /// kill the node at `idx` (crash-fault injection) and reap it.
+    ///
+    /// Its compute daemon goes too: the daemon is that node's plane, and
+    /// leaving one attached to a dead node would keep retrying against a
+    /// port the next spawn reuses.
     pub fn kill(&mut self, idx: usize) {
-        self.nodes[idx] = None; // NodeProc::drop kills + waits
+        self.daemons[idx] = None; // NodeProc::drop kills + waits
+        self.nodes[idx] = None;
     }
 
     /// remove node `idx`'s storage directory — a killed slot reused as a

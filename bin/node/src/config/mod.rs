@@ -811,7 +811,7 @@ pub(crate) fn http_base_in(dir: &Path) -> Result<String, String> {
 /// a co-located CLI reaches the node over loopback. `0.0.0.0` → `127.0.0.1`,
 /// but `[::]` → `[::1]`, NOT 127.0.0.1 — a bindv6only `[::]` listener refuses
 /// v4 loopback dials (mirrors `agent_provision::node_http_base`).
-fn http_base_of(http_listen: &str) -> String {
+pub(crate) fn http_base_of(http_listen: &str) -> String {
     let Some((host, port)) = http_listen.rsplit_once(':') else {
         return format!("http://{http_listen}");
     };

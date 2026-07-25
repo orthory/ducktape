@@ -344,6 +344,20 @@ pub enum SagaQuery {
     AssignedPending {
         assignee: Vec<u8>,
     },
+    /// every PENDING saga whose current attempt is UNASSIGNED, projected as
+    /// the [`WorkerRequest`]s the effect lane would have carried — the
+    /// ANNOUNCEMENT requests, which a capable host claims with
+    /// [`SagaMsg::Accept`] and the first accept in consensus order wins.
+    ///
+    /// The twin of [`Self::AssignedPending`], and needed for the same reason:
+    /// a host that does not execute blocks never observes the effect that
+    /// carried the announcement. Without this read, an announcement can only
+    /// be claimed by a node running the pool in-process — which is no node at
+    /// all now that compute is a standalone daemon.
+    ///
+    /// Read-only, like every other variant here: it derives a projection from
+    /// committed state and stages nothing.
+    UnassignedPending,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -358,6 +372,7 @@ pub enum SagaReply {
     Saga(Option<SagaView>),
     NextExpiry(Option<u64>),
     AssignedPending(Vec<WorkerRequest>),
+    UnassignedPending(Vec<WorkerRequest>),
 }
 
 /// a saga's observable state — the full read projection.
