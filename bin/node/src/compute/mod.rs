@@ -1,10 +1,10 @@
 //! `ducktape service run compute` — the standalone compute daemon.
 //!
 //! This is the compute plane. The node process constructs no provider set, no
-//! dispatch pool and no resource ledger any more; it keeps only the podman
-//! SERVICE (its still-in-node pty plane needs one) and the consensus lanes.
-//! Everything below runs in a separate process with its own failure domain, and
-//! reaches its node exactly the way the CLI does — over localhost `/v1` + ws.
+//! dispatch pool, no resource ledger and — since the agent carve — no podman
+//! service either; it keeps the consensus lanes and nothing else. Everything
+//! below runs in a separate process with its own failure domain, and reaches its
+//! node exactly the way the CLI does — over localhost `/v1` + ws.
 //!
 //! ## the seams, and where each one landed
 //!
@@ -18,12 +18,14 @@
 //! | `OutputSink` → stream hub | a `run_output` ws frame ([`link`]) |
 //! | `__egress-hook` | already a subcommand of THIS binary — the hook podman fires is `ducktape __egress-hook`, and the daemon ships in the same executable, so nothing moved |
 //!
-//! ## what the node still owns
+//! ## podman is this daemon's, not the node's
 //!
-//! The podman service itself: its socket, storage root and egress hook live
-//! under the node's data dir and its interactive terminal plane spawns ptys
-//! through them. The daemon is a CLIENT of that socket. Container ownership is
-//! therefore label-scoped, not socket-scoped — see [`reap`].
+//! This daemon starts its own node-private podman service under
+//! `<storage>/services/compute` — socket, storage root and egress hook. The node
+//! starts none, and neither does it share one with the agent daemon: a
+//! `kill_on_drop` service child shared between two processes would make them a
+//! single failure domain. Container ownership is label-scoped ON TOP of that —
+//! see [`reap`] — so the two guarantees are independent.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -83,10 +85,20 @@ async fn run(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
     // not exist yet and then spin on an unreadable projection.
     await_node(&node).await;
 
-    let backend = resolved
-        .sandbox
-        .clone()
-        .ok_or("no [sandbox] table in node.toml: this host has no configured way to isolate a run")?;
+    // this daemon's OWN podman service, under `<storage>/services/compute`. The
+    // node used to start one for everybody; it does not any more, because a
+    // `kill_on_drop` service child shared between two daemons made them one
+    // failure domain. Fail-closed: a start failure ends the process rather than
+    // leaving a daemon that announces capacity it cannot sandbox.
+    let backend = crate::services::podman_backend(&resolved, &grant.kind)?;
+    let self_exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve this daemon's own executable: {error}"))?;
+    let _podman = provider_host::PodmanService::start_for(
+        &backend,
+        &crate::services::podman_data_dir(&resolved, &grant.kind),
+        &self_exe,
+    )
+    .await?;
     reap(&backend, &grant).await;
 
     let (line_tx, line_rx) = tokio::sync::mpsc::channel(link::OUTPUT_LANE);
@@ -177,45 +189,39 @@ async fn await_node(node: &NodeLink) {
     }
 }
 
-/// Adopt this instance's containers and sweep the retired flat label.
+/// Adopt this instance's crash orphans.
 ///
-/// Two sweeps, deliberately different in kind:
+/// A daemon that crashed mid-run left containers behind; it returns with the
+/// SAME `compute#hex8` (the id is the grant hash and the grant persists in
+/// `services.toml`) and so can recognise them as its own. That re-adoption
+/// across restart is exactly why the id must survive one.
 ///
-/// - **this instance's own label.** A daemon that crashed mid-run left
-///   containers behind; it returns with the SAME `compute#hex8` (the id is the
-///   grant hash and the grant persists in `services.toml`) and so can recognise
-///   them as its own. That re-adoption across restart is exactly why the id
-///   must survive one.
-/// - **`io.ducktape.managed=capability-host`.** The pre-daemon flat label,
-///   written when one node process owned every container. Nothing writes it any
-///   more. This is DISPOSABLE RUNTIME-STATE CLEANUP, not a compat arm — delete
-///   this sweep once no host can still be carrying pre-daemon containers.
+/// ONE sweep, and no retired-flat-label arm: this daemon's graph root is private
+/// now, so a pre-daemon `capability-host` container lives in the node's OLD root
+/// and is not enumerable through this socket. Unreachable by construction, not
+/// pending cleanup.
 ///
-/// Best-effort throughout: a reap failure is a log line, never a boot failure.
+/// Best-effort: a reap failure is a log line, never a boot failure.
 async fn reap(backend: &provider_host::SandboxBackend, grant: &ServiceGrant) {
     let provider_host::SandboxBackend::Podman { socket, .. } = backend else {
         // Tart clones and deletes a VM per run; there is no label to reap.
         return;
     };
-    let mine = provider_host::managed_label(&grant.display_id());
-    for (label, reason) in [
-        (mine.as_str(), "own_orphans"),
-        (provider_host::RETIRED_FLAT_MANAGED_LABEL, "retired_label"),
-    ] {
-        match provider_host::reap_by_label(socket, label).await {
-            Ok(0) => {}
-            Ok(removed) => tracing::info!(
-                target: "ducktape::service",
-                removed,
-                reason,
-                "reaped orphaned sandbox containers"
-            ),
-            Err(error) => tracing::warn!(
-                target: "ducktape::service",
-                reason = "reap_failed",
-                "could not sweep sandbox containers: {error}"
-            ),
-        }
+    match provider_host::reap_by_label(socket, &provider_host::managed_label(&grant.display_id()))
+        .await
+    {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(
+            target: "ducktape::service",
+            removed,
+            reason = "own_orphans",
+            "reaped orphaned sandbox containers"
+        ),
+        Err(error) => tracing::warn!(
+            target: "ducktape::service",
+            reason = "reap_failed",
+            "could not sweep sandbox containers: {error}"
+        ),
     }
 }
 
@@ -361,15 +367,10 @@ mod tests {
 
     #[test]
     fn the_managed_label_is_scoped_to_one_service_instance() {
-        // the whole point of the flag day: two services on one podman socket
-        // produce two disjoint labels, so neither reaper can see the other's
-        // containers — and neither equals the retired flat label the boot
-        // sweep removes.
+        // two services produce two disjoint labels, so neither reaper can see
+        // the other's containers even if they ever shared a socket.
         let compute = provider_host::managed_label("compute#deadbeef");
-        let term = provider_host::managed_label(provider_host::NODE_TERM_OWNER);
         assert_eq!(compute, "io.ducktape.managed=compute#deadbeef");
-        assert_ne!(compute, term);
-        assert_ne!(compute, provider_host::RETIRED_FLAT_MANAGED_LABEL);
-        assert_ne!(term, provider_host::RETIRED_FLAT_MANAGED_LABEL);
+        assert_ne!(compute, provider_host::managed_label("agent#deadbeef"));
     }
 }

@@ -62,6 +62,7 @@ mod constants;
 mod cred_cli;
 mod node_http;
 mod tty;
+mod agent;
 mod compute;
 mod drain_actions;
 mod explorer;
@@ -349,18 +350,12 @@ fn run_node(
         );
     }
 
-    // the compute-plane gate: a configured sandbox must actually be runnable
-    // on THIS host before anything is discovered, announced, or spawned — a
-    // missing runtime binary is a boot error, never a bare fallback.
-    if let Some(backend) = &sandbox {
-        let runtime = backend.probe().map_err(|error| format!("sandbox: {error}"))?;
-        tracing::info!(
-            target: "ducktape::node",
-            node = %label,
-            runtime = %runtime.display(),
-            "sandbox runtime probed"
-        );
-    }
+    // There is NO sandbox probe here any more, and its absence is the point:
+    // this process runs nothing in a sandbox. Both planes that did — compute's
+    // headless runs and agent's interactive ptys — are separate daemons that
+    // probe the runtime themselves before they signal, and start their own
+    // podman service before they serve. Probing here would have made a missing
+    // podman a fatal BOOT error on a node that never needed one.
 
     let gateway_enabled = gateway_can_start(
         sync_only,
@@ -593,7 +588,6 @@ fn run_node(
                 chain_id.clone(),
                 mesh_state_file.clone(),
                 checkpoint_blocks,
-                sandbox.clone(),
                 sandbox_capacity.clone(),
                 rpc_listener,
                 http_cmds,
@@ -646,7 +640,6 @@ fn run_node(
                 advertised_reach,
                 checkpoint_blocks,
                 dev_demo,
-                sandbox,
                 sandbox_capacity,
                 stream_hub,
                 index,
@@ -690,7 +683,6 @@ fn run_node(
             checkpoint_blocks,
             promoted,
             dev_demo,
-            sandbox,
             sandbox_capacity,
             rpc_listener,
             http_cmds,

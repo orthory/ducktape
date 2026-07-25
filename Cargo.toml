@@ -102,6 +102,7 @@ members = [
     "crates/modules/apps/inbox",
     "crates/modules/apps/files",
     # services — off-chain host-side executors
+    "crates/services/agent",
     "crates/services/broker",
     "crates/services/compute",
     "crates/services/provider",
@@ -269,6 +270,7 @@ automations = { path = "crates/modules/apps/automations" }
 inbox = { path = "crates/modules/apps/inbox" }
 files = { path = "crates/modules/apps/files" }
 # internal — off-chain service crates
+agent-service = { path = "crates/services/agent" }
 broker-host = { path = "crates/services/broker" }
 compute-service = { path = "crates/services/compute" }
 provider-host = { path = "crates/services/provider" }

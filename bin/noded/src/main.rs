@@ -120,34 +120,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor_handle = handle.clone();
 
     // the node-local, off-chain interactive terminal-session plane (lives in the
-    // daemon like the stream hub — never consensus). Available ONLY when the
-    // operator configured a sandbox (DUCKTAPE_SANDBOX_IMAGE); with none there
-    // is no compute plane and create returns a clear error — a bare spawn is
-    // unrepresentable. The identity +
-    // agent dirs mirror the oracle pool's (ORACLE_ORIGIN, AgentDirs under
-    // <storage>). The manager shares the StreamHub's terminal ring so its pump
-    // appends where the ws catch-up reads.
+    // daemon like the stream hub — never consensus). This node spawns no pty:
+    // the plane is the RINGS and the metadata, and an agent daemon (`ducktape
+    // service run agent`) attaches over the ws to own the ptys. With none
+    // attached, create returns a clear 503 — a bare spawn is unrepresentable.
     let term_ring = handle.stream_hub().terminals();
     let term_cmd_ring = handle.stream_hub().term_commands();
-    let interactive = noded::term::backend_from_env().and_then(|backend| {
-        noded::term::discover_interactive(
-            ORACLE_ORIGIN,
-            provider_host::AgentDirs::under(&storage),
-            backend,
-        )
-    });
-    tracing::info!(
-        target: "ducktape::term",
-        enabled = interactive.is_some(),
-        "terminal_plane_ready"
-    );
-    let handle = handle.with_terminals(noded::TerminalSessions::new(
-        interactive,
-        provider_host::execution_node_id(ORACLE_ORIGIN),
-        storage.join("term-sessions"),
-        term_ring,
-        term_cmd_ring,
-    ));
+    // no link token: this test daemon has no workspace to hold one, so it
+    // refuses every attach and therefore has no interactive plane. Nothing
+    // runs an agent daemon against it.
+    let handle =
+        handle.with_terminals(noded::TerminalSessions::new(term_ring, term_cmd_ring, None));
     std::thread::Builder::new()
         .name("node-actor".into())
         .spawn(move || {

@@ -9,10 +9,9 @@
 //! member typing into the container never reaches the operator's secrets.
 //!
 //! Three moving parts:
-//! - [`TerminalSessions`] — the manager: a bounded map `session_id ->
-//!   Arc<InteractiveSession>`, a per-session output ring, and a pump task per
-//!   session that copies pty output into the ring and broadcasts it on the ws
-//!   `term:<id>` topic (modelled on the `run-output:<id>` plane).
+//! - [`TerminalSessions`] — the node's half of the plane: per-session metadata,
+//!   the ordered command lane, and the link to the agent daemon that owns the
+//!   actual ptys.
 //! - [`TermRing`] — the per-session scrollback ring, a focused twin of
 //!   [`crate::stream::RunOutputRegistry`]: bounded bytes, monotonic seq,
 //!   catch-up on (re)subscribe, LRU across sessions. Owned by the
@@ -21,46 +20,45 @@
 //! - the HTTP routes ([`create_session`]/[`close_session`]) + the ws
 //!   `TermInput`/`TermResize` handlers (in `stream.rs`).
 //!
-//! **Podman only.** Interactive spawn refuses the `Direct` backend
-//! (`provider_host::CliProvider::spawn_interactive_session`), so this plane is
-//! available only when the operator configured a Podman sandbox image
-//! (`DUCKTAPE_SANDBOX_IMAGE`). With no image, [`create_session`] returns a clear
-//! error and NEVER falls back to a Direct spawn.
+//! ## the process boundary
+//!
+//! **This node spawns no pty.** The interactive plane's execution half is
+//! `agent-service`, running as a separate process (`ducktape service run
+//! agent`) that dials this node's `/v1/ws` and drives ptys on the other side of
+//! [`agent_service::wire`]. This file is everything ABOVE the pty: the rings the
+//! ws serves, the mode/creator metadata the input gates read, the ordered
+//! command lane, and the mesh-facing create/close entry points.
+//!
+//! The split is what it is because everything here is inherently the node's: a
+//! pty client attaches to THIS node's ws, cross-node sessions ride the mesh term
+//! plane (authenticated by mesh `PeerId`, admitted from committed state), and
+//! neither is expressible in a process that holds no keypair.
+//!
+//! With no daemon attached there is no interactive plane: create refuses with
+//! [`TermError::NoSandbox`] — the same 503 rung the unsandboxed node used to
+//! return, kept distinct from the "terminal sessions are not enabled on this
+//! node" 503 that means the plane was never wired at all.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agent_service::wire;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use provider_host::{
-    AgentDirs, AirlockConfig, InteractiveSession, ProviderSet, RunContext, SandboxBackend,
-};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::NodeHandle;
 
-/// the per-node concurrent-session cap. a terminal is arbitrary code execution
-/// on the operator's node burning the operator's subscription, so the ceiling
-/// is deliberately small; over it, create refuses rather than spawning.
-pub const MAX_TERM_SESSIONS: usize = 4;
-/// the hard wall-clock ceiling on any single session. A session is a human
-/// driving a CLI TUI, so 4h is a generous single working session; past it the
-/// session is force-closed no matter what. This is the backstop that makes a
-/// session non-immortal: the primary teardown is still explicit close on
-/// unmount, but if the app tab is killed (its `close` never runs) or an idle TUI
-/// is just left open, this timer guarantees the container + its slot are
-/// reclaimed instead of pinned forever. There is deliberately NO idle-timeout —
-/// a terminal is legitimately idle while a human reads (see the design's
-/// "no idle-timeout kill"); silence is not death, the wall clock is the bound.
-const MAX_SESSION_LIFETIME: Duration = Duration::from_secs(4 * 60 * 60);
+/// how many commands may be in flight to the agent daemon before a sender
+/// waits. Deep enough that a burst of keystrokes never blocks the ws reader;
+/// bounded so a wedged daemon back-pressures instead of growing without limit.
+const COMMAND_LANE: usize = 1024;
 /// how many bytes of (base64) scrollback each session keeps for catch-up.
 /// `ponytail:` fixed per-session cap; make it a config knob only if a real TUI
 /// redraw pattern proves it too small.
@@ -75,27 +73,11 @@ const TERM_RING_MAX_SESSIONS: usize = 16;
 /// `ponytail:` fixed per-session cap; make it a config knob only if a real
 /// long-running session proves it too small.
 const TERM_CMD_RING_MAX_COMMANDS: usize = 1024;
-/// one pty read chunk. human typing + TUI redraws are modest; a chunk this size
-/// coalesces a redraw burst into few frames without a large per-session buffer.
-const TERM_READ_BUF: usize = 32 * 1024;
 /// the per-ring peer-forwarder broadcast buffer (the feed `bin/node`'s
 /// `term_plane` tails and fans out to peer nodes). A lagged subscriber — a slow
 /// or stalled peer stream — drops the overflow and continues: terminal output
 /// is observational, never consensus. Mirrors the run-output feed's buffer.
 const TERM_APPEND_BUFFER: usize = 2048;
-/// the environment knob carrying the sandbox image interactive sessions run in
-/// (a container image for Podman, a VM image for Tart). mirrors `bin/node`'s
-/// `sandbox_image` (node.toml) but as a plain env var, since the daemon parses
-/// no toml — same `DUCKTAPE_*` precedent as `DUCKTAPE_AGENT_WORKSPACES` /
-/// `DUCKTAPE_PROVIDER_TIMEOUT_SECS`.
-pub const SANDBOX_IMAGE_ENV: &str = "DUCKTAPE_SANDBOX_IMAGE";
-/// which sandbox backend hosts interactive sessions: `"podman"` (default, Linux)
-/// or `"tart"` (macOS guest VM). mirrors `bin/node`'s `sandbox` selector.
-pub const SANDBOX_BACKEND_ENV: &str = "DUCKTAPE_SANDBOX_BACKEND";
-/// the node-private podman socket the Podman backend drives (see
-/// `provider_host::PodmanService`). `bin/node` derives this from the
-/// workspace; `bin/noded` (no toml) reads it here.
-pub const SANDBOX_SOCKET_ENV: &str = "DUCKTAPE_PODMAN_SOCKET";
 
 /// the ws topic a session's output rides.
 pub fn topic(session_id: &str) -> String {
@@ -501,14 +483,20 @@ impl TermCommandRing {
 }
 
 // ---------------------------------------------------------------------------
-// the session manager
+// the session bridge — the node's half of the interactive plane
 // ---------------------------------------------------------------------------
 
-/// the node-local terminal-session manager. Arc-backed so a clone can ride into
-/// each session's pump task; injected onto the [`NodeHandle`] as an `Option`
-/// (absent on the test/embedded handle → the routes 503).
+/// the node's half of the terminal plane: what a session IS to this node
+/// (its mode, its creator, its ordered command lane) plus the link to the agent
+/// daemon that owns the pty. Arc-backed so a clone rides into each session's
+/// command consumer; injected onto the [`NodeHandle`] as an `Option` (absent on
+/// a sync-only node → the routes 503 "not enabled").
+///
+/// Nothing here spawns a process. Every effect on a pty is a
+/// [`wire::Command`] down the link, and every fact about one arrives as a
+/// [`wire::Event`] through [`TerminalSessions::on_event`].
 #[derive(Clone)]
-pub struct TerminalSessions(Arc<Inner>);
+pub struct TerminalSessions(Arc<Bridge>);
 
 /// one ordered command bound for a session's pty: the "command grain" — a
 /// submitted line (a prompt), attributed to `origin`. The ws (`TermCommand`)
@@ -519,14 +507,6 @@ pub struct Command {
     pub text: String,
 }
 
-/// a live session plus the ordered-command lane feeding it and the drop-guard
-/// that cancels its wall-clock reaper. When the entry leaves the map (`finish`),
-/// dropping `_reaper_cancel` resolves the reaper's cancel receiver, so its timer
-/// exits WITHOUT firing — an early end (pump EOF or explicit close) can never
-/// leave a stale timer around to reap a later session that reused this id.
-/// Dropping the entry also drops `cmd_tx`, the lane's only long-lived sender, so
-/// the serial consumer's `recv()` returns `None` and it exits — the same
-/// drop-driven teardown the pump takes on EOF, no separate cancel needed.
 /// how a session is driven — chosen at create, enforced for its whole life.
 ///
 /// `Single`: one member, raw keystrokes straight to the pty — the
@@ -542,51 +522,55 @@ pub enum SessionMode {
     Shared,
 }
 
+/// what this node knows about a live session. The pty itself lives in the
+/// daemon; none of these facts do, because none of them is the daemon's
+/// business: `mode` and `creator_node` are admission decisions this node made,
+/// and the command lane is the total order it owns.
 struct Live {
-    session: Arc<InteractiveSession>,
     mode: SessionMode,
     /// the node that created this session, for the host-side input gate. `None`
     /// for a local (non peer-attached) session — a forwarded input frame naming
     /// a local session is refused, since no peer owns it.
     creator_node: Option<[u8; 32]>,
+    /// whether output fans out to peer nodes (a Shared local session, or a
+    /// peer-attached one). Decided at create and stored, so an output frame
+    /// racing the create reply already knows where it goes.
+    forward: bool,
     cmd_tx: mpsc::UnboundedSender<Command>,
-    _reaper_cancel: oneshot::Sender<()>,
+    /// the pending create's answer, taken by whichever of `TermCreated` /
+    /// `TermRefused` / a detach arrives first. `None` once the session is live.
+    reply: Option<oneshot::Sender<Result<(), TermError>>>,
 }
 
-struct Inner {
-    /// the Podman-backed provider set. `None` when no sandbox image is
-    /// configured — create then refuses with a clear error, never a Direct
-    /// spawn (which the interactive path rejects anyway).
-    providers: Option<ProviderSet>,
-    /// this node's canonical execution id — Podman lifecycle cleanup scopes
-    /// container reaping to it, so a shared rootless user can't cross nodes.
-    executing_node: String,
-    /// per-session workdirs are created under here (the provider mounts one
-    /// rw into the container; the fresh mount namespace fences the rest off).
-    workdir_root: PathBuf,
+struct Bridge {
     /// the shared scrollback ring (owned by the StreamHub, cloned in here so
-    /// the pump can append to the same ring the ws catch-up reads).
+    /// daemon output lands in the same ring the ws catch-up reads).
     ring: TermRing,
     /// the shared ordered command-log ring (owned by the StreamHub, cloned in
     /// here so each session's serial consumer appends to the same ring the ws
     /// `term-cmd:<session>` catch-up reads).
     cmd_ring: TermCommandRing,
-    /// live sessions. `std::sync::Mutex`: every critical section clones an
-    /// `Arc` out and drops the guard before any `.await`, so it never crosses
-    /// an await point.
+    /// live sessions. `std::sync::Mutex`: every critical section clones what it
+    /// needs out and drops the guard before any `.await`, so it never crosses an
+    /// await point.
     sessions: Mutex<HashMap<String, Live>>,
-    /// reserved-or-live session count, the atomic backing the concurrency cap.
-    /// reserved at create (before the spawn await), released exactly once when
-    /// the session leaves the map (close or pump EOF).
-    active: AtomicUsize,
+    /// the attached agent daemon's command lane. `None` — no daemon signaling —
+    /// IS the `no_sandbox` state: this node has no interactive plane to offer.
+    link: Mutex<Option<mpsc::Sender<wire::Command>>>,
+    /// the secret a daemon must present to take the link. `None` — a node with
+    /// no workspace to hold one — refuses every attach: holding the link means
+    /// becoming this node's interactive plane, which is not a capability to hand
+    /// out on the strength of dialing loopback.
+    link_token: Option<String>,
 }
 
 /// everything the host needs to spawn a session on behalf of a mesh peer: the
-/// creator node (the input gate), the guest's consensus-resolved credential as a
-/// self-host airlock config (the broker upstream), and the cpu/mem limits.
+/// creator node (the input gate), the guest's consensus-resolved credential
+/// (which the daemon turns back into the broker's self-host airlock config), and
+/// the cpu/mem limits.
 pub struct PeerAttach {
     pub creator_node: [u8; 32],
-    pub airlock: AirlockConfig,
+    pub credential: wire::Credential,
     pub limits: BTreeMap<String, u64>,
 }
 
@@ -598,10 +582,11 @@ pub struct CreatedSession {
 }
 
 /// why a create refused. Each maps to a distinct status.
+#[derive(Debug)]
 pub enum TermError {
-    /// no Podman sandbox image is configured — interactive is unavailable.
+    /// no agent service is attached — this node has no interactive plane.
     NoSandbox,
-    /// the per-node concurrent-session cap is reached.
+    /// the daemon's concurrent-session cap is reached.
     AtCapacity,
     /// no provider serves the requested agent tag.
     Resolve(String),
@@ -610,15 +595,28 @@ pub enum TermError {
 }
 
 impl TermError {
+    /// the daemon's refusal, in this node's vocabulary. `NoSandbox` has no
+    /// counterpart on purpose: a daemon with no sandbox never starts, so only
+    /// this node can be in that state and it answers without asking.
+    fn from_refusal(reason: wire::Refusal, detail: String) -> Self {
+        match reason {
+            wire::Refusal::AtCapacity => TermError::AtCapacity,
+            wire::Refusal::UnknownProvider => TermError::Resolve(detail),
+            wire::Refusal::SpawnFailed => TermError::Spawn(detail),
+        }
+    }
+
     fn response(self) -> Response {
         let (status, msg) = match self {
             TermError::NoSandbox => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "interactive sessions require a configured podman sandbox image".to_string(),
+                "interactive sessions require an agent service on this node — \
+                 run `ducktape service run agent`"
+                    .to_string(),
             ),
             TermError::AtCapacity => (
                 StatusCode::TOO_MANY_REQUESTS,
-                format!("terminal session cap ({MAX_TERM_SESSIONS}) reached"),
+                format!("terminal session cap ({}) reached", agent_service::MAX_TERM_SESSIONS),
             ),
             TermError::Resolve(detail) => (StatusCode::BAD_REQUEST, detail),
             TermError::Spawn(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail),
@@ -627,97 +625,286 @@ impl TermError {
     }
 }
 
+/// what a create needs decided before anything is sent. Built by
+/// [`TerminalSessions::create`] (local) or [`TerminalSessions::create_for_peer`]
+/// (mesh), executed by [`TerminalSessions::start`] — so the two entry points
+/// stay pure decisions and exactly one place performs the effects.
+struct Spawn {
+    provider: String,
+    mode: SessionMode,
+    creator_node: Option<[u8; 32]>,
+    /// output fans out to peer nodes.
+    forward: bool,
+    /// run the restricted (read-only, non-prompting) argv rather than the solo TUI.
+    restricted: bool,
+    limits: BTreeMap<String, u64>,
+    credential: Option<wire::Credential>,
+}
+
+/// holds a daemon's attachment open. Dropping it — the ws connection closed,
+/// the daemon exited, the node is shutting down — detaches the link AND ends
+/// every session it was serving.
+///
+/// Ending them is not tidiness. The pty lives in the other process; once the
+/// link is gone this node can neither feed a session's topic nor close it, so a
+/// client attached to `term:<id>` would block forever on a stream that will
+/// never produce another byte. That is exactly the wedge the `term_ended` signal
+/// exists to prevent, and a daemon dying is just another way for a session to
+/// end.
+pub struct AttachGuard(TerminalSessions);
+
+impl Drop for AttachGuard {
+    fn drop(&mut self) {
+        self.0.detach();
+    }
+}
+
 impl TerminalSessions {
-    /// build a manager. `providers` is `None` when interactive is disabled (no
-    /// sandbox image); `ring` is the StreamHub's shared [`TermRing`] and
-    /// `cmd_ring` its shared [`TermCommandRing`].
-    pub fn new(
-        providers: Option<ProviderSet>,
-        executing_node: String,
-        workdir_root: PathBuf,
-        ring: TermRing,
-        cmd_ring: TermCommandRing,
-    ) -> Self {
-        Self(Arc::new(Inner {
-            providers,
-            executing_node,
-            workdir_root,
+    /// build the bridge over the StreamHub's shared [`TermRing`] and
+    /// [`TermCommandRing`]. No daemon is attached yet — one arrives (or does
+    /// not) over the ws.
+    pub fn new(ring: TermRing, cmd_ring: TermCommandRing, link_token: Option<String>) -> Self {
+        Self(Arc::new(Bridge {
             ring,
             cmd_ring,
             sessions: Mutex::new(HashMap::new()),
-            active: AtomicUsize::new(0),
+            link: Mutex::new(None),
+            link_token,
         }))
     }
 
-    /// create a session for `agent`, spawning its interactive TUI on a pty.
-    /// Reserves a slot against the cap BEFORE the spawn await so concurrent
-    /// creates can't both slip past a stale count.
+    // ---- the daemon's attachment ------------------------------------------
+
+    /// Take the interactive plane for this connection.
+    ///
+    /// `None` when a daemon is already attached: one agent service per node, and
+    /// FIRST ATTACH WINS. That is a boundary, not a nicety — a second attacher
+    /// could otherwise displace the live daemon and receive the create commands
+    /// (including lent-credential records) meant for it.
+    pub fn attach(&self, token: &str) -> Option<(AttachGuard, mpsc::Receiver<wire::Command>)> {
+        let Some(expected) = self.0.link_token.as_deref() else {
+            tracing::warn!(target: "ducktape::service", reason = "no_link_token", "agent service link refused");
+            return None;
+        };
+        if !crate::services::token_matches(token, expected) {
+            tracing::warn!(target: "ducktape::service", reason = "bad_link_token", "agent service link refused");
+            return None;
+        }
+        let mut link = self.0.link.lock().expect("term link lock poisoned");
+        if link.is_some() {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel(COMMAND_LANE);
+        *link = Some(tx);
+        tracing::info!(target: "ducktape::term", "agent service attached");
+        Some((AttachGuard(self.clone()), rx))
+    }
+
+    /// drop the link and end every session it was serving. See [`AttachGuard`].
+    fn detach(&self) {
+        *self.0.link.lock().expect("term link lock poisoned") = None;
+        let live = std::mem::take(
+            &mut *self
+                .0
+                .sessions
+                .lock()
+                .expect("term sessions lock poisoned"),
+        );
+        if !live.is_empty() {
+            tracing::warn!(
+                target: "ducktape::term",
+                sessions = live.len(),
+                reason = "agent_service_gone",
+                "ending every session: the agent service detached"
+            );
+        }
+        for (id, session) in live {
+            // the terminator every `term:<id>` subscriber is blocked on. The
+            // ring creates the entry if the session never produced a byte, so a
+            // session that died before its first output still unblocks.
+            self.0.ring.mark_ended(&id);
+            answer(session.reply, TermError::NoSandbox);
+        }
+        tracing::info!(target: "ducktape::term", "agent service detached");
+    }
+
+    /// whether an agent service is attached — the host-side admission's
+    /// `no_sandbox` gate, and what `has capacity` means to a mesh peer.
+    pub fn has_sandbox(&self) -> bool {
+        self.link().is_some()
+    }
+
+    fn link(&self) -> Option<mpsc::Sender<wire::Command>> {
+        self.0.link.lock().expect("term link lock poisoned").clone()
+    }
+
+    // ---- events from the daemon -------------------------------------------
+
+    /// THE dispatch for everything the daemon reports. One arm per variant, each
+    /// a single delegation — a new event fails the build until it is routed.
+    pub fn on_event(&self, event: wire::Event) {
+        match event {
+            wire::Event::TermCreated { session } => self.created(&session),
+            wire::Event::TermRefused {
+                session,
+                reason,
+                detail,
+            } => self.refused(&session, reason, detail),
+            wire::Event::TermOutput {
+                session,
+                chunk_b64,
+            } => self.output(&session, chunk_b64),
+            wire::Event::TermEnded { session } => self.ended(&session),
+        }
+    }
+
+    /// the pty is live: release the create that is waiting on it.
+    ///
+    /// If nobody is still waiting, END IT. A dropped receiver means the caller
+    /// gave up — axum drops the handler future when the client disconnects, and
+    /// a Ctrl-C during a cold image pull is ordinary behaviour, not an edge
+    /// case. The id was never returned to anyone, so no close can ever arrive
+    /// for this session: left alone it would burn a container running the agent
+    /// CLI on the operator's credential, plus one of the daemon's few cap slots,
+    /// until the wall-clock ceiling fires hours later.
+    fn created(&self, id: &str) {
+        let Some(reply) = self.take_reply(id) else {
+            return;
+        };
+        if reply.send(Ok(())).is_ok() {
+            return;
+        }
+        tracing::warn!(
+            target: "ducktape::term",
+            session = %id,
+            reason = "create_abandoned",
+            "ending a session whose caller went away"
+        );
+        // `close` only hands a frame to the link, but that is an await, and this
+        // runs on the ws read loop. The teardown proper happens when the
+        // daemon's `TermEnded` comes back through `ended`.
+        let bridge = self.clone();
+        let id = id.to_string();
+        tokio::spawn(async move { bridge.close(&id).await });
+    }
+
+    /// the create failed: release it with the daemon's reason, and forget the
+    /// session — there is no pty to end, so no `TermEnded` will follow.
+    fn refused(&self, id: &str, reason: wire::Refusal, detail: String) {
+        let removed = self
+            .0
+            .sessions
+            .lock()
+            .expect("term sessions lock poisoned")
+            .remove(id);
+        let Some(live) = removed else {
+            return;
+        };
+        answer(live.reply, TermError::from_refusal(reason, detail));
+    }
+
+    /// one chunk of pty output, into the ring the ws catch-up reads. A session
+    /// that forwards also publishes to the peer-forwarder feed; a solo one stays
+    /// node-local. An unknown id is a stale frame from a session this node
+    /// already ended — dropped without a line, since the daemon's own teardown
+    /// already logged the end.
+    fn output(&self, id: &str, chunk_b64: String) {
+        let Some(forward) = self.with_session(id, |live| live.forward) else {
+            return;
+        };
+        if forward {
+            self.0.ring.append(id, chunk_b64);
+        } else {
+            self.0.ring.append_local_only(id, chunk_b64);
+        }
+    }
+
+    /// the session is over. Mark the ring ended FIRST — unconditionally, before
+    /// the entry is removed — so the terminal frame reaches every `term:<id>`
+    /// subscriber even for a session that never produced a byte (`mark_ended`
+    /// creates the ring entry). An `agent pty` client blocks on this topic and
+    /// only unblocks when it sees the session is over.
+    fn ended(&self, id: &str) {
+        self.0.ring.mark_ended(id);
+        let removed = self
+            .0
+            .sessions
+            .lock()
+            .expect("term sessions lock poisoned")
+            .remove(id);
+        // a session that ends before its create was answered (the child exited
+        // instantly) still owes that create a reply.
+        if let Some(live) = removed {
+            answer(live.reply, TermError::Spawn("the session ended immediately".into()));
+        }
+    }
+
+    // ---- creates ----------------------------------------------------------
+
+    /// create a session for `agent` on this node's agent service.
     pub async fn create(
         &self,
         agent: &str,
         mode: SessionMode,
     ) -> Result<CreatedSession, TermError> {
-        let inner = &self.0;
-        let Some(providers) = inner.providers.as_ref() else {
-            tracing::warn!(target: "ducktape::term", reason = "no_sandbox", "session create refused");
-            return Err(TermError::NoSandbox);
-        };
-        // reserve; release on any early return below.
-        if inner.active.fetch_add(1, Ordering::SeqCst) + 1 > MAX_TERM_SESSIONS {
-            inner.active.fetch_sub(1, Ordering::SeqCst);
-            tracing::warn!(target: "ducktape::term", reason = "at_capacity", cap = MAX_TERM_SESSIONS, "session create refused");
-            return Err(TermError::AtCapacity);
-        }
-        match self.spawn(providers, agent, mode).await {
-            Ok(created) => Ok(created),
-            Err(err) => {
-                inner.active.fetch_sub(1, Ordering::SeqCst);
-                Err(err)
-            }
-        }
+        // a Shared session runs the restricted argv and fans out to peers; a
+        // Single session is the solo TUI and stays node-local.
+        let shared = mode == SessionMode::Shared;
+        self.start(Spawn {
+            provider: agent.to_string(),
+            mode,
+            creator_node: None,
+            forward: shared,
+            restricted: shared,
+            limits: BTreeMap::new(),
+            credential: None,
+        })
+        .await
     }
 
-    /// resolve the provider, build the run context, spawn the pty session, and
-    /// register it + its pump. The reservation is held by the caller.
-    async fn spawn(
+    /// create a session on behalf of a mesh PEER (the host side of a directed
+    /// `ducktape agent pty --node <this>`): the FULL solo TUI (raw keystrokes)
+    /// but with output FORWARDING on — so `term_plane` fans the pty out to the
+    /// guest node — and the creator node recorded for the host-side input gate.
+    /// The credential rides to the daemon, which pins it as the broker's
+    /// self-host airlock upstream; `attach.limits` becomes the container's
+    /// cpu/mem ceilings.
+    pub async fn create_for_peer(
         &self,
-        providers: &ProviderSet,
-        agent: &str,
-        mode: SessionMode,
+        provider: &str,
+        attach: PeerAttach,
     ) -> Result<CreatedSession, TermError> {
-        let provider = providers.resolve(agent).map_err(|detail| {
-            tracing::warn!(target: "ducktape::term", reason = "unknown_agent", agent, "session create refused");
-            TermError::Resolve(detail)
-        })?;
-        let id = format!("{:016x}", rand::random::<u64>());
-        let ctx = RunContext {
-            agent_id: Some(agent.to_string()),
-            // Podman requires the executing-node id for lifecycle scoping.
-            executing_node: Some(self.0.executing_node.clone()),
-            // a fresh per-session workdir; the provider create_dir_all's it and
-            // mounts it rw into the container.
-            workdir_override: Some(self.0.workdir_root.join(&id)),
-            // a native pty session is a host-local optimization, never portable
-            // state to resume/capture.
-            portable: true,
-            ..Default::default()
+        self.start(Spawn {
+            provider: provider.to_string(),
+            // a peer-attached session is driven by raw keystrokes, never the
+            // ordered command lane.
+            mode: SessionMode::Single,
+            creator_node: Some(attach.creator_node),
+            // ALWAYS forwards — that is how the guest node streams it (the
+            // security-critical INPUT direction is creator-gated host-side).
+            forward: true,
+            restricted: false,
+            limits: attach.limits,
+            credential: Some(attach.credential),
+        })
+        .await
+    }
+
+    /// the one place a create is performed: mint the id, record what this node
+    /// knows, send the command, and wait for the daemon's answer.
+    ///
+    /// The metadata goes in BEFORE the command goes out, so an output frame that
+    /// races the reply always finds its session. There is deliberately no
+    /// timeout: a cold image pull legitimately takes minutes, and the failure
+    /// mode a timeout would cover — the daemon vanishing — is already covered by
+    /// [`AttachGuard`], which answers every pending create.
+    async fn start(&self, spawn: Spawn) -> Result<CreatedSession, TermError> {
+        let Some(link) = self.link() else {
+            tracing::warn!(target: "ducktape::term", reason = "no_agent_service", "session create refused");
+            return Err(TermError::NoSandbox);
         };
-        // a Shared session runs the restricted (read-only, non-prompting) argv;
-        // a Single session runs the full solo TUI.
-        let restricted = mode == SessionMode::Shared;
-        let session = provider
-            .spawn_interactive(&ctx, restricted)
-            .await
-            .map_err(|detail| {
-                tracing::warn!(target: "ducktape::term", reason = "spawn_failed", agent, mode = ?mode, "interactive spawn failed");
-                TermError::Spawn(detail)
-            })?;
-        let session = Arc::new(session);
-        // dropping `cancel_tx` (when the entry leaves the map) cancels the
-        // reaper; holding it in the map keeps the ceiling armed for the session.
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        // the ordered command lane. `cmd_tx` lives in the map entry (its only
-        // long-lived sender), so `finish` dropping the entry ends the consumer.
+        let id = format!("{:016x}", rand::random::<u64>());
+        let (reply_tx, reply_rx) = oneshot::channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         self.0
             .sessions
@@ -726,251 +913,96 @@ impl TerminalSessions {
             .insert(
                 id.clone(),
                 Live {
-                    session: session.clone(),
-                    mode,
-                    // a local session has no creator peer — the input gate treats
-                    // a forwarded frame for it as "not an attached session".
-                    creator_node: None,
+                    mode: spawn.mode,
+                    creator_node: spawn.creator_node,
+                    forward: spawn.forward,
                     cmd_tx,
-                    _reaper_cancel: cancel_tx,
+                    reply: Some(reply_tx),
                 },
             );
-        // only a Shared session fans its output out to peers; a solo Single
-        // session stays node-local (rings + local ws only).
-        let forward = mode == SessionMode::Shared;
-        self.spawn_pump(id.clone(), session.clone(), forward);
+        let command = wire::Command::TermCreate(wire::Create {
+            session: id.clone(),
+            provider: spawn.provider,
+            restricted: spawn.restricted,
+            limits: spawn.limits,
+            credential: spawn.credential,
+        });
+        if link.send(command).await.is_err() {
+            // the daemon detached between the link clone and the send; its guard
+            // has already cleaned the entry up.
+            tracing::warn!(target: "ducktape::term", reason = "no_agent_service", "session create refused");
+            return Err(TermError::NoSandbox);
+        }
+        // `Err` = the sender was dropped without answering, which only the
+        // detach path does — and it logs its own reason.
+        match reply_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(refusal)) => return Err(refusal),
+            Err(_) => return Err(TermError::NoSandbox),
+        }
         // the ordered command lane exists only for a Shared session; a Single
         // session drives the pty with raw keystrokes (no lane, no consumer).
-        if mode == SessionMode::Shared {
-            self.spawn_command_consumer(id.clone(), session, cmd_rx);
+        if spawn.mode == SessionMode::Shared {
+            self.spawn_command_consumer(id.clone(), cmd_rx);
         }
-        self.spawn_reaper(id.clone(), cancel_rx);
-        tracing::info!(target: "ducktape::term", session = %id, agent, mode = ?mode, "session_created");
+        tracing::info!(target: "ducktape::term", session = %id, mode = ?spawn.mode, "session_created");
         Ok(CreatedSession {
             topic: topic(&id),
             session_id: id,
         })
     }
 
-    /// create a session on behalf of a mesh PEER (the host side of a directed
-    /// `ducktape agent pty --node <this>`): the FULL solo TUI (`restricted =
-    /// false`, raw keystrokes) but with output FORWARDING on — so `term_plane`
-    /// fans the pty out to the guest node — and the creator node recorded for the
-    /// host-side input gate. The credential rides `attach.airlock` onto the
-    /// interactive broker (the guest's self-host gateway); `attach.limits`
-    /// becomes the container's cpu/mem ceilings. Reserves a slot against the cap
-    /// exactly like [`Self::create`].
-    pub async fn create_for_peer(
-        &self,
-        provider: &str,
-        attach: PeerAttach,
-    ) -> Result<CreatedSession, TermError> {
-        let inner = &self.0;
-        let Some(providers) = inner.providers.as_ref() else {
-            tracing::warn!(target: "ducktape::term", reason = "no_sandbox", "peer session create refused");
-            return Err(TermError::NoSandbox);
-        };
-        if inner.active.fetch_add(1, Ordering::SeqCst) + 1 > MAX_TERM_SESSIONS {
-            inner.active.fetch_sub(1, Ordering::SeqCst);
-            tracing::warn!(target: "ducktape::term", reason = "at_capacity", cap = MAX_TERM_SESSIONS, "peer session create refused");
-            return Err(TermError::AtCapacity);
-        }
-        match self.spawn_for_peer(providers, provider, attach).await {
-            Ok(created) => Ok(created),
-            Err(err) => {
-                inner.active.fetch_sub(1, Ordering::SeqCst);
-                Err(err)
-            }
-        }
-    }
+    // ---- driving a live session -------------------------------------------
 
-    /// resolve the provider, build the peer-attached run context (limits +
-    /// airlock, portable), spawn the solo TUI, and register it forwarding. The
-    /// reservation is held by [`Self::create_for_peer`].
-    async fn spawn_for_peer(
-        &self,
-        providers: &ProviderSet,
-        provider: &str,
-        attach: PeerAttach,
-    ) -> Result<CreatedSession, TermError> {
-        let resolved = providers.resolve(provider).map_err(|detail| {
-            tracing::warn!(target: "ducktape::term", reason = "unknown_provider", provider, "peer session create refused");
-            TermError::Resolve(detail)
-        })?;
-        let id = format!("{:016x}", rand::random::<u64>());
-        let ctx = RunContext {
-            agent_id: Some(provider.to_string()),
-            executing_node: Some(self.0.executing_node.clone()),
-            workdir_override: Some(self.0.workdir_root.join(&id)),
-            portable: true,
-            limits: attach.limits,
-            airlock: Some(attach.airlock),
-            ..Default::default()
-        };
-        // a peer-attached session is the solo TUI (raw keystrokes), never the
-        // restricted command-lane argv.
-        let session = resolved
-            .spawn_interactive(&ctx, false)
-            .await
-            .map_err(|detail| {
-                tracing::warn!(target: "ducktape::term", reason = "spawn_failed", provider, "peer interactive spawn failed");
-                TermError::Spawn(detail)
-            })?;
-        let session = Arc::new(session);
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        // a Single session drives the pty with raw keystrokes: the lane has no
-        // consumer, but the field must hold a sender.
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-        self.0
-            .sessions
-            .lock()
-            .expect("term sessions lock poisoned")
-            .insert(
-                id.clone(),
-                Live {
-                    session: session.clone(),
-                    mode: SessionMode::Single,
-                    creator_node: Some(attach.creator_node),
-                    cmd_tx,
-                    _reaper_cancel: cancel_tx,
-                },
-            );
-        // a peer-attached session ALWAYS forwards its output — that is how the
-        // guest node streams it (the security-critical INPUT direction is
-        // creator-gated host-side, not here).
-        self.spawn_pump(id.clone(), session, true);
-        self.spawn_reaper(id.clone(), cancel_rx);
-        tracing::info!(target: "ducktape::term", session = %id, provider, "session_created");
-        Ok(CreatedSession {
-            topic: topic(&id),
-            session_id: id,
-        })
-    }
-
-    /// the pump: copy pty output into the ring + broadcast until EOF, then
-    /// clean the session up. One task per session. `forward` (decided by the
-    /// caller as a named predicate) fans output out to peers: true for a Shared
-    /// local session AND a peer-attached one, false for a solo local session.
-    fn spawn_pump(&self, id: String, session: Arc<InteractiveSession>, forward: bool) {
-        let manager = self.clone();
-        let ring = self.0.ring.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; TERM_READ_BUF];
-            loop {
-                match session.read(&mut buf).await {
-                    // EOF: the child (and its container) is gone.
-                    Ok(0) => break,
-                    Ok(n) => {
-                        // never log the bytes — only their count.
-                        let chunk = STANDARD.encode(&buf[..n]);
-                        if forward {
-                            ring.append(&id, chunk);
-                        } else {
-                            ring.append_local_only(&id, chunk);
-                        }
-                        tracing::trace!(target: "ducktape::term", session = %id, bytes = n, "term_output");
-                    }
-                    Err(err) => {
-                        tracing::warn!(target: "ducktape::term", session = %id, reason = "read_failed", error = %err, "term pump stopped");
-                        break;
-                    }
-                }
-            }
-            // mark the ring ended FIRST, so the terminal frame reaches every
-            // `term:<id>` ws subscriber (an `agent pty` client blocks on this
-            // topic and only unblocks when it sees the session is over). Then
-            // finish() removes the entry: whoever removes it owns teardown + the
-            // lifecycle log, so an explicit close() racing the EOF here never
-            // double-terminates.
-            ring.mark_ended(&id);
-            if let Some(session) = manager.finish(&id) {
-                session.close().await;
-                tracing::info!(target: "ducktape::term", session = %id, "session_ended");
-            }
-        });
-    }
-
-    /// the serial command consumer: the total order. One task per session,
-    /// spawned at create alongside the pump. It drains the session's ordered
-    /// command lane FIFO, stamps each command with a monotonic per-session `seq`
-    /// (via the shared command-log ring, starting at 1), records `(seq, origin,
-    /// text)` to that ring — which wakes `term-cmd:<id>` subscribers — THEN
-    /// feeds the command grain (`text` + `\r`, a submitted line) to the pty.
-    /// Serial processing IS the total order; one host feeds the pty. Exits the
-    /// moment every sender drops (the `Live` entry left the map via `finish`),
-    /// the same drop-driven teardown the pump takes on EOF — so it can never
-    /// outlive a reused id and never leaks.
-    fn spawn_command_consumer(
-        &self,
-        id: String,
-        session: Arc<InteractiveSession>,
-        mut rx: mpsc::UnboundedReceiver<Command>,
-    ) {
-        let cmd_ring = self.0.cmd_ring.clone();
-        tokio::spawn(async move {
-            while let Some(Command { origin, text }) = rx.recv().await {
-                // record + wake subscribers BEFORE the pty write: the ordered,
-                // attributed log is the shared object; the pty write is its
-                // effect. Never log the command text — it can carry secrets.
-                let seq = cmd_ring.append(&id, &origin, &text);
-                tracing::debug!(target: "ducktape::term", session = %id, seq, %origin, "term_command");
-                if let Err(err) = session.write_all(text.as_bytes()).await {
-                    tracing::warn!(target: "ducktape::term", session = %id, reason = "write_failed", error = %err, "term command dropped");
-                    continue;
-                }
-                if let Err(err) = session.write_all(b"\r").await {
-                    tracing::warn!(target: "ducktape::term", session = %id, reason = "write_failed", error = %err, "term command dropped");
-                }
-            }
-        });
-    }
-
-    /// arm the hard wall-clock ceiling: after [`MAX_SESSION_LIFETIME`] the
-    /// session is force-closed through `finish()` — the SAME teardown path pump
-    /// EOF and explicit close take, so the slot still releases exactly once and
-    /// this can't double-release or race those paths. Cancelled cleanly the
-    /// moment the session ends earlier: `finish()` drops the entry (and with it
-    /// `cancel`'s sender), the select below takes the cancel arm, and the timer
-    /// never fires — so it can't reap a later session that reused this id.
-    fn spawn_reaper(&self, id: String, cancel: oneshot::Receiver<()>) {
-        let manager = self.clone();
-        tokio::spawn(async move {
-            if !reaper_fires(MAX_SESSION_LIFETIME, cancel).await {
-                return; // the session ended before the ceiling — nothing to reap.
-            }
-            if let Some(session) = manager.finish(&id) {
-                session.close().await;
-                tracing::info!(target: "ducktape::term", session = %id, reason = "lifetime_ceiling", "session_ended");
-            }
-        });
-    }
-
-    /// close a session (idempotent): terminate the child + drop it from the
-    /// manager. Unknown / already-closed id → a no-op.
+    /// close a session (idempotent). The daemon owns the teardown, so this only
+    /// asks: the session leaves this node's map when its `TermEnded` arrives,
+    /// which is the same path a child exiting on its own takes.
     pub async fn close(&self, id: &str) {
-        if let Some(session) = self.finish(id) {
-            session.close().await;
-            tracing::info!(target: "ducktape::term", session = %id, "session_ended");
+        self.send(wire::Command::TermClose {
+            session: id.to_string(),
+        })
+        .await;
+    }
+
+    /// write raw keystrokes to a session's pty.
+    pub async fn input(&self, id: &str, data_b64: &str) {
+        self.send(wire::Command::TermInput {
+            session: id.to_string(),
+            data_b64: data_b64.to_string(),
+        })
+        .await;
+    }
+
+    /// change a session's window size.
+    pub async fn resize(&self, id: &str, cols: u16, rows: u16) {
+        self.send(wire::Command::TermResize {
+            session: id.to_string(),
+            cols,
+            rows,
+        })
+        .await;
+    }
+
+    /// the single writer to the daemon. A missing or closed link drops the
+    /// command with a named reason — never a panic; the session is ending
+    /// anyway, and [`AttachGuard`] is what tells the client so.
+    async fn send(&self, command: wire::Command) {
+        let Some(link) = self.link() else {
+            tracing::warn!(target: "ducktape::term", reason = "no_agent_service", "term command dropped");
+            return;
+        };
+        if link.send(command).await.is_err() {
+            tracing::warn!(target: "ducktape::term", reason = "agent_service_gone", "term command dropped");
         }
     }
 
     /// the `CommandSource` entry point: enqueue an ordered, origin-attributed
-    /// command for `session`. The ws calls this now (from `TermCommand`);
-    /// consensus (PR 2) will. The per-session serial consumer assigns the total
+    /// command for `session`. The per-session serial consumer assigns the total
     /// order and feeds the pty — this only appends to the FIFO lane. An unknown
     /// session id is a no-op + `warn` (`unknown_session`), exactly like the
     /// input/resize handlers; never a panic. Never logs the command text.
     pub fn enqueue_command(&self, session: &str, origin: String, text: String) {
-        // read the mode + sender under the lock, drop the guard before sending
-        // (send is sync and non-blocking, but this keeps the manager's
-        // no-work-under-lock discipline uniform).
-        let found = self
-            .0
-            .sessions
-            .lock()
-            .expect("term sessions lock poisoned")
-            .get(session)
-            .map(|live| (live.mode, live.cmd_tx.clone()));
+        let found = self.with_session(session, |live| (live.mode, live.cmd_tx.clone()));
         let Some((mode, tx)) = found else {
             tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term command dropped");
             return;
@@ -980,136 +1012,85 @@ impl TerminalSessions {
             tracing::warn!(target: "ducktape::term", session = %session, reason = "command_on_single", "term command dropped");
             return;
         }
-        // a send failure means the consumer already exited (a teardown race with
-        // finish()); the session is ending, so the drop is benign.
+        // a send failure means the consumer already exited (a teardown race);
+        // the session is ending, so the drop is benign.
         let _ = tx.send(Command { origin, text });
     }
 
-    /// whether a sandbox provider set is configured — the host-side admission's
-    /// `no_sandbox` gate. False when the node has no compute plane.
-    pub fn has_sandbox(&self) -> bool {
-        self.0.providers.is_some()
+    /// the serial command consumer: the total order. One task per Shared
+    /// session. It drains the session's ordered command lane FIFO, stamps each
+    /// command with a monotonic per-session `seq` (via the shared command-log
+    /// ring, starting at 1), records `(seq, origin, text)` to that ring — which
+    /// wakes `term-cmd:<id>` subscribers — THEN feeds the command grain to the
+    /// pty as a submitted line (the text with a trailing carriage return).
+    /// Serial processing IS the total order; one node stamps it. Exits the
+    /// moment every sender drops (the `Live` entry left the map), so it can
+    /// never outlive a reused id.
+    ///
+    /// The order is assigned HERE, not in the daemon: the ordered attributed log
+    /// is the shared object this node publishes, and the pty write is merely its
+    /// effect.
+    fn spawn_command_consumer(&self, id: String, mut rx: mpsc::UnboundedReceiver<Command>) {
+        let bridge = self.clone();
+        tokio::spawn(async move {
+            while let Some(Command { origin, text }) = rx.recv().await {
+                // record + wake subscribers BEFORE the pty write. Never log the
+                // command text — it can carry secrets.
+                let seq = bridge.0.cmd_ring.append(&id, &origin, &text);
+                tracing::debug!(target: "ducktape::term", session = %id, seq, %origin, "term_command");
+                // one write, not two: a submitted line is `text` plus the
+                // carriage return that submits it.
+                let mut line = text.into_bytes();
+                line.push(b'\r');
+                bridge.input(&id, &STANDARD.encode(&line)).await;
+            }
+        });
     }
+
+    // ---- what this node knows about a session ------------------------------
 
     /// the mode a session was created with (for the ws input gates), if live.
     pub fn mode(&self, id: &str) -> Option<SessionMode> {
-        self.0
-            .sessions
-            .lock()
-            .expect("term sessions lock poisoned")
-            .get(id)
-            .map(|live| live.mode)
+        self.with_session(id, |live| live.mode)
     }
 
     /// the node that created a peer-attached session — the host-side input gate.
     /// `None` for a local session (no creator peer) or an unknown id, so a
     /// forwarded input frame for either is refused.
     pub fn creator_node(&self, id: &str) -> Option<[u8; 32]> {
+        self.with_session(id, |live| live.creator_node).flatten()
+    }
+
+    /// read one fact off a live session under the lock, never holding it across
+    /// anything that can await.
+    fn with_session<T>(&self, id: &str, pick: impl FnOnce(&Live) -> T) -> Option<T> {
         self.0
             .sessions
             .lock()
             .expect("term sessions lock poisoned")
             .get(id)
-            .and_then(|live| live.creator_node)
+            .map(pick)
     }
 
-    /// the live session for `id`, if any (for `TermInput`/`TermResize`).
-    pub fn session(&self, id: &str) -> Option<Arc<InteractiveSession>> {
+    /// take a pending create's answer channel, if it has not been answered yet.
+    fn take_reply(&self, id: &str) -> Option<oneshot::Sender<Result<(), TermError>>> {
         self.0
             .sessions
             .lock()
             .expect("term sessions lock poisoned")
-            .get(id)
-            .map(|live| live.session.clone())
-    }
-
-    /// remove a session from the map, releasing its cap slot exactly once.
-    /// Returns the removed handle so the caller can tear it down. Dropping the
-    /// removed [`Live`] also drops its reaper-cancel sender, so an early end
-    /// disarms the wall-clock timer here (after the lock is released).
-    fn finish(&self, id: &str) -> Option<Arc<InteractiveSession>> {
-        let removed = self
-            .0
-            .sessions
-            .lock()
-            .expect("term sessions lock poisoned")
-            .remove(id);
-        if removed.is_some() {
-            self.0.active.fetch_sub(1, Ordering::SeqCst);
-        }
-        removed.map(|live| live.session)
+            .get_mut(id)
+            .and_then(|live| live.reply.take())
     }
 }
 
-/// resolve to `true` iff `lifetime` elapses before the session is cancelled
-/// (its reaper-cancel sender dropped). Split out of `spawn_reaper` so the
-/// ceiling-vs-cancel race is unit-testable under paused time without a live pty
-/// session.
-async fn reaper_fires(lifetime: Duration, cancel: oneshot::Receiver<()>) -> bool {
-    tokio::select! {
-        _ = tokio::time::sleep(lifetime) => true,
-        _ = cancel => false,
-    }
-}
-
-/// build the sandbox-backed interactive provider set for `backend`. the
-/// caller owns backend selection — and calls this only when a sandbox is
-/// actually configured: `bin/node` passes its resolved `node.toml` backend,
-/// `bin/noded` passes [`backend_from_env`]'s `Some`. a discovery error is
-/// logged and disables the terminal plane.
-pub fn discover_interactive(
-    node_identity: &[u8],
-    dirs: AgentDirs,
-    backend: SandboxBackend,
-) -> Option<ProviderSet> {
-    // the pty plane is still in-node (the agent carve is a later step), so it
-    // has no minted service instance — but its containers must carry an owner
-    // tag of their OWN, or the compute daemon's reaper would sweep live pty
-    // sessions.
-    match provider_host::discover(
-        node_identity,
-        dirs,
-        None,
-        backend,
-        provider_host::NODE_TERM_OWNER,
-    ) {
-        Ok(set) => Some(set),
-        Err(err) => {
-            tracing::error!(target: "ducktape::term", error = %err, "interactive_discovery_failed");
-            None
-        }
-    }
-}
-
-/// derive the daemon's sandbox backend from its env vars
-/// (`DUCKTAPE_SANDBOX_IMAGE` / `DUCKTAPE_SANDBOX_BACKEND`). `None` — no
-/// compute plane, no terminal plane — when no image is configured or the
-/// backend name is unknown. `bin/noded` uses this because it parses no toml;
-/// `bin/node` resolves its backend from `node.toml` instead.
-pub fn backend_from_env() -> Option<SandboxBackend> {
-    let Ok(image) = std::env::var(SANDBOX_IMAGE_ENV) else {
-        return None;
-    };
-    let image = image.trim().to_string();
-    if image.is_empty() {
-        return None;
-    }
-    match std::env::var(SANDBOX_BACKEND_ENV)
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        None | Some("") | Some("podman") => {
-            let socket = std::path::PathBuf::from(
-                std::env::var(SANDBOX_SOCKET_ENV).unwrap_or_default(),
-            );
-            Some(SandboxBackend::Podman { image, socket })
-        }
-        Some("tart") => Some(SandboxBackend::Tart { image }),
-        Some(other) => {
-            tracing::error!(target: "ducktape::term", backend = other, "unknown sandbox backend; compute plane disabled");
-            None
-        }
+/// answer a pending create that ended without a pty — a refusal, or a detach.
+///
+/// A dropped receiver is benign HERE and only here: there is no session to leak,
+/// because none was ever created. The success path deliberately does NOT use
+/// this ([`TerminalSessions::created`] must act on the dropped receiver).
+fn answer(reply: Option<oneshot::Sender<Result<(), TermError>>>, refusal: TermError) {
+    if let Some(reply) = reply {
+        let _ = reply.send(Err(refusal));
     }
 }
 
@@ -1578,69 +1559,296 @@ mod tests {
         assert_eq!(msg, "node must be a 32-byte hex node key");
     }
 
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// a bridge with a fake daemon on the other end: every `TermCreate` is
+    /// answered `TermCreated`, which is all a create needs to complete. The
+    /// caller drives everything else (`on_event`) by hand, so each test names
+    /// exactly the daemon behaviour it is about.
+    fn with_daemon() -> (TerminalSessions, AttachGuard) {
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        let (guard, mut rx) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
+        let daemon = terminals.clone();
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                if let wire::Command::TermCreate(create) = command {
+                    daemon.on_event(wire::Event::TermCreated {
+                        session: create.session,
+                    });
+                }
+            }
+        });
+        (terminals, guard)
+    }
+
     #[test]
     fn creator_node_is_absent_for_a_local_or_unknown_session() {
-        // a manager with no providers can't spawn, but the input-gate accessor is
-        // pure: an unknown id (and, by construction, any local session) has no
-        // creator node — so a forwarded input frame naming it is refused. The
-        // live peer-attach spawn is covered by the two-node e2e (real pty).
-        let terminals = TerminalSessions::new(
-            None,
-            "node".into(),
-            PathBuf::from("term-sessions"),
-            TermRing::default(),
-            TermCommandRing::default(),
-        );
+        // the input-gate accessor is pure: an unknown id (and, by construction,
+        // any local session) has no creator node — so a forwarded input frame
+        // naming it is refused.
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
         assert!(terminals.creator_node("nope").is_none());
     }
 
     #[test]
     fn enqueue_command_on_an_unknown_session_is_a_no_op() {
-        // no sandbox providers → no live session can exist; enqueue must warn +
-        // no-op, never panic (mirrors the input/resize unknown-session
-        // discipline) and record nothing. The live enqueue→consumer→pty path
-        // needs a real InteractiveSession (private ctor, real pty) and is
-        // exercised by the parent's live podman check.
-        let terminals = TerminalSessions::new(
-            None,
-            "node".into(),
-            PathBuf::from("term-sessions"),
-            TermRing::default(),
-            TermCommandRing::default(),
-        );
+        // enqueue must warn + no-op, never panic (mirrors the input/resize
+        // unknown-session discipline) and record nothing.
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
         terminals.enqueue_command("nope", "alice".into(), "ls".into());
         assert!(terminals.0.cmd_ring.read_after("nope", 0, 8).0.is_empty());
     }
 
-    // The reaper drives `finish()` (the exactly-once slot release) once its
-    // ceiling elapses; a live `InteractiveSession` can't be built in a unit test
-    // (private ctor, real pty), so the two tests below pin the ceiling-vs-cancel
-    // decision that gates that call. The reap-exactly-once itself is structural:
-    // pump EOF, explicit close, and the reaper all funnel through the single
-    // `remove().is_some()`-guarded `finish()`, covered live by fleet QA.
+    #[tokio::test]
+    async fn a_create_refuses_when_no_agent_service_is_attached() {
+        // the `no_sandbox` rung, in its new meaning: the plane is wired (the
+        // manager exists, so the route does NOT return "not enabled") but no
+        // daemon owns a pty for it.
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        assert!(!terminals.has_sandbox());
+        let refused = terminals.create("claude", SessionMode::Single).await;
+        assert!(matches!(refused, Err(TermError::NoSandbox)));
+    }
 
-    #[tokio::test(start_paused = true)]
-    async fn reaper_fires_once_past_the_lifetime_ceiling() {
-        // the sender is held (session still live), so only the sleep can win.
-        let (_cancel_tx, cancel_rx) = oneshot::channel();
-        let reaper = tokio::spawn(reaper_fires(Duration::from_secs(10), cancel_rx));
-        tokio::time::advance(Duration::from_secs(11)).await;
+    #[test]
+    fn a_second_attach_cannot_displace_a_live_daemon() {
+        // FIRST ATTACH WINS is a boundary: a local impersonator that could take
+        // the link would receive the create commands — lent-credential records
+        // included — meant for the real daemon.
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        let first = terminals.attach(TEST_TOKEN);
+        assert!(first.is_some());
         assert!(
-            reaper.await.unwrap(),
-            "past the ceiling with no earlier end, the reaper fires"
+            terminals.attach(TEST_TOKEN).is_none(),
+            "the link is already held"
+        );
+        // and it is reclaimable once the holder goes.
+        drop(first);
+        assert!(terminals.attach(TEST_TOKEN).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_create_completes_when_the_daemon_answers() {
+        let (terminals, _guard) = with_daemon();
+        let created = terminals
+            .create("claude", SessionMode::Single)
+            .await
+            .expect("the daemon answered");
+        assert_eq!(created.topic, topic(&created.session_id));
+        assert_eq!(terminals.mode(&created.session_id), Some(SessionMode::Single));
+    }
+
+    #[tokio::test]
+    async fn a_create_whose_caller_went_away_is_closed_not_leaked() {
+        // THE cancelled-create regression. axum drops the handler future when
+        // the client disconnects, and a Ctrl-C during a cold image pull is
+        // ordinary. The pty still comes up on the daemon — but nobody ever
+        // received its id, so no close can ever arrive for it. Unless this node
+        // sends one, it burns a container on the operator's credential and one
+        // of four cap slots for four hours.
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
+        let (_guard, mut rx) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
+
+        // no auto-answering daemon here: hold the create unanswered, exactly as
+        // a slow pull would, and take the command off the link by hand.
+        let mut pending = Box::pin(terminals.create("claude", SessionMode::Single));
+        let command = tokio::select! {
+            _ = &mut pending => panic!("a create cannot complete while nothing answers it"),
+            command = rx.recv() => command.expect("the create reached the link"),
+        };
+        let wire::Command::TermCreate(create) = command else {
+            panic!("the first command must be the create");
+        };
+        // the caller gives up.
+        drop(pending);
+        // the daemon finishes starting the pty anyway.
+        terminals.on_event(wire::Event::TermCreated {
+            session: create.session.clone(),
+        });
+        assert_eq!(
+            rx.recv().await.expect("a close must follow an abandoned create"),
+            wire::Command::TermClose {
+                session: create.session
+            },
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn reaper_is_cancelled_when_the_session_ends_early() {
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let reaper = tokio::spawn(reaper_fires(Duration::from_secs(10), cancel_rx));
-        // the session ended (finish() dropped the entry, and with it the sender)
-        // before the ceiling — the timer must NOT fire, so a reused id is safe.
-        drop(cancel_tx);
-        assert!(
-            !reaper.await.unwrap(),
-            "an early end cancels the timer; it never fires on a reused id"
+    #[test]
+    fn the_link_needs_this_nodes_token() {
+        // holding the link means BECOMING the interactive plane and receiving
+        // every lent-credential record with it. Dialing loopback is not enough.
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
         );
+        assert!(terminals.attach("").is_none(), "an empty token is not a token");
+        assert!(
+            terminals.attach("0123456789abcdef0123456789abcdee").is_none(),
+            "a near miss is still a miss"
+        );
+        assert!(terminals.attach(TEST_TOKEN).is_some());
+    }
+
+    #[test]
+    fn a_node_that_could_not_mint_a_token_refuses_every_attach() {
+        // fail CLOSED: a node that cannot write its 0600 token has no way to
+        // tell a daemon from any other local process, so it has no interactive
+        // plane rather than an unguarded one.
+        let terminals =
+            TerminalSessions::new(TermRing::default(), TermCommandRing::default(), None);
+        assert!(terminals.attach("").is_none());
+        assert!(terminals.attach(TEST_TOKEN).is_none());
+        assert!(!terminals.has_sandbox());
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_child_exits_ends_without_wedging() {
+        // THE wedge regression. An attached `agent pty` client blocks on
+        // `term:<id>` until the ring says the session ended; if the child's exit
+        // did not mark it, the client would hang forever.
+        let (terminals, _guard) = with_daemon();
+        let created = terminals
+            .create("claude", SessionMode::Single)
+            .await
+            .expect("the daemon answered");
+        terminals.on_event(wire::Event::TermOutput {
+            session: created.session_id.clone(),
+            chunk_b64: STANDARD.encode(b"hi"),
+        });
+        terminals.on_event(wire::Event::TermEnded {
+            session: created.session_id.clone(),
+        });
+        assert!(terminals.0.ring.is_ended(&created.session_id));
+        assert!(
+            terminals.mode(&created.session_id).is_none(),
+            "an ended session leaves the map"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_that_never_printed_a_byte_still_marks_ended() {
+        // the no-output path, historically the one that wedged: the ring has no
+        // entry for a session that produced nothing, so `mark_ended` must CREATE
+        // one rather than silently do nothing.
+        let (terminals, _guard) = with_daemon();
+        let created = terminals
+            .create("claude", SessionMode::Single)
+            .await
+            .expect("the daemon answered");
+        terminals.on_event(wire::Event::TermEnded {
+            session: created.session_id.clone(),
+        });
+        assert!(terminals.0.ring.is_ended(&created.session_id));
+    }
+
+    #[tokio::test]
+    async fn a_detaching_daemon_ends_every_live_session() {
+        // the failure mode the process split introduces: the daemon dies while
+        // sessions are live. This node can no longer feed or close them, so it
+        // must terminate them rather than leave every attached client blocked.
+        let (terminals, guard) = with_daemon();
+        let created = terminals
+            .create("claude", SessionMode::Single)
+            .await
+            .expect("the daemon answered");
+        drop(guard);
+        assert!(terminals.0.ring.is_ended(&created.session_id));
+        assert!(!terminals.has_sandbox());
+        assert!(matches!(
+            terminals.create("claude", SessionMode::Single).await,
+            Err(TermError::NoSandbox)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_solo_session_never_reaches_the_peer_forwarder_feed() {
+        // `forward` is decided at create and stored, so an output frame that
+        // races the create reply still routes correctly. A Single local session
+        // stays node-local; publishing it would fan a private terminal out to
+        // every peer.
+        let (terminals, _guard) = with_daemon();
+        let created = terminals
+            .create("claude", SessionMode::Single)
+            .await
+            .expect("the daemon answered");
+        let mut appends = terminals.0.ring.subscribe_appends();
+        terminals.on_event(wire::Event::TermOutput {
+            session: created.session_id.clone(),
+            chunk_b64: STANDARD.encode(b"secret"),
+        });
+        assert!(
+            appends.try_recv().is_err(),
+            "a solo session must not publish to the peer feed"
+        );
+        // but it IS in the local ring the ws catch-up serves.
+        assert!(!terminals.0.ring.read_after(&created.session_id, 0, 8).0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_shared_session_does_reach_the_peer_forwarder_feed() {
+        let (terminals, _guard) = with_daemon();
+        let created = terminals
+            .create("claude", SessionMode::Shared)
+            .await
+            .expect("the daemon answered");
+        let mut appends = terminals.0.ring.subscribe_appends();
+        terminals.on_event(wire::Event::TermOutput {
+            session: created.session_id.clone(),
+            chunk_b64: STANDARD.encode(b"shared"),
+        });
+        assert!(appends.try_recv().is_ok(), "a shared session fans out");
+    }
+
+    #[tokio::test]
+    async fn a_daemon_refusal_keeps_the_diagnosis_ladder_intact() {
+        // the rungs an operator reads: 503 = nothing can serve this, 429 = it
+        // could but is full, 400 = you asked for a provider nobody has, 500 =
+        // the spawn itself failed. Each must survive the process boundary.
+        let ladder = [
+            (TermError::NoSandbox, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                TermError::from_refusal(wire::Refusal::AtCapacity, String::new()),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                TermError::from_refusal(wire::Refusal::UnknownProvider, "no such tag".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TermError::from_refusal(wire::Refusal::SpawnFailed, "image absent".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (error, expected) in ladder {
+            assert_eq!(error.response().status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_create_returns_the_daemon_reason_and_forgets_the_session() {
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        let (_guard, mut rx) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
+        let daemon = terminals.clone();
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                if let wire::Command::TermCreate(create) = command {
+                    daemon.on_event(wire::Event::TermRefused {
+                        session: create.session,
+                        reason: wire::Refusal::SpawnFailed,
+                        detail: "image absent".into(),
+                    });
+                }
+            }
+        });
+        let refused = terminals.create("claude", SessionMode::Single).await;
+        let Err(TermError::Spawn(detail)) = refused else {
+            panic!("a spawn failure must surface as Spawn, not another rung");
+        };
+        assert_eq!(detail, "image absent");
     }
 }

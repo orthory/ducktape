@@ -389,10 +389,12 @@ fn a_parked_joiner_serves_the_terminal_plane() {
         "/v1/term/sessions",
         Some(&json!({ "agent": "echo" })),
     );
-    assert_eq!(status, 503, "no sandbox is configured, so the create refuses: {body}");
-    assert_eq!(
-        body["error"].as_str().unwrap_or_default(),
-        "interactive sessions require a configured podman sandbox image",
-        "the refusal must be the no-sandbox one — the plane itself is present: {body}"
+    assert_eq!(status, 503, "no agent service is attached, so the create refuses: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("interactive sessions require an agent service"),
+        "the refusal must be the no-daemon one — the plane itself is present: {body}"
     );
 }
