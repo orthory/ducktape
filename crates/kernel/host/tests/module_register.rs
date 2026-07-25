@@ -63,7 +63,11 @@ const MEMBER: [u8; 32] = [7; 32];
 /// anywhere: the module this proof admits does not exist at genesis.
 fn bare_host(with_factory: bool) -> Host {
     let mut host = Host::new();
-    host.register(Box::new(Lifecycle::new(LIFECYCLE_MODULE_ID, "valset")));
+    host.register(Box::new(Lifecycle::new(
+        LIFECYCLE_MODULE_ID,
+        Box::new(sdk_testkit::MemStore::new()),
+        "valset",
+    )));
     let mut valset = valset::Valset::new("valset");
     valset.insert(MEMBER.to_vec());
     host.register(Box::new(valset));

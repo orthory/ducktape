@@ -66,6 +66,15 @@ impl StagedStore {
         self.store.get(&store_key(key)).await
     }
 
+    /// read `key` from COMMITTED state only, bypassing the overlay — the
+    /// boundary-decider read: a kernel coordinator whose activation decides
+    /// over the frozen end-of-(H-1) state (lifecycle's `Advance`, dispatch's
+    /// committed-only query lane) must not see writes staged earlier in the
+    /// same block. everything else reads [`get`](StagedStore::get).
+    pub async fn get_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        self.store.get(&store_key(key)).await
+    }
+
     /// stage `key -> value` (upsert) for this block WITHOUT committing. visible
     /// to [`get`](StagedStore::get) at once; folded into the store — and
     /// [`root`](StagedStore::root) — only at [`commit`](StagedStore::commit).

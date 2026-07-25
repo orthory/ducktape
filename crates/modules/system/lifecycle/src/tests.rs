@@ -52,7 +52,17 @@ fn hash(seed: u8) -> Vec<u8> {
     vec![seed; CODE_HASH_LEN]
 }
 fn fresh() -> Lifecycle {
-    Lifecycle::new("lifecycle", "valset")
+    Lifecycle::new(
+        "lifecycle",
+        Box::new(sdk_testkit::MemStore::new()),
+        "valset",
+    )
+}
+
+/// the root of a store that never committed anything — the store-backed twin
+/// of the old ZERO sentinel.
+fn empty_root() -> StateRoot {
+    fresh().root()
 }
 fn msg(m: LifecycleMsg) -> Msg {
     Msg {
@@ -434,12 +444,12 @@ fn cancelled_admission_removes_entry() {
 // ============================================================================
 
 #[test]
-fn root_zero_fresh_then_state_moves_it() {
+fn root_empty_fresh_then_state_moves_it() {
     let mut lc = fresh();
-    assert_eq!(lc.root(), StateRoot::ZERO);
+    assert_eq!(lc.root(), empty_root());
     register_module(&mut lc, "hello", 1);
     let after_register = lc.root();
-    assert_ne!(after_register, StateRoot::ZERO);
+    assert_ne!(after_register, empty_root());
     let mut sys = ctx(Origin::System, 0);
     run(
         &mut lc,
@@ -452,38 +462,36 @@ fn root_zero_fresh_then_state_moves_it() {
 }
 
 #[test]
-fn snapshot_round_trips_and_rejects_tampering() {
+fn genesis_seed_publishes_once_and_reseeding_is_a_no_op() {
     let mut lc = fresh();
-    let mut sys = ctx(Origin::System, 0);
-    register_module(&mut lc, "hello", 1);
-    run(
-        &mut lc,
-        &mut sys,
-        &schedule_swap("hello", "replacement", 20, 2),
-    )
-    .unwrap();
-    commit(&mut lc);
-    make_swap_ready(&mut lc, "hello", "replacement");
+    futures::executor::block_on(async {
+        lc.seed("hello", hash(1)).await.unwrap();
+        lc.seed("directory", hash(2)).await.unwrap();
+        lc.finish_seed().await.unwrap();
+    });
+    let seeded = lc.root();
+    assert_ne!(seeded, empty_root(), "the seed set is committed state");
+    assert_eq!(module_status(&lc).len(), 2);
 
-    let bytes = lc.snapshot();
-    let root = lc.root();
-    let digest: [u8; 32] = Sha256::digest(&bytes).into();
-    assert_eq!(StateRoot(digest), root, "sha256(snapshot) == root");
-    let mut dst = fresh();
-    dst.install(&bytes, root).expect("install round-trips");
-    assert_eq!(dst.committed, lc.committed);
-    assert_eq!(dst.root(), root);
-
-    // tamper rejected, target untouched.
-    let mut flipped = bytes.clone();
-    flipped[0] ^= 0x01;
-    let mut other = fresh();
-    register_module(&mut other, "z", 7);
-    let pre = other.root();
-    assert!(other.install(&flipped, root).is_err());
-    assert!(other.install(&bytes[..bytes.len() - 1], root).is_err());
-    let mut trailing = bytes.clone();
-    trailing.push(0);
-    assert!(other.install(&trailing, root).is_err());
-    assert_eq!(other.root(), pre, "failed install left target untouched");
+    // a reopened workspace re-entering the genesis path re-seeds — the
+    // idempotence gate must leave the store byte-untouched.
+    futures::executor::block_on(async {
+        lc.seed("hello", hash(9)).await.unwrap();
+        lc.finish_seed().await.unwrap();
+    });
+    assert_eq!(
+        lc.root(),
+        seeded,
+        "re-seeding an initialized store is a no-op"
+    );
+    let status = module_status(&lc);
+    assert_eq!(
+        status
+            .iter()
+            .find(|m| m.module_id == "hello")
+            .unwrap()
+            .active_code_hash,
+        hash(1),
+        "the original seed survived the re-entry"
+    );
 }

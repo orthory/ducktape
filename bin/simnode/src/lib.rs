@@ -867,7 +867,11 @@ fn run_sim(
                 "identity",
             )
             .with_invite_binding(invite_binding);
-            let lifecycle = Lifecycle::new("lifecycle", "valset");
+            let lifecycle = Lifecycle::new(
+                "lifecycle",
+                Box::new(QmdbStore::init(context.child("lifecycle"), "lifecycle").await),
+                "valset",
+            );
             modules.push(Box::new(kv));
             modules.push(Box::new(valset));
             modules.push(Box::new(governance));

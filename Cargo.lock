@@ -4872,12 +4872,15 @@ name = "lifecycle"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
+ "commonware-runtime",
  "futures",
  "sdk",
  "sdk-testkit",
  "serde",
  "serde_json",
  "sha2",
+ "statesync",
  "valset",
 ]
 
