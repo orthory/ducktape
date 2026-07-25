@@ -1077,6 +1077,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "broker-host"
+version = "0.1.0"
+dependencies = [
+ "airlock",
+ "axum",
+ "futures",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1166,9 +1182,9 @@ dependencies = [
 name = "capability-host"
 version = "0.1.0"
 dependencies = [
- "airlock",
  "async-trait",
  "axum",
+ "broker-host",
  "capability",
  "capability-host",
  "futures",

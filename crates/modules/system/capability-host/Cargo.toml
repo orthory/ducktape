@@ -17,15 +17,14 @@ futures = { workspace = true }
 # the shared capability-tag shape rule: a tag that validates at spec-parse
 # time can never bounce off the consensus registry's Announce validation.
 capability = { workspace = true }
-# airlock: use a verified TEE gateway as the run's Anthropic credential SOURCE
-# instead of a host-held credential — verify its attestation, handshake for a
-# scoped session token, forward the run's traffic to it (the gateway swaps the
-# token for the real credential in-enclave). `client` = the async Gateway.
-airlock = { path = "../airlock", features = ["client", "verify"] }
 # the sandbox muscle: SandboxBackend + its boot probe, the Tart guest plan, and
 # the node-private rootless podman (libpod socket) + egress firewall. carved out
 # of this crate; re-exported from src/lib.rs so callers see no move.
 sandbox-host = { workspace = true }
+# the run-scoped credential broker (crates/services/broker): the loopback
+# endpoint a provider child dials, and the airlock client layer behind it. the
+# run loop here starts one per run and re-exports its credential vocabulary.
+broker-host = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
@@ -60,6 +59,6 @@ testkit = ["sandbox-host/testkit"]
 # `sandbox-host/testkit` can only ever be on in a graph where our `testkit` is
 # on too — the lockstep the feature comment above requires.
 capability-host = { path = ".", features = ["testkit"] }
-# the in-process airlock custody test boots the gateway HTTP service itself
-# (server feature) to drive sandbox → broker → gateway → upstream end to end.
-airlock = { path = "../airlock", features = ["client", "server", "verify", "testkit"] }
+# `testkit` exposes RunBroker::start_for_test — the idle-control test drives a
+# real run against a broker whose upstream is a dead port.
+broker-host = { workspace = true, features = ["testkit"] }
