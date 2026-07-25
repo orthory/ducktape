@@ -557,6 +557,11 @@ struct Bridge {
     /// the attached agent daemon's command lane. `None` — no daemon signaling —
     /// IS the `no_sandbox` state: this node has no interactive plane to offer.
     link: Mutex<Option<mpsc::Sender<wire::Command>>>,
+    /// the secret a daemon must present to take the link. `None` — a node with
+    /// no workspace to hold one — refuses every attach: holding the link means
+    /// becoming this node's interactive plane, which is not a capability to hand
+    /// out on the strength of dialing loopback.
+    link_token: Option<String>,
 }
 
 /// everything the host needs to spawn a session on behalf of a mesh peer: the
@@ -658,12 +663,13 @@ impl TerminalSessions {
     /// build the bridge over the StreamHub's shared [`TermRing`] and
     /// [`TermCommandRing`]. No daemon is attached yet — one arrives (or does
     /// not) over the ws.
-    pub fn new(ring: TermRing, cmd_ring: TermCommandRing) -> Self {
+    pub fn new(ring: TermRing, cmd_ring: TermCommandRing, link_token: Option<String>) -> Self {
         Self(Arc::new(Bridge {
             ring,
             cmd_ring,
             sessions: Mutex::new(HashMap::new()),
             link: Mutex::new(None),
+            link_token,
         }))
     }
 
@@ -675,7 +681,15 @@ impl TerminalSessions {
     /// FIRST ATTACH WINS. That is a boundary, not a nicety — a second attacher
     /// could otherwise displace the live daemon and receive the create commands
     /// (including lent-credential records) meant for it.
-    pub fn attach(&self) -> Option<(AttachGuard, mpsc::Receiver<wire::Command>)> {
+    pub fn attach(&self, token: &str) -> Option<(AttachGuard, mpsc::Receiver<wire::Command>)> {
+        let Some(expected) = self.0.link_token.as_deref() else {
+            tracing::warn!(target: "ducktape::service", reason = "no_link_token", "agent service link refused");
+            return None;
+        };
+        if !crate::services::token_matches(token, expected) {
+            tracing::warn!(target: "ducktape::service", reason = "bad_link_token", "agent service link refused");
+            return None;
+        }
         let mut link = self.0.link.lock().expect("term link lock poisoned");
         if link.is_some() {
             return None;
@@ -709,7 +723,7 @@ impl TerminalSessions {
             // ring creates the entry if the session never produced a byte, so a
             // session that died before its first output still unblocks.
             self.0.ring.mark_ended(&id);
-            answer(session.reply, Err(TermError::NoSandbox));
+            answer(session.reply, TermError::NoSandbox);
         }
         tracing::info!(target: "ducktape::term", "agent service detached");
     }
@@ -745,8 +759,33 @@ impl TerminalSessions {
     }
 
     /// the pty is live: release the create that is waiting on it.
+    ///
+    /// If nobody is still waiting, END IT. A dropped receiver means the caller
+    /// gave up — axum drops the handler future when the client disconnects, and
+    /// a Ctrl-C during a cold image pull is ordinary behaviour, not an edge
+    /// case. The id was never returned to anyone, so no close can ever arrive
+    /// for this session: left alone it would burn a container running the agent
+    /// CLI on the operator's credential, plus one of the daemon's few cap slots,
+    /// until the wall-clock ceiling fires hours later.
     fn created(&self, id: &str) {
-        answer(self.take_reply(id), Ok(()));
+        let Some(reply) = self.take_reply(id) else {
+            return;
+        };
+        if reply.send(Ok(())).is_ok() {
+            return;
+        }
+        tracing::warn!(
+            target: "ducktape::term",
+            session = %id,
+            reason = "create_abandoned",
+            "ending a session whose caller went away"
+        );
+        // `close` only hands a frame to the link, but that is an await, and this
+        // runs on the ws read loop. The teardown proper happens when the
+        // daemon's `TermEnded` comes back through `ended`.
+        let bridge = self.clone();
+        let id = id.to_string();
+        tokio::spawn(async move { bridge.close(&id).await });
     }
 
     /// the create failed: release it with the daemon's reason, and forget the
@@ -761,7 +800,7 @@ impl TerminalSessions {
         let Some(live) = removed else {
             return;
         };
-        answer(live.reply, Err(TermError::from_refusal(reason, detail)));
+        answer(live.reply, TermError::from_refusal(reason, detail));
     }
 
     /// one chunk of pty output, into the ring the ws catch-up reads. A session
@@ -796,7 +835,7 @@ impl TerminalSessions {
         // a session that ends before its create was answered (the child exited
         // instantly) still owes that create a reply.
         if let Some(live) = removed {
-            answer(live.reply, Err(TermError::Spawn("the session ended immediately".into())));
+            answer(live.reply, TermError::Spawn("the session ended immediately".into()));
         }
     }
 
@@ -1044,11 +1083,14 @@ impl TerminalSessions {
     }
 }
 
-/// answer a pending create, if one is still waiting. A dropped receiver means
-/// the caller gave up (its HTTP request was cancelled) — benign.
-fn answer(reply: Option<oneshot::Sender<Result<(), TermError>>>, outcome: Result<(), TermError>) {
+/// answer a pending create that ended without a pty — a refusal, or a detach.
+///
+/// A dropped receiver is benign HERE and only here: there is no session to leak,
+/// because none was ever created. The success path deliberately does NOT use
+/// this ([`TerminalSessions::created`] must act on the dropped receiver).
+fn answer(reply: Option<oneshot::Sender<Result<(), TermError>>>, refusal: TermError) {
     if let Some(reply) = reply {
-        let _ = reply.send(outcome);
+        let _ = reply.send(Err(refusal));
     }
 }
 
@@ -1517,13 +1559,15 @@ mod tests {
         assert_eq!(msg, "node must be a 32-byte hex node key");
     }
 
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
     /// a bridge with a fake daemon on the other end: every `TermCreate` is
     /// answered `TermCreated`, which is all a create needs to complete. The
     /// caller drives everything else (`on_event`) by hand, so each test names
     /// exactly the daemon behaviour it is about.
     fn with_daemon() -> (TerminalSessions, AttachGuard) {
-        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default());
-        let (guard, mut rx) = terminals.attach().expect("the first attach wins");
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        let (guard, mut rx) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
         let daemon = terminals.clone();
         tokio::spawn(async move {
             while let Some(command) = rx.recv().await {
@@ -1542,7 +1586,7 @@ mod tests {
         // the input-gate accessor is pure: an unknown id (and, by construction,
         // any local session) has no creator node — so a forwarded input frame
         // naming it is refused.
-        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default());
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
         assert!(terminals.creator_node("nope").is_none());
     }
 
@@ -1550,7 +1594,7 @@ mod tests {
     fn enqueue_command_on_an_unknown_session_is_a_no_op() {
         // enqueue must warn + no-op, never panic (mirrors the input/resize
         // unknown-session discipline) and record nothing.
-        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default());
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
         terminals.enqueue_command("nope", "alice".into(), "ls".into());
         assert!(terminals.0.cmd_ring.read_after("nope", 0, 8).0.is_empty());
     }
@@ -1560,7 +1604,7 @@ mod tests {
         // the `no_sandbox` rung, in its new meaning: the plane is wired (the
         // manager exists, so the route does NOT return "not enabled") but no
         // daemon owns a pty for it.
-        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default());
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
         assert!(!terminals.has_sandbox());
         let refused = terminals.create("claude", SessionMode::Single).await;
         assert!(matches!(refused, Err(TermError::NoSandbox)));
@@ -1571,13 +1615,16 @@ mod tests {
         // FIRST ATTACH WINS is a boundary: a local impersonator that could take
         // the link would receive the create commands — lent-credential records
         // included — meant for the real daemon.
-        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default());
-        let first = terminals.attach();
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        let first = terminals.attach(TEST_TOKEN);
         assert!(first.is_some());
-        assert!(terminals.attach().is_none(), "the link is already held");
+        assert!(
+            terminals.attach(TEST_TOKEN).is_none(),
+            "the link is already held"
+        );
         // and it is reclaimable once the holder goes.
         drop(first);
-        assert!(terminals.attach().is_some());
+        assert!(terminals.attach(TEST_TOKEN).is_some());
     }
 
     #[tokio::test]
@@ -1589,6 +1636,74 @@ mod tests {
             .expect("the daemon answered");
         assert_eq!(created.topic, topic(&created.session_id));
         assert_eq!(terminals.mode(&created.session_id), Some(SessionMode::Single));
+    }
+
+    #[tokio::test]
+    async fn a_create_whose_caller_went_away_is_closed_not_leaked() {
+        // THE cancelled-create regression. axum drops the handler future when
+        // the client disconnects, and a Ctrl-C during a cold image pull is
+        // ordinary. The pty still comes up on the daemon — but nobody ever
+        // received its id, so no close can ever arrive for it. Unless this node
+        // sends one, it burns a container on the operator's credential and one
+        // of four cap slots for four hours.
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
+        let (_guard, mut rx) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
+
+        // no auto-answering daemon here: hold the create unanswered, exactly as
+        // a slow pull would, and take the command off the link by hand.
+        let mut pending = Box::pin(terminals.create("claude", SessionMode::Single));
+        let command = tokio::select! {
+            _ = &mut pending => panic!("a create cannot complete while nothing answers it"),
+            command = rx.recv() => command.expect("the create reached the link"),
+        };
+        let wire::Command::TermCreate(create) = command else {
+            panic!("the first command must be the create");
+        };
+        // the caller gives up.
+        drop(pending);
+        // the daemon finishes starting the pty anyway.
+        terminals.on_event(wire::Event::TermCreated {
+            session: create.session.clone(),
+        });
+        assert_eq!(
+            rx.recv().await.expect("a close must follow an abandoned create"),
+            wire::Command::TermClose {
+                session: create.session
+            },
+        );
+    }
+
+    #[test]
+    fn the_link_needs_this_nodes_token() {
+        // holding the link means BECOMING the interactive plane and receiving
+        // every lent-credential record with it. Dialing loopback is not enough.
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
+        assert!(terminals.attach("").is_none(), "an empty token is not a token");
+        assert!(
+            terminals.attach("0123456789abcdef0123456789abcdee").is_none(),
+            "a near miss is still a miss"
+        );
+        assert!(terminals.attach(TEST_TOKEN).is_some());
+    }
+
+    #[test]
+    fn a_node_that_could_not_mint_a_token_refuses_every_attach() {
+        // fail CLOSED: a node that cannot write its 0600 token has no way to
+        // tell a daemon from any other local process, so it has no interactive
+        // plane rather than an unguarded one.
+        let terminals =
+            TerminalSessions::new(TermRing::default(), TermCommandRing::default(), None);
+        assert!(terminals.attach("").is_none());
+        assert!(terminals.attach(TEST_TOKEN).is_none());
+        assert!(!terminals.has_sandbox());
     }
 
     #[tokio::test]
@@ -1716,8 +1831,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_create_returns_the_daemon_reason_and_forgets_the_session() {
-        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default());
-        let (_guard, mut rx) = terminals.attach().expect("the first attach wins");
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        let (_guard, mut rx) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
         let daemon = terminals.clone();
         tokio::spawn(async move {
             while let Some(command) = rx.recv().await {

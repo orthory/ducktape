@@ -275,9 +275,22 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         // looks for: the plane is WIRED. Whether it can serve is a second
         // question, answered by whether an agent daemon has attached.
         tracing::info!(target: "ducktape::term", "terminal_plane_ready");
+        // minted fresh each boot and written 0600 beside node.toml; the agent
+        // daemon reads it on every attach. A mint failure disables the plane
+        // rather than handing the link out unguarded.
+        let link_token = noded::services::mint_link_token(workspace)
+            .inspect_err(|error| {
+                tracing::error!(
+                    target: "ducktape::service",
+                    reason = "link_token_unwritable",
+                    "the interactive plane will refuse every agent service: {error}"
+                );
+            })
+            .ok();
         Some(noded::TerminalSessions::new(
             stream_hub.terminals(),
             stream_hub.term_commands(),
+            link_token,
         ))
     } else {
         None

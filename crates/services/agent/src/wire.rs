@@ -138,6 +138,17 @@ pub enum Refusal {
     SpawnFailed,
 }
 
+/// a session id is 16 lowercase hex — the shape the node mints. Checked on
+/// arrival at the daemon, because the id becomes a directory name there, and by
+/// the mesh term plane before a grain reaches a ring. Lives here rather than in
+/// either consumer: the id is this protocol's, so its validity rule is too.
+pub fn valid_session(session: &str) -> bool {
+    session.len() == 16
+        && session
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+}
+
 impl Refusal {
     /// the stable token — what the mesh refusal reason and the logs carry.
     pub fn token(self) -> &'static str {
@@ -186,6 +197,23 @@ mod tests {
         let text = serde_json::to_string(&ended).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&text).unwrap(), ended);
         assert!(text.contains(r#""op":"term_ended""#), "{text}");
+    }
+
+    #[test]
+    fn a_session_id_is_sixteen_lowercase_hex() {
+        assert!(valid_session("0123456789abcdef"));
+        // the id becomes a directory name on the daemon: nothing that could
+        // walk out of the workdir root may pass.
+        for bad in [
+            "",
+            "0123456789abcde",       // short
+            "0123456789abcdef0",     // long
+            "0123456789ABCDEF",      // upper
+            "../../etc/passwd",
+            "0123456789abcde/",
+        ] {
+            assert!(!valid_session(bad), "must reject {bad:?}");
+        }
     }
 
     #[test]

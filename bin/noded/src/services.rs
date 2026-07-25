@@ -114,6 +114,72 @@ pub fn build_identity() -> Option<&'static str> {
     option_env!("DUCKTAPE_BUILD").filter(|id| !id.is_empty())
 }
 
+/// the file a node writes its service-link secret into, next to `node.toml`.
+pub const LINK_TOKEN_FILE: &str = "service-link.token";
+
+/// Mint this node's service-link secret and write it 0600 next to `node.toml`.
+///
+/// Holding the link means BECOMING this node's interactive plane: the holder
+/// receives every `TermCreate`, lent-credential records included. Before the
+/// carve nothing outside the node process could hold that, so requiring a file
+/// read raises the bar from "can dial loopback" — which any local process can —
+/// back to "can read the node's own workspace", which is the same bar the node
+/// key already sets.
+///
+/// Freshly minted each boot rather than persisted: a node restart should
+/// invalidate a stale holder, and the daemon re-reads the file on every attach,
+/// so it costs nothing.
+pub fn mint_link_token(workspace: &std::path::Path) -> Result<String, String> {
+    use rand::RngCore as _;
+    let mut raw = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut raw);
+    let token: String = raw.iter().map(|byte| format!("{byte:02x}")).collect();
+    let path = workspace.join(LINK_TOKEN_FILE);
+    // create 0600 from the start — a world-readable window, however short, is
+    // the whole thing this file exists to avoid.
+    write_owner_only(&path, &token)
+        .map_err(|error| format!("service link token {}: {error}", path.display()))?;
+    Ok(token)
+}
+
+#[cfg(unix)]
+fn write_owner_only(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let _ = std::fs::remove_file(path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(token.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    std::fs::write(path, token)
+}
+
+/// Read a node's service-link secret — what a daemon presents when it attaches.
+pub fn read_link_token(workspace: &std::path::Path) -> Result<String, String> {
+    let path = workspace.join(LINK_TOKEN_FILE);
+    std::fs::read_to_string(&path)
+        .map(|token| token.trim().to_string())
+        .map_err(|error| format!("service link token {}: {error}", path.display()))
+}
+
+/// Compare two secrets without leaking their common prefix through timing.
+pub fn token_matches(presented: &str, expected: &str) -> bool {
+    if presented.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in presented.bytes().zip(expected.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 /// Why a hello was turned away. A typed reason rather than a bare string: the
 /// status and the stable `reason` token are derived from the variant, so they
 /// cannot drift apart and a typo cannot silently downgrade a refusal.

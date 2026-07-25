@@ -100,13 +100,6 @@ fn term_flow() -> FlowId {
     FlowId::derive(b"ducktape:term-session:v1")
 }
 
-/// a session id is 16 lowercase hex (see `term::spawn`'s `format!("{:016x}",
-/// …)`). The agent plane's twin guard checks a 64-hex run id; ours accepts the
-/// shorter session id and rejects anything else, so a malformed grain never
-/// reaches a ring.
-fn valid_session(session: &str) -> bool {
-    session.len() == 16 && session.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
 
 struct TermBook {
     peers: Arc<MediaPeers>,
@@ -301,7 +294,7 @@ async fn receive_chunks<S: AsyncRead + Unpin>(
         }
         // a peer sending a malformed session id is a bug, not consensus — skip
         // the grain and keep the stream (best-effort, observational).
-        if valid_session(&event.session) {
+        if agent_service::wire::valid_session(&event.session) {
             ring.append_remote(event);
         }
     }
@@ -321,7 +314,7 @@ async fn receive_commands<S: AsyncRead + Unpin>(
         if !peers.contains(peer) {
             return Ok(());
         }
-        if valid_session(&event.session) {
+        if agent_service::wire::valid_session(&event.session) {
             // append_remote replays the origin's seq verbatim — the peer shows
             // the same total order and never re-stamps it.
             ring.append_remote(event);
@@ -398,7 +391,7 @@ async fn send_peer<T: DataPlaneTransport>(
             tokio::select! {
                 event = chunks.recv() => match event {
                     Ok(event) => {
-                        if valid_session(&event.session)
+                        if agent_service::wire::valid_session(&event.session)
                             && write_frame(&mut chunk_stream, &event).await.is_err()
                         {
                             break;
@@ -409,7 +402,7 @@ async fn send_peer<T: DataPlaneTransport>(
                 },
                 event = commands.recv() => match event {
                     Ok(event) => {
-                        if valid_session(&event.session)
+                        if agent_service::wire::valid_session(&event.session)
                             && write_frame(&mut cmd_stream, &event).await.is_err()
                         {
                             break;
@@ -601,7 +594,9 @@ fn refused_from_term_error(err: TermError) -> SessionControlReply {
     let (reason, detail) = match err {
         TermError::NoSandbox => (
             "no_sandbox",
-            "this node has no configured sandbox image".to_string(),
+            // the same fact the HTTP path reports, worded the same way: this
+            // host CAN sandbox, it just has no agent service attached.
+            "this node has no agent service attached".to_string(),
         ),
         TermError::AtCapacity => (
             "at_capacity",
@@ -734,6 +729,14 @@ async fn receive_input<S: AsyncRead + Unpin>(
 /// resize). Shared by the remote input stream and the loopback client path.
 async fn deliver_input(sessions: &TerminalSessions, peer: PeerId, event: SessionInputEvent) {
     let session = input_session(&event).to_string();
+    // an unknown (or already-ended) session and a peer that does not own a live
+    // one are different diagnoses, and `creator_node` returns `None` for both —
+    // so establish existence first, or every stale id would be counted as an
+    // authorization failure.
+    if sessions.mode(&session).is_none() {
+        tracing::warn!(target: "ducktape::term", reason = "unknown_session", "forwarded input dropped");
+        return;
+    }
     let permitted = input_permitted(sessions.creator_node(&session), peer);
     if !permitted {
         tracing::warn!(target: "ducktape::term", reason = "input_not_creator", "forwarded input dropped");
@@ -1055,11 +1058,11 @@ mod tests {
 
     #[test]
     fn valid_session_accepts_16_hex_and_rejects_the_rest() {
-        assert!(valid_session("00000000deadbeef"));
-        assert!(!valid_session("deadbeef"), "too short");
-        assert!(!valid_session("00000000deadbeef0"), "too long");
-        assert!(!valid_session("00000000deadbeeg"), "non-hex digit");
-        assert!(!valid_session(""), "empty");
+        assert!(agent_service::wire::valid_session("00000000deadbeef"));
+        assert!(!agent_service::wire::valid_session("deadbeef"), "too short");
+        assert!(!agent_service::wire::valid_session("00000000deadbeef0"), "too long");
+        assert!(!agent_service::wire::valid_session("00000000deadbeeg"), "non-hex digit");
+        assert!(!agent_service::wire::valid_session(""), "empty");
     }
 
     #[tokio::test]

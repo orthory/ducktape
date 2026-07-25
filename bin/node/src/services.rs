@@ -1020,6 +1020,7 @@ fn serve_kind(
             grant,
             resolved,
             http_base,
+            workspace: workspace.to_path_buf(),
         })?,
     }
     Ok(Served::Stopped)
@@ -1040,8 +1041,16 @@ fn serve_kind(
 /// needs nothing.
 fn scopes_for(kind: &str) -> Vec<String> {
     match daemon_for(kind) {
+        // drives interactive pty sessions on this node, and receives the
+        // consensus-resolved LENT credential records those sessions run under
+        // (the airlock contact point — the secret stays at the lender's gateway,
+        // but the record is what points at it).
         Some(Daemon::Agent) => vec!["term.sessions".into(), "credential.lent".into()],
-        Some(Daemon::Compute) | None => Vec::new(),
+        // submits signed frames through this node's key (`compute::run` posts
+        // saga results and lease heartbeats to /v1/submit), and resolves the
+        // same lent-credential records for the runs it executes.
+        Some(Daemon::Compute) => vec!["saga.runs".into(), "credential.lent".into()],
+        None => Vec::new(),
     }
 }
 

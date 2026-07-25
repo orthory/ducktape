@@ -126,7 +126,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // attached, create returns a clear 503 — a bare spawn is unrepresentable.
     let term_ring = handle.stream_hub().terminals();
     let term_cmd_ring = handle.stream_hub().term_commands();
-    let handle = handle.with_terminals(noded::TerminalSessions::new(term_ring, term_cmd_ring));
+    // no link token: this test daemon has no workspace to hold one, so it
+    // refuses every attach and therefore has no interactive plane. Nothing
+    // runs an agent daemon against it.
+    let handle =
+        handle.with_terminals(noded::TerminalSessions::new(term_ring, term_cmd_ring, None));
     std::thread::Builder::new()
         .name("node-actor".into())
         .spawn(move || {

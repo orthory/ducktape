@@ -46,6 +46,11 @@ const RUN_OUTPUT_ID_LEN: usize = 64;
 /// `[node xxxxxxxx] ` prefix and the json envelope.
 const MAX_RUN_OUTPUT_LINE: usize = 16 * 1024;
 
+/// how long a command may wait to reach the attached service daemon before the
+/// link is declared wedged. Generous — a healthy daemon takes one in microseconds
+/// (it only enqueues), so anything near this is a stuck process, not a slow one.
+const SERVICE_COMMAND_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ClientMsg {
@@ -134,6 +139,10 @@ pub enum ClientMsg {
     ServiceAttach {
         kind: String,
         build: String,
+        /// the node's own 0600 link secret, read from its workspace. Holding the
+        /// link means BECOMING this node's interactive plane and receiving every
+        /// lent-credential record with it, so dialing loopback is not enough.
+        token: String,
     },
     /// one lifecycle fact about a pty from the daemon that owns it. Honored ONLY
     /// on a connection that has attached: without that gate, any local process
@@ -808,8 +817,8 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                             }
                             // a service daemon claiming this connection as its
                             // command link, and the events it publishes back.
-                            Ok(ClientMsg::ServiceAttach { kind, build }) => {
-                                match take_service_link(&handle, &kind, &build) {
+                            Ok(ClientMsg::ServiceAttach { kind, build, token }) => {
+                                match take_service_link(&handle, &kind, &build, &token) {
                                     Ok((guard, rx)) => {
                                         attached = Some(guard);
                                         service_rx = Some(rx);
@@ -909,10 +918,30 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
             }
             // the service link's outbound half. Inert on every connection that
             // is not the attached daemon (see `next_service_command`).
+            //
+            // BOUNDED, and it is the only write here that is: every other frame
+            // on this loop goes to a subscriber, but this one goes to another
+            // PROCESS that is simultaneously writing events back. If the daemon
+            // ever stopped reading, an unbounded await here would stop this loop
+            // reading its events, and the two blocked writes would deadlock with
+            // nothing to break them — taking the whole interactive plane with
+            // them, permanently. A daemon that cannot accept a command in this
+            // long is wedged; dropping the link ends its sessions cleanly
+            // (`AttachGuard`) and lets it redial.
             command = next_service_command(&mut service_rx) => {
-                if !send_frame(&mut socket, ServerFrame::ServiceCommand { command }).await {
+                let sent = tokio::time::timeout(
+                    SERVICE_COMMAND_WRITE_TIMEOUT,
+                    send_frame(&mut socket, ServerFrame::ServiceCommand { command }),
+                )
+                .await;
+                let Ok(true) = sent else {
+                    tracing::warn!(
+                        target: "ducktape::service",
+                        reason = "service_link_write_stalled",
+                        "dropping the agent service link"
+                    );
                     return;
-                }
+                };
             }
         }
     }
@@ -946,6 +975,7 @@ fn take_service_link(
     handle: &NodeHandle,
     kind: &str,
     build: &str,
+    token: &str,
 ) -> Result<
     (
         crate::term::AttachGuard,
@@ -973,8 +1003,8 @@ fn take_service_link(
         .terminals()
         .ok_or("terminal sessions are not enabled on this node")?;
     terminals
-        .attach()
-        .ok_or("an agent service is already attached to this node")
+        .attach(token)
+        .ok_or("refused: present this node's service-link token, and only one agent service may attach")
 }
 
 /// Apply one daemon-published event to the terminal plane, or drop it.
@@ -1125,10 +1155,17 @@ async fn handle_term_input(
         tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term input dropped");
         return;
     };
+    // a live session has a mode; an unknown or already-ended one has none. Two
+    // causes, two countable reasons — collapsing them would hide "the id is
+    // stale" behind "you used the wrong lane".
+    let Some(mode) = terminals.mode(session) else {
+        tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term input dropped");
+        return;
+    };
     // raw keystrokes are the SINGLE-session path only. A shared session refuses
     // them so nothing bypasses its ordered command lane (drive it with
-    // TermCommand); an unknown id has no mode and is refused the same way.
-    if terminals.mode(session) != Some(crate::term::SessionMode::Single) {
+    // TermCommand).
+    if mode != crate::term::SessionMode::Single {
         tracing::warn!(target: "ducktape::term", session = %session, reason = "raw_input_on_shared", "term input dropped");
         return;
     }
@@ -1172,6 +1209,12 @@ async fn handle_term_resize(
         tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term resize dropped");
         return;
     };
+    // the same no-op-on-unknown discipline as input: refuse here rather than
+    // spending a link frame on a session that is already gone.
+    if terminals.mode(session).is_none() {
+        tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term resize dropped");
+        return;
+    }
     terminals.resize(session, cols, rows).await;
 }
 

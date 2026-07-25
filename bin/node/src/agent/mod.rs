@@ -56,6 +56,8 @@ pub(crate) struct Agent {
     pub(crate) grant: ServiceGrant,
     pub(crate) resolved: config::Resolved,
     pub(crate) http_base: String,
+    /// where `node.toml` and the node's 0600 service-link token live.
+    pub(crate) workspace: std::path::PathBuf,
 }
 
 /// Serve until the process is stopped. Returns only on a fatal
@@ -75,6 +77,7 @@ async fn run(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
         grant,
         resolved,
         http_base,
+        workspace,
     } = agent;
     let node_key = resolved.signer.public_key().as_ref().to_vec();
     let backend = crate::services::podman_backend(&resolved, &grant.kind)?;
@@ -120,53 +123,43 @@ async fn run(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
 
     // the link never returns: a dropped socket is ordinary (the node restarts,
     // the operator upgrades) and is redialed forever.
-    link::attach(ws_url(&http_base), sessions, event_rx).await;
+    link::attach(ws_url(&http_base), workspace, sessions, event_rx).await;
     Ok(())
 }
 
-/// Adopt this instance's containers and sweep the retired flat label.
+/// Adopt this instance's crash orphans.
 ///
-/// Two sweeps, deliberately different in kind:
+/// A daemon that crashed mid-session left containers behind; it returns with the
+/// SAME `agent#hex8` (the id is the grant hash and the grant persists in
+/// `services.toml`) and so can recognise them as its own. That re-adoption
+/// across a restart is exactly why the id must survive one.
 ///
-/// - **this instance's own label.** A daemon that crashed mid-session left
-///   containers behind; it returns with the SAME `agent#hex8` (the id is the
-///   grant hash and the grant persists in `services.toml`) and so can recognise
-///   them as its own.
-/// - **`io.ducktape.managed=node-term`.** The label the node's in-process pty
-///   plane wrote before this carve. Nothing writes it any more, and its
-///   containers are unreachable: the manager that knew their session ids is
-///   gone. This is DISPOSABLE RUNTIME-STATE CLEANUP, not a compat arm — delete
-///   this sweep once no host can still be carrying pre-carve containers.
+/// ONE sweep, and no retired-label arm: this daemon's own graph root is private,
+/// so a pre-carve `node-term` container lives in the node's OLD root and is not
+/// enumerable through this socket at all. It is unreachable by construction, not
+/// pending cleanup.
 ///
-/// Both sweeps hit THIS daemon's own socket, so neither can see a compute
-/// container even if one somehow wore a matching label.
-///
-/// Best-effort throughout: a reap failure is a log line, never a boot failure.
+/// Best-effort: a reap failure is a log line, never a boot failure.
 async fn reap(backend: &provider_host::SandboxBackend, grant: &ServiceGrant) {
     let provider_host::SandboxBackend::Podman { socket, .. } = backend else {
         // Tart clones and deletes a VM per session; there is no label to reap.
         return;
     };
-    let mine = provider_host::managed_label(&grant.display_id());
-    let retired = provider_host::managed_label(provider_host::NODE_TERM_OWNER);
-    for (label, reason) in [
-        (mine.as_str(), "own_orphans"),
-        (retired.as_str(), "retired_in_node_pty"),
-    ] {
-        match provider_host::reap_by_label(socket, label).await {
-            Ok(0) => {}
-            Ok(removed) => tracing::info!(
-                target: "ducktape::service",
-                removed,
-                reason,
-                "reaped orphaned session containers"
-            ),
-            Err(error) => tracing::warn!(
-                target: "ducktape::service",
-                reason = "reap_failed",
-                "could not sweep session containers: {error}"
-            ),
-        }
+    match provider_host::reap_by_label(socket, &provider_host::managed_label(&grant.display_id()))
+        .await
+    {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(
+            target: "ducktape::service",
+            removed,
+            reason = "own_orphans",
+            "reaped orphaned session containers"
+        ),
+        Err(error) => tracing::warn!(
+            target: "ducktape::service",
+            reason = "reap_failed",
+            "could not sweep session containers: {error}"
+        ),
     }
 }
 
@@ -194,15 +187,13 @@ mod tests {
     }
 
     #[test]
-    fn the_managed_label_separates_agent_from_compute_and_from_the_node() {
-        // the co-tenancy guarantee, as an assertion: three disjoint label
-        // namespaces, so no reaper can ever sweep another service's containers.
+    fn the_managed_label_separates_agent_from_compute() {
+        // the co-tenancy guarantee as an assertion. It is the SECOND line of
+        // defence — per-service graph roots already mean neither daemon can even
+        // enumerate the other's containers — but a shared socket would be an
+        // easy future mistake, and this is what would catch it.
         let agent = provider_host::managed_label("agent#deadbeef");
-        let compute = provider_host::managed_label("compute#deadbeef");
-        let node_pty = provider_host::managed_label(provider_host::NODE_TERM_OWNER);
         assert_eq!(agent, "io.ducktape.managed=agent#deadbeef");
-        assert_ne!(agent, compute);
-        assert_ne!(agent, node_pty);
-        assert_ne!(agent, provider_host::RETIRED_FLAT_MANAGED_LABEL);
+        assert_ne!(agent, provider_host::managed_label("compute#deadbeef"));
     }
 }

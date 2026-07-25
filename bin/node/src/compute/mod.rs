@@ -189,45 +189,39 @@ async fn await_node(node: &NodeLink) {
     }
 }
 
-/// Adopt this instance's containers and sweep the retired flat label.
+/// Adopt this instance's crash orphans.
 ///
-/// Two sweeps, deliberately different in kind:
+/// A daemon that crashed mid-run left containers behind; it returns with the
+/// SAME `compute#hex8` (the id is the grant hash and the grant persists in
+/// `services.toml`) and so can recognise them as its own. That re-adoption
+/// across restart is exactly why the id must survive one.
 ///
-/// - **this instance's own label.** A daemon that crashed mid-run left
-///   containers behind; it returns with the SAME `compute#hex8` (the id is the
-///   grant hash and the grant persists in `services.toml`) and so can recognise
-///   them as its own. That re-adoption across restart is exactly why the id
-///   must survive one.
-/// - **`io.ducktape.managed=capability-host`.** The pre-daemon flat label,
-///   written when one node process owned every container. Nothing writes it any
-///   more. This is DISPOSABLE RUNTIME-STATE CLEANUP, not a compat arm — delete
-///   this sweep once no host can still be carrying pre-daemon containers.
+/// ONE sweep, and no retired-flat-label arm: this daemon's graph root is private
+/// now, so a pre-daemon `capability-host` container lives in the node's OLD root
+/// and is not enumerable through this socket. Unreachable by construction, not
+/// pending cleanup.
 ///
-/// Best-effort throughout: a reap failure is a log line, never a boot failure.
+/// Best-effort: a reap failure is a log line, never a boot failure.
 async fn reap(backend: &provider_host::SandboxBackend, grant: &ServiceGrant) {
     let provider_host::SandboxBackend::Podman { socket, .. } = backend else {
         // Tart clones and deletes a VM per run; there is no label to reap.
         return;
     };
-    let mine = provider_host::managed_label(&grant.display_id());
-    for (label, reason) in [
-        (mine.as_str(), "own_orphans"),
-        (provider_host::RETIRED_FLAT_MANAGED_LABEL, "retired_label"),
-    ] {
-        match provider_host::reap_by_label(socket, label).await {
-            Ok(0) => {}
-            Ok(removed) => tracing::info!(
-                target: "ducktape::service",
-                removed,
-                reason,
-                "reaped orphaned sandbox containers"
-            ),
-            Err(error) => tracing::warn!(
-                target: "ducktape::service",
-                reason = "reap_failed",
-                "could not sweep sandbox containers: {error}"
-            ),
-        }
+    match provider_host::reap_by_label(socket, &provider_host::managed_label(&grant.display_id()))
+        .await
+    {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(
+            target: "ducktape::service",
+            removed,
+            reason = "own_orphans",
+            "reaped orphaned sandbox containers"
+        ),
+        Err(error) => tracing::warn!(
+            target: "ducktape::service",
+            reason = "reap_failed",
+            "could not sweep sandbox containers: {error}"
+        ),
     }
 }
 
@@ -373,15 +367,10 @@ mod tests {
 
     #[test]
     fn the_managed_label_is_scoped_to_one_service_instance() {
-        // the whole point of the flag day: two services on one podman socket
-        // produce two disjoint labels, so neither reaper can see the other's
-        // containers — and neither equals the retired flat label the boot
-        // sweep removes.
+        // two services produce two disjoint labels, so neither reaper can see
+        // the other's containers even if they ever shared a socket.
         let compute = provider_host::managed_label("compute#deadbeef");
-        let term = provider_host::managed_label(provider_host::NODE_TERM_OWNER);
         assert_eq!(compute, "io.ducktape.managed=compute#deadbeef");
-        assert_ne!(compute, term);
-        assert_ne!(compute, provider_host::RETIRED_FLAT_MANAGED_LABEL);
-        assert_ne!(term, provider_host::RETIRED_FLAT_MANAGED_LABEL);
+        assert_ne!(compute, provider_host::managed_label("agent#deadbeef"));
     }
 }

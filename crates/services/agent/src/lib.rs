@@ -35,7 +35,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -92,6 +92,13 @@ struct Inner {
     /// reserved at create (before the spawn await), released exactly once when
     /// the session leaves the map.
     active: AtomicUsize,
+    /// which link generation is current. Bumped by [`Sessions::close_all`] on
+    /// every disconnect, and captured by a create BEFORE its spawn await: a pty
+    /// that finishes starting under a stale epoch is one the node has already
+    /// forgotten, so it is torn down instead of registered. Without this the
+    /// sweep cannot see a session that is not in the map yet, and the container
+    /// survives, unreachable, until the wall-clock ceiling.
+    epoch: AtomicU64,
     /// the one way anything here reaches the node. Every writer goes through
     /// [`Inner::emit`], so frame ordering is owned by a single place.
     events: mpsc::Sender<wire::Event>,
@@ -103,7 +110,24 @@ struct Inner {
 /// leave a stale timer around to reap a later session that reused this id.
 struct Live {
     session: Arc<InteractiveSession>,
+    /// this session's ordered input lane. Its only long-lived sender, so
+    /// dropping the map entry ends the driver task — the same drop-driven
+    /// teardown the pump and reaper take.
+    drive: mpsc::UnboundedSender<Drive>,
     _reaper_cancel: oneshot::Sender<()>,
+}
+
+/// one thing to do to a live pty, in the order it arrived.
+///
+/// These ride a PER-SESSION lane rather than being performed on the link task.
+/// A pty master write blocks whenever the child stops draining stdin — a TUI
+/// mid-render, a paste larger than the tty buffer — and doing it inline would
+/// make the link the serialization point for every session at once: one
+/// blocked pty would stop all four sessions' output. Per-session ordering is
+/// the requirement; a shared queue was never part of it.
+enum Drive {
+    Input(String),
+    Resize { cols: u16, rows: u16 },
 }
 
 impl Sessions {
@@ -121,6 +145,7 @@ impl Sessions {
             workdir_root,
             sessions: Mutex::new(HashMap::new()),
             active: AtomicUsize::new(0),
+            epoch: AtomicU64::new(0),
             events,
         }))
     }
@@ -132,13 +157,13 @@ impl Sessions {
         match command {
             wire::Command::TermCreate(create) => self.create(create).await,
             wire::Command::TermInput { session, data_b64 } => {
-                self.input(&session, &data_b64).await
+                self.enqueue(&session, Drive::Input(data_b64))
             }
             wire::Command::TermResize {
                 session,
                 cols,
                 rows,
-            } => self.resize(&session, cols, rows),
+            } => self.enqueue(&session, Drive::Resize { cols, rows }),
             wire::Command::TermClose { session } => self.finish(&session).await,
         }
     }
@@ -156,6 +181,11 @@ impl Sessions {
     /// until the wall-clock ceiling fires hours later. Called by the link task
     /// on every disconnect, before it redials.
     pub async fn close_all(&self) {
+        // BEFORE the snapshot: a create still inside `spawn_interactive` is not
+        // in the map yet, so the sweep below cannot see it. Bumping first is
+        // what makes that create notice, on its way out, that the node it was
+        // starting for has already forgotten it.
+        self.0.epoch.fetch_add(1, Ordering::SeqCst);
         let live: Vec<String> = self
             .0
             .sessions
@@ -243,6 +273,17 @@ impl Sessions {
         provider: &dyn Provider,
         spec: wire::Create,
     ) -> Result<(), (wire::Refusal, String)> {
+        // the id becomes a directory name below, so it is checked HERE, at the
+        // boundary where it arrives, and not trusted for having come from our
+        // own node.
+        if !wire::valid_session(&spec.session) {
+            return Err((
+                wire::Refusal::SpawnFailed,
+                "session id must be 16 lowercase hex".to_string(),
+            ));
+        }
+        // captured before the await: see `Inner::epoch`.
+        let epoch = self.0.epoch.load(Ordering::SeqCst);
         let ctx = RunContext {
             agent_id: Some(spec.provider.clone()),
             // podman requires the executing-node id for lifecycle scoping.
@@ -262,9 +303,22 @@ impl Sessions {
             .await
             .map_err(|detail| (wire::Refusal::SpawnFailed, detail))?;
         let session = Arc::new(session);
+        // the link dropped while this pty was starting. The node forgot this
+        // session when it detached, so nothing will ever reach it, close it, or
+        // read its output — registering it now would leak a container running
+        // the agent CLI until the wall-clock ceiling.
+        let node_forgot_it = self.0.epoch.load(Ordering::SeqCst) != epoch;
+        if node_forgot_it {
+            session.close().await;
+            return Err((
+                wire::Refusal::SpawnFailed,
+                "the node link dropped while the session was starting".to_string(),
+            ));
+        }
         // dropping `cancel_tx` (when the entry leaves the map) cancels the
         // reaper; holding it in the map keeps the ceiling armed for the session.
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (drive, drive_rx) = mpsc::unbounded_channel();
         self.0
             .sessions
             .lock()
@@ -273,40 +327,58 @@ impl Sessions {
                 spec.session.clone(),
                 Live {
                     session: session.clone(),
+                    drive,
                     _reaper_cancel: cancel_tx,
                 },
             );
+        self.spawn_driver(spec.session.clone(), session.clone(), drive_rx);
         self.spawn_pump(spec.session.clone(), session);
         self.spawn_reaper(spec.session, cancel_rx);
         Ok(())
     }
 
-    /// write raw bytes to a live session's pty. An unknown id, bad base64 or a
-    /// failed write is a no-op + `warn` with a named reason — never a panic, and
-    /// never the bytes in a log line.
-    async fn input(&self, id: &str, data_b64: &str) {
-        let Some(session) = self.session(id) else {
-            tracing::warn!(target: "ducktape::term", session = %id, reason = "unknown_session", "term input dropped");
+    /// hand one input or resize to its session's own ordered lane.
+    ///
+    /// Non-blocking by construction — that is the whole point. An unknown id is
+    /// a no-op + `warn` with a named reason, never a panic.
+    fn enqueue(&self, id: &str, drive: Drive) {
+        let lane = self
+            .0
+            .sessions
+            .lock()
+            .expect("agent sessions lock poisoned")
+            .get(id)
+            .map(|live| live.drive.clone());
+        let Some(lane) = lane else {
+            tracing::warn!(target: "ducktape::term", session = %id, reason = "unknown_session", "term drive dropped");
             return;
         };
-        let Ok(bytes) = STANDARD.decode(data_b64) else {
-            tracing::warn!(target: "ducktape::term", session = %id, reason = "bad_base64", "term input dropped");
-            return;
-        };
-        if let Err(error) = session.write_all(&bytes).await {
-            tracing::warn!(target: "ducktape::term", session = %id, reason = "write_failed", error = %error, "term input dropped");
-        }
+        // a send failure means the driver already exited (a teardown race with
+        // `finish`); the session is ending, so the drop is benign.
+        let _ = lane.send(drive);
     }
 
-    /// resize a live session's pty. Same no-op-on-unknown discipline as input.
-    fn resize(&self, id: &str, cols: u16, rows: u16) {
-        let Some(session) = self.session(id) else {
-            tracing::warn!(target: "ducktape::term", session = %id, reason = "unknown_session", "term resize dropped");
-            return;
-        };
-        if let Err(error) = session.resize(cols, rows) {
-            tracing::warn!(target: "ducktape::term", session = %id, reason = "resize_failed", error = %error, "term resize dropped");
-        }
+    /// the driver: one task per session, performing that session's inputs and
+    /// resizes in the order they arrived.
+    ///
+    /// Serial per session IS the ordering guarantee. Doing this on the link task
+    /// instead would have made a single blocked pty — a TUI mid-render, a paste
+    /// bigger than the tty buffer — stop every other session's output too, since
+    /// the link would not be reading while it waited.
+    fn spawn_driver(
+        &self,
+        id: String,
+        session: Arc<InteractiveSession>,
+        mut lane: mpsc::UnboundedReceiver<Drive>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(drive) = lane.recv().await {
+                match drive {
+                    Drive::Input(data_b64) => write_input(&id, &session, &data_b64).await,
+                    Drive::Resize { cols, rows } => resize(&id, &session, cols, rows),
+                }
+            }
+        });
     }
 
     // ---- the session lifetime ---------------------------------------------
@@ -385,15 +457,6 @@ impl Sessions {
         tracing::info!(target: "ducktape::term", session = %id, "session_ended");
     }
 
-    /// the live pty for `id`, if any.
-    fn session(&self, id: &str) -> Option<Arc<InteractiveSession>> {
-        self.0
-            .sessions
-            .lock()
-            .expect("agent sessions lock poisoned")
-            .get(id)
-            .map(|live| live.session.clone())
-    }
 }
 
 impl Inner {
@@ -408,6 +471,25 @@ impl Inner {
                 "agent event dropped"
             );
         }
+    }
+}
+
+/// write raw bytes to a pty. Bad base64 or a failed write is a no-op + `warn`
+/// with a named reason — never a panic, and never the bytes in a log line.
+async fn write_input(id: &str, session: &InteractiveSession, data_b64: &str) {
+    let Ok(bytes) = STANDARD.decode(data_b64) else {
+        tracing::warn!(target: "ducktape::term", session = %id, reason = "bad_base64", "term input dropped");
+        return;
+    };
+    if let Err(error) = session.write_all(&bytes).await {
+        tracing::warn!(target: "ducktape::term", session = %id, reason = "write_failed", error = %error, "term input dropped");
+    }
+}
+
+/// set a pty's window size so the child's TUI reflows.
+fn resize(id: &str, session: &InteractiveSession, cols: u16, rows: u16) {
+    if let Err(error) = session.resize(cols, rows) {
+        tracing::warn!(target: "ducktape::term", session = %id, reason = "resize_failed", error = %error, "term resize dropped");
     }
 }
 

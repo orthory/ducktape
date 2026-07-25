@@ -14,6 +14,10 @@ serde_json = { workspace = true }
 # "net" pulls tokio::net::UnixStream — the libpod socket transport; "process"
 # drives the podman/tart host binaries; "io-util" the attach-stream framing.
 tokio = { workspace = true, features = ["process", "io-util", "net"] }
+# ONE call: SIGTERM to a predecessor's orphaned podman child, after verifying by
+# /proc/<pid>/exe that it is podman. Already a direct dep of provider-host and
+# bin/node.
+libc = "0.2"
 
 [features]
 # the test-harness `SandboxBackend::Bare` spawn. a `cfg(test)` gate cannot cross

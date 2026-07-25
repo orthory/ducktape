@@ -36,6 +36,7 @@ const REDIAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// Run the daemon's ws attachment until the process stops.
 pub(crate) async fn attach(
     ws_url: String,
+    workspace: std::path::PathBuf,
     sessions: Arc<Sessions>,
     mut events: mpsc::Receiver<wire::Event>,
 ) {
@@ -51,7 +52,7 @@ pub(crate) async fn attach(
                     );
                 }
                 failures = 0;
-                pump(socket, &sessions, &mut events).await;
+                pump(socket, &workspace, &sessions, &mut events).await;
                 // the connection is gone, and with it every session: the node
                 // forgot them the moment this link dropped, so a surviving pty
                 // would be a container nobody can reach, feed or close.
@@ -75,8 +76,12 @@ pub(crate) async fn attach(
 
 /// One connection's lifetime: claim the link, then commands in and events out
 /// until it closes. Returns so the caller redials.
-async fn pump<S>(socket: S, sessions: &Arc<Sessions>, events: &mut mpsc::Receiver<wire::Event>)
-where
+async fn pump<S>(
+    socket: S,
+    workspace: &std::path::Path,
+    sessions: &Arc<Sessions>,
+    events: &mut mpsc::Receiver<wire::Event>,
+) where
     S: futures::Sink<
             tokio_tungstenite::tungstenite::Message,
             Error = tokio_tungstenite::tungstenite::Error,
@@ -96,10 +101,24 @@ where
     let Some(build) = noded::services::build_identity() else {
         return;
     };
+    // re-read per attach, never latched: a node restart mints a fresh token, and
+    // a daemon holding a stale one would be refused forever.
+    let token = match noded::services::read_link_token(workspace) {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::error!(
+                target: "ducktape::service",
+                reason = "link_token_unreadable",
+                "the agent daemon cannot present its node's service-link token: {error}"
+            );
+            return;
+        }
+    };
     let claim = serde_json::json!({
         "op": "service_attach",
         "kind": noded::services::AGENT_KIND,
         "build": build,
+        "token": token,
     })
     .to_string();
     if tx.send(Message::Text(claim)).await.is_err() {
@@ -185,18 +204,23 @@ fn classify(text: &str) -> Incoming {
 
 /// Perform one command, on this task or its own.
 ///
-/// A create can take minutes — a cold image pull is a real thing — so it MUST
-/// NOT run inline: nothing else could flow on the link while one session
-/// started, including the output of every session already running. Its answer
-/// rides the event lane like any other, and no other command for that session
-/// can exist yet, because the node does not release a session id to anyone
-/// until the create is answered.
+/// The link must never stop reading, so nothing slow may run on it:
 ///
-/// Everything else is a map lookup plus a pty write, and stays INLINE — that is
-/// what keeps keystrokes in the order they arrived.
+/// - **create** starts a container (a cold image pull is minutes) and **close**
+///   tears one down, so both get their own task. Neither needs ordering against
+///   anything: the node does not release a session id to anyone until the create
+///   is answered, and a close is the escape hatch that must not queue behind a
+///   blocked pty.
+/// - **input and resize** only ENQUEUE onto the target session's own ordered
+///   lane, which is a map lookup and a channel send. That is what keeps
+///   keystrokes in arrival order without making the link the queue — the pty
+///   write itself happens on the session's driver task.
 async fn execute(sessions: &Arc<Sessions>, command: wire::Command) {
-    let starts_a_session = matches!(command, wire::Command::TermCreate(_));
-    if starts_a_session {
+    let touches_a_container = matches!(
+        command,
+        wire::Command::TermCreate(_) | wire::Command::TermClose { .. }
+    );
+    if touches_a_container {
         let sessions = sessions.clone();
         tokio::spawn(async move { sessions.dispatch(command).await });
         return;

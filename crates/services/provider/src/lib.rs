@@ -84,16 +84,6 @@ const PODMAN_RETRY_MAX: Duration = Duration::from_secs(1);
 /// names the owning service instance, so two service daemons sharing one node's
 /// podman reap only their own containers ([`managed_label`]).
 pub const PODMAN_MANAGED_KEY: &str = "io.ducktape.managed";
-/// the pre-daemonization flat label, when one node process owned every
-/// container. Nothing writes it any more; the compute daemon sweeps it ONCE at
-/// boot. Disposable runtime-state cleanup, not a compat arm — delete it once no
-/// host can still be carrying pre-daemon containers.
-pub const RETIRED_FLAT_MANAGED_LABEL: &str = "io.ducktape.managed=capability-host";
-/// the owner tag the node's own interactive terminal plane stamps. Not a
-/// service instance id: the pty plane is still in-node (the agent carve is a
-/// later step), so it has no grant and no minted id — but it MUST be distinct
-/// from compute's, or one reaper would kill the other's containers.
-pub const NODE_TERM_OWNER: &str = "node-term";
 /// the owner tag for a provider built outside [`discover`] — tests and
 /// embedders. Deliberately matches no service instance, so nothing reaps it.
 const UNSCOPED_OWNER: &str = "unscoped";
@@ -3403,9 +3393,10 @@ fn excerpt(s: &str) -> String {
 /// `node_identity` is the verified local signer/origin bytes, kept for the run
 /// labels. `managed_owner` names the SERVICE INSTANCE that owns every container
 /// this set creates ([`managed_label`]) — `compute#deadbeef` for the compute
-/// daemon, [`NODE_TERM_OWNER`] for the node's own pty plane. Crash-orphan
-/// cleanup reaps exactly that label ([`reap_by_label`]), so one
-/// service can never sweep another's containers.
+/// daemon, `agent#deadbeef` for the agent daemon. Crash-orphan cleanup reaps
+/// exactly that label ([`reap_by_label`]), so one service can never sweep
+/// another's containers. (Each daemon also has its own private graph root, so
+/// this is the second line of defence, not the only one.)
 pub fn discover(
     node_identity: &[u8],
     dirs: AgentDirs,

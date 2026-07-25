@@ -1010,9 +1010,81 @@ fn urlencode(value: &str) -> String {
 /// design, which is the entire point — see [`PodmanService::socket_path`].
 fn runtime_dir() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => std::env::temp_dir(),
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("ducktape"),
+        // no session runtime dir: fall back to temp, but into a per-uid subdir
+        // that `start` chmods 0700. A socket sitting directly in a
+        // world-writable `/tmp` under a guessable name is one any local user
+        // could squat to intercept the link.
+        _ => std::env::temp_dir().join(format!("ducktape-{}", nix_uid())),
     }
+}
+
+/// the pid of the process that owns a service root, and of the podman child it
+/// supervises. Plain files, because the question they answer ("is that process
+/// still alive, and is it what it claims to be?") is answered against /proc.
+const OWNER_PID_FILE: &str = "owner.pid";
+const PODMAN_PID_FILE: &str = "podman.pid";
+
+fn read_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// is `pid` alive AND running `exe`? Verified by executable so a recycled pid
+/// belonging to something else is never mistaken for ours.
+#[cfg(target_os = "linux")]
+fn runs_exe(pid: u32, exe: &Path) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|running| running == exe)
+}
+
+/// no /proc: fail SAFE by claiming the root is free. The alternative — assuming
+/// an owner — would make a crash unrecoverable without hand cleanup.
+#[cfg(not(target_os = "linux"))]
+fn runs_exe(_pid: u32, _exe: &Path) -> bool {
+    false
+}
+
+/// kill a predecessor's orphaned `podman system service`, verified by executable
+/// before any signal is sent. Best-effort: if it is already gone, or is not
+/// podman at all, there is nothing to do.
+#[cfg(unix)]
+fn reap_orphan_podman(pid: u32) {
+    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return;
+    };
+    if exe.file_name().is_none_or(|name| name != "podman") {
+        return;
+    }
+    // SAFETY: a plain SIGTERM to a pid this function has just verified is a
+    // podman binary. `kill(2)` has no memory effects.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+}
+
+#[cfg(not(unix))]
+fn reap_orphan_podman(_pid: u32) {}
+
+/// keep a directory we own to this user only.
+#[cfg(unix)]
+fn owner_only_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("podman service: chmod {}: {e}", dir.display()))
+}
+
+#[cfg(not(unix))]
+fn owner_only_dir(_dir: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// this process's uid, for the temp-dir fallback name. `libc` is not a
+/// dependency here and this is a directory name, not a decision — the
+/// `$UID`/`USER` pair the shell exports is enough, and the 0700 mode is what
+/// actually protects it.
+fn nix_uid() -> String {
+    std::env::var("UID")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "anon".into())
 }
 
 pub struct PodmanService {
@@ -1085,6 +1157,7 @@ impl PodmanService {
         if let Some(parent) = socket.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("podman service: create {}: {e}", parent.display()))?;
+            owner_only_dir(parent)?;
         }
         for dir in [&storage, &runroot, &hooks_dir] {
             std::fs::create_dir_all(dir)
@@ -1098,7 +1171,10 @@ impl PodmanService {
         );
         std::fs::write(hooks_dir.join("ducktape-egress.json"), hook_json)
             .map_err(|e| format!("podman service: write egress hook: {e}"))?;
-        // a leftover socket from a previous boot would make `service` fail to bind.
+        // SINGLETON, before anything binds. See [`Self::claim`].
+        Self::claim(&root, &socket, self_exe)?;
+        // a leftover file (ours, from a crash) would make `service` fail to
+        // bind, so clear it now that we know it is nobody's.
         let _ = std::fs::remove_file(&socket);
 
         let child = tokio::process::Command::new(podman_bin)
@@ -1116,9 +1192,49 @@ impl PodmanService {
             .spawn()
             .map_err(|e| format!("podman service: spawn `{} system service`: {e}", podman_bin.display()))?;
 
+        // recorded so a successor can tell "my predecessor's orphan, kill it"
+        // from "a live sibling, refuse" — see [`Self::claim`].
+        if let Some(pid) = child.id() {
+            let _ = std::fs::write(root.join(PODMAN_PID_FILE), pid.to_string());
+        }
         let service = Self { socket, child };
         service.await_socket().await?;
         Ok(service)
+    }
+
+    /// Take ownership of this service's root, or refuse.
+    ///
+    /// Two `service run <kind>` on one storage root is the hazard: unlinking the
+    /// socket unconditionally would leave the first one's `podman system
+    /// service` supervising the same store through a dangling inode — two
+    /// supervisors, one store, no error anywhere. But a daemon that was SIGKILLed
+    /// leaves an identical-looking answering socket behind, and refusing THAT
+    /// would make every crash need hand cleanup before the service could restart.
+    ///
+    /// So the two are told apart by the recorded owner pid, verified BY
+    /// EXECUTABLE — the same discipline the repo's other reapers use, never a
+    /// bare pid and never a pattern match. A live owner means refuse; a dead one
+    /// means its podman child is an orphan, and it is killed (also by verified
+    /// exe) before this process binds.
+    fn claim(root: &Path, socket: &Path, self_exe: &Path) -> Result<(), String> {
+        let owner = read_pid(&root.join(OWNER_PID_FILE));
+        let live_sibling = owner
+            .filter(|pid| *pid != std::process::id())
+            .is_some_and(|pid| runs_exe(pid, self_exe));
+        if live_sibling {
+            return Err(format!(
+                "another service daemon (pid {}) already owns {} — stop it before starting this one",
+                owner.unwrap_or_default(),
+                socket.display()
+            ));
+        }
+        // nobody owns the root, so any podman still answering here is our dead
+        // predecessor's `kill_on_drop` that never fired (SIGKILL unwinds nothing).
+        if let Some(pid) = read_pid(&root.join(PODMAN_PID_FILE)) {
+            reap_orphan_podman(pid);
+        }
+        std::fs::write(root.join(OWNER_PID_FILE), std::process::id().to_string())
+            .map_err(|e| format!("podman service: claim {}: {e}", root.display()))
     }
 
     /// the node-private socket path — what [`SandboxBackend::Podman`] carries.
