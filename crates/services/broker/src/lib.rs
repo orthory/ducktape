@@ -220,21 +220,21 @@ enum IdleControlReply {
     },
 }
 
-pub(crate) struct BrokerInvocation {
-    pub(crate) endpoint: BrokerEndpoint,
-    pub(crate) idle_deadline: watch::Receiver<Option<tokio::time::Instant>>,
+pub struct BrokerInvocation {
+    pub endpoint: BrokerEndpoint,
+    pub idle_deadline: watch::Receiver<Option<tokio::time::Instant>>,
     idle_control: Arc<IdleControl>,
 }
 
 impl BrokerInvocation {
-    pub(crate) fn arm(&self, hard_deadline: tokio::time::Instant) {
+    pub fn arm(&self, hard_deadline: tokio::time::Instant) {
         let mut state = self.idle_control.state.lock().unwrap();
         if state.token == self.endpoint.control_token {
             state.hard_deadline = Some(hard_deadline);
         }
     }
 
-    pub(crate) fn revoke(&self) {
+    pub fn revoke(&self) {
         let mut state = self.idle_control.state.lock().unwrap();
         if state.token == self.endpoint.control_token {
             revoke_idle_control(&mut state);
@@ -245,7 +245,7 @@ impl BrokerInvocation {
     /// won the mutex first, its watched deadline is observed and the child
     /// continues. Otherwise expiry revokes the token before a later request
     /// can be reported as granted.
-    pub(crate) fn continue_after_timeout_wake(
+    pub fn continue_after_timeout_wake(
         &self,
         last_activity: tokio::time::Instant,
         idle: Duration,
@@ -287,11 +287,11 @@ fn revoke_idle_control(state: &mut IdleControlState) {
 
 /// The only information that crosses into the provider child. None of these
 /// values can recover the host credential; all die with this run's broker.
-pub(crate) struct BrokerEndpoint {
-    pub(crate) base_url: String,
-    pub(crate) run_bearer: String,
-    pub(crate) control_url: String,
-    pub(crate) control_token: String,
+pub struct BrokerEndpoint {
+    pub base_url: String,
+    pub run_bearer: String,
+    pub control_url: String,
+    pub control_token: String,
 }
 
 /// how the provider child reaches this run's broker — which drives BOTH the
@@ -308,7 +308,7 @@ pub(crate) struct BrokerEndpoint {
 /// names the gateway. The opaque per-run bearer still gates it; binding beyond
 /// loopback is the reachability cost of the stronger network isolation.
 #[derive(Clone, Copy)]
-pub(crate) enum Reachability {
+pub enum Reachability {
     Loopback,
     HostGateway(&'static str),
 }
@@ -331,8 +331,8 @@ impl Reachability {
     }
 }
 
-pub(crate) struct RunBroker {
-    pub(crate) endpoint: BrokerEndpoint,
+pub struct RunBroker {
+    pub endpoint: BrokerEndpoint,
     idle_control: Arc<IdleControl>,
     shutdown: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
@@ -341,27 +341,30 @@ pub(crate) struct RunBroker {
 impl RunBroker {
     /// `airlock` is the per-run credential source (a self-host resolution); when
     /// `None` the operator's local Codex credential proxies to the provider.
-    pub(crate) async fn start(airlock: Option<AirlockConfig>) -> Result<Self, String> {
+    pub async fn start(airlock: Option<AirlockConfig>) -> Result<Self, String> {
         let (auth, url) = resolve_codex_upstream(airlock).await?;
         Self::start_codex(auth, url, Reachability::Loopback).await
     }
 
-    pub(crate) async fn start_for_tart(airlock: Option<AirlockConfig>) -> Result<Self, String> {
+    pub async fn start_for_tart(airlock: Option<AirlockConfig>) -> Result<Self, String> {
         let (auth, url) = resolve_codex_upstream(airlock).await?;
         Self::start_codex(auth, url, Reachability::HostGateway("ducktape-host")).await
     }
 
     /// a private-netns Podman container reaches the loopback host only via the
     /// `host.containers.internal` gateway podman adds to its `/etc/hosts`.
-    pub(crate) async fn start_for_podman_private(
+    pub async fn start_for_podman_private(
         airlock: Option<AirlockConfig>,
     ) -> Result<Self, String> {
         let (auth, url) = resolve_codex_upstream(airlock).await?;
         Self::start_codex(auth, url, Reachability::HostGateway("host.containers.internal")).await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn start_for_test() -> Self {
+    /// Test-only: a broker whose upstream is a dead port. `testkit` exposes it
+    /// to the consumer crates' tests too (capability-host drives a run against
+    /// it); it is compiled OUT of any build that doesn't ask for the feature.
+    #[cfg(any(test, feature = "testkit"))]
+    pub async fn start_for_test() -> Self {
         Self::start_with(
             UpstreamCredential {
                 bearer: "unused".into(),
@@ -376,7 +379,7 @@ impl RunBroker {
 
     /// host-path convenience for tests: wrap a literal credential and serve. The
     /// live path goes through [`Self::start`]/[`resolve_codex_upstream`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     async fn start_with(upstream: UpstreamCredential, reach: Reachability) -> Result<Self, String> {
         let responses_url = upstream.url.clone();
         Self::start_codex(CodexAuth::Host(upstream), responses_url, reach).await
@@ -456,7 +459,7 @@ impl RunBroker {
     /// Arm a fresh control credential and deadline channel for one child
     /// invocation. A resume fallback rotates the credential before spawning
     /// its replacement child, so an old MCP process cannot control the new one.
-    pub(crate) fn begin_invocation(&self) -> BrokerInvocation {
+    pub fn begin_invocation(&self) -> BrokerInvocation {
         let control_token = random_token();
         let (deadline, idle_deadline) = watch::channel(None);
         *self.idle_control.state.lock().unwrap() = IdleControlState {
@@ -1598,14 +1601,14 @@ impl RunBroker {
     /// start the Anthropic Messages broker for a Podman run (loopback).
     /// `airlock` is the per-run credential source (a self-host resolution); when
     /// `None` the env boundary then a host credential decide the upstream.
-    pub(crate) async fn start_anthropic(airlock: Option<AirlockConfig>) -> Result<Self, String> {
+    pub async fn start_anthropic(airlock: Option<AirlockConfig>) -> Result<Self, String> {
         let (auth, url) = resolve_anthropic_upstream(airlock).await?;
         Self::start_anthropic_with(auth, Reachability::Loopback, url).await
     }
 
     /// start it for a Tart guest — bind the host gateway the guest reaches as
     /// `ducktape-host`.
-    pub(crate) async fn start_anthropic_for_tart(
+    pub async fn start_anthropic_for_tart(
         airlock: Option<AirlockConfig>,
     ) -> Result<Self, String> {
         let (auth, url) = resolve_anthropic_upstream(airlock).await?;
@@ -1613,7 +1616,7 @@ impl RunBroker {
     }
 
     /// start it for a private-netns Podman container (`host.containers.internal`).
-    pub(crate) async fn start_anthropic_for_podman_private(
+    pub async fn start_anthropic_for_podman_private(
         airlock: Option<AirlockConfig>,
     ) -> Result<Self, String> {
         let (auth, url) = resolve_anthropic_upstream(airlock).await?;

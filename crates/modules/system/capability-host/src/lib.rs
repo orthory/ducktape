@@ -142,7 +142,10 @@ fn broker_provider_overrides(broker: &broker::BrokerEndpoint, workdir: &Path) ->
     ]
 }
 
-mod broker;
+// the broker lives in its own crate (crates/services/broker); the alias keeps
+// the run loop's `broker::…` call sites reading as the module they were carved
+// from.
+pub(crate) use broker_host as broker;
 // The airlock credential-resolution surface: a consensus-resolved credential and
 // the per-run config the broker builds from it (self-host pins the on-chain
 // seal_pk). `CredentialKind` is capability-host's OWN mirror of the gateway

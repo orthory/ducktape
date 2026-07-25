@@ -25,7 +25,8 @@
 #   crates/services/ — off-chain service crates: the host-side executors that
 #                      serve a consensus module without being one (compute —
 #                      the dispatch WorkSpec pool/ledger/gate; sandbox — the
-#                      node-local podman/egress/backend-probe muscle)
+#                      node-local podman/egress/backend-probe muscle; broker —
+#                      the run-scoped credential loopback + airlock client)
 #   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
 #                      — the `files` module wraps it), disk, client (OS-side)
 #   crates/guests/   — shared wasm-port infra ONLY: guest-adapter (the
@@ -101,6 +102,7 @@ members = [
     "crates/modules/apps/inbox",
     "crates/modules/apps/files",
     # services — off-chain host-side executors
+    "crates/services/broker",
     "crates/services/compute",
     "crates/services/sandbox",
     # examples — demo / test scaffolding modules
@@ -267,6 +269,7 @@ automations = { path = "crates/modules/apps/automations" }
 inbox = { path = "crates/modules/apps/inbox" }
 files = { path = "crates/modules/apps/files" }
 # internal — off-chain service crates
+broker-host = { path = "crates/services/broker" }
 compute-service = { path = "crates/services/compute" }
 sandbox-host = { path = "crates/services/sandbox" }
 duckfs-core = { path = "crates/duckfs/core" }
