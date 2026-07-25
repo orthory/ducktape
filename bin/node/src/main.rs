@@ -333,6 +333,25 @@ fn run_node(
         promoted,
     } = boot::env::derive(resolved, sync_only);
 
+    // A node whose config says it can isolate runs, booting with no compute
+    // plane, is the shape EVERY workspace predating the grant has — and the
+    // one an operator lands in without asking. Silence here is how an upgrade
+    // looks like a hang, so the NODE BOOT that takes the compute-less branch
+    // says it plainly and names the fix. Deliberately not in `config::resolve`:
+    // that runs for every verb reading a workspace, including `service run`,
+    // which is not booting a node and offers to fix this on its next line.
+    let configured_but_ungranted = sandbox.is_some() && compute_backend.is_none();
+    if configured_but_ungranted {
+        tracing::warn!(
+            target: "ducktape::service",
+            node = %label,
+            reason = "compute_not_granted",
+            "sandbox configured but the compute service is not enabled; this node will run no \
+             provider work and announce no capabilities — enable it with `ducktape service \
+             run compute`"
+        );
+    }
+
     // the compute-plane gate: a configured sandbox must actually be runnable
     // on THIS host before anything is discovered, announced, or spawned — a
     // missing runtime binary is a boot error, never a bare fallback.

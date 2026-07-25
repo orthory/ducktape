@@ -180,18 +180,10 @@ fn gate_on_compute_grant(
         // no table at all: a consensus-only node, silently and by choice.
         return Ok((None, Vec::new()));
     };
+    // This is a pure decision: `resolve` runs for EVERY verb that reads a
+    // workspace, so the "you are compute-less" warning belongs at the node
+    // boot that actually takes the branch, not here. See `run_node_verb`.
     let Some(grant) = crate::services::grant_for(workspace, crate::services::COMPUTE_KIND)? else {
-        // A configured sandbox with no grant is the shape EVERY pre-existing
-        // workspace has, so this is the one branch an operator can land in
-        // without having asked for it. Going dark silently here is how an
-        // upgrade looks like a hang, so say it plainly and name the fix.
-        tracing::warn!(
-            target: "ducktape::service",
-            reason = "compute_not_granted",
-            "sandbox configured but the compute service is not enabled; this node will run no \
-             provider work and announce no capabilities — enable it with `ducktape service \
-             enable compute`"
-        );
         return Ok((None, Vec::new()));
     };
     Ok((Some(backend.clone()), grant.capabilities))
