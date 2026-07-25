@@ -61,11 +61,12 @@ fn key(tag: u8) -> Vec<u8> {
     vec![tag; 32]
 }
 
-fn seeded_valset(members: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset");
+async fn seeded_valset(members: &[Vec<u8>]) -> Valset {
+    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
     for m in members {
-        valset.insert(m.clone());
+        valset.seed(m.clone()).await.expect("seed valset");
     }
+    valset.finish_seed().await.expect("seed valset");
     valset
 }
 
@@ -115,10 +116,10 @@ impl Module for Recorder {
 
 use sha2::Digest as _;
 
-fn native_host(members: &[Vec<u8>]) -> Host {
+async fn native_host(members: &[Vec<u8>]) -> Host {
     Host::genesis(vec![
         Box::new(native_saga()),
-        Box::new(seeded_valset(members)),
+        Box::new(seeded_valset(members).await),
         Box::new(CapabilityRegistry::new(
             "capability",
             Box::new(sdk_testkit::MemStore::new()),
@@ -129,10 +130,10 @@ fn native_host(members: &[Vec<u8>]) -> Host {
     .expect("genesis")
 }
 
-fn wasm_host_(members: &[Vec<u8>]) -> Host {
+async fn wasm_host_(members: &[Vec<u8>]) -> Host {
     Host::genesis(vec![
         Box::new(wasm_saga()),
-        Box::new(seeded_valset(members)),
+        Box::new(seeded_valset(members).await),
         Box::new(CapabilityRegistry::new(
             "capability",
             Box::new(sdk_testkit::MemStore::new()),
@@ -416,8 +417,8 @@ async fn same_ops_inner() {
         "t-open", "t-cap", "t-ann", "t-pin", "t-cxl", "t-renew", "t-re",
     ];
 
-    let mut native = native_host(&members);
-    let mut wasm = wasm_host_(&members);
+    let mut native = native_host(&members).await;
+    let mut wasm = wasm_host_(&members).await;
 
     // the SCHEMA-BREAK pin, saga-shaped: the native empty root hashes the
     // empty canonical map (a bare zero count — NOT the ZERO sentinel), and the
@@ -918,8 +919,8 @@ async fn crank_inner() {
     let member_keys: [&[u8]; 2] = [&a, &b];
     let ids = ["t-dead", "t-lease"];
 
-    let mut native = native_host(&members);
-    let mut wasm = wasm_host_(&members);
+    let mut native = native_host(&members).await;
+    let mut wasm = wasm_host_(&members).await;
 
     // a saga bounded by an absolute deadline, and one bounded by short leases.
     roundtrip(
@@ -1020,8 +1021,8 @@ async fn rejections_inner() {
     let member_keys: [&[u8]; 2] = [&a, &b];
     let ids = ["live", "solo", "pinned"];
 
-    let mut native = native_host(&members);
-    let mut wasm = wasm_host_(&members);
+    let mut native = native_host(&members).await;
+    let mut wasm = wasm_host_(&members).await;
 
     // seed: a lone provider for "solo" (reassignment has no alternate), a live
     // assigned saga (the oversized-outcome seam is gated to its assignee), a
@@ -1285,8 +1286,8 @@ async fn multi_dispatch_inner() {
     let member_keys: [&[u8]; 1] = [&a];
     let ids = ["s1", "s2"];
 
-    let mut native = native_host(&members);
-    let mut wasm = wasm_host_(&members);
+    let mut native = native_host(&members).await;
+    let mut wasm = wasm_host_(&members).await;
 
     // ONE block, three ops: the result reads the STAGED trigger (and its
     // staged lease), and the prune reads the STAGED terminal state — on the

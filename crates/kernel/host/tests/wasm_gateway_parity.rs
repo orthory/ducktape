@@ -105,11 +105,12 @@ fn native_identity() -> Identity {
     )
 }
 
-fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset");
+async fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
+    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
     for v in validators {
-        valset.insert(v.clone());
+        valset.seed(v.clone()).await.expect("seed valset");
     }
+    valset.finish_seed().await.expect("seed valset");
     valset
 }
 
@@ -118,7 +119,7 @@ async fn native_host(context: &deterministic::Context, validators: &[Vec<u8>]) -
     Host::genesis(vec![
         Box::new(native_gateway(Box::new(store))),
         Box::new(native_identity()),
-        Box::new(seeded_valset(validators)),
+        Box::new(seeded_valset(validators).await),
     ])
     .expect("genesis")
 }
@@ -128,7 +129,7 @@ async fn wasm_host_(context: &deterministic::Context, validators: &[Vec<u8>]) ->
     Host::genesis(vec![
         Box::new(wasm_gateway(Box::new(store))),
         Box::new(native_identity()),
-        Box::new(seeded_valset(validators)),
+        Box::new(seeded_valset(validators).await),
     ])
     .expect("genesis")
 }
@@ -1014,7 +1015,7 @@ async fn genesis_config_inner(context: &deterministic::Context) {
     let mut other_host = Host::genesis(vec![
         Box::new(wasm_gateway(Box::new(other))),
         Box::new(native_identity()),
-        Box::new(seeded_valset(&validators)),
+        Box::new(seeded_valset(&validators).await),
     ])
     .expect("genesis");
     w.seed(&mut wasm).await;

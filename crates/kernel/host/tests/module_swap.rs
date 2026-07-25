@@ -72,8 +72,9 @@ fn host_with_wasm() -> Host {
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
     )));
-    let mut valset = valset::Valset::new("valset");
-    valset.insert(MEMBER.to_vec());
+    let mut valset = valset::Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    block_on(valset.seed(MEMBER.to_vec())).expect("seed valset");
+    block_on(valset.finish_seed()).expect("seed valset");
     host.register(Box::new(valset));
     host.register(Box::new(
         WasmModule::from_bytes("hello", HELLO_V1).expect("load v1"),
@@ -310,8 +311,9 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
     )));
-    let mut joiner_valset = valset::Valset::new("valset");
-    joiner_valset.insert(MEMBER.to_vec());
+    let mut joiner_valset = valset::Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    block_on(joiner_valset.seed(MEMBER.to_vec())).expect("seed valset");
+    block_on(joiner_valset.finish_seed()).expect("seed valset");
     joiner.register(Box::new(joiner_valset));
     joiner.register(Box::new(
         WasmModule::from_bytes("hello", HELLO_V1).expect("genesis v1 code"),

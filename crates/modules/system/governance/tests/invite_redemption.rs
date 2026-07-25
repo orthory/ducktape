@@ -94,10 +94,11 @@ fn redeem_msg(token: &InviteToken, joiner: &PrivateKey) -> Vec<u8> {
 
 /// a host with governance (invite-wired) gating a valset seeded with members
 /// 1 and 2.
-fn gov_host() -> Host {
-    let mut valset = Valset::new("valset");
-    valset.insert(key_bytes(&keypair(1)));
-    valset.insert(key_bytes(&keypair(2)));
+async fn gov_host() -> Host {
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+    valset.seed(key_bytes(&keypair(1))).await.expect("seed valset");
+    valset.seed(key_bytes(&keypair(2))).await.expect("seed valset");
+    valset.finish_seed().await.expect("seed valset");
     Host::genesis(vec![
         Box::new(valset),
         Box::new(Identity::new(
@@ -176,7 +177,7 @@ async fn redemption(host: &Host, nonce: &[u8]) -> Option<governance::RedemptionV
 #[test]
 fn a_valid_redemption_grants_full_node_standing_without_a_ballot() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (member, joiner) = (keypair(1), keypair(9));
         let token = mint(&member, 7, InviteRole::Resident, u64::MAX);
 
@@ -210,7 +211,7 @@ fn a_valid_redemption_grants_full_node_standing_without_a_ballot() {
 #[test]
 fn a_token_is_single_use() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (member, joiner) = (keypair(1), keypair(9));
         let token = mint(&member, 7, InviteRole::Resident, u64::MAX);
 
@@ -245,7 +246,7 @@ fn a_token_is_single_use() {
 #[test]
 fn forged_or_unauthorized_redemptions_are_refused() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (member, outsider, joiner) = (keypair(1), keypair(8), keypair(9));
 
         // a token minted by a NON-member verifies cryptographically but fails
@@ -295,8 +296,9 @@ fn forged_or_unauthorized_redemptions_are_refused() {
 #[test]
 fn a_network_without_a_binding_refuses_redemption() {
     block_on(async {
-        let mut valset = Valset::new("valset");
-        valset.insert(key_bytes(&keypair(1)));
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        valset.seed(key_bytes(&keypair(1))).await.expect("seed valset");
+        valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
             Box::new(valset),
             // no with_invite_binding — the dev-seed shape.
@@ -329,7 +331,7 @@ fn a_network_without_a_binding_refuses_redemption() {
 #[test]
 fn a_bearer_resident_token_is_first_wins_single_use() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let issuer = keypair(1);
         // ONE bearer Resident token; two different keys race to redeem it.
         let token = mint(&issuer, 1, InviteRole::Resident, u64::MAX);
@@ -375,7 +377,7 @@ fn a_bearer_resident_token_is_first_wins_single_use() {
 #[test]
 fn a_client_role_token_grants_client_standing_not_residency() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (member, client) = (keypair(1), keypair(9));
         let token = mint(&member, 3, InviteRole::Client, u64::MAX);
 
@@ -410,7 +412,7 @@ fn a_client_role_token_grants_client_standing_not_residency() {
 #[test]
 fn a_client_token_is_single_use() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (member, client) = (keypair(1), keypair(9));
         let token = mint(&member, 4, InviteRole::Client, u64::MAX);
 
@@ -449,7 +451,7 @@ fn a_client_token_is_single_use() {
 #[test]
 fn the_join_proof_is_enforced_for_a_client_token_too() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let issuer = keypair(1);
 
         // claim keypair(10) as the joiner but sign the proof with keypair(8):

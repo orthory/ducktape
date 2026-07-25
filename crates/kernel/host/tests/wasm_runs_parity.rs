@@ -144,10 +144,11 @@ async fn siblings(
         Box::new(Files::open("files", files_dir).expect("files open")),
     ];
     if let Some(members) = assignment_members {
-        let mut valset = Valset::new("valset");
+        let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
         for member in members {
-            valset.insert(member.clone());
+            valset.seed(member.clone()).await.expect("seed valset");
         }
+        valset.finish_seed().await.expect("seed valset");
         modules.push(Box::new(valset));
         modules.push(Box::new(CapabilityRegistry::new(
             "capability",

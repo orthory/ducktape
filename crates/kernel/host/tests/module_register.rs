@@ -68,8 +68,9 @@ fn bare_host(with_factory: bool) -> Host {
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
     )));
-    let mut valset = valset::Valset::new("valset");
-    valset.insert(MEMBER.to_vec());
+    let mut valset = valset::Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    block_on(valset.seed(MEMBER.to_vec())).expect("seed valset");
+    block_on(valset.finish_seed()).expect("seed valset");
     host.register(Box::new(valset));
     if with_factory {
         host.set_module_factory(Box::new(WasmFactory));

@@ -292,10 +292,11 @@ fn strict_lease_rejects_a_non_assignee_and_accepts_the_assignee() {
         // three (genesis-seeded) validators; the saga module assigns each
         // attempt over the valset and enforces the lease strictly.
         let keys = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]];
-        let mut valset = Valset::new("valset");
+        let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
         for key in &keys {
-            valset.insert(key.clone());
+            valset.seed(key.clone()).await.expect("seed valset");
         }
+        valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
             // no capability module is registered: these triggers are untagged,
             // so assignment stays on the valset path.
