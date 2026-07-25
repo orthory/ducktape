@@ -49,7 +49,11 @@ async fn gov_host_with_modreg() -> Host {
             Governance::new("governance", Box::new(MemStore::new()), "valset", "identity")
                 .with_code_registry("lifecycle"),
         ),
-        Box::new(Lifecycle::new("lifecycle", "valset")),
+        Box::new(Lifecycle::new(
+            "lifecycle",
+            Box::new(MemStore::new()),
+            "valset",
+        )),
     ])
     .expect("genesis");
     // genesis-bootstrap the swappable module's initial code (System origin).

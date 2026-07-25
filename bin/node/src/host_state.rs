@@ -214,76 +214,113 @@ const FILES_MODULE_ID: &str = "files";
 /// hash, identical on every node (the embedded components ARE the hashes'
 /// preimages). shared by the genesis / restore / state-sync host builders so
 /// all three compose the same registry shape.
-fn seeded_lifecycle() -> Lifecycle {
-    let mut reg = Lifecycle::new(host::LIFECYCLE_MODULE_ID, "valset");
+async fn seeded_lifecycle(store: Box<dyn sdk::MerkleStore>) -> Lifecycle {
+    let mut reg = Lifecycle::new(host::LIFECYCLE_MODULE_ID, store, "valset");
     reg.seed(
         HELLO_WASM_MODULE_ID,
         sha2::Sha256::digest(HELLO_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         DIRECTORY_MODULE_ID,
         sha2::Sha256::digest(DIRECTORY_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         INBOX_MODULE_ID,
         sha2::Sha256::digest(INBOX_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         TASKS_MODULE_ID,
         sha2::Sha256::digest(TASKS_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         TAGGING_MODULE_ID,
         sha2::Sha256::digest(TAGGING_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         CAPABILITY_MODULE_ID,
         sha2::Sha256::digest(CAPABILITY_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         IDENTITY_MODULE_ID,
         sha2::Sha256::digest(IDENTITY_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         GATEWAY_MODULE_ID,
         sha2::Sha256::digest(GATEWAY_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         GOVERNANCE_MODULE_ID,
         sha2::Sha256::digest(GOVERNANCE_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         PAGES_MODULE_ID,
         sha2::Sha256::digest(PAGES_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         CHAT_MODULE_ID,
         sha2::Sha256::digest(CHAT_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         SAGA_MODULE_ID,
         sha2::Sha256::digest(SAGA_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         AGENT_MODULE_ID,
         sha2::Sha256::digest(AGENT_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         AUTOMATIONS_MODULE_ID,
         sha2::Sha256::digest(AUTOMATIONS_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         RUNS_MODULE_ID,
         sha2::Sha256::digest(RUNS_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         DISPATCH_MODULE_ID,
         sha2::Sha256::digest(DISPATCH_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.seed(
         FILES_MODULE_ID,
         sha2::Sha256::digest(FILES_WASM_COMPONENT).to_vec(),
-    );
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
+    reg.finish_seed()
+        .await
+        .expect("genesis lifecycle seeds commit");
     reg
 }
 
@@ -613,6 +650,12 @@ pub(super) async fn genesis_host(
     let tagging = tagging_wasm(Box::new(
         QmdbStore::init(context.child("tagging"), "tagging").await,
     ));
+    // the lifecycle registry is NATIVE but store-backed the same way; the
+    // genesis seed set commits into its store in one idempotent batch.
+    let lifecycle = seeded_lifecycle(Box::new(
+        QmdbStore::init(context.child("lifecycle"), "lifecycle").await,
+    ))
+    .await;
     seed_genesis_components(&blobs);
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
@@ -642,8 +685,9 @@ pub(super) async fn genesis_host(
         // the network module-code registry: the consensus commitment to WHICH
         // component each hot-swappable wasm module runs, seeded with the genesis
         // hashes. governance schedules height-gated swaps into it; the host
-        // realizes them through the blobstore-backed CodeSource.
-        lifecycle: seeded_lifecycle(),
+        // realizes them through the blobstore-backed CodeSource. native but
+        // store-backed over the host-constructed qmdb store.
+        lifecycle,
         // the reference wasm module — the live-update machinery's first tenant.
         hello_wasm: genesis_hello_wasm(),
         // capability-aware strict leases: a saga whose trigger names a
@@ -776,18 +820,16 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
 
-    // the lifecycle module-code registry restores like any in-memory module:
-    // construct at genesis shape, adopt the
-    // checkpoint snapshot. its seeded code hashes carry the genesis registry; the
-    // wasm tenants are rebuilt on their EMBEDDED genesis components here, and
-    // recovery's boot-time code reconciliation swaps them to the checkpoint's
-    // committed active code (state installs independently of code, so the roots
-    // check out either way).
-    let mut lifecycle = Lifecycle::new(host::LIFECYCLE_MODULE_ID, "valset");
-    let (bytes, root) = snapshot_of(host::LIFECYCLE_MODULE_ID)?;
-    lifecycle
-        .install(bytes, root)
-        .map_err(|e| format!("lifecycle install: {e}"))?;
+    // the lifecycle module-code registry reopens like the other store-backed
+    // tenants (its store carries the genesis seeds and every committed swap);
+    // the wasm tenants are rebuilt on their EMBEDDED genesis components here,
+    // and recovery's boot-time code reconciliation swaps them to the
+    // committed active code.
+    let lifecycle = Lifecycle::new(
+        host::LIFECYCLE_MODULE_ID,
+        Box::new(QmdbStore::init(context.child("lifecycle"), "lifecycle").await),
+        "valset",
+    );
 
     let mut hello_wasm = genesis_hello_wasm();
     let (bytes, root) = snapshot_of(HELLO_WASM_MODULE_ID)?;
@@ -1113,17 +1155,26 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
 
-    // the lifecycle module-code registry joins like any in-memory module: adopt
-    // the served snapshot, root-checked. the
-    // wasm tenants join on their EMBEDDED genesis components — a post-swap
+    // the lifecycle module-code registry joins like the other store-backed
+    // tenants: rebuild the store at the manifest's pinned target. the wasm
+    // tenants join on their EMBEDDED genesis components — a post-swap
     // network's committed active hash differs, and the joiner's first code
     // reconciliation (before it applies any block) swaps them to the committed
     // components, fetched off the blob plane.
-    let (bytes, root) = snapshot_of(host::LIFECYCLE_MODULE_ID).await?;
-    let mut lifecycle = Lifecycle::new(host::LIFECYCLE_MODULE_ID, "valset");
-    lifecycle
-        .install(&bytes, root)
-        .map_err(|e| format!("lifecycle install: {e}"))?;
+    let (target, resolver) = fetch_target(host::LIFECYCLE_MODULE_ID).await?;
+    let lifecycle = Lifecycle::new(
+        host::LIFECYCLE_MODULE_ID,
+        Box::new(
+            QmdbStore::sync_from(
+                scratch_context.child(child_label("lifecycle")),
+                "lifecycle",
+                target,
+                resolver,
+            )
+            .await?,
+        ),
+        "valset",
+    );
 
     let (bytes, root) = snapshot_of(HELLO_WASM_MODULE_ID).await?;
     let mut hello_wasm = genesis_hello_wasm();

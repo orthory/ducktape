@@ -67,7 +67,11 @@ const MEMBER: [u8; 32] = [7; 32];
 /// as hello's genesis-active code.
 fn host_with_wasm() -> Host {
     let mut host = Host::new();
-    host.register(Box::new(Lifecycle::new(LIFECYCLE_MODULE_ID, "valset")));
+    host.register(Box::new(Lifecycle::new(
+        LIFECYCLE_MODULE_ID,
+        Box::new(sdk_testkit::MemStore::new()),
+        "valset",
+    )));
     let mut valset = valset::Valset::new("valset");
     valset.insert(MEMBER.to_vec());
     host.register(Box::new(valset));
@@ -291,40 +295,62 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
     assert_eq!(active, sha(HELLO_REPLACEMENT));
     assert!(!pending, "post-activation: nothing pending");
 
-    // joiner: modreg installed from the source's committed snapshot (the
-    // verify-then-adopt state-sync path), wasm module freshly wired from
-    // GENESIS (v1) code.
+    // joiner: modreg rebuilt to the source's committed state (the real
+    // joiner pulls the qmdb op range — `lifecycle/tests/sync_round_trip.rs`
+    // pins that wire; here the deterministic REPLAY of the same admin ops
+    // reconstructs the identical record set over the MemStore double, and
+    // the roots must agree), wasm module freshly wired from GENESIS (v1)
+    // code.
     let modreg_root = source
         .module_root(LIFECYCLE_MODULE_ID)
         .expect("modreg root");
-    let mut joined_modreg = Lifecycle::new(LIFECYCLE_MODULE_ID, "valset");
-    // reach the committed snapshot through the module's own state-sync surface,
-    // exactly as a joiner would receive it.
-    let handle = {
-        let snap = source
-            .capture_finalized_snapshot(host::FinalizedBlock {
-                height: H + 1,
-                root_hash: source.root_hash(),
-            })
-            .expect("finalized snapshot");
-        snap.modules
-            .into_iter()
-            .find(|m| m.id == LIFECYCLE_MODULE_ID)
-            .expect("modreg snapshot")
-            .state_sync
-    };
-    let sdk::StateSyncHandle::SnapshotBytes(bytes) = handle else {
-        panic!("modreg serves snapshot bytes");
-    };
-    joined_modreg
-        .install(&bytes, modreg_root)
-        .expect("verify-then-adopt install");
-
     let mut joiner = Host::new();
-    joiner.register(Box::new(joined_modreg));
+    joiner.register(Box::new(Lifecycle::new(
+        LIFECYCLE_MODULE_ID,
+        Box::new(sdk_testkit::MemStore::new()),
+        "valset",
+    )));
+    let mut joiner_valset = valset::Valset::new("valset");
+    joiner_valset.insert(MEMBER.to_vec());
+    joiner.register(Box::new(joiner_valset));
     joiner.register(Box::new(
         WasmModule::from_bytes("hello", HELLO_V1).expect("genesis v1 code"),
     ));
+    submit(
+        &mut joiner,
+        0,
+        Origin::System,
+        lifecycle_msg(&LifecycleMsg::RegisterModule {
+            module_id: "hello".into(),
+            code_hash: sha(HELLO_V1),
+        }),
+    );
+    submit(
+        &mut joiner,
+        3,
+        Origin::System,
+        schedule_msg(H, sha(HELLO_REPLACEMENT)),
+    );
+    submit(
+        &mut joiner,
+        4,
+        Origin::External(MEMBER.to_vec()),
+        signal_ready_msg(),
+    );
+    // any block at H lets the drain inject the boundary Advance that flips
+    // the committed active hash — the idempotent re-signal is a harmless
+    // carrier op.
+    submit(
+        &mut joiner,
+        H,
+        Origin::External(MEMBER.to_vec()),
+        signal_ready_msg(),
+    );
+    assert_eq!(
+        joiner.module_root(LIFECYCLE_MODULE_ID).expect("modreg root"),
+        modreg_root,
+        "the replayed registry converges on the source's committed root"
+    );
 
     // the reconciliation the joiner runs before applying its first block: no
     // pending swap exists, yet the running code must land on the committed ACTIVE.

@@ -9,6 +9,8 @@ edition.workspace = true
 
 [dependencies]
 sdk = { workspace = true }
+# the store-record codec: compact, canonical, deterministic. wire stays sdk::wire.
+borsh = { workspace = true }
 valset = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -16,5 +18,8 @@ sha2 = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+# the sync round-trip proof drives a real qmdb source/joiner pair.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }
 futures = { workspace = true }
 sdk-testkit = { workspace = true }

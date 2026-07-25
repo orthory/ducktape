@@ -29,48 +29,58 @@
 //!
 //! ## state model
 //!
-//! a whole-state overlay (like governance): `execute` STAGES the whole
-//! `LifecycleState` into an overlay (committed untouched), `read()` sees
-//! staged-over-committed, `commit_block` publishes, `abort_block` discards;
-//! `root()` is sha256 over the canonical encoding of COMMITTED state
-//! (`StateRoot::ZERO` when fully uninitialized), and `snapshot`/`install` ship
-//! exactly that root preimage (verify-then-adopt).
+//! pure logic over a host-injected [`sdk::MerkleStore`]: one point record per
+//! registered module (`mod\0{id}` → active hash + optional pending swap,
+//! borsh) behind the sorted module roster (`modules`, bounded by
+//! [`MAX_MODULES`]) the status/advance walks read. writes are staged during a
+//! block and flushed in one batch at `commit_block`; the module root IS the
+//! store's merkle root, and sync belongs to the store. the `Advance` decide
+//! reads COMMITTED state only ([`sdk::StagedStore::get_committed`]) — the
+//! frozen boundary snapshot — while the reconciliation applies over the
+//! staged view like every other write.
 
 mod interface;
 pub use interface::*;
 
-use std::collections::BTreeMap;
-
-use sdk::codec::{Cursor, push_bytes};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
-use sha2::{Digest, Sha256};
+use borsh::{BorshDeserialize, BorshSerialize};
+use sdk::{
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
+    StateRoot, StateSyncHandle,
+};
 
 /// the minimum lead (in blocks) between the scheduling block and a swap's
 /// `activation_height`, so `H` is strictly in every node's future — long enough
 /// to fetch + verify the out-of-band bytes before the boundary.
 pub const MIN_SWAP_LEAD: u64 = 3;
 
-/// one registered module's code state.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// registered modules retained at once (the roster count cap). the registry
+/// is governance/genesis-authored, so this sits far above any real set;
+/// registering past it refuses loudly at execute.
+pub const MAX_MODULES: usize = 1024;
+/// serialized roster-record byte bound — the uniform poison backstop on top
+/// of the count cap.
+const MAX_ROSTER_RECORD_BYTES: usize = 512 * 1024;
+
+/// per-module record key: prefix + 0 + module id. safe because the roster
+/// literal below is fixed and neither is the other followed by a 0 byte.
+fn mod_key(module_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(3 + 1 + module_id.len());
+    key.extend_from_slice(b"mod");
+    key.push(0);
+    key.extend_from_slice(module_id.as_bytes());
+    key
+}
+
+/// the module roster's whole key (sorted module ids).
+const MODULE_ROSTER_KEY: &[u8] = b"modules";
+
+/// one registered module's code state — stored verbatim (borsh; a readiness
+/// list stays strictly increasing by construction, so one state has exactly
+/// one encoding).
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct ModuleEntry {
     active_code_hash: Vec<u8>,
     pending: Option<ScheduledSwap>,
-}
-
-/// the whole committed (or staged) lifecycle state — small enough to overlay
-/// wholesale.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-struct LifecycleState {
-    /// per hot-swappable module, its active code hash + at most one pending swap.
-    modules: BTreeMap<String, ModuleEntry>,
-}
-
-impl LifecycleState {
-    /// the fully-uninitialized sentinel: no registered module. `root()` is
-    /// `ZERO` exactly here.
-    fn is_empty(&self) -> bool {
-        self.modules.is_empty()
-    }
 }
 
 pub struct Lifecycle {
@@ -78,51 +88,185 @@ pub struct Lifecycle {
     /// the valset module the readiness denominator (boundary member set) comes
     /// from, via host-routed queries. genesis wiring — identical on every node.
     valset_id: ModuleId,
-    committed: LifecycleState,
-    staged: Option<LifecycleState>,
+    /// the host-injected authenticated store plus this block's staging overlay
+    /// (read-your-writes, folded into `root()` at `commit_block`). store key
+    /// is `sha256(logical_key)`, owned by [`StagedStore`].
+    staged: StagedStore,
 }
 
 impl Lifecycle {
-    pub fn new(id: impl Into<ModuleId>, valset_id: impl Into<ModuleId>) -> Self {
+    /// wrap the host-constructed store under module identity `id`.
+    pub fn new(
+        id: impl Into<ModuleId>,
+        store: Box<dyn MerkleStore>,
+        valset_id: impl Into<ModuleId>,
+    ) -> Self {
         Self {
             id: id.into(),
             valset_id: valset_id.into(),
-            committed: LifecycleState::default(),
-            staged: None,
+            staged: StagedStore::new(store),
         }
     }
 
-    /// whether any registered module carries a pending swap in committed state.
-    pub fn has_pending_swaps(&self) -> bool {
-        self.committed
-            .modules
-            .values()
-            .any(|entry| entry.pending.is_some())
-    }
-
-    /// GENESIS seeding: install a module's initial active code hash directly into
-    /// committed state, BEFORE the host registers this instance. deterministic
-    /// and identical on every node (a different seed set composes a different
-    /// genesis root-hash and the network forks at genesis). never valid after
-    /// genesis: live changes go through `RegisterModule`/`ScheduleSwap` ops.
-    pub fn seed(&mut self, module_id: impl Into<String>, code_hash: Vec<u8>) {
+    /// GENESIS seeding: stage a module's initial active code hash BEFORE the
+    /// host registers this instance; [`Lifecycle::finish_seed`] publishes the
+    /// whole seed set in one batch. deterministic and identical on every node
+    /// (a different seed set composes a different genesis root-hash and the
+    /// network forks at genesis). never valid after genesis: live changes go
+    /// through `RegisterModule`/`ScheduleSwap` ops.
+    pub async fn seed(
+        &mut self,
+        module_id: impl Into<String>,
+        code_hash: Vec<u8>,
+    ) -> Result<(), Error> {
         assert_eq!(
             code_hash.len(),
             CODE_HASH_LEN,
             "genesis code hash must be {CODE_HASH_LEN} bytes"
         );
-        self.committed.modules.insert(
-            module_id.into(),
-            ModuleEntry {
+        let module_id = module_id.into();
+        let mut roster = self.roster().await?;
+        if let Err(position) = roster.binary_search(&module_id) {
+            roster.insert(position, module_id.clone());
+            self.store_bounded(
+                MODULE_ROSTER_KEY.to_vec(),
+                &roster,
+                MAX_ROSTER_RECORD_BYTES,
+                "module roster",
+            )?;
+        }
+        self.store(
+            mod_key(&module_id),
+            &ModuleEntry {
                 active_code_hash: code_hash,
                 pending: None,
             },
         );
+        Ok(())
     }
 
-    /// staged-over-committed read (read-your-writes within a block).
-    fn read(&self) -> &LifecycleState {
-        self.staged.as_ref().unwrap_or(&self.committed)
+    /// publish the staged genesis seeds in one batch — idempotent: a store
+    /// that already carries a roster (a reopened workspace re-entering the
+    /// genesis path) is left byte-untouched, exactly like the host's
+    /// `seed_store_config`.
+    pub async fn finish_seed(&mut self) -> Result<(), Error> {
+        let already_seeded = self
+            .staged
+            .get_committed(MODULE_ROSTER_KEY)
+            .await?
+            .is_some();
+        if already_seeded {
+            self.staged.abort();
+            return Ok(());
+        }
+        self.staged.commit().await
+    }
+
+    // ---- staged-over-committed reads ----------------------------------------
+
+    async fn load<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
+    where
+        T: BorshDeserialize,
+    {
+        match self.staged.get(key).await? {
+            Some(bytes) => Ok(Some(
+                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// a COMMITTED-only decode — the frozen boundary read `Advance` decides
+    /// over ([`StagedStore::get_committed`]).
+    async fn load_committed<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
+    where
+        T: BorshDeserialize,
+    {
+        match self.staged.get_committed(key).await? {
+            Some(bytes) => Ok(Some(
+                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// stage a value whose serialized size is bounded by construction (a
+    /// module entry: fixed-size hashes plus a member-capped readiness list).
+    fn store<T>(&mut self, key: Vec<u8>, value: &T)
+    where
+        T: BorshSerialize,
+    {
+        self.staged.stage(
+            key,
+            borsh::to_vec(value).expect("lifecycle value is serializable"),
+        );
+    }
+
+    /// stage a value only if its serialized size fits `cap` — the write-time
+    /// guard against poison values (the qmdb codec cap is decode-only).
+    fn store_bounded<T>(
+        &mut self,
+        key: Vec<u8>,
+        value: &T,
+        cap: usize,
+        what: &str,
+    ) -> Result<(), Error>
+    where
+        T: BorshSerialize,
+    {
+        let bytes = borsh::to_vec(value).expect("lifecycle value is serializable");
+        if bytes.len() > cap {
+            return Err(Error::Module(format!(
+                "{what} record too large: {} > {cap} bytes",
+                bytes.len()
+            )));
+        }
+        self.staged.stage(key, bytes);
+        Ok(())
+    }
+
+    async fn entry(&self, module_id: &str) -> Result<Option<ModuleEntry>, Error> {
+        self.load(&mod_key(module_id)).await
+    }
+
+    /// a module the roster points at. a rostered id without its record is a
+    /// store bug — loud, never skipped.
+    async fn rostered_entry(&self, module_id: &str) -> Result<ModuleEntry, Error> {
+        self.entry(module_id)
+            .await?
+            .ok_or_else(|| Error::Module("missing module record".into()))
+    }
+
+    /// the module roster — every registered module id, sorted.
+    async fn roster(&self) -> Result<Vec<String>, Error> {
+        Ok(self.load(MODULE_ROSTER_KEY).await?.unwrap_or_default())
+    }
+
+    /// register `module_id` in the roster (count-capped, byte-gated) and stage
+    /// its entry — the shared tail of register/schedule-register/seed.
+    fn register_entry(
+        &mut self,
+        mut roster: Vec<String>,
+        module_id: String,
+        entry: &ModuleEntry,
+    ) -> Result<(), Error> {
+        let Err(position) = roster.binary_search(&module_id) else {
+            return Err(Error::Module(
+                "module roster carries an id with no record".into(),
+            ));
+        };
+        if roster.len() >= MAX_MODULES {
+            return Err(Error::Module(format!("module cap reached ({MAX_MODULES})")));
+        }
+        roster.insert(position, module_id.clone());
+        self.store_bounded(
+            MODULE_ROSTER_KEY.to_vec(),
+            &roster,
+            MAX_ROSTER_RECORD_BYTES,
+            "module roster",
+        )?;
+        self.store(mod_key(&module_id), entry);
+        Ok(())
     }
 
     /// the CURRENT boundary member set: the valset module's staged-over-committed
@@ -172,21 +316,20 @@ impl Lifecycle {
     ) -> Result<(), Error> {
         Self::require_module_or_system(ctx)?;
         Self::require_hash_len(&code_hash)?;
-        let mut next = self.read().clone();
-        if next.modules.contains_key(&module_id) {
+        if self.entry(&module_id).await?.is_some() {
             return Err(Error::Module(format!(
                 "module {module_id} is already registered (code changes go through ScheduleSwap)"
             )));
         }
-        next.modules.insert(
+        let roster = self.roster().await?;
+        self.register_entry(
+            roster,
             module_id,
-            ModuleEntry {
+            &ModuleEntry {
                 active_code_hash: code_hash,
                 pending: None,
             },
-        );
-        self.staged = Some(next);
-        Ok(())
+        )
     }
 
     async fn handle_schedule_swap(
@@ -199,8 +342,7 @@ impl Lifecycle {
     ) -> Result<(), Error> {
         Self::require_module_or_system(ctx)?;
         Self::require_hash_len(&code_hash)?;
-        let mut next = self.read().clone();
-        let entry = next.modules.get_mut(&module_id).ok_or_else(|| {
+        let mut entry = self.entry(&module_id).await?.ok_or_else(|| {
             Error::Module(format!(
                 "cannot schedule a swap for unregistered module {module_id}"
             ))
@@ -231,7 +373,7 @@ impl Lifecycle {
             readiness: Vec::new(),
             ready: false,
         });
-        self.staged = Some(next);
+        self.store(mod_key(&module_id), &entry);
         Ok(())
     }
 
@@ -265,8 +407,7 @@ impl Lifecycle {
                 "module id {module_id} is already live on this host"
             )));
         }
-        let mut next = self.read().clone();
-        if next.modules.contains_key(&module_id) {
+        if self.entry(&module_id).await?.is_some() {
             return Err(Error::Module(format!(
                 "module {module_id} is already registered (code changes go through ScheduleSwap)"
             )));
@@ -277,9 +418,11 @@ impl Lifecycle {
                 "activation_height {activation_height} must exceed height+MIN_SWAP_LEAD ({floor})"
             )));
         }
-        next.modules.insert(
+        let roster = self.roster().await?;
+        self.register_entry(
+            roster,
             module_id,
-            ModuleEntry {
+            &ModuleEntry {
                 active_code_hash: Vec::new(),
                 pending: Some(ScheduledSwap {
                     name,
@@ -289,9 +432,7 @@ impl Lifecycle {
                     ready: false,
                 }),
             },
-        );
-        self.staged = Some(next);
-        Ok(())
+        )
     }
 
     async fn handle_cancel_swap(
@@ -302,10 +443,9 @@ impl Lifecycle {
     ) -> Result<(), Error> {
         Self::require_module_or_system(ctx)?;
         let height = ctx.env().height;
-        let mut next = self.read().clone();
-        let entry = next
-            .modules
-            .get_mut(&module_id)
+        let mut entry = self
+            .entry(&module_id)
+            .await?
             .ok_or_else(|| Error::Module(format!("no such module {module_id}")))?;
         match &entry.pending {
             // can only cancel BEFORE the boundary — never race an arming swap.
@@ -321,11 +461,22 @@ impl Lifecycle {
         }
         entry.pending = None;
         // cancelling an ADMISSION (empty active hash: the module never ran)
-        // removes the entry entirely — lifecycle must never claim a codeless module.
+        // removes the entry entirely — lifecycle must never claim a codeless
+        // module. its roster slot is freed with it.
         if entry.active_code_hash.is_empty() {
-            next.modules.remove(&module_id);
+            let mut roster = self.roster().await?;
+            if let Ok(position) = roster.binary_search(&module_id) {
+                roster.remove(position);
+            }
+            if roster.is_empty() {
+                self.staged.delete(MODULE_ROSTER_KEY.to_vec());
+            } else {
+                self.store(MODULE_ROSTER_KEY.to_vec(), &roster);
+            }
+            self.staged.delete(mod_key(&module_id));
+        } else {
+            self.store(mod_key(&module_id), &entry);
         }
-        self.staged = Some(next);
         Ok(())
     }
 
@@ -351,10 +502,9 @@ impl Lifecycle {
                 "SwapReady submitter is not a current validator-set member".into(),
             ));
         }
-        let mut next = self.read().clone();
-        let entry = next
-            .modules
-            .get_mut(&module_id)
+        let mut entry = self
+            .entry(&module_id)
+            .await?
             .ok_or_else(|| Error::Module(format!("no such module {module_id}")))?;
         let swap = match &mut entry.pending {
             Some(swap) if swap.name == name => swap,
@@ -378,7 +528,7 @@ impl Lifecycle {
         {
             swap.ready = true;
         }
-        self.staged = Some(next);
+        self.store(mod_key(&module_id), &entry);
         Ok(())
     }
 
@@ -394,122 +544,71 @@ impl Lifecycle {
         Self::require_system(ctx)?;
         let height = ctx.env().height;
 
-        // decide over FROZEN committed state.
-        let armed_swaps: Vec<String> = self
-            .committed
-            .modules
-            .iter()
-            .filter(|(_, e)| {
-                e.pending
-                    .as_ref()
-                    .is_some_and(|p| p.ready && height >= p.activation_height)
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        // decide over FROZEN committed state: the committed roster and the
+        // committed entries, bypassing any writes staged earlier this block
+        // (`StagedStore::get_committed`).
+        let committed_roster: Vec<String> = self
+            .load_committed(MODULE_ROSTER_KEY)
+            .await?
+            .unwrap_or_default();
+        let mut armed_swaps = Vec::new();
+        for id in committed_roster {
+            let armed = self
+                .load_committed::<ModuleEntry>(&mod_key(&id))
+                .await?
+                .and_then(|e| e.pending)
+                .is_some_and(|p| p.ready && height >= p.activation_height);
+            if armed {
+                armed_swaps.push(id);
+            }
+        }
 
         // nothing to reconcile: a true no-op (root untouched).
         if armed_swaps.is_empty() {
             return Ok(());
         }
 
-        let mut next = self.read().clone();
-
-        // flip every armed swap's active hash into the root-hash.
+        // flip every armed swap's active hash into the root, applied over the
+        // staged view like every other write.
         for id in armed_swaps {
-            if let Some(entry) = next.modules.get_mut(&id)
-                && let Some(swap) = entry.pending.take()
-            {
-                entry.active_code_hash = swap.code_hash;
-            }
+            let mut entry = self.rostered_entry(&id).await?;
+            let Some(swap) = entry.pending.take() else {
+                continue;
+            };
+            entry.active_code_hash = swap.code_hash;
+            self.store(mod_key(&id), &entry);
         }
-
-        self.staged = Some(next);
         Ok(())
     }
 
     // ---- queries ------------------------------------------------------------
 
-    fn module_status(&self) -> LifecycleReply {
-        let modules = self
-            .read()
-            .modules
-            .iter()
-            .map(|(id, e)| ModuleCode {
-                module_id: id.clone(),
-                active_code_hash: e.active_code_hash.clone(),
-                pending: e.pending.clone(),
-            })
-            .collect();
-        LifecycleReply::ModuleStatus { modules }
+    async fn module_status(&self) -> Result<LifecycleReply, Error> {
+        let mut modules = Vec::new();
+        for id in self.roster().await? {
+            let e = self.rostered_entry(&id).await?;
+            modules.push(ModuleCode {
+                module_id: id,
+                active_code_hash: e.active_code_hash,
+                pending: e.pending,
+            });
+        }
+        Ok(LifecycleReply::ModuleStatus { modules })
     }
 
-    fn armed_at(&self, height: u64) -> LifecycleReply {
-        let swaps = self
-            .read()
-            .modules
-            .iter()
-            .filter_map(|(id, e)| {
-                e.pending.as_ref().and_then(|p| {
-                    (p.ready && height >= p.activation_height).then(|| ArmedSwap {
-                        module_id: id.clone(),
-                        code_hash: p.code_hash.clone(),
-                    })
-                })
-            })
-            .collect();
-        LifecycleReply::ArmedAt { swaps }
-    }
-
-    // ---- canonical state bytes (root preimage + snapshot format) ------------
-
-    fn encode_state(s: &LifecycleState) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&(s.modules.len() as u64).to_le_bytes());
-        for (id, entry) in &s.modules {
-            push_bytes(&mut out, id.as_bytes());
-            push_bytes(&mut out, &entry.active_code_hash);
-            match &entry.pending {
-                None => out.push(0),
-                Some(swap) => {
-                    out.push(1);
-                    push_bytes(&mut out, swap.name.as_bytes());
-                    out.extend_from_slice(&swap.activation_height.to_le_bytes());
-                    push_bytes(&mut out, &swap.code_hash);
-                    out.push(u8::from(swap.ready));
-                    out.extend_from_slice(&(swap.readiness.len() as u64).to_le_bytes());
-                    for pubkey in &swap.readiness {
-                        push_bytes(&mut out, pubkey);
-                    }
-                }
+    async fn armed_at(&self, height: u64) -> Result<LifecycleReply, Error> {
+        let mut swaps = Vec::new();
+        for id in self.roster().await? {
+            let e = self.rostered_entry(&id).await?;
+            let Some(p) = e.pending else { continue };
+            if p.ready && height >= p.activation_height {
+                swaps.push(ArmedSwap {
+                    module_id: id,
+                    code_hash: p.code_hash,
+                });
             }
         }
-        out
-    }
-
-    /// sha256 over the canonical encoding; `ZERO` iff the state is fully
-    /// uninitialized.
-    fn root_of(s: &LifecycleState) -> StateRoot {
-        if s.is_empty() {
-            return StateRoot::ZERO;
-        }
-        let mut h = Sha256::new();
-        h.update(Self::encode_state(s));
-        StateRoot(h.finalize().into())
-    }
-
-    /// canonical bytes of COMMITTED state — the exact preimage of `root()`.
-    pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode_state(&self.committed)
-    }
-
-    /// verify-then-adopt a peer snapshot: decode, recompute the root, refuse on
-    /// mismatch — committed state and stage untouched on any error.
-    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let decoded = decode_state(bytes)?;
-        sdk::verify_snapshot_root(Self::root_of(&decoded), expected)?;
-        self.committed = decoded;
-        self.staged = None;
-        Ok(())
+        Ok(LifecycleReply::ArmedAt { swaps })
     }
 }
 
@@ -519,12 +618,25 @@ impl Module for Lifecycle {
         self.id.clone()
     }
 
+    /// the store's merkle root over all committed records, verbatim — the
+    /// staged overlay is invisible here until `commit_block`.
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.committed)
+        self.staged.root()
     }
 
-    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
-        Some(self.snapshot())
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        self.staged.state_sync_handle()
+    }
+
+    /// the network state-sync serve lane: answers the shared qmdb wire requests
+    /// (historical proof-carrying op ranges) from committed state. read-only;
+    /// the joiner's sync engine merkle-verifies every batch.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.staged.serve_sync(req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        self.staged.sync_target().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -564,105 +676,23 @@ impl Module for Lifecycle {
     /// read projection — the module-code projections need no host routing.
     async fn query_with(&self, _ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            LifecycleQuery::ModuleStatus => Ok(encode_reply(&self.module_status())),
-            LifecycleQuery::ArmedAt { height } => Ok(encode_reply(&self.armed_at(height))),
+            LifecycleQuery::ModuleStatus => Ok(encode_reply(&self.module_status().await?)),
+            LifecycleQuery::ArmedAt { height } => {
+                Ok(encode_reply(&self.armed_at(height).await?))
+            }
         }
     }
 
+    /// publish the block's staged writes in ONE store batch. no-op (and no
+    /// root movement) if nothing was staged.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        if let Some(s) = self.staged.take() {
-            self.committed = s;
-        }
-        Ok(())
+        self.staged.commit().await
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.staged = None;
+        self.staged.abort();
         Ok(())
     }
-}
-
-// ---- strict snapshot decode (untrusted bytes) -------------------------------
-
-fn decode_state(bytes: &[u8]) -> Result<LifecycleState, Error> {
-    let mut cur = Cursor::new(bytes);
-
-    let module_count = cur.u64("snapshot module count")?;
-    // each module costs at least an 8-byte id-length prefix + an 8-byte active
-    // hash-length prefix + a 1-byte pending tag — bound before looping.
-    cur.bound(module_count, 17, "snapshot modules")?;
-    let mut modules = BTreeMap::new();
-    let mut prev_id: Option<String> = None;
-    for _ in 0..module_count {
-        let id = cur.string("snapshot module id")?;
-        // strictly increasing ids: one state has exactly one encoding.
-        if prev_id.as_deref().is_some_and(|p| p >= id.as_str()) {
-            return Err(Error::Module(
-                "snapshot module ids must be strictly increasing".into(),
-            ));
-        }
-        let active_code_hash = cur.bytes("snapshot module active hash")?.to_vec();
-        // EMPTY = admission-pending (`ScheduleRegister`): registered, no active
-        // code until its boundary realizes the initial hash.
-        if active_code_hash.len() != CODE_HASH_LEN && !active_code_hash.is_empty() {
-            return Err(Error::Module("snapshot: bad active hash length".into()));
-        }
-        let pending = match cur.byte("snapshot module pending tag")? {
-            0 => None,
-            1 => {
-                let name = cur.string("snapshot swap name")?;
-                let activation_height = cur.u64("snapshot swap activation height")?;
-                let code_hash = cur.bytes("snapshot swap code hash")?.to_vec();
-                if code_hash.len() != CODE_HASH_LEN {
-                    return Err(Error::Module("snapshot: bad pending hash length".into()));
-                }
-                let ready = match cur.byte("snapshot swap ready tag")? {
-                    0 => false,
-                    1 => true,
-                    other => {
-                        return Err(Error::Module(format!("snapshot: bad ready tag {other}")));
-                    }
-                };
-                let signals = cur.u64("snapshot swap readiness count")?;
-                cur.bound(signals, 8, "snapshot swap readiness")?;
-                let mut readiness = Vec::with_capacity(signals as usize);
-                let mut prev_sig: Option<Vec<u8>> = None;
-                for _ in 0..signals {
-                    let pubkey = cur.bytes("snapshot swap readiness key")?.to_vec();
-                    if prev_sig.as_ref().is_some_and(|p| p >= &pubkey) {
-                        return Err(Error::Module(
-                            "snapshot swap readiness keys must be strictly increasing".into(),
-                        ));
-                    }
-                    prev_sig = Some(pubkey.clone());
-                    readiness.push(pubkey);
-                }
-                Some(ScheduledSwap {
-                    name,
-                    activation_height,
-                    code_hash,
-                    readiness,
-                    ready,
-                })
-            }
-            other => {
-                return Err(Error::Module(format!(
-                    "snapshot: bad module pending tag {other}"
-                )));
-            }
-        };
-        prev_id = Some(id.clone());
-        modules.insert(
-            id,
-            ModuleEntry {
-                active_code_hash,
-                pending,
-            },
-        );
-    }
-
-    cur.finish("snapshot")?;
-    Ok(LifecycleState { modules })
 }
 
 #[cfg(test)]

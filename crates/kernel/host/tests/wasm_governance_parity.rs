@@ -125,32 +125,40 @@ fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
 
 /// a code registry with one seeded tenant, so UpdateModule has a module to
 /// re-code (mirrors bin/node's genesis-seeded registry).
-fn seeded_lifecycle() -> Lifecycle {
-    let mut lifecycle = Lifecycle::new("lifecycle", "valset");
-    lifecycle.seed("hello", vec![0xAA; 32]);
+async fn seeded_lifecycle() -> Lifecycle {
+    let mut lifecycle = Lifecycle::new(
+        "lifecycle",
+        Box::new(sdk_testkit::MemStore::new()),
+        "valset",
+    );
+    lifecycle
+        .seed("hello", vec![0xAA; 32])
+        .await
+        .expect("seed stages");
+    lifecycle.finish_seed().await.expect("seed commits");
     lifecycle
 }
 
 /// the full native sibling set both hosts carry: valset (membership), identity
 /// (account shares), lifecycle (node upgrades + code swaps).
-fn siblings(validators: &[Vec<u8>]) -> Vec<Box<dyn sdk::Module>> {
+async fn siblings(validators: &[Vec<u8>]) -> Vec<Box<dyn sdk::Module>> {
     vec![
         Box::new(seeded_valset(validators)),
         Box::new(native_identity()),
-        Box::new(seeded_lifecycle()),
+        Box::new(seeded_lifecycle().await),
     ]
 }
 
 async fn native_host(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
     let store = gov_store(context, "native_gov", INVITE).await;
-    let mut modules = siblings(validators);
+    let mut modules = siblings(validators).await;
     modules.push(Box::new(native_governance(Box::new(store))));
     Host::genesis(modules).expect("genesis")
 }
 
 async fn wasm_host_(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
     let store = gov_store(context, "wasm_gov", INVITE).await;
-    let mut modules = siblings(validators);
+    let mut modules = siblings(validators).await;
     modules.push(Box::new(wasm_governance(Box::new(store))));
     Host::genesis(modules).expect("genesis")
 }
@@ -1189,7 +1197,7 @@ async fn genesis_config_inner(context: &deterministic::Context) {
     let validators = vec![ed_pub(&a)];
     let mut wasm = wasm_host_(context, &validators).await;
     let mut other_host = {
-        let mut modules = siblings(&validators);
+        let mut modules = siblings(&validators).await;
         modules.push(Box::new(wasm_governance(Box::new(other))));
         Host::genesis(modules).expect("genesis")
     };
