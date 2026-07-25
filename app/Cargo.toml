@@ -7,6 +7,12 @@ publish = false
 [dependencies]
 chat.workspace = true
 ducktape-rpc.workspace = true
+forge.workspace = true
+# the client-computed merge lane: a bare mirror fetched over the node's
+# /forge/{repo} smart-HTTP bridge + the scratch merge commit MergePr CASes.
+# forge's exact pin (vendored, no TLS transports — the bridge speaks plain
+# http on loopback/LAN; probed against a live node before adoption).
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 governance.workspace = true
 identity.workspace = true
 inbox.workspace = true

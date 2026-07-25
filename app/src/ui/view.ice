@@ -326,7 +326,7 @@ view
                   pressed bg=fg/15
             container width=fill padding=8.0 bg=surface border=fg/13 border-w=1.0 r=13.0 shadow=black/24 shadow-y=3.0 shadow-blur=18.0
               flex width=fill gap=8.0 align-items=end
-                editor #message <-> message_editor placeholder="Message #general…" disabled=(loading || !connected || empty(active_channel) || active_channel_archived) min-height=44.0 max-height=150.0 size=14.0 line-height=1.3 padding=6.6 wrapping=word key-binding=composer_keys() -> send_message_submit
+                editor #message <-> message_editor placeholder="Message the channel…" disabled=(loading || !connected || empty(active_channel) || active_channel_archived) min-height=44.0 max-height=150.0 size=14.0 line-height=1.3 padding=6.6 wrapping=word key-binding=composer_keys() -> send_message_submit
                   active bg=transparent border=transparent value=fg placeholder=muted selection=primary/40 border-w=0.0 r=9.0
                   hovered bg=fg/4 border=fg/8 border-w=1.0
                   focused bg=fg/6 border=primary/45 border-w=1.0
@@ -1043,8 +1043,14 @@ view
               text forge_item_title width=fill size=13.0 wrapping=none font=medium @text-fg
               text forge_item_kind size=11.0 wrapping=none font=mono @text-primary
               text forge_item_state size=11.0 wrapping=none font=mono @text-muted
-            if !empty(forge_item_branches)
-              text forge_item_branches size=11.0 font=mono @text-muted
+            row width=fill spacing=8.0 align=center
+              if !empty(forge_item_author)
+                text forge_item_author size=11.0 wrapping=none @text-muted
+              if !empty(forge_item_branches)
+                text forge_item_branches size=11.0 wrapping=none font=mono @text-muted
+              if forge_item_files_changed > 0
+                text forge_stats(forge_item_files_changed, forge_item_additions, forge_item_deletions) size=11.0 wrapping=none font=mono @text-muted
+              space width=fill
             scroll direction=vertical width=fill height=fill
               col width=fill spacing=8.0
                 if !empty(forge_item_body)
@@ -1052,7 +1058,122 @@ view
                     text forge_item_body size=13.0 @text-fg
                 if !empty(forge_item_diff)
                   container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
-                    text forge_item_diff size=11.0 font=mono @text-fg
+                    col width=fill spacing=5.0
+                      if forge_item_diff_truncated
+                        text "Patch truncated — the statistics cover the full diff." size=11.0 @text-muted
+                      text forge_item_diff size=11.0 font=mono @text-fg
+                if forge_item_kind == "pr"
+                  container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                    col width=fill spacing=6.0
+                      row width=fill spacing=6.0 align=center
+                        text "Merge" width=fill size=13.0 font=medium @text-fg
+                        text forge_item_approvals size=11.0 wrapping=none font=mono @text-primary
+                        text "approvals" size=11.0 wrapping=none @text-muted
+                        text "·" size=11.0 wrapping=none @text-muted
+                        text forge_item_change_requests size=11.0 wrapping=none font=mono @text-muted
+                        text "change requests" size=11.0 wrapping=none @text-muted
+                      if forge_item_state == "merged"
+                        text forge_merge_note(forge_item_merge_oid, forge_item_branches) size=13.0 font=mono @text-primary
+                      if forge_item_state == "closed"
+                        text "Closed without merging." size=13.0 @text-muted
+                      if forge_item_state == "open"
+                        if !empty(forge_merge_conflicts)
+                          col width=fill spacing=3.0
+                            text "Merge conflicts — resolve on the branch and push again:" size=11.0 @text-muted
+                            for conflict_path in forge_merge_conflicts
+                              text conflict_path size=11.0 font=mono @text-fg
+                        row width=fill spacing=8.0 align=center
+                          if !forge_merge_busy
+                            button "Merge pull request" disabled=(!connected || empty(forge_item_source_oid)) height=28.0 padding=6.0 -> forge_merge_submit
+                              active bg=primary text=fg border=primaryhi/50 border-w=1.0 r=9.0
+                              hovered bg=primaryhi text=fg
+                              pressed bg=primary text=fg
+                              disabled bg=fg/8 text=muted
+                          if forge_merge_busy
+                            button "Merging…" disabled=true height=28.0 padding=6.0 -> forge_merge_submit
+                              active bg=fg/8 text=muted border=fg/10 border-w=1.0 r=9.0
+                              disabled bg=fg/8 text=muted
+                          text "Approvals are advisory — merging is never gated." size=11.0 wrapping=none @text-muted
+                if forge_item_kind == "pr"
+                  container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                    col width=fill spacing=6.0
+                      text "Reviews" size=13.0 font=medium @text-fg
+                      if empty(forge_item_reviews)
+                        text "No reviews yet." size=13.0 @text-muted
+                      for review in forge_item_reviews
+                        container width=fill padding=8.0 bg=elevated border=fg/8 border-w=1.0 r=8.0
+                          col width=fill spacing=4.0
+                            row width=fill spacing=7.0 align=center
+                              text review.author_name size=13.0 wrapping=none font=medium @text-fg
+                              if review.verdict == "approve"
+                                text verdict_label(review.verdict) size=11.0 wrapping=none font=mono @text-primary
+                              if review.verdict != "approve"
+                                text verdict_label(review.verdict) size=11.0 wrapping=none font=mono @text-muted
+                              text review.commit size=11.0 wrapping=none font=mono @text-muted
+                              if review.outdated
+                                text "outdated" size=11.0 wrapping=none font=mono @text-muted
+                              space width=fill
+                            if !empty(review.body)
+                              text review.body size=13.0 @text-fg
+                            for comment in review.comments
+                              container width=fill padding=6.0 bg=surface border=fg/8 border-w=1.0 r=7.0
+                                col width=fill spacing=2.0
+                                  text comment.anchor size=11.0 font=mono @text-muted
+                                  text comment.body size=13.0 @text-fg
+                      row width=fill spacing=6.0 align=center
+                        button label="Pick comment verdict" height=24.0 padding=5.0 -> forge_review_pick("comment")
+                          text verdict_pick_label(forge_review_verdict, "comment", "Comment") size=11.0
+                          active bg=fg/6 text=fg border=fg/10 border-w=1.0 r=7.0
+                          hovered bg=fg/10 text=fg
+                          pressed bg=fg/14
+                        button label="Pick approve verdict" height=24.0 padding=5.0 -> forge_review_pick("approve")
+                          text verdict_pick_label(forge_review_verdict, "approve", "Approve") size=11.0
+                          active bg=primary/14 text=fg border=primary/26 border-w=1.0 r=7.0
+                          hovered bg=primary/22 text=fg
+                          pressed bg=primary/30
+                        button label="Pick request-changes verdict" height=24.0 padding=5.0 -> forge_review_pick("request_changes")
+                          text verdict_pick_label(forge_review_verdict, "request_changes", "Request changes") size=11.0
+                          active bg=danger/10 text=fg border=danger/26 border-w=1.0 r=7.0
+                          hovered bg=danger/18 text=fg
+                          pressed bg=danger/24
+                        space width=fill
+                      row width=fill spacing=6.0 align=center
+                        input "" #forge-review-body label="Review body" <-> forge_review_draft hint="Leave a review…" disabled=(forge_review_busy || !connected) submit=forge_review_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
+                          active bg=elevated border=fg/16 value=fg placeholder=muted selection=primary/40 border-w=1.0 r=8.0
+                          hovered bg=elevated border=fg/21
+                          focused bg=elevated border=primary/45
+                          disabled bg=fg/6 value=muted
+                        button "Submit review" disabled=(forge_review_busy || !connected || empty(forge_item_source_oid)) height=28.0 padding=6.0 -> forge_review_submit
+                          active bg=primary/16 text=fg border=primary/30 border-w=1.0 r=8.0
+                          hovered bg=primary/24 text=fg
+                          pressed bg=primary/30
+                          disabled bg=fg/8 text=muted
+                container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                  col width=fill spacing=6.0
+                    text "Discussion" size=13.0 font=medium @text-fg
+                    if empty(forge_discussion)
+                      text "No discussion yet." size=13.0 @text-muted
+                    for message in forge_discussion
+                      row width=fill spacing=9.0 align=start
+                        container width=28.0 height=28.0 align-x=center align-y=center style=avatar_style(message.avatar_r, message.avatar_g, message.avatar_b)
+                          text message.initial size=13.0 font=display @text-fg
+                        col width=fill spacing=2.0
+                          row width=fill spacing=7.0 align=center
+                            text message.author size=13.0 wrapping=none font=display @text-fg
+                            text message.meta size=11.0 wrapping=none @text-muted
+                            space width=fill
+                          MessageBody message=message
+                    flex width=fill gap=8.0 align-items=end
+                      editor #forge-note <-> forge_discussion_editor placeholder="Write a note…" disabled=(loading || !connected || empty(forge_item_channel)) min-height=38.0 max-height=120.0 size=13.0 line-height=1.3 padding=6.0 wrapping=word key-binding=composer_keys() -> forge_note_submit
+                        active bg=transparent border=fg/10 value=fg placeholder=muted selection=primary/40 border-w=1.0 r=8.0
+                        hovered bg=fg/4 border=fg/12 border-w=1.0
+                        focused bg=fg/6 border=primary/45 border-w=1.0
+                        disabled value=muted
+                      button "Send" disabled=(loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending) || empty(trim(editor_text(forge_discussion_editor)))) width=60.0 height=28.0 padding=6.0 -> forge_note_submit
+                        active bg=primary text=fg border=primaryhi/50 border-w=1.0 r=9.0
+                        hovered bg=primaryhi text=fg
+                        pressed bg=primary text=fg
+                        disabled bg=fg/8 text=muted
     governance:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center

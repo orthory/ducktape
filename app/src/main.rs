@@ -131,6 +131,44 @@ mod tests {
     }
 
     #[test]
+    fn forge_depth_rides_the_established_seams() {
+        let lifecycle = include_str!("ui/handlers/lifecycle.ice");
+        let view = include_str!("ui/view.ice");
+        let backend = include_str!("ui/backend.ice");
+
+        // the item discussion IS a chat surface: hydrated through the chat
+        // lanes and spliced by the SAME fold the chat pane uses, scoped to
+        // the item's hidden channel — never a forge-private message path.
+        assert!(lifecycle.contains(
+            "forge_discussion = apply_chat_messages(forge_discussion, next.chat, forge_item_channel)"
+        ));
+        assert!(lifecycle.contains(
+            "run send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending"
+        ));
+
+        // a review pins the source head the reviewer saw; the merge CASes
+        // BOTH heads (recompute on a moved branch, never a blind retry).
+        assert!(backend.contains(
+            "submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str)"
+        ));
+        assert!(backend.contains(
+            "merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str)"
+        ));
+
+        // committed forge ops refresh scoped slices through the handler's one
+        // terminal parallel — no polling, no per-op full reloads.
+        assert!(lifecycle.contains(
+            "run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, forge_generation)"
+        ));
+        assert!(!lifecycle.contains("every 1s"));
+
+        // approvals stay advisory in the merge box, and the merged state
+        // renders the CAS'd commit.
+        assert!(view.contains("Approvals are advisory"));
+        assert!(view.contains("forge_merge_note(forge_item_merge_oid, forge_item_branches)"));
+    }
+
+    #[test]
     fn background_refresh_preserves_editing_state() {
         let root = include_str!("ui/app.ice");
         let view = include_str!("ui/view.ice");
