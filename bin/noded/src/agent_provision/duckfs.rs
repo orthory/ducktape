@@ -189,7 +189,7 @@ impl ProvisionedWorkspace for NodedWorkspace {
         let result = tokio::task::spawn_blocking(move || {
             // Provider HOME/auth/temp/build state is reserved runtime debris,
             // never an agent output facet. Remove it before duckfs scans.
-            let _ = std::fs::remove_dir_all(dir.join(capability_host::RUN_RUNTIME_DIR));
+            let _ = std::fs::remove_dir_all(dir.join(provider_host::RUN_RUNTIME_DIR));
             commit(&api, &dir, &message)
         })
         .await

@@ -34,7 +34,7 @@ use data_plane::{
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use capability_host::{AirlockConfig, ResolvedCredential};
+use provider_host::{AirlockConfig, ResolvedCredential};
 use futures::SinkExt as _;
 use futures::channel::{mpsc as fmpsc, oneshot};
 use noded::{
@@ -615,7 +615,7 @@ fn refused_from_term_error(err: TermError) -> SessionControlReply {
 #[derive(Debug)]
 struct AdmitOk {
     name: String,
-    kind: capability_host::CredentialKind,
+    kind: provider_host::CredentialKind,
     seal_pk: [u8; 32],
     owner_account: Vec<u8>,
     limits: std::collections::BTreeMap<String, u64>,
@@ -666,10 +666,10 @@ fn admit_create(
 
 /// gateway kind → capability-host kind (the two are deliberately separate types;
 /// capability-host must not depend on the gateway crate).
-fn map_kind(kind: gateway::CredentialKind) -> capability_host::CredentialKind {
+fn map_kind(kind: gateway::CredentialKind) -> provider_host::CredentialKind {
     match kind {
-        gateway::CredentialKind::Claude => capability_host::CredentialKind::Claude,
-        gateway::CredentialKind::Codex => capability_host::CredentialKind::Codex,
+        gateway::CredentialKind::Claude => provider_host::CredentialKind::Claude,
+        gateway::CredentialKind::Codex => provider_host::CredentialKind::Codex,
     }
 }
 
@@ -1181,7 +1181,7 @@ mod tests {
         let ok = admit_create("codex", &owner, Some(&codex), Some(3), Some(8), true).unwrap();
         assert_eq!(ok.limits.get("cores"), Some(&3));
         assert_eq!(ok.limits.get("mem_gb"), Some(&8));
-        assert!(matches!(ok.kind, capability_host::CredentialKind::Codex));
+        assert!(matches!(ok.kind, provider_host::CredentialKind::Codex));
     }
 
     #[test]

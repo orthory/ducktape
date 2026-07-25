@@ -457,14 +457,14 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl capability_host::Provider for SlowProvider {
+    impl provider_host::Provider for SlowProvider {
         fn capability(&self) -> &str {
             "alpha"
         }
         async fn run(
             &self,
             prompt: &str,
-            ctx: &capability_host::RunContext,
+            ctx: &provider_host::RunContext,
         ) -> Result<String, String> {
             self.executions.fetch_add(1, Ordering::SeqCst);
             let mut guard = RunGuard {
@@ -486,8 +486,8 @@ mod tests {
         }
     }
 
-    fn spec_toml() -> capability_host::CapabilitySpec {
-        capability_host::CapabilitySpec::parse(
+    fn spec_toml() -> provider_host::CapabilitySpec {
+        provider_host::CapabilitySpec::parse(
             r#"
 spec = 1
 [capability]
@@ -573,7 +573,7 @@ format = "text"
         Arc<AtomicUsize>,
     ) {
         let executions = Arc::new(AtomicUsize::new(0));
-        let providers: Vec<Box<dyn capability_host::Provider>> = if installed {
+        let providers: Vec<Box<dyn provider_host::Provider>> = if installed {
             vec![Box::new(SlowProvider {
                 delay,
                 executions: executions.clone(),
@@ -582,8 +582,8 @@ format = "text"
         } else {
             Vec::new()
         };
-        let providers = Arc::new(capability_host::ProviderSet::assemble(
-            capability_host::SpecSet::from_specs(vec![spec_toml()]),
+        let providers = Arc::new(provider_host::ProviderSet::assemble(
+            provider_host::SpecSet::from_specs(vec![spec_toml()]),
             providers,
         ));
         let (tx, rx) = futures::channel::mpsc::unbounded::<Msg>();

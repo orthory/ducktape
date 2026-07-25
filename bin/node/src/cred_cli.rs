@@ -559,7 +559,7 @@ async fn pump_login(command: tokio::process::Command, artifact: &Path) -> CredRe
     // the code never registers. The guard restores the tty on return AND on panic.
     let _raw = crate::tty::RawGuard::enter();
 
-    let session = Arc::new(capability_host::InteractiveSession::spawn_local(command)?);
+    let session = Arc::new(provider_host::InteractiveSession::spawn_local(command)?);
 
     // Forward this terminal's stdin to the child until the session ends. A Ctrl-C
     // (byte, not SIGINT — ISIG is off in raw mode) CANCELS: without this it would

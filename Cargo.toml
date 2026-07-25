@@ -18,7 +18,7 @@
 #                      valset, governance, identity, lifecycle, saga,
 #                      capability, dispatch, tagging, gateway + its
 #                      absorbed duckdns naming library) and their host-side
-#                      counterparts (blobstore, capability-host)
+#                      counterparts (blobstore)
 #   crates/modules/apps/   — application modules, the product features (forge,
 #                      chat, pages, agent, runs, tasks, vaults, automations,
 #                      inbox, files, jobs)
@@ -26,7 +26,8 @@
 #                      serve a consensus module without being one (compute —
 #                      the dispatch WorkSpec pool/ledger/gate; sandbox — the
 #                      node-local podman/egress/backend-probe muscle; broker —
-#                      the run-scoped credential loopback + airlock client)
+#                      the run-scoped credential loopback + airlock client;
+#                      provider — the executor spec layer + CliProvider run loop)
 #   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
 #                      — the `files` module wraps it), disk, client (OS-side)
 #   crates/guests/   — shared wasm-port infra ONLY: guest-adapter (the
@@ -77,7 +78,6 @@ members = [
     "crates/modules/system/lifecycle",
     "crates/modules/system/saga",
     "crates/modules/system/capability",
-    "crates/modules/system/capability-host",
     "crates/modules/system/blobstore",
     "crates/modules/system/dispatch",
     "crates/modules/system/tagging",
@@ -104,6 +104,7 @@ members = [
     # services — off-chain host-side executors
     "crates/services/broker",
     "crates/services/compute",
+    "crates/services/provider",
     "crates/services/sandbox",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
@@ -240,7 +241,6 @@ indexer = { path = "crates/kernel/indexer" }
 # `index-guest` (the guest-builder --index contract), and cargo refuses a
 # feature sharing its name with a non-optional dependency key.
 index_guest = { path = "crates/kernel/index-guest", package = "index-guest" }
-capability-host = { path = "crates/modules/system/capability-host" }
 wasm-host = { path = "crates/kernel/wasm-host" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
@@ -271,6 +271,7 @@ files = { path = "crates/modules/apps/files" }
 # internal — off-chain service crates
 broker-host = { path = "crates/services/broker" }
 compute-service = { path = "crates/services/compute" }
+provider-host = { path = "crates/services/provider" }
 sandbox-host = { path = "crates/services/sandbox" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }

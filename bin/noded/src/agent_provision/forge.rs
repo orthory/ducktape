@@ -825,7 +825,7 @@ fn commit_blocking(
     // The provider's isolated HOME/auth/temp/target tree lives inside the
     // disk-backed run worktree but is runtime debris, not authored source.
     // Delete it before `git add -A` so credentials and caches cannot be pushed.
-    let _ = std::fs::remove_dir_all(run_dir.join(capability_host::RUN_RUNTIME_DIR));
+    let _ = std::fs::remove_dir_all(run_dir.join(provider_host::RUN_RUNTIME_DIR));
     sanitize_agent_git_control(run_dir)?;
     let head = run_git(run_dir, &["rev-parse", "HEAD"], &[])?;
     let safe_display_name = sanitize_display_name(&identity.agent_display_name);

@@ -233,7 +233,7 @@ default). For snp, `DUCKTAPE_AIRLOCK_SNP_PRODUCT` pins the platform generation
 tdx) — all parsed once at the config boundary. The run's
 `claude` traffic is then verified, handshaked, and forwarded to the gateway with
 a scoped session token (re-minted on a gateway 401). The local path is exercised
-end-to-end by in-process tests (`cargo test -p capability-host airlock`),
+end-to-end by in-process tests (`cargo test -p broker-host airlock`),
 including a check that a sandbox child cannot inject the overlay routing header.
 See the design spec §graft.
 

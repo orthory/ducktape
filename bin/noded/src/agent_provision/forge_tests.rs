@@ -893,7 +893,7 @@ async fn a_read_only_clean_tree_yields_no_changes_and_no_push() {
         .provision(&bed.read_only_spec("s1:0", &bed.head))
         .await
         .expect("provision");
-    let runtime = ws.workdir().join(capability_host::RUN_RUNTIME_DIR);
+    let runtime = ws.workdir().join(provider_host::RUN_RUNTIME_DIR);
     assert_eq!(
         git_stdout(&ws.workdir(), &["remote"]),
         "",

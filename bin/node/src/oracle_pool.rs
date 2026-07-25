@@ -39,7 +39,7 @@ const ORACLE_RESULT_LANE: usize = 64;
 /// there. one content-addressed plane instead of two.
 pub(crate) fn build<C>(
     context: &C,
-    providers: capability_host::ProviderSet,
+    providers: provider_host::ProviderSet,
     node_key: Vec<u8>,
     provisioner: SharedProvisioner,
     // the announced sandbox capacity — the pool's `ResourceLedger`. EMPTY for

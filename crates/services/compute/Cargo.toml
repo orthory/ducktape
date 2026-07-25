@@ -14,7 +14,7 @@ version.workspace = true
 # that can drift is how a record consensus accepts becomes a run nothing loads.
 agent = { workspace = true }
 async-trait = { workspace = true }
-capability-host = { workspace = true }
+provider-host = { workspace = true }
 dispatch = { workspace = true }
 # the pool's spawn/deliver/resolver seams are boxed futures; the semaphore
 # caps concurrent provider runs (tokio::sync is runtime-agnostic).

@@ -219,7 +219,7 @@ pub(super) async fn park(
     wireguard_listen: Option<std::net::SocketAddr>,
     checkpoint_blocks: u64,
     announce_capabilities: bool,
-    sandbox: Option<capability_host::SandboxBackend>,
+    sandbox: Option<provider_host::SandboxBackend>,
     sandbox_capacity: std::collections::BTreeMap<String, u64>,
     sync_sources: Vec<ed25519::PublicKey>,
     sync_source: Option<ed25519::PublicKey>,
@@ -238,7 +238,7 @@ pub(super) async fn park(
     blobs: noded::blobs::BlobHandle,
     agent_provisioner: &compute_service::SharedProvisioner,
     cred_resolver: &compute_service::SharedCredentialResolver,
-    agent_dirs: &capability_host::AgentDirs,
+    agent_dirs: &provider_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
     planes: data_plane::PlaneMonitor,
@@ -682,13 +682,13 @@ pub(super) async fn park(
     let self_exe = std::env::current_exe()
         .unwrap_or_else(|e| panic!("cannot resolve this node's own executable: {e}"));
     let _podman_service = match &sandbox {
-        Some(backend) => capability_host::PodmanService::start_for(backend, &self_exe)
+        Some(backend) => provider_host::PodmanService::start_for(backend, &self_exe)
             .await
             .unwrap_or_else(|e| panic!("podman sandbox service failed to start: {e}")),
         None => None,
     };
     let resident_provider_set = match sandbox {
-        Some(backend) => capability_host::discover(
+        Some(backend) => provider_host::discover(
             &me_bytes,
             agent_dirs.clone(),
             Some(stream_hub.run_output().output_sink()),
@@ -697,7 +697,7 @@ pub(super) async fn park(
             backend,
         )
         .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
-        None => capability_host::ProviderSet::empty(),
+        None => provider_host::ProviderSet::empty(),
     };
     let resident_capabilities = resident_provider_set.capabilities();
     let mut resident_announcer = resident_announce::ResidentAnnouncer::new(

@@ -1,5 +1,5 @@
 [package]
-name = "capability-host"
+name = "provider-host"
 edition.workspace = true
 version.workspace = true
 
@@ -58,7 +58,7 @@ testkit = ["sandbox-host/testkit"]
 # on for our OWN unit tests (cargo allows dev-dependency cycles). it also means
 # `sandbox-host/testkit` can only ever be on in a graph where our `testkit` is
 # on too — the lockstep the feature comment above requires.
-capability-host = { path = ".", features = ["testkit"] }
+provider-host = { path = ".", features = ["testkit"] }
 # `testkit` exposes RunBroker::start_for_test — the idle-control test drives a
 # real run against a broker whose upstream is a dead port.
 broker-host = { workspace = true, features = ["testkit"] }

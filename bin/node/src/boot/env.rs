@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use capability_host::SandboxBackend;
+use provider_host::SandboxBackend;
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Ingress;
@@ -60,7 +60,7 @@ pub(crate) struct BootEnv {
     pub(crate) sync_index: bool,
     pub(crate) announce_capabilities: bool,
     /// the compute plane (`node.toml [sandbox]`) — threaded to both
-    /// `capability_host::discover` call sites (validator + resident). `None`
+    /// `provider_host::discover` call sites (validator + resident). `None`
     /// = consensus-only: no discovery, no announce, no oracle pool.
     pub(crate) sandbox: Option<SandboxBackend>,
     /// the capacity a compute node announces AND enforces: the single source

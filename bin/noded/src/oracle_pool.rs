@@ -33,7 +33,7 @@ pub(crate) fn oracle_workers<C>(
     context: &C,
     cmds: mpsc::Sender<NodeCommand>,
     node_handle: noded::NodeHandle,
-    agent_dirs: capability_host::AgentDirs,
+    agent_dirs: provider_host::AgentDirs,
     storage: &std::path::Path,
     forge_push_base: Option<String>,
     node_http_base: Option<String>,
@@ -61,7 +61,7 @@ where
     // grab the live-output registry BEFORE the provisioner below consumes
     // the handle — the sink keys per-run rings by ctx.run_key.
     let run_output = node_handle.stream_hub().run_output();
-    let providers = capability_host::discover(
+    let providers = provider_host::discover(
         ORACLE_ORIGIN,
         agent_dirs,
         Some(run_output.output_sink()),

@@ -224,7 +224,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         // podman pipes the OCI state on stdin; a non-zero exit aborts the
         // container (fail-closed), so map a hook error to a real process error.
-        Family::EgressHook => capability_host::run_egress_hook().map_err(Into::into),
+        Family::EgressHook => provider_host::run_egress_hook().map_err(Into::into),
         Family::User(cmd) => userkey_cli::run(cmd),
         Family::Agent(args) => agent_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),
@@ -399,7 +399,7 @@ fn run_node(
     // override — see capability-host. host-local only, never consensus.
     // Persistent agent workspaces stay under <storage>; portable run mounts
     // live under agent_runs_root outside it.
-    let agent_dirs = capability_host::AgentDirs::under(&storage);
+    let agent_dirs = provider_host::AgentDirs::under(&storage);
     // 15s instead of commonware's 60s default: this read/write deadline is
     // the mesh's only half-open detector — see `constants::MESH_IO_TIMEOUT`.
     let rt_cfg = commonware_runtime::tokio::Config::default()

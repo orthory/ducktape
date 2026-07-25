@@ -1179,29 +1179,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "capability-host"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "broker-host",
- "capability",
- "capability-host",
- "futures",
- "libc",
- "rand 0.8.6",
- "reqwest 0.12.28",
- "sandbox-host",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-stream",
- "toml 0.8.23",
- "tracing",
-]
-
-[[package]]
 name = "cargo-platform"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1857,10 +1834,10 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "async-trait",
- "capability-host",
  "dispatch 0.1.0",
  "futures",
  "host",
+ "provider-host",
  "saga",
  "sdk",
  "serde",
@@ -5333,7 +5310,6 @@ dependencies = [
  "blobstore",
  "bytes",
  "capability",
- "capability-host",
  "chacha20poly1305",
  "chat",
  "clap",
@@ -5374,6 +5350,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "overlay-net",
  "pages",
+ "provider-host",
  "rand 0.8.6",
  "reachability",
  "recovery",
@@ -5414,7 +5391,6 @@ dependencies = [
  "blobstore",
  "borsh",
  "bytes",
- "capability-host",
  "chat",
  "commonware-codec",
  "commonware-cryptography",
@@ -5438,6 +5414,7 @@ dependencies = [
  "nettest",
  "node",
  "pages",
+ "provider-host",
  "rand 0.8.6",
  "runs",
  "saga",
@@ -6554,6 +6531,29 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "provider-host"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "broker-host",
+ "capability",
+ "futures",
+ "libc",
+ "provider-host",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "sandbox-host",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-stream",
+ "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]

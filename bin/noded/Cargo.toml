@@ -46,7 +46,7 @@ tagging = { workspace = true }
 compute-service = { workspace = true }
 # host-side provider discovery: the dispatch worker runs the operator's locally
 # installed executor CLIs (BYO), never any credential file.
-capability-host = { workspace = true }
+provider-host = { workspace = true }
 saga = { workspace = true }
 pages = { workspace = true }
 forge = { workspace = true }

@@ -495,15 +495,15 @@ impl Default for RunOutputRegistry {
 }
 
 impl RunOutputRegistry {
-    pub fn output_sink(&self) -> capability_host::OutputSink {
+    pub fn output_sink(&self) -> provider_host::OutputSink {
         let registry = self.clone();
         Arc::new(move |ctx, line| {
             let Some(run_key) = ctx.run_key.as_deref() else {
                 return;
             };
             let stream = match line.stream {
-                capability_host::OutputStream::Stdout => RunStream::Stdout,
-                capability_host::OutputStream::Stderr => RunStream::Stderr,
+                provider_host::OutputStream::Stdout => RunStream::Stdout,
+                provider_host::OutputStream::Stderr => RunStream::Stderr,
             };
             registry.append(run_key, stream, line.line);
         })

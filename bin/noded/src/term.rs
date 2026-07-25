@@ -4,7 +4,7 @@
 //! and nothing here commits on-chain. It lives entirely in the daemon exactly
 //! like the stream hub does: a member creates one over an authenticated local
 //! RPC, then drives a `codex`/`claude` CLI's native TUI over the websocket
-//! stream. The isolation lives one layer down in `capability_host`: the broker
+//! stream. The isolation lives one layer down in `provider_host`: the broker
 //! holds the credential and the Podman backend fences the filesystem, so the
 //! member typing into the container never reaches the operator's secrets.
 //!
@@ -22,7 +22,7 @@
 //!   `TermInput`/`TermResize` handlers (in `stream.rs`).
 //!
 //! **Podman only.** Interactive spawn refuses the `Direct` backend
-//! (`capability_host::CliProvider::spawn_interactive_session`), so this plane is
+//! (`provider_host::CliProvider::spawn_interactive_session`), so this plane is
 //! available only when the operator configured a Podman sandbox image
 //! (`DUCKTAPE_SANDBOX_IMAGE`). With no image, [`create_session`] returns a clear
 //! error and NEVER falls back to a Direct spawn.
@@ -39,7 +39,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use capability_host::{
+use provider_host::{
     AgentDirs, AirlockConfig, InteractiveSession, ProviderSet, RunContext, SandboxBackend,
 };
 use serde::{Deserialize, Serialize};
@@ -93,7 +93,7 @@ pub const SANDBOX_IMAGE_ENV: &str = "DUCKTAPE_SANDBOX_IMAGE";
 /// or `"tart"` (macOS guest VM). mirrors `bin/node`'s `sandbox` selector.
 pub const SANDBOX_BACKEND_ENV: &str = "DUCKTAPE_SANDBOX_BACKEND";
 /// the node-private podman socket the Podman backend drives (see
-/// `capability_host::PodmanService`). `bin/node` derives this from the
+/// `provider_host::PodmanService`). `bin/node` derives this from the
 /// workspace; `bin/noded` (no toml) reads it here.
 pub const SANDBOX_SOCKET_ENV: &str = "DUCKTAPE_PODMAN_SOCKET";
 
@@ -1062,7 +1062,7 @@ pub fn discover_interactive(
     dirs: AgentDirs,
     backend: SandboxBackend,
 ) -> Option<ProviderSet> {
-    match capability_host::discover(node_identity, dirs, None, backend) {
+    match provider_host::discover(node_identity, dirs, None, backend) {
         Ok(set) => Some(set),
         Err(err) => {
             tracing::error!(target: "ducktape::term", error = %err, "interactive_discovery_failed");

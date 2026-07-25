@@ -142,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let interactive = noded::term::backend_from_env().and_then(|backend| {
         noded::term::discover_interactive(
             ORACLE_ORIGIN,
-            capability_host::AgentDirs::under(&storage),
+            provider_host::AgentDirs::under(&storage),
             backend,
         )
     });
@@ -153,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let handle = handle.with_terminals(noded::TerminalSessions::new(
         interactive,
-        capability_host::execution_node_id(ORACLE_ORIGIN),
+        provider_host::execution_node_id(ORACLE_ORIGIN),
         storage.join("term-sessions"),
         term_ring,
         term_cmd_ring,
@@ -222,7 +222,7 @@ fn run_node(
     // override — see capability-host. host-local only, never consensus.
     // Persistent agent workspaces stay under <storage>; portable run mounts
     // live under agent_runs_root outside it.
-    let agent_dirs = capability_host::AgentDirs::under(&storage);
+    let agent_dirs = provider_host::AgentDirs::under(&storage);
     // keys the portable run-root's per-node salt + D7 validation (oracle_workers).
     let storage_for_runs = storage.clone();
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);

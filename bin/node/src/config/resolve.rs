@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use capability_host::SandboxBackend;
+use provider_host::SandboxBackend;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
 
@@ -188,15 +188,15 @@ fn resolve_sandbox(
     let image = sandbox.image.clone();
     match sandbox.runtime.as_str() {
         "podman" => {
-            let socket = capability_host::PodmanService::socket_path(workspace);
+            let socket = provider_host::PodmanService::socket_path(workspace);
             Ok((Some(SandboxBackend::Podman { image, socket }), probed()?))
         }
         "tart" => {
             let capacity = probed()?;
-            if capacity.get("cores").copied().unwrap_or(0) < capability_host::TART_MIN_CORES {
+            if capacity.get("cores").copied().unwrap_or(0) < provider_host::TART_MIN_CORES {
                 return Err(format!(
                     "sandbox capacity: Tart requires at least {} cores",
-                    capability_host::TART_MIN_CORES
+                    provider_host::TART_MIN_CORES
                 ));
             }
             Ok((Some(SandboxBackend::Tart { image }), capacity))

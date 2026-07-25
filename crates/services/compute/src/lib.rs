@@ -2,7 +2,7 @@
 //!
 //! the dispatch module stages a saga whose spec is a self-described
 //! [`WorkSpec`]. this crate is the impure host-side counterpart: it resolves
-//! the spec's capability tag to a machine-local [`capability_host::Provider`]
+//! the spec's capability tag to a machine-local [`provider_host::Provider`]
 //! (whichever executor CLI the operator brought), feeds the payload to it,
 //! and submits the raw answer as a saga `OracleResult` op.
 //!
@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 
-use capability_host::{ProviderOutput, ProviderSet};
+use provider_host::{ProviderOutput, ProviderSet};
 use dispatch::{AdmissionPolicy, WorkSpec, decode_work_spec};
 use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Event, Msg};
@@ -269,7 +269,7 @@ mod tests {
     /// a provider surface with one loaded mock spec and NO installed
     /// binaries — enough for every non-live test; no executor is named.
     fn mock_specs_only() -> ProviderSet {
-        let spec = capability_host::CapabilitySpec::parse(
+        let spec = provider_host::CapabilitySpec::parse(
             r#"
 spec = 1
 [capability]
@@ -285,7 +285,7 @@ format = "text"
             "test",
         )
         .expect("mock spec parses");
-        ProviderSet::assemble(capability_host::SpecSet::from_specs(vec![spec]), Vec::new())
+        ProviderSet::assemble(provider_host::SpecSet::from_specs(vec![spec]), Vec::new())
     }
 
     fn effect_for(spec: Vec<u8>, assignee: Option<&[u8]>) -> Event {
@@ -357,14 +357,14 @@ format = "text"
     /// a provider whose only job is making resolve() succeed in tests.
     struct StubProvider;
     #[async_trait::async_trait]
-    impl capability_host::Provider for StubProvider {
+    impl provider_host::Provider for StubProvider {
         fn capability(&self) -> &str {
             "alpha"
         }
         async fn run(
             &self,
             _prompt: &str,
-            _ctx: &capability_host::RunContext,
+            _ctx: &provider_host::RunContext,
         ) -> Result<String, String> {
             Ok("stub answer".into())
         }
@@ -459,7 +459,7 @@ format = "text"
     /// of `mock_specs_only`, for tests where the capacity check must be what
     /// produces the Skip (not a missing provider).
     fn servable_providers() -> ProviderSet {
-        let spec = capability_host::CapabilitySpec::parse(
+        let spec = provider_host::CapabilitySpec::parse(
             r#"
 spec = 1
 [capability]
@@ -476,7 +476,7 @@ format = "text"
         )
         .expect("mock spec parses");
         ProviderSet::assemble(
-            capability_host::SpecSet::from_specs(vec![spec]),
+            provider_host::SpecSet::from_specs(vec![spec]),
             vec![Box::new(StubProvider)],
         )
     }

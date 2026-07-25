@@ -36,7 +36,7 @@ saga = { workspace = true }
 # the network-wide node-capability registry + its wire surface; the host-side
 # provider discovery announces this node's installed executor CLIs into it.
 capability = { workspace = true }
-capability-host = { workspace = true }
+provider-host = { workspace = true }
 # the task plane: recipe manifests + capability dispatch + its host worker.
 dispatch = { workspace = true }
 tagging = { workspace = true }

@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use capability_host::RunContext;
+use provider_host::RunContext;
 use serde::{Deserialize, Serialize};
 
 use crate::workspace_source::WorkspaceSource;
