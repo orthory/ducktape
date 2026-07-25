@@ -1,10 +1,8 @@
-//! the adapter-port equivalence proof for the MERGED gateway module: the
-//! `gateway` guest component (the NATIVE `gateway` crate compiled to wasm
-//! behind `guest-adapter`) and the native `Gateway` module answer the SAME op
-//! sequence with IDENTICAL query replies, and their roots move in lockstep
-//! (move on commit, hold on no-ops and abort). the roots THEMSELVES differ —
-//! the port persists the native canonical snapshot as one host-KV value, an
-//! intentional greenfield root break pinned by this proof.
+//! the STORE-BACKED cutover-continuity proof for the MERGED gateway module:
+//! the `gateway` guest component over `WasmModule::with_store(QmdbStore)` and
+//! the native `Gateway` over the same store shape are ROOT-CONTINUOUS — the
+//! same op sequence commits the IDENTICAL qmdb merkle root after every block
+//! (both roots ARE the store's root).
 //!
 //! gateway now owns the WHOLE `.duck` name → AccountId → route pipeline: BOTH
 //! the route plane AND the `.duck` handle plane absorbed from the retired
@@ -13,9 +11,11 @@
 //! handle-plane test covers SetHandle / Resolve on the SAME merged tenant.
 //!
 //! like identity, gateway's constructor takes the PER-NETWORK chain id, which
-//! travels as GENESIS CONFIG (a host-installed `__config` store entry —
-//! `sdk::genesis_config`); the config-in-the-root and config-governs-the-guest
-//! pins ride at the end of this file.
+//! travels as GENESIS CONFIG — a `__config` RECORD seeded into the qmdb store
+//! under `sdk::store_key` (the production `seed_store_config` seam), read
+//! back by the guest's `store_genesis_chain_id` per dispatch. BOTH runtimes'
+//! stores carry the identical record; the config-in-the-root and
+//! config-governs-the-guest pins ride at the end of this file.
 //!
 //! every gateway execute depends on SIBLING reads: the valset standing gate
 //! (validators ∪ residents) and the identity `OfNode` account derivation plus
@@ -28,6 +28,7 @@
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use gateway::{
     DuckDnsName, GATEWAY_ROUTE_NS, Gateway, GatewayMsg, GatewayQuery, GatewayReply,
     MAX_QUERY_LIMIT, MemberAuthorization, ResolvedAccount, RouteAudience, RouteDefinition,
@@ -38,7 +39,8 @@ use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use identity::{
     IDENTITY_BIND_NS, Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof, bind_preimage,
 };
-use sdk::{Error, Module as _, Msg, Origin, StateRoot};
+use sdk::{Error, MerkleStore as _, Msg, Origin, StateRoot};
+use statesync::qmdb::QmdbStore;
 use valset::{Valset, ValsetMsg, encode_msg as valset_encode_msg};
 use wasm_host::WasmModule;
 
@@ -51,26 +53,44 @@ const GATEWAY_WASM: &[u8] = include_bytes!("fixtures/gateway.component.wasm");
 /// identity sibling binds under the same id (one network, one chain id).
 const CHAIN_ID: &str = "test-chain";
 
-/// the wasm gateway at a given chain id: component + the host-computed initial
-/// store carrying the `__config` genesis parameters — exactly the production
-/// construction (`bin/node/src/host_state.rs`).
-fn wasm_gateway_with_chain(chain_id: &str) -> WasmModule {
-    let mut module = WasmModule::from_bytes("gateway", GATEWAY_WASM).expect("load component");
+/// a fresh qmdb store carrying the seeded `__config` chain-id record —
+/// exactly the production genesis seam (`bin/node/src/host_state.rs`
+/// `seed_store_config`). BOTH runtimes' stores get the identical record:
+/// root-continuity demands it, and the guest reads its chain id from it.
+/// `label` doubles as the store id (the deterministic runtime keys storage
+/// partitions by id alone).
+async fn gw_store(
+    context: &deterministic::Context,
+    label: &'static str,
+    chain_id: &str,
+) -> QmdbStore<deterministic::Context> {
+    let mut store = QmdbStore::init(context.child(label), label).await;
     let config = sdk::genesis_config::encode_config(&[("chain_id", chain_id.as_bytes())]);
-    let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
-    module
-        .install(&bytes, root)
-        .expect("install genesis config");
-    module
+    store
+        .commit_batch(vec![(
+            sdk::store_key(sdk::genesis_config::CONFIG_KEY),
+            Some(config),
+        )])
+        .await
+        .expect("seed genesis config");
+    store
 }
 
-fn wasm_gateway() -> WasmModule {
-    wasm_gateway_with_chain(CHAIN_ID)
+/// the wasm gateway over the host-constructed (config-seeded) store —
+/// exactly the production construction (`bin/node/src/host_state.rs`).
+fn wasm_gateway(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store("gateway", GATEWAY_WASM, store).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
-fn native_gateway() -> Gateway {
-    Gateway::new("gateway", "identity", Some("valset".into()), CHAIN_ID)
+fn native_gateway(store: Box<dyn sdk::MerkleStore>) -> Gateway {
+    Gateway::new(
+        "gateway",
+        store,
+        "identity",
+        Some("valset".into()),
+        CHAIN_ID,
+    )
 }
 
 /// the native identity SIBLING over a MemStore double — the store backend is
@@ -93,18 +113,20 @@ fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
     valset
 }
 
-fn native_host(validators: &[Vec<u8>]) -> Host {
+async fn native_host(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+    let store = gw_store(context, "native_gw", CHAIN_ID).await;
     Host::genesis(vec![
-        Box::new(native_gateway()),
+        Box::new(native_gateway(Box::new(store))),
         Box::new(native_identity()),
         Box::new(seeded_valset(validators)),
     ])
     .expect("genesis")
 }
 
-fn wasm_host_(validators: &[Vec<u8>]) -> Host {
+async fn wasm_host_(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+    let store = gw_store(context, "wasm_gw", CHAIN_ID).await;
     Host::genesis(vec![
-        Box::new(wasm_gateway()),
+        Box::new(wasm_gateway(Box::new(store))),
         Box::new(native_identity()),
         Box::new(seeded_valset(validators)),
     ])
@@ -376,28 +398,39 @@ async fn roundtrip(
         assert_eq!(root_of(native), n_before, "native root moved at {height}");
         assert_eq!(root_of(wasm), w_before, "wasm root moved at {height}");
     }
-    assert_ne!(root_of(native), root_of(wasm));
+    // THE continuity property: both roots ARE the same store root.
+    assert_eq!(
+        root_of(native),
+        root_of(wasm),
+        "the two runtimes diverged at {height}"
+    );
 }
 
 #[test]
-fn same_ops_same_replies_roots_in_lockstep_schema_break_pinned() {
-    futures::executor::block_on(same_ops_inner());
+fn same_ops_same_replies_roots_in_lockstep_and_continuous() {
+    deterministic::Runner::default().start(|context| async move {
+        same_ops_inner(&context).await;
+    });
 }
 
-async fn same_ops_inner() {
+async fn same_ops_inner(context: &deterministic::Context) {
     let w = World::new();
     let validators = vec![w.node_a.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
 
-    // the schema break is visible from GENESIS, asymmetrically: the native
-    // empty registry is the ZERO sentinel, the wasm root commits to the
-    // host-KV store already carrying the genesis config.
-    assert_eq!(root_of(&native), StateRoot::ZERO, "native genesis sentinel");
+    // ROOT-CONTINUITY from GENESIS: both roots are the store's merkle root,
+    // and the store already carries the seeded `__config` record — a real
+    // (non-sentinel) root, identical across the runtimes.
     assert_ne!(
         root_of(&native),
+        StateRoot::ZERO,
+        "the config record is in the root from block zero"
+    );
+    assert_eq!(
+        root_of(&native),
         root_of(&wasm),
-        "genesis roots must differ — the port is a DECLARED schema break"
+        "genesis roots must be continuous across the runtimes"
     );
 
     // sibling-only seeding (grants + binds) holds the gateway roots.
@@ -561,16 +594,18 @@ async fn same_ops_inner() {
 
 #[test]
 fn rejections_match_and_leave_no_trace() {
-    futures::executor::block_on(rejections_inner());
+    deterministic::Runner::default().start(|context| async move {
+        rejections_inner(&context).await;
+    });
 }
 
-async fn rejections_inner() {
+async fn rejections_inner(context: &deterministic::Context) {
     let w = World::new();
     let outsider = ed_pub(&ed(99));
     let outsider_signer = ed(99);
     let validators = vec![w.node_a.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
     for host in [&mut native, &mut wasm] {
         w.seed(host).await;
         // one committed route so the revision matrix has a stream to violate.
@@ -772,16 +807,18 @@ async fn rejections_inner() {
 
 #[test]
 fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
-    futures::executor::block_on(multi_dispatch_inner());
+    deterministic::Runner::default().start(|context| async move {
+        multi_dispatch_inner(&context).await;
+    });
 }
 
-async fn multi_dispatch_inner() {
+async fn multi_dispatch_inner(context: &deterministic::Context) {
     let w = World::new();
     let outsider = ed_pub(&ed(99));
     let outsider_signer = ed(99);
     let validators = vec![w.node_a.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
     w.seed(&mut native).await;
     w.seed(&mut wasm).await;
 
@@ -899,6 +936,7 @@ async fn multi_dispatch_inner() {
     }
     assert_ne!(root_of(&native), n_before);
     assert_ne!(root_of(&wasm), w_before);
+    assert_eq!(root_of(&native), root_of(&wasm));
     assert_eq!(
         replies(&native, &w.accounts()).await,
         replies(&wasm, &w.accounts()).await
@@ -938,6 +976,7 @@ async fn multi_dispatch_inner() {
     }
     assert_ne!(root_of(&native), n_before);
     assert_ne!(root_of(&wasm), w_before);
+    assert_eq!(root_of(&native), root_of(&wasm));
     assert_eq!(
         replies(&native, &w.accounts()).await,
         replies(&wasm, &w.accounts()).await
@@ -946,20 +985,24 @@ async fn multi_dispatch_inner() {
 
 #[test]
 fn genesis_config_is_consensus_state_and_governs_the_guest() {
-    futures::executor::block_on(genesis_config_inner());
+    deterministic::Runner::default().start(|context| async move {
+        genesis_config_inner(&context).await;
+    });
 }
 
-async fn genesis_config_inner() {
-    // the config is IN the root: per-network genesis roots, honestly.
-    let here = wasm_gateway_with_chain(CHAIN_ID);
-    let same = wasm_gateway_with_chain(CHAIN_ID);
-    let other = wasm_gateway_with_chain("other-chain");
+async fn genesis_config_inner(context: &deterministic::Context) {
+    // the config record is IN the store root: per-network genesis roots,
+    // honestly.
+    let here = gw_store(context, "cfg_here", CHAIN_ID).await;
+    let same = gw_store(context, "cfg_same", CHAIN_ID).await;
+    let other = gw_store(context, "cfg_other", "other-chain").await;
     assert_eq!(here.root(), same.root(), "same config, same genesis root");
     assert_ne!(
         here.root(),
         other.root(),
         "a different chain id IS a different genesis consensus state"
     );
+    drop((here, same));
 
     // and the config GOVERNS the guest: the same signed route statement
     // (scoped to CHAIN_ID) is accepted by the tenant configured with CHAIN_ID
@@ -967,9 +1010,9 @@ async fn genesis_config_inner() {
     // configured differently.
     let w = World::new();
     let validators = vec![w.node_a.clone()];
-    let mut wasm = wasm_host_(&validators);
+    let mut wasm = wasm_host_(context, &validators).await;
     let mut other_host = Host::genesis(vec![
-        Box::new(wasm_gateway_with_chain("other-chain")),
+        Box::new(wasm_gateway(Box::new(other))),
         Box::new(native_identity()),
         Box::new(seeded_valset(&validators)),
     ])
@@ -1051,32 +1094,25 @@ async fn resolved(h: &Host, handle: &str) -> Option<ResolvedAccount> {
 
 #[test]
 fn handle_plane_ops_stay_in_lockstep_on_the_merged_tenant() {
-    futures::executor::block_on(handle_plane_inner());
+    deterministic::Runner::default().start(|context| async move {
+        handle_plane_inner(&context).await;
+    });
 }
 
-async fn handle_plane_inner() {
+async fn handle_plane_inner(context: &deterministic::Context) {
     let w = World::new();
     let validators = vec![w.node_a.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
 
-    // the schema break is visible from genesis (native ZERO sentinel vs the
-    // wasm host-KV root that already commits to `__config`).
-    assert_eq!(root_of(&native), StateRoot::ZERO, "native genesis sentinel");
-    assert_ne!(
-        root_of(&native),
-        root_of(&wasm),
-        "genesis roots differ (schema break)"
-    );
+    // root-continuity from genesis: both roots carry the seeded `__config`.
+    let genesis = root_of(&native);
+    assert_eq!(genesis, root_of(&wasm), "genesis roots must be continuous");
 
     // sibling-only seed blocks leave the gateway root untouched on both sides.
     w.seed(&mut native).await;
     w.seed(&mut wasm).await;
-    assert_eq!(
-        root_of(&native),
-        StateRoot::ZERO,
-        "seed holds the native root"
-    );
+    assert_eq!(root_of(&native), genesis, "seed holds the native root");
 
     // every handle op family in one deterministic sequence; `moves` says
     // whether committed state changes — root movement must agree on both sides.
@@ -1116,7 +1152,7 @@ async fn handle_plane_inner() {
             assert_eq!(root_of(&native), n_before, "native moved at {height}");
             assert_eq!(root_of(&wasm), w_before, "wasm moved at {height}");
         }
-        assert_ne!(root_of(&native), root_of(&wasm), "the pinned schema break");
+        assert_eq!(root_of(&native), root_of(&wasm), "continuity per block");
     }
 
     // resolution stops at the stable AccountId (the founding key), never a node.

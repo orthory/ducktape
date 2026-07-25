@@ -14,14 +14,12 @@ mod interface;
 mod manifest;
 mod module;
 mod proxy;
-mod registry;
 
 pub use frames::*;
 pub use interface::*;
 pub use manifest::*;
 pub use module::Gateway;
 pub use proxy::*;
-pub use registry::Registry;
 
 // the `.duck` handle-plane surface, absorbed as gateway's internal facet: the
 // grammar and wire TYPES for human names are re-exported here so callers speak

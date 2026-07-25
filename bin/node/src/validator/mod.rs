@@ -176,7 +176,6 @@ pub(crate) async fn run_validator(
         signer.clone(),
         label.clone(),
         namespace.clone(),
-        identity_chain_id.clone(),
         validators.clone(),
         forge_repo.clone(),
         duckfs_dir.clone(),

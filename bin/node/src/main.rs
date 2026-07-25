@@ -482,7 +482,6 @@ fn run_node(
                 metrics.clone(),
                 storage_for_sync,
                 namespace,
-                identity_chain_id,
                 blobs,
                 voice_requests,
             )
@@ -560,7 +559,6 @@ fn run_node(
                 signer.clone(),
                 label.clone(),
                 namespace.clone(),
-                identity_chain_id,
                 peers.clone(),
                 validators.clone(),
                 wireguard_listen,

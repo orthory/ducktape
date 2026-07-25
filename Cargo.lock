@@ -3513,15 +3513,19 @@ name = "gateway"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "commonware-cryptography",
+ "commonware-runtime",
  "duckdns",
  "futures",
  "guest-adapter",
  "identity",
  "sdk",
+ "sdk-testkit",
  "serde",
  "serde_json",
  "sha2",
+ "statesync",
  "valset",
 ]
 

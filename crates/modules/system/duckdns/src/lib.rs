@@ -5,11 +5,8 @@
 //! AccountId. The `gateway` module embeds this registry and wire surface and
 //! owns the authenticated AccountId derivation and namespace-mutation gating.
 
-mod codec;
 mod names;
-mod registry;
 mod wire;
 
 pub use names::{parse_hostname, validate_handle, validate_handle_shape};
-pub use registry::Registry;
 pub use wire::*;

@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use duckdns::{DuckDnsName, HandleRegistration, ResolvedAccount};
 use sdk::codec::{push_bytes, push_opt_str};
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 /// Commonware signing namespace for every gateway route mutation.
@@ -32,7 +33,7 @@ pub const SHA256_HEX_BYTES: usize = 64;
 
 /// The account apex (`None`) or one DNS-shaped label below it. The account is
 /// carried separately so a route name can never cross authority boundaries.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(deny_unknown_fields)]
 pub struct RouteName {
     pub label: Option<String>,
@@ -62,7 +63,7 @@ impl RouteName {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteMethod {
     Get,
@@ -93,7 +94,7 @@ impl RouteMethod {
 /// A globally signed audience. Transport peers still have to be admitted by
 /// the current network set; this policy then resolves their authenticated node
 /// key through Identity before a request reaches the local upstream.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteAudience {
     /// Only a node currently bound to the owning account.
@@ -104,7 +105,7 @@ pub enum RouteAudience {
     Accounts { account_ids: Vec<Vec<u8>> },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutePolicy {
     pub audience: RouteAudience,
@@ -124,7 +125,7 @@ pub struct RoutePolicy {
     pub allow_upgrade: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteTarget {
     /// Static content: the signed SHA-256 of the off-consensus manifest
@@ -145,7 +146,7 @@ impl RouteTarget {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteDefinition {
     pub target: RouteTarget,
@@ -154,7 +155,7 @@ pub struct RouteDefinition {
 
 /// `route = None` is an authenticated tombstone and still advances the
 /// independent per-name revision, preventing replay.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteStatement {
     /// Signed into the preimage; publishers stamp `1` today.
@@ -167,14 +168,14 @@ pub struct RouteStatement {
     pub route: Option<RouteDefinition>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MemberAuthorization {
     pub signer: Vec<u8>,
     pub signature: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteRecord {
     pub statement: RouteStatement,
@@ -198,7 +199,7 @@ pub struct RouteSummary {
 /// never secret material. Grants are managed exclusively through the
 /// owner-signed [`GatewayMsg::GrantCredential`]/[`GatewayMsg::RevokeCredential`]
 /// ops, so they are never carried unsigned on [`GatewayMsg::SetCredential`].
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialKind {
     Claude,
@@ -214,7 +215,7 @@ impl CredentialKind {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialRecord {
     pub name: String,
