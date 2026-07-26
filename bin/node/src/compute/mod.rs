@@ -30,7 +30,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use commonware_cryptography::Signer as _;
 use compute_service::{DeliverFn, DispatchPool, SpawnFn, SpawnKind, max_concurrent_runs_from_env};
 use noded::node_link::NodeLink;
 
@@ -52,10 +51,17 @@ const READY_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 const LOG_EVERY: u64 = 15;
 
 /// Everything the daemon needs, resolved before any of it runs.
+///
+/// `service` is [`config::ServiceConfig`], NOT `config::Resolved`: the latter
+/// carries the node's ed25519 private key, and this process must not be able to
+/// hold one. `node_key` is the node's PUBLIC identity, learned from the node
+/// over `/v1/status` — it names provider dirs and forge authorship, and signs
+/// nothing.
 pub(crate) struct Compute {
     pub(crate) grant: ServiceGrant,
-    pub(crate) resolved: config::Resolved,
+    pub(crate) service: config::ServiceConfig,
     pub(crate) http_base: String,
+    pub(crate) node_key: [u8; 32],
 }
 
 /// Serve until the process is stopped. Returns only on a fatal misconfiguration
@@ -74,11 +80,12 @@ pub(crate) fn serve(compute: Compute) -> Result<(), Box<dyn std::error::Error>> 
 async fn run(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
     let Compute {
         grant,
-        resolved,
+        service,
         http_base,
+        node_key,
     } = compute;
-    let node_key = resolved.signer.public_key().as_ref().to_vec();
-    let node = NodeLink::new(&http_base).with_forge_repo(resolved.storage_dir.join("forge-repo"));
+    let node_key = node_key.to_vec();
+    let node = NodeLink::new(&http_base).with_forge_repo(service.storage_dir.join("forge-repo"));
 
     // the node must be ANSWERING before anything is discovered or reaped: a
     // daemon that boots first would otherwise reap against a socket that does
@@ -90,12 +97,12 @@ async fn run(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
     // `kill_on_drop` service child shared between two daemons made them one
     // failure domain. Fail-closed: a start failure ends the process rather than
     // leaving a daemon that announces capacity it cannot sandbox.
-    let backend = crate::services::podman_backend(&resolved, &grant.kind)?;
+    let backend = crate::services::podman_backend(&service, &grant.kind)?;
     let self_exe = std::env::current_exe()
         .map_err(|error| format!("cannot resolve this daemon's own executable: {error}"))?;
     let _podman = provider_host::PodmanService::start_for(
         &backend,
-        &crate::services::podman_data_dir(&resolved, &grant.kind),
+        &crate::services::podman_data_dir(&service, &grant.kind),
         &self_exe,
     )
     .await?;
@@ -104,7 +111,7 @@ async fn run(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
     let (line_tx, line_rx) = tokio::sync::mpsc::channel(link::OUTPUT_LANE);
     let providers = provider_host::discover(
         &node_key,
-        provider_host::AgentDirs::under(&resolved.storage_dir),
+        provider_host::AgentDirs::under(&service.storage_dir),
         Some(output_sink(line_tx)),
         backend,
         &grant.display_id(),
@@ -118,7 +125,7 @@ async fn run(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
         line_rx,
     ));
 
-    let (mut pump, mut delivered) = build_pool(&node, &resolved, node_key, providers).await?;
+    let (mut pump, mut delivered) = build_pool(&node, &service, node_key, providers).await?;
 
     tracing::info!(
         target: "ducktape::service",
@@ -244,7 +251,7 @@ fn output_sink(lines: tokio::sync::mpsc::Sender<link::OutputLine>) -> provider_h
 /// Assemble the pool and the intake pump around it.
 async fn build_pool(
     node: &NodeLink,
-    resolved: &config::Resolved,
+    service: &config::ServiceConfig,
     node_key: Vec<u8>,
     providers: provider_host::ProviderSet,
 ) -> Result<
@@ -288,14 +295,14 @@ async fn build_pool(
     let provisioner: compute_service::SharedProvisioner = Arc::new(
         noded::agent_provision::NodedProvisioner::new(
             node.clone(),
-            noded::agent_provision::agent_runs_root(&resolved.storage_dir)?,
+            noded::agent_provision::agent_runs_root(&service.storage_dir)?,
         )
         .with_forge(
-            noded::agent_provision::forge_push_base(resolved.http_listen.as_deref()),
+            noded::agent_provision::forge_push_base(service.http_listen.as_deref()),
             config::hex_bytes(&node_key),
         )
         .with_node_url(noded::agent_provision::node_http_base(
-            resolved.http_listen.as_deref(),
+            service.http_listen.as_deref(),
         )),
     );
 
@@ -309,7 +316,7 @@ async fn build_pool(
         spawn,
         deliver,
         max_concurrent_runs_from_env(),
-        capacity_of(resolved),
+        capacity_of(service),
         provisioner,
     )
     .with_credential_resolver(resolver);
@@ -322,8 +329,8 @@ async fn build_pool(
 
 /// the announced capacity IS the pool's ledger — one source, so the scheduler
 /// never promises what this daemon cannot seat.
-fn capacity_of(resolved: &config::Resolved) -> BTreeMap<String, u64> {
-    resolved.sandbox_capacity.clone()
+fn capacity_of(service: &config::ServiceConfig) -> BTreeMap<String, u64> {
+    service.sandbox_capacity.clone()
 }
 
 /// the node's browser-gateway base — the `via` a lent credential's traffic

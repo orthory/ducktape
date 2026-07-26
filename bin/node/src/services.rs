@@ -20,8 +20,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use commonware_cryptography::Signer as _;
-
 use crate::config;
 
 pub const FILE_NAME: &str = "services.toml";
@@ -57,8 +55,8 @@ fn daemon_for(kind: &str) -> Option<Daemon> {
 /// containers along — exactly the coupling separate processes exist to remove.
 /// The honest cost is two image stores: an image both services use is pulled
 /// into each.
-pub(crate) fn podman_data_dir(resolved: &config::Resolved, kind: &str) -> PathBuf {
-    resolved.storage_dir.join("services").join(kind)
+pub(crate) fn podman_data_dir(service: &config::ServiceConfig, kind: &str) -> PathBuf {
+    service.storage_dir.join("services").join(kind)
 }
 
 /// this service's OWN sandbox backend, with its socket named.
@@ -71,10 +69,10 @@ pub(crate) fn podman_data_dir(resolved: &config::Resolved, kind: &str) -> PathBu
 /// Non-Podman backends (Tart) are returned unchanged — a Tart run clones and
 /// deletes a VM per run, so there is no service, no socket and no shared root.
 pub(crate) fn podman_backend(
-    resolved: &config::Resolved,
+    service: &config::ServiceConfig,
     kind: &str,
 ) -> Result<provider_host::SandboxBackend, String> {
-    let backend = resolved.sandbox.clone().ok_or(
+    let backend = service.sandbox.clone().ok_or(
         "no [sandbox] table in node.toml: this host has no configured way to isolate a run",
     )?;
     let provider_host::SandboxBackend::Podman { image, .. } = backend else {
@@ -83,9 +81,82 @@ pub(crate) fn podman_backend(
     Ok(provider_host::SandboxBackend::Podman {
         image,
         socket: provider_host::PodmanService::socket_path(
-            &podman_data_dir(resolved, kind),
+            &podman_data_dir(service, kind),
             kind,
         ),
+    })
+}
+
+/// Ask the NODE who it is.
+///
+/// A daemon needs its node's public identity (it names provider dirs, forge
+/// commit authorship and the service instance id), and the obvious place to
+/// read it — `identity.key` — is the node's PRIVATE key. So it is asked of the
+/// node instead: the process that holds the key is the one that answers for it,
+/// and the daemon reaches `/v1/status` over the same localhost surface it
+/// already signals on.
+///
+/// Loud on failure, matching the first-hello contract: a daemon that cannot
+/// learn which node it serves must not sit in a retry loop pretending to be
+/// configured. The three ways this read can fail are three DIFFERENT operator
+/// problems, so they get three different sentences — a malformed key reported
+/// as "not started yet" sends the reader to restart a node that is already up.
+///
+/// TRUST BOUNDARY, and a DIRECTIONAL change worth writing down: the node's
+/// identity moved from a file this process could verify (`identity.key`, 0600,
+/// owned by the workspace) to an UNAUTHENTICATED local port — `/v1/status`
+/// carries no auth. A same-uid process that binds the workspace's `http_listen`
+/// before the node does can answer with any `public_key` it likes, and that
+/// value goes on to name provider dirs, `execution_node_id`, forge commit
+/// authorship and the instance id written into `services.toml`.
+///
+/// That grants a same-uid attacker nothing they could not already get by
+/// reading `identity.key` directly, so it is not a regression and not a
+/// blocker. It becomes load-bearing the day a daemon has NO workspace and this
+/// port is its only source of the node's identity — at which point this read
+/// needs to authenticate the node (the service-link token beside `node.toml` is
+/// the obvious carrier), not just parse it.
+fn node_identity(base: &str) -> Result<[u8; 32], String> {
+    let status = crate::node_http::get_json(base, "/v1/status")
+        .map_err(|error| format!("could not read this node's identity: {error}"))?;
+    published_identity(&status)
+}
+
+/// what a node that is up but has not yet published its mesh identity looks
+/// like — and the ONE thing an operator can do about it.
+const NOT_PUBLISHED_YET: &str =
+    "this node has not published a mesh identity yet — start it, then start the daemon";
+
+/// Decode the node's published mesh identity out of its `/v1/status` document.
+///
+/// Split from the fetch so every outcome is checkable without standing up a
+/// server: this is the decide half, [`node_identity`] is the I/O half.
+fn published_identity(status: &serde_json::Value) -> Result<[u8; 32], String> {
+    // ABSENT and PRESENT-BUT-EMPTY are ONE operator condition, and the empty
+    // case is the one that actually happens: `/v1/status` types `public_key` as
+    // a non-Option `String` (`noded::NodeStatus`) which a booting node serves as
+    // `""` until it publishes. Without this filter `as_str()` returns
+    // `Some("")`, `unhex("")` returns `Ok(vec![])`, and a routine startup race
+    // fell through to the length arm below as "0-byte mesh identity" — a
+    // malformed-node diagnosis for a node that is merely still booting, while
+    // the message written for exactly this case was unreachable.
+    //
+    // `bin/node` still binds its HTTP listener before publishing, so a
+    // supervisor co-starting a node and a daemon reaches this every time.
+    let Some(published) = status["public_key"].as_str().filter(|hex| !hex.is_empty()) else {
+        return Err(NOT_PUBLISHED_YET.into());
+    };
+    // the remaining two are malformed-status cases, not startup timing. They
+    // deliberately name no gate to go and check: an operator sent to look for a
+    // "build mismatch" goes hunting for the daemon/node build check, which is a
+    // different mechanism and not what failed here.
+    let decoded = config::unhex(published)
+        .map_err(|error| format!("this node published a mesh identity that is not hex: {error}"))?;
+    <[u8; 32]>::try_from(decoded.as_slice()).map_err(|_| {
+        format!(
+            "this node published a {}-byte mesh identity, not 32",
+            decoded.len()
+        )
     })
 }
 
@@ -647,7 +718,9 @@ impl WorkspaceArgs {
     /// grant.
     fn dir(&self) -> Result<PathBuf, String> {
         if let Some(file) = &self.config {
-            return Ok(config::resolve(file)?.workspace);
+            // the keyless read: every `service` verb — `run` included — answers
+            // "which workspace?" without ever opening the node's identity.
+            return Ok(config::resolve_service(file)?.workspace);
         }
         if let Some(dir) = &self.workspace {
             return Ok(dir.clone());
@@ -832,7 +905,24 @@ impl EnablePlan {
 }
 
 /// Decide what enabling `kind` would mean. Writes nothing.
-pub(crate) fn plan_enable(workspace: &Path, kind: &str) -> Result<EnablePlan, String> {
+///
+/// `node_id` is supplied by the caller ([`node_identity`]) rather than read out
+/// of `identity.key`: minting an instance id needs the node's PUBLIC key, and
+/// resolving it from the key file would put the node's private key in every
+/// process that offers a consent screen.
+///
+/// `service` is passed in rather than re-resolved from
+/// `<workspace>/node.toml`, for the reason `run_service` gives: a workspace
+/// does not always CONTAIN the config that names it (`--config` points
+/// elsewhere; the dev shape's workspace is its `storage_dir`). Re-reading would
+/// mint the consent screen's chain id from a different file than the one this
+/// verb was pointed at — or fail on a file that is not there.
+pub(crate) fn plan_enable(
+    workspace: &Path,
+    kind: &str,
+    service: &config::ServiceConfig,
+    node_id: [u8; 32],
+) -> Result<EnablePlan, String> {
     if !kind_is_well_formed(kind) {
         return Err(format!(
             "{kind:?} is not a service kind (1..32 chars of [a-z0-9-])"
@@ -846,9 +936,6 @@ pub(crate) fn plan_enable(workspace: &Path, kind: &str) -> Result<EnablePlan, St
             existing.display_id()
         ));
     }
-    // the node's own key scopes the id, so the mint reads the workspace
-    // identity exactly the way every other node-scoped verb does.
-    let resolved = config::resolve(&workspace.join("node.toml"))?;
     // the grant is minted FROM a reviewed hello, so there must BE one. A
     // grant invented for an absent daemon would record no offered tags and no
     // requested scopes — the consent screen would show nothing and the
@@ -864,9 +951,8 @@ pub(crate) fn plan_enable(workspace: &Path, kind: &str) -> Result<EnablePlan, St
         })?;
     Ok(EnablePlan {
         kind: kind.to_string(),
-        chain_id: resolved.chain_id,
-        node_id: <[u8; 32]>::try_from(resolved.signer.public_key().as_ref())
-            .map_err(|_| "node identity key is not 32 bytes".to_string())?,
+        chain_id: service.chain_id.clone(),
+        node_id,
         offered: Some(offered),
     })
 }
@@ -936,16 +1022,30 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("{kind:?} is not a service kind (1..32 chars of [a-z0-9-])").into());
     }
     let workspace = args.workspace.dir()?;
-    let resolved = config::resolve(&args.workspace.config_file()?)?;
+    // THE daemon config path (`config::ServiceConfig`): everything below is
+    // derived without ever opening the node's `identity.key`, so this process
+    // cannot sign as the node — which is why `/v1/submit` re-signing is a
+    // boundary rather than a formality.
+    let service = config::resolve_service(&args.workspace.config_file()?)?;
     // the base comes from the SAME resolved config as everything else, rather
     // than a second read of a node.toml the workspace may not contain.
-    let base = resolved
+    let base = service
         .http_listen
         .as_deref()
         .map(config::http_base_of)
         .ok_or("this node serves no http surface, so a service daemon has nothing to signal to")?;
+    // which node this daemon serves — asked of the node, not read off its key.
+    //
+    // This is now the FIRST hard dependency on a live node; it used to be
+    // `send_hello` below, one `backend.probe()` later. A supervisor that
+    // co-starts node and daemon therefore loses the probe's duration of
+    // startup slack, and a daemon that loses the race exits loudly instead of
+    // spinning — which is the contract on this path, but it is a shorter fuse
+    // than before. Order it after the probe only if that slack turns out to
+    // matter; do not paper over it with a retry loop here.
+    let node_key = node_identity(&base)?;
 
-    let hello = discover_hello(&kind, &resolved)?;
+    let hello = discover_hello(&kind, &service, &node_key)?;
     // the FIRST hello must land: a daemon that cannot signal has nothing to
     // offer and must not sit in a retry loop pretending otherwise. A build
     // mismatch or a down node is a loud exit, not a silent spin.
@@ -954,11 +1054,11 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         "{} {} · signaling to {} · offering {}\n",
         paint(GREEN, "●"),
         paint(BOLD, &kind),
-        resolved.chain_id,
+        service.chain_id,
         join_or_dash(&hello.capabilities),
     ))?;
 
-    offer_enable(&workspace, &kind, args.offer())?;
+    offer_enable(&workspace, &kind, args.offer(), &service, node_key)?;
 
     // the heartbeat must outlive this call: for compute it runs BESIDE the
     // execution loop, so a long run never lets the node's catalog entry lapse
@@ -968,7 +1068,7 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .name("service-hello".into())
         .spawn(move || heartbeat(&beat_base, &hello))?;
 
-    match serve_kind(&kind, &workspace, resolved, &base)? {
+    match serve_kind(&kind, &workspace, service, &base, node_key)? {
         // nothing to execute (an ungranted kind, or a kind with no first-party
         // daemon): the signal IS the whole job, so park on it.
         Served::SignalOnly => loop {
@@ -991,8 +1091,9 @@ enum Served {
 fn serve_kind(
     kind: &str,
     workspace: &Path,
-    resolved: config::Resolved,
+    service: config::ServiceConfig,
     base: &str,
+    node_key: [u8; 32],
 ) -> Result<Served, Box<dyn std::error::Error>> {
     let Some(daemon) = daemon_for(kind) else {
         // every other kind is recorded, listed and signaled — and executes
@@ -1013,13 +1114,15 @@ fn serve_kind(
     match daemon {
         Daemon::Compute => crate::compute::serve(crate::compute::Compute {
             grant,
-            resolved,
+            service,
             http_base,
+            node_key,
         })?,
         Daemon::Agent => crate::agent::serve(crate::agent::Agent {
             grant,
-            resolved,
+            service,
             http_base,
+            node_key,
             workspace: workspace.to_path_buf(),
         })?,
     }
@@ -1060,9 +1163,10 @@ fn scopes_for(kind: &str) -> Vec<String> {
 /// the whole point of signaling before enabling.
 fn discover_hello(
     kind: &str,
-    resolved: &config::Resolved,
+    service: &config::ServiceConfig,
+    node_key: &[u8; 32],
 ) -> Result<noded::services::Hello, String> {
-    let backend = podman_backend(resolved, kind)?;
+    let backend = podman_backend(service, kind)?;
     // the same precondition the node's own boot enforces — a daemon must not
     // advertise tags it has no runnable sandbox for.
     backend.probe().map_err(|error| format!("sandbox: {error}"))?;
@@ -1072,8 +1176,8 @@ fn discover_hello(
     // one. The serving set is rediscovered under `<kind>#hex8` once a grant
     // exists.
     let providers = provider_host::discover(
-        resolved.signer.public_key().as_ref(),
-        provider_host::AgentDirs::under(&resolved.storage_dir),
+        node_key,
+        provider_host::AgentDirs::under(&service.storage_dir),
         None,
         backend,
         kind,
@@ -1104,6 +1208,8 @@ fn offer_enable(
     workspace: &Path,
     kind: &str,
     offer: EnableOffer,
+    service: &config::ServiceConfig,
+    node_id: [u8; 32],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if load(workspace)?.grant(kind).is_some() {
         // already granted: straight to serving, never a prompt.
@@ -1117,7 +1223,9 @@ fn offer_enable(
         // a unit file and a pipe have no one to ask; say it once and serve.
         EnableOffer::Never => return write_err(&hint),
         EnableOffer::AskIfTty if !crate::tty::stdin_is_tty() => return write_err(&hint),
-        EnableOffer::Always | EnableOffer::AskIfTty => plan_enable(workspace, kind)?,
+        EnableOffer::Always | EnableOffer::AskIfTty => {
+            plan_enable(workspace, kind, service, node_id)?
+        }
     };
     let asked = matches!(offer, EnableOffer::AskIfTty);
     if asked {
@@ -1173,7 +1281,22 @@ fn heartbeat(base: &str, hello: &noded::services::Hello) -> ! {
 
 fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
     let workspace = args.workspace.dir()?;
-    let plan = plan_enable(&workspace, &args.kind)?;
+    // the SAME resolved value `run` uses, from the SAME file this verb was
+    // pointed at. Reading `<workspace>/node.toml` here instead would be a
+    // second read of a node.toml the workspace may not contain — with
+    // `--config <elsewhere>/alt.toml` that is a different node, a different
+    // port, or no file at all.
+    let service = config::resolve_service(&args.workspace.config_file()?)?;
+    // the consent screen names the node, so it asks the node — the same keyless
+    // route `service run` takes. `enable` already requires a live hello, so a
+    // reachable node is a precondition either way.
+    let base = service
+        .http_listen
+        .as_deref()
+        .map(config::http_base_of)
+        .ok_or("this node serves no http surface, so `enable` cannot ask it who it is")?;
+    let node_id = node_identity(&base)?;
+    let plan = plan_enable(&workspace, &args.kind, &service, node_id)?;
 
     write_err(&render_enable_summary(&plan))?;
     let question = format!("Enable {} on this node?", plan.kind);
@@ -1263,6 +1386,286 @@ mod tests {
             scopes: vec![],
             needs: vec![],
         }
+    }
+
+    /// Each way `/v1/status` can fail to name a node must produce its OWN
+    /// message, and the empty string must reach the startup one.
+    ///
+    /// The empty case is why this test exists rather than four eyeballed
+    /// `format!`s: `public_key` is a non-Option `String` that a booting node
+    /// serves as `""`, so it silently took the wrong-length arm and reported a
+    /// routine startup race as a malformed identity — while the message written
+    /// for it was dead code no test executed.
+    #[test]
+    fn every_status_identity_outcome_gets_its_own_message() {
+        let absent = published_identity(&serde_json::json!({})).expect_err("no field at all");
+        let booting = published_identity(&serde_json::json!({ "public_key": "" }))
+            .expect_err("up, but not published yet");
+        assert_eq!(absent, NOT_PUBLISHED_YET);
+        assert_eq!(
+            booting, NOT_PUBLISHED_YET,
+            "an empty public_key is a booting node, not a malformed one"
+        );
+        // the specific regression: it must NOT be diagnosed by length.
+        assert!(
+            !booting.contains("byte"),
+            "the empty case must not fall through to the length arm: {booting}"
+        );
+
+        let not_hex = published_identity(&serde_json::json!({ "public_key": "zz" }))
+            .expect_err("not hex at all");
+        assert!(not_hex.contains("not hex"), "{not_hex}");
+
+        let short = published_identity(&serde_json::json!({ "public_key": "abcd" }))
+            .expect_err("hex, but not 32 bytes");
+        assert!(short.contains("2-byte"), "{short}");
+
+        // all four failures are distinguishable from one another.
+        let messages = [&absent, &not_hex, &short];
+        assert_eq!(
+            messages
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3,
+            "each outcome needs its own sentence: {messages:?}"
+        );
+
+        // and the happy path still decodes.
+        let key = "ab".repeat(32);
+        let decoded = published_identity(&serde_json::json!({ "public_key": key }))
+            .expect("a published 32-byte identity decodes");
+        assert_eq!(decoded, [0xab; 32]);
+    }
+
+    /// collect `.rs` files under `dir`, RECURSIVELY.
+    ///
+    /// A flat `read_dir` would leave `compute/sub/keys.rs` unscanned — a
+    /// one-directory hiding place inside the very tree the lint is about.
+    fn rust_files_under(dir: &Path, prefix: &str, into: &mut Vec<(String, PathBuf)>) {
+        for entry in std::fs::read_dir(dir).expect("read daemon module dir") {
+            let path = entry.expect("dir entry").path();
+            let name = format!("{prefix}/{}", path.file_name().unwrap().to_string_lossy());
+            if path.is_dir() {
+                rust_files_under(&path, &name, into);
+                continue;
+            }
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                into.push((name, path));
+            }
+        }
+    }
+
+    /// every `.rs` on the daemon path: this file, plus both daemon module trees.
+    fn daemon_path_sources() -> Vec<(String, String)> {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = vec![("services.rs".to_string(), src.join("services.rs"))];
+        for module in ["compute", "agent"] {
+            rust_files_under(&src.join(module), module, &mut files);
+        }
+        files
+            .into_iter()
+            .map(|(name, path)| {
+                let source = std::fs::read_to_string(&path).expect("read daemon source");
+                // NOTHING is truncated. This used to cut the file at its first
+                // `#[cfg(test)]`, which meant one test helper near the top of a
+                // file blinded the scan to every line below it — the largest
+                // hole this lint had. Test code is daemon-path code for the
+                // purpose of naming the key, so it is scanned too; the fixtures
+                // below are assembled from pieces for exactly that reason.
+                //
+                // Line comments ARE stripped: this is a lint on CODE, and the
+                // doc comments deliberately NAME the thing they forbid.
+                let code = source
+                    .lines()
+                    .map(|line| line.split("//").next().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (name, code)
+            })
+            .collect()
+    }
+
+    /// Rust identifier tokens in `code`.
+    fn identifiers(code: &str) -> impl Iterator<Item = &str> {
+        code.split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|token| !token.is_empty())
+    }
+
+    /// Every name this code pulls out of `crate::config`.
+    ///
+    /// The daemon path reaches the node's key through exactly one module, and
+    /// both ways of reaching into it end in the same eight characters:
+    /// `use ...config::{A as X, b as y}` and a qualified `config::b(..)`. So
+    /// one scan for `config::` and a read of whatever follows — a braced list,
+    /// or a single name — sees the REAL names regardless of what they are then
+    /// aliased to. There is no alias-of-an-alias: the import has to spell the
+    /// true name once, right here, or it does not compile.
+    ///
+    /// Scanning names rather than whole files is what keeps the ban honest in
+    /// the other direction too: `compute_service::Resolved` (a resolved
+    /// CREDENTIAL) and the `CredentialResolver::resolve` trait method share
+    /// their spelling with the banned config names and have nothing to do with
+    /// them, so a bare token ban would fire on `compute/cred.rs` and teach the
+    /// next reader to delete the lint.
+    fn config_names(code: &str) -> Vec<&str> {
+        const PREFIX: &str = "config::";
+        let mut names = Vec::new();
+        let mut rest = code;
+        while let Some(at) = rest.find(PREFIX) {
+            let tail = &rest[at + PREFIX.len()..];
+            let chunk = match tail.strip_prefix('{') {
+                // a use-list: every name in it, aliases and all.
+                Some(list) => &list[..list.find('}').unwrap_or(list.len())],
+                // a single qualified name: read to the end of the identifier,
+                // so `config::resolve_service` yields ONE name and can never
+                // be read as `resolve`.
+                None => {
+                    let end = tail
+                        .find(|c: char| !c.is_alphanumeric() && c != '_')
+                        .unwrap_or(tail.len());
+                    &tail[..end]
+                }
+            };
+            names.extend(identifiers(chunk));
+            rest = tail;
+        }
+        names
+    }
+
+    /// the config names that hand over the node's private key, or a type that
+    /// carries it. `resolve_service`/`ServiceConfig` are the whole legal
+    /// surface.
+    const KEYED_CONFIG_NAMES: &[&str] = &[
+        "Resolved",
+        "resolve",
+        "load_identity",
+        "load_or_generate_identity",
+    ];
+
+    /// A TRIPWIRE on the daemon path, not the guarantee — and the difference
+    /// matters, because a guard described as load-bearing is one the next
+    /// reader stops looking behind.
+    ///
+    /// WHAT ACTUALLY HOLDS THE LINE, in order:
+    /// 1. The TYPE. [`crate::compute::Compute`] and [`crate::agent::Agent`]
+    ///    hold a `config::ServiceConfig`, which has no field a secret can live
+    ///    in. Nothing on this path is handed the key, so nothing has to refrain
+    ///    from using it.
+    /// 2. The BEHAVIORAL proof,
+    ///    `config::resolve::tests::the_service_path_never_reads_the_node_key`:
+    ///    it resolves a workspace with `identity.key` ABSENT and asserts the
+    ///    daemon path succeeds where the node path fails. Add a key loader to
+    ///    the service path and it goes red on the spot, whatever the loader is
+    ///    called.
+    /// 3. This lint, which catches the remaining case the other two cannot:
+    ///    NEW code on the daemon path that reaches back into `config` for the
+    ///    keyed resolver.
+    ///
+    /// WHAT IT CANNOT DO. It is a string matcher over source text, so it is
+    /// defence in depth and nothing more. It reads `config::`-qualified paths
+    /// and use-lists, which covers every honest spelling and every aliased one
+    /// (an alias must still write the true name at the import). It does not
+    /// parse Rust: a glob `use crate::config::*`, a macro that assembles the
+    /// path, a re-export through a third module, or a helper living outside the
+    /// scanned tree all walk past it. Treat a green run here as "nobody typed
+    /// the obvious thing", never as proof; the proof is (1) and (2).
+    ///
+    /// Why it is worth keeping anyway: `config::resolve` yields a
+    /// `config::Resolved`, whose `signer` field IS the node's ed25519 PRIVATE
+    /// key. A daemon holding that needs no node surface at all — it can sign
+    /// frames itself, which caps every authorization boundary anyone draws on
+    /// `/v1` later. And now that `Resolved` CONTAINS a `ServiceConfig`, calling
+    /// `resolve()` looks like a perfectly reasonable way to get one, while
+    /// handing over the key in the same breath. That is the mistake this catches.
+    ///
+    /// Not scanned, and it does not need to be: `crates/services/**` cannot
+    /// name `config` at all — those crates do not depend on this binary, so the
+    /// module is unreachable from them by construction rather than by promise.
+    #[test]
+    fn the_daemon_path_cannot_name_the_node_key() {
+        // ASSEMBLED, not written out: this file is scanned by the loop below,
+        // so a literal here would be a hit on the lint's own assertion text.
+        // That is the honest cost of scanning test code instead of truncating
+        // at the first `#[cfg(test)]` — a truncation that used to blind the
+        // scan to every line beneath it.
+        let key_type = ["Private", "Key"].concat();
+        let key_file = ["identity", ".key"].concat();
+        for (file, code) in daemon_path_sources() {
+            for name in config_names(&code) {
+                assert!(
+                    !KEYED_CONFIG_NAMES.contains(&name),
+                    "{file} takes `{name}` out of `config`: the daemon path must not be \
+                     able to reach the node's private key — resolve through \
+                     `config::resolve_service` and ask the node who it is over `/v1/status`"
+                );
+            }
+            // the route around the resolver entirely: open the key file and
+            // decode it. One type can hold the result, and one file holds it.
+            assert!(
+                identifiers(&code).all(|token| token != key_type),
+                "{file} names `{key_type}`: a daemon must not decode the node's key"
+            );
+            assert!(
+                !code.contains(&key_file),
+                "{file} names `{key_file}`: a daemon must not open the node's key file"
+            );
+        }
+    }
+
+    /// The lint is only worth having if it catches a REAL attempt, so this
+    /// feeds it the exact aliased steal that the previous substring form let
+    /// through: `use crate::config::{Resolved as NodeCfg, resolve as node_cfg}`
+    /// plus `let NodeCfg { signer, .. } = node_cfg(path)?` contains none of
+    /// `config::Resolved`, `config::resolve(` or `.signer`, so
+    /// `code.contains(needle)` passed while the key was being loaded. It was
+    /// not a hypothetical — that code was compiled into `compute/mod.rs` and
+    /// the old lint stayed green.
+    ///
+    /// Without this, a later "simplification" back to substring matching would
+    /// leave every daemon-path test green again.
+    ///
+    /// The fixtures are ASSEMBLED rather than written out, because this file is
+    /// itself scanned by the lint above: a fixture that spelled the banned
+    /// import literally would trip the very test it exercises.
+    #[test]
+    fn the_lint_catches_an_aliased_key_steal() {
+        let qualified = ["config", "::"].concat();
+        let steal = format!(
+            "use crate::{qualified}{{Resolved as NodeCfg, resolve as node_cfg}};\n\
+             let NodeCfg {{ signer, .. }} = node_cfg(path).ok()?;"
+        );
+        let caught: Vec<&str> = config_names(&steal)
+            .into_iter()
+            .filter(|name| KEYED_CONFIG_NAMES.contains(name))
+            .collect();
+        assert_eq!(
+            caught,
+            ["Resolved", "resolve"],
+            "aliases must not hide the real names"
+        );
+
+        // a bare `config::resolve (p)` — one space defeated the old ban.
+        let spaced = format!("{qualified}resolve (p)?");
+        assert!(
+            config_names(&spaced).contains(&"resolve"),
+            "whitespace must not hide the call"
+        );
+
+        // and the legal daemon spellings must NOT trip it: `resolve_service` is
+        // ONE identifier, and another crate's `Resolved` is not config's.
+        let legal = format!(
+            "use compute_service::{{CredentialResolver, Resolved}};\n\
+             let service = {qualified}resolve_service(path)?;\n\
+             async fn resolve(&self) -> Result<Resolved, String> {{}}"
+        );
+        assert!(
+            config_names(&legal)
+                .into_iter()
+                .all(|name| !KEYED_CONFIG_NAMES.contains(&name)),
+            "only names taken out of `config` are banned: {:?}",
+            config_names(&legal)
+        );
     }
 
     #[test]

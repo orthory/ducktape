@@ -77,24 +77,34 @@ pub(crate) struct BootEnv {
 
 pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
     let Resolved {
+        // the keyless half this node shares VERBATIM with its service daemons.
+        // Destructured exhaustively (no `..`) on purpose: a new shared fact must
+        // be routed here rather than silently ignored.
+        service:
+            config::ServiceConfig {
+                workspace,
+                storage_dir: storage,
+                // the descriptor's own chain-id (network shape) or the raw
+                // dev-shape namespace — NOT `namespace` below, which is
+                // `genesis_namespace()` (chain_id@fingerprint) on the network
+                // shape. this is the string the desktop app records as
+                // `Workspace.chain_id`; threaded into `identity`'s certificate
+                // domain separation.
+                chain_id: identity_chain_id,
+                http_listen,
+                sandbox,
+                sandbox_capacity,
+            },
         signer,
         label,
         namespace,
-        // the descriptor's own chain-id (network shape) or the raw dev-shape
-        // namespace — NOT `namespace` below, which is `genesis_namespace()`
-        // (chain_id@fingerprint) on the network shape. this is the string the
-        // desktop app records as `Workspace.chain_id`; threaded into
-        // `identity`'s certificate domain separation.
-        chain_id: identity_chain_id,
         mesh: peers,
         validators,
         bootstrappers,
         coordinated,
         listen,
         advertised,
-        storage_dir: storage,
         rpc_listen,
-        http_listen,
         gateway_listen,
         wireguard_listen,
         wireguard_key_file,
@@ -107,13 +117,10 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         sync_index,
         coordination,
         coord_cap,
-        workspace,
         primary_coordinator,
         coordinator_relay,
         wireguard_advertised,
-        sandbox,
         compute_backend,
-        sandbox_capacity,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk

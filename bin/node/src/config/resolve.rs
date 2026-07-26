@@ -18,23 +18,31 @@ use super::{
 };
 
 /// everything `run_node` needs, shape-independent.
+///
+/// A node is a service daemon's workspace PLUS the key it signs with and the
+/// consensus/transport plumbing only a node runs. That "plus" is the whole
+/// relationship, so it is spelled structurally: [`ServiceConfig`] is a MEMBER
+/// here, never a parallel copy of the same six facts. Nothing re-derives
+/// `storage_dir` or `chain_id` beside it — there is one of each in the type
+/// graph, so the node view and the daemon view cannot disagree about where a
+/// workspace's state lives (a parity test asserting they agree would be
+/// asserting `x == x`).
+///
+/// The nesting is one-directional ON PURPOSE: `Resolved` reaches
+/// `ServiceConfig`, never the reverse. A daemon that holds a `ServiceConfig`
+/// has no route — no field, no accessor, no `Option` left `None` by convention
+/// — back to `signer`.
 #[derive(Debug)]
 pub struct Resolved {
+    /// the keyless facts, derived exactly once (by [`resolve_service`]'s own
+    /// per-shape halves) and shared verbatim with every service daemon.
+    pub service: ServiceConfig,
     pub signer: ed25519::PrivateKey,
     /// log prefix: "#<id>" for the dev shape, the identity's short hex
     /// otherwise.
     pub label: String,
     /// the network genesis namespace, or the dev shape's raw namespace.
     pub namespace: Vec<u8>,
-    /// this network's chain id — the descriptor's own `chain_id` field (network
-    /// shape) or the raw configured namespace (dev shape, which has no
-    /// fingerprint appended). NOT `namespace`: the network shape's `namespace`
-    /// is `genesis_namespace()`, i.e. `chain_id@fingerprint` — a DIFFERENT
-    /// string. This is the exact string the desktop app records as
-    /// `Workspace.chain_id` (the `init` verb's last stdout line), so modules
-    /// that must agree with the app on "this network's id" (e.g. `identity`'s
-    /// certificate domain separation) use this field, never `namespace`.
-    pub chain_id: String,
     /// the authorized mesh set (unsorted here; the caller builds the ordered
     /// Set discovery tracks).
     pub mesh: Vec<ed25519::PublicKey>,
@@ -54,9 +62,7 @@ pub struct Resolved {
     /// tunnel with a stable name never needs an address update — and it BOOTS
     /// even while its own name does not resolve.
     pub advertised: Ingress,
-    pub storage_dir: PathBuf,
     pub rpc_listen: Option<String>,
-    pub http_listen: Option<String>,
     pub gateway_listen: Option<String>,
     /// the staged WireGuard reachability plane's advertised UDP endpoint
     /// (userspace socket backend); None = plane off (dev-seed harness
@@ -119,33 +125,157 @@ pub struct Resolved {
     /// (`NodeToml::wireguard_advertised`); `None` = derive it from
     /// `wireguard_listen` exactly like today (see `reachability_plane.rs`).
     pub wireguard_advertised: Option<Ingress>,
-    /// the workspace base directory — where `identity.key`, `network.toml`,
-    /// `wireguard.key` and `coord.cap` live (the network shape's config
-    /// directory; the dev shape's `storage_dir`). Threaded so a parked
-    /// joiner's gate phase can persist a `coord.cap` delivered over its
-    /// sealed `IntroReply::Admitted` ack via `save_coord_cap`.
-    pub workspace: PathBuf,
-    /// the compute plane (`NodeToml::sandbox`): `Some` = provider runs spawn
-    /// inside this backend and the node announces `sandbox_capacity`;
-    /// `None` = consensus-only — no provider discovery, no announce, no
-    /// oracle pool, no terminal plane. a bare host spawn is unrepresentable.
-    pub sandbox: Option<SandboxBackend>,
-    /// the numeric capacity a compute node announces alongside its tags
-    /// (probed host totals, per-key overrides winning). EMPTY for a
-    /// consensus-only node. This one value is both
-    /// the dispatch pool's ledger and the capability announce's resources.
-    pub sandbox_capacity: BTreeMap<String, u64>,
     /// the COMPUTE SERVICE's backend — `Some` only when both halves agree:
     /// the operator's `[sandbox]` table says HOW runs are isolated on this
     /// host, and the user's `services.toml` grant (`ducktape service enable
     /// compute`) says WHETHER this node runs any. `None` = no provider
     /// discovery, no oracle pool, no capability announce.
     ///
-    /// Deliberately NOT the same value as `sandbox`: the interactive terminal
-    /// plane and the airlock gateway key off the table alone, so a node whose
-    /// operator wants pty sessions does not have to grant it a compute
+    /// Deliberately NOT the same value as `service.sandbox`: the interactive
+    /// terminal plane and the airlock gateway key off the table alone, so a node
+    /// whose operator wants pty sessions does not have to grant it a compute
     /// service. Decided once here so no boot site re-derives the predicate.
     pub compute_backend: Option<SandboxBackend>,
+}
+
+/// Everything a SERVICE DAEMON legitimately needs from its node's workspace —
+/// and, being a member of [`Resolved`], everything the NODE knows about the
+/// same six facts. There is no second copy to drift from.
+///
+/// The type is separate from `Resolved` because `Resolved` carries
+/// `signer: ed25519::PrivateKey`, so every `ducktape service run <kind>` used to
+/// load the node's consensus identity into the daemon's address space — and a
+/// daemon holding that key never needs `/v1/submit` (which re-signs with the
+/// node key precisely so a daemon needs none): it can sign frames itself. That
+/// makes every authorization boundary drawn later on `/v1` decorative, because
+/// the caller already holds the thing `/v1` exists to lend.
+///
+/// This type has no field a secret could live in, [`resolve_service`] never
+/// opens `identity.key`, and the containment runs ONE WAY — `Resolved` holds a
+/// `ServiceConfig`, never the reverse — so on the daemon path holding the
+/// node's key is UNREPRESENTABLE rather than merely unused.
+///
+/// The node's own IDENTITY is deliberately absent too: a daemon that needs it
+/// asks the node (`GET /v1/status`). The process that holds the key is the one
+/// that answers for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceConfig {
+    /// the workspace base directory — where `identity.key`, `network.toml`,
+    /// `wireguard.key`, `coord.cap` and `services.toml` (a daemon's grant) live:
+    /// the network shape's config directory, the dev shape's `storage_dir`.
+    /// Threaded into the node so a parked joiner's gate phase can persist a
+    /// `coord.cap` delivered over its sealed `IntroReply::Admitted` ack via
+    /// `save_coord_cap`.
+    pub workspace: PathBuf,
+    /// the node's state root; per-service podman roots and provider state hang
+    /// off it too.
+    pub storage_dir: PathBuf,
+    /// this network's chain id — the descriptor's own `chain_id` field (network
+    /// shape) or the raw configured namespace (dev shape, which has no
+    /// fingerprint appended). NOT `Resolved::namespace`: the network shape's
+    /// `namespace` is `genesis_namespace()`, i.e. `chain_id@fingerprint` — a
+    /// DIFFERENT string. This is the exact string the desktop app records as
+    /// `Workspace.chain_id` (the `init` verb's last stdout line), so modules
+    /// that must agree with the app on "this network's id" (e.g. `identity`'s
+    /// certificate domain separation) use this field, never `namespace`. It is
+    /// also the daemon's signaling line and consent screen.
+    pub chain_id: String,
+    /// the node's HTTP surface: the ONLY transport a daemon has to it.
+    pub http_listen: Option<String>,
+    /// the `[sandbox]` table — HOW this host isolates a run. `Some` = provider
+    /// runs spawn inside this backend and the node announces `sandbox_capacity`;
+    /// `None` = consensus-only, and a daemon must refuse to serve because this
+    /// host has no configured way to isolate a run. A bare host spawn is
+    /// unrepresentable. NOT the grant-gated `Resolved::compute_backend`: a
+    /// daemon reads its own grant from `services.toml`, at the one place that
+    /// already does.
+    pub sandbox: Option<SandboxBackend>,
+    /// the capacity that table yields (probed host totals, per-key overrides
+    /// winning). EMPTY for a consensus-only node. This one value is both the
+    /// dispatch pool's ledger and the capability announce's resources.
+    pub sandbox_capacity: BTreeMap<String, u64>,
+}
+
+/// Read a node config into the DAEMON's view of it.
+///
+/// The keyless HALF of [`resolve`] — not a twin of it: `resolve` builds its
+/// `Resolved` around the very [`ServiceConfig`] these shape functions return, so
+/// there is no second derivation of `storage_dir`, `chain_id` or the sandbox
+/// table to keep in step. No path through here calls `load_identity`, so a
+/// workspace whose `identity.key` is absent or unreadable still resolves, which
+/// is exactly the property `the_service_path_never_reads_the_node_key` pins.
+pub fn resolve_service(cfg_path: &Path) -> Result<ServiceConfig, String> {
+    match super::node_toml::load_raw_node_toml(cfg_path)? {
+        (super::node_toml::RawNodeToml::Network(raw), _) => {
+            let base = absolute_runtime_path(cfg_path.parent().unwrap_or_else(|| Path::new(".")))?;
+            // the descriptor is read for its chain id alone — the validator set,
+            // the reach hints and the genesis fingerprint are consensus facts a
+            // daemon has no use for. It is still VALIDATED here, by the same
+            // loader the node uses: a daemon that signaled happily against a
+            // descriptor its own node will never boot on would announce capacity
+            // for a network that cannot exist.
+            let descriptor = load_valid_descriptor(&base.join(&raw.network))?;
+            service_network_shape(&base, &raw, &descriptor)
+        }
+        (super::node_toml::RawNodeToml::DevSeed(raw), _) => service_dev_shape(&raw),
+    }
+}
+
+/// Load a network descriptor and refuse the two states NO process may run on.
+///
+/// One loader, one refusal set, for the same reason there is one derivation of
+/// the six shared facts: the daemon path and the node path must not be able to
+/// disagree about whether a `network.toml` is runnable. Splitting these checks
+/// is the same drift the [`ServiceConfig`] nesting exists to prevent, just
+/// wearing a different hat.
+fn load_valid_descriptor(path: &Path) -> Result<NetworkDescriptor, String> {
+    let descriptor = NetworkDescriptor::load(path)?;
+    if descriptor.scheme != SCHEME_ED25519 {
+        return Err(format!(
+            "network {} uses scheme {:?}; this build runs {SCHEME_ED25519:?}",
+            descriptor.chain_id, descriptor.scheme
+        ));
+    }
+    if descriptor.validator_keys()?.is_empty() {
+        return Err(format!("network {} has no validators", descriptor.chain_id));
+    }
+    Ok(descriptor)
+}
+
+/// THE network-shape derivation of the six shared facts. `resolve_service`
+/// returns this; `resolve` embeds it. Nothing else computes them.
+fn service_network_shape(
+    base: &Path,
+    raw: &NodeToml,
+    descriptor: &NetworkDescriptor,
+) -> Result<ServiceConfig, String> {
+    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref())?;
+    Ok(ServiceConfig {
+        workspace: base.to_path_buf(),
+        storage_dir: base.join(&raw.storage_dir),
+        chain_id: descriptor.chain_id.clone(),
+        http_listen: Some(raw.http_listen.clone()),
+        sandbox,
+        sandbox_capacity,
+    })
+}
+
+/// THE dev-shape derivation of the same six facts, on the same terms.
+fn service_dev_shape(raw: &DevSeedToml) -> Result<ServiceConfig, String> {
+    let storage_dir = dev_storage_dir(raw)?;
+    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref())?;
+    Ok(ServiceConfig {
+        // the dev shape has no config directory; its per-process state dir
+        // stands in as the workspace.
+        workspace: storage_dir.clone(),
+        storage_dir,
+        // the dev shape's namespace carries no fingerprint suffix, so it IS
+        // the chain id.
+        chain_id: raw.namespace.clone(),
+        http_listen: raw.http_listen.clone(),
+        sandbox,
+        sandbox_capacity,
+    })
 }
 
 /// the podman provider image default — what `[sandbox]` generation writes
@@ -265,9 +395,25 @@ fn absolute_runtime_path(path: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("current directory: {e}"))
 }
 
+/// the dev shape's per-process state dir — its storage AND its stand-in
+/// workspace. ONE derivation, so the node view ([`resolve`]) and the daemon
+/// view ([`resolve_service`]) can never disagree about where a dev node's
+/// state lives.
+fn dev_storage_dir(raw: &DevSeedToml) -> Result<PathBuf, String> {
+    match &raw.storage_dir {
+        Some(path) => absolute_runtime_path(Path::new(path)),
+        None => Ok(std::env::temp_dir().join(format!("ducktape-{}", raw.id))),
+    }
+}
+
 /// read + resolve a config file into its runnable form. paths inside the file
 /// (network, key_file, storage_dir) resolve relative to the file's directory,
 /// so a workspace directory is relocatable.
+///
+/// The node view IS the daemon view plus the key: both shape functions below
+/// build their [`Resolved`] around the [`ServiceConfig`] that
+/// [`resolve_service`]'s own halves produce, so every fact both processes need
+/// is computed in exactly one place.
 pub fn resolve(cfg_path: &Path) -> Result<Resolved, String> {
     match super::node_toml::load_raw_node_toml(cfg_path)? {
         (super::node_toml::RawNodeToml::Network(raw), _) => {
@@ -279,24 +425,19 @@ pub fn resolve(cfg_path: &Path) -> Result<Resolved, String> {
 }
 
 fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String> {
-    let descriptor_path = base.join(&raw.network);
-    let descriptor = NetworkDescriptor::load(&descriptor_path)?;
-    if descriptor.scheme != SCHEME_ED25519 {
-        return Err(format!(
-            "network {} uses scheme {:?}; this build runs {SCHEME_ED25519:?}",
-            descriptor.chain_id, descriptor.scheme
-        ));
-    }
+    let descriptor = load_valid_descriptor(&base.join(&raw.network))?;
+    // the shared half, derived by the daemon path's own function: from here on
+    // `service.workspace` IS `base` and `service.storage_dir` IS the node's
+    // state root, with nothing beside them to disagree.
+    let service = service_network_shape(base, &raw, &descriptor)?;
     let key_path = base.join(&raw.key_file);
     let signer = load_identity(&key_path).map_err(|e| {
         format!("{e} — run `ducktape node init` or `ducktape node join <invite>` first")
     })?;
     let me = signer.public_key();
 
+    // non-empty by `load_valid_descriptor`, which BOTH paths run.
     let validators = descriptor.validator_keys()?;
-    if validators.is_empty() {
-        return Err(format!("network {} has no validators", descriptor.chain_id));
-    }
     // one dial source of truth: reach_entries() folds bootstrap-synthesised
     // Direct hints in with the typed `reach` hints (their union). Direct/Fronted
     // resolve to a mesh Ingress dialed directly; Coordinated routes are handed
@@ -352,13 +493,11 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         wireguard_listen,
     )?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised_value())?;
-    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref())?;
-    let compute_backend = gate_on_compute_grant(sandbox.as_ref(), base)?;
+    let compute_backend = gate_on_compute_grant(service.sandbox.as_ref(), &service.workspace)?;
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
         namespace: descriptor.genesis_namespace().into_bytes(),
-        chain_id: descriptor.chain_id.clone(),
         signer,
         mesh,
         validators,
@@ -366,9 +505,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         coordinated,
         listen,
         advertised,
-        storage_dir: base.join(&raw.storage_dir),
         rpc_listen: Some(raw.rpc_listen),
-        http_listen: Some(raw.http_listen),
         gateway_listen: Some(raw.gateway_listen),
         wireguard_listen,
         wireguard_key_file: base.join("wireguard.key"),
@@ -384,14 +521,10 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         // genesis validator needs none (admitted by membership), a joiner is
         // issued one beside its identity.
         coord_cap: load_coord_cap(base),
-        // the config directory: identity.key / network.toml / coord.cap live
-        // here, so a joiner persists a delivered cap into it.
-        workspace: base.to_path_buf(),
         primary_coordinator: Some(raw.primary_coordinator),
         coordinator_relay: Some(raw.coordinator_relay),
         wireguard_advertised,
-        sandbox,
-        sandbox_capacity,
+        service,
         compute_backend,
     })
 }
@@ -559,17 +692,13 @@ fn resolve_advertised(
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
 /// bootstraps nobody; everyone else dials peer_seeds[0] at bootstrapper_addr.
 fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
-    // the workspace/storage dir doubles as the podman-socket base, so it is
-    // derived before `resolve_sandbox` (which names the socket) — and before any
-    // other field of `raw` is moved out below.
-    let storage_dir = match &raw.storage_dir {
-        Some(path) => absolute_runtime_path(Path::new(path))?,
-        None => std::env::temp_dir().join(format!("ducktape-{}", raw.id)),
-    };
-    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref())?;
+    // the shared half first: it owns the storage/workspace derivation (which
+    // doubles as the podman-socket base) and must run before any field of `raw`
+    // is moved out below.
+    let service = service_dev_shape(&raw)?;
     // the dev shape's per-process state dir stands in as its workspace, so its
     // grant file sits beside its storage — one rule for both shapes.
-    let compute_backend = gate_on_compute_grant(sandbox.as_ref(), &storage_dir)?;
+    let compute_backend = gate_on_compute_grant(service.sandbox.as_ref(), &service.workspace)?;
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let invite_listen = resolved_intro_listener(
         raw.advertised.as_deref(),
@@ -638,9 +767,6 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
-        // the dev shape's namespace carries no fingerprint suffix (unlike the
-        // network shape's `genesis_namespace()`), so it IS the chain id here.
-        chain_id: namespace.clone(),
         namespace: namespace.into_bytes(),
         mesh,
         validators,
@@ -651,13 +777,8 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         advertised,
         // the dev shape has no identity.key directory; the wireguard key
         // lives with the node's other per-process state.
-        wireguard_key_file: storage_dir.join("wireguard.key"),
-        // the dev shape has no config directory; its per-process state dir
-        // stands in as the workspace base (it never delivers a real cap).
-        workspace: storage_dir.clone(),
-        storage_dir,
+        wireguard_key_file: service.storage_dir.join("wireguard.key"),
         rpc_listen: raw.rpc_listen,
-        http_listen: raw.http_listen,
         gateway_listen,
         wireguard_listen,
         invite_listen,
@@ -674,8 +795,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         primary_coordinator: raw.primary_coordinator,
         coordinator_relay: raw.coordinator_relay,
         wireguard_advertised,
-        sandbox,
-        sandbox_capacity,
+        service,
         compute_backend,
     })
 }
@@ -840,10 +960,10 @@ mod tests {
         assert_eq!(r.bootstrappers[0].0, other);
         assert!(!r.dev_demo);
         assert_eq!(r.signer.public_key(), me.public_key());
-        assert_eq!(r.storage_dir, dir.join("storage"));
+        assert_eq!(r.service.storage_dir, dir.join("storage"));
         // the workspace base is the config directory — where a joiner would
         // persist a `coord.cap` delivered over its Admitted gate reply.
-        assert_eq!(r.workspace, dir);
+        assert_eq!(r.service.workspace, dir);
     }
 
     #[test]
@@ -880,10 +1000,10 @@ mod tests {
             .join("node.toml");
         let resolved = resolve(&relative_config).expect("resolve relative config");
 
-        assert_eq!(resolved.storage_dir, dir.join("storage"));
-        assert!(resolved.storage_dir.is_absolute());
-        assert_eq!(resolved.workspace, dir);
-        assert!(resolved.workspace.is_absolute());
+        assert_eq!(resolved.service.storage_dir, dir.join("storage"));
+        assert!(resolved.service.storage_dir.is_absolute());
+        assert_eq!(resolved.service.workspace, dir);
+        assert!(resolved.service.workspace.is_absolute());
     }
 
     #[test]
@@ -896,8 +1016,8 @@ mod tests {
         )
         .expect("parse dev config");
         let resolved = resolve_dev_shape(raw).expect("resolve relative storage");
-        assert_eq!(resolved.storage_dir, launch_cwd.join("relative/storage"));
-        assert!(resolved.storage_dir.is_absolute());
+        assert_eq!(resolved.service.storage_dir, launch_cwd.join("relative/storage"));
+        assert!(resolved.service.storage_dir.is_absolute());
 
         let default_raw: DevSeedToml = toml::from_str(
             "id = 8\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
@@ -905,8 +1025,8 @@ mod tests {
         )
         .expect("parse default dev config");
         let default = resolve_dev_shape(default_raw).expect("resolve default storage");
-        assert_eq!(default.storage_dir, std::env::temp_dir().join("ducktape-8"));
-        assert!(default.storage_dir.is_absolute());
+        assert_eq!(default.service.storage_dir, std::env::temp_dir().join("ducktape-8"));
+        assert!(default.service.storage_dir.is_absolute());
     }
 
     #[cfg(unix)]
@@ -926,9 +1046,9 @@ mod tests {
             );
 
             let network = resolve(Path::new(network_config)).expect("absolute network config");
-            assert!(network.storage_dir.is_absolute());
+            assert!(network.service.storage_dir.is_absolute());
             let dev = resolve(Path::new(dev_config)).expect("absolute dev config");
-            assert!(dev.storage_dir.is_absolute());
+            assert!(dev.service.storage_dir.is_absolute());
             return;
         }
 
@@ -1052,7 +1172,7 @@ mod tests {
         assert_eq!(resolved.compute_backend, None, "no grant, no compute plane");
         // the grant lives in the WORKSPACE, which for the dev shape is the
         // per-process state dir rather than the config dir.
-        let workspace = resolved.workspace.clone();
+        let workspace = resolved.service.workspace.clone();
 
         // a grant carrying tags is what opts this node into the pools.
         write_compute_grant(&workspace, &["quack-text", "quack-json"]);
@@ -1107,9 +1227,9 @@ mod tests {
         // no [sandbox] table ⇒ consensus-only: no backend, no capacity.
         std::fs::write(dir.join("node.toml"), base).expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve default");
-        assert_eq!(resolved.sandbox, None);
+        assert_eq!(resolved.service.sandbox, None);
         assert!(
-            resolved.sandbox_capacity.is_empty(),
+            resolved.service.sandbox_capacity.is_empty(),
             "a consensus-only node makes no capacity promise"
         );
 
@@ -1134,15 +1254,15 @@ mod tests {
         let resolved = resolve(&dir.join("node.toml")).expect("resolve podman");
         assert!(
             matches!(
-                &resolved.sandbox,
+                &resolved.service.sandbox,
                 Some(SandboxBackend::Podman { image, .. })
                     if image == "docker.io/library/node:22-slim"
             ),
             "podman backend with the probed image: {:?}",
-            resolved.sandbox
+            resolved.service.sandbox
         );
         assert!(
-            resolved.sandbox_capacity.get("cores").copied().unwrap_or(0) >= 1,
+            resolved.service.sandbox_capacity.get("cores").copied().unwrap_or(0) >= 1,
             "a podman node announces its probed capacity"
         );
 
@@ -1158,14 +1278,14 @@ mod tests {
         let resolved = resolve(&dir.join("node.toml")).expect("resolve overrides");
         assert!(
             matches!(
-                &resolved.sandbox,
+                &resolved.service.sandbox,
                 Some(SandboxBackend::Podman { image, .. }) if image == "docker.io/library/rust:1"
             ),
             "custom image honored: {:?}",
-            resolved.sandbox
+            resolved.service.sandbox
         );
-        assert_eq!(resolved.sandbox_capacity.get("cores"), Some(&99));
-        assert_eq!(resolved.sandbox_capacity.get("mem_gb"), Some(&128));
+        assert_eq!(resolved.service.sandbox_capacity.get("cores"), Some(&99));
+        assert_eq!(resolved.service.sandbox_capacity.get("mem_gb"), Some(&128));
 
         // tart ⇒ the Tart backend, probed capacity, and the minimum-cores
         // rule enforced at this boundary.
@@ -1179,7 +1299,7 @@ mod tests {
         .expect("write");
         let tart = resolve(&dir.join("node.toml")).expect("tart accepted");
         assert_eq!(
-            tart.sandbox,
+            tart.service.sandbox,
             Some(SandboxBackend::Tart {
                 image: "ghcr.io/cirruslabs/macos-sonoma-base:latest".into()
             })
@@ -1187,7 +1307,7 @@ mod tests {
         assert!(
             ["cores", "mem_gb"]
                 .iter()
-                .all(|dimension| tart.sandbox_capacity.contains_key(*dimension)),
+                .all(|dimension| tart.service.sandbox_capacity.contains_key(*dimension)),
             "both enforceable capacity dimensions ride Tart"
         );
         std::fs::write(
@@ -1374,6 +1494,100 @@ mod tests {
                 format!("{key} = {value}\n")
             })
             .collect()
+    }
+
+    /// THE regression test for the daemon key hole: a service daemon must be
+    /// able to resolve its node's config with `identity.key` ABSENT.
+    ///
+    /// This is what makes "the key is gone" checkable rather than asserted. It
+    /// goes red the moment anything on `resolve_service`'s path calls
+    /// `load_identity` again — no comment, no convention, a failing build.
+    /// `resolve` on the SAME workspace is asserted to fail, so the test also
+    /// proves the file is genuinely the node's only identity source and the
+    /// daemon path simply does not need it.
+    #[test]
+    fn the_service_path_never_reads_the_node_key() {
+        let dir = tmp("keyless-service");
+        // a descriptor with somebody else's validator: this workspace has no
+        // identity of its own on disk at all.
+        let founder = ed25519::PrivateKey::from_seed(11).public_key();
+        NetworkDescriptor {
+            chain_id: "keyless#12345678".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(founder.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        }
+        .save(&dir.join("network.toml"))
+        .expect("save descriptor");
+        std::fs::write(dir.join("node.toml"), network_shape_toml(&[])).expect("write node.toml");
+        assert!(
+            !dir.join("identity.key").exists(),
+            "the premise: this workspace holds no node key"
+        );
+
+        let service = resolve_service(&dir.join("node.toml"))
+            .expect("the daemon path resolves with no node key on disk");
+        assert_eq!(service.chain_id, "keyless#12345678");
+        assert_eq!(service.storage_dir, dir.join("storage"));
+        assert_eq!(service.workspace, dir);
+
+        let node = resolve(&dir.join("node.toml"));
+        assert!(
+            node.is_err(),
+            "the NODE path still requires the key it signs with"
+        );
+    }
+
+    // NOTE: the anti-drift pin `the_service_view_agrees_with_the_node_view` was
+    // DELETED here, not weakened. It compared the six facts field by field
+    // across two parallel shapes; `Resolved` now CONTAINS the `ServiceConfig` it
+    // used to duplicate, so the comparison it made is `x == x` — a tautology no
+    // change to this file can falsify. Drift is not tested for because it can no
+    // longer be written down.
+    //
+    // The refusal set below is the one thing the nesting does NOT make
+    // structural — a `Result` has no field to share — so it keeps a real test.
+
+    /// A descriptor no node will boot on must not be one a DAEMON signals
+    /// against.
+    ///
+    /// The service path loads `network.toml` for its chain id, so it would
+    /// happily resolve a descriptor with a foreign signature scheme or an empty
+    /// validator set — and `ducktape service run compute` would then announce
+    /// capacity for a network its own node refuses to start. Both paths run
+    /// [`load_valid_descriptor`], and this is what says so: weaken either
+    /// refusal and one of these four assertions goes red.
+    #[test]
+    fn both_paths_refuse_a_descriptor_no_node_can_run() {
+        let cases = [
+            ("badscheme", "sr25519", vec![hex_bytes(ed25519::PrivateKey::from_seed(5).public_key().as_ref())], "scheme"),
+            ("novalidators", SCHEME_ED25519, vec![], "no validators"),
+        ];
+        for (slug, scheme, validators, expected) in cases {
+            let dir = tmp(slug);
+            // a REAL key on disk, so the node path fails on the descriptor
+            // rather than on a missing identity.
+            load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+            NetworkDescriptor {
+                chain_id: format!("{slug}#12345678"),
+                scheme: scheme.into(),
+                validators,
+                bootstrap: vec![],
+                reach: vec![],
+                coordination: None,
+            }
+            .save(&dir.join("network.toml"))
+            .expect("save descriptor");
+            std::fs::write(dir.join("node.toml"), network_shape_toml(&[])).expect("write");
+
+            let node = resolve(&dir.join("node.toml")).expect_err("the node path refuses it");
+            assert!(node.contains(expected), "node path: {node}");
+            let service =
+                resolve_service(&dir.join("node.toml")).expect_err("so must the daemon path");
+            assert!(service.contains(expected), "service path: {service}");
+        }
     }
 
     /// the desktop shape's posture: a config with no dialable underlay host

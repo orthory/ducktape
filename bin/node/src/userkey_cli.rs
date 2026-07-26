@@ -327,7 +327,7 @@ fn cmd_user_account_init(
         let authorizer = config::ed25519_member_auth(
             &user,
             identity::IDENTITY_BIND_NS,
-            &identity::bind_preimage(&resolved.chain_id, node_pub.as_ref(), 0),
+            &identity::bind_preimage(&resolved.service.chain_id, node_pub.as_ref(), 0),
         );
         let msg = IdentityMsg::BindNode { authorizer };
         let height = crate::node_http::submit(&base, "identity", &serde_json::to_value(&msg)?)?;
