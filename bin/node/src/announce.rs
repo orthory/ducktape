@@ -59,21 +59,29 @@ pub(crate) struct AnnounceSet {
 /// what `plan_enable` refuses, so that an operator is never asked to approve a
 /// consent screen listing tags this node will never announce.
 ///
-/// Neither is reachable from the watcher, by construction rather than by luck,
-/// and that is the property to preserve in review:
+/// The two are NOT equally unreachable from the watcher, and the difference is
+/// worth stating precisely because it is easy to assume symmetry:
 ///
-/// - `IllegalTags` — [`announced_set`] only ever emits tags drawn from
-///   `grant.capabilities` (intersected with a hello), and `Services::validate`
-///   refuses to load a grant carrying an illegal tag. So the file cannot hold
-///   one, and the watcher cannot derive one.
-/// - `OverCap` — `plan_enable` bounds the WIDEST set the grants could ever
-///   produce ([`widest`]), not the set they happen to produce against whoever
-///   is signaling at that moment. Every live derivation is a subset of that
-///   bound, so it cannot cross.
+/// - `IllegalTags` is unreachable as a **property of the file**.
+///   `Services::validate` rejects a grant carrying an illegal tag on every
+///   `load`, and [`announced_set`] only ever emits tags drawn from
+///   `grant.capabilities`. So no `services.toml` this node will read can produce
+///   one, whoever wrote it.
+/// - `OverCap` is unreachable only as a **property of the writer**.
+///   `plan_enable` bounds the WIDEST set the grants could ever produce
+///   ([`widest`]), and every live derivation is a subset of that bound — but
+///   `Services::validate` enforces no cap on tag COUNT, so a `services.toml`
+///   written by anything other than `plan_enable` (a hand edit, a restored
+///   backup, a future verb) hands the watcher a permanently undecidable set:
+///   every tick refuses, nothing is announced, and the only signal is a
+///   throttled warn.
 ///
-/// If either ever does fire on the watcher path, the fix is upstream at the
-/// boundary that let it into `services.toml` — not a trim here, which would
-/// only hide it.
+/// Closing that gap means teaching `validate` the cap, which would make an
+/// over-cap file fail the NODE'S BOOT rather than only its announce — a
+/// deliberately harsher trade than it looks, and not one to make as a side
+/// effect. Until then: if `OverCap` ever fires on the watcher path, the fix is
+/// upstream at whatever wrote the file, never a trim here, which would only
+/// hide it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     /// tags the registry's own grammar rejects. The hello boundary's item rule
@@ -215,7 +223,13 @@ pub(crate) fn submit(base: &str, set: &AnnounceSet) -> Result<u64, String> {
     crate::node_http::submit(base, "capability", &payload).map_err(|error| error.to_string())
 }
 
-/// This node's committed announce, read once to seed the watcher.
+/// This node's committed announce.
+///
+/// TWO `/v1/query` round trips, not one — the registry answers tags and
+/// resources through separate query variants. Both cross the node's command
+/// lane, so a host busy with a catch-up stage can leave this unanswered for as
+/// long as that stage runs; the watcher then reports `Unknown` and waits, which
+/// is the safe direction (a read failure can never retract a live set).
 fn committed(base: &str, node_key: &[u8]) -> Option<AnnounceSet> {
     use capability::{CapabilityQuery, CapabilityReply};
     let ask = |query: CapabilityQuery| -> Option<CapabilityReply> {
@@ -238,17 +252,18 @@ fn committed(base: &str, node_key: &[u8]) -> Option<AnnounceSet> {
 
 /// how often the watcher re-derives the announce.
 ///
-/// The same period the daemons beat at (`HELLO_TTL / 3`), so a death is noticed
-/// within roughly one TTL of the catalog entry lapsing and no faster — sampling
-/// quicker would only re-read a catalog that cannot have changed conclusion.
-const TICK: std::time::Duration =
-    std::time::Duration::from_secs(noded::services::HELLO_TTL.as_secs() / 3);
+/// THE DAEMON'S OWN BEAT, not a copy of the formula behind it. Sampling faster
+/// than daemons report would only re-read a catalog that cannot have changed
+/// conclusion, and sampling slower would miss a beat — so this is not "the same
+/// number as `HEARTBEAT`", it IS `HEARTBEAT`, and re-deriving it from
+/// `HELLO_TTL` here is how the two silently drift apart when one is tuned.
+const TICK: std::time::Duration = crate::services::HEARTBEAT;
 
 /// how long after this thread starts before it may submit anything.
 ///
 /// The signaling catalog lives in THIS process, so a node restart does not age
 /// it out — it starts EMPTY. A daemon that never stopped running re-registers on
-/// its own beat (`HELLO_TTL / 3`), and its beats fail while the node's `/v1` is
+/// its own beat ([`crate::services::HEARTBEAT`]), and its beats fail while the node's `/v1` is
 /// down, so its first post-boot hello can land after this thread's first tick.
 /// Acting then would read "nothing is signaling" off a catalog that has simply
 /// not been filled yet and RETRACT a healthy daemon — pulling a live node out of
@@ -260,6 +275,14 @@ const TICK: std::time::Duration =
 /// really gone. The cost is that a genuinely stale registry is corrected up to
 /// `SETTLE` later at boot, which is fine — nothing places work on a node faster
 /// than the operator can start its daemon.
+///
+/// KNOWN CEILING, named rather than handled: the clock is per-thread, so a node
+/// crash-looping faster than `SETTLE` never reaches a tick that may submit, and
+/// a stale announce of its stands until it stays up for one full window. That is
+/// the right trade — a node that cannot stay up for 30 s has a worse problem
+/// than a stale tag, and the alternative (persisting the settle deadline across
+/// restarts) would let a fast restart retract a daemon that never stopped, which
+/// is the failure this constant exists to prevent.
 const SETTLE: std::time::Duration = noded::services::HELLO_TTL;
 
 /// a failure is reported on the FIRST occurrence and every Nth after it,
@@ -298,65 +321,107 @@ pub(crate) fn spawn(watch: Watch) -> std::io::Result<()> {
         .map(|_| ())
 }
 
+/// what one tick concludes. ONE discriminant, so every path the watcher can
+/// take is a named value a test can assert on rather than a branch buried in a
+/// loop that only runs against a live node.
+#[derive(Debug, PartialEq, Eq)]
+enum Tick {
+    /// inside the settle window: the catalog's emptiness means nothing yet.
+    Wait,
+    /// the committed registry did not answer, so there is nothing to compare
+    /// against. Never a submit — a read failure must not be able to retract a
+    /// live set.
+    Unknown,
+    /// the desired set could not be formed (unreadable grants, a refusal).
+    Undecidable(String),
+    /// the registry already says what this node offers.
+    Quiet,
+    /// the registry disagrees; announce this.
+    Announce(AnnounceSet),
+}
+
+/// THE decision, pure: no clock, no I/O, no logging, no `self`.
+///
+/// Every rule the watcher has lives here and only here, which is what lets the
+/// loop below be a plain executor — and what makes deleting one of these rules
+/// fail a test instead of shipping.
+fn tick(settled: bool, committed: Option<AnnounceSet>, want: Result<AnnounceSet, String>) -> Tick {
+    if !settled {
+        return Tick::Wait;
+    }
+    let Some(committed) = committed else {
+        return Tick::Unknown;
+    };
+    let want = match want {
+        Ok(want) => want,
+        Err(reason) => return Tick::Undecidable(reason),
+    };
+    if want == committed {
+        return Tick::Quiet;
+    }
+    Tick::Announce(want)
+}
+
 fn run(watch: Watch) {
     let started = std::time::Instant::now();
     let mut failures: u64 = 0;
+    tracing::info!(
+        target: "ducktape::service",
+        settle_secs = SETTLE.as_secs(),
+        tick_secs = TICK.as_secs(),
+        "announce watcher started; quiet until the signaling catalog has settled"
+    );
     loop {
         std::thread::sleep(TICK);
-        // the catalog has to have had a chance to fill before its emptiness
-        // means anything. Until then this thread does nothing at all.
+        // BOTH inputs are re-read every tick, never cached. The committed set is
+        // the only thing that says what the network actually believes, and a
+        // snapshot taken once at boot is not the same information: a node whose
+        // host was still catching up when this started would hold an empty
+        // snapshot forever, agree with an empty desired set, and never notice a
+        // dead daemon's tags standing on chain. Comparing against FRESH
+        // committed state is what makes this converge rather than merely track
+        // — the old pump's per-tick read was the guarantee, not just its cost.
+        // Two loopback queries per tick — `committed` issues one for tags and
+        // one for resources — is not a price worth trading it for.
         let settled = started.elapsed() >= SETTLE;
-        if !settled {
-            continue;
-        }
-        // RE-READ every tick, never cached. The committed set is the only thing
-        // that says what the network actually believes, and a snapshot taken
-        // once at boot is not the same information: a node whose host was still
-        // catching up when the watcher started would hold an empty snapshot
-        // forever, agree with an empty desired set, and never notice that a
-        // dead daemon's tags were standing on chain the whole time. Comparing
-        // against fresh committed state is what makes this converge rather than
-        // merely track — the old pump's per-tick read was the guarantee, not
-        // just its cost. One loopback query per 10 s is not a cost worth
-        // trading it for.
-        let Some(committed) = committed(&watch.base, &watch.node_key) else {
-            failures += 1;
-            report(failures, "the committed capability registry did not answer");
-            continue;
-        };
-        let want = match desired(&watch, std::time::Instant::now()) {
-            Ok(want) => want,
-            Err(reason) => {
+        let decision = tick(
+            settled,
+            committed(&watch.base, &watch.node_key),
+            desired(&watch, std::time::Instant::now()),
+        );
+        match decision {
+            Tick::Wait => tracing::debug!(
+                target: "ducktape::service",
+                "announce watcher waiting for the signaling catalog to settle"
+            ),
+            Tick::Unknown => {
                 failures += 1;
-                report(failures, &reason);
-                continue;
+                report(failures, "the committed capability registry did not answer");
             }
-        };
-        // the registry already says what this node offers — including when the
-        // `enable`/`disable` verb just put it there, which is why that submit
-        // costs no follow-up frame here.
-        if want == committed {
-            failures = 0;
-            continue;
-        }
-        match submit(&watch.base, &want) {
-            Ok(height) => {
-                failures = 0;
-                tracing::info!(
-                    target: "ducktape::service",
-                    height,
-                    capabilities = ?want.capabilities,
-                    "capabilities announced"
-                );
-            }
-            // nothing is latched on failure, so the next tick simply re-derives
-            // and retries — which is what a node not yet admitted to its network
-            // needs. Bounded by the tick plus the submit's own hold, so ~one
-            // attempt per 20 s.
-            Err(reason) => {
+            Tick::Undecidable(reason) => {
                 failures += 1;
                 report(failures, &reason);
             }
+            Tick::Quiet => failures = 0,
+            Tick::Announce(want) => match submit(&watch.base, &want) {
+                Ok(height) => {
+                    failures = 0;
+                    tracing::info!(
+                        target: "ducktape::service",
+                        height,
+                        capabilities = ?want.capabilities,
+                        "capabilities announced"
+                    );
+                }
+                // nothing is latched on failure, so the next tick simply
+                // re-derives and retries — which is what a node not yet admitted
+                // to its network needs. Bounded by the tick plus the submit's
+                // own hold, so ~one attempt per 20 s.
+                Err(reason) => {
+                    failures += 1;
+                    report(failures, &reason);
+                }
+            },
         }
     }
 }
@@ -625,12 +690,68 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_submitted_before_the_catalog_has_settled() {
+        // the boot-retraction guard. The catalog is empty on a node restart, so
+        // an unsettled tick would read `want` = {} against a live committed set
+        // and RETRACT a daemon that never stopped. Deleting the gate makes this
+        // return `Announce({})` — the retraction — instead of `Wait`.
+        let committed = AnnounceSet {
+            capabilities: tags(&["claude", "compute"]),
+            resources: caps(4),
+        };
+        let empty = AnnounceSet::default();
+        assert_eq!(
+            tick(false, Some(committed.clone()), Ok(empty.clone())),
+            Tick::Wait,
+            "an unsettled tick must never act, least of all retract"
+        );
+        // and once settled, the same inputs DO retract — so the test above is
+        // pinning the gate, not a set that happens to agree.
+        assert_eq!(
+            tick(true, Some(committed), Ok(empty.clone())),
+            Tick::Announce(empty),
+            "a settled tick with a genuinely empty catalog retracts"
+        );
+    }
+
+    #[test]
+    fn a_failed_registry_read_never_submits() {
+        // a read failure is not evidence about anything. If `Unknown` ever
+        // became a submit, a node whose host was busy would retract its whole
+        // announce for the duration.
+        let want = AnnounceSet {
+            capabilities: tags(&["compute"]),
+            resources: caps(4),
+        };
+        assert_eq!(tick(true, None, Ok(want)), Tick::Unknown);
+    }
+
+    #[test]
+    fn a_matching_registry_is_quiet_and_an_undecidable_one_is_reported() {
+        let set = AnnounceSet {
+            capabilities: tags(&["compute"]),
+            resources: caps(4),
+        };
+        // this is also what makes `enable`/`disable` cost no follow-up frame:
+        // the verb's own submit is already committed by the next tick.
+        assert_eq!(tick(true, Some(set.clone()), Ok(set.clone())), Tick::Quiet);
+        assert_eq!(
+            tick(true, Some(set), Err("grants unreadable".into())),
+            Tick::Undecidable("grants unreadable".into()),
+            "an unreadable grant is reported, never treated as an empty set"
+        );
+    }
+
+    #[test]
     fn the_settle_window_outlasts_a_live_daemons_beat() {
         // the boot-retraction guard is only correct if a daemon that never
         // stopped is GUARANTEED to have re-registered before the window closes.
         // A daemon beats every HELLO_TTL/3, so it beats at least twice inside
         // SETTLE even if its first post-boot attempt is lost.
-        let beat_period = noded::services::HELLO_TTL / 3;
+        // the beat the DAEMON actually sleeps on, not a re-derivation of it —
+        // reading `HELLO_TTL / 3` here would keep this test green while someone
+        // retuned `HEARTBEAT` out from under the property it claims to pin.
+        let beat_period = crate::services::HEARTBEAT;
         assert!(
             SETTLE >= beat_period * 2,
             "SETTLE must outlast at least two daemon beats, else a node restart \

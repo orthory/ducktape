@@ -934,6 +934,7 @@ fn join_or_dash(items: &[String]) -> String {
 /// user, and only then commits — and `service run`'s inline "enable now?"
 /// prompt (step 2) drives the same two calls, so there is exactly one grant
 /// mint and one consent record no matter which surface the user came through.
+#[derive(Debug)]
 pub(crate) struct EnablePlan {
     pub kind: String,
     pub chain_id: String,
@@ -975,6 +976,22 @@ pub(crate) fn plan_enable(
     service: &config::ServiceConfig,
     node_id: [u8; 32],
 ) -> Result<EnablePlan, String> {
+    plan_enable_from(workspace, kind, service, node_id, signaling_now(workspace))
+}
+
+/// The decide half, with the signaling catalog SUPPLIED rather than fetched.
+///
+/// Split so the consent boundary's two refusals — an illegal tag and a
+/// cap-crossing union — are reachable from a test. `signaling_now` reads
+/// `/v1/services` over HTTP, so with it inlined every rule in here could only be
+/// exercised against a running node, which in practice meant not at all.
+fn plan_enable_from(
+    workspace: &Path,
+    kind: &str,
+    service: &config::ServiceConfig,
+    node_id: [u8; 32],
+    signaling: Vec<noded::services::Signaling>,
+) -> Result<EnablePlan, String> {
     if !kind_is_well_formed(kind) {
         return Err(format!(
             "{kind:?} is not a service kind (1..32 chars of [a-z0-9-])"
@@ -992,7 +1009,7 @@ pub(crate) fn plan_enable(
     // grant invented for an absent daemon would record no offered tags and no
     // requested scopes — the consent screen would show nothing and the
     // announce set would be empty — which is consent in name only.
-    let offered = signaling_now(workspace)
+    let offered = signaling
         .into_iter()
         .find(|entry| entry.kind == kind)
         .ok_or_else(|| {
@@ -1044,17 +1061,30 @@ fn mint_grant(kind: &str, node_id: [u8; 32], offered: &noded::services::Signalin
     }
 }
 
-/// Commit the plan: ANNOUNCE first, then persist. THE enable code path.
+/// Commit the plan: PERSIST first, then announce. THE enable code path.
 ///
-/// Two writers, in this order, and the order is the whole reason there is no
-/// divergence to manage between the file and the chain:
+/// The order is the opposite of what it was, and the reason is the watcher.
+/// `/v1/submit` answers only once consensus has settled, so there is a real
+/// interval between the submit returning and the file landing — and a watcher
+/// tick inside it reads the NEW set from the chain and the OLD set from disk,
+/// concludes the chain is wrong, and submits the opposite. On `enable` that
+/// retracts the kind just enabled; on `disable` it re-announces consent that
+/// was just revoked. "Submit first" was safe against a crash and unsafe against
+/// a concurrent reader, and there is a concurrent reader now.
 ///
-/// - the announce is **rejected** → nothing is written, the verb fails carrying
-///   the module's own words, and re-running it is the entire retry story;
-/// - the announce **applies** and the file write then fails → the error names
-///   both facts. The window is an over-announce and it is inert, because
-///   `serve_kind` refuses to serve a kind with no grant; re-running re-announces
-///   (the module stages nothing for a set it already holds) and writes.
+/// Persisting first makes the same interval benign: the watcher reads the new
+/// set from disk and the old one from the chain, and submits exactly what this
+/// verb is about to submit. Worst case is one redundant frame the module stages
+/// nothing for.
+///
+/// It also changes what a failed announce leaves behind, and for the better:
+/// the grant stands, un-announced, and the watcher retries it every tick until
+/// it lands. That is the honest outcome — the operator DID consent; what failed
+/// was reaching a network. The verb still reports the failure, and `service
+/// status` still shows the kind as granted, so nothing is silent. The old
+/// ordering's failure mode was the opposite direction and worse: an announce on
+/// chain with no grant behind it, which places work on a node that then refuses
+/// to serve it.
 ///
 /// The submit carries no key: `/v1/submit` re-frames the op with the NODE's key
 /// inside the node process, which is the identity `capability` keys the registry
@@ -1082,13 +1112,13 @@ pub(crate) fn commit_enable(
         &plan.capacity,
     )
     .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))?;
-    let height = crate::announce::submit(base, &announce)
-        .map_err(|error| format!("{} was not enabled: {error}", plan.kind))?;
-    save(workspace, &services).map_err(|error| {
+    save(workspace, &services)?;
+    let height = crate::announce::submit(base, &announce).map_err(|error| {
         format!(
-            "{} is ANNOUNCED at height {height} but its grant was not written, so nothing will \
-             serve it: {error}",
-            plan.kind
+            "{} is granted but NOT announced, so nothing will be placed on it yet — this node \
+             retries every {}s until it lands: {error}",
+            plan.kind,
+            HEARTBEAT.as_secs(),
         )
     })?;
     // the grant mint is the audit-relevant event, and `service run` installs a
@@ -1109,7 +1139,9 @@ pub(crate) fn commit_enable(
 /// How often the daemon re-signals. A third of the TTL, so two consecutive
 /// lost heartbeats still leave the entry alive. Also the beat the airlock
 /// daemon re-asserts its gateway route on, so a daemon's two liveness signals
-/// travel together.
+/// travel together — and the period the node's announce watcher samples on
+/// (`crate::announce::TICK` IS this constant), because a watcher that sampled
+/// on its own copy of the formula would drift from the thing it is watching.
 pub(crate) const HEARTBEAT: std::time::Duration =
     std::time::Duration::from_secs(noded::services::HELLO_TTL.as_secs() / 3);
 
@@ -1606,19 +1638,29 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
         .position(|grant| grant.kind == kind)
         .ok_or_else(|| format!("{kind} is not enabled in {}", workspace.display()))?;
     let retired = services.grants.remove(position);
-    // RETRACT first, persist second — the same order `commit_enable` uses and
-    // for the same reason. A refusal here cannot come from this removal (a
-    // disable can only shrink the set); it means the file already held
-    // something the registry refuses, which `Services::validate` now prevents.
+    // PERSIST first, retract second — the same order `commit_enable` uses and
+    // for the same reason: a watcher tick between the two must never read a
+    // revoked grant off the chain and a live one off disk, and re-announce
+    // consent the operator has just withdrawn. Revocation lands on disk first,
+    // so the worst a concurrent tick can do is retract it slightly early.
+    //
+    // A refusal here cannot come from this removal (a disable only shrinks the
+    // set); it would mean the file already held something the registry refuses,
+    // which `Services::validate` prevents on load.
     let announce = crate::announce::announced_set(
         &services.grants,
         &signaling_now(&workspace),
         &service.sandbox_capacity,
     )
     .map_err(|refusal| format!("{kind} was not disabled: {refusal}"))?;
-    let height = crate::announce::submit(&base, &announce)
-        .map_err(|error| format!("{kind} was not disabled: {error}"))?;
     save(&workspace, &services)?;
+    let height = crate::announce::submit(&base, &announce).map_err(|error| {
+        format!(
+            "{kind}'s grant is revoked but the announce was NOT retracted — this node retries \
+             every {}s until it lands: {error}",
+            HEARTBEAT.as_secs(),
+        )
+    })?;
     println!("{}", retired.display_id());
     write_err(&format!(
         "disabled {kind}; {} is retired (a re-enable mints a fresh id) · retracted at height \
@@ -1673,6 +1715,175 @@ mod tests {
             scopes: vec![],
             needs: vec![],
         }
+    }
+
+    /// a workspace holding `grants`, plus a `ServiceConfig` pointed at it.
+    fn planning_workspace(
+        grants: &[(&str, &[&str])],
+    ) -> (tempfile::TempDir, config::ServiceConfig) {
+        let dir = tempfile::tempdir().expect("scratch workspace");
+        let mut services = Services::default();
+        for (kind, capabilities) in grants {
+            services.grants.push(ServiceGrant {
+                kind: (*kind).into(),
+                instance: "aa".repeat(32),
+                nonce: "bb".repeat(16),
+                granted_unix: 1,
+                capabilities: capabilities.iter().map(|t| t.to_string()).collect(),
+                scopes: Vec::new(),
+            });
+        }
+        services.grants.sort_by(|a, b| a.kind.cmp(&b.kind));
+        save(dir.path(), &services).expect("write grants");
+        let service = config::ServiceConfig {
+            workspace: dir.path().to_path_buf(),
+            storage_dir: dir.path().to_path_buf(),
+            chain_id: "test#00000000".into(),
+            http_listen: Some("127.0.0.1:1".into()),
+            sandbox: None,
+            sandbox_capacity: Default::default(),
+        };
+        (dir, service)
+    }
+
+    fn hello_offering(kind: &str, capabilities: &[&str]) -> noded::services::Signaling {
+        noded::services::Signaling {
+            kind: kind.into(),
+            version: "1".into(),
+            build: "b".into(),
+            capabilities: capabilities.iter().map(|t| t.to_string()).collect(),
+            scopes: Vec::new(),
+            needs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn planning_refuses_a_tag_the_registry_would_reject() {
+        // the hello boundary admits a space; the registry does not. The refusal
+        // has to land HERE, before the operator is asked to consent to a set
+        // this node can never announce.
+        let (dir, service) = planning_workspace(&[]);
+        let error = plan_enable_from(
+            dir.path(),
+            "compute",
+            &service,
+            NODE_A,
+            vec![hello_offering("compute", &["Claude Sonnet"])],
+        )
+        .expect_err("an illegal tag must refuse the plan");
+        assert!(error.contains("Claude Sonnet"), "the offending tag is named: {error}");
+    }
+
+    #[test]
+    fn planning_bounds_the_cap_independently_of_who_is_signaling() {
+        // THE order-dependence guard. `agent` is already granted a full budget
+        // of executors but its daemon is DOWN, so it contributes nothing to the
+        // live signaling set. Bounding the live union would let this enable
+        // through and let the total cross the cap later, when `agent` restarts
+        // and no verb is running to refuse it.
+        let many: Vec<String> = (0..63).map(|n| format!("e{n}")).collect();
+        let borrowed: Vec<&str> = many.iter().map(String::as_str).collect();
+        let (dir, service) = planning_workspace(&[("agent", &borrowed)]);
+        let error = plan_enable_from(
+            dir.path(),
+            "compute",
+            &service,
+            NODE_A,
+            // only compute is signaling; agent is absent.
+            vec![hello_offering("compute", &["codex"])],
+        )
+        .expect_err("the widest union crosses the cap, so the plan must refuse");
+        assert!(
+            error.contains("at most") || error.contains("64"),
+            "the refusal names the registry cap: {error}"
+        );
+    }
+
+    #[test]
+    fn planning_succeeds_when_the_widest_union_fits() {
+        // the same shape, under the cap — so the test above is pinning the
+        // bound rather than a plan that could never succeed.
+        let (dir, service) = planning_workspace(&[("agent", &["claude"])]);
+        let plan = plan_enable_from(
+            dir.path(),
+            "compute",
+            &service,
+            NODE_A,
+            vec![hello_offering("compute", &["codex"])],
+        )
+        .expect("a union well under the cap plans fine");
+        assert_eq!(plan.grant.kind, "compute");
+        assert_eq!(plan.grant.capabilities, vec!["codex".to_string()]);
+    }
+
+    /// Consent lands on DISK before it lands on chain, in both verbs.
+    ///
+    /// A source lint because the property is an ORDER between two writers, not
+    /// a value: `/v1/submit` answers only once consensus has settled, so there
+    /// is a real interval between the two. A watcher tick inside it compares the
+    /// chain against the file, and if the chain moved first it reads the verb's
+    /// own change as drift and submits the OPPOSITE — retracting a kind just
+    /// enabled, or re-announcing consent just revoked. Persisting first makes
+    /// that interval benign: the watcher then agrees with the verb.
+    #[test]
+    fn both_verbs_persist_before_they_announce() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/services.rs"))
+            .expect("this file");
+        for (verb, marker) in [
+            ("commit_enable", "pub(crate) fn commit_enable("),
+            ("disable", "fn disable(args: KindArgs)"),
+        ] {
+            let body = source
+                .split(marker)
+                .nth(1)
+                .and_then(|rest| rest.split("\nfn ").next())
+                .unwrap_or_else(|| panic!("{verb} has a body"));
+            let saved = body.find("save(").unwrap_or_else(|| panic!("{verb} persists"));
+            let announced = body
+                .find("announce::submit(")
+                .unwrap_or_else(|| panic!("{verb} announces"));
+            assert!(
+                saved < announced,
+                "{verb} announces before it persists — a watcher tick in between reads the \
+                 chain as ahead of the file and submits the opposite, undoing this verb"
+            );
+        }
+    }
+
+    /// The daemon must SURVIVE every way enabling can fail.
+    ///
+    /// A source lint rather than a behavioural test, because `offer_enable`
+    /// prompts on a TTY and writes to stderr, and the property is about control
+    /// flow rather than a value: NEITHER half of enabling may use `?`, because
+    /// this runs BEFORE the heartbeat thread is spawned, so an early return
+    /// exits the process and takes the signal with it — losing the daemon, the
+    /// hello, and the `service list` row that would have said why.
+    #[test]
+    fn neither_half_of_enabling_may_abort_the_daemon() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/services.rs"))
+            .expect("this file");
+        let body = source
+            .split("fn offer_enable(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("offer_enable has a body");
+        for call in ["plan_enable(", "commit_enable("] {
+            let site = body
+                .split(call)
+                .nth(1)
+                .unwrap_or_else(|| panic!("offer_enable calls {call}"));
+            let tail: String = site.chars().take(200).collect();
+            assert!(
+                !tail.contains(")?"),
+                "offer_enable must not `?` on {call} — it runs before the heartbeat \
+                 thread is spawned, so an early return kills the daemon instead of \
+                 leaving it signaling. Route the failure through `decline`."
+            );
+        }
+        assert!(
+            body.matches("decline(").count() >= 2,
+            "both halves of enabling must route their failure through `decline`"
+        );
     }
 
     /// Each way `/v1/status` can fail to name a node must produce its OWN
