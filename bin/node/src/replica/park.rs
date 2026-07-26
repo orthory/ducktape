@@ -26,7 +26,6 @@ use crate::host_state::{SyncSubstrates, restore_host, sync_all_modules};
 use crate::relay;
 use crate::relay_runtime;
 use crate::replica;
-use crate::validator::announce::{CapabilityAnnouncer, Fate, Rearm};
 use crate::rpc::{JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
 use crate::sync::catchup::{PostRebootCatchupError, catch_up_post_reboot_frames};
 use crate::sync::serve::{
@@ -34,6 +33,7 @@ use crate::sync::serve::{
     replica_orchestrator_at, replica_verifier, verify_manifest_floor, write_boundary_checkpoint,
 };
 use crate::util::{fatal, hex};
+use crate::validator::announce::{CapabilityAnnouncer, Fate, Rearm};
 use noded::projection::{BlockProjection, project_block};
 
 use super::promotion::{PromotionBoundary, choose_promotion_boundary, joiner_manifest_fetch_retry};

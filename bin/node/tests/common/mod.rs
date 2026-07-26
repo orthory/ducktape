@@ -362,6 +362,19 @@ impl NetworkShapeCluster {
     ///
     /// The FIRST hello is synchronous and asserted — that IS the readiness
     /// event; the refresh then rides a heartbeat thread like the daemon's.
+    ///
+    /// ponytail: two known divergences from the real daemon, both latent while
+    /// one serialized test uses this.
+    /// 1. The real daemon treats a failed FIRST hello as FATAL; this retries
+    ///    for 60s, so a permanent refusal (a build-identity skew) burns the
+    ///    whole budget and surfaces as a timeout instead of failing instantly.
+    ///    Fix by splitting connect-refused (retry, the node is still binding)
+    ///    from an answered non-200 (fail now) when a second caller appears.
+    /// 2. The heartbeat thread has no exit condition and no liveness check, and
+    ///    `common` is shared across test binaries over recycled port ranges —
+    ///    so a future SECOND caller could inject a stale `compute` hello into
+    ///    an unrelated cluster that inherited the port. Give it a stop flag
+    ///    cleared by `kill` at that point.
     pub fn signal_service(&mut self, idx: usize, kind: &str, capabilities: &[&str]) {
         let hello = noded::services::Hello {
             kind: kind.into(),

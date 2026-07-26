@@ -18,14 +18,30 @@ const ANNOUNCE_RETRY: Duration = Duration::from_secs(15);
 /// re-flushes it under the same id), so needing more than a couple of blocks
 /// already means something is wrong, and the cost of waiting is silence in the
 /// registry rather than a duplicate in the mempool.
+///
+/// ponytail: a fixed block budget, and the ceiling is the validator COUNT. A
+/// frame waits at most ~2V blocks (`eager_flush_due` requires `orderer_idle`,
+/// so this node has one batch outstanding at a time and round-robin leadership
+/// gives it a slot every V), which is comfortable at V ≤ 8, marginal near
+/// V ≈ 16 and wrong above it. The damage is bounded — the duplicate carries a
+/// fresh `seq` so it is a distinct `FrameId`, the first fate then fails
+/// `owns()` and drops silently, and the second lands as a declarative-replace
+/// no-op — so the upgrade (scale the budget by `current_members().len()`) waits
+/// for a network that big to exist.
 const ANNOUNCE_RETRY_BLOCKS: u64 = 32;
 
-/// a permanently-rejected announce is reported on the FIRST rejection and
-/// every Nth after it, carrying the count. The doctrine's rule for a
-/// forever-retry loop: an unconditional `warn!` on a ~1s round trip evicts the
-/// whole 4096-line ring in half an hour and destroys the evidence someone came
-/// to read — and the counter IS the diagnosis.
-const REJECTION_REPORT_EVERY: u64 = 32;
+/// a failed announce is reported on the FIRST failure and every Nth after it,
+/// carrying the count. The doctrine's rule for a forever-retry loop: an
+/// unconditional `warn!` on a ~1s round trip evicts the whole 4096-line ring in
+/// half an hour and destroys the evidence someone came to read — and the
+/// counter IS the diagnosis.
+const FAILURE_REPORT_EVERY: u64 = 32;
+
+/// the give-up reasons — a submitted announce whose consensus fate never
+/// arrived at all, which is a different diagnosis per lane than a fate that
+/// arrived and said no.
+const REASON_NEVER_ORDERED: &str = "announce_never_ordered";
+const REASON_REPLY_LOST: &str = "announce_reply_lost";
 
 /// what un-latches a submitted announce whose consensus fate never arrived.
 ///
@@ -82,7 +98,7 @@ pub(crate) enum Fate {
     /// carrying the consecutive-rejection count.
     Rejected { attempts: u64 },
     /// refused as well, and deliberately silent: one of the rejections BETWEEN
-    /// reports (see [`REJECTION_REPORT_EVERY`]).
+    /// reports (see [`FAILURE_REPORT_EVERY`]).
     RejectedQuietly,
 }
 
@@ -161,13 +177,14 @@ pub(crate) struct CapabilityAnnouncer {
     rearm: Rearm,
     /// the submitted announce awaiting its consensus fate.
     in_flight: Option<InFlight>,
-    /// consecutive non-applied fates since the last APPLIED announce (or
-    /// boot) — the retry counter the rejection warn carries. Deliberately not
-    /// reset when the offered set changes: "this node has failed to enter the
-    /// registry N times running" is the operator's question, and the pair is
-    /// re-latched identically after every rejection anyway, so a
-    /// per-pair reset would pin the counter at 1 and silence the throttle.
-    rejections: u64,
+    /// consecutive failures to get an announce APPLIED since the last one that
+    /// was (or boot) — counting BOTH a fate that came back rejected and a
+    /// frame whose fate never came at all, because "this node has failed to
+    /// enter the registry N times running" is the operator's one question and
+    /// both paths retry the same loop. Deliberately not reset when the offered
+    /// set changes: the pair is re-latched identically after every failure, so
+    /// a per-pair reset would pin the counter at 1 and silence the throttle.
+    failures: u64,
     /// whether the last grant read failed — latched so a corrupt
     /// `services.toml` is reported once, not once per drain tick.
     grant_unreadable: bool,
@@ -195,7 +212,7 @@ impl CapabilityAnnouncer {
             announced: None,
             rearm,
             in_flight: None,
-            rejections: 0,
+            failures: 0,
             grant_unreadable: false,
             over_cap: false,
             illegal_tags: false,
@@ -266,8 +283,7 @@ impl CapabilityAnnouncer {
             let Some(grant) = grants.iter().find(|grant| grant.kind == live.kind) else {
                 continue;
             };
-            let offers_now: BTreeSet<&str> =
-                live.capabilities.iter().map(String::as_str).collect();
+            let offers_now: BTreeSet<&str> = live.capabilities.iter().map(String::as_str).collect();
             // the kind rides even when the intersection is empty: a daemon that
             // spawns nothing (an airlock-style plug) still IS that kind, and
             // that is precisely what placement asks about.
@@ -485,27 +501,48 @@ impl CapabilityAnnouncer {
         }
         let flight = self.in_flight.take().expect("owns() proved it is latched");
         if applied {
-            self.rejections = 0;
+            self.failures = 0;
             return Some(Fate::Applied {
                 capabilities: flight.capabilities,
             });
         }
         self.announced = None;
-        self.rejections += 1;
-        Some(self.rejection_report())
+        if self.count_failure() {
+            return Some(Fate::Rejected {
+                attempts: self.failures,
+            });
+        }
+        Some(Fate::RejectedQuietly)
     }
 
-    /// the FIRST rejection and every [`REJECTION_REPORT_EVERY`]th after it are
-    /// reported; the ones between are counted only.
-    fn rejection_report(&self) -> Fate {
-        let first = self.rejections == 1;
-        let every_nth = self.rejections.is_multiple_of(REJECTION_REPORT_EVERY);
-        if first || every_nth {
-            return Fate::Rejected {
-                attempts: self.rejections,
-            };
+    /// count one more consecutive failure and answer whether THIS one is
+    /// reported: the first, then every [`FAILURE_REPORT_EVERY`]th.
+    fn count_failure(&mut self) -> bool {
+        self.failures += 1;
+        let first = self.failures == 1;
+        let every_nth = self.failures.is_multiple_of(FAILURE_REPORT_EVERY);
+        first || every_nth
+    }
+
+    /// abandon the in-flight announce: its consensus fate never arrived at all.
+    ///
+    /// This is the SIBLING of a rejection and gets the same treatment, because
+    /// it is the same forever-retry loop seen from the other side. Silence here
+    /// was the worse bug of the two: a rejection at least carries a module
+    /// reason, while a frame nobody ever answered leaves an operator with a
+    /// node that is out of every rendezvous pool and a log that says nothing at
+    /// all at the default level.
+    fn give_up(&mut self, reason: &'static str) {
+        if self.count_failure() {
+            tracing::warn!(
+                target: "ducktape::modules",
+                reason,
+                attempts = self.failures,
+                "a submitted capability announce never reached a consensus fate; \
+                 re-deciding and retrying from committed state"
+            );
         }
-        Fate::RejectedQuietly
+        self.submit_failed();
     }
 
     /// `blocks` more blocks finalized on this node's own lane: charge them
@@ -529,7 +566,7 @@ impl CapabilityAnnouncer {
         };
         let gave_up = left == 0;
         if gave_up {
-            self.submit_failed();
+            self.give_up(REASON_NEVER_ORDERED);
         }
     }
 
@@ -547,7 +584,7 @@ impl CapabilityAnnouncer {
             Expiry::Unordered(_) => false,
         };
         if gave_up {
-            self.submit_failed();
+            self.give_up(REASON_REPLY_LOST);
         }
     }
 
@@ -588,7 +625,8 @@ impl CapabilityAnnouncer {
             return None;
         };
         let offered = self.offered(now);
-        let (capabilities, resources) = self.decide(&offered, &committed_tags, &committed_resources)?;
+        let (capabilities, resources) =
+            self.decide(&offered, &committed_tags, &committed_resources)?;
         Some(Msg {
             target: "capability".into(),
             payload: encode_msg(&CapabilityMsg::Announce {
@@ -732,7 +770,10 @@ mod capability_announcer_tests {
         // a grant with NO daemon signaling offers nothing. This is the whole
         // point of the transition: the node discovers nothing itself, so a
         // grant alone is not evidence that anything can run.
-        assert!(offered(&mut a).is_empty(), "a grant without a hello offers nothing");
+        assert!(
+            offered(&mut a).is_empty(),
+            "a grant without a hello offers nothing"
+        );
         let nothing = offered(&mut a);
         assert_eq!(
             a.decide(&nothing, &[], &BTreeMap::new()),
@@ -741,7 +782,11 @@ mod capability_announcer_tests {
         );
 
         // a daemon signals: the intersection appears, with the KIND beside it.
-        signal(&catalog, "compute", &["agent.claude", "agent.codex", "agent.extra"]);
+        signal(
+            &catalog,
+            "compute",
+            &["agent.claude", "agent.codex", "agent.extra"],
+        );
         assert_eq!(
             offered(&mut a),
             tags(&["agent.claude", "agent.codex", "compute"]),
@@ -766,7 +811,10 @@ mod capability_announcer_tests {
             caps(8),
             Rearm::Silence,
         );
-        assert!(offered(&mut a).is_empty(), "no grant on disk: announce nothing");
+        assert!(
+            offered(&mut a).is_empty(),
+            "no grant on disk: announce nothing"
+        );
     }
 
     /// DEFECT: the announcer used to read the compute grant and nothing else,
@@ -804,8 +852,7 @@ mod capability_announcer_tests {
         // and the intersection is PER KIND: one daemon's hello can never
         // validate another kind's granted tag.
         let catalog = noded::services::ServiceCatalog::default();
-        let workspace =
-            granted_workspace(&[("agent", &["agent.claude"]), ("compute", &["codex"])]);
+        let workspace = granted_workspace(&[("agent", &["agent.claude"]), ("compute", &["codex"])]);
         let mut a = announcer(1, &workspace, &catalog, caps(8));
         // agent signals compute's tag; compute itself is silent.
         signal(&catalog, "agent", &["codex"]);
@@ -838,8 +885,7 @@ mod capability_announcer_tests {
             .collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
         let catalog = noded::services::ServiceCatalog::default();
-        let workspace =
-            granted_workspace(&[("agent", &many), ("compute", &many)]);
+        let workspace = granted_workspace(&[("agent", &many), ("compute", &many)]);
         let mut a = announcer(3, &workspace, &catalog, caps(8));
         signal(&catalog, "agent", &many);
         signal(&catalog, "compute", &many);
@@ -854,7 +900,10 @@ mod capability_announcer_tests {
             set.contains(&"agent".to_string()) && set.contains(&"compute".to_string()),
             "the kinds are kept whatever is dropped"
         );
-        assert!(a.over_cap, "and crossing the cap is latched for one warning");
+        assert!(
+            a.over_cap,
+            "and crossing the cap is latched for one warning"
+        );
 
         // sorted, so it can compare equal to the committed BTreeSet.
         let mut sorted = set.clone();
@@ -897,6 +946,100 @@ mod capability_announcer_tests {
         );
     }
 
+    /// the `Rearm` bound at a construction site, parsed out of `source`.
+    fn bound_rearm(source: &str) -> String {
+        source
+            .lines()
+            .skip_while(|line| !line.contains("CapabilityAnnouncer::new("))
+            .take_while(|line| !line.contains(");"))
+            .find_map(|line| {
+                let at = line.find("Rearm::")?;
+                Some(
+                    line[at + "Rearm::".len()..]
+                        .trim_end_matches(&[',', ' '][..])
+                        .to_string(),
+                )
+            })
+            .expect("the construction site binds a Rearm variant")
+    }
+
+    /// EACH TIER MUST BIND ITS OWN discriminant, and only two lines in the
+    /// tree decide that. Swapping them type-checks and leaves every behaviour
+    /// test green — [`the_validator_lane_ignores_the_clock_and_gives_up_on_blocks`]
+    /// proves the TYPE behaves, never that a lane HAS the right type.
+    ///
+    /// The wrong half is not cosmetic. `on_blocks` is called from the drain and
+    /// nowhere else, so a resident holding an `Expiry::Unordered` has a budget
+    /// nothing ever charges and a `rearm_if_stale` that refuses it by
+    /// construction: `in_flight` never clears and the pump is wedged forever on
+    /// one lost relay Reply — this file's original defect, on the very lane
+    /// whose stated design assumption is that its reply lane is lossy.
+    #[test]
+    fn each_tier_binds_its_own_rearm() {
+        let validator =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/validator/run.rs"))
+                .expect("the validator loop's source");
+        let resident =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/replica/park.rs"))
+                .expect("the resident park loop's source");
+        assert_eq!(
+            bound_rearm(&validator),
+            "Unordered",
+            "the validator submits into its OWN orderer and the drain charges \
+             `on_blocks`; wall-clock silence there is a stall, not a loss"
+        );
+        assert_eq!(
+            bound_rearm(&resident),
+            "Silence",
+            "the resident's frame sits in another node's custody and NOTHING calls \
+             `on_blocks` for it — an `Unordered` budget here never gets charged and \
+             wedges the pump on the first lost Reply"
+        );
+    }
+
+    /// the drain's announce wiring, guarded at the source: it has no unit-test
+    /// seam of its own (the loop needs a live `ValidatorRuntime`), and every
+    /// claim below survives deletion with 373 tests and the e2e still green.
+    #[test]
+    fn the_drain_routes_the_announce_and_suppresses_the_generic_warn() {
+        let drain = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/validator/run/drain.rs"
+        ))
+        .expect("the drain's source");
+        // ONE rejection must produce ONE line: the generic per-frame
+        // "op rejected in consensus" warn stands down for the frame the
+        // announce route already reports with the module detail AND `attempts`.
+        assert!(
+            drain.contains("!announce_is_ours"),
+            "the generic rejection warn must exclude this pump's own announce frame"
+        );
+        // the ownership question is asked BEFORE the route consumes the latch.
+        let owns_at = drain
+            .find("announcer.owns(&d.id)")
+            .expect("the drain reads ownership before routing");
+        let routes_at = drain
+            .find("announcer.on_outcome(")
+            .expect("the drain routes the announce outcome");
+        assert!(
+            owns_at < routes_at,
+            "`owns` answers nothing once `on_outcome` has taken the latch"
+        );
+        // all three fates are routed — a new variant must not compile away.
+        for fate in ["Fate::Applied", "Fate::Rejected", "Fate::RejectedQuietly"] {
+            assert!(drain.contains(fate), "the drain must route {fate}");
+        }
+        // and the block budget is charged AFTER the per-frame loop, so a fate
+        // arriving in this very drain settles the flight before it is billed.
+        let charge_at = drain
+            .find("announcer.on_blocks(")
+            .expect("the drain charges the validator lane's block budget");
+        assert!(
+            routes_at < charge_at,
+            "charging the budget before routing would drop the fate that just arrived"
+        );
+    }
+
     /// the TTL retraction, EXERCISED rather than simulated: one catalog, one
     /// hello, and the clock the announcer decides against moved past
     /// [`noded::services::HELLO_TTL`] — so the catalog's own expiry runs. (A
@@ -934,8 +1077,7 @@ mod capability_announcer_tests {
     #[test]
     fn an_absent_daemon_retracts_only_its_own_kind() {
         let catalog = noded::services::ServiceCatalog::default();
-        let workspace =
-            granted_workspace(&[("agent", &["agent.claude"]), ("compute", &["codex"])]);
+        let workspace = granted_workspace(&[("agent", &["agent.claude"]), ("compute", &["codex"])]);
         let mut a = announcer(8, &workspace, &catalog, caps(4));
         signal(&catalog, "compute", &["codex"]);
         assert_eq!(
@@ -1058,7 +1200,7 @@ mod capability_announcer_tests {
     fn a_permanently_rejected_announce_reports_attempt_one_then_every_nth() {
         let mut a = decided(Rearm::Unordered);
         let mut reported = Vec::new();
-        for round in 1..=REJECTION_REPORT_EVERY * 2 {
+        for round in 1..=FAILURE_REPORT_EVERY * 2 {
             // the pump re-decides and re-submits after every rejection.
             a.decide(&tags(&["codex"]), &[], &BTreeMap::new());
             a.sent(frame(round as u8), Instant::now());
@@ -1070,7 +1212,7 @@ mod capability_announcer_tests {
         }
         assert_eq!(
             reported,
-            vec![1, REJECTION_REPORT_EVERY, REJECTION_REPORT_EVERY * 2],
+            vec![1, FAILURE_REPORT_EVERY, FAILURE_REPORT_EVERY * 2],
             "64 rejections produce THREE warnings, each carrying its count"
         );
 
@@ -1142,6 +1284,10 @@ mod capability_announcer_tests {
             a.announced.is_none(),
             "un-latched so the next tick re-decides from committed state"
         );
+        // and the give-up is COUNTED, so the very next line the operator sees
+        // is `reason = announce_reply_lost, attempts = 1` rather than the
+        // silence this path used to emit at the default level.
+        assert_eq!(a.failures, 1, "abandoning a frame is a reported failure");
     }
 
     /// THE REGRESSION the hoist introduced: the validator inherited the
@@ -1171,6 +1317,21 @@ mod capability_announcer_tests {
             "blocks went by without our frame among them: that IS the loss"
         );
         assert!(a.announced.is_none(), "and the next tick re-decides");
+        assert_eq!(a.failures, 1, "abandoning a frame is a reported failure");
+
+        // the give-up path shares the rejection throttle rather than running a
+        // second one: a node failing to enter the registry is ONE story to an
+        // operator however the individual frames died, and a silent forever-
+        // retry was this round's worst regression.
+        for _ in 1..FAILURE_REPORT_EVERY {
+            a.decide(&tags(&["codex"]), &[], &BTreeMap::new());
+            a.sent(frame(2), Instant::now());
+            a.on_blocks(ANNOUNCE_RETRY_BLOCKS);
+        }
+        assert_eq!(
+            a.failures, FAILURE_REPORT_EVERY,
+            "every abandonment counts toward the same attempt-1-then-every-Nth report"
+        );
     }
 
     #[test]
@@ -1196,7 +1357,11 @@ mod capability_announcer_tests {
         let mut a = announcer(5, &workspace, &catalog, caps(8));
         // the hello boundary admits all three — that is the looser copy of
         // the rule this filter exists to absorb.
-        signal(&catalog, "compute", &["Claude Sonnet", "agent.claude", "UPPER"]);
+        signal(
+            &catalog,
+            "compute",
+            &["Claude Sonnet", "agent.claude", "UPPER"],
+        );
 
         assert_eq!(
             offered(&mut a),
