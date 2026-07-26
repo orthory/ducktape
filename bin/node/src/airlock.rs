@@ -93,13 +93,12 @@ pub(crate) struct Airlock {
 pub(crate) fn serve(airlock: Airlock) -> Result<(), Box<dyn std::error::Error>> {
     let Airlock { grant, service, http_base, workspace } = airlock;
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    runtime.block_on(run(
-        grant.display_id(),
-        service.storage_dir,
-        http_base,
-        workspace,
-        stop_requested(),
-    ))
+    runtime.block_on(async move {
+        // ARMED before `run` publishes anything (and inside the runtime, which
+        // installing a signal handler requires). See [`arm_stop_requested`].
+        let stop = arm_stop_requested();
+        run(grant.display_id(), service.storage_dir, http_base, workspace, stop).await
+    })
 }
 
 /// Serve until `stop` resolves. Split from [`serve`] so the route's whole
@@ -127,6 +126,16 @@ async fn run(
 
     // Register the loopback port only once the router exists: a route pointing
     // at a gateway that never came up is worse than no route at all.
+    //
+    // KNOWN RESIDUAL, not an oversight: this entry survives a death that runs no
+    // code — SIGKILL, the OOM killer, `abort()`, power loss, parent death. The
+    // node then keeps reverse-proxying authorized overlay ingress to a freed
+    // ephemeral port, and nothing re-validates it before dialing. The borrower
+    // is not misled (the node's connect-refused is a `GatewayFailure::Unavailable`
+    // -> 502, which the broker names `airlock_gateway_unreachable`), so what is
+    // missing is only the EVICTION, not the diagnosis. Its own PR: a stale entry
+    // dropped after N consecutive connect-refusals in `gateway_plane`, or a lease
+    // this beat renews. Deliberately not built here.
     let route = gateway::RouteName::named(AIRLOCK_ROUTE);
     crate::gateway_routes::register(&workspace, route.clone(), port)
         .map_err(|error| format!("register airlock gateway route: {error}"))?;
@@ -167,27 +176,41 @@ async fn run(
     served
 }
 
-/// Resolve when the operator stops this daemon: SIGTERM is what systemd and a
-/// killed shell send, SIGINT is Ctrl-C.
+/// Install the stop handlers NOW and return a future that waits on them: SIGTERM
+/// is what systemd and a killed shell send, SIGINT is Ctrl-C.
+///
+/// The split matters. `signal()` installs the handler when it is CALLED; the
+/// future it returns only waits. Building that future lazily inside the
+/// `select!` would leave a window between publishing the route and the first
+/// poll in which a SIGTERM takes its DEFAULT disposition — killing the process
+/// with a live route pointing at a port anything may then bind.
 ///
 /// A handler that will not install is NOT fatal — the daemon then dies without
 /// retiring its route, which is the behavior before this arm existed, not a new
-/// failure. It parks so the server keeps owning the process.
-async fn stop_requested() {
+/// failure. The future parks so the server keeps owning the process.
+///
+/// The other half is deliberately NOT closed, and should stay open: tokio's
+/// handlers remain installed after these `Signal`s drop, so a SECOND SIGTERM
+/// arriving during [`retire_route`] is swallowed and SIGKILL is the operator's
+/// only escape. Retiring is one file write — a hang there means an unwritable
+/// workspace, which is the real problem — and a SIGTERM-count escalation is not
+/// worth its complexity. Do not "finish" this.
+fn arm_stop_requested() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut terminate), Ok(mut interrupt)) =
-        (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
-    else {
-        tracing::warn!(
-            target: "ducktape::gateway",
-            reason = "signal_handler_install_failed",
-            "the airlock gateway route will not be retired on exit"
-        );
-        return std::future::pending().await;
-    };
-    tokio::select! {
-        _ = terminate.recv() => {}
-        _ = interrupt.recv() => {}
+    let armed = (signal(SignalKind::terminate()), signal(SignalKind::interrupt()));
+    async move {
+        let (Ok(mut terminate), Ok(mut interrupt)) = armed else {
+            tracing::warn!(
+                target: "ducktape::gateway",
+                reason = "signal_handler_install_failed",
+                "the airlock gateway route will not be retired on exit"
+            );
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
     }
 }
 
@@ -431,6 +454,18 @@ mod tests {
         seed_credential(&storage, "owner-codex-1");
         std::fs::write(workspace.join(crate::services::FILE_NAME), "this is not toml {{{").unwrap();
         assert_eq!(lending_without_a_grant(&storage, &workspace), None);
+    }
+
+    /// Arming installs a real signal handler, which PANICS outside a reactor
+    /// rather than erroring — so "inside the runtime, before the route is
+    /// published" is a constraint a refactor could silently break into a
+    /// production-only crash. This is the call site [`serve`] uses.
+    #[test]
+    fn stop_signals_arm_inside_the_daemon_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let _armed = arm_stop_requested();
+        });
     }
 
     /// The registered port is a standing instruction to the node's reverse
