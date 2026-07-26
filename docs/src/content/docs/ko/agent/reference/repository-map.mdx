@@ -31,8 +31,8 @@ import { WorkspaceMap } from '../../../../../components/diagram/WorkspaceMap.cli
 - `crates/system/governance`: valset 위의 validator-set governance.
 - `crates/system/identity`: canonical account, member key, display name, node
   binding.
-- `crates/system/duckdns`: optional `<handle>.duck` → AccountId naming. node나
-  service directory는 없다.
+- `crates/duckdns`: `<handle>.duck` → AccountId naming. module이 아니라
+  LIBRARY다 — `gateway` module이 이걸 품고 on-chain 절반을 소유한다.
 - `crates/system/wireguard`: WireGuard tunnel-upgrade protocol.
   `wireguard::effect`가 apply layer다.
 - `crates/system/nat-traversal`, `reachability`, `data-plane`, `overlay-net`:
@@ -40,8 +40,8 @@ import { WorkspaceMap } from '../../../../../components/diagram/WorkspaceMap.cli
   overlay seam.
 - `crates/system/lifecycle`, `capability`, `dispatch`, `tagging`: module code
   registry, capability registry, capability-routed dispatch, engagement routing.
-- `crates/system/blobstore`, `gateway`, `dispatch-oracle`: node-local blob
-  store, `.duck` gateway route state, host-side dispatch worker.
+- `crates/kernel/blobstore`: node-local content-addressed blob store, 어느 root에도
+  들어가지 않는다. `crates/modules/system/gateway`: `.duck` gateway route state.
 - `crates/duckfs/client`: OS-side duckfs checkout/commit engine — chunk
   hashing, versioned `.duckfs` index, worktree scan/status, change planning, 그리고
   sync `NodeApi` transport(HTTP). consensus path에는 절대 오르지 않는다.

@@ -35,8 +35,8 @@ workspace는 platform layer별로 구성되어 있다.
 - `crates/system/governance`: valset 위의 validator-set governance.
 - `crates/system/identity`: canonical account, member key, display name, node
   binding.
-- `crates/system/duckdns`: optional `<handle>.duck` → AccountId naming. node나
-  service directory는 없다.
+- `crates/duckdns`: `<handle>.duck` → AccountId naming. module이 아니라
+  LIBRARY다 — `gateway` module이 이걸 품고 on-chain 절반을 소유한다.
 - `crates/system/wireguard`: validator-set 기반 WireGuard tunnel-upgrade
   protocol. `wireguard::effect`가 apply layer다.
 - `crates/system/nat-traversal`, `reachability`, `data-plane`, `overlay-net`:
@@ -44,8 +44,8 @@ workspace는 platform layer별로 구성되어 있다.
   overlay seam.
 - `crates/system/lifecycle`, `capability`, `dispatch`, `tagging`: module code
   registry, executor capability, capability-routed dispatch, engagement routing.
-- `crates/system/blobstore`, `gateway`, `dispatch-oracle`: node-local blob
-  store, `.duck` gateway route state, host-side dispatch worker.
+- `crates/kernel/blobstore`: node-local content-addressed blob store, 어느 root에도
+  들어가지 않는다. `crates/modules/system/gateway`: `.duck` gateway route state.
 - wire surface: 각 module이 types-only payload와 query shape를 crate root(`src/interface.rs`)에 공개한다.
 
 ## Apps

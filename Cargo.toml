@@ -9,25 +9,39 @@
 #                      traits), host (submit/execute loop, root-hash composition,
 #                      the host::worker seam), node (ordered replication),
 #                      consensus (BFT orderer), statesync, recovery, indexer,
-#                      wasm-host (runs a ducktape:module component as a native
-#                      sdk::Module), module-guest (that world's WIT definition)
+#                      blobstore (node-local receipt-lane byte store — like
+#                      indexer, never in any root), wasm-host (runs a
+#                      ducktape:module component as a native sdk::Module),
+#                      module-guest (that world's WIT definition)
 #   crates/networking/ — the netstack: host-side transport infra ONLY
 #                      (wireguard, nat-traversal, reachability, data-plane,
 #                      overlay-net) — owns no consensus module
+#   crates/modules/   — CONSENSUS MODULES AND NOTHING ELSE. every crate under
+#                      system/ or apps/ implements `sdk::Module`; anything that
+#                      does not belongs somewhere else in this list. (module =
+#                      onchain, service = offchain.)
 #   crates/modules/system/ — system modules: consensus infrastructure (kv,
 #                      valset, governance, identity, lifecycle, saga,
-#                      capability, dispatch, tagging, gateway + its
-#                      absorbed duckdns naming library) and their host-side
-#                      counterparts (blobstore)
+#                      capability, dispatch, tagging, gateway — which absorbed
+#                      the duckdns naming library it now consumes from
+#                      crates/duckdns)
 #   crates/modules/apps/   — application modules, the product features (forge,
 #                      chat, pages, agent, runs, tasks, vaults, automations,
-#                      inbox, files, jobs)
+#                      inbox, files)
 #   crates/services/ — off-chain service crates: the host-side executors that
 #                      serve a consensus module without being one (compute —
 #                      the dispatch WorkSpec pool/ledger/gate; sandbox — the
 #                      node-local podman/egress/backend-probe muscle; broker —
 #                      the run-scoped credential loopback + airlock client;
-#                      provider — the executor spec layer + CliProvider run loop)
+#                      provider — the executor spec layer + CliProvider run loop;
+#                      agent — the pty session daemon; airlock — the lender)
+#   crates/airlock/  — the two-party execution/auth contract (see members below)
+#   crates/duckdns/  — the `.duck` account naming library: hostname grammar,
+#                      handle registry, wire types. NOT a module — the `gateway`
+#                      module embeds it and owns the onchain half, while the
+#                      four composing binaries parse/validate names host-side,
+#                      so it sits beside the other cross-plane libraries rather
+#                      than under the one module that happens to wrap it
 #   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
 #                      — the `files` module wraps it), disk, client (OS-side)
 #   crates/guests/   — shared wasm-port infra ONLY: guest-adapter (the
@@ -63,6 +77,10 @@ members = [
     "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
     "crates/kernel/index-guest",
+    # the node-local receipt-lane byte store. platform, not a module: it holds
+    # no consensus state and lands in no root — the same standing `indexer` has
+    # two lines up, and the reason it left crates/modules/system/.
+    "crates/kernel/blobstore",
     "crates/kernel/wasm-host",
     # networking — the netstack (host-side infra + the modules that govern it)
     "crates/networking/wireguard",
@@ -70,7 +88,7 @@ members = [
     "crates/networking/reachability",
     "crates/networking/data-plane",
     "crates/networking/overlay-net",
-    # modules/system — system modules and their host-side counterparts
+    # modules/system — system modules. every entry implements `sdk::Module`.
     "crates/modules/system/kv",
     "crates/modules/system/valset",
     "crates/modules/system/governance",
@@ -78,16 +96,20 @@ members = [
     "crates/modules/system/lifecycle",
     "crates/modules/system/saga",
     "crates/modules/system/capability",
-    "crates/modules/system/blobstore",
     "crates/modules/system/dispatch",
     "crates/modules/system/tagging",
-    "crates/modules/system/duckdns",
     "crates/modules/system/gateway",
     # airlock — the two-party execution/auth contract. NOT a consensus module
     # (no MODULE_ID, no guest wasm): a protocol shared by the lender service,
     # the borrower broker and the enclave binary, so it sits beside the other
     # cross-plane protocol families rather than under any one party.
     "crates/airlock",
+    # duckdns — the `.duck` naming library, same standing for the same reason.
+    # NOT a consensus module (no `sdk::Module`, no MODULE_ID, no guest wasm):
+    # `gateway` absorbed the onchain half and embeds this registry, while
+    # node/noded/simnode/demo parse and validate `.duck` names host-side. Under
+    # crates/modules/system/ it made "modules = onchain" literally false.
+    "crates/duckdns",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
@@ -243,6 +265,7 @@ consensus = { path = "crates/kernel/consensus" }
 statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }
+blobstore = { path = "crates/kernel/blobstore" }
 # keyed with the underscore ON PURPOSE: module crates declare a feature named
 # `index-guest` (the guest-builder --index contract), and cargo refuses a
 # feature sharing its name with a non-optional dependency key.
@@ -258,10 +281,8 @@ identity = { path = "crates/modules/system/identity" }
 lifecycle = { path = "crates/modules/system/lifecycle" }
 saga = { path = "crates/modules/system/saga" }
 capability = { path = "crates/modules/system/capability" }
-blobstore = { path = "crates/modules/system/blobstore" }
 dispatch = { path = "crates/modules/system/dispatch" }
 tagging = { path = "crates/modules/system/tagging" }
-duckdns = { path = "crates/modules/system/duckdns" }
 gateway = { path = "crates/modules/system/gateway" }
 forge = { path = "crates/modules/apps/forge" }
 design = { path = "crates/design" }
@@ -281,6 +302,10 @@ broker-host = { path = "crates/services/broker" }
 compute-service = { path = "crates/services/compute" }
 provider-host = { path = "crates/services/provider" }
 sandbox-host = { path = "crates/services/sandbox" }
+# internal — cross-plane libraries: neither a consensus module nor a service.
+# duckdns is the `.duck` naming library the `gateway` module embeds and the
+# composing binaries validate names through (see the members list).
+duckdns = { path = "crates/duckdns" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }
 duckfs-client = { path = "crates/duckfs/client" }
