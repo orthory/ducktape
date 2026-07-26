@@ -8,14 +8,32 @@
 //!
 //! - `Disabled` unregisters the routes entirely — the surface is simply ABSENT
 //!   (`router` never merges them), a 404, not a gated-but-present 403.
-//! - `Loopback` (the default): reachable only from loopback peers, and a
-//!   loopback peer is TRUSTED — no PoP. this matches `origin_guard`'s own model
-//!   (a loopback process can already read `user.key` off disk, so loopback is a
-//!   boundary this layer cannot tighten) and the capability matrix's "local
-//!   control is always available on loopback". frictionless local control.
+//! - `Loopback` (the default): reachable only from loopback peers, AND the peer
+//!   must present the operator credential ([`ADMIN_TOKEN_HEADER`]).
 //! - `Public`: reachable off-box, so the OWNER gate (A5) is the ONLY thing
 //!   standing between a remote caller and node control — enforced for every
 //!   peer. this is the new capability W2 adds, and the case PoP exists for.
+//!
+//! ## the operator gate — why loopback presence is NOT authority
+//!
+//! loopback used to BE the gate here, on the reasoning `origin_guard` states for
+//! itself: a local process can read `user.key` off disk anyway. that reasoning
+//! broke when compute, agent and airlock became separate local daemon
+//! processes — three long-lived programs now sit exactly where "any loopback
+//! peer" points, and any of them could `POST /v1/admin/shutdown` or stage module
+//! wasm without ever asking for a grant.
+//!
+//! so admin requires what the node's OWN workspace requires: a secret minted
+//! fresh each boot and written 0600 beside `node.toml` ([`mint_operator_token`]).
+//! that is the SAME bar, and the same mechanism, `service-link.token` already
+//! sets for the interactive plane (`crate::services::mint_link_token`) — the
+//! compare is literally `crate::services::token_matches`. it raises admin from
+//! "can dial loopback" to "can read the node's own workspace".
+//!
+//! CEILING, stated rather than assumed: a first-party daemon launched WITH the
+//! workspace path still clears this bar, because nothing in-process can gate a
+//! `read(2)` by the same uid. bounding that is the launch contract's job (start
+//! a daemon with a base URL, never with `--config`), not this file's.
 //!
 //! ## the owner gate (A5, only under `Public`)
 //!
@@ -28,11 +46,11 @@
 //! ## the bootstrap window
 //!
 //! a `Public` node with NO committed owner yet (fresh network, before the first
-//! `BindNode`) has nobody to authenticate against, so admin falls back to
-//! loopback-trust until the first bind commits — never drivable off-box with no
-//! owner check, collapsing to the full owner gate the instant ownership exists.
+//! `BindNode`) has nobody to authenticate against, so admin falls back to the
+//! operator gate until the first bind commits — never drivable off-box with no
+//! check at all, collapsing to the full owner gate the instant ownership exists.
 //! the embedded single-writer daemon (`node_key = None`, no consensus) can only
-//! ever be loopback-trust.
+//! ever be operator-gated.
 //!
 //! ## the PoP wire (mirrors `nat-traversal::auth`)
 //!
@@ -64,8 +82,8 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, Verifier as _, ed25519};
 use serde::Deserialize;
 
+use crate::NodeHandle;
 use crate::handle::NodeCommand;
-use crate::{NodeHandle, error_response};
 
 /// PoP signing namespace: `sign(ADMIN_REQ_NS, method ‖ 0x1f ‖ path ‖ 0x1f ‖ ts)`.
 pub const ADMIN_REQ_NS: &[u8] = b"ducktape-admin-req-v1";
@@ -79,8 +97,76 @@ pub const ADMIN_TS_HEADER: &str = "x-ducktape-admin-ts";
 /// hex ed25519 signature (64 bytes) over the canonical request bytes.
 pub const ADMIN_SIG_HEADER: &str = "x-ducktape-admin-sig";
 
+/// the operator credential — the secret [`mint_operator_token`] wrote into the
+/// node's workspace. a HEADER, never a path or query parameter: the logging
+/// doctrine forbids logging URIs precisely because a capability in a path is
+/// unredactable.
+pub const ADMIN_TOKEN_HEADER: &str = "x-ducktape-admin-token";
+
+/// the file a node writes its operator credential into, beside `node.toml`.
+pub const ADMIN_TOKEN_FILE: &str = "admin.token";
+
 /// the default identity module id ownership resolves against.
 pub const DEFAULT_IDENTITY_MODULE: &str = "identity";
+
+/// a fresh 32-byte operator credential, hex. for an embedder that holds the
+/// node in-process and so IS the operator (the test harness), with no workspace
+/// to write into.
+pub fn new_operator_token() -> String {
+    use rand::RngCore as _;
+    let mut raw = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut raw);
+    raw.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Mint this node's operator credential and write it 0600 into `dir` (the
+/// workspace beside `node.toml`, or the storage root on the embedded daemon).
+///
+/// Freshly minted each boot rather than persisted, for the reason
+/// `crate::services::mint_link_token` gives: a node restart must invalidate a
+/// stale holder, and a reader that opens the file per call pays nothing for it.
+///
+/// The 0600 create-new dance mirrors that function byte for byte; it is spelled
+/// out again here only because its writer is private to that module, which is
+/// under concurrent edit. Fold the two together once it settles.
+pub fn mint_operator_token(dir: &std::path::Path) -> Result<String, String> {
+    let token = new_operator_token();
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("admin token dir {}: {error}", dir.display()))?;
+    let path = dir.join(ADMIN_TOKEN_FILE);
+    // create 0600 from the start — a world-readable window, however short, is
+    // the whole thing this credential exists to avoid.
+    write_owner_only(&path, &token)
+        .map_err(|error| format!("admin token {}: {error}", path.display()))?;
+    Ok(token)
+}
+
+#[cfg(unix)]
+fn write_owner_only(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let _ = std::fs::remove_file(path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(token.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    std::fs::write(path, token)
+}
+
+/// Read a node's operator credential — what an operator client presents in
+/// [`ADMIN_TOKEN_HEADER`].
+pub fn read_operator_token(dir: &std::path::Path) -> Result<String, String> {
+    let path = dir.join(ADMIN_TOKEN_FILE);
+    std::fs::read_to_string(&path)
+        .map(|token| token.trim().to_string())
+        .map_err(|error| format!("admin token {}: {error}", path.display()))
+}
 
 /// how the node exposes its admin (control) namespace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,10 +210,14 @@ pub struct AdminConfig {
     pub exposure: AdminExposure,
     /// this node's own consensus key — the subject of the `BindNode` that names
     /// its owner. `None` on the embedded daemon (no consensus, no owner on
-    /// chain): admin stays loopback-trust there.
+    /// chain): admin stays operator-gated there.
     pub node_key: Option<Vec<u8>>,
     /// identity module id ownership resolves against.
     pub identity_module: String,
+    /// this boot's operator credential ([`mint_operator_token`]). `None` FAILS
+    /// CLOSED — a node that could not mint one refuses every admin request
+    /// rather than falling back to the loopback trust this replaced.
+    pub operator_token: Option<String>,
 }
 
 impl Default for AdminConfig {
@@ -136,6 +226,7 @@ impl Default for AdminConfig {
             exposure: AdminExposure::default(),
             node_key: None,
             identity_module: DEFAULT_IDENTITY_MODULE.to_string(),
+            operator_token: None,
         }
     }
 }
@@ -296,86 +387,232 @@ fn peer_is_loopback(req: &axum::extract::Request) -> bool {
         .unwrap_or(false)
 }
 
-/// the ONE gate over `/v1/admin/*`: exposure, then owner PoP (with the
-/// bootstrap fallback). runs BEFORE the body is read, so a large staged
-/// artifact never buffers here.
+/// Why an admin request was turned away. Typed exactly like
+/// [`crate::services::HelloRefusal`]: the status and the stable snake_case
+/// `reason` are DERIVED from the variant, so they cannot drift apart and a typo
+/// cannot silently downgrade a refusal.
+///
+/// No variant's message names the expected credential, any part of it, or the
+/// request URI — the caller learns only which check it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminRefusal {
+    /// the namespace is not registered on this node at all.
+    NamespaceAbsent,
+    /// a non-loopback peer, on a node whose admin is not publicly exposed.
+    OffBox,
+    /// this node minted no operator credential, so it can verify nothing.
+    OperatorTokenUnavailable,
+    /// the request carried no operator credential.
+    OperatorTokenMissing,
+    /// the operator credential presented is not this node's.
+    OperatorTokenMismatch,
+    /// the committed owner could not be read (identity module unreachable).
+    OwnerUnresolved,
+    /// the owner PoP is absent or does not verify.
+    OwnerSignatureInvalid,
+    /// the owner PoP is outside the freshness window.
+    OwnerSignatureStale,
+    /// a valid PoP by a key that does not own this node.
+    NotTheOwner,
+}
+
+impl AdminRefusal {
+    /// the stable snake_case token — greppable, countable, never prose.
+    pub fn reason(self) -> &'static str {
+        match self {
+            AdminRefusal::NamespaceAbsent => "admin_namespace_absent",
+            AdminRefusal::OffBox => "admin_off_box",
+            AdminRefusal::OperatorTokenUnavailable => "operator_token_unavailable",
+            AdminRefusal::OperatorTokenMissing => "operator_token_missing",
+            AdminRefusal::OperatorTokenMismatch => "operator_token_mismatch",
+            AdminRefusal::OwnerUnresolved => "owner_unresolved",
+            AdminRefusal::OwnerSignatureInvalid => "owner_signature_invalid",
+            AdminRefusal::OwnerSignatureStale => "owner_signature_stale",
+            AdminRefusal::NotTheOwner => "not_the_owner",
+        }
+    }
+
+    /// 404 for "there is nothing here"; 401 for "you presented nothing usable";
+    /// 403 for "you presented something, and it is not enough"; 503 for "this
+    /// node cannot serve the check at all".
+    pub fn status(self) -> StatusCode {
+        match self {
+            AdminRefusal::NamespaceAbsent => StatusCode::NOT_FOUND,
+            AdminRefusal::OffBox => StatusCode::FORBIDDEN,
+            AdminRefusal::OperatorTokenUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            AdminRefusal::OperatorTokenMissing => StatusCode::UNAUTHORIZED,
+            AdminRefusal::OperatorTokenMismatch => StatusCode::FORBIDDEN,
+            AdminRefusal::OwnerUnresolved => StatusCode::SERVICE_UNAVAILABLE,
+            AdminRefusal::OwnerSignatureInvalid => StatusCode::UNAUTHORIZED,
+            AdminRefusal::OwnerSignatureStale => StatusCode::UNAUTHORIZED,
+            AdminRefusal::NotTheOwner => StatusCode::FORBIDDEN,
+        }
+    }
+
+    /// the operator-facing sentence. names the FILE to read, never its contents.
+    pub fn message(self) -> &'static str {
+        match self {
+            AdminRefusal::NamespaceAbsent => "not found",
+            AdminRefusal::OffBox => "admin namespace is not reachable off-box on this node",
+            AdminRefusal::OperatorTokenUnavailable => {
+                "this node minted no operator credential, so it refuses every admin request"
+            }
+            AdminRefusal::OperatorTokenMissing => {
+                "admin requires the operator credential from admin.token in the node's workspace"
+            }
+            AdminRefusal::OperatorTokenMismatch => "that operator credential is not this node's",
+            AdminRefusal::OwnerUnresolved => "cannot resolve node owner",
+            AdminRefusal::OwnerSignatureInvalid => "admin request needs a valid owner signature",
+            AdminRefusal::OwnerSignatureStale => "admin request timestamp is stale",
+            AdminRefusal::NotTheOwner => "signer is not the node owner",
+        }
+    }
+}
+
+/// everything the gate decides on, captured from the request BEFORE any await:
+/// an axum `Request` is not `Sync`, so a reference to one cannot be held across
+/// the owner lookup. Nothing here is the BODY — the gate must never buffer one
+/// (`module-code/stage` streams a large artifact).
+struct Presented {
+    peer_is_loopback: bool,
+    method: String,
+    path_and_query: String,
+    headers: HeaderMap,
+}
+
+impl Presented {
+    fn of(req: &axum::extract::Request) -> Self {
+        Self {
+            peer_is_loopback: peer_is_loopback(req),
+            method: req.method().as_str().to_string(),
+            path_and_query: req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| req.uri().path().to_string()),
+            headers: req.headers().clone(),
+        }
+    }
+}
+
+/// the ONE gate over `/v1/admin/*`: decide, then run or refuse. runs BEFORE the
+/// body is read, so a large staged artifact never buffers here.
 pub async fn admin_guard(
     State(handle): State<NodeHandle>,
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    let cfg = &handle.admin;
-    let loopback = peer_is_loopback(&req);
+    let presented = Presented::of(&req);
+    match admit(&handle, &presented).await {
+        Ok(()) => next.run(req).await,
+        Err(refusal) => refuse(refusal),
+    }
+}
 
+/// the decide half: one `match` on the exposure, each arm one delegation. reads
+/// the request, writes nothing.
+async fn admit(handle: &NodeHandle, presented: &Presented) -> Result<(), AdminRefusal> {
+    let cfg = &handle.admin;
     match cfg.exposure {
         // `router` never mounts these when disabled; this arm is belt-and-braces.
-        AdminExposure::Disabled => error_response(StatusCode::NOT_FOUND, "not found"),
-        // LOOPBACK exposure: on-box access is the gate. loopback-trust matches
-        // `origin_guard`'s own model — a loopback process can already read
-        // `user.key` off disk, and the capability matrix makes local control
-        // "always available on loopback". a non-loopback peer never gets in.
-        AdminExposure::Loopback => require_loopback(loopback, req, next).await,
+        AdminExposure::Disabled => Err(AdminRefusal::NamespaceAbsent),
+        // LOOPBACK exposure: on-box AND holding the operator credential.
+        AdminExposure::Loopback => admit_operator(cfg, presented),
         // PUBLIC exposure: the surface is reachable off-box, so the OWNER PoP is
-        // the only gate that matters (ADR A5) — enforced for every peer,
-        // loopback or not. a node with no owner to authenticate against (no
-        // consensus, or the pre-bind bootstrap window) can only fall back to
-        // loopback-trust: it must not be drivable off-box with no owner check.
-        AdminExposure::Public => {
-            let Some(node_key) = cfg.node_key.as_deref() else {
-                return require_loopback(loopback, req, next).await;
-            };
-            match resolve_owner(&handle, &cfg.identity_module, node_key).await {
-                OwnerResolve::Unavailable => {
-                    error_response(StatusCode::SERVICE_UNAVAILABLE, "cannot resolve node owner")
-                }
-                OwnerResolve::NoOwner => require_loopback(loopback, req, next).await,
-                OwnerResolve::Owned(members) => {
-                    enforce_owner_pop(members, node_key, req, next).await
-                }
-            }
-        }
+        // the gate that matters (ADR A5) — enforced for every peer, loopback or
+        // not. a node with no owner to authenticate against (no consensus, or
+        // the pre-bind bootstrap window) falls back to the operator credential:
+        // it must not be drivable with no check at all.
+        AdminExposure::Public => admit_public(handle, cfg, presented).await,
     }
+}
+
+/// PUBLIC exposure: the owner PoP where an owner exists, the operator
+/// credential where one does not yet.
+async fn admit_public(
+    handle: &NodeHandle,
+    cfg: &AdminConfig,
+    presented: &Presented,
+) -> Result<(), AdminRefusal> {
+    let Some(node_key) = cfg.node_key.as_deref() else {
+        return admit_operator(cfg, presented);
+    };
+    match resolve_owner(handle, &cfg.identity_module, node_key).await {
+        OwnerResolve::Unavailable => Err(AdminRefusal::OwnerUnresolved),
+        OwnerResolve::NoOwner => admit_operator(cfg, presented),
+        OwnerResolve::Owned(members) => admit_owner(&members, node_key, presented),
+    }
+}
+
+/// the operator gate: a loopback peer holding this boot's workspace credential.
+/// BOTH, conjunctively — loopback alone is what this file stopped trusting, and
+/// the credential alone must not re-open the off-box reach `Loopback` denies.
+fn admit_operator(cfg: &AdminConfig, presented: &Presented) -> Result<(), AdminRefusal> {
+    if !presented.peer_is_loopback {
+        return Err(AdminRefusal::OffBox);
+    }
+    let Some(expected) = cfg.operator_token.as_deref() else {
+        return Err(AdminRefusal::OperatorTokenUnavailable);
+    };
+    let Some(offered) = header_str(&presented.headers, ADMIN_TOKEN_HEADER) else {
+        return Err(AdminRefusal::OperatorTokenMissing);
+    };
+    // the SAME constant-time compare the service link uses — one implementation.
+    let credential_matches = crate::services::token_matches(offered, expected);
+    if !credential_matches {
+        return Err(AdminRefusal::OperatorTokenMismatch);
+    }
+    Ok(())
 }
 
 /// the owner PoP gate: the request must carry a fresh signature by a key that
 /// is a member of the account owning this node, bound to THIS node's key.
-async fn enforce_owner_pop(
-    members: Vec<Vec<u8>>,
+fn admit_owner(
+    members: &[Vec<u8>],
     node_key: &[u8],
-    req: axum::extract::Request,
-    next: Next,
-) -> Response {
-    let method = req.method().as_str().to_string();
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| req.uri().path().to_string());
-    match verify_pop(req.headers(), &method, &path, node_key, now_secs()) {
-        Ok(account_key) if members.contains(&account_key) => next.run(req).await,
-        Ok(_) => error_response(StatusCode::FORBIDDEN, "signer is not the node owner"),
-        Err(PopError::Stale) => {
-            error_response(StatusCode::UNAUTHORIZED, "admin request timestamp is stale")
+    presented: &Presented,
+) -> Result<(), AdminRefusal> {
+    let account_key = match verify_pop(
+        &presented.headers,
+        &presented.method,
+        &presented.path_and_query,
+        node_key,
+        now_secs(),
+    ) {
+        Ok(key) => key,
+        Err(PopError::Stale) => return Err(AdminRefusal::OwnerSignatureStale),
+        Err(PopError::MissingAuth | PopError::BadKey | PopError::BadSig) => {
+            return Err(AdminRefusal::OwnerSignatureInvalid);
         }
-        Err(_) => error_response(
-            StatusCode::UNAUTHORIZED,
-            "admin request needs a valid owner signature",
-        ),
+    };
+    let signer_owns_this_node = members.contains(&account_key);
+    if !signer_owns_this_node {
+        return Err(AdminRefusal::NotTheOwner);
     }
+    Ok(())
 }
 
-/// a loopback peer passes; a non-loopback peer is refused. the loopback-trust
-/// states are LOOPBACK exposure, the embedded daemon (no owner on chain), and a
-/// full node still in its pre-bind bootstrap window.
-async fn require_loopback(loopback: bool, req: axum::extract::Request, next: Next) -> Response {
-    if loopback {
-        next.run(req).await
-    } else {
-        error_response(
-            StatusCode::FORBIDDEN,
-            "admin namespace is not reachable off-box on this node",
-        )
-    }
+/// the write half: one refusal body, mirroring `services::hello`'s shape.
+///
+/// `debug`, not `warn`: a refusal is per-request and any local process can drive
+/// one in a loop, so an unconditional `warn!` here would evict the 4096-line ring
+/// — the exact hazard `error_response` already latches for. The `reason` token is
+/// the greppable half; the URI never appears.
+fn refuse(refusal: AdminRefusal) -> Response {
+    tracing::debug!(
+        target: "ducktape::admin",
+        reason = refusal.reason(),
+        status = refusal.status().as_u16(),
+        "admin request refused"
+    );
+    (
+        refusal.status(),
+        Json(serde_json::json!({
+            "error": refusal.message(),
+            "reason": refusal.reason(),
+        })),
+    )
+        .into_response()
 }
 
 /// the admin sub-router: control routes plus the owner gate. merged into the
@@ -610,6 +847,53 @@ mod tests {
         assert_eq!(AdminExposure::from_flag(""), AdminExposure::Loopback);
         assert!(!AdminExposure::Disabled.enabled());
         assert!(AdminExposure::Loopback.enabled());
+    }
+
+    /// the operator credential is OWNER-ONLY on disk and round-trips — a
+    /// world-readable one would hand admin to every process on the box, which
+    /// is the exact thing this gate exists to stop.
+    #[test]
+    #[cfg(unix)]
+    fn the_operator_token_is_owner_only_and_round_trips() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let minted = mint_operator_token(dir.path()).expect("mint");
+        assert_eq!(read_operator_token(dir.path()).as_deref(), Ok(minted.as_str()));
+        let mode = std::fs::metadata(dir.path().join(ADMIN_TOKEN_FILE))
+            .expect("token file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // fresh each boot: a second mint over the same dir replaces the secret,
+        // so a restart invalidates a stale holder.
+        let reminted = mint_operator_token(dir.path()).expect("re-mint");
+        assert_ne!(reminted, minted);
+        // and it is a real 32-byte secret, not a guessable constant.
+        assert_eq!(minted.len(), 64);
+    }
+
+    #[test]
+    fn a_refusal_names_one_stable_reason_per_variant() {
+        // the reason token is the machine contract; no two variants may share
+        // one, or a dashboard cannot tell "no credential" from "wrong one".
+        let all = [
+            AdminRefusal::NamespaceAbsent,
+            AdminRefusal::OffBox,
+            AdminRefusal::OperatorTokenUnavailable,
+            AdminRefusal::OperatorTokenMissing,
+            AdminRefusal::OperatorTokenMismatch,
+            AdminRefusal::OwnerUnresolved,
+            AdminRefusal::OwnerSignatureInvalid,
+            AdminRefusal::OwnerSignatureStale,
+            AdminRefusal::NotTheOwner,
+        ];
+        let mut reasons: Vec<&str> = all.iter().map(|r| r.reason()).collect();
+        reasons.sort_unstable();
+        let unique = reasons.len();
+        reasons.dedup();
+        assert_eq!(reasons.len(), unique, "two refusals share a reason token");
+        // nothing is a 2xx, and nothing leaks prose that could carry a secret.
+        assert!(all.iter().all(|r| !r.status().is_success()));
     }
 
     #[test]

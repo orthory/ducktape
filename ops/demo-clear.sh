@@ -70,8 +70,13 @@ try {
 } catch {}
 JS
 )"
-if [ -n "$HTTP_PORT" ]; then
-  curl -s -m 2 -X POST "http://127.0.0.1:$HTTP_PORT/v1/admin/shutdown" >/dev/null 2>&1
+if [ -n "$HTTP_PORT" ] && [ -r "$WSDIR/admin.token" ]; then
+  # /v1/admin/* is the OPERATOR's plane: loopback presence is not authority (a
+  # service daemon is a loopback peer too), so the request carries the credential
+  # the node minted 0600 into its own workspace. No token readable => skip
+  # straight to the pid sweep below.
+  curl -s -m 2 -X POST "http://127.0.0.1:$HTTP_PORT/v1/admin/shutdown" \
+    -H "x-ducktape-admin-token: $(cat "$WSDIR/admin.token")" >/dev/null 2>&1
 fi
 
 PIDS="$(node_pids | xargs)"

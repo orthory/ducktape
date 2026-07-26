@@ -30,6 +30,10 @@ use crate::{
 /// thread serving the client surface, torn down cleanly on drop.
 pub struct InProcDaemon {
     port: u16,
+    /// this harness's admin credential. The harness OWNS the node in-process, so
+    /// it is the operator — there is no workspace to write the token into, and
+    /// nothing outside this struct ever learns it.
+    operator_token: String,
     server: Option<JoinHandle<()>>,
     actor: Option<JoinHandle<()>>,
 }
@@ -50,6 +54,14 @@ impl InProcDaemon {
         // the testkit has no mesh and no registry: an empty exposition
         // parses to the honest empty peers sample and an empty scrape.
         status.wire_exposition(String::new);
+        // the admin namespace is operator-gated, and this harness serves on a
+        // REAL loopback port — so it mints a real per-instance credential rather
+        // than a shared literal any other local process could guess.
+        let operator_token = crate::admin::new_operator_token();
+        let handle = handle.with_admin(crate::AdminConfig {
+            operator_token: Some(operator_token.clone()),
+            ..Default::default()
+        });
 
         // the readiness event, same contract as `bin/noded`'s daemon: genesis
         // runs on the actor thread and publishes the boot snapshot, and only
@@ -83,6 +95,7 @@ impl InProcDaemon {
 
         let daemon = Self {
             port,
+            operator_token,
             server: Some(server),
             actor: Some(actor),
         };
@@ -124,7 +137,12 @@ impl Drop for InProcDaemon {
         // its sole handle drops → the command channel closes → both threads end,
         // so a caller's tempdir (dropped AFTER this) is removed only once the
         // host's qmdb handles are closed.
-        let _ = nettest::http_status(self.port, "POST", "/v1/admin/shutdown");
+        let _ = nettest::http_status_with(
+            self.port,
+            "POST",
+            "/v1/admin/shutdown",
+            &[(crate::admin::ADMIN_TOKEN_HEADER, &self.operator_token)],
+        );
         if let Some(server) = self.server.take() {
             let _ = server.join();
         }

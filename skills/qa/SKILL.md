@@ -40,6 +40,17 @@ phrases in reports.
 Never use `pkill -f` — a pattern match will cheerfully kill an editor, a grep,
 or an unrelated node. Identify a process by executable, process cwd, and the
 workspace's `--config` before signalling it, or use the node's own graceful
-`/v1/admin/shutdown`. For merged-worktree cleanup, dry-run
+`/v1/admin/shutdown`. Every `/v1/admin/*` route requires the OPERATOR
+credential — loopback presence is not authority, since a service daemon is a
+loopback peer too. Present the secret the node minted 0600 into its own
+workspace:
+
+```
+curl -XPOST localhost:$PORT/v1/admin/shutdown \
+  -H "x-ducktape-admin-token: $(cat "$WORKSPACE/admin.token")"
+```
+
+Never paste that token (or the file's contents) into a report. For
+merged-worktree cleanup, dry-run
 `ops/worktree-clean.sh` and then use `--yes`; its retired-workflow reaper is
 intentionally preserved for old external homes and never uses `pkill -f`.

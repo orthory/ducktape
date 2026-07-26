@@ -468,21 +468,45 @@ async fn metrics_forwards_the_encoded_registry_as_openmetrics_text() {
     );
 }
 
+/// this test node's operator credential — what a real node mints 0600 into its
+/// workspace and hands only to whoever can read that directory.
+const OPERATOR: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+/// a handle whose admin namespace is gated on [`OPERATOR`], default exposure.
+fn operator_handle() -> (NodeHandle, mpsc::Receiver<NodeCommand>) {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let handle = handle.with_admin(AdminConfig {
+        operator_token: Some(OPERATOR.to_string()),
+        ..Default::default()
+    });
+    (handle, cmd_rx)
+}
+
+/// stamp the operator credential onto a request the way a client that read
+/// `admin.token` out of the node's workspace would.
+fn with_operator(mut req: Request<Body>) -> Request<Body> {
+    req.headers_mut().insert(
+        noded::admin::ADMIN_TOKEN_HEADER,
+        OPERATOR.parse().expect("token is a header value"),
+    );
+    req
+}
+
 #[tokio::test]
 async fn shutdown_acknowledges_then_signals() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx) = operator_handle();
     spawn_fake_actor(cmd_rx, None);
     let signal = handle.clone();
 
     // shutdown moved to the owner-gated admin namespace (ADR A2). the default
-    // handle is loopback-trust with no on-chain owner; the loopback check is
-    // FAIL-CLOSED on a missing ConnectInfo, so the test stamps a loopback peer
-    // exactly as the connect-info make-service would.
+    // handle has no on-chain owner, so the operator credential is the gate; the
+    // loopback check is FAIL-CLOSED on a missing ConnectInfo, so the test stamps
+    // a loopback peer exactly as the connect-info make-service would.
     let response = noded::router(handle)
-        .oneshot(with_peer(
+        .oneshot(with_operator(with_peer(
             post("/v1/admin/shutdown", serde_json::json!({})),
             "127.0.0.1:40000",
-        ))
+        )))
         .await
         .unwrap();
 
@@ -562,6 +586,97 @@ async fn a_non_loopback_peer_is_refused_under_loopback_exposure() {
         response.status(),
         StatusCode::FORBIDDEN,
         "loopback-only admin refuses a remote peer"
+    );
+}
+
+/// THE regression this gate exists for: a LOOPBACK process with no operator
+/// credential — a service daemon, a stray script, anything that can dial the
+/// port — must not be able to stop the node or stage module wasm. The operator,
+/// who read `admin.token` out of the node's own workspace, still can.
+#[tokio::test]
+async fn a_loopback_caller_without_the_operator_credential_cannot_drive_admin() {
+    // both destructive routes: shutdown stops the process, module-code/stage
+    // ingests a wasm artifact and fans it out to members.
+    for route in ["/v1/admin/shutdown", "/v1/admin/module-code/stage"] {
+        let (handle, cmd_rx) = operator_handle();
+        spawn_fake_actor(cmd_rx, None);
+        let response = noded::router(handle)
+            .oneshot(with_peer(
+                post(route, serde_json::json!({})),
+                "127.0.0.1:40000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{route} must refuse an uncredentialed loopback caller"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["reason"], "operator_token_missing");
+        // the refusal must never hand back the credential it wanted.
+        assert!(
+            !body.to_string().contains(OPERATOR),
+            "a refusal must never echo the expected credential"
+        );
+    }
+
+    // a WRONG credential is a distinct, and distinctly named, refusal.
+    let (handle, cmd_rx) = operator_handle();
+    spawn_fake_actor(cmd_rx, None);
+    let mut guessed = with_peer(
+        post("/v1/admin/shutdown", serde_json::json!({})),
+        "127.0.0.1:40000",
+    );
+    guessed
+        .headers_mut()
+        .insert(noded::admin::ADMIN_TOKEN_HEADER, "deadbeef".parse().unwrap());
+    let response = noded::router(handle).oneshot(guessed).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["reason"], "operator_token_mismatch");
+
+    // and the operator still gets through — a gate that locks the owner out is
+    // a worse bug than the one it closes.
+    let (handle, cmd_rx) = operator_handle();
+    spawn_fake_actor(cmd_rx, None);
+    let signal = handle.clone();
+    let response = noded::router(handle)
+        .oneshot(with_operator(with_peer(
+            post("/v1/admin/shutdown", serde_json::json!({})),
+            "127.0.0.1:40000",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // wait on the system's own event, not on a duration.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        signal.shutdown_requested(),
+    )
+    .await
+    .expect("the operator's shutdown reached the node");
+}
+
+/// FAIL CLOSED: a node that minted no operator credential verifies nothing, so
+/// it refuses every admin request. There is no "unauthenticated if unset" arm —
+/// that fallback IS the hole this gate closes.
+#[tokio::test]
+async fn a_node_with_no_minted_credential_refuses_every_admin_request() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    // the default config carries no token, and the default exposure is Loopback.
+    assert_eq!(AdminConfig::default().operator_token, None);
+    let response = noded::router(handle)
+        .oneshot(with_operator(with_peer(
+            post("/v1/admin/shutdown", serde_json::json!({})),
+            "127.0.0.1:40000",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body_json(response).await["reason"],
+        "operator_token_unavailable"
     );
 }
 
