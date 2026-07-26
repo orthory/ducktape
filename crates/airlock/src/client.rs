@@ -38,6 +38,31 @@ pub enum SessionResponseFault {
     TokenWouldNotOpen,
 }
 
+/// The gateway ANSWERED and refused, carrying its own stable reason token as the
+/// body.
+///
+/// Tagged onto the error the same way [`SessionResponseFault`] is, and for the
+/// same reason: `error_for_status` throws the body away, and a bare 403 cannot
+/// tell "your grant is missing" from "you claimed an account the transport did
+/// not vouch for" — two refusals whose operator actions have nothing in common.
+/// The token is the gateway's own; this type only carries it across the
+/// boundary and never invents one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRefusedBy {
+    pub status: u16,
+    /// the response body verbatim. A snake_case token from this crate's own
+    /// gateway; free prose from anything else in the path (a node's proxy).
+    pub reason: String,
+}
+
+impl std::fmt::Display for SessionRefusedBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the gateway refused the session ({}): {}", self.status, self.reason)
+    }
+}
+
+impl std::error::Error for SessionRefusedBy {}
+
 impl std::fmt::Display for SessionResponseFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -159,7 +184,7 @@ impl Gateway {
         // Everything from `.json()` down runs on an ARRIVED response, so each
         // step tags itself (see [`SessionResponseFault`]) — the caller must not
         // have to guess which one failed from an absent transport error.
-        let resp: SessionResponse = self
+        let response = self
             .route(self.http.post(self.url("/session")))
             .json(&SessionRequest {
                 sub: sub.to_string(),
@@ -168,11 +193,16 @@ impl Gateway {
                 account_b64: account.map(|a| BASE64.encode(a)),
             })
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context(SessionResponseFault::Malformed)?;
+            .await?;
+        // Not `error_for_status`: it discards the body, which is where the
+        // gateway's own refusal token lives. See [`SessionRefusedBy`].
+        let status = response.status();
+        if !status.is_success() {
+            let reason = response.text().await.unwrap_or_default();
+            return Err(SessionRefusedBy { status: status.as_u16(), reason }.into());
+        }
+        let resp: SessionResponse =
+            response.json().await.context(SessionResponseFault::Malformed)?;
         let sealed = BASE64
             .decode(&resp.sealed_token_b64)
             .context(SessionResponseFault::Malformed)?;

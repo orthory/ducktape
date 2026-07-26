@@ -9,12 +9,21 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+/// Strict, like every type in `wire`: an unknown field in a token payload is a
+/// producer out of step, not something to skip past.
+///
+/// There is deliberately NO `max_requests` claim. One was minted into every
+/// token and read for a decision nowhere — the live budget keys on `sub` (the
+/// credential NAME) and is refilled by every `/session`, so the number in the
+/// token described a cap that did not exist. An unenforced field in a signed
+/// token is worse than no field: the next reader trusts it. The real budget and
+/// its actual scope are documented on `server::AppState::budgets`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Claims {
     pub sub: String,
     pub iat: u64,
     pub exp: u64,
-    pub max_requests: u32,
     /// base64url of the session's client ephemeral X25519 pk — the enclave
     /// re-derives the handshake keys from it statelessly per request.
     pub eph: String,
@@ -58,7 +67,6 @@ mod tests {
             sub: "demo".into(),
             iat: 100,
             exp: 200,
-            max_requests: 5,
             eph: "AAAA".into(),
             seal: true,
         }
@@ -79,10 +87,26 @@ mod tests {
         let forged = format!(
             "{}.{sig}",
             URL_SAFE_NO_PAD.encode(
-                br#"{"sub":"attacker","iat":100,"exp":200,"max_requests":999,"eph":"AAAA","seal":false}"#
+                br#"{"sub":"attacker","iat":100,"exp":200,"eph":"AAAA","seal":false}"#
             )
         );
         assert!(verify(&sk.verifying_key(), &forged).is_err());
+    }
+
+    /// A validly SIGNED token carrying a field the claim set does not declare
+    /// must fail decode, not ride along unread. The signature is genuine here,
+    /// so `deny_unknown_fields` is the only thing that can refuse it — which is
+    /// what keeps a re-introduced `max_requests` from becoming a second
+    /// unenforced cap.
+    #[test]
+    fn a_signed_token_with_an_unknown_claim_is_refused() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let payload = URL_SAFE_NO_PAD.encode(
+            br#"{"sub":"demo","iat":100,"exp":200,"max_requests":999,"eph":"AAAA","seal":true}"#,
+        );
+        let sig = sk.sign(payload.as_bytes());
+        let token = format!("{payload}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
+        assert!(verify(&sk.verifying_key(), &token).is_err());
     }
 
     #[test]

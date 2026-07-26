@@ -3,6 +3,10 @@
 //! AMD builtins — so nothing here can forge a quote a production verifier
 //! accepts. RSA-2048 stands in for AMD's 4096-bit CA keys: the verifier checks
 //! the algorithm (RSA-PSS/SHA-384), not the size, and 2048 keeps keygen fast.
+//!
+//! Also the fake NODE PROXY ([`behind_gateway_proxy`]), for the same reason: a
+//! test that dials a lending gateway's listener directly is testing a topology
+//! production does not have.
 
 use anyhow::{anyhow, Context, Result};
 use p384::ecdsa::signature::DigestSigner;
@@ -97,6 +101,35 @@ impl SnpTestEnclave {
             vcek: VcekSource::Der(self.vcek_der.clone()),
         }))
     }
+}
+
+/// Put an airlock router behind a stand-in for the node's gateway proxy.
+///
+/// In production nothing reaches a lending gateway's loopback listener except
+/// through `bin/node`'s gateway plane, which authenticates the WireGuard peer,
+/// resolves it to an Identity account, and stamps
+/// [`crate::server::CALLER_ACCOUNT_HEADER`] — refusing any caller-supplied copy
+/// at decode. `account` is therefore what the proxy VERIFIED, not what anyone
+/// asked for.
+///
+/// Drive an attack by wrapping with one account and CLAIMING another in
+/// `SessionRequest::account_b64`; that is exactly the shape of a member who read
+/// a lender's public credential record and copied the owner out of it.
+#[cfg(feature = "server")]
+pub fn behind_gateway_proxy(app: axum::Router, account: &[u8]) -> axum::Router {
+    let stamped: axum::http::HeaderValue =
+        hex::encode(account).parse().expect("hex is a valid header value");
+    app.layer(axum::middleware::from_fn(
+        move |mut request: axum::extract::Request, next: axum::middleware::Next| {
+            let stamped = stamped.clone();
+            async move {
+                request
+                    .headers_mut()
+                    .insert(crate::server::CALLER_ACCOUNT_HEADER, stamped);
+                next.run(request).await
+            }
+        },
+    ))
 }
 
 /// 48-byte big-endian scalar -> the report's 72-byte little-endian field.
