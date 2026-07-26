@@ -234,3 +234,56 @@ fn peer_block_commits_past_a_parked_queue() {
     let channels = sim.query("chat", serde_json::json!("channels"));
     assert_eq!(channels["channels"].as_array().map(Vec::len), Some(2));
 }
+
+// ── The admin namespace ─────────────────────────────────
+
+/// The sim serves noded's router VERBATIM, `/v1/admin/*` included — and that
+/// namespace refuses EVERYTHING unless the node minted an operator credential.
+/// The sim is a node here in the way that matters: `sim_router` has no shutdown
+/// of its own and `SimHandle::wait` blocks on exactly `/v1/admin/shutdown`, so
+/// an unminted sim binary has no http stop path AT ALL.
+///
+/// Nothing in-tree drove the spawned binary's admin surface (embed.rs stops its
+/// sim in-process), which is precisely why an admin surface that answered 503
+/// to every request once shipped green. This is that missing driver.
+#[test]
+fn the_spawned_sim_serves_a_credentialed_admin_surface() {
+    let storage = tempfile::tempdir().expect("storage dir");
+    let mut sim = Sim::spawn(storage.path(), &[]);
+    let port = sim.port();
+
+    // uncredentialed: refused — and specifically NOT 503, which is what a node
+    // that minted nothing answers. 401 says the gate is live and only the
+    // credential is absent.
+    let (code, body) =
+        nettest::try_http_json(port, "GET", "/v1/admin/ping", None).expect("sim reachable");
+    assert_eq!(code, 401, "an uncredentialed admin caller must be refused: {body}");
+    assert_eq!(
+        body["reason"], "operator_token_missing",
+        "503 here means the sim minted no credential at all: {body}"
+    );
+
+    // the operator reads the credential out of the sim's own storage dir, the
+    // same way `ops/demo-clear.sh` reads a real node's workspace.
+    let token = noded::admin::read_operator_token(storage.path())
+        .expect("the spawned sim minted an operator token");
+    let credential = [(noded::admin::ADMIN_TOKEN_HEADER, token.as_str())];
+    assert_eq!(
+        nettest::http_status_with(port, "GET", "/v1/admin/ping", &credential),
+        Some(200),
+        "the operator must reach the admin namespace"
+    );
+
+    // and the stop path — the binary's ONLY http shutdown.
+    assert_eq!(
+        nettest::http_status_with(port, "POST", "/v1/admin/shutdown", &credential),
+        Some(200),
+        "the operator's shutdown must be accepted"
+    );
+    // wait on the child's own exit, never on a duration.
+    let status = sim.wait_for_exit();
+    assert!(
+        status.success(),
+        "a graceful admin shutdown must exit 0, got {status}"
+    );
+}

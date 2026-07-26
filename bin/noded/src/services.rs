@@ -130,20 +130,62 @@ pub const LINK_TOKEN_FILE: &str = "service-link.token";
 /// invalidate a stale holder, and the daemon re-reads the file on every attach,
 /// so it costs nothing.
 pub fn mint_link_token(workspace: &std::path::Path) -> Result<String, String> {
+    mint_secret_file(workspace, LINK_TOKEN_FILE)
+}
+
+/// Read a node's service-link secret — what a daemon presents when it attaches.
+pub fn read_link_token(workspace: &std::path::Path) -> Result<String, String> {
+    read_secret_file(workspace, LINK_TOKEN_FILE)
+}
+
+/// A fresh 32-byte secret, hex — the one generator behind every workspace
+/// credential. Exposed for the embedder that holds a node IN-PROCESS and so IS
+/// the operator (the test harness): it has no workspace to write into, but its
+/// credential must be the same unguessable 32 bytes as a real one.
+pub fn new_secret() -> String {
     use rand::RngCore as _;
     let mut raw = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut raw);
-    let token: String = raw.iter().map(|byte| format!("{byte:02x}")).collect();
-    let path = workspace.join(LINK_TOKEN_FILE);
+    raw.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Mint a fresh secret and write it 0600 into `dir/name`.
+///
+/// THE writer for every workspace credential — the service link
+/// ([`LINK_TOKEN_FILE`]) and the admin namespace's operator token
+/// ([`crate::admin::ADMIN_TOKEN_FILE`]). One function on purpose: the two were
+/// byte-identical copies, so an fsync, an atomic mint-to-temp-then-rename, or
+/// an EINTR fix would land in one and silently not the other.
+///
+/// Freshly minted each boot rather than persisted: a node restart must
+/// invalidate a stale holder, and every reader opens the file per call, so it
+/// costs nothing.
+///
+/// The error names the PATH, never the secret — the path already carries the
+/// file name, so no second label is needed to tell the two apart.
+pub(crate) fn mint_secret_file(dir: &std::path::Path, name: &str) -> Result<String, String> {
+    let secret = new_secret();
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("secret dir {}: {error}", dir.display()))?;
+    let path = dir.join(name);
     // create 0600 from the start — a world-readable window, however short, is
-    // the whole thing this file exists to avoid.
-    write_owner_only(&path, &token)
-        .map_err(|error| format!("service link token {}: {error}", path.display()))?;
-    Ok(token)
+    // the whole thing these files exist to avoid.
+    write_owner_only(&path, &secret)
+        .map_err(|error| format!("secret file {}: {error}", path.display()))?;
+    Ok(secret)
+}
+
+/// Read a secret [`mint_secret_file`] wrote. Trims, because an operator who
+/// `echo`s the file into a variable picks up the newline their shell added.
+pub(crate) fn read_secret_file(dir: &std::path::Path, name: &str) -> Result<String, String> {
+    let path = dir.join(name);
+    std::fs::read_to_string(&path)
+        .map(|secret| secret.trim().to_string())
+        .map_err(|error| format!("secret file {}: {error}", path.display()))
 }
 
 #[cfg(unix)]
-fn write_owner_only(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+fn write_owner_only(path: &std::path::Path, secret: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let _ = std::fs::remove_file(path);
@@ -152,20 +194,12 @@ fn write_owner_only(path: &std::path::Path, token: &str) -> std::io::Result<()> 
         .create_new(true)
         .mode(0o600)
         .open(path)?
-        .write_all(token.as_bytes())
+        .write_all(secret.as_bytes())
 }
 
 #[cfg(not(unix))]
-fn write_owner_only(path: &std::path::Path, token: &str) -> std::io::Result<()> {
-    std::fs::write(path, token)
-}
-
-/// Read a node's service-link secret — what a daemon presents when it attaches.
-pub fn read_link_token(workspace: &std::path::Path) -> Result<String, String> {
-    let path = workspace.join(LINK_TOKEN_FILE);
-    std::fs::read_to_string(&path)
-        .map(|token| token.trim().to_string())
-        .map_err(|error| format!("service link token {}: {error}", path.display()))
+fn write_owner_only(path: &std::path::Path, secret: &str) -> std::io::Result<()> {
+    std::fs::write(path, secret)
 }
 
 /// Compare two secrets without leaking their common prefix through timing.

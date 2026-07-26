@@ -404,9 +404,22 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     } else {
         NodeHandle::channel()
     };
+    // the sim serves noded's router VERBATIM, admin namespace included, so it
+    // needs the same operator credential the real daemons mint — without one
+    // `admit_operator` refuses every request with `operator_token_unavailable`
+    // and the binary has no HTTP stop path at all (`sim_router` has no shutdown
+    // of its own; `SimHandle::wait` waits on exactly `/v1/admin/shutdown`).
+    // Minted into `storage`, so a driver reads it back with
+    // `noded::admin::read_operator_token(storage)`. `DUCKTAPE_ADMIN=off` still
+    // removes the surface entirely; a mint failure refuses every admin request
+    // rather than falling back to loopback trust.
     let handle = handle
         .with_forge_repo(forge_repo.clone())
-        .with_index_store(index.clone());
+        .with_index_store(index.clone())
+        .with_admin(noded::AdminConfig::minted(
+            noded::AdminExposure::from_env(),
+            &storage,
+        ));
 
     let (control_tx, control_rx) = mpsc::channel::<SimCommand>(16);
     let persona = Arc::new(Mutex::new(persona));

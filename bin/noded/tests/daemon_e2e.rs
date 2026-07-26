@@ -25,6 +25,9 @@ use sha2::{Digest as _, Sha256};
 struct Daemon {
     child: Child,
     port: u16,
+    /// the operator credential the daemon minted 0600 into its storage root.
+    /// `/v1/admin/*` requires it: loopback presence is not authority.
+    admin_token: String,
 }
 
 impl Drop for Daemon {
@@ -63,13 +66,32 @@ impl Daemon {
             cmd.env("DUCKTAPE_NODED_ECHO_ORACLE", "1");
         }
         let child = cmd.spawn().expect("spawn ducktape-noded");
-        let mut daemon = Self { child, port };
+        let mut daemon = Self {
+            child,
+            port,
+            admin_token: String::new(),
+        };
         // readiness = a status answer, never the listen line: the daemon binds
         // its listener only AFTER the node actor publishes its boot snapshot,
         // so the first answer is genesis (or the resumed height) — never the
         // empty default.
         daemon.await_status();
+        // the credential is written before the listener binds, so a daemon that
+        // answers /v1/status has already minted it.
+        daemon.admin_token =
+            noded::admin::read_operator_token(storage).expect("daemon minted an operator token");
         daemon
+    }
+
+    /// POST the graceful-exit route with this daemon's operator credential —
+    /// the ONLY thing that may drive it.
+    fn admin_shutdown(&self) -> Option<u16> {
+        nettest::http_status_with(
+            self.port,
+            "POST",
+            "/v1/admin/shutdown",
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &self.admin_token)],
+        )
     }
 
     fn await_status(&mut self) {
@@ -665,8 +687,7 @@ fn state_persists_across_restart() {
 
         // graceful retirement THROUGH the wire — the port is the daemon's
         // identity; a client that spawned it has no pid to signal.
-        let (code, _) = daemon.request("POST", "/v1/admin/shutdown", None);
-        assert_eq!(code, 200);
+        assert_eq!(daemon.admin_shutdown(), Some(200));
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut daemon = daemon;
         loop {
@@ -847,8 +868,7 @@ fn per_module_index_serves_ops_and_views() {
 
         pre_restart_height = daemon.status()["height"].as_u64().expect("height");
 
-        let (code, _) = daemon.request("POST", "/v1/admin/shutdown", None);
-        assert_eq!(code, 200);
+        assert_eq!(daemon.admin_shutdown(), Some(200));
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut daemon = daemon;
         while daemon.child.try_wait().expect("poll daemon").is_none() {

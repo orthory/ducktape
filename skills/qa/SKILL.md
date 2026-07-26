@@ -40,6 +40,42 @@ phrases in reports.
 Never use `pkill -f` — a pattern match will cheerfully kill an editor, a grep,
 or an unrelated node. Identify a process by executable, process cwd, and the
 workspace's `--config` before signalling it, or use the node's own graceful
-`/v1/admin/shutdown`. For merged-worktree cleanup, dry-run
+`/v1/admin/shutdown`. Every `/v1/admin/*` route needs a credential — WHICH one
+is decided by the node's `DUCKTAPE_ADMIN` exposure, and by nothing else. Read
+the node's env before reaching for a token; owning an account does not change
+the answer.
+
+**`loopback` — the default, and what an unset `DUCKTAPE_ADMIN` gives you.** The
+OPERATOR credential, on an on-box caller. Loopback presence alone is not
+authority (a service daemon is a loopback peer too), so present the secret the
+node minted 0600 into its own workspace:
+
+```
+curl -XPOST localhost:$PORT/v1/admin/shutdown \
+  -H "x-ducktape-admin-token: $(cat "$WORKSPACE/admin.token")"
+```
+
+**`public` — only when the operator set `DUCKTAPE_ADMIN=public`.** The surface
+is reachable off-box, so the OWNER proof-of-possession is the gate for every
+peer, loopback included. The operator token is NOT accepted and NOT a fallback
+there; mint a per-request PoP with the account key instead:
+
+```
+ducktape user sign-admin --key "$WORKSPACE/user.key" \
+  --method POST --path /v1/admin/shutdown --node-key "$NODE_KEY"
+# one json line {"key","ts","sig"} -> x-ducktape-admin-key / -ts / -sig
+```
+
+A `public` node with no committed owner yet (before its first `BindNode`) falls
+back to the operator token until one commits — so on a fresh network both
+recipes work, and after `user account-init` only the PoP does.
+
+The refusals tell the two apart: a token presented to an owned `public` node is
+`401 owner_signature_invalid` (wrong credential TYPE), never `403
+operator_token_mismatch` (right type, wrong secret). `DUCKTAPE_ADMIN=off`
+removes the routes entirely — 404, and no token is minted at all.
+
+Never paste either credential (or a token file's contents) into a report. For
+merged-worktree cleanup, dry-run
 `ops/worktree-clean.sh` and then use `--yes`; its retired-workflow reaper is
 intentionally preserved for old external homes and never uses `pkill -f`.

@@ -98,13 +98,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // state, separate from the module's own `<storage>/duckfs` dir).
         .with_duckfs_workspaces(storage.join("duckfs-workspaces"))
         // the single-writer daemon has no consensus and no on-chain owner, so
-        // admin stays loopback-trust (ADR A2/A5); `DUCKTAPE_ADMIN=off` still
-        // removes the control surface entirely.
-        .with_admin(noded::AdminConfig {
-            exposure: noded::AdminExposure::from_env(),
-            node_key: None,
-            ..Default::default()
-        });
+        // admin is operator-gated (ADR A2/A5): the credential minted into
+        // <storage>/admin.token 0600 is what a client presents. `DUCKTAPE_ADMIN=off`
+        // removes the control surface entirely, and mints nothing.
+        .with_admin(noded::AdminConfig::minted(
+            noded::AdminExposure::from_env(),
+            &storage,
+        ));
 
     // the node actor gets its own thread: commonware's tokio runner owns that
     // thread's runtime, and the host must never leave it. the blob handle is

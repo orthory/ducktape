@@ -68,6 +68,21 @@ impl Sim {
         }
     }
 
+    /// this sim's http port — for the routes the helpers below do not wrap,
+    /// namely `/v1/admin/*`, which needs a credential header no json helper
+    /// carries.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// block until the child exits ON ITS OWN — the event a graceful
+    /// `/v1/admin/shutdown` produces. `Drop`'s kill is the backstop for a test
+    /// that never reaches here; this is what a shutdown assertion waits on, and
+    /// it waits on the process's own exit rather than on a duration.
+    pub fn wait_for_exit(&mut self) -> std::process::ExitStatus {
+        self.child.wait().expect("wait for sim exit")
+    }
+
     pub fn request(
         &self,
         method: &str,

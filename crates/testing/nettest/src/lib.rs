@@ -51,10 +51,28 @@ pub fn try_http_bytes(
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<(u16, Vec<u8>)> {
+    try_http_bytes_with(port, method, path, content_type, &[], body)
+}
+
+/// [`try_http_bytes`] plus extra request headers — what a gated surface needs:
+/// `/v1/admin/*` requires the node's operator credential in a header, so a
+/// harness that shuts its node down must be able to set one.
+pub fn try_http_bytes_with(
+    port: u16,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> std::io::Result<(u16, Vec<u8>)> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    let extra: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: {content_type}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
@@ -111,7 +129,18 @@ pub fn http_text(port: u16, method: &str, path: &str) -> (u16, String) {
 /// if it is not up yet (connect refused) — the readiness/liveness probe every
 /// harness polls before driving, and posts its shutdown through.
 pub fn http_status(port: u16, method: &str, path: &str) -> Option<u16> {
-    try_http_bytes(port, method, path, "application/json", &[])
+    http_status_with(port, method, path, &[])
+}
+
+/// [`http_status`] carrying extra request headers — the shape an admin route
+/// needs, since every one of them requires the node's operator credential.
+pub fn http_status_with(
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Option<u16> {
+    try_http_bytes_with(port, method, path, "application/json", headers, &[])
         .ok()
         .map(|(status, _)| status)
 }
