@@ -51,10 +51,19 @@ impl InProcDaemon {
         // parses to the honest empty peers sample and an empty scrape.
         status.wire_exposition(String::new);
 
+        // the readiness event, same contract as `bin/noded`'s daemon: genesis
+        // runs on the actor thread and publishes the boot snapshot, and only
+        // THEN does the listener bind. Serving first would let `await_ready`
+        // (and any harness probing `/v1/status` for "up") take a 200 carrying
+        // `NodeStatus::default()` — version "", no modules, height 0 — as the
+        // node's real state, while genesis is still running behind it.
+        let (booted_tx, booted_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let actor = std::thread::Builder::new()
             .name("inproc-actor".into())
-            .spawn(move || run_actor(build_host(), status_modules, cmd_rx, status))
+            .spawn(move || run_actor(build_host(), status_modules, cmd_rx, status, booted_tx))
             .expect("spawn actor");
+        // a dropped sender means genesis panicked; say that rather than block.
+        booted_rx.recv().expect("in-proc actor died during genesis");
 
         let server = std::thread::Builder::new()
             .name("inproc-server".into())
@@ -133,12 +142,16 @@ pub fn run_actor(
     status_modules: Vec<String>,
     mut cmd_rx: mpsc::Receiver<NodeCommand>,
     status: crate::StatusCell,
+    booted: std::sync::mpsc::SyncSender<()>,
 ) {
     let mut height: u64 = 0;
     futures::executor::block_on(async move {
         // the boot snapshot, then one publish per committed block — the SAME
-        // publish-into-the-cell contract the real daemons serve.
+        // publish-into-the-cell contract the real daemons serve. the signal
+        // releases the caller to bind: the first status a client can reach is
+        // this one, never the cell's empty default.
         publish_status(&status, &host, &status_modules, height);
+        let _ = booted.send(());
         while let Some(cmd) = cmd_rx.next().await {
             match cmd {
                 NodeCommand::Submit {

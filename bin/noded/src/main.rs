@@ -114,6 +114,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor_forge_repo = forge_repo.clone();
     let actor_index = index.clone();
     let blobs = handle.blob_handle();
+    // the readiness event: the actor publishes its FIRST status snapshot
+    // (genesis or the resumed height) and signals; the http listener is not
+    // bound until then. `/v1/status` answering 200 is what every client uses as
+    // "this daemon is up" — the desktop spawn probe, the CLI, the e2e harness —
+    // so serving before the actor's boot publish hands them a snapshot claiming
+    // version "", root_hash "", no modules and height 0. On a restart over
+    // existing storage that last one is an outright lie about committed state.
+    let (booted_tx, booted_rx) = std::sync::mpsc::sync_channel::<()>(1);
     // a full handle clone for the actor loop's own surfaces (status, blobs,
     // the stream hub). The agent-run provisioner is NOT here any more: it lives
     // in the compute daemon and reaches this node over /v1.
@@ -142,8 +150,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 actor_handle,
                 cmd_rx,
                 stream_hub,
+                booted_tx,
             )
         })?;
+
+    // a dropped sender means the actor thread died inside genesis — report that
+    // instead of blocking forever on a boot that will never happen.
+    booted_rx
+        .recv()
+        .map_err(|_| "node actor died during genesis — see the error above")?;
 
     tracing::info!(
         target: "ducktape::node",
@@ -178,6 +193,7 @@ fn run_node(
     node_handle: noded::NodeHandle,
     mut cmds: mpsc::Receiver<NodeCommand>,
     stream_hub: StreamHub,
+    booted: std::sync::mpsc::SyncSender<()>,
 ) {
     // forge_repo is derived by the caller (shared with the http upload-pack lane).
     let duckfs_dir = storage.join("duckfs");
@@ -376,8 +392,12 @@ fn run_node(
             }
         }
         // the boot snapshot: resumed (or genesis) state serves immediately —
-        // /v1/status answers before the first command, never behind it.
+        // /v1/status answers before the first command, never behind it. the
+        // signal is what makes "immediately" true: main binds the listener only
+        // after this publish, so the daemon's first answer is never the empty
+        // default snapshot.
         publish_status(&status, &metrics, &index, &host, height);
+        let _ = booted.send(());
         while let Some(cmd) = cmds.next().await {
             match cmd {
                 NodeCommand::Submit {
