@@ -56,7 +56,7 @@ use agent::{ACTION_CHAT_POST, AgentMsg};
 use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
-use common::{Cluster, serial};
+use common::{Cluster, SANDBOX_IMAGE, sandbox_toml, serial, skip_unless_sandboxed};
 use dispatch::{DispatchQuery, DispatchReply, DispatchStatus};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
@@ -68,73 +68,6 @@ const FINALIZE: Duration = Duration::from_secs(60);
 /// (several blocks plus one container start — and, on a cold host, the pull
 /// that fills this daemon's private image store).
 const ROUND_TRIP: Duration = Duration::from_secs(300);
-
-/// The provider environment every run is sandboxed into.
-///
-/// The SMALLEST image that proves execution end to end: the container's command
-/// is the executor binary itself, so all a script provider needs of an image is
-/// a `/bin/sh` for its shebang. Size is not cosmetic here — each service daemon
-/// keeps its OWN private podman graph root, so a three-node cluster pulls this
-/// three times, into three empty stores, on every run of the suite. busybox is
-/// ~4 MB where the default `node:22-slim` is ~200 MB.
-const SANDBOX_IMAGE: &str = "docker.io/library/busybox:stable";
-
-/// the `[sandbox]` table each cluster node boots with — appended LAST to the
-/// generated toml (nothing may follow a toml table header).
-fn sandbox_toml() -> Vec<String> {
-    vec![
-        "[sandbox]".into(),
-        "runtime = \"podman\"".into(),
-        format!("image = {SANDBOX_IMAGE:?}"),
-        "cores = 0".into(),
-        "mem_gb = 0".into(),
-    ]
-}
-
-/// Can this host isolate a run the way the compute daemon demands?
-///
-/// Asks the PRODUCT'S OWN predicate rather than `podman version`, and the
-/// difference is not academic: podman on `PATH` is only one of four things the
-/// Podman backend requires (`pasta` for the netns, `nft` + `nsenter` for the
-/// egress firewall). A box with a portable podman install has the binary on
-/// `PATH` and its helpers only inside the install prefix — `podman version`
-/// says yes, the daemon exits `FATAL: sandbox: pasta is not executable`, and a
-/// suite gated on the weaker question runs anyway and fails. Gating on
-/// `probe()` means the suite skips when, and only when, a real node would
-/// refuse to serve compute.
-fn unsandboxable_host() -> Option<String> {
-    provider_host::SandboxBackend::Podman {
-        image: SANDBOX_IMAGE.into(),
-        socket: PathBuf::new(),
-    }
-    .probe()
-    .err()
-}
-
-/// Set to `1` on any host that is SUPPOSED to run this suite, and a skip becomes
-/// a failure.
-///
-/// A skip is the honest answer for a laptop without the sandbox tooling, but
-/// `ok. 2 passed ... finished in 0.00s` is indistinguishable from a real green
-/// run in CI output — and a regression suite that silently passes everywhere is
-/// the precise trap this whole campaign keeps walking into (the compute plane
-/// was dead on dev for exactly this class of reason). So the decision is the
-/// operator's: unset, a host without podman skips loudly; set, it fails.
-const REQUIRE_SANDBOX_ENV: &str = "DUCKTAPE_REQUIRE_SANDBOX";
-
-/// `Some(reason)` = this test cannot run here; the caller returns. Panics
-/// instead when the host was declared sandbox-capable.
-fn skip_unless_sandboxed(test: &str) -> Option<()> {
-    let why = unsandboxable_host()?;
-    assert!(
-        std::env::var_os(REQUIRE_SANDBOX_ENV).is_none_or(|require| require != "1"),
-        "{REQUIRE_SANDBOX_ENV}=1 but this host cannot sandbox a run: {why}"
-    );
-    // stderr, not the harness's own channel: a skip must be visible in the CI
-    // log beside a `2 passed` that covered nothing.
-    eprintln!("SKIP {test}: {why} (set {REQUIRE_SANDBOX_ENV}=1 to make this a failure)");
-    Some(())
-}
 
 /// one script-backed provider staged on disk for one node: an operator spec
 /// dir holding a single capability spec whose `detect.env` points at an
@@ -554,7 +487,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // HOW a run is isolated (the table) is independent of WHETHER this node runs
     // any (the grant); the compute daemon needs both, and refuses to boot
     // without the table. Appended LAST — nothing may follow a toml table header.
-    cluster.extra_toml.extend(sandbox_toml());
+    cluster.extra_toml.extend(sandbox_toml(SANDBOX_IMAGE));
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
     cluster.env[1] = [text_provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.env[2] = [json_provider.env(), hide_builtins(fixtures.path(), "node2")].concat();
@@ -714,7 +647,7 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     cluster.compute_grant = Some(vec![]);
     // and the table that says HOW it isolates one. Without it the daemon exits
     // at boot and this whole scenario silently exercises nothing.
-    cluster.extra_toml.extend(sandbox_toml());
+    cluster.extra_toml.extend(sandbox_toml(SANDBOX_IMAGE));
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
     cluster.env[1] = [racer_one.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.env[2] = [racer_two.env(), hide_builtins(fixtures.path(), "node2")].concat();

@@ -1374,15 +1374,17 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
 // stash, and the consensus `Push` CAS.
 // ============================================================================
 
-/// whether a `git` binary is on PATH (the bridge test needs a real client).
-fn have_git() -> bool {
-    Command::new("git")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// `Some(())` = no real `git` client here, so `test` cannot run and the caller
+/// must return.
+///
+/// The whole forge-over-http protocol suite is five tests behind this, and a
+/// bare early-return made every one of them report green on a host without git
+/// — five protocol proofs covering nothing, indistinguishable in CI output from
+/// five that ran. [`nettest::skip_without`] makes the skip loud and turns it
+/// into a FAILURE under `DUCKTAPE_REQUIRE_TOOLS=1`, which is what a host that is
+/// supposed to have git should set.
+fn skip_without_git(test: &str) -> Option<()> {
+    nettest::skip_without(test, nettest::missing_tool("git"))
 }
 
 /// a `git` invocation in `dir` with a hermetic config: no host global/system
@@ -1456,8 +1458,7 @@ fn forge_head(daemon: &Daemon, repo: &str) -> Option<String> {
 
 #[test]
 fn git_push_over_http_lands_in_forge_head() {
-    if !have_git() {
-        eprintln!("skipping git_push_over_http_lands_in_forge_head: no `git` on PATH");
+    if skip_without_git("git_push_over_http_lands_in_forge_head").is_some() {
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -1546,8 +1547,7 @@ fn log_oids(dir: &Path) -> Vec<u8> {
 
 #[test]
 fn git_clone_over_http_round_trips_full_history() {
-    if !have_git() {
-        eprintln!("skipping git_clone_over_http_round_trips_full_history: no `git` on PATH");
+    if skip_without_git("git_clone_over_http_round_trips_full_history").is_some() {
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -1631,10 +1631,7 @@ fn git_clone_over_http_round_trips_full_history() {
 /// PACK bytes are legal only in the final response.
 #[test]
 fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
-    if !have_git() {
-        eprintln!(
-            "skipping git_fetch_and_pull_into_nonempty_checkout_complete_negotiation: no `git` on PATH"
-        );
+    if skip_without_git("git_fetch_and_pull_into_nonempty_checkout_complete_negotiation").is_some() {
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -1703,8 +1700,7 @@ fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
 /// exact client the app's `forge_sync_remote` runs, so this pins that interop.
 #[test]
 fn libgit2_mirror_fetch_completes_incremental_sync() {
-    if !have_git() {
-        eprintln!("skipping libgit2_mirror_fetch_completes_incremental_sync: no `git` on PATH");
+    if skip_without_git("libgit2_mirror_fetch_completes_incremental_sync").is_some() {
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -1766,10 +1762,7 @@ fn libgit2_mirror_fetch_completes_incremental_sync() {
 /// `http.postBuffer=1` makes git take the probe path for even a one-commit push.
 #[test]
 fn git_push_larger_than_post_buffer_uses_the_probe_path() {
-    if !have_git() {
-        eprintln!(
-            "skipping git_push_larger_than_post_buffer_uses_the_probe_path: no `git` on PATH"
-        );
+    if skip_without_git("git_push_larger_than_post_buffer_uses_the_probe_path").is_some() {
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
