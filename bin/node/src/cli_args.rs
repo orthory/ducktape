@@ -123,6 +123,143 @@ impl Selector {
     }
 }
 
+/// which NODE a verb DIALS: the http base of a running node's `/v1` surface.
+/// Deliberately a different question from [`Selector`], which resolves a
+/// workspace's node.toml PATH for the daemon that IS the node.
+///
+/// `--node` is an http base here and means nothing else anywhere: the `agent`
+/// family's host targeting — which PEER runs the work, a display name or a raw
+/// node key — is `--host-node`, because it is a different type of input.
+#[derive(Debug, Default, clap::Args)]
+pub struct NodeAddr {
+    /// the node's http base url (wins over -n/--network and DUCKTAPE_NODE)
+    #[arg(long, value_name = "HTTP-URL", global = true)]
+    pub node: Option<String>,
+    /// a registered workspace's chain id — resolves to its node.toml http_listen
+    #[arg(
+        short = 'n',
+        long = "network",
+        value_name = "CHAIN-ID",
+        global = true
+    )]
+    pub network: Option<String>,
+}
+
+/// one rung of the node-addressing ladder — ONE tagged value, so the precedence
+/// is a single ordered expression instead of a hand-written `if` chain per
+/// family. Four of those existed and disagreed about `DUCKTAPE_NODE`, so
+/// `ducktape fs`, `ducktape agent` and `ducktape user redeem-invite` could each
+/// dial a DIFFERENT node in one shell.
+#[derive(Debug)]
+enum Rung {
+    /// `--node <http-url>`
+    Flag(String),
+    /// `-n/--network <chain-id>` → the workspace node.toml's `http_listen`
+    Network(String),
+    /// the `DUCKTAPE_NODE` environment variable
+    Env(String),
+    /// the caller's own ambient address (`fs` inside a checkout: the `.duckfs`
+    /// index's recorded node url)
+    Context(String),
+    /// the single registered workspace, when exactly one is registered
+    LoneWorkspace,
+}
+
+/// the message every unresolved address ends with — it names every rung, so a
+/// user who hit the bottom of the ladder can see all of it.
+const NO_NODE_ADDRESS: &str =
+    "no node address: pass --node <http-url>, -n/--network <id>, or set DUCKTAPE_NODE";
+
+/// turn a chosen rung into the http base. The one `match`: a new rung must be
+/// routed here or the build fails.
+fn rung_base(rung: Rung) -> Result<String, String> {
+    match rung {
+        Rung::Flag(url) | Rung::Env(url) | Rung::Context(url) => Ok(trim_base(&url)),
+        Rung::Network(needle) => http_of_workspace(&needle),
+        Rung::LoneWorkspace => lone_workspace_base(),
+    }
+}
+
+/// a trailing slash on the base would double up against every `/v1/...` path.
+fn trim_base(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
+fn http_of_workspace(needle: &str) -> Result<String, String> {
+    let (_dir, http) = config::resolve_network(needle)?;
+    let base = http.ok_or_else(|| {
+        format!(
+            "network {needle:?} resolves to a workspace with no http listen \
+             (its node.toml sets no http_listen) — pass --node <http-url>"
+        )
+    })?;
+    Ok(trim_base(&base))
+}
+
+/// the bottom rung: infer the node from the registry when exactly one workspace
+/// is registered — the same "a freshly-init'd machine runs with no flags at all"
+/// ergonomic [`Selector::config_path`] already has.
+fn lone_workspace_base() -> Result<String, String> {
+    let mut workspaces = config::list_workspaces()?;
+    match workspaces.len() {
+        1 => {
+            let (chain_id, _path) = workspaces.swap_remove(0);
+            http_of_workspace(&chain_id)
+        }
+        0 => Err(NO_NODE_ADDRESS.into()),
+        _ => Err(format!(
+            "{NO_NODE_ADDRESS}\nseveral workspaces are registered — pick one with -n:\n{}",
+            workspaces
+                .iter()
+                .map(|(chain_id, _)| format!("  {chain_id}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )),
+    }
+}
+
+/// the ONE read of `DUCKTAPE_NODE` in the CLI — see
+/// `the_cli_reads_ducktape_node_in_exactly_one_place`.
+fn env_node() -> Option<String> {
+    std::env::var("DUCKTAPE_NODE").ok()
+}
+
+impl NodeAddr {
+    /// the whole ladder, for a caller with no ambient address of its own.
+    pub fn resolve(&self) -> Result<String, String> {
+        self.resolve_with(|| None)
+    }
+
+    /// the whole ladder: `--node` → `-n/--network` → `DUCKTAPE_NODE` →
+    /// `context()` → the lone registered workspace.
+    ///
+    /// `context` is the caller's own ambient address, tried AFTER what the
+    /// operator stated and BEFORE the registry inference. `fs` inside a checkout
+    /// passes the `.duckfs` index's recorded url: more specific than "the one
+    /// workspace registered on this box", less specific than a flag.
+    pub fn resolve_with(
+        &self,
+        context: impl FnOnce() -> Option<String>,
+    ) -> Result<String, String> {
+        rung_base(self.ladder_rung(env_node(), context))
+    }
+
+    /// pick the rung. `env` is a parameter rather than a read so the precedence
+    /// is testable without mutating process env — racy across parallel tests,
+    /// and `unsafe` since edition 2024.
+    fn ladder_rung(&self, env: Option<String>, context: impl FnOnce() -> Option<String>) -> Rung {
+        let flag = self.node.clone().filter(|url| !url.is_empty());
+        let network = self.network.clone().filter(|id| !id.is_empty());
+        let env = env.filter(|url| !url.is_empty());
+        // THE PRECEDENCE. Written once, in one expression, for every family.
+        flag.map(Rung::Flag)
+            .or_else(|| network.map(Rung::Network))
+            .or_else(|| env.map(Rung::Env))
+            .or_else(|| context().filter(|url| !url.is_empty()).map(Rung::Context))
+            .unwrap_or(Rung::LoneWorkspace)
+    }
+}
+
 /// a verb whose only arguments are the workspace selector.
 #[derive(Debug, clap::Args)]
 pub struct SelectorArgs {
@@ -277,4 +414,114 @@ pub struct PlumbingArgs {
     /// invite intro listener address
     #[arg(long, value_name = "ADDR", hide_short_help = true)]
     pub invite_listen: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(node: Option<&str>, network: Option<&str>) -> NodeAddr {
+        NodeAddr {
+            node: node.map(str::to_string),
+            network: network.map(str::to_string),
+        }
+    }
+
+    /// the precedence, pinned rung by rung and hermetically: only the `Flag`,
+    /// `Env` and `Context` rungs are resolved to a base (the registry rungs are
+    /// asserted as rungs, so no test ever walks `~/.ducktape`).
+    #[test]
+    fn the_node_address_ladder_ranks_flag_network_env_context_registry() {
+        let env = || Some("http://env:1/".to_string());
+        let ctx = || Some("http://ctx:1/".to_string());
+
+        // 1. --node wins over everything below it.
+        let rung = addr(Some("http://flag:1/"), Some("some-workspace")).ladder_rung(env(), ctx);
+        assert_eq!(rung_base(rung).unwrap(), "http://flag:1");
+
+        // 2. -n/--network beats the env — the rung `user redeem-invite` used to
+        //    reach only because it ignored DUCKTAPE_NODE entirely.
+        assert!(matches!(
+            addr(None, Some("some-workspace")).ladder_rung(env(), ctx),
+            Rung::Network(id) if id == "some-workspace"
+        ));
+
+        // 3. the env beats the caller's ambient context.
+        assert_eq!(
+            rung_base(addr(None, None).ladder_rung(env(), ctx)).unwrap(),
+            "http://env:1"
+        );
+
+        // 4. the context beats the registry: `fs commit` inside a checkout must
+        //    reach the node it was checked out FROM, not "the one workspace
+        //    registered on this box".
+        assert_eq!(
+            rung_base(addr(None, None).ladder_rung(None, ctx)).unwrap(),
+            "http://ctx:1"
+        );
+
+        // 5. nothing at all → the registry inference, the bottom rung.
+        assert!(matches!(
+            addr(None, None).ladder_rung(None, || None),
+            Rung::LoneWorkspace
+        ));
+    }
+
+    /// an empty flag/env/context value is NOT an address — an exported but empty
+    /// `DUCKTAPE_NODE` must fall through, not resolve to `""`.
+    #[test]
+    fn an_empty_value_is_not_a_rung() {
+        assert!(matches!(
+            addr(Some(""), Some("")).ladder_rung(Some(String::new()), || Some(String::new())),
+            Rung::LoneWorkspace
+        ));
+    }
+
+    /// the fifth-caller guard. `DUCKTAPE_NODE` was read by three families with
+    /// three different precedences, so `ducktape fs`, `ducktape agent` and
+    /// `ducktape user redeem-invite` could each dial a different node in one
+    /// shell. There is now exactly ONE read; a family that hand-writes its own
+    /// ladder fails here instead of shipping a fourth answer.
+    ///
+    /// `bin/node/src/mcp/` is not an exception to find: it binds a RUN's tool
+    /// plane to its node through `mcp::identity::ENV_NODE`, which is a different
+    /// consumer and not a CLI addressing flag.
+    // ponytail: matches the literal `env::var("DUCKTAPE_NODE")` call, so a
+    // fifth caller routing through a const would slip past. Escalate to a full
+    // parse only if that ever actually happens.
+    #[test]
+    fn the_cli_reads_ducktape_node_in_exactly_one_place() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut readers = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read source");
+                let reads_env = text.contains(r#"env::var("DUCKTAPE_NODE")"#)
+                    || text.contains(r#"env::var_os("DUCKTAPE_NODE")"#);
+                if reads_env {
+                    readers.push(
+                        path.strip_prefix(&src)
+                            .expect("under src")
+                            .display()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        readers.sort();
+        assert_eq!(
+            readers,
+            vec!["cli_args.rs".to_string()],
+            "DUCKTAPE_NODE must be read only by the one node-addressing ladder"
+        );
+    }
 }

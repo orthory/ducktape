@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Signer as _, ed25519};
 
+use crate::cli_args::NodeAddr;
 use crate::{config, userkey};
 use config::hex_bytes;
 
@@ -63,12 +64,8 @@ pub(crate) struct AccountInitArgs {
     /// the account's human-readable display name (also the default `.duck` handle)
     #[arg(long, value_name = "NAME")]
     name: String,
-    /// the local node's http base (e.g. `http://host:port`)
-    #[arg(long, value_name = "URL")]
-    node: Option<String>,
-    /// resolve the node through a registered workspace's chain id
-    #[arg(short = 'n', long = "network", value_name = "CHAIN-ID")]
-    network: Option<String>,
+    #[command(flatten)]
+    addr: NodeAddr,
     /// path to the user key file (defaults to the network workspace's
     /// `user.key`, minting it there if absent — the canonical per-network key)
     #[arg(long, value_name = "PATH")]
@@ -236,12 +233,8 @@ pub(crate) struct RedeemArgs {
     /// the one-line invite blob to redeem
     #[arg(value_name = "INVITE-BLOB")]
     blob: String,
-    /// the member node's http base (e.g. `http://host:port`)
-    #[arg(long, value_name = "URL")]
-    node: Option<String>,
-    /// resolve the node through a registered workspace's chain id
-    #[arg(short = 'n', long = "network", value_name = "CHAIN-ID")]
-    network: Option<String>,
+    #[command(flatten)]
+    addr: NodeAddr,
     /// path to the encrypted user key file
     #[arg(long, value_name = "PATH")]
     key: PathBuf,
@@ -299,8 +292,9 @@ fn cmd_user_account_init(
 ) -> CommandResult {
     use identity::{IdentityMsg, IdentityQuery, IdentityReply};
 
-    let base = redeem_node(args.node.as_deref(), args.network.as_deref())?;
+    let base = args.addr.resolve()?;
     let needle = args
+        .addr
         .network
         .as_deref()
         .filter(|n| !n.is_empty())
@@ -751,33 +745,6 @@ fn cmd_user_sign_frame(args: FrameArgs, stdin: &mut impl std::io::BufRead) -> Co
     Ok(())
 }
 
-/// resolve the member node's HTTP base for `redeem-invite`: an explicit
-/// `--node <url>` wins, else `-n/--network <id>` resolves through the registry
-/// to the workspace node.toml's `http_listen`. a set-but-broken `--network`
-/// (unknown/ambiguous workspace, or one with no http listen) is a loud error.
-pub(crate) fn redeem_node(
-    node: Option<&str>,
-    network: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    if let Some(url) = node.filter(|url| !url.is_empty()) {
-        return Ok(url.trim_end_matches('/').to_string());
-    }
-    if let Some(needle) = network.filter(|needle| !needle.is_empty()) {
-        let (_dir, http) = config::resolve_network(needle)?;
-        let base = http.ok_or_else(|| {
-            format!(
-                "network {needle:?} resolves to a workspace with no http listen \
-                 (its node.toml sets no http_listen) — pass --node <http-url>"
-            )
-        })?;
-        return Ok(base.trim_end_matches('/').to_string());
-    }
-    Err(
-        "user-redeem-invite needs --node <http-base, e.g. http://host:port> or -n/--network <id>"
-            .into(),
-    )
-}
-
 /// `user-redeem-invite` core — see [`cmd_user_redeem_invite`].
 ///
 /// redeems a CLIENT invite as this user key over a member node's frameless
@@ -792,7 +759,7 @@ fn user_redeem_invite(
     args: RedeemArgs,
     stdin: &mut impl std::io::BufRead,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let node = redeem_node(args.node.as_deref(), args.network.as_deref())?;
+    let node = args.addr.resolve()?;
 
     // fail-closed expiry + envelope/token verification at decode.
     let invite = config::decode_invite(&args.blob)?;
@@ -1252,16 +1219,6 @@ mod userkey_verb_tests {
     }
 
     #[test]
-    fn redeem_node_prefers_explicit_node_over_network() {
-        // --node short-circuits before the registry, so a bogus -n never
-        // resolves; the trailing slash is trimmed.
-        assert_eq!(
-            redeem_node(Some("http://explicit:8844/"), Some("no-such-workspace")).unwrap(),
-            "http://explicit:8844"
-        );
-    }
-
-    #[test]
     fn redeem_refuses_a_resident_blob_by_name() {
         let dir = tempfile::tempdir().unwrap();
         let issuer = ed25519::PrivateKey::from_seed(1);
@@ -1270,8 +1227,10 @@ mod userkey_verb_tests {
         let err = user_redeem_invite(
             RedeemArgs {
                 blob,
-                node: Some("http://127.0.0.1:1".to_string()),
-                network: None,
+                addr: NodeAddr {
+                    node: Some("http://127.0.0.1:1".to_string()),
+                    network: None,
+                },
                 key,
             },
             &mut empty_stdin(),

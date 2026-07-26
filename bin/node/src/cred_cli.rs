@@ -27,23 +27,20 @@ use std::path::Path;
 use commonware_cryptography::Signer as _;
 
 use crate::config;
-use crate::userkey_cli::{load_user_signer, redeem_node};
+use crate::cli_args::NodeAddr;
+use crate::userkey_cli::load_user_signer;
 
 pub(crate) type CredResult = Result<(), Box<dyn std::error::Error>>;
 
 /// `ducktape user cred <verb>` — the credential subfamily. `--node`/`-n` are the
-/// same node-resolution pair `redeem-invite` carries, made `global` so they
-/// attach in any position (`cred add claude -n net` reads naturally).
+/// shared [`NodeAddr`] group every family carries, `global` so they attach in
+/// any position (`cred add claude -n net` reads naturally).
 #[derive(Debug, clap::Args)]
 pub(crate) struct CredArgs {
     #[command(subcommand)]
     cmd: CredCmd,
-    /// the co-hosted node's http base (e.g. `http://host:port`)
-    #[arg(long, value_name = "URL", global = true)]
-    node: Option<String>,
-    /// resolve the co-hosted node through a registered workspace's chain id
-    #[arg(short = 'n', long = "network", value_name = "CHAIN-ID", global = true)]
-    network: Option<String>,
+    #[command(flatten)]
+    addr: NodeAddr,
     /// path to the user key file (defaults to the network workspace's `user.key`)
     #[arg(long, value_name = "PATH", global = true)]
     key: Option<std::path::PathBuf>,
@@ -180,13 +177,8 @@ impl ProviderArg {
 /// Dispatch one `cred` verb. `stdin` is threaded to [`load_user_signer`], which
 /// reads the key password from it only when the key file is encrypted.
 pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
-    let CredArgs {
-        cmd,
-        node,
-        network,
-        key,
-    } = args;
-    let ctx = VerbCtx { node, network, key };
+    let CredArgs { cmd, addr, key } = args;
+    let ctx = VerbCtx { addr, key };
     match cmd {
         CredCmd::Add { provider, name } => cmd_add(&ctx, provider, name, stdin),
         CredCmd::List { json } => cmd_list(&ctx, json),
@@ -207,15 +199,14 @@ pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
 
 /// The shared node/key context every verb resolves against.
 struct VerbCtx {
-    node: Option<String>,
-    network: Option<String>,
+    addr: NodeAddr,
     key: Option<std::path::PathBuf>,
 }
 
 impl VerbCtx {
-    /// the node's http base (explicit `--node` wins, else the workspace's).
+    /// the node's http base, through the one shared addressing ladder.
     fn http_base(&self) -> Result<String, Box<dyn std::error::Error>> {
-        redeem_node(self.node.as_deref(), self.network.as_deref())
+        Ok(self.addr.resolve()?)
     }
 
     /// the user key path for the signing verbs: explicit `--key` wins, else the
@@ -229,6 +220,7 @@ impl VerbCtx {
             Some(explicit) => explicit.clone(),
             None => {
                 let needle = self
+                    .addr
                     .network
                     .as_deref()
                     .filter(|n| !n.is_empty())
@@ -253,6 +245,7 @@ impl VerbCtx {
     /// cannot locate the on-disk workspace.
     fn workspace(&self) -> Result<config::Resolved, Box<dyn std::error::Error>> {
         let needle = self
+            .addr
             .network
             .as_deref()
             .filter(|n| !n.is_empty())
@@ -896,11 +889,11 @@ mod tests {
         let present = dir.join("user.key");
         std::fs::write(&present, b"deadbeef").unwrap();
 
-        let ctx = VerbCtx { node: None, network: None, key: Some(present.clone()) };
+        let ctx = VerbCtx { addr: NodeAddr::default(), key: Some(present.clone()) };
         assert_eq!(ctx.key_path().unwrap(), present);
 
         let missing = dir.join("nope.key");
-        let ctx = VerbCtx { node: None, network: None, key: Some(missing) };
+        let ctx = VerbCtx { addr: NodeAddr::default(), key: Some(missing) };
         let err = ctx.key_path().unwrap_err().to_string();
         assert!(err.contains("no user key at"), "expected absent-key error, got {err:?}");
 
