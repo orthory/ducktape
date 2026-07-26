@@ -28,8 +28,22 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// node → daemon. One variant per thing the node can ask of a pty.
+///
+/// `deny_unknown_fields`, like every type on this boundary: there is no live
+/// network and no compat obligation, so a frame carrying a field this build
+/// does not know is a SKEW REPORT, not something to tolerate. Tolerating it
+/// silently drops whatever the other side thought it was saying — and on
+/// [`Create`] that would mean running a session without a restriction the
+/// sender believed it had imposed.
+///
+/// What the daemon DOES with a refused decode differs by direction, and only
+/// one direction is finished. An [`Event`] the node cannot decode is answered
+/// with a `BadFrame` naming the field. A [`Command`] the DAEMON cannot decode
+/// is only dropped, so a skewed `TermCreate` leaves the node's create waiting
+/// — see `classify` in `bin/node/src/agent/link.rs` for why that is left, and
+/// what closing it looks like.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     /// spawn a session under the node-minted `session` id.
     TermCreate(Create),
@@ -49,7 +63,15 @@ pub enum Command {
 /// everything the daemon needs to spawn one session. The node has already
 /// decided admission (who may create, with whose credential, at what limits);
 /// this is the decision's output, not its input.
+///
+/// EVERY field is required. Nothing here defaults, deliberately: each of the
+/// two that used to would have failed OPEN if a sender omitted it — an absent
+/// `credential` reads as "run on the operator's own locally-resolved
+/// credential", and absent `limits` as "the provider's defaults" — so a skewed
+/// sender's silence would have widened this session's authority or its
+/// resource ceiling. A decision's output must be stated, not inferred.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Create {
     /// the node-minted session id — also the workdir name and the ws topic.
     pub session: String,
@@ -58,12 +80,19 @@ pub struct Create {
     /// `true` runs the restricted (read-only, non-prompting) argv — the shared
     /// session's command-lane shape. `false` is the full solo TUI.
     pub restricted: bool,
-    /// cpu/mem ceilings for the sandbox. Empty = the provider's defaults.
-    #[serde(default)]
+    /// cpu/mem ceilings for the sandbox. An EMPTY map means the provider's
+    /// defaults — and must be written as one, never omitted.
     pub limits: BTreeMap<String, u64>,
-    /// a lent credential resolved from committed state, or `None` for a session
-    /// running on the operator's own locally-resolved credential.
-    #[serde(default)]
+    /// a lent credential resolved from committed state, or `null` for a session
+    /// running on the operator's own locally-resolved credential. `null` is a
+    /// statement the sender makes; it is not what silence means.
+    ///
+    /// `deserialize_with` is what makes that true. Serde lets an `Option` field
+    /// go MISSING even with no `#[serde(default)]` — absent decodes to `None`,
+    /// which here is the fail-open "use the operator's own credential". Naming
+    /// a deserializer suppresses that fallback, so an omitted field is a
+    /// `missing field` error like every other.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub credential: Option<Credential>,
 }
 
@@ -72,6 +101,7 @@ pub struct Create {
 /// rather than re-exported so this protocol stays a stable, inspectable shape
 /// that a third-party plug can implement without linking provider-host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Credential {
     pub name: String,
     pub kind: CredentialKind,
@@ -96,7 +126,7 @@ pub enum CredentialKind {
 /// daemon → node. The lifecycle of a session, as the process that owns it sees
 /// it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
     /// the pty is live. Answers exactly one [`Command::TermCreate`].
     TermCreated { session: String },
@@ -216,14 +246,48 @@ mod tests {
         }
     }
 
+    /// Every skew this protocol can see is a NAMED decode error. There is no
+    /// live network, so nothing here may be tolerant: an unknown field and an
+    /// absent field both stop the frame instead of quietly becoming a default.
+    ///
+    /// This is the whole justification the build gate's deletion rests on — the
+    /// gate was a whole-connection version check standing in for per-frame
+    /// decoding, and per-frame decoding only replaces it if it actually
+    /// refuses. Before this, an added field decoded `Ok` and was dropped: a
+    /// spend cap added to [`Credential`] would have been silently discarded and
+    /// the session run without it.
     #[test]
-    fn a_create_without_optional_fields_decodes() {
-        // a third-party plug must be able to omit what it does not use; the
-        // node's own encoder always writes them.
-        let create: Create =
-            serde_json::from_str(r#"{"session":"a","provider":"claude","restricted":false}"#)
-                .unwrap();
-        assert!(create.limits.is_empty());
-        assert!(create.credential.is_none());
+    fn skew_in_either_direction_is_a_named_decode_error() {
+        let full = r#"{"op":"term_create","session":"a","provider":"claude","restricted":false,"limits":{},"credential":null}"#;
+        serde_json::from_str::<Command>(full).expect("the current shape decodes");
+
+        // a NEWER sender's extra field — on the command, on the create, and on
+        // a lent credential (where dropping one is dropping a restriction).
+        let cred = r#""credential":{"name":"n","kind":"claude","authority":"a","via":"v","seal_pk":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"account":[1]"#;
+        for newer in [
+            r#"{"op":"term_create","session":"a","provider":"claude","restricted":false,"limits":{},"credential":null,"future":1}"#.to_string(),
+            r#"{"op":"term_close","session":"a","force":true}"#.to_string(),
+            format!(r#"{{"op":"term_create","session":"a","provider":"claude","restricted":false,"limits":{{}},{cred},"spend_cap":10}}}}"#),
+        ] {
+            let error = serde_json::from_str::<Command>(&newer)
+                .expect_err(&format!("an unknown field must refuse: {newer}"));
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
+
+        // an OLDER sender's omission. Both of these used to decode to a
+        // fail-open default: no credential (the operator's own), no limits.
+        for older in [
+            r#"{"op":"term_create","session":"a","provider":"claude","restricted":false,"limits":{}}"#,
+            r#"{"op":"term_create","session":"a","provider":"claude","restricted":false,"credential":null}"#,
+        ] {
+            let error = serde_json::from_str::<Command>(older)
+                .expect_err(&format!("a missing field must refuse: {older}"));
+            assert!(error.to_string().contains("missing field"), "{error}");
+        }
+
+        // and the daemon → node direction, same rule.
+        let event = serde_json::from_str::<Event>(r#"{"op":"term_ended","session":"a","code":0}"#)
+            .expect_err("an unknown field must refuse on an event too");
+        assert!(event.to_string().contains("unknown field"), "{event}");
     }
 }

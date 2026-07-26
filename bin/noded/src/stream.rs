@@ -51,8 +51,16 @@ const MAX_RUN_OUTPUT_LINE: usize = 16 * 1024;
 /// (it only enqueues), so anything near this is a stuck process, not a slow one.
 const SERVICE_COMMAND_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// what a ws client may say to this node.
+///
+/// `deny_unknown_fields`: there is no live network and no compat obligation, so
+/// a frame carrying a field this build does not know is refused with a
+/// `BadFrame` naming it, never decoded into whatever subset happens to match.
+/// Silently dropping the rest would make the sender's intent unobservable — and
+/// this PR is a live instance of the direction that used to be tolerated, since
+/// it deleted `ServiceAttach.build`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMsg {
     Subscribe {
         topics: Vec<String>,
@@ -130,12 +138,13 @@ pub enum ClientMsg {
     /// the terminal plane come to me". Until one connection does this, the node
     /// has no interactive plane and every create refuses.
     ///
-    /// `build` is the skew gate: node and daemon are separate processes with
-    /// independent restart timing, so a mismatched build is REFUSED with a
-    /// nameable reason rather than negotiated. Only one connection may hold the
-    /// link at a time; a second attach is refused, which is what stops a local
-    /// impersonator from displacing the live daemon and receiving the create
-    /// commands (and lent-credential records) meant for it.
+    /// The claim carries no build stamp and this node compares none: node and
+    /// daemon are separate processes with independent restart timing, so skew
+    /// is ordinary, and it is named by `service status` rather than refused
+    /// (see [`crate::services::build_identity`]). What IS refused is a second
+    /// holder — only one connection may hold the link at a time, which is what
+    /// stops a local impersonator from displacing the live daemon and receiving
+    /// the create commands (and lent-credential records) meant for it.
     ServiceAttach {
         kind: String,
         /// the node's own 0600 link secret, read from its workspace. Holding the
@@ -972,9 +981,22 @@ async fn next_service_command(
 /// Build equality is NOT one of them. It authenticated nobody (a stamp is
 /// compiled into a binary any local process can read), it excluded every
 /// separately-compiled daemon by construction, and its `None` case refused
-/// every link on any build without `.git`. Skew degrades to per-frame decode
-/// refusals — `malformed_command`, `BadFrame` — which is where the no-compat
-/// doctrine already enforces "speak the current protocol or be refused".
+/// every link on any build without `.git`.
+///
+/// Skew is caught per FRAME instead, and that is a claim with an enforcement
+/// site rather than a hope: [`ClientMsg`] and every `agent_service::wire` type
+/// carry `deny_unknown_fields` and default nothing, so a field this build does
+/// not know is refused by name and a field it does know cannot go missing. A
+/// connection-wide version check would refuse frames this node understands
+/// perfectly; the per-frame check refuses exactly the ones it does not.
+///
+/// The strictness is ONE-DIRECTIONAL, and saying otherwise would be the same
+/// overclaim the deleted gate's justification made. Daemon→node is the clean
+/// half: an undecodable frame earns this connection a `BadFrame` naming the
+/// field and the socket stays open. Node→daemon only DROPS — the daemon warns
+/// `malformed_command` and the node's create waits on a reply that never
+/// arrives. That gap and its fix live at the drop site,
+/// `bin/node/src/agent/link.rs`'s `classify`.
 fn take_service_link(
     handle: &NodeHandle,
     kind: &str,
@@ -2429,6 +2451,61 @@ mod tests {
             }
             other => panic!("expected one metrics tail frame, got {other:?}"),
         }
+    }
+
+    /// The service link is granted on the TOKEN and nothing else.
+    ///
+    /// `take_service_link` had no behavioural coverage at all, which left the
+    /// deleted build gate's only guard a source lint — and a lint is defeated by
+    /// any indirection. This is the direct assertion: present the node's token
+    /// and the link is yours, whatever this binary was built from.
+    ///
+    /// What it CANNOT see: `build_identity()` is `option_env!`, resolved at
+    /// compile time, so a test running in a stamped build cannot make the
+    /// git-absent case happen. A reintroduced `if build_identity().is_none() {
+    /// refuse }` would pass this test and break exactly the checkouts the gate
+    /// broke. That specific hole is why the source lint stays — see
+    /// `crate::services`'s `no_admission_path_reads_this_node_s_build_stamp`,
+    /// which forbids the stamp anywhere in THIS file.
+    #[test]
+    fn a_service_link_is_granted_on_the_token_alone() {
+        const TOKEN: &str = "b0a1c2d3e4f50617";
+        let terminals = crate::term::TerminalSessions::new(
+            crate::term::TermRing::default(),
+            crate::term::TermCommandRing::default(),
+            Some(TOKEN.into()),
+        );
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        let handle = handle.with_terminals(terminals);
+
+        // the whole admission: the right kind, the node's own token.
+        let (guard, _rx) = take_service_link(&handle, crate::services::AGENT_KIND, TOKEN)
+            .expect("the token alone grants the link");
+
+        // and the two refusals that DO exist, so this test also pins that the
+        // grant above is not simply "everything succeeds".
+        assert!(take_service_link(&handle, "compute", TOKEN).is_err());
+        assert!(take_service_link(&handle, crate::services::AGENT_KIND, "wrong").is_err());
+        assert!(
+            take_service_link(&handle, crate::services::AGENT_KIND, TOKEN).is_err(),
+            "first attach wins while the guard lives"
+        );
+
+        // the guard's Drop releases the link — the next daemon may claim it.
+        drop(guard);
+        take_service_link(&handle, crate::services::AGENT_KIND, TOKEN)
+            .expect("a released link is claimable again");
+    }
+
+    /// A handle with no terminal plane refuses every link, and that refusal is
+    /// about the NODE's wiring, never about a build.
+    #[test]
+    fn a_node_with_no_terminal_plane_has_no_link_to_give() {
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        let Err(refusal) = take_service_link(&handle, crate::services::AGENT_KIND, "any") else {
+            panic!("a handle with no terminal plane has no link to give");
+        };
+        assert!(refusal.contains("terminal sessions are not enabled"), "{refusal}");
     }
 
     #[tokio::test]

@@ -112,11 +112,21 @@ pub struct Hello {
 ///   construction. A third-party service would have to hardcode this
 ///   operator's exact commit, and on a dirty tree a `DefaultHasher` digest
 ///   `build.rs` itself notes is not toolchain-stable, at ITS compile time.
-/// - it protected no correctness property. The node↔daemon protocol decodes
-///   every frame at its boundary, so skew already degrades to named refusals
-///   (`malformed_command`, `BadFrame`, `deny_unknown_fields`) rather than
-///   corruption. Under the no-compat doctrine "speak the current protocol or
-///   be refused" is enforced per frame, where it belongs.
+/// - it protected no correctness property that per-frame decoding does not.
+///   Under the no-compat doctrine "speak the current protocol or be refused"
+///   is enforced at each frame's boundary, where it belongs: [`Hello`],
+///   `crate::stream::ClientMsg` and every `agent_service::wire` type carry
+///   `deny_unknown_fields` and default nothing, so a field this build does not
+///   know is refused and a field it does know cannot go missing. A
+///   whole-connection stamp check refused frames a node understood perfectly
+///   while catching nothing the decoder does not.
+///
+///   One honest qualifier: that refusal is one-directional. Daemon→node names
+///   the bad field back to the sender; node→daemon drops the command and the
+///   node's create then waits unanswered. The gap is documented at the drop
+///   site (`bin/node/src/agent/link.rs`'s `classify`) and is skew-only — it
+///   needs a node and a daemon built from different trees, which nothing here
+///   owes support to.
 /// - and `None` FAILING CLOSED made a git-absent build a node with no compute,
 ///   no agent pty and no airlock, whose only symptom was a bare 503.
 ///
@@ -477,10 +487,23 @@ fn expire(entries: &mut HashMap<String, Entry>, now: Instant) {
 /// its presence. Returns the TTL it must re-signal within, and this node's own
 /// build so the daemon can name any skew between them.
 ///
-/// The build rides the OK body and NEVER a refusal body: a caller that got a
-/// 200 has already been admitted, whereas answering an unauthenticated
-/// rejection with a fact about this node is what the deleted build gate did
-/// wrong. Nothing secret goes in either body.
+/// The build rides the OK body and never a refusal body — and NOT because a
+/// 200 authenticates anyone. It does not: this route is unauthenticated (see
+/// the AUTH note above), so any local process reads the stamp by posting a
+/// hello, exactly as it used to read it out of the old gate's 409. Nothing was
+/// closed by moving it, and nothing needed to be: a stamp is compiled into a
+/// binary any local process can already read.
+///
+/// The reason is that a body must answer the request it is on. A refusal
+/// describes what the CALLER sent or what this node's capacity is, and adding
+/// an unrelated fact about this node to it is noise on the one response a
+/// confused caller has to read. The OK body pairs the stamp with the hello it
+/// answers, which is the pairing that makes it a diagnostic at all.
+///
+/// That diagnostic is honest-daemon-only, by construction: a daemon that wanted
+/// to look in step could read this stamp from its own OK body and echo it back
+/// as its `build` on the next hello, and `service status` would render a clean
+/// match. Nothing here is evidence, and no decision reads it.
 pub async fn hello(
     axum::extract::State(handle): axum::extract::State<crate::handle::NodeHandle>,
     axum::Json(body): axum::Json<Hello>,
@@ -660,10 +683,16 @@ mod tests {
 /// pin that admission never consults the stamp again.
 ///
 /// `build_identity()` is `option_env!`, resolved at COMPILE time, so no test
-/// can make it `None` at runtime. The behavioural half below therefore proves
-/// the stamp is not compared, and the source-parsing half proves the two
-/// admission paths never read it at all — which is the same guarantee, stated
-/// where a test can actually assert it.
+/// can make it `None` at runtime. Two halves cover that between them:
+///
+/// - **behavioural** — the hello path here, and
+///   `crate::stream`'s `a_service_link_is_granted_on_the_token_alone` for the
+///   service link. These prove no stamp VALUE is ever compared, which is every
+///   reintroduction except one.
+/// - **source lint** — the exception: `if build_identity().is_none() { refuse }`
+///   passes on a stamped build and breaks exactly the git-absent checkouts the
+///   gate broke. `no_admission_path_reads_this_node_s_build_stamp` forbids the
+///   stamp being NAMED, which is the only place a test can stand.
 #[cfg(test)]
 mod build_is_metadata_not_a_gate {
     use super::*;
@@ -732,50 +761,102 @@ mod build_is_metadata_not_a_gate {
         }
     }
 
-    /// A source-parsing lint, because `option_env!` cannot be made `None` at
-    /// runtime: neither admission path may name `build_identity` again.
+    /// Every way this source can name the node's own build stamp.
+    ///
+    /// `option_env!` written out by hand is in the list on purpose: it is the
+    /// same read spelled without the helper, and a guard that only knew the
+    /// helper's name would wave it through.
+    const STAMP_TOKENS: [&str; 2] = ["build_identity", "DUCKTAPE_BUILD"];
+
+    /// The source lint, at FILE granularity — because `option_env!` resolves at
+    /// compile time, so no runtime test can produce the git-absent case the
+    /// deleted gate broke.
+    ///
+    /// File granularity, and not the function-body parse this replaced, for two
+    /// reasons the old shape got wrong:
+    ///
+    /// - **it fell open silently.** The parse counted raw `{`/`}` bytes, so a
+    ///   brace inside a string literal (`"expected `}` here"`) ended the body
+    ///   early and the lint read — and passed — a few lines. Matching braces in
+    ///   Rust honestly means lexing raw strings and telling `'}'` from a
+    ///   lifetime; that is a parser, not a guard, and a subtly-wrong one is
+    ///   worse than none.
+    /// - **it only looked in one frame.** A one-line wrapper around
+    ///   `build_identity`, or the same check moved up to the `ServiceAttach`
+    ///   arm that CALLS `take_service_link`, both left the body clean. A whole
+    ///   file cannot be stepped out of.
     #[test]
-    fn neither_admission_path_consults_the_build_stamp() {
-        let paths = [
-            (file!(), "fn admit("),
-            ("bin/noded/src/stream.rs", "fn take_service_link("),
-        ];
-        for (relative, signature) in paths {
-            let source = std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../..")
-                    .join(relative),
-            )
-            .unwrap_or_else(|error| panic!("{relative}: {error}"));
-            let body = function_body(&source, signature)
-                .unwrap_or_else(|| panic!("{relative} no longer defines `{signature}`"));
-            assert!(
-                !body.contains("build_identity"),
-                "{signature} in {relative} must not gate on the build stamp — a \
-                 git-absent build would refuse every hello and every service link"
-            );
-        }
+    fn no_admission_path_reads_this_node_s_build_stamp() {
+        // the service-link path. Nothing in stream.rs may name the stamp at
+        // all: the file has no honest use for it, so the allowlist is empty and
+        // every evasion above fails here.
+        assert_eq!(
+            lines_naming_the_stamp(&read_source("bin/noded/src/stream.rs")),
+            Vec::<String>::new(),
+            "the service-link path must not read this node's build stamp — a \
+             git-absent build would refuse every link and leave the node with no \
+             interactive plane"
+        );
+
+        // this file DEFINES the stamp and `hello` RENDERS it, so its rule is an
+        // allowlist. It reads only the shipping half, which is also what keeps
+        // the literals below from matching themselves.
+        assert_eq!(
+            lines_naming_the_stamp(&shipping_half(file!())),
+            [
+                "pub fn build_identity() -> Option<&'static str> {",
+                r#"option_env!("DUCKTAPE_BUILD").filter(|id| !id.is_empty())"#,
+                "pub fn build_identity_or_unknown() -> &'static str {",
+                "build_identity().unwrap_or(UNKNOWN_BUILD)",
+                r#""build": build_identity_or_unknown(),"#,
+            ],
+            "the stamp is DEFINED and RENDERED here and read nowhere else — a new \
+             mention is a new reader, and `admit` in particular must never become \
+             one"
+        );
     }
 
-    /// The brace-balanced body of the function whose signature starts with
-    /// `signature`. Deliberately dumb: it only has to serve the two callers
-    /// above, and a parse that ever gets confused fails the test loudly.
-    fn function_body<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
-        let start = source.find(signature)? + signature.len();
-        let open = start + source[start..].find('{')?;
-        let mut depth = 0usize;
-        for (offset, byte) in source[open..].bytes().enumerate() {
-            match byte {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(&source[open..open + offset]);
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
+    /// Read a repo-relative source file, or fail the test saying which.
+    fn read_source(relative: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative);
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{relative}: {error}"))
+    }
+
+    /// The part of a file that SHIPS: everything above its first top-level
+    /// `#[cfg(test)]`.
+    ///
+    /// Panics unless that attribute starts a line at column zero. An indented
+    /// one is a test-only item mid-file, and cutting there would hand the lint a
+    /// shorter file than it thinks it has — the silent-fall-open failure this
+    /// whole guard exists not to have.
+    fn shipping_half(relative: &str) -> String {
+        const MARKER: &str = "#[cfg(test)]";
+        let source = read_source(relative);
+        let Some(cut) = source.find(MARKER) else {
+            panic!("{relative} has no {MARKER} — this lint lives in one");
+        };
+        assert_eq!(
+            cut,
+            source[..cut].rfind('\n').map_or(0, |newline| newline + 1),
+            "{relative}: the first {MARKER} is indented, so it is a test-only \
+             item mid-file. Move the stamp lint's scan, or this cut silently \
+             reads less than the whole shipping half."
+        );
+        source[..cut].to_string()
+    }
+
+    /// Every line of `source` that names the stamp, comments excluded — the
+    /// stamp is discussed at length in the docs above and none of that is a
+    /// read.
+    fn lines_naming_the_stamp(source: &str) -> Vec<String> {
+        source
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| STAMP_TOKENS.iter().any(|token| line.contains(token)))
+            .map(str::to_string)
+            .collect()
     }
 }
