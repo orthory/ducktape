@@ -275,7 +275,7 @@ fn cmd_grant(ctx: &VerbCtx, name: String, account: String, stdin: &mut impl BufR
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let grantee = resolve_account(&base, &account)?;
     let statement = gateway::CredentialGrantStatement {
-        chain_id: resolved.chain_id.clone(),
+        chain_id: resolved.service.chain_id.clone(),
         owner_account,
         name,
         account: grantee,
@@ -302,7 +302,7 @@ fn cmd_revoke(
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let grantee = resolve_account(&base, &account)?;
     let statement = gateway::CredentialGrantStatement {
-        chain_id: resolved.chain_id.clone(),
+        chain_id: resolved.service.chain_id.clone(),
         owner_account,
         name,
         account: grantee,
@@ -323,7 +323,7 @@ fn cmd_remove(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> CredResu
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let statement = gateway::RemoveCredentialStatement {
-        chain_id: resolved.chain_id.clone(),
+        chain_id: resolved.service.chain_id.clone(),
         owner_account,
         name,
     };
@@ -370,7 +370,7 @@ fn cmd_add(
     gateway::validate_credential_name(&name)?;
 
     // capture the login artifact into the on-disk store, keyed by name.
-    let store = crate::airlock_serve::cred_store_root(&resolved.storage_dir);
+    let store = crate::airlock_serve::cred_store_root(&resolved.service.storage_dir);
     let dir = store.join(&name);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     // `DUCKTAPE_CRED_REUSE_ARTIFACT=<path>` imports an ALREADY-authenticated
@@ -417,7 +417,7 @@ fn cmd_add(
         grants: std::collections::BTreeSet::new(),
     };
     let statement = gateway::SetCredentialStatement {
-        chain_id: resolved.chain_id.clone(),
+        chain_id: resolved.service.chain_id.clone(),
         record,
     };
     let preimage = gateway::set_credential_preimage(&statement)?;
@@ -463,7 +463,7 @@ fn ensure_airlock_route(
     // bearer (`allow_authorization`). Request cap is the module ceiling.
     let statement = gateway::RouteStatement {
         version: 1,
-        chain_id: resolved.chain_id.clone(),
+        chain_id: resolved.service.chain_id.clone(),
         account_id: account_id.to_vec(),
         name,
         publisher_node: resolved.signer.public_key().as_ref().to_vec(),
