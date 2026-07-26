@@ -261,7 +261,14 @@ mod tests {
 
         // a NEWER sender's extra field — on the command, on the create, and on
         // a lent credential (where dropping one is dropping a restriction).
-        let cred = r#""credential":{"name":"n","kind":"claude","authority":"a","via":"v","seal_pk":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"account":[1]"#;
+        //
+        // `cred` must be EXACTLY the current shape and nothing more. It once
+        // carried a since-deleted `account` field, and serde reports the FIRST
+        // unknown field it meets: the assertion below went on passing while the
+        // `spend_cap` arm — the one this test exists for — stopped running
+        // entirely. Deleting `"spend_cap":10` from the composed string is the
+        // check that it still does.
+        let cred = r#""credential":{"name":"n","kind":"claude","authority":"a","via":"v","seal_pk":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"#;
         for newer in [
             r#"{"op":"term_create","session":"a","provider":"claude","restricted":false,"limits":{},"credential":null,"future":1}"#.to_string(),
             r#"{"op":"term_close","session":"a","force":true}"#.to_string(),

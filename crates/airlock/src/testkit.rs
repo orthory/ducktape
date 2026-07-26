@@ -112,9 +112,11 @@ impl SnpTestEnclave {
 /// at decode. `account` is therefore what the proxy VERIFIED, not what anyone
 /// asked for.
 ///
-/// Drive an attack by wrapping with one account and CLAIMING another in
-/// `SessionRequest::account_b64`; that is exactly the shape of a member who read
-/// a lender's public credential record and copied the owner out of it.
+/// This is the ONLY way a test supplies an account, because it is the only way
+/// production does. A session request carries none — the field a caller could
+/// once name itself with is deleted — so an ungranted member is driven by
+/// wrapping with the account the proxy would really have stamped for them, and
+/// asserting the lender refuses it.
 #[cfg(feature = "server")]
 pub fn behind_gateway_proxy(app: axum::Router, account: &[u8]) -> axum::Router {
     let stamped: axum::http::HeaderValue =

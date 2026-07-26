@@ -254,9 +254,16 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
     let guest_node = Cluster::identity(0);
     let host_node = Cluster::identity(1);
 
-    // bind the guest node to the guest account — the host derives the creator
-    // account from the mesh-authenticated requesting node, so this is what makes
-    // the guest the credential owner in the admission decision.
+    // bind the guest node to the guest account. The HOST no longer derives a
+    // creator account at all — whether the credential may be drawn on is the
+    // lender's decision, made against the account the lender's node stamps on the
+    // gateway hop, which is the HOST's. What this binding still buys is the
+    // publisher→owner tie the gateway module needs for the record below, and the
+    // `.duck` handle the host resolves as the airlock authority.
+    //
+    // So this test no longer proves an admission decision about the guest. What
+    // it does prove is the half that survives: a peer-created session spawns,
+    // streams, and is input-gated to its creator node.
     cluster.submit(
         0,
         "identity",

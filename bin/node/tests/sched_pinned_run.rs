@@ -342,9 +342,13 @@ fn airlock_route_revision(cluster: &Cluster, reader: usize, account: &[u8]) -> O
 }
 
 /// Seed the owner's DISK store the way `ducktape user cred add` writes it, so the
-/// real lender daemon serves it from its first session. The lender is the only
-/// gateway with a grant gate; the in-process testkit gateway above deliberately
-/// has none, which is why a grant can only be proven against this one.
+/// real lender daemon serves it from its first session.
+///
+/// The in-process testkit gateway above wires no grant gate, so no grant can be
+/// proven against it. `cred_lending` does use the real gated lender and does
+/// exercise a grant — but with the borrower and the executor being the same node,
+/// so what nothing exercised was the grant against an executor DISTINCT from the
+/// submitter. That is this test, and it needs the real lender.
 fn seed_claude_store(storage: &Path, name: &str, refresh: &str) {
     let dir = storage.join("airlock-creds").join(name);
     std::fs::create_dir_all(&dir).unwrap();

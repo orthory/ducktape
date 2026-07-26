@@ -405,6 +405,25 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
         query_credential(&cluster, 1, "owner-claude-1")
     });
 
+    // BEFORE the grant: the real lender refuses this node, and the grant is the
+    // only thing that will change that. Cheap on purpose — this lane needs no
+    // sandbox, so the property stays provable on a host that cannot run one.
+    let record_ungranted = query_credential(&cluster, 1, "owner-claude-1").expect("record");
+    let (status, browser) = cluster.http(1, "GET", "/v1/gateway/browser", None);
+    assert_eq!(status, 200, "browser base failed: {browser}");
+    let via_pre = browser["base"].as_str().unwrap().to_string();
+    let refused_before_grant = rt.block_on(async {
+        AirlockClient::remote("airlock.owner.duck".into(), via_pre)
+            .open_session(&record_ungranted.seal_pk, "owner-claude-1")
+            .await
+    });
+    let refused_before_grant =
+        refused_before_grant.expect_err("an ungranted node must not open a session");
+    assert!(
+        format!("{refused_before_grant}").contains("credential_not_granted"),
+        "and it is the GRANT that is missing, named as such: {refused_before_grant}"
+    );
+
     let compute_account = compute.public_key().as_ref().to_vec();
     cluster.submit(
         0,
@@ -468,9 +487,10 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     // rather than at runtime. The account the lender authorizes is the one its
     // own node stamps on the hop.
     //
-    // The runtime half of that — an UNGRANTED executing node is refused, and a
-    // grant to the executing node is what changes it — needs a submitter and a
-    // separate executor to be worth anything, and lives in
+    // The runtime half — an ungranted node is refused by the real lender — ran
+    // above, before the grant committed, in this same lane and with no sandbox.
+    // What needs a submitter DISTINCT from the executor, and therefore podman,
+    // is the delegated shape:
     // `sched_pinned_run::a_delegated_run_draws_as_the_executing_node_not_the_submitter`.
 
     // And the lender serves no credential UPLOAD: its store is written by

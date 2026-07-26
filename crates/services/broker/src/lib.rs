@@ -3232,13 +3232,17 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// The production round-trip the lending e2e never exercises through the
-    /// broker: a grant-GATED self-host gateway (what `user cred add` always
-    /// builds) admits the broker's sealed session ONLY because the broker names
-    /// the granted account in `account_b64`. A broker that dropped the account
-    /// (the bug this guards) would 403 `credential_not_granted` at session open.
+    /// The production round-trip through the BROKER against a grant-GATED
+    /// self-host gateway (what `user cred add` always builds): the sealed session
+    /// opens, the credential is swapped in, and the reply comes back.
+    ///
+    /// It admits because the gateway's proxy vouched for an account the grant
+    /// names — nothing the broker sent. The broker names no account at all; it
+    /// cannot, since `SessionRequest` carries none. This test formerly asserted
+    /// the opposite ("only because the broker names the granted account in
+    /// `account_b64`"), and that field was the credential-theft defect.
     #[tokio::test]
-    async fn broker_sends_the_grant_account_to_a_gated_gateway() {
+    async fn a_gated_lender_admits_the_brokers_session_on_the_vouched_account() {
         let upstream = bearer_upstream("tok-grant").await;
         let (kp, seal_pk) = seal_pair();
         let gateway_url = boot_grant_gated_gateway(

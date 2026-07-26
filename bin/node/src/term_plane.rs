@@ -490,10 +490,17 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
     write_frame(&mut stream, &reply).await
 }
 
-/// the host's create path: derive the creator account from the mesh-authenticated
-/// peer, resolve the named credential from committed gateway state, decide
-/// admission, then spawn a peer-attached session drawing on the guest's
-/// self-host gateway. Every refusal carries a stable snake_case `reason`.
+/// the host's create path: resolve the named credential from committed gateway
+/// state, decide what THIS HOST admits (sandbox present, credential registered,
+/// provider/kind agreement, size ceiling), then spawn a peer-attached session
+/// drawing on the guest's self-host gateway. Every refusal carries a stable
+/// snake_case `reason`.
+///
+/// It deliberately does NOT resolve the creator's account. Whether the credential
+/// may be drawn on is the LENDER's decision, made against the account its own
+/// node stamps when this session's traffic makes the gateway hop — which is this
+/// host, not the peer. `peer` is still used, for the one thing it can settle
+/// locally: binding the session's input frames to the node that created it.
 async fn serve_create(
     control: &ControlState,
     peer: PeerId,
@@ -632,6 +639,17 @@ fn admit_create(
             "no credential by that name is registered".into(),
         ));
     };
+    let over_ceiling = cpu.is_some_and(|cores| cores > MAX_SESSION_CORES)
+        || mem_gb.is_some_and(|mem| mem > MAX_SESSION_MEM_GB);
+    if over_ceiling {
+        return Err((
+            "limits_exceed_host_ceiling",
+            format!(
+                "this host caps a session at {MAX_SESSION_CORES} cores / \
+                 {MAX_SESSION_MEM_GB} GB"
+            ),
+        ));
+    }
     let contradicts = provider_contradicts_kind(provider, record.kind);
     if contradicts {
         return Err((
@@ -667,6 +685,25 @@ fn provider_contradicts_kind(provider: &str, kind: gateway::CredentialKind) -> b
         _ => false,
     }
 }
+
+/// Per-session ceiling on what a REMOTE creator may ask this host to allocate.
+///
+/// `cpu`/`mem_gb` arrive from a mesh peer and go straight to the sandbox
+/// backend. Before the credential gate moved to the lender, a stranger could not
+/// reach [`build_limits`] at all on a node they held no grant on; now any
+/// admitted member naming any registered credential can, so the size of the
+/// container they get is a number they choose. `TermError::AtCapacity` bounds
+/// the session COUNT, not the size of one.
+///
+/// Refused rather than silently clamped: quietly handing back a tenth of what
+/// was asked for is the fail-quiet this repo's refusal doctrine exists to
+/// prevent, and the reason token tells the caller what actually happened.
+///
+/// ponytail: a constant, not the host's real capacity. The compute plane already
+/// models that (`compute_service::ResourceLedger`); wiring one into the term
+/// plane is the upgrade when a host wants to sell its actual size.
+const MAX_SESSION_CORES: u64 = 8;
+const MAX_SESSION_MEM_GB: u64 = 32;
 
 /// `--cpu`/`--mem` → the container limit keys the sandbox backend enforces.
 fn build_limits(cpu: Option<u64>, mem_gb: Option<u64>) -> std::collections::BTreeMap<String, u64> {
@@ -1123,6 +1160,42 @@ mod tests {
         );
         // an unknown provider tag is not a contradiction (the manager resolves it).
         assert!(admit_create("echo", Some(&claude), Some(1), Some(2), true).is_ok());
+    }
+
+    /// The size of the container is a number a REMOTE creator picks, and since
+    /// the credential gate moved to the lender any admitted member can reach it.
+    /// The ceiling is what stops "give me 1024 cores" from being a sentence a
+    /// stranger can say to this host.
+    #[test]
+    fn a_remote_creator_cannot_ask_this_host_for_any_size_it_likes() {
+        let owner = b"owner-acct".to_vec();
+        let claude = rec("c1", &owner, &[], gateway::CredentialKind::Claude);
+
+        // at the ceiling is fine; a step past it is refused, per knob.
+        assert!(
+            admit_create(
+                "claude",
+                Some(&claude),
+                Some(MAX_SESSION_CORES),
+                Some(MAX_SESSION_MEM_GB),
+                true
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            admit_create("claude", Some(&claude), Some(MAX_SESSION_CORES + 1), None, true)
+                .unwrap_err()
+                .0,
+            "limits_exceed_host_ceiling"
+        );
+        assert_eq!(
+            admit_create("claude", Some(&claude), None, Some(MAX_SESSION_MEM_GB + 1), true)
+                .unwrap_err()
+                .0,
+            "limits_exceed_host_ceiling"
+        );
+        // and an unset knob is not a request for infinity.
+        assert!(admit_create("claude", Some(&claude), None, None, true).is_ok());
     }
 
     #[test]
