@@ -567,9 +567,18 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
     let seal_pk = kp.public_bytes();
     // The injected gate: only the account `granted` may draw on the credential —
     // the node's committed-record lookup, stubbed to one allowed account here.
+    // `wedged` stands in for a node that did not answer at all.
     let check: airlock::server::GrantCheck = std::sync::Arc::new(|_name: String, account: Vec<u8>| {
-        Box::pin(async move { account == b"granted" })
-            as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        Box::pin(async move {
+            match account.as_slice() {
+                b"granted" => airlock::server::GrantAnswer::Granted,
+                b"wedged" => airlock::server::GrantAnswer::Undetermined,
+                _other => airlock::server::GrantAnswer::Refused,
+            }
+        })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = airlock::server::GrantAnswer> + Send>,
+            >
     });
     let (app, _) = server::build_seeded_gated(
         self_host_cfg(Some(kp), upstream.clone(), String::new()),
@@ -604,6 +613,15 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
     // account is a refusal, never a bypass.
     let err = gw.open_session(&seal_pk, "a").await.unwrap_err();
     assert!(err.to_string().contains("403"), "an accountless session must 403: {err}");
+
+    // The gate could not ASK its authority. That is NOT a refusal: a 403 sends
+    // the borrower's operator to add a grant that already exists, so the one
+    // answer that carries no information gets its own 503 instead.
+    let err = gw.open_session_as(&seal_pk, "a", b"wedged").await.unwrap_err();
+    assert!(
+        err.to_string().contains("503"),
+        "an undetermined grant must 503, never 403: {err}"
+    );
 }
 
 #[test]

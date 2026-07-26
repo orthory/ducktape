@@ -96,7 +96,14 @@ fn save(workspace: &Path, routes: &LocalRoutes) -> Result<(), String> {
     routes.validate()?;
     std::fs::create_dir_all(workspace).map_err(|error| format!("create {workspace:?}: {error}"))?;
     let path = workspace.join(FILE_NAME);
-    let temporary = workspace.join(format!(".{FILE_NAME}.tmp"));
+    // Per-process temp name. This file is now read-modify-written on a service
+    // daemon's 10 s heartbeat, so a FIXED name lets that beat and an operator's
+    // `gateway bind` interleave until one rename publishes the other's bytes.
+    //
+    // ponytail: the read-modify-write itself is still last-writer-wins across
+    // processes — a lost update, not a torn file. Take a lock only if a second
+    // route-writing daemon ever appears.
+    let temporary = workspace.join(format!(".{FILE_NAME}.{}.tmp", std::process::id()));
     if routes.routes.is_empty() {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -230,11 +237,77 @@ pub fn register(
     save(workspace, &routes)
 }
 
-/// Retire a node-local loopback route — the programmatic twin of [`unbind`],
-/// for a service daemon dropping its port on the way out. A route that is
-/// already absent is success: the operator may have unbound it by hand, and a
-/// daemon stopping must not fail on that.
-pub fn unregister(workspace: &Path, name: &gateway::RouteName) -> Result<(), String> {
+/// Who holds a route right now, from the point of view of the daemon serving
+/// `port`. The ONE discriminant both the heartbeat re-assert and the exit
+/// retire branch on.
+///
+/// Nothing stops two daemons of one kind on one workspace — `service run` takes
+/// no lock and keeps no pidfile — and NAME-scoped writes make that pair
+/// pathological: they flap the route between their ports every beat, and the
+/// first to stop deletes the survivor's live entry, 404ing authorized overlay
+/// ingress. Port-scoped, the newcomer simply wins and the loser goes quiet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteOwner {
+    /// no entry: nothing registered it, or the operator unbound it by hand.
+    Vacant,
+    /// the entry names this daemon's own port.
+    Ours,
+    /// the entry names a different port — another daemon owns the route now.
+    Foreign,
+}
+
+fn owner_of(workspace: &Path, name: &gateway::RouteName, port: u16) -> Result<RouteOwner, String> {
+    let Some(registered) = load(workspace)?.port(name) else {
+        return Ok(RouteOwner::Vacant);
+    };
+    let is_ours = registered == port;
+    if is_ours {
+        return Ok(RouteOwner::Ours);
+    }
+    Ok(RouteOwner::Foreign)
+}
+
+/// Re-assert `name -> port` on a daemon's heartbeat, so the port the node
+/// proxies to cannot disagree with the port this process serves on for longer
+/// than one beat. Returns what the file said BEFORE: only `Vacant` writes — an
+/// operator's `gateway unbind`, corrected within one beat.
+///
+/// `Ours` is already exactly the instruction we want, and rewriting it every
+/// beat would re-open the read-modify-write window for no change. `Foreign`
+/// yields to the newer daemon rather than flapping the entry between two ports.
+pub fn reassert(
+    workspace: &Path,
+    name: &gateway::RouteName,
+    port: u16,
+) -> Result<RouteOwner, String> {
+    let owner = owner_of(workspace, name, port)?;
+    match owner {
+        RouteOwner::Vacant => register(workspace, name.clone(), port)?,
+        RouteOwner::Ours => {}
+        RouteOwner::Foreign => {}
+    }
+    Ok(owner)
+}
+
+/// Retire a daemon's own loopback route on the way out — the programmatic twin
+/// of [`unbind`], scoped to the `port` that proves ownership. Returns the owner
+/// as it was BEFORE the removal: only `Ours` is removed. A route that is already
+/// absent is success (the operator may have unbound it by hand), and a `Foreign`
+/// one is LEFT ALONE — deleting it would 404 a live daemon's ingress.
+pub fn retire(
+    workspace: &Path,
+    name: &gateway::RouteName,
+    port: u16,
+) -> Result<RouteOwner, String> {
+    let owner = owner_of(workspace, name, port)?;
+    match owner {
+        RouteOwner::Vacant | RouteOwner::Foreign => {}
+        RouteOwner::Ours => remove(workspace, name)?,
+    }
+    Ok(owner)
+}
+
+fn remove(workspace: &Path, name: &gateway::RouteName) -> Result<(), String> {
     let mut routes = load(workspace)?;
     let Ok(index) = routes.routes.binary_search_by(|route| route.name.cmp(name)) else {
         return Ok(());
@@ -302,30 +375,58 @@ mod tests {
         assert!(bind(bind_args(dir.path(), Some("evil.name"), None, 1)).is_err());
     }
 
-    /// A daemon's port is a standing instruction to the node's reverse proxy,
-    /// so it must be re-assertable while the daemon lives and gone once it
-    /// stops — otherwise overlay ingress keeps landing on a port any local
-    /// process may bind next.
+    /// A restarted daemon comes back on a FRESH ephemeral port, so registering
+    /// the same route name twice must replace the entry rather than add one —
+    /// the file refuses duplicate names outright.
     #[test]
-    fn a_daemon_port_is_refreshable_and_retires_completely() {
+    fn registering_a_route_name_twice_replaces_the_entry_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let name = gateway::RouteName::named("airlock");
         register(dir.path(), name.clone(), 4100).unwrap();
-        assert_eq!(load(dir.path()).unwrap().port(&name), Some(4100));
-
-        // the heartbeat re-assert is idempotent, and a restarted daemon on a
-        // fresh ephemeral port replaces the entry rather than adding one.
         register(dir.path(), name.clone(), 4100).unwrap();
         register(dir.path(), name.clone(), 4200).unwrap();
         assert_eq!(load(dir.path()).unwrap().routes.len(), 1);
         assert_eq!(load(dir.path()).unwrap().port(&name), Some(4200));
+    }
 
-        // retiring removes exactly it, leaves no husk file, and is safe twice
-        // (the operator may have unbound it by hand first).
-        unregister(dir.path(), &name).unwrap();
+    /// A daemon's port is a standing instruction to the node's reverse proxy,
+    /// and two daemons on one workspace are prevented NOWHERE. So both the beat
+    /// and the exit are scoped to the port that proves ownership: name-scoped,
+    /// the pair would flap the route every beat and the first to stop would
+    /// delete the survivor's live entry.
+    #[test]
+    fn a_route_is_owned_by_the_port_that_registered_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = gateway::RouteName::named("airlock");
+
+        // one daemon: its own beat holds the route.
+        register(dir.path(), name.clone(), 4100).unwrap();
+        assert_eq!(reassert(dir.path(), &name, 4100).unwrap(), RouteOwner::Ours);
+        assert_eq!(load(dir.path()).unwrap().port(&name), Some(4100));
+
+        // a second daemon starts and takes it. The first must now yield.
+        register(dir.path(), name.clone(), 4200).unwrap();
+        assert_eq!(reassert(dir.path(), &name, 4100).unwrap(), RouteOwner::Foreign);
+        assert_eq!(
+            load(dir.path()).unwrap().port(&name),
+            Some(4200),
+            "a yielded beat writes nothing — otherwise the two flap forever"
+        );
+
+        // ...and the first daemon's SIGTERM must not delete the survivor's entry.
+        assert_eq!(retire(dir.path(), &name, 4100).unwrap(), RouteOwner::Foreign);
+        assert_eq!(load(dir.path()).unwrap().port(&name), Some(4200));
+
+        // the owner retires its own: gone, no husk file, and safe twice (the
+        // operator may have unbound it by hand first).
+        assert_eq!(retire(dir.path(), &name, 4200).unwrap(), RouteOwner::Ours);
         assert_eq!(load(dir.path()).unwrap().port(&name), None);
         assert!(!dir.path().join(FILE_NAME).exists());
-        unregister(dir.path(), &name).unwrap();
+        assert_eq!(retire(dir.path(), &name, 4200).unwrap(), RouteOwner::Vacant);
+
+        // a hand `gateway unbind` is corrected on the next beat.
+        assert_eq!(reassert(dir.path(), &name, 4200).unwrap(), RouteOwner::Vacant);
+        assert_eq!(load(dir.path()).unwrap().port(&name), Some(4200));
     }
 
     #[test]

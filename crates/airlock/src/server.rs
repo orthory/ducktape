@@ -124,14 +124,31 @@ fn now_secs() -> u64 {
 /// vendor roots, so this seam grants no forgery power.
 pub type Quoter = Box<dyn Fn(&[u8; attest::REPORT_DATA_LEN]) -> Result<Vec<u8>> + Send + Sync>;
 
+/// What the injected grant gate answered. THREE states, not two: a `bool` has
+/// no room for "I could not ask", and folding that into a refusal is the
+/// expensive mistake — it tells the borrower's operator to go add a grant that
+/// already exists, which is the one thing provably not wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantAnswer {
+    /// the authority answered, and its committed record admits this account.
+    Granted,
+    /// the authority answered, and it does not admit this account — no such
+    /// record, or an account that is neither the owner nor a grantee.
+    Refused,
+    /// the authority could not be ASKED: a node link that timed out, a refused
+    /// connection, a resident that is not serving, a reply that would not
+    /// decode. Nothing at all is known about the grant.
+    Undetermined,
+}
+
 /// The co-hosted-lending grant gate, injected by the node. Given a credential
 /// `name` and the account the session claims to act on behalf of, it answers
 /// whether that account may draw on the credential — the node resolves this
 /// against its own COMMITTED gateway-module record (owner or a granted account).
 /// `None` on gateways that never lend (owner-local, TEE): the claimed account is
-/// then unread. A `false` answer 403s the session before any handshake work.
+/// then unread. See [`GrantAnswer`] for what each answer costs the borrower.
 pub type GrantCheck =
-    Arc<dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+    Arc<dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = GrantAnswer> + Send>> + Send + Sync>;
 
 /// Lazy store loader: given a credential name, return its payload from the
 /// on-disk store, or `None` if absent. Lets a running gateway pick up a
@@ -423,14 +440,16 @@ async fn credential(
 }
 
 /// Run the injected grant gate for one session request: the claimed account must
-/// be present and base64-decodable, and the node's lookup must allow it. A
-/// missing or malformed claimed account is a refusal, never a bypass.
-async fn grant_allows(check: &GrantCheck, req: &SessionRequest) -> bool {
+/// be present and base64-decodable, and the node's lookup must admit it. A
+/// missing or malformed claimed account is a refusal, never a bypass — and a
+/// REFUSAL, not [`GrantAnswer::Undetermined`]: this gateway decided it on the
+/// request alone, without needing its authority.
+async fn grant_answer(check: &GrantCheck, req: &SessionRequest) -> GrantAnswer {
     let Some(account_b64) = &req.account_b64 else {
-        return false;
+        return GrantAnswer::Refused;
     };
     let Ok(account) = BASE64.decode(account_b64) else {
-        return false;
+        return GrantAnswer::Refused;
     };
     check(req.sub.clone(), account).await
 }
@@ -475,10 +494,23 @@ async fn session(
     // Co-hosted lending: when a grant gate is wired, the session's claimed account
     // must be the owner or a granted account of the on-chain record. Refuse before
     // any handshake work — a session for an ungranted account never opens.
+    //
+    // Three answers, three statuses. A 403 sends the borrower's operator to go
+    // get a grant, so an authority we could not REACH must never wear one: that
+    // is a 503 naming the lender's node, which the borrower retries.
     if let Some(check) = &st.grant_check {
-        let granted = grant_allows(check, &req).await;
-        if !granted {
-            return Err(AppErr(StatusCode::FORBIDDEN, "credential_not_granted".into()));
+        let denial = match grant_answer(check, &req).await {
+            GrantAnswer::Granted => None,
+            GrantAnswer::Refused => {
+                Some(AppErr(StatusCode::FORBIDDEN, "credential_not_granted".into()))
+            }
+            GrantAnswer::Undetermined => Some(AppErr(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "grant_authority_unavailable".into(),
+            )),
+        };
+        if let Some(denial) = denial {
+            return Err(denial);
         }
     }
     // Enclave side of the handshake: derive the shared key from the client's

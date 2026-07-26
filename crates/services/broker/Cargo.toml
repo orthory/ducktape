@@ -9,6 +9,9 @@ version.workspace = true
 # (codex) and Anthropic Messages (claude) — plus the airlock client layer that
 # swaps a host-held credential for a verified TEE gateway session.
 [dependencies]
+# the airlock client hands back `anyhow::Error`, and a failed session handshake
+# is CLASSIFIED off its cause chain (see `SessionRefusal`) rather than its text.
+anyhow = "1"
 axum = "0.8"
 # StreamExt for the Anthropic broker's SSE passthrough (reqwest bytes_stream →
 # axum Body::from_stream, never buffered).

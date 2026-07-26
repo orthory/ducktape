@@ -177,6 +177,27 @@ fn artifact_mtime(dir: &Path) -> Option<SystemTime> {
     newest
 }
 
+/// How many credentials the store holds, WITHOUT opening one.
+///
+/// A caller that wants only the NUMBER must never take the [`load_seeds`] path
+/// to get it: that parses every vendor login artifact into a live refresh/access
+/// token inside the asking process, and logs the operator-chosen credential NAME
+/// for each incomplete dir. `ducktape user cred add` writes the `kind` marker
+/// last, so a dir carrying one is a registered credential and a `read_dir` is
+/// the whole answer.
+///
+/// A store root that cannot be read counts ZERO — an unreadable store is not
+/// evidence of lending.
+pub fn count_credentials(root: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("kind").is_file())
+        .count()
+}
+
 /// Load every credential in the store as a gateway seed. A dir missing its `kind`
 /// marker or its login artifact is SKIPPED with a warn (never a hard error — one
 /// broken credential must not stop the rest being served). A missing store root
@@ -373,6 +394,30 @@ mod tests {
         assert_eq!(name, "eddy-codex-1");
         assert_eq!(*kind, CredentialKind::Codex);
         assert!(matches!(payload, CredentialPayload::Bearer { access_token } if access_token == "tok-codex"));
+    }
+
+    /// The node's boot diagnostic wants a COUNT. Taking `load_seeds` for it
+    /// would materialize every credential's live tokens in the node process and
+    /// log the operator-chosen names — so the count must come off `read_dir`,
+    /// and this proves it does: a dir with no login artifact at all is still
+    /// counted, which only a path that never opens one can do.
+    #[test]
+    fn credentials_are_counted_without_opening_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cred_store_root(tmp.path());
+        assert_eq!(count_credentials(&root), 0, "a store that does not exist lends nothing");
+
+        load_or_create_seal_keypair(&root).unwrap(); // writes seal.key beside them
+        seed_claude(&root, "eddy-claude-1", "rt-eddy");
+        seed_codex(&root, "eddy-codex-1", "tok-codex");
+        write(&root.join("registered-but-broken").join("kind"), "claude\n");
+
+        assert_eq!(count_credentials(&root), 3, "seal.key is not a credential; a broken one is");
+        assert_eq!(
+            load_seeds(&root).unwrap().len(),
+            2,
+            "load_seeds knows the third is broken only because it OPENED the other two"
+        );
     }
 
     #[test]

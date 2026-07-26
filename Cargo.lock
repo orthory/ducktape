@@ -1077,6 +1077,7 @@ name = "broker-host"
 version = "0.1.0"
 dependencies = [
  "airlock",
+ "anyhow",
  "axum",
  "futures",
  "rand 0.8.6",
