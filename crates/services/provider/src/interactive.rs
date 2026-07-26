@@ -652,9 +652,24 @@ mod tests {
         assert_eq!(claude, vec!["--foo".to_string()]);
     }
 
-    // ---- live podman integration (skips when podman is unavailable) ---------
+    // ---- live podman integration -------------------------------------------
     // These exercise the SAME pty primitive against a REAL `podman run -it`
     // container — the bridge PR1 could only argv-assert off a podman host.
+    //
+    // `#[ignore]`, like every other live test in this module. This crate's
+    // default lane is 85 tests that need nothing, and making the whole
+    // inner-loop `cargo test -p provider-host` require podman for 2 of them is
+    // where the pressure to put the opt-out in a shell profile comes from — an
+    // opt-out in a profile buys nothing and costs churn. An IGNORED test is
+    // disclosed: libtest prints `N ignored` in the summary, which is the exact
+    // property a captured "skipping" line lacked. Run them with
+    // `cargo test -p provider-host -- --ignored`, where the podman gate below
+    // still FAILS loudly on a host that cannot honour it.
+    //
+    // Nothing is lost on a provisioned box: `bin/node/tests/remote_session.rs`
+    // drives this same pty primitive end to end through a real sandbox (guest
+    // directs, host spawns, keystroke forwarded, echo fanned back), in a suite
+    // that does run by default.
 
     /// `Some(())` = no podman here, so `test` cannot run and the caller must
     /// return — which by default it will not: a missing capability FAILS unless
@@ -686,6 +701,7 @@ mod tests {
 
     /// REAL podman: openpty + `podman run -it … cat` bridges bytes both ways.
     #[tokio::test]
+    #[ignore = "live: needs podman (spends nothing) — cargo test -p provider-host -- --ignored"]
     async fn pty_bridges_a_real_podman_container() {
         if skip_without_podman("pty_bridges_a_real_podman_container").is_some() {
             return;
@@ -1013,6 +1029,7 @@ mod tests {
     /// REAL podman: `-t` gives the CONTAINER process a genuine tty — what a TUI
     /// needs. `test -t 0` is true only over a real pty.
     #[tokio::test]
+    #[ignore = "live: needs podman (spends nothing) — cargo test -p provider-host -- --ignored"]
     async fn podman_dash_t_gives_the_container_a_real_tty() {
         if skip_without_podman("podman_dash_t_gives_the_container_a_real_tty").is_some() {
             return;
