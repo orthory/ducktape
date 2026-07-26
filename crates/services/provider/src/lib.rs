@@ -1382,6 +1382,13 @@ impl CliProvider {
             ));
         }
 
+        // A probe that TIMES OUT or refuses is "sshd isn't up yet", not "give
+        // up": the guest needs ~10s before it answers, so the first probes are
+        // expected to fail. Only two conditions end the loop early — sshpass
+        // missing (unrecoverable) and the `tart run` process dying (checked
+        // below). Every other failure is retried, carrying the last one into the
+        // timeout error for diagnosis.
+        let mut last_probe_error = String::new();
         for attempt in 0..30 {
             let ssh_args = sandbox::tart_ssh_argv(&guard.ip, "true", false);
             let status = guard
@@ -1407,12 +1414,7 @@ impl CliProvider {
                         self.spec.tag
                     ));
                 }
-                Err(error) => {
-                    return Err(format!(
-                        "{}: Tart SSH readiness probe failed: {error}",
-                        self.spec.tag
-                    ));
-                }
+                Err(error) => last_probe_error = error,
                 Ok(_) => {}
             }
             #[cfg(unix)]
@@ -1452,7 +1454,7 @@ impl CliProvider {
             }
         }
         Err(format!(
-            "{}: Tart VM {vm} got IP {} but SSH did not become ready within 30s",
+            "{}: Tart VM {vm} got IP {} but SSH did not become ready within 30s: {last_probe_error}",
             self.spec.tag, guard.ip
         ))
     }
