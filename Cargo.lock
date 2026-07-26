@@ -159,6 +159,7 @@ dependencies = [
 name = "airlock"
 version = "0.1.0"
 dependencies = [
+ "airlock",
  "anyhow",
  "axum",
  "base64 0.22.1",
@@ -5285,6 +5286,7 @@ dependencies = [
  "futures",
  "host",
  "kv",
+ "node",
  "saga",
  "sdk",
  "statesync",
@@ -6548,6 +6550,7 @@ dependencies = [
  "capability",
  "futures",
  "libc",
+ "nettest",
  "provider-host",
  "rand 0.8.6",
  "reqwest 0.12.28",

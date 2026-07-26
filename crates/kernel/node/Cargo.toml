@@ -31,6 +31,12 @@ commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
 
 [dev-dependencies]
+# a SELF dev-dependency (the `data-plane` pattern): `tests/submit_decoded.rs`
+# opens with `#![cfg(feature = "sim")]` and `sim` is off by default, so
+# `cargo test -p node` compiled it to `running 0 tests` — a green that proved
+# nothing, alive only under `--workspace` or `-p simnode`, which is where the
+# feature happened to get unified in.
+node = { path = ".", features = ["sim"] }
 # the host-side qmdb store handle injected into disk-backed modules.
 statesync = { workspace = true }
 # tests stand hosts over in-memory directory modules and drive the async seams
