@@ -119,6 +119,38 @@ pub struct Cluster {
     dir: tempfile::TempDir,
 }
 
+impl Drop for Cluster {
+    /// Reap each compute daemon AND the podman service it left behind.
+    ///
+    /// [`NodeProc::drop`] SIGKILLs, so a compute daemon never runs
+    /// [`provider_host::PodmanService`]'s `kill_on_drop` — and that service was
+    /// started `--time=0`, meaning it never idle-exits. It therefore outlives the
+    /// whole test holding ~45 MB, rooted in a tempdir that is about to vanish.
+    /// `PodmanService::claim` only reaps such an orphan when a SUCCESSOR boots on
+    /// the same root, and a torn-down cluster never gets one: left alone these
+    /// accumulate for as long as the box stays up (102 of them, ~4.5 GB, were
+    /// swept by hand once).
+    ///
+    /// Runs BEFORE the fields drop, which is the whole point — the pid file lives
+    /// in `dir`. Daemons go first so nothing re-creates a service after the sweep.
+    /// The reap is identity-verified by executable inside `provider_host`, never a
+    /// `pkill -f` pattern match (which has killed an agent's own shell here).
+    fn drop(&mut self) {
+        for daemon in &mut self.daemons {
+            *daemon = None; // NodeProc::drop kills + waits
+        }
+        for idx in 0..self.peer_ids.len() {
+            provider_host::reap_service_at(
+                &self.workspace(idx).join("services").join(COMPUTE_SERVICE_KIND),
+            );
+        }
+    }
+}
+
+/// the service kind whose podman root this harness reaps — the only daemon it
+/// spawns. An `agent` daemon would need its own entry here.
+const COMPUTE_SERVICE_KIND: &str = "compute";
+
 /// a two-person network-shape ceremony: real `init`/`invite`/`join` verbs,
 /// key files, network.toml descriptors, and node.toml configs.
 pub struct NetworkShapeCluster {
@@ -980,14 +1012,13 @@ impl Cluster {
         }
     }
 
-    /// Wait until `probe` answers, re-evaluating it ONCE PER BLOCK.
+    /// Wait until `probe` answers, re-evaluating it on node `idx`'s heartbeat.
     ///
-    /// The event-driven replacement for a sleep-and-retry poll: the thread
-    /// blocks on node `idx`'s ws stream and re-reads committed state only when
-    /// the chain itself says a block landed (see [`BlockFeed`]). Committed state
-    /// cannot change without a block, so between two frames there is by
-    /// construction nothing new to find — which is exactly what makes a timed
-    /// poll of this predicate a disguised timeout, and this not one.
+    /// Replaces a 300ms client-side sleep-and-retry with a thread that blocks on
+    /// the node's own ws stream: committed state cannot change without a block,
+    /// so re-reading on the node's schedule instead of the test's is both
+    /// cheaper and impossible to make fire early. It is a ≤3s wake rather than a
+    /// pure event — see [`BlockFeed`] for exactly why.
     ///
     /// Derived read models (`/v1/index/...`) apply BEHIND finalized state, so a
     /// predicate over one simply satisfies a block or two later; the loop is
@@ -1008,7 +1039,8 @@ impl Cluster {
         loop {
             if let Err(why) = blocks.next_block() {
                 panic!(
-                    "waiting for {what} via node idx {idx}: {why};\n{}",
+                    "timed out after {timeout:?} waiting for {what} \
+                     (via node idx {idx}): {why};\n{}",
                     self.all_log_tails(60)
                 );
             }
@@ -1251,19 +1283,26 @@ fn await_marker(proc: &mut NodeProc, marker: &str, timeout: Duration) -> Result<
     }
 }
 
-/// A live feed of one node's block wakes — the harness's event seam for
-/// "committed state changed".
+/// A live feed of one node's heartbeat frames — the harness's wake seam for
+/// "committed state may have changed".
 ///
-/// The node publishes a `heartbeat` frame to EVERY ws client on every block
-/// wake, nop fillers included, so an unsubscribed connection is already the
-/// changed feed (`bin/noded/src/stream.rs`, and the compute daemon's own intake
-/// rides the same frame). Blocking on that socket is waiting on the system's own
-/// event: a loaded CI box makes frames arrive later, it can never make the wait
-/// give up early, and nothing here consults a clock to decide when to look again.
+/// The node sends a `heartbeat` frame to every ws client on every block wake,
+/// nop fillers included, so an unsubscribed connection is already the changed
+/// feed (the compute daemon's own intake rides the same frame). Blocking on that
+/// socket means the thread wakes on the chain's own event and re-reads only when
+/// there is something new to read.
+///
+/// **It is not purely event-driven, and the difference matters.**
+/// `bin/noded/src/stream.rs` also emits a byte-identical heartbeat on a 3s
+/// `tokio::time::interval`, and nothing in the frame distinguishes the two — so
+/// this is a ≤3s poll that additionally wakes per block. What it buys over the
+/// 300ms client-side spin it replaces is real but bounded: it cannot fire early
+/// on a slow box, it re-reads only on the node's own schedule, and an idle chain
+/// costs nothing. Calling it "waits on events, never on time" would be false.
 ///
 /// The socket read timeout is the FAILURE path only — a node that has stopped
-/// producing blocks must fail with a diagnosis rather than hang CI forever. It
-/// is not a poll interval: no successful wait ever waits it out.
+/// sending anything must fail with a diagnosis rather than hang CI forever. No
+/// successful wait ever waits it out.
 pub struct BlockFeed {
     socket: tokio_tungstenite::tungstenite::WebSocket<
         tokio_tungstenite::tungstenite::stream::MaybeTlsStream<TcpStream>,
@@ -1277,7 +1316,11 @@ impl BlockFeed {
         use tokio_tungstenite::tungstenite::Message;
         loop {
             if Instant::now() >= self.deadline {
-                return Err("no block wake before the deadline".into());
+                // NOT "no block wake" — the chain is almost always producing
+                // them fine and the predicate is simply still false. Saying
+                // otherwise sends the reader hunting a stalled consensus that
+                // is not stalled; the caller names the predicate instead.
+                return Err("never became true".into());
             }
             let frame = self
                 .socket

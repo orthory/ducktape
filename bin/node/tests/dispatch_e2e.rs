@@ -19,9 +19,16 @@
 //!   validators run a compute grant announcing nothing (accept-lane-only), so
 //!   the agent's tag has an EMPTY rendezvous pool and the dispatch's
 //!   WorkerRequest goes out UNASSIGNED — an announcement. both capable nodes
-//!   race `SagaMsg::Accept`; consensus order seats exactly one winner, the
-//!   loser's accept finalizes as a deterministic no-op, and the work runs
-//!   ONCE — the double-execution safety property, live across processes.
+//!   race `SagaMsg::Accept`; consensus order seats exactly one winner and the
+//!   loser's accept finalizes as a deterministic no-op.
+//!
+//!   What the assertions PROVE is narrower than "the work runs once": at most
+//!   one `OracleResult` op commits PER ATTEMPT, which rules out two nodes both
+//!   believing they won one claim. It does not rule out a node that lost its
+//!   lease mid-run finishing and paying for the work anyway — that gap is a
+//!   product guard (the cancellation check between podman `create` and `start`,
+//!   held by a source lint in `provider-host`), not something committed state
+//!   can show, because the late result lands as a no-op.
 //!
 //! ## the compute plane is a real, sandboxed, out-of-process one
 //!
@@ -102,6 +109,31 @@ fn unsandboxable_host() -> Option<String> {
     }
     .probe()
     .err()
+}
+
+/// Set to `1` on any host that is SUPPOSED to run this suite, and a skip becomes
+/// a failure.
+///
+/// A skip is the honest answer for a laptop without the sandbox tooling, but
+/// `ok. 2 passed ... finished in 0.00s` is indistinguishable from a real green
+/// run in CI output — and a regression suite that silently passes everywhere is
+/// the precise trap this whole campaign keeps walking into (the compute plane
+/// was dead on dev for exactly this class of reason). So the decision is the
+/// operator's: unset, a host without podman skips loudly; set, it fails.
+const REQUIRE_SANDBOX_ENV: &str = "DUCKTAPE_REQUIRE_SANDBOX";
+
+/// `Some(reason)` = this test cannot run here; the caller returns. Panics
+/// instead when the host was declared sandbox-capable.
+fn skip_unless_sandboxed(test: &str) -> Option<()> {
+    let why = unsandboxable_host()?;
+    assert!(
+        std::env::var_os(REQUIRE_SANDBOX_ENV).is_none_or(|require| require != "1"),
+        "{REQUIRE_SANDBOX_ENV}=1 but this host cannot sandbox a run: {why}"
+    );
+    // stderr, not the harness's own channel: a skip must be visible in the CI
+    // log beside a `2 passed` that covered nothing.
+    eprintln!("SKIP {test}: {why} (set {REQUIRE_SANDBOX_ENV}=1 to make this a failure)");
+    Some(())
 }
 
 /// one script-backed provider staged on disk for one node: an operator spec
@@ -260,12 +292,15 @@ fn boot(cluster: &mut Cluster) {
 /// The op index records ops rather than effects, which is precisely why the
 /// duplicate is visible here and nowhere else in committed state.
 ///
-/// Keyed BY ATTEMPT, and that is the whole subtlety. Two results under two
-/// different attempts are the designed recovery, not a safety violation: a lease
-/// expired, the saga re-announced, and a node claimed the new attempt. Summing
-/// across attempts would call that retry a double execution — which a cold host
-/// reaches routinely, because the winner's very first run waits out an image
-/// pull and can lose its lease doing it.
+/// Keyed BY ATTEMPT because the attempt IS the saga's idempotency key — the
+/// thing a result is a result *of*. Two results under two different attempts are
+/// the designed recovery, not a safety violation, and summing across attempts
+/// would call that recovery a double execution.
+///
+/// A second attempt is reachable here: `runs` allows `RUN_MAX_ATTEMPTS = 2`, so
+/// a provider failure retries once. It is NOT lease expiry — `runs` mints its
+/// sagas with `RUN_LEASE_VIEWS = 1024` (~17 min), against a busybox pull that
+/// measures ~2.4s.
 ///
 /// (The host-side log could not survive the move into a container: the run's
 /// mount namespace has no path to the fixture directory.)
@@ -488,8 +523,7 @@ fn op_height(ops: &[serde_json::Value], pick: impl Fn(&serde_json::Value) -> boo
 
 #[test]
 fn mention_routes_to_the_announced_provider_across_nodes() {
-    if let Some(why) = unsandboxable_host() {
-        eprintln!("skipping mention_routes_to_the_announced_provider_across_nodes: {why}");
+    if skip_unless_sandboxed("mention_routes_to_the_announced_provider_across_nodes").is_some() {
         return;
     }
     let _serial = serial();
@@ -651,8 +685,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
 
 #[test]
 fn unannounced_capable_nodes_race_accept_and_execute_once() {
-    if let Some(why) = unsandboxable_host() {
-        eprintln!("skipping unannounced_capable_nodes_race_accept_and_execute_once: {why}");
+    if skip_unless_sandboxed("unannounced_capable_nodes_race_accept_and_execute_once").is_some() {
         return;
     }
     let _serial = serial();

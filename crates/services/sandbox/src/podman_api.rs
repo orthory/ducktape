@@ -584,17 +584,49 @@ impl Podman {
     /// check would therefore report a missing image as acquired and let the
     /// retried create 404 again under a diagnosis that names the wrong thing, so
     /// the stream's own error line is the verdict.
+    ///
+    /// BOUNDED, because this runs inside a run's lease window and [`Self::request`]
+    /// has no timeout of its own: a blackholed registry holds the socket open
+    /// indefinitely (measured at 123 s against TEST-NET before the caller even
+    /// noticed), and an unbounded network await inside a lease is the shape that
+    /// lets a lease expire under a run that then proceeds anyway. The caller's
+    /// cancellation check after `create` is the other half of that guard.
     pub async fn pull(&self, image: &str) -> Result<(), String> {
+        tracing::info!(
+            target: "ducktape::sandbox",
+            image,
+            "pulling provider image into this service's store"
+        );
         // `/` and `:` are legal query characters and podman parses the reference
         // verbatim, so the image name travels as written.
-        let resp = self
-            .request("POST", &format!("{API}/images/pull?reference={image}"), None)
-            .await?;
+        let path = format!("{API}/images/pull?reference={image}");
+        let Ok(resp) = tokio::time::timeout(PULL_TIMEOUT, self.request("POST", &path, None)).await
+        else {
+            tracing::warn!(
+                target: "ducktape::sandbox",
+                image,
+                seconds = PULL_TIMEOUT.as_secs(),
+                reason = "pull_timeout",
+                "provider image pull gave up"
+            );
+            return Err(format!(
+                "pull {image}: no answer from the registry within {}s",
+                PULL_TIMEOUT.as_secs()
+            ));
+        };
+        let resp = resp?;
         resp.ok()?;
-        match pull_failure(&resp.body) {
-            Some(error) => Err(format!("pull {image}: {error}")),
-            None => Ok(()),
+        if let Some(error) = pull_failure(&resp.body) {
+            tracing::warn!(
+                target: "ducktape::sandbox",
+                image,
+                reason = "pull_refused",
+                "provider image pull failed: {error}"
+            );
+            return Err(format!("pull {image}: {error}"));
         }
+        tracing::info!(target: "ducktape::sandbox", image, "provider image pulled");
+        Ok(())
     }
 
     pub async fn start(&self, id: &str) -> Result<(), String> {
@@ -919,6 +951,14 @@ impl HttpResponse {
     }
 }
 
+/// How long a `pull` may hold a run's lease window before it is a failure.
+///
+/// Generous enough for a large image on a slow link (`node:22-slim` is ~200 MB;
+/// busybox measures ~2.4 s), short enough that "the registry is not answering"
+/// becomes a diagnosis instead of a wedge. Losing a lease to a slow pull is the
+/// caller's problem to detect, not this one's — see [`Podman::pull`].
+const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// the `error` a pull stream reported, if any — see [`Podman::pull`] for why a
 /// 200 is not an answer. Progress lines are ordinary and carry no `error`.
 fn pull_failure(body: &[u8]) -> Option<String> {
@@ -1098,6 +1138,26 @@ fn runs_exe(pid: u32, exe: &Path) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn runs_exe(_pid: u32, _exe: &Path) -> bool {
     false
+}
+
+/// Reap the `podman system service` a daemon recorded under `data_dir`.
+///
+/// A daemon killed by SIGKILL never runs [`PodmanService`]'s `kill_on_drop`, and
+/// the service is started `--time=0` — it never idle-exits — so it outlives its
+/// owner holding ~45 MB. [`PodmanService::claim`] reaps it when a SUCCESSOR boots
+/// on the same root, which covers a restarting node and nothing else: a root that
+/// never gets a successor (a torn-down test workspace, a moved node dir) keeps
+/// the process until the box reboots.
+///
+/// So this is that same reap, callable by whoever owns the daemon's lifetime
+/// instead of only by its replacement. Identity-verified by executable before any
+/// signal — never a pattern match on a command line. Best-effort and idempotent:
+/// no pid file, a dead pid, or a pid that is not podman are all nothing to do.
+pub fn reap_service_at(data_dir: &Path) {
+    let Some(pid) = read_pid(&data_dir.join("podman").join(PODMAN_PID_FILE)) else {
+        return;
+    };
+    reap_orphan_podman(pid);
 }
 
 /// kill a predecessor's orphaned `podman system service`, verified by executable
