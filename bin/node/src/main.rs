@@ -52,6 +52,7 @@ use commonware_runtime::{Metrics as _, Runner, Supervisor};
 mod agent_cli;
 mod agent_plane;
 mod airlock;
+mod announce;
 mod blob_fetch;
 mod boot;
 mod cli;
@@ -383,6 +384,9 @@ fn run_node(
         wireguard_listen,
     );
 
+    // the announce's own base, kept before `http_listen` moves into the bind.
+    let announce_base = http_listen.as_deref().map(config::http_base_of);
+
     let boot::surfaces::Surfaces {
         rpc_listener,
         http_cmds,
@@ -418,6 +422,25 @@ fn run_node(
         node_key: signer.public_key().as_ref().to_vec(),
         admin_exposure: noded::AdminExposure::from_env(),
     })?;
+
+    // THE LIVENESS HALF of the capability announce. Consent is submitted by the
+    // verb that changes it (`service enable`/`disable`); this watches the other
+    // input — whether each granted kind's daemon is still signaling — and
+    // submits the corrected set when that changes. It runs on its own OS thread
+    // and talks to this node over its own `/v1`, because it must BLOCK on a
+    // settling submit and the host must never leave the runner thread.
+    //
+    // No http surface means no `/v1` to submit through and no daemon that could
+    // have signaled in the first place, so there is nothing to watch.
+    if let Some(base) = announce_base {
+        announce::spawn(announce::Watch {
+            base,
+            node_key: signer.public_key().as_ref().to_vec(),
+            workspace: workspace.clone(),
+            services: services.clone(),
+            capacity: sandbox_capacity.clone(),
+        })?;
+    }
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
     let storage_for_sync = storage.clone();
@@ -602,7 +625,6 @@ fn run_node(
                 chain_id.clone(),
                 mesh_state_file.clone(),
                 checkpoint_blocks,
-                sandbox_capacity.clone(),
                 rpc_listener,
                 http_cmds,
                 gateway_requests,
@@ -616,7 +638,6 @@ fn run_node(
                 status.clone(),
                 voice_requests,
                 blobs.clone(),
-                services.clone(),
                 overlay_slot.clone(),
                 bulk_pacer.clone(),
                 plane_monitor.clone(),
@@ -654,12 +675,10 @@ fn run_node(
                 advertised_reach,
                 checkpoint_blocks,
                 dev_demo,
-                sandbox_capacity,
                 stream_hub,
                 index,
                 code_stage_requests,
                 blobs,
-                services,
                 overlay_slot,
                 bulk_pacer,
                 plane_monitor,
@@ -697,7 +716,6 @@ fn run_node(
             checkpoint_blocks,
             promoted,
             dev_demo,
-            sandbox_capacity,
             rpc_listener,
             http_cmds,
             gateway_requests,
@@ -710,7 +728,6 @@ fn run_node(
             voice_requests,
             code_stage_requests,
             blobs,
-            services,
             overlay_slot,
             bulk_pacer,
             plane_monitor,

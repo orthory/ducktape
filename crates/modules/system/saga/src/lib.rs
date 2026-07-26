@@ -345,14 +345,25 @@ fn saga_origin(origin: &Origin) -> SagaOrigin {
     }
 }
 
-/// the absolute view a lease granted now expires at: an explicit window wins,
-/// an assigned attempt without one gets [`DEFAULT_LEASE_VIEWS`], and an
-/// unassigned attempt without one carries no lease at all.
+/// the absolute view a lease granted now expires at: an UNASSIGNED attempt
+/// carries no lease at all, an explicit window wins for an assigned one, and an
+/// assigned attempt without a window gets [`DEFAULT_LEASE_VIEWS`].
+///
+/// The assignee gate comes first, and it is the whole point: a lease is the
+/// grip ONE holder has on an attempt, so an announcement nobody has claimed has
+/// nothing to expire. Granting one anyway made the `Crank` fire on an
+/// unassigned saga and consume an attempt against nobody — a workload waiting
+/// on the claim lane for a daemon to come back burned its entire
+/// `max_attempts` budget and reached `Failed` while no node had ever held it.
+///
+/// A whole-saga `deadline` still applies to an unassigned attempt: the `Crank`
+/// checks it independently of the lease, and `NextExpiry` folds both, so this
+/// removes the false expiry without removing the real one.
 fn lease_expiry(height: u64, assignee: &Option<Vec<u8>>, lease_views: Option<u64>) -> Option<u64> {
     match (assignee, lease_views) {
-        (_, Some(views)) => Some(height.saturating_add(views)),
+        (None, _) => None,
+        (Some(_), Some(views)) => Some(height.saturating_add(views)),
         (Some(_), None) => Some(height.saturating_add(DEFAULT_LEASE_VIEWS)),
-        (None, None) => None,
     }
 }
 
@@ -2848,6 +2859,78 @@ mod tests {
             .with_capable_providers(capable)
     }
 
+
+    #[test]
+    fn an_unassigned_announcement_does_not_burn_the_attempt_budget() {
+        // an attempt nobody holds has no lease to expire. Before this was
+        // enforced, a trigger carrying an explicit `lease_views` gave its
+        // UNASSIGNED announcement an expiry too, so the crank consumed one
+        // attempt per window against nobody: a workload waiting on the claim
+        // lane for a daemon to come back exhausted `max_attempts` and reached
+        // `Failed` while no node had ever held it.
+        let only = vec![9u8; 32];
+        let mut m = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        // the sole provider is announced at trigger time, so the attempt leases.
+        let mut ctx = capability_ctx_with(vec![only.clone()], vec![only.clone()]);
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                saga_id: "s1".into(),
+                spec: b"w".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 3,
+                lease_views: Some(5),
+                capability: Some("compute".into()),
+                pinned_assignee: None,
+                demands: Default::default(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, "s1").unwrap().assignee, Some(only.clone()));
+
+        // the provider's daemon dies and its node retracts the announce, so the
+        // pool is empty from here on. The expired lease consumes ONE attempt and
+        // re-leases to nobody — which is where the budget must stop draining.
+        for height in [5u64, 10, 15, 20] {
+            let mut ctx = capability_ctx_with(Vec::new(), Vec::new()).at(height);
+            exec(&mut m, &mut ctx, &crank()).unwrap();
+            commit(&mut m);
+            let v = get(&m, "s1").unwrap();
+            assert_eq!(v.assignee, None, "nobody holds it");
+            assert_eq!(v.lease_expires_at, None, "and so there is no lease to expire");
+            assert_eq!(v.attempt, 1, "the announcement must not consume attempts");
+            assert_eq!(
+                v.status,
+                SagaStatus::Pending,
+                "it waits on the claim lane for a daemon to return, it does not fail"
+            );
+        }
+
+        // and it is still claimable: the lease starts when someone takes it.
+        let mut ctx = CaptureCtx::new().at(30).with_origin(Origin::External(only.clone()));
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Accept {
+                saga_id: "s1".into(),
+                attempt: 1,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let v = get(&m, "s1").unwrap();
+        assert_eq!(v.assignee, Some(only), "the claim lane still works");
+        assert_eq!(
+            v.lease_expires_at,
+            Some(35),
+            "and the lease begins at the claim, on the trigger's own window"
+        );
+    }
+
     #[test]
     fn capability_tagged_sagas_assign_over_providers_not_the_valset() {
         let validators = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]];
@@ -3071,11 +3154,18 @@ mod tests {
 
     #[test]
     fn next_expiry_reports_the_earliest_pending_expiry() {
-        let mut m = SagaModule::new("saga");
+        // ASSIGNING, because a lease implies a holder: an attempt nobody holds
+        // carries no expiry at all (see
+        // `an_unassigned_announcement_does_not_burn_the_attempt_budget`), so a
+        // ledger that assigns nobody is the wrong fixture for a test about
+        // which expiry is earliest.
+        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Open);
         assert_eq!(next_expiry(&m), None, "an empty ledger has no expiry");
 
-        let mut ctx = CaptureCtx::new();
-        // a deadline at 50, a lease at 7, and one saga with neither.
+        let validators = vec![b"node-a".to_vec()];
+        let mut ctx = CaptureCtx::new().with_validators(validators);
+        // a deadline at 50, a lease at 7, and one saga with neither of its own
+        // (so it takes the default lease window, 64).
         exec(
             &mut m,
             &mut ctx,

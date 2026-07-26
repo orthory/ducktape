@@ -11,7 +11,6 @@ use directory::{DirQuery, DirReply, decode_reply, encode_query};
 use recovery::Manifest;
 use sdk::Msg;
 
-use super::super::announce::{Fate, dispatch_pending_deliveries, saga_next_expiry};
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET};
 use crate::drain_actions::{CutoverTrigger, EpochActions};
@@ -64,7 +63,6 @@ impl ValidatorRuntime<'_> {
             pending_relays,
             pending_gates,
             gating,
-            announcer,
             validator_relay,
             last_published,
             blocks_since_checkpoint,
@@ -278,45 +276,6 @@ impl ValidatorRuntime<'_> {
                     false,
                 );
             }
-            // this node's OWN capability announce — the resident tier's twin of
-            // this route is the relay Reply in `replica::park`. An internal
-            // submit enters no hold map, so without this its consensus fate
-            // falls straight through the `continue` below, and a REJECTED
-            // announce leaves the decision core latched on a pair the registry
-            // never took: the offered set has not changed, so every later tick
-            // matches the latch and stays quiet, and the node announces nothing
-            // again EVER.
-            //
-            // read BEFORE the route consumes the latch: the generic
-            // "op rejected in consensus" warn at the bottom must not
-            // double-report a frame this route already reports, with the
-            // module's own detail AND the retry counter.
-            let announce_is_ours = announcer.owns(&d.id);
-            if let Some(fate) =
-                announcer.on_outcome(&d.id, d.disposition == node::Disposition::Applied)
-            {
-                match fate {
-                    Fate::Applied { capabilities } => tracing::info!(
-                        target: "ducktape::modules",
-                        node = %label,
-                        height = d.height,
-                        capabilities = ?capabilities,
-                        "capabilities announced"
-                    ),
-                    Fate::Rejected { attempts } => tracing::warn!(
-                        target: "ducktape::modules",
-                        node = %label,
-                        height = d.height,
-                        attempts,
-                        reason = "capability_announce_rejected",
-                        detail = %d.reason.as_deref().unwrap_or("deterministic_no_op"),
-                        "capability announce did not apply; retrying"
-                    ),
-                    // counted, not logged — the retry loop would otherwise
-                    // evict the whole ring between one operator and the next.
-                    Fate::RejectedQuietly => {}
-                }
-            }
             // BEFORE the pending_submits lookup, deliberately. An op rejected in
             // consensus produced no record ANYWHERE: the submitter's own log says
             // SUCCESS (the submit was accepted) while the state machine says NO.
@@ -324,10 +283,10 @@ impl ValidatorRuntime<'_> {
             // and the internal submits — oracle results, upgrade readiness,
             // code-ready signals — are fire-and-forget and never enter
             // `pending_submits` at all, so the `continue` below swallows their
-            // rejection whole. That is exactly how an announcer that latches on
-            // submit-Ok wedges FOREVER: silently out of every rendezvous pool, the
-            // upgrade stuck at R<n, and nothing anywhere saying why. The capability
-            // announce is routed above; the rest still are not.
+            // rejection whole. The capability announce used to be the worst case
+            // of that and no longer travels this lane at all (it is a settling
+            // `/v1/submit` from outside this loop now); the rest are still
+            // unrouted, which is its own item.
             let module = d.op.as_ref().map_or("system", |op| op.target.as_str());
             // the idle-chain NOP filler is rejected BY DESIGN — it targets a module
             // that deliberately does not exist. warning on it would fire every block
@@ -335,7 +294,7 @@ impl ValidatorRuntime<'_> {
             // minutes and drowning the very evidence someone came to read.
             let rejected = d.disposition == node::Disposition::Rejected;
             let is_idle_nop = module == NOP_TARGET;
-            if rejected && !is_idle_nop && !announce_is_ours {
+            if rejected && !is_idle_nop {
                 tracing::warn!(
                     target: "ducktape::submit",
                     node = %label,
@@ -369,13 +328,6 @@ impl ValidatorRuntime<'_> {
                 node::Disposition::Discarded => continue,
             });
         }
-        // AFTER the per-frame routing above, so a fate that arrived in this
-        // very drain settles the flight before its budget is charged: the
-        // validator lane loses an announce by having blocks go by WITHOUT it,
-        // never by wall-clock silence (a chain that is not finalizing is
-        // stalled, and a duplicate announce into the same `outstanding` is
-        // exactly what a stall does not need).
-        announcer.on_blocks(sealed_heights);
         validator_relay.expire(context.current(), relay_tx);
         // expire holds the mesh never finalized in time. the op may
         // still land later — clients re-query on block events.
@@ -820,7 +772,6 @@ impl ValidatorRuntime<'_> {
         // saga crank, dispatch delivery nudge.
         self.pump_heartbeat().await;
         self.pump_code_readiness().await;
-        self.pump_capability_announce().await;
         self.pump_saga_crank().await;
         self.pump_dispatch_nudge().await;
 
@@ -1189,62 +1140,6 @@ impl ValidatorRuntime<'_> {
         }
     }
 
-    // CAPABILITY ANNOUNCE: a current member whose offerable set
-    // (`grant ∩ live hello`) differs from the committed registry
-    // self-submits ONE declarative `Announce`. member-gated (the
-    // module rejects non-members) and idempotent (committed-read
-    // + local latch). Inert with no compute daemon signaling, and
-    // inert on a grant that consents to no tags — the accept-lane-only
-    // provider, which announces nothing yet still executes work it
-    // CLAIMS from the announcement lane (the daemon's claim pump, see
-    // `compute::intake`), so it never enters a tag's rendezvous pool.
-    // Both collapse to an EMPTY announce set — there is no separate
-    // switch that could disagree with the grant.
-    async fn pump_capability_announce(&mut self) {
-        let Self {
-            node,
-            orchestrator,
-            next_seq,
-            signer,
-            label,
-            announcer,
-            ..
-        } = self;
-        let now = std::time::Instant::now();
-        if orchestrator
-                .current_members()
-                .contains(&signer.public_key())
-            && let Some(msg) = announcer.maybe_announce(node.host(), now).await
-        {
-            let seq = *next_seq;
-            *next_seq += 1;
-            match node.submit(signer, seq, msg).await {
-                // SUBMITTED, not announced: the registry has agreed to nothing
-                // yet. Latch the frame so the drain can route its consensus
-                // fate back here, and say so at debug — the info line belongs
-                // on the APPLIED outcome, where it is true.
-                Ok(id) => {
-                    announcer.sent(id, now);
-                    tracing::debug!(
-                        target: "ducktape::modules",
-                        node = %label,
-                        "capability announce submitted"
-                    );
-                }
-                Err(e) => {
-                    // un-latch so a transient submit failure retries.
-                    announcer.submit_failed();
-                    tracing::debug!(
-                        target: "ducktape::modules",
-                        node = %label,
-                        error = %e,
-                        "capability announce submit failed; retrying"
-                    );
-                }
-            }
-        }
-    }
-
     // SAGA CRANK (P7 liveness, host side): nothing else ever
     // submits `SagaMsg::Crank`, and under strict leases a
     // saga whose assignee went dark advances ONLY via a crank
@@ -1416,6 +1311,37 @@ fn round_robin_leader(
     }
     let index = epoch.wrapping_add(view) as usize % participants.len();
     participants.iter().nth(index)
+}
+
+/// the committed dispatch mailbox's undelivered-result count — the nudge
+/// pump's read. `0` when the module is absent or the mailbox is empty.
+pub(crate) async fn dispatch_pending_deliveries(host: &host::Host) -> u64 {
+    use dispatch::{DispatchQuery, DispatchReply, decode_reply, encode_query};
+    let Ok(reply) = host
+        .query("dispatch", &encode_query(&DispatchQuery::PendingDeliveries))
+        .await
+    else {
+        return 0;
+    };
+    match decode_reply(&reply) {
+        Ok(DispatchReply::PendingDeliveries(n)) => n,
+        _ => 0,
+    }
+}
+
+/// the committed saga ledger's earliest pending lease-expiry/deadline — the
+/// crank pump's read. `None` when the module is absent or nothing pending
+/// carries one.
+pub(crate) async fn saga_next_expiry(host: &host::Host) -> Option<u64> {
+    use saga::{SagaQuery, SagaReply, decode_reply, encode_query};
+    let reply = host
+        .query("saga", &encode_query(&SagaQuery::NextExpiry))
+        .await
+        .ok()?;
+    match decode_reply(&reply).ok()? {
+        SagaReply::NextExpiry(v) => v,
+        _ => None,
+    }
 }
 
 #[cfg(test)]

@@ -33,7 +33,6 @@ use crate::sync::serve::{
     replica_orchestrator_at, replica_verifier, verify_manifest_floor, write_boundary_checkpoint,
 };
 use crate::util::{fatal, hex};
-use crate::validator::announce::{CapabilityAnnouncer, Fate, Rearm};
 use noded::projection::{BlockProjection, project_block};
 
 use super::promotion::{PromotionBoundary, choose_promotion_boundary, joiner_manifest_fetch_retry};
@@ -218,7 +217,6 @@ pub(super) async fn park(
     checkpoint_blocks: u64,
     // what this node ANNOUNCES it can seat. The capacity is the node's to
     // publish; the sandbox that would honour it belongs to the service daemons.
-    sandbox_capacity: std::collections::BTreeMap<String, u64>,
     sync_sources: Vec<ed25519::PublicKey>,
     sync_source: Option<ed25519::PublicKey>,
     status_public_key: String,
@@ -234,9 +232,6 @@ pub(super) async fn park(
     metrics: noded::NodeMetrics,
     status: noded::StatusCell,
     blobs: noded::blobs::BlobHandle,
-    // the volatile service-signaling catalog: the live half of the capability
-    // announce (`grant ∩ hello`), shared with the http surface's handle.
-    services: noded::services::ServiceCatalog,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
     planes: data_plane::PlaneMonitor,
@@ -328,10 +323,8 @@ pub(super) async fn park(
     };
     // the announce pump re-reads the grant from this path per tick; the
     // gateway closure below takes ownership of the original.
-    let grant_workspace = workspace.clone();
     // handed to the seat if this node is promoted, so the announce keeps its
     // read-through grant across the transition.
-    let baton_workspace = workspace.clone();
     let gateway_book = gateway_requests.map(|requests| {
         let book = crate::gateway_plane::OverlayBook::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
@@ -678,17 +671,10 @@ pub(super) async fn park(
     // A resident discovers nothing and executes nothing: the compute daemon
     // does both, and reaches consensus through this node's own /v1 surface —
     // which serves a resident's committed queries and relays its submits
-    // exactly as it does for any other local client. What is left here is the
-    // announce, and its offered half now comes from the daemon's live hello.
-    let mut resident_announcer = CapabilityAnnouncer::new(
-        me_bytes.clone(),
-        grant_workspace,
-        services,
-        sandbox_capacity,
-        // this tier's frame rides the LOSSY relay lane in another node's
-        // custody, so wall-clock silence is the only evidence it has.
-        Rearm::Silence,
-    );
+    // exactly as it does for any other local client. The announce is not here
+    // either: `service enable`/`disable` submit it, and the liveness watcher
+    // (`crate::announce`) retracts it, both over that same /v1 surface. A
+    // resident therefore runs no announce pump at all.
 
     // ── THE JOIN GATE rides first contact now (join ADR §4) ────────────────
     // a fresh TOKENED joiner's sealed intro IS its gate request: the wiring
@@ -941,40 +927,12 @@ pub(super) async fn park(
                     answer = relay_ingress.next() => {
                         let Some((peer, bytes)) = answer else { continue };
                         let Ok(msg) = relay::decode_msg(&bytes) else { continue };
-                        let Some((frame_id, outcome)) =
-                            resident_relay.on_message(peer, msg, &mut relay_tx)
-                        else {
-                            continue;
-                        };
-                        // Unclaimed final replies belong to the
-                        // resident-owned capability announce pump.
-                        let applied =
-                            matches!(outcome, relay::RelayOutcome::Applied { .. });
-                        // the validator tier's twin of this route lives in
-                        // `validator::run::drain`; both report the SAME three
-                        // fates in the same places, so a log contract fixed on
-                        // one tier cannot drift on the other.
-                        if let Some(fate) = resident_announcer.on_outcome(&frame_id, applied) {
-                            match fate {
-                                Fate::Applied { capabilities } => tracing::info!(
-                                    target: "ducktape::modules",
-                                    node = %label,
-                                    capabilities = ?capabilities,
-                                    "resident: announced capabilities"
-                                ),
-                                Fate::Rejected { attempts } => tracing::warn!(
-                                    target: "ducktape::modules",
-                                    node = %label,
-                                    attempts,
-                                    outcome = ?outcome,
-                                    reason = "capability_announce_rejected",
-                                    "resident capability announce did not apply; retrying"
-                                ),
-                                // counted, not logged: a permanently-rejected
-                                // announce retries forever.
-                                Fate::RejectedQuietly => {}
-                            }
-                        }
+                        // the reply is routed for its SIDE EFFECT — it
+                        // releases whatever held caller was waiting on this
+                        // frame. Nothing here consumes the outcome any more:
+                        // the announce was the only resident-tier pump that
+                        // did, and it no longer travels this lane.
+                        resident_relay.on_message(peer, msg, &mut relay_tx);
                     }
                     // a raw certificate arrived. FOLDING replica:
                     // decode, plan against the watermark, admit
@@ -1621,7 +1579,6 @@ pub(super) async fn park(
             );
             return PromotionBaton {
                 context,
-                workspace: baton_workspace,
                 host,
                 recovery,
                 epoch: seat.epoch,
@@ -2072,55 +2029,6 @@ pub(super) async fn park(
                         }
                     }
                 }
-                // ---- the resident-tier pumps, one pass per poll ----
-                //
-                // both read the served boundary (committed state) and
-                // write through the relay lane — the resident's only
-                // write path. state-driven and idempotent like their
-                // validator-loop twins: quiet once committed state
-                // matches, deadline-based retry over the lossy lane.
-                if let Some((_, node_r)) = &serving {
-                    let host = node_r.host();
-                    let now = std::time::Instant::now();
-                    // CAPABILITY ANNOUNCE (resident tier): mirrors the
-                    // validator pump. A grant announcing no tags leaves
-                    // the announcer's set empty, so a resident stays an
-                    // accept-lane-only provider and never enters a
-                    // tag's rendezvous pool.
-                    if let Some(msg) = resident_announcer.maybe_announce(host, now).await
-                    {
-                        match resident_relay.submit_unheld(
-                            &signer,
-                            &announce_targets,
-                            &mut relay_tx,
-                            msg.target,
-                            msg.payload,
-                        ) {
-                            Ok(id) => {
-                                resident_announcer.sent(id, now);
-                                // RELAYED, not announced: the registry has
-                                // agreed to nothing yet. The info belongs on
-                                // the applied outcome, where it is true — the
-                                // validator tier says it in the same place.
-                                tracing::debug!(
-                                    target: "ducktape::modules",
-                                    node = %label,
-                                    "resident: capability announce relayed"
-                                );
-                            }
-                            Err(e) => {
-                                resident_announcer.submit_failed();
-                                tracing::warn!(
-                                    target: "ducktape::modules",
-                                    node = %label,
-                                    error = %e,
-                                    reason = "capability_announce_relay_failed",
-                                    "resident capability announce relay failed"
-                                );
-                            }
-                        }
-                    }
-                }
                 continue;
             }
             // the token-less MANUAL / restore path polling for an out-of-band
@@ -2356,7 +2264,6 @@ pub(super) async fn park(
     let root_hash = host.root_hash();
     PromotionBaton {
         context,
-        workspace: baton_workspace,
         host,
         recovery,
         epoch: boundary.epoch,

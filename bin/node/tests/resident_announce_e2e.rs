@@ -2,10 +2,17 @@
 //! cluster: a fresh identity JOINS the founder's network with a live invite
 //! (the product flow — no manual ceremony), lands RESIDENT standing, and —
 //! without ever being promoted — publishes `grant ∩ live hello` into the
-//! COMMITTED capability registry over the submit-relay lane, then settles its
-//! own frame's consensus fate back through the resident tier's `on_outcome`
-//! route. The founder is hermetically capability-free (no grant, no hello), so
-//! the only possible provider is the resident.
+//! COMMITTED capability registry — through the node's OWN `/v1/submit`, which
+//! frames the op with the node's key and relays it for a resident exactly as
+//! it does any other local write. The founder is hermetically capability-free
+//! (no grant, no hello), so the only possible provider is the resident.
+//!
+//! This is the LIVENESS half of the announce, which is the half a cluster can
+//! actually exercise: the grant is written straight to `services.toml` here
+//! (the consent half belongs to `service enable`, which submits its own
+//! announce and is unit-covered), and what this proves is that a grant sitting
+//! on disk announces NOTHING until a daemon signals — and lands the moment one
+//! does.
 //!
 //! The offered half is a real `POST /v1/services/hello` against the resident's
 //! own app surface, refreshed on a heartbeat — a service daemon's entire
@@ -124,11 +131,10 @@ fn a_joined_resident_announces_into_the_committed_registry() {
         "the granted-and-signaling kind is a capability tag in its own right"
     );
 
-    // the pump's own settle log confirms the reply lane round-tripped and the
-    // resident tier's `on_outcome` route ran: the APPLIED line, the only one
-    // that is true. (The submit-time line is `debug` on both tiers now —
-    // relayed is not announced.)
-    cluster.wait_marker(1, "resident: announced capabilities", CONVERGE);
+    // the watcher's own settle log: `/v1/submit` answers only once consensus
+    // has settled, so this line is emitted on the APPLIED height and nowhere
+    // else — there is no submit-time line to confuse it with any more.
+    cluster.wait_marker(1, "capabilities announced", CONVERGE);
 
     cluster.kill(1);
     cluster.kill(0);
