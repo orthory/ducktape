@@ -119,18 +119,42 @@ pub(crate) fn podman_backend(
 fn node_identity(base: &str) -> Result<[u8; 32], String> {
     let status = crate::node_http::get_json(base, "/v1/status")
         .map_err(|error| format!("could not read this node's identity: {error}"))?;
-    let Some(published) = status["public_key"].as_str() else {
-        return Err(
-            "this node has not published a mesh identity yet — start it, then start the daemon"
-                .into(),
-        );
+    published_identity(&status)
+}
+
+/// what a node that is up but has not yet published its mesh identity looks
+/// like — and the ONE thing an operator can do about it.
+const NOT_PUBLISHED_YET: &str =
+    "this node has not published a mesh identity yet — start it, then start the daemon";
+
+/// Decode the node's published mesh identity out of its `/v1/status` document.
+///
+/// Split from the fetch so every outcome is checkable without standing up a
+/// server: this is the decide half, [`node_identity`] is the I/O half.
+fn published_identity(status: &serde_json::Value) -> Result<[u8; 32], String> {
+    // ABSENT and PRESENT-BUT-EMPTY are ONE operator condition, and the empty
+    // case is the one that actually happens: `/v1/status` types `public_key` as
+    // a non-Option `String` (`noded::NodeStatus`) which a booting node serves as
+    // `""` until it publishes. Without this filter `as_str()` returns
+    // `Some("")`, `unhex("")` returns `Ok(vec![])`, and a routine startup race
+    // fell through to the length arm below as "0-byte mesh identity" — a
+    // malformed-node diagnosis for a node that is merely still booting, while
+    // the message written for exactly this case was unreachable.
+    //
+    // `bin/node` still binds its HTTP listener before publishing, so a
+    // supervisor co-starting a node and a daemon reaches this every time.
+    let Some(published) = status["public_key"].as_str().filter(|hex| !hex.is_empty()) else {
+        return Err(NOT_PUBLISHED_YET.into());
     };
-    let decoded = config::unhex(published).map_err(|error| {
-        format!("this node published a mesh identity that is not hex ({error}) — build mismatch")
-    })?;
+    // the remaining two are malformed-status cases, not startup timing. They
+    // deliberately name no gate to go and check: an operator sent to look for a
+    // "build mismatch" goes hunting for the daemon/node build check, which is a
+    // different mechanism and not what failed here.
+    let decoded = config::unhex(published)
+        .map_err(|error| format!("this node published a mesh identity that is not hex: {error}"))?;
     <[u8; 32]>::try_from(decoded.as_slice()).map_err(|_| {
         format!(
-            "this node published a {}-byte mesh identity, not 32 — build mismatch",
+            "this node published a {}-byte mesh identity, not 32",
             decoded.len()
         )
     })
@@ -1362,6 +1386,56 @@ mod tests {
             scopes: vec![],
             needs: vec![],
         }
+    }
+
+    /// Each way `/v1/status` can fail to name a node must produce its OWN
+    /// message, and the empty string must reach the startup one.
+    ///
+    /// The empty case is why this test exists rather than four eyeballed
+    /// `format!`s: `public_key` is a non-Option `String` that a booting node
+    /// serves as `""`, so it silently took the wrong-length arm and reported a
+    /// routine startup race as a malformed identity — while the message written
+    /// for it was dead code no test executed.
+    #[test]
+    fn every_status_identity_outcome_gets_its_own_message() {
+        let absent = published_identity(&serde_json::json!({})).expect_err("no field at all");
+        let booting = published_identity(&serde_json::json!({ "public_key": "" }))
+            .expect_err("up, but not published yet");
+        assert_eq!(absent, NOT_PUBLISHED_YET);
+        assert_eq!(
+            booting, NOT_PUBLISHED_YET,
+            "an empty public_key is a booting node, not a malformed one"
+        );
+        // the specific regression: it must NOT be diagnosed by length.
+        assert!(
+            !booting.contains("byte"),
+            "the empty case must not fall through to the length arm: {booting}"
+        );
+
+        let not_hex = published_identity(&serde_json::json!({ "public_key": "zz" }))
+            .expect_err("not hex at all");
+        assert!(not_hex.contains("not hex"), "{not_hex}");
+
+        let short = published_identity(&serde_json::json!({ "public_key": "abcd" }))
+            .expect_err("hex, but not 32 bytes");
+        assert!(short.contains("2-byte"), "{short}");
+
+        // all four failures are distinguishable from one another.
+        let messages = [&absent, &not_hex, &short];
+        assert_eq!(
+            messages
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3,
+            "each outcome needs its own sentence: {messages:?}"
+        );
+
+        // and the happy path still decodes.
+        let key = "ab".repeat(32);
+        let decoded = published_identity(&serde_json::json!({ "public_key": key }))
+            .expect("a published 32-byte identity decodes");
+        assert_eq!(decoded, [0xab; 32]);
     }
 
     /// collect `.rs` files under `dir`, RECURSIVELY.
