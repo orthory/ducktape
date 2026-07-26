@@ -138,7 +138,6 @@ pub enum ClientMsg {
     /// commands (and lent-credential records) meant for it.
     ServiceAttach {
         kind: String,
-        build: String,
         /// the node's own 0600 link secret, read from its workspace. Holding the
         /// link means BECOMING this node's interactive plane and receiving every
         /// lent-credential record with it, so dialing loopback is not enough.
@@ -817,8 +816,8 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                             }
                             // a service daemon claiming this connection as its
                             // command link, and the events it publishes back.
-                            Ok(ClientMsg::ServiceAttach { kind, build, token }) => {
-                                match take_service_link(&handle, &kind, &build, &token) {
+                            Ok(ClientMsg::ServiceAttach { kind, token }) => {
+                                match take_service_link(&handle, &kind, &token) {
                                     Ok((guard, rx)) => {
                                         attached = Some(guard);
                                         service_rx = Some(rx);
@@ -967,14 +966,18 @@ async fn next_service_command(
 
 /// Admit a service daemon's claim on this connection, or name why not.
 ///
-/// Three refusals, each a stable reason an operator can act on: a kind this node
-/// hosts no plane for, a build that does not match this one (the skew gate — a
-/// loud refusal beats silent misbehavior between two independently-restarted
-/// processes), and a link another daemon already holds.
+/// Two refusals, each a stable reason an operator can act on: a kind this node
+/// hosts no plane for, and a link another daemon already holds.
+///
+/// Build equality is NOT one of them. It authenticated nobody (a stamp is
+/// compiled into a binary any local process can read), it excluded every
+/// separately-compiled daemon by construction, and its `None` case refused
+/// every link on any build without `.git`. Skew degrades to per-frame decode
+/// refusals — `malformed_command`, `BadFrame` — which is where the no-compat
+/// doctrine already enforces "speak the current protocol or be refused".
 fn take_service_link(
     handle: &NodeHandle,
     kind: &str,
-    build: &str,
     token: &str,
 ) -> Result<
     (
@@ -985,19 +988,6 @@ fn take_service_link(
 > {
     if kind != crate::services::AGENT_KIND {
         return Err("only the agent service has a command link on this node");
-    }
-    // `None` fails closed: a node that cannot identify its own build refuses
-    // every attach rather than trusting an unverifiable peer.
-    let mine = crate::services::build_identity().ok_or(
-        "this node cannot identify its own build, so it refuses every service link",
-    )?;
-    if build != mine {
-        tracing::warn!(
-            target: "ducktape::service",
-            reason = "build_mismatch",
-            "agent service link refused"
-        );
-        return Err("build mismatch: restart the agent daemon on this node's build");
     }
     let terminals = handle
         .terminals()

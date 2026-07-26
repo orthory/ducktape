@@ -1,15 +1,19 @@
-//! Stamp this build's identity into the binary for the service hello gate.
+//! Stamp this build's identity into the binary, as a DIAGNOSTIC.
 //!
-//! `noded::services::build_identity` compares a signaling daemon's build
-//! against the node's own and refuses a mismatch. The package version cannot
-//! carry that: the repo pins version numbering at v1 permanently, so
-//! `CARGO_PKG_VERSION` is a constant and every skewed pair would compare equal.
-//! The commit — plus a dirty marker, since a working-tree build is not the
-//! commit it sits on — is the identity that actually moves.
+//! `noded::services::build_identity` reads it back so `ducktape service status`
+//! can print a daemon's build beside the node's own and make ordinary dev-loop
+//! skew visible. Nothing is refused for it — see that function for why build
+//! equality is not an admission rule.
 //!
-//! Git absent (a source tarball, a vendored build) is NOT an error: the env
-//! var is simply left unset and `build_identity` falls back to the package
-//! version through `option_env!`.
+//! The package version cannot carry this: the repo pins version numbering at v1
+//! permanently, so `CARGO_PKG_VERSION` is a constant and every pair of builds
+//! would compare equal. The commit — plus a working-tree digest, since a dirty
+//! build is not the commit it sits on — is the identity that actually moves.
+//!
+//! Git absent (a source tarball, a vendored build, Docker without `.git`) is
+//! NOT an error and NOT a fallback to anything: the env var is simply left
+//! unset, `build_identity()` is `None`, and the node reports its build as
+//! `unknown` while serving every service plane normally.
 
 use std::process::Command;
 
@@ -39,9 +43,10 @@ fn build_id() -> Option<String> {
     if diff.is_empty() {
         return Some(commit);
     }
-    // `DefaultHasher` is not stable across toolchains, and that is fine: it is
-    // only ever compared between two binaries, and any difference fails the
-    // skew check CLOSED. stdlib, so no build-dependency for one hash.
+    // `DefaultHasher` is not stable across toolchains, and that is fine now
+    // that this is only ever DISPLAYED: two builds of the same dirty tree under
+    // different toolchains render as different stamps, which reads as skew and
+    // costs nothing. stdlib, so no build-dependency for one hash.
     use std::hash::{Hash as _, Hasher as _};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     diff.hash(&mut hasher);

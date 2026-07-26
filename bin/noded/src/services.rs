@@ -72,8 +72,9 @@ pub struct Hello {
     pub kind: String,
     /// the daemon's own version. Metadata only — never part of identity.
     pub version: String,
-    /// the daemon's BUILD identity, which must equal the node's own. See
-    /// [`build_identity`]: a mismatch is refused, never negotiated.
+    /// the daemon's build identity — METADATA, never a gate. Rendered beside
+    /// the node's own by `ducktape service status` so an operator can see skew;
+    /// see [`build_identity`] for why equality is not an admission rule.
     pub build: String,
     /// the capability tags this daemon offers to run.
     #[serde(default)]
@@ -93,25 +94,46 @@ pub struct Hello {
     pub needs: Vec<String>,
 }
 
-/// This binary's build identity — what a daemon must present in its hello and
-/// what the node compares against its own. `None` when the build could not be
-/// identified at compile time.
+/// This binary's build identity, as `build.rs` stamped it: the short commit,
+/// plus a working-tree digest when the tree was dirty. `None` when the build
+/// could not be identified at compile time (a source tarball, a vendored
+/// build, any checkout without `.git`).
 ///
-/// The node and a service daemon are separate processes with independent
-/// restart timing, so skew is real even when one binary is on disk: an
-/// operator upgrades and restarts the node while yesterday's daemon is still
-/// running. Per the repo's no-versioning doctrine a mismatch is REFUSED with a
-/// nameable reason — no negotiation, no compat arm, no minimum-version window.
+/// **Diagnostic only.** The node and a service daemon are separate processes
+/// with independent restart timing, so skew is real — an operator upgrades and
+/// restarts the node while yesterday's daemon is still running. Naming that
+/// skew is worth doing; REFUSING on it is not, and this node does not:
+///
+/// - it authenticates nobody. A stamp is not a secret: it is compiled into a
+///   binary any local process can read, and the caller does not even need to —
+///   before this was metadata, the node handed its own stamp back in the
+///   refusal body of the first wrong guess.
+/// - it excludes every legitimately separately-compiled daemon by
+///   construction. A third-party service would have to hardcode this
+///   operator's exact commit, and on a dirty tree a `DefaultHasher` digest
+///   `build.rs` itself notes is not toolchain-stable, at ITS compile time.
+/// - it protected no correctness property. The node↔daemon protocol decodes
+///   every frame at its boundary, so skew already degrades to named refusals
+///   (`malformed_command`, `BadFrame`, `deny_unknown_fields`) rather than
+///   corruption. Under the no-compat doctrine "speak the current protocol or
+///   be refused" is enforced per frame, where it belongs.
+/// - and `None` FAILING CLOSED made a git-absent build a node with no compute,
+///   no agent pty and no airlock, whose only symptom was a bare 503.
 ///
 /// It is deliberately NOT the package version: version numbering is pinned at
-/// v1 permanently, so `CARGO_PKG_VERSION` is a constant and every skewed pair
-/// would compare equal — an inert gate that looks like a live one. `build.rs`
-/// stamps the commit (plus a working-tree digest when dirty).
-///
-/// `None` FAILS CLOSED: an unidentifiable build refuses every hello rather
-/// than falling back to a constant that admits all of them.
+/// v1 permanently, so `CARGO_PKG_VERSION` is a constant that could never
+/// distinguish two builds.
 pub fn build_identity() -> Option<&'static str> {
     option_env!("DUCKTAPE_BUILD").filter(|id| !id.is_empty())
+}
+
+/// what a build with no identifiable stamp reports as. An honest "unknown"
+/// rather than a value that pretends to name a commit.
+pub const UNKNOWN_BUILD: &str = "unknown";
+
+/// This binary's build identity, or [`UNKNOWN_BUILD`] — the rendering form.
+pub fn build_identity_or_unknown() -> &'static str {
+    build_identity().unwrap_or(UNKNOWN_BUILD)
 }
 
 /// the file a node writes its service-link secret into, next to `node.toml`.
@@ -221,11 +243,6 @@ pub fn token_matches(presented: &str, expected: &str) -> bool {
 pub enum HelloRefusal {
     /// the hello itself is not well-formed.
     Malformed(&'static str),
-    /// the daemon is a different build from this node.
-    BuildMismatch,
-    /// this node cannot identify its OWN build, so it can prove nothing about
-    /// anyone else's. Refuses everything by construction.
-    BuildIdentityUnavailable,
     /// too many distinct kinds are already signaling.
     CatalogFull,
 }
@@ -235,38 +252,25 @@ impl HelloRefusal {
     pub fn reason(self) -> &'static str {
         match self {
             HelloRefusal::Malformed(_) => "malformed_hello",
-            HelloRefusal::BuildMismatch => "build_mismatch",
-            HelloRefusal::BuildIdentityUnavailable => "build_identity_unavailable",
             HelloRefusal::CatalogFull => "catalog_full",
         }
     }
 
-    /// 400 for "you sent nonsense"; 409 for "you do not belong here"; 503 for
-    /// "this node cannot serve the check at all".
+    /// 400 for "you sent nonsense"; 503 for "this node cannot serve you right
+    /// now".
     pub fn status(self) -> axum::http::StatusCode {
         match self {
             HelloRefusal::Malformed(_) => axum::http::StatusCode::BAD_REQUEST,
-            HelloRefusal::BuildMismatch => axum::http::StatusCode::CONFLICT,
-            HelloRefusal::BuildIdentityUnavailable => {
-                axum::http::StatusCode::SERVICE_UNAVAILABLE
-            }
             HelloRefusal::CatalogFull => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
-    /// the operator-facing sentence.
+    /// the operator-facing sentence. It describes only what the CALLER sent or
+    /// what this node's capacity is — never a fact about this node the caller
+    /// did not already have, since the route is unauthenticated.
     pub fn message(self) -> String {
         match self {
             HelloRefusal::Malformed(detail) => detail.to_string(),
-            HelloRefusal::BuildMismatch => format!(
-                "this node runs build {}; restart the service daemon from the same build",
-                build_identity().unwrap_or("unknown")
-            ),
-            HelloRefusal::BuildIdentityUnavailable => {
-                "this node cannot identify its own build, so it refuses every service hello; \
-                 rebuild it from a git checkout"
-                    .into()
-            }
             HelloRefusal::CatalogFull => {
                 "too many services are signaling to this node".into()
             }
@@ -303,6 +307,18 @@ impl Hello {
         if self.version.len() > MAX_VERSION_LEN || !item_is_well_formed(&self.version) {
             return Err(HelloRefusal::Malformed("version must be 1..32 printable ascii chars"));
         }
+        // the build is no longer compared, but it IS rendered — `service
+        // status` prints it — so it stays a validated trust boundary: a
+        // caller-supplied string reaching a terminal must carry no control
+        // bytes and no unbounded length.
+        //
+        // Sized as an ITEM (1..64), not a version (1..32), and deliberately: a
+        // stamp is `<sha>-<u64 hex>`, which reaches 57 chars under
+        // `core.abbrev = 40`. A cap that refused an honest daemon's own stamp
+        // would be the same fail-closed trap the build gate was.
+        if !item_is_well_formed(&self.build) {
+            return Err(HelloRefusal::Malformed("build must be 1..64 printable ascii chars"));
+        }
         let lists_ok = self.capabilities.len() <= MAX_CAPABILITIES
             && self.scopes.len() <= MAX_LIST_LEN
             && self.needs.len() <= MAX_LIST_LEN;
@@ -333,6 +349,11 @@ impl Hello {
 pub struct Signaling {
     pub kind: String,
     pub version: String,
+    /// the daemon's build stamp, carried through for display. This is the
+    /// diagnostic that replaced the old build gate: `service status` prints it
+    /// beside the node's own, so ordinary dev-loop skew is visible instead of
+    /// being a refusal.
+    pub build: String,
     pub capabilities: Vec<String>,
     pub scopes: Vec<String>,
     /// the kinds this daemon declared it wants present. Display only.
@@ -368,18 +389,13 @@ impl ServiceCatalog {
         })
     }
 
+    // NOTE: admission consults [`build_identity`] nowhere, deliberately. A
+    // build stamp is not a credential and equality was never a correctness
+    // rule; making it one turned every git-absent build into a node that
+    // refused all three service planes. Skew is a DIAGNOSTIC now — the hello
+    // OK body carries this node's build so a daemon can name its own.
     fn admit(&self, hello: Hello, now: Instant) -> Result<Duration, HelloRefusal> {
         hello.validate()?;
-        // a node that cannot name its own build can prove nothing about
-        // anyone else's, so it refuses everything rather than waving it through.
-        let Some(mine) = build_identity() else {
-            return Err(HelloRefusal::BuildIdentityUnavailable);
-        };
-        // loud and total: a daemon built against a different node does not get
-        // to signal, let alone be enabled.
-        if hello.build != mine {
-            return Err(HelloRefusal::BuildMismatch);
-        }
         let mut entries = self.0.lock().expect("service catalog lock poisoned");
         expire(&mut entries, now);
         let kind = hello.kind.clone();
@@ -417,6 +433,7 @@ impl ServiceCatalog {
             .map(|entry| Signaling {
                 kind: entry.hello.kind.clone(),
                 version: entry.hello.version.clone(),
+                build: entry.hello.build.clone(),
                 capabilities: entry.hello.capabilities.clone(),
                 scopes: entry.hello.scopes.clone(),
                 needs: entry.hello.needs.clone(),
@@ -457,7 +474,13 @@ fn expire(entries: &mut HashMap<String, Entry>, now: Instant) {
 // bound the damage; they do not replace keeping the surface private.
 
 /// POST /v1/services/hello — a local service daemon declares (or refreshes)
-/// its presence. Returns the TTL it must re-signal within.
+/// its presence. Returns the TTL it must re-signal within, and this node's own
+/// build so the daemon can name any skew between them.
+///
+/// The build rides the OK body and NEVER a refusal body: a caller that got a
+/// 200 has already been admitted, whereas answering an unauthenticated
+/// rejection with a fact about this node is what the deleted build gate did
+/// wrong. Nothing secret goes in either body.
 pub async fn hello(
     axum::extract::State(handle): axum::extract::State<crate::handle::NodeHandle>,
     axum::Json(body): axum::Json<Hello>,
@@ -466,7 +489,10 @@ pub async fn hello(
     match handle.services().hello(body, Instant::now()) {
         Ok(ttl) => (
             axum::http::StatusCode::OK,
-            axum::Json(serde_json::json!({ "ttl_secs": ttl.as_secs() })),
+            axum::Json(serde_json::json!({
+                "ttl_secs": ttl.as_secs(),
+                "build": build_identity_or_unknown(),
+            })),
         )
             .into_response(),
         Err(refusal) => (
@@ -503,7 +529,7 @@ mod tests {
         Hello {
             kind: kind.into(),
             version: "1.2.3".into(),
-            build: build_identity().expect("a test build is git-identifiable").into(),
+            build: "deadbeef".into(),
             capabilities: vec!["agent.claude".into()],
             scopes: vec!["cred:read".into()],
             needs: Vec::new(),
@@ -592,73 +618,164 @@ mod tests {
         long_item.scopes = vec!["s".repeat(MAX_ITEM_LEN + 1)];
         assert!(catalog.hello(long_item, now).is_err());
 
-        // nothing malformed ever landed.
-        assert!(catalog.live(now).is_empty());
-    }
-}
-
-#[cfg(test)]
-mod build_gate_tests {
-    use super::*;
-
-    /// the build this test binary was compiled as; `build_identity` must be
-    /// Some here, since the tests only ever run from a git checkout.
-    static TEST_BUILD: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        build_identity()
-            .expect("tests run from a git checkout, so a build id exists")
-            .to_string()
-    });
-
-    fn hello_from_build(build: &str) -> Hello {
-        Hello {
-            kind: "compute".into(),
-            version: "1.2.3".into(),
-            build: build.into(),
-            capabilities: vec![],
-            scopes: vec![],
-            needs: vec![],
-        }
-    }
-
-    #[test]
-    fn a_hello_from_a_different_build_is_refused_and_never_enters_the_catalog() {
-        let catalog = ServiceCatalog::default();
-        let now = Instant::now();
-
-        // skew in either direction is refused — there is no minimum-version
-        // window and no negotiation, only equality.
-        for skewed in ["0.0.0-ancient", "99.99.99", ""] {
-            assert_eq!(
-                catalog.hello(hello_from_build(skewed), now),
-                Err(HelloRefusal::BuildMismatch),
-                "build {skewed:?} must be refused"
+        // the build is no longer compared, but it is still RENDERED, so it
+        // stays a validated boundary: no control bytes, bounded length.
+        for bad_build in ["", "a\0b", "esc\x1b[31m"] {
+            let mut bad = hello("compute");
+            bad.build = bad_build.into();
+            assert!(
+                catalog.hello(bad, now).is_err(),
+                "build {bad_build:?} must be refused"
             );
         }
-        assert!(
-            catalog.live(now).is_empty(),
-            "a refused hello leaves nothing behind"
-        );
+        let mut long_build = hello("compute");
+        long_build.build = "b".repeat(MAX_ITEM_LEN + 1);
+        assert!(catalog.hello(long_build, now).is_err());
 
-        // the node's own build is what passes.
-        catalog
-            .hello(hello_from_build(TEST_BUILD.as_str()), now)
-            .expect("matching build is admitted");
-        assert_eq!(catalog.live(now).len(), 1);
+        // nothing malformed ever landed.
+        assert!(catalog.live(now).is_empty());
     }
 
     #[test]
     fn declared_needs_ride_the_hello_through_to_the_catalog() {
         let catalog = ServiceCatalog::default();
         let now = Instant::now();
-        let mut hello = hello_from_build(TEST_BUILD.as_str());
-        hello.kind = "agent".into();
-        hello.needs = vec!["compute".into()];
-        catalog.hello(hello, now).unwrap();
+        let mut signal = hello("agent");
+        signal.needs = vec!["compute".into()];
+        catalog.hello(signal, now).unwrap();
         assert_eq!(catalog.live(now)[0].needs, vec!["compute".to_string()]);
 
         // a need is a KIND, so a malformed one is refused like any other.
-        let mut bad = hello_from_build(TEST_BUILD.as_str());
+        let mut bad = hello("agent");
         bad.needs = vec!["Not A Kind".into()];
         assert!(catalog.hello(bad, now).is_err());
+    }
+}
+
+/// The regression guard for the deleted build gate.
+///
+/// The gate refused every hello and every service link when `build_identity()`
+/// was `None`, which is what a build without `.git` produces — a node with no
+/// compute, no agent pty and no airlock, reporting only a bare 503. These tests
+/// pin that admission never consults the stamp again.
+///
+/// `build_identity()` is `option_env!`, resolved at COMPILE time, so no test
+/// can make it `None` at runtime. The behavioural half below therefore proves
+/// the stamp is not compared, and the source-parsing half proves the two
+/// admission paths never read it at all — which is the same guarantee, stated
+/// where a test can actually assert it.
+#[cfg(test)]
+mod build_is_metadata_not_a_gate {
+    use super::*;
+
+    fn hello_from_build(build: &str) -> Hello {
+        Hello {
+            kind: "compute".into(),
+            version: "1.2.3".into(),
+            build: build.into(),
+            capabilities: vec!["compute.small".into()],
+            scopes: vec![],
+            needs: vec![],
+        }
+    }
+
+    #[test]
+    fn a_hello_from_any_build_is_admitted_and_its_stamp_is_carried_through() {
+        let catalog = ServiceCatalog::default();
+        let now = Instant::now();
+
+        // skew in either direction, and a stamp this node could never have
+        // minted: all admitted. There is no equality rule left to fail.
+        // the widest stamp `build.rs` can actually mint is in this list on
+        // purpose: a 40-char sha under `core.abbrev = 40` plus a u64 digest is
+        // 57 chars, so a cap sized for a version string would have refused an
+        // honest daemon its own build — the fail-closed trap all over again.
+        let widest = format!("{}-{:x}", "a".repeat(40), u64::MAX);
+        for foreign in [
+            "0.0.0-ancient",
+            "99.99.99",
+            UNKNOWN_BUILD,
+            "a-third-party-daemon",
+            widest.as_str(),
+        ] {
+            catalog
+                .hello(hello_from_build(foreign), now)
+                .unwrap_or_else(|refusal| {
+                    panic!("build {foreign:?} must be admitted, got {refusal:?}")
+                });
+            let live = catalog.live(now);
+            assert_eq!(live.len(), 1, "one kind is one row whatever its build");
+            assert_eq!(
+                live[0].build, foreign,
+                "the daemon's stamp reaches the catalog as metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn no_refusal_message_leaks_this_node_s_build() {
+        // the deleted `BuildMismatch` interpolated `build_identity()` into a
+        // message that `hello()` returned verbatim in the 409 body — handing
+        // an unauthenticated caller the correct stamp on its first wrong
+        // guess. Every surviving refusal describes the CALLER's input or this
+        // node's capacity, and nothing else.
+        let messages = [
+            HelloRefusal::Malformed("kind must be 1..32 chars of [a-z0-9-]").message(),
+            HelloRefusal::CatalogFull.message(),
+        ];
+        let mine = build_identity_or_unknown();
+        for message in messages {
+            assert!(
+                !message.contains(mine),
+                "a refusal body must not publish this node's build: {message:?}"
+            );
+        }
+    }
+
+    /// A source-parsing lint, because `option_env!` cannot be made `None` at
+    /// runtime: neither admission path may name `build_identity` again.
+    #[test]
+    fn neither_admission_path_consults_the_build_stamp() {
+        let paths = [
+            (file!(), "fn admit("),
+            ("bin/noded/src/stream.rs", "fn take_service_link("),
+        ];
+        for (relative, signature) in paths {
+            let source = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(relative),
+            )
+            .unwrap_or_else(|error| panic!("{relative}: {error}"));
+            let body = function_body(&source, signature)
+                .unwrap_or_else(|| panic!("{relative} no longer defines `{signature}`"));
+            assert!(
+                !body.contains("build_identity"),
+                "{signature} in {relative} must not gate on the build stamp — a \
+                 git-absent build would refuse every hello and every service link"
+            );
+        }
+    }
+
+    /// The brace-balanced body of the function whose signature starts with
+    /// `signature`. Deliberately dumb: it only has to serve the two callers
+    /// above, and a parse that ever gets confused fails the test loudly.
+    fn function_body<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
+        let start = source.find(signature)? + signature.len();
+        let open = start + source[start..].find('{')?;
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&source[open..open + offset]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 }

@@ -94,13 +94,9 @@ async fn pump<S>(
 {
     use tokio_tungstenite::tungstenite::Message;
     let (mut tx, mut rx) = socket.split();
-    // claim the link FIRST. `build` is the skew gate: node and daemon restart
-    // independently, so a mismatch is refused with a nameable reason rather than
-    // negotiated. `None` here means this binary has no build identity at all,
-    // which `run` already refused before serving.
-    let Some(build) = noded::services::build_identity() else {
-        return;
-    };
+    // claim the link FIRST. The claim carries no build stamp: the node does not
+    // gate on one, so sending it would only be a field nobody reads.
+    //
     // re-read per attach, never latched: a node restart mints a fresh token, and
     // a daemon holding a stale one would be refused forever.
     let token = match noded::services::read_link_token(workspace) {
@@ -117,7 +113,6 @@ async fn pump<S>(
     let claim = serde_json::json!({
         "op": "service_attach",
         "kind": noded::services::AGENT_KIND,
-        "build": build,
         "token": token,
     })
     .to_string();
