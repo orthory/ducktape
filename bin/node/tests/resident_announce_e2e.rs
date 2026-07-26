@@ -1,153 +1,39 @@
-//! resident capability announce + dispatch execution, end to end on the
-//! network-shape cluster: a fresh identity JOINS the founder's network with a
-//! live invite (the product flow — no manual ceremony), lands RESIDENT
-//! standing, and — without ever being promoted — (1) announces its
-//! script-backed provider into the capability registry through the
-//! submit-relay lane, and (2) EXECUTES the dispatch work the saga module
-//! rendezvous-assigns to it: a mention of an agent bound to its tag runs on
-//! the resident's host and the raw answer comes back as one chat reply,
-//! relayed OracleResult and all. the founder is hermetically capability-free,
-//! so the only possible executor is the resident — an execution IS the proof
-//! that announced residents serve their leases instead of stalling them.
+//! the RESIDENT capability-announce lane, end to end on the network-shape
+//! cluster: a fresh identity JOINS the founder's network with a live invite
+//! (the product flow — no manual ceremony), lands RESIDENT standing, and —
+//! without ever being promoted — publishes `grant ∩ live hello` into the
+//! COMMITTED capability registry over the submit-relay lane, then settles its
+//! own frame's consensus fate back through the resident tier's `on_outcome`
+//! route. The founder is hermetically capability-free (no grant, no hello), so
+//! the only possible provider is the resident.
+//!
+//! The offered half is a real `POST /v1/services/hello` against the resident's
+//! own app surface, refreshed on a heartbeat — a service daemon's entire
+//! contribution to THIS lane. The daemon PROCESS is deliberately not spawned:
+//! an announce test that boots a container runtime pays podman's availability
+//! and startup cost for no extra signal. What a real daemon would additionally
+//! prove — that a REAL hello carries the shape this lane expects — belongs in
+//! the dispatch e2e (#826), which owns the `[sandbox]` fixture and the runtime
+//! plumbing. The dispatch-EXECUTION leg this file used to carry moved into the
+//! daemon with #816/#817 and lives there now.
 //!
 //! run alone (cluster e2es flake under parallel load):
 //!   cargo test -p node-bin --test resident_announce_e2e -- --nocapture --test-threads=1
 
 mod common;
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use agent::{ACTION_CHAT_POST, AgentMsg};
 use capability::{CapabilityQuery, CapabilityReply};
-use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
 use common::{NetworkShapeCluster, poll_until, serial};
-use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 
 /// generous like the sibling network-shape legs: standing → follow-arm sync →
 /// announce relay → registry commit is several blocks of slack.
 const CONVERGE: Duration = Duration::from_secs(180);
-/// budget for one submitted op to finalize and become readable elsewhere.
-const FINALIZE: Duration = Duration::from_secs(60);
-/// budget for a full mention -> resident execution -> delivery -> reply round
-/// trip (several blocks, a resident boundary re-sync, one provider spawn).
-const ROUND_TRIP: Duration = Duration::from_secs(120);
 
-/// one script-backed provider staged on disk (dispatch_e2e's fixture, trimmed
-/// to the text format this leg needs): an operator spec dir holding a single
-/// capability spec whose `detect.env` points at an executable script that
-/// logs each invocation and answers on stdout.
-struct ScriptProvider {
-    tag: String,
-    spec_dir: PathBuf,
-    env_var: String,
-    script: PathBuf,
-    exec_log: PathBuf,
-}
-
-impl ScriptProvider {
-    fn stage(root: &std::path::Path, name: &str, tag: &str, stdout: &str) -> Self {
-        let dir = root.join(name);
-        let spec_dir = dir.join("specs");
-        std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-        let exec_log = dir.join("exec.log");
-        let script = dir.join("provider.sh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 # a test executor: drain the payload, log the invocation,\n\
-                 # answer in the spec's output format.\n\
-                 cat > /dev/null\n\
-                 echo \"ran $(date +%s.%N)\" >> {log}\n\
-                 printf '%s\\n' '{stdout}'\n",
-                log = exec_log.display(),
-            ),
-        )
-        .expect("write provider script");
-        let mut perms = std::fs::metadata(&script)
-            .expect("script metadata")
-            .permissions();
-        use std::os::unix::fs::PermissionsExt as _;
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).expect("chmod provider script");
-
-        let env_var = format!(
-            "DUCKTAPE_TEST_{}_BIN",
-            tag.replace(['-', '.'], "_").to_uppercase()
-        );
-        std::fs::write(
-            spec_dir.join(format!("{tag}.toml")),
-            format!(
-                "spec = 1\n\
-                 [capability]\n\
-                 tag = \"{tag}\"\n\
-                 description = \"resident announce e2e script executor\"\n\
-                 [detect]\n\
-                 bin = \"{tag}-nonexistent-cli\"\n\
-                 env = \"{env_var}\"\n\
-                 [invoke]\n\
-                 args = []\n\
-                 prompt = \"stdin\"\n\
-                 timeout_secs = 30\n\
-                 [output]\n\
-                 format = \"text\"\n"
-            ),
-        )
-        .expect("write provider spec");
-        Self {
-            tag: tag.into(),
-            spec_dir,
-            env_var,
-            script,
-            exec_log,
-        }
-    }
-
-    /// the env pairs that make a node provide this tag.
-    fn env(&self) -> Vec<(String, String)> {
-        vec![
-            (
-                "DUCKTAPE_CAPABILITY_DIR".into(),
-                self.spec_dir.display().to_string(),
-            ),
-            (self.env_var.clone(), self.script.display().to_string()),
-        ]
-    }
-
-    /// how many times the script actually ran on its node.
-    fn executions(&self) -> usize {
-        std::fs::read_to_string(&self.exec_log)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
-    }
-}
-
-/// env that keeps a node OUT of the provider business regardless of what the
-/// host machine has installed (dispatch_e2e's hermetic knob).
-fn hermetic_env(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
-    let empty = root.join(name).join("specs");
-    std::fs::create_dir_all(&empty).expect("empty spec dir");
-    let missing = root.join(name).join("missing-executor");
-    vec![
-        (
-            "DUCKTAPE_CAPABILITY_DIR".into(),
-            empty.display().to_string(),
-        ),
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
-    ]
-}
-
-/// the detect overrides that hide the embedded executor specs, for the node
-/// that DOES carry the script provider dir.
-fn hide_builtins(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
-    let missing = root.join(name).join("missing-executor");
-    vec![
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
-    ]
-}
+/// the tag the resident's grant consents to and its hello offers — the
+/// intersection of the two is what must appear on chain.
+const TAG: &str = "quack-resident";
 
 /// the tag's committed provider pool on `idx`, sorted by key.
 fn providers(cluster: &NetworkShapeCluster, idx: usize, tag: &str) -> Option<Vec<Vec<u8>>> {
@@ -164,50 +50,35 @@ fn providers(cluster: &NetworkShapeCluster, idx: usize, tag: &str) -> Option<Vec
     }
 }
 
+/// serving is opt-in (default OFF), and the grant is the ONLY switch —
+/// node.toml carries no announce key any more. It is also only HALF of it: the
+/// offered set is `grant ∩ live hello`, so this pairs with `signal_service`.
+fn opt_in_serving(cluster: &NetworkShapeCluster, idx: usize, tag: &str) {
+    let workspace = cluster
+        .config_file(idx)
+        .parent()
+        .expect("node.toml has a parent")
+        .to_path_buf();
+    std::fs::write(
+        workspace.join("services.toml"),
+        format!(
+            "version = 1\n\n[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
+             nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = [{tag:?}]\n\
+             scopes = []\n",
+            "11".repeat(32),
+            "22".repeat(16),
+        ),
+    )
+    .expect("write services.toml");
+}
+
 #[test]
-fn a_joined_resident_announces_and_executes_assigned_dispatch() {
+fn a_joined_resident_announces_into_the_committed_registry() {
     let _serial = serial();
-    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
-    let provider = ScriptProvider::stage(
-        fixtures.path(),
-        "friend",
-        "quack-resident",
-        "the resident word is quack",
-    );
-
     let mut cluster = NetworkShapeCluster::new();
-    // the FOUNDER (the only validator) provides nothing; the FRIEND (the
-    // joining resident) carries the script provider. any execution of the
-    // tag can therefore only have happened on the resident.
-    cluster.env[0] = hermetic_env(fixtures.path(), "founder");
-    cluster.env[1] = [provider.env(), hide_builtins(fixtures.path(), "friend")].concat();
-
-    // serving is opt-in (default OFF): this test exercises the resident
-    // announce path, so both the founder and the joining resident are granted
-    // the compute service announcing this provider's tag. The grant is the
-    // ONLY switch — node.toml carries no announce key any more.
-    fn opt_in_serving(cluster: &NetworkShapeCluster, idx: usize, tag: &str) {
-        let workspace = cluster
-            .config_file(idx)
-            .parent()
-            .expect("node.toml has a parent")
-            .to_path_buf();
-        std::fs::write(
-            workspace.join("services.toml"),
-            format!(
-                "version = 1\n\n[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
-                 nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = [{tag:?}]\n\
-                 scopes = []\n",
-                "11".repeat(32),
-                "22".repeat(16),
-            ),
-        )
-        .expect("write services.toml");
-    }
 
     let chain_id = cluster.init_founder("resident-announce");
     assert!(!chain_id.is_empty(), "init should print the founded chain id");
-    opt_in_serving(&cluster, 0, &provider.tag);
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
@@ -217,157 +88,47 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
     let friend_key_hex = cluster.join_friend(&invite);
     assert_eq!(friend_key_hex.len(), 64, "join prints the friend's pubkey hex");
     let friend_key = common::unhex(&friend_key_hex);
-    opt_in_serving(&cluster, 1, &provider.tag);
+    opt_in_serving(&cluster, 1, TAG);
     cluster.spawn(1);
     cluster.wait_marker(1, "joining:", Duration::from_secs(60));
     cluster.wait_admitted(1, CONVERGE);
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 
-    // (1) THE ANNOUNCE: without promotion, the resident's discovered tag set
-    //     reaches the COMMITTED registry — relayed to the founder, admitted by
-    //     the relaxed member gate, applied in consensus.
-    cluster.wait_marker(1, "resident: capability announce relayed", CONVERGE);
+    // the grant alone announces NOTHING — the live half has to exist too.
+    assert_eq!(
+        providers(&cluster, 0, TAG),
+        Some(Vec::new()),
+        "a grant with no daemon signaling puts nobody in the pool"
+    );
+
+    // the resident's compute plane starts signaling.
+    cluster.signal_service(1, "compute", &[TAG]);
+
+    // THE ANNOUNCE: without promotion, `grant ∩ live hello` reaches the
+    // COMMITTED registry — relayed to the founder, admitted by the relaxed
+    // member gate, applied in consensus.
     poll_until(
         "the resident's announce to land in the founder's registry",
         CONVERGE,
         || {
-            let pool = providers(&cluster, 0, &provider.tag)?;
+            let pool = providers(&cluster, 0, TAG)?;
             (pool == vec![friend_key.clone()]).then_some(())
         },
     );
-    // and the pump's own settle log confirms the reply lane round-tripped.
+
+    // and the KIND is announced beside the executor tag, which is the whole of
+    // defect 2: "which nodes run compute" is a registry query now.
+    assert_eq!(
+        providers(&cluster, 0, "compute"),
+        Some(vec![friend_key.clone()]),
+        "the granted-and-signaling kind is a capability tag in its own right"
+    );
+
+    // the pump's own settle log confirms the reply lane round-tripped and the
+    // resident tier's `on_outcome` route ran: the APPLIED line, the only one
+    // that is true. (The submit-time line is `debug` on both tiers now —
+    // relayed is not announced.)
     cluster.wait_marker(1, "resident: announced capabilities", CONVERGE);
-
-    // (2) THE DISPATCH: an agent bound to the tag is mentioned on the
-    //     founder. rendezvous assignment draws from the announced pool — the
-    //     resident, alone — and the resident's state-driven worker pump must
-    //     execute the lease and relay the result home.
-    cluster.submit(
-        0,
-        "chat",
-        &chat::encode_msg(&ChatMsg::CreateChannel {
-            channel_id: "dispatch".into(),
-            name: "Dispatch".into(),
-            post_policy: PostPolicy::Open,
-        }),
-    );
-    poll_until("the channel to finalize on the founder", FINALIZE, || {
-        let raw = cluster.query(
-            0,
-            "chat",
-            &chat::encode_query(&ChatQuery::Channel {
-                channel_id: "dispatch".into(),
-            }),
-        )?;
-        matches!(chat::decode_reply(&raw).ok()?, ChatReply::Channel(Some(_))).then_some(())
-    });
-
-    // arm the agent the way the app does — and note what is NO LONGER here: the
-    // prompt blob. an agent's persona used to be blob bytes staged on ONE node,
-    // which a run leasing anywhere else had to fetch across the mesh (#298); it
-    // is a curated duckfs skill now, so consensus replicates it and the executor
-    // materializes it locally. this agent curates none, which is a legitimate
-    // agent: it still gets the ambient context document, and this leg is about
-    // WHERE the run executes, not what the model was told.
-    cluster.submit(
-        0,
-        "agent",
-        &agent::encode_msg(&AgentMsg::RegisterAgent {
-            agent_id: "quacker".into(),
-            display_name: "quacker".into(),
-            capability: provider.tag.clone(),
-            allowed_actions: vec![ACTION_CHAT_POST.into()],
-            recipe_hash: None,
-            caps: None,
-            skills: None,
-        }),
-    );
-    cluster.submit(
-        0,
-        "runs",
-        &runs::encode_msg(&RunsMsg::WatchChannel {
-            channel_id: "dispatch".into(),
-            policy: TurnPolicy::Mention,
-        }),
-    );
-    // the watch must be committed before the mention posts, or the tagging
-    // plane has no subscriber to engage.
-    poll_until("the channel watch to commit", FINALIZE, || {
-        let reply = cluster.query(0, "runs", &runs::encode_query(&RunsQuery::Watches))?;
-        match runs::decode_reply(&reply) {
-            Ok(RunsReply::Watches(w)) => {
-                w.iter().any(|v| v.channel_id == "dispatch").then_some(())
-            }
-            _ => None,
-        }
-    });
-    cluster.submit(
-        0,
-        "chat",
-        &chat::encode_msg(&ChatMsg::PostMessage {
-            channel_id: "dispatch".into(),
-            message_id: "m1".into(),
-            blocks: vec![Block::Paragraph(vec![
-                Span::plain("hey "),
-                Span {
-                    text: "@quacker".into(),
-                    marks: vec![Mark::Mention(AuthorRef::Agent {
-                        module: "runs".into(),
-                        agent_id: "quacker".into(),
-                    })],
-                },
-                Span::plain(" say the word"),
-            ])],
-            thread: None,
-            as_agent: None,
-        }),
-    );
-
-    // the mention was the fresh channel's seq 1.
-    let run_id = runs::run_id_for("dispatch", 1, "quacker");
-    let reply_text = poll_until("the agent reply to post", ROUND_TRIP, || {
-        let reply = cluster.query(
-            0,
-            "chat",
-            &chat::encode_query(&ChatQuery::MessagesRange {
-                channel_id: "dispatch".into(),
-                from_seq: 1,
-                limit: 64,
-            }),
-        )?;
-        let ChatReply::Messages(views) = chat::decode_reply(&reply).ok()? else {
-            return None;
-        };
-        views.into_iter().find_map(|v| {
-            (v.head.message_id == format!("agent/{run_id}")).then(|| {
-                v.head
-                    .blocks
-                    .iter()
-                    .map(|b| match b {
-                        Block::Paragraph(spans) | Block::Quote(spans) => {
-                            spans.iter().map(|s| s.text.as_str()).collect::<String>()
-                        }
-                        Block::Code { text, .. } => text.clone(),
-                        Block::Divider => String::new(),
-                    })
-                    .collect::<String>()
-            })
-        })
-    });
-    assert_eq!(
-        reply_text, "the resident word is quack",
-        "the reply is the RESIDENT provider's raw answer"
-    );
-    // the execution evidence: the resident's script ran exactly once — the
-    // lease was served on the resident host, not stalled to expiry and not
-    // double-run through the re-send path.
-    assert_eq!(
-        provider.executions(),
-        1,
-        "the resident executed its assignment exactly once"
-    );
-    // and the resident's own log shows the relayed result applying.
-    cluster.wait_marker(1, "resident: dispatch result for saga", CONVERGE);
 
     cluster.kill(1);
     cluster.kill(0);

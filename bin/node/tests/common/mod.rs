@@ -400,6 +400,78 @@ impl NetworkShapeCluster {
         });
     }
 
+    /// keep node `idx`'s `<kind>` hello alive — a service daemon's ENTIRE
+    /// contribution to the capability-announce lane, without the daemon.
+    ///
+    /// The daemon PROCESS is deliberately not spawned, and that is a SCOPING
+    /// choice, not a limitation of the host: a daemon's entire contribution to
+    /// the announce lane is this POST, so booting a container runtime to prove
+    /// capability announcement buys no extra signal and couples this lane to
+    /// podman's availability and startup cost. What a real daemon would
+    /// additionally prove — that a REAL hello carries the shape this lane
+    /// expects — is a daemon-fixture concern, and it belongs in the dispatch
+    /// e2e (#826), which owns the `[sandbox]` fixture, the portable-podman
+    /// PATH, and the libpod pull-on-404 fix that lane actually needs.
+    ///
+    /// The FIRST hello is synchronous and asserted — that IS the readiness
+    /// event; the refresh then rides a heartbeat thread like the daemon's.
+    ///
+    /// ponytail: two known divergences from the real daemon, both latent while
+    /// one serialized test uses this.
+    /// 1. The real daemon treats a failed FIRST hello as FATAL; this retries
+    ///    for 60s, so a permanent refusal (a build-identity skew) burns the
+    ///    whole budget and surfaces as a timeout instead of failing instantly.
+    ///    Fix by splitting connect-refused (retry, the node is still binding)
+    ///    from an answered non-200 (fail now) when a second caller appears.
+    /// 2. The heartbeat thread has no exit condition and no liveness check, and
+    ///    `common` is shared across test binaries over recycled port ranges —
+    ///    so a future SECOND caller could inject a stale `compute` hello into
+    ///    an unrelated cluster that inherited the port. Give it a stop flag
+    ///    cleared by `kill` at that point.
+    pub fn signal_service(&mut self, idx: usize, kind: &str, capabilities: &[&str]) {
+        let hello = noded::services::Hello {
+            kind: kind.into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            build: noded::services::build_identity()
+                .expect("tests run from a git checkout")
+                .into(),
+            capabilities: capabilities.iter().map(|tag| tag.to_string()).collect(),
+            scopes: Vec::new(),
+            needs: Vec::new(),
+        };
+        let body = serde_json::to_value(&hello).expect("a hello serializes");
+        let port = self.http_ports[idx];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match nettest::try_http_json(port, "POST", "/v1/services/hello", Some(&body)) {
+                Ok((200, _)) => break,
+                other => assert!(
+                    Instant::now() < deadline,
+                    "node idx {idx} never accepted a {kind:?} hello ({other:?});\n{}",
+                    self.all_log_tails(60),
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        // detached like the daemon's own heartbeat thread: it outlives this
+        // call, ignores a post to a node that has gone away, and dies with the
+        // test process.
+        std::thread::Builder::new()
+            .name(format!("hello-{kind}-{idx}"))
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(noded::services::HELLO_TTL / 3);
+                    let _ = nettest::try_http_json(
+                        port,
+                        "POST",
+                        "/v1/services/hello",
+                        Some(&body),
+                    );
+                }
+            })
+            .expect("spawn the hello heartbeat");
+    }
+
     /// kill node `idx`'s process (reaped by NodeProc's drop).
     pub fn kill(&mut self, idx: usize) {
         self.nodes[idx] = None;
