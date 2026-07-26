@@ -51,7 +51,7 @@ use commonware_runtime::{Metrics as _, Runner, Supervisor};
 
 mod agent_cli;
 mod agent_plane;
-mod airlock_serve;
+mod airlock;
 mod blob_fetch;
 mod boot;
 mod cli;
@@ -60,6 +60,7 @@ mod code_plane;
 mod config;
 mod constants;
 mod cred_cli;
+mod cred_seal;
 mod node_http;
 mod tty;
 mod agent;
@@ -350,6 +351,25 @@ fn run_node(
         );
     }
 
+    // The LENDER twin of the same silence. An operator whose credentials are
+    // registered and granted on chain lends exactly nothing without an airlock
+    // daemon, and every other diagnostic still reads healthy: `user cred list`
+    // shows the records, `gateway list` shows the route, and `service
+    // list`/`status` render no airlock row at all (they fold signaling ∪
+    // grants, and an ungranted, unstarted service is in neither). This line is
+    // the only place that says so.
+    if let Some(credentials) = crate::airlock::lending_without_a_grant(&storage, &workspace) {
+        tracing::warn!(
+            target: "ducktape::service",
+            node = %label,
+            credentials,
+            reason = "airlock_not_granted",
+            "credentials are registered but the airlock service is not enabled; nothing will \
+             lend them and a borrower's session will not connect — enable it with `ducktape \
+             service run airlock`"
+        );
+    }
+
     // There is NO sandbox probe here any more, and its absence is the point:
     // this process runs nothing in a sandbox. Both planes that did — compute's
     // headless runs and agent's interactive ptys — are separate daemons that
@@ -384,7 +404,7 @@ fn run_node(
         label: &label,
         storage: &storage,
         // the config dir where gateway-routes.json lives (= storage in the dev
-        // shape); an embedded airlock gateway registers its port here.
+        // shape); a service daemon registers its loopback port there.
         workspace: &workspace,
         rpc_listen,
         http_listen,
@@ -398,11 +418,6 @@ fn run_node(
         // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice (ADR A2/A4).
         node_key: signer.public_key().as_ref().to_vec(),
         admin_exposure: noded::AdminExposure::from_env(),
-        // the resolved node.toml sandbox backend: the interactive terminal plane
-        // uses the SAME backend + identity as this node's real agent runs, so a
-        // Direct node has no terminal plane and Podman reaping stays consistent.
-        // cloned — the validator/resident arms below consume the original.
-        sandbox: sandbox.clone(),
     })?;
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.

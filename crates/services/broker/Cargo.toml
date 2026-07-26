@@ -9,6 +9,9 @@ version.workspace = true
 # (codex) and Anthropic Messages (claude) — plus the airlock client layer that
 # swaps a host-held credential for a verified TEE gateway session.
 [dependencies]
+# the airlock client hands back `anyhow::Error`, and a failed session handshake
+# is CLASSIFIED off its cause chain (see `SessionRefusal`) rather than its text.
+anyhow = "1"
 axum = "0.8"
 # StreamExt for the Anthropic broker's SSE passthrough (reqwest bytes_stream →
 # axum Body::from_stream, never buffered).
@@ -17,7 +20,7 @@ futures = { workspace = true }
 # instead of a host-held credential — verify its attestation, handshake for a
 # scoped session token, forward the run's traffic to it (the gateway swaps the
 # token for the real credential in-enclave). `client` = the async Gateway.
-airlock = { path = "../../modules/system/airlock", features = ["client", "verify"] }
+airlock = { path = "../../airlock", features = ["client", "verify"] }
 rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -34,4 +37,4 @@ testkit = []
 [dev-dependencies]
 # the in-process airlock custody test boots the gateway HTTP service itself
 # (server feature) to drive sandbox → broker → gateway → upstream end to end.
-airlock = { path = "../../modules/system/airlock", features = ["client", "server", "verify", "testkit"] }
+airlock = { path = "../../airlock", features = ["client", "server", "verify", "testkit"] }

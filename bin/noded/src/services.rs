@@ -37,6 +37,11 @@ pub const COMPUTE_KIND: &str = "compute";
 /// compute, not a layer on it — both link the same provider/sandbox/broker
 /// libraries and spawn their own sandboxes, and their bus is the chain.
 pub const AGENT_KIND: &str = "agent";
+/// the airlock service: the credential-LENDING gateway, serving this
+/// operator's own store to accounts their on-chain grants name. Unlike the
+/// other two it spawns nothing — no sandbox, no container, no provider — so a
+/// node that lends credentials needs no container runtime at all.
+pub const AIRLOCK_KIND: &str = "airlock";
 
 /// Cap on distinct kinds the catalog will hold. The kind in a hello is
 /// caller-chosen, so an unbounded map is a trivial memory-exhaustion vector

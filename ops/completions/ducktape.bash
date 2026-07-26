@@ -18,9 +18,9 @@ _ducktape() {
     local node_flags="--config -n --network --sync-only --json --out --dir --name --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --wireguard-effect --role --ttl-days"
 
     local user_key="init restore unlock reveal encrypt status"
-    local user_cred="add list remove grant revoke"
+    local user_cred="add list remove grant revoke inspect seal"
     local user_verbs="key sign-bind sign-unbind sign-possession sign-add-member sign-remove-member sign-gateway-route sign-frame sign-admin redeem-invite webauthn-challenge p256-payload cred account-init help"
-    local user_flags="--path --method --statement --possession --out --key --node -n --network --account-id --chain-id --new-key --new-kind --node-key --node-pub --target-key --nonce --seq --route-key --name --json --label"
+    local user_flags="--path --method --statement --possession --out --key --node -n --network --account-id --chain-id --new-key --new-kind --node-key --node-pub --target-key --nonce --seq --route-key --name --json --label --host --remote --attest --pccs-url --snp-product --snp-vcek --vendor --measurement --credentials --cred-kind --access-token --refresh-token"
     local gateway_verbs="bind unbind list help"
     local gateway_flags="--workspace -n --network --label --port"
     local fs_verbs="ls cat stat history diff checkout status commit pin help"

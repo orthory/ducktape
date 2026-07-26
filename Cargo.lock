@@ -184,40 +184,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "airlock-broker"
-version = "0.1.0"
-dependencies = [
- "airlock",
- "anyhow",
- "axum",
- "hex",
- "rand 0.8.6",
- "reqwest 0.12.28",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
-name = "airlock-cli"
-version = "0.1.0"
-dependencies = [
- "airlock",
- "anyhow",
- "hex",
- "reqwest 0.12.28",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "airlock-gateway"
 version = "0.1.0"
 dependencies = [
  "airlock",
  "anyhow",
  "axum",
- "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "airlock-service"
+version = "0.1.0"
+dependencies = [
+ "airlock",
+ "axum",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -1093,6 +1077,7 @@ name = "broker-host"
 version = "0.1.0"
 dependencies = [
  "airlock",
+ "anyhow",
  "axum",
  "futures",
  "rand 0.8.6",
@@ -5314,8 +5299,10 @@ dependencies = [
  "agent",
  "agent-service",
  "airlock",
+ "airlock-service",
  "anstream",
  "anstyle",
+ "anyhow",
  "argon2",
  "async-trait",
  "automations",
@@ -5351,6 +5338,7 @@ dependencies = [
  "futures",
  "gateway",
  "governance",
+ "hex",
  "host",
  "identity",
  "inbox",

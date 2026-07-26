@@ -81,9 +81,13 @@ members = [
     "crates/modules/system/blobstore",
     "crates/modules/system/dispatch",
     "crates/modules/system/tagging",
-    "crates/modules/system/airlock",
     "crates/modules/system/duckdns",
     "crates/modules/system/gateway",
+    # airlock — the two-party execution/auth contract. NOT a consensus module
+    # (no MODULE_ID, no guest wasm): a protocol shared by the lender service,
+    # the borrower broker and the enclave binary, so it sits beside the other
+    # cross-plane protocol families rather than under any one party.
+    "crates/airlock",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
@@ -103,6 +107,7 @@ members = [
     "crates/modules/apps/files",
     # services — off-chain host-side executors
     "crates/services/agent",
+    "crates/services/airlock",
     "crates/services/broker",
     "crates/services/compute",
     "crates/services/provider",
@@ -114,7 +119,7 @@ members = [
     "crates/testing/nettest",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
-    "bin/airlock-gateway", "bin/airlock-broker", "bin/airlock-cli",
+    "bin/airlock-gateway",
     "bin/guest-builder",
     # native desktop client — intentionally only Chat + Pages
     "app",
@@ -271,6 +276,7 @@ inbox = { path = "crates/modules/apps/inbox" }
 files = { path = "crates/modules/apps/files" }
 # internal — off-chain service crates
 agent-service = { path = "crates/services/agent" }
+airlock-service = { path = "crates/services/airlock" }
 broker-host = { path = "crates/services/broker" }
 compute-service = { path = "crates/services/compute" }
 provider-host = { path = "crates/services/provider" }

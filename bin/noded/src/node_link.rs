@@ -27,10 +27,20 @@ use std::path::{Path, PathBuf};
 
 use duckfs_client::http::HttpNode;
 
-/// How long one lane call may take. A submit rides real consensus, so it gets
-/// the same generous ceiling `HttpNode` gives a commit; a lane that hangs
-/// forever would wedge a run with no diagnosis.
+/// How long one lane call may take by DEFAULT. A submit rides real consensus,
+/// so it gets the same generous ceiling `HttpNode` gives a commit; a lane that
+/// hangs forever would wedge a run with no diagnosis. A link that only reads
+/// committed state on someone's interactive critical path says so with
+/// [`NodeLink::with_timeout`] instead of inheriting this.
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn http_client(timeout: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+        .expect("build a reqwest client")
+}
 
 /// The node a daemon serves, addressed over its local `/v1` surface.
 #[derive(Clone)]
@@ -45,16 +55,21 @@ pub struct NodeLink {
 impl NodeLink {
     /// address the node at `base` (e.g. `http://127.0.0.1:8844`).
     pub fn new(base: impl Into<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(CALL_TIMEOUT)
-            .build()
-            .expect("build a reqwest client");
         Self {
             base: base.into().trim_end_matches('/').to_string(),
             forge_repo: None,
-            client,
+            client: http_client(CALL_TIMEOUT),
         }
+    }
+
+    /// Bound this link's calls at `timeout` rather than the consensus-sized
+    /// default — for a daemon whose link carries only committed READS on a
+    /// caller's critical path (the airlock grant gate: a borrower's session is
+    /// blocked on it). Fail-closed in seconds beats a two-minute hang while a
+    /// node is wedged or restarting.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.client = http_client(timeout);
+        self
     }
 
     /// point the forge worktree lane at the node's materialized bare repos.

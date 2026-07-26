@@ -452,12 +452,26 @@ fn self_host_cfg(
 
 /// An upstream that echoes back the `Authorization` header the gateway sent, so a
 /// round-trip reveals exactly which credential's token the proxy planted.
+///
+/// This is the ONE fixture that stands in for BOTH vendors, so it must serve
+/// every shape `server::upstream_path` can produce from the caller's
+/// `/v1/messages` — claude passes through, codex has its `/v1` stripped (the
+/// ChatGPT backend serves `/responses` under `/backend-api/codex`, with no
+/// `/v1`). A fixture that knows only one vendor's shape does not fail loudly: it
+/// 404s, the echo comes back EMPTY, and the assertion blames the credential.
+/// That is how this went red and stayed red — add the new shape here when a
+/// third credential kind lands, not after the next bisect.
 async fn boot_echo_upstream() -> String {
     async fn echo(headers: HeaderMap) -> Response {
         let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
         ([("content-type", "text/plain")], got).into_response()
     }
-    spawn(Router::new().route("/v1/messages", post(echo))).await
+    spawn(
+        Router::new()
+            .route("/v1/messages", post(echo)) // claude: pass-through
+            .route("/messages", post(echo)), // codex: `/v1` stripped
+    )
+    .await
 }
 
 /// Open a session for `name` and POST once; return the `Authorization` header the
@@ -567,9 +581,18 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
     let seal_pk = kp.public_bytes();
     // The injected gate: only the account `granted` may draw on the credential —
     // the node's committed-record lookup, stubbed to one allowed account here.
+    // `wedged` stands in for a node that did not answer at all.
     let check: airlock::server::GrantCheck = std::sync::Arc::new(|_name: String, account: Vec<u8>| {
-        Box::pin(async move { account == b"granted" })
-            as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        Box::pin(async move {
+            match account.as_slice() {
+                b"granted" => airlock::server::GrantAnswer::Granted,
+                b"wedged" => airlock::server::GrantAnswer::Undetermined,
+                _other => airlock::server::GrantAnswer::Refused,
+            }
+        })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = airlock::server::GrantAnswer> + Send>,
+            >
     });
     let (app, _) = server::build_seeded_gated(
         self_host_cfg(Some(kp), upstream.clone(), String::new()),
@@ -604,6 +627,15 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
     // account is a refusal, never a bypass.
     let err = gw.open_session(&seal_pk, "a").await.unwrap_err();
     assert!(err.to_string().contains("403"), "an accountless session must 403: {err}");
+
+    // The gate could not ASK its authority. That is NOT a refusal: a 403 sends
+    // the borrower's operator to add a grant that already exists, so the one
+    // answer that carries no information gets its own 503 instead.
+    let err = gw.open_session_as(&seal_pk, "a", b"wedged").await.unwrap_err();
+    assert!(
+        err.to_string().contains("503"),
+        "an undetermined grant must 503, never 403: {err}"
+    );
 }
 
 #[test]

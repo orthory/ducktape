@@ -36,8 +36,8 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) label: &'a str,
     pub(crate) storage: &'a std::path::Path,
     /// the config dir where `gateway-routes.json` lives (= `storage` in the dev
-    /// shape). An embedded airlock gateway registers its loopback port here so
-    /// the gateway proxy can find it.
+    /// shape). A serving daemon registers its loopback port there so the
+    /// gateway proxy can find it; the file is re-read per request.
     pub(crate) workspace: &'a std::path::Path,
     pub(crate) rpc_listen: Option<String>,
     pub(crate) http_listen: Option<String>,
@@ -49,10 +49,6 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) node_key: Vec<u8>,
     /// how the owner-gated admin namespace is exposed (ADR A2/A4).
     pub(crate) admin_exposure: noded::AdminExposure,
-    /// the compute plane (`node.toml [sandbox]`): a Podman/Tart backend, or
-    /// `None` for a consensus-only node — which hosts no terminal plane and
-    /// starts no auto airlock gateway.
-    pub(crate) sandbox: Option<provider_host::SandboxBackend>,
 }
 
 pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
@@ -68,7 +64,6 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         log_ring,
         node_key,
         admin_exposure,
-        sandbox,
     } = config;
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise. a
@@ -104,75 +99,6 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             Some((listener, actual))
         }
         _ => None,
-    };
-    // An embedded airlock gateway (credential-provider node): either the
-    // disk-backed self-host store (`user cred add`) or the TEE env path
-    // (DUCKTAPE_AIRLOCK_SERVE). Run it in-process on loopback and register its
-    // port as the `airlock` gateway route, so a compute node can reach it over
-    // the overlay (airlock.<handle>.duck). Bound here (out of the runtime) like
-    // the browser gateway; served on the app-surface thread below. Only when the
-    // gateway plane is up to serve it; route PUBLICATION stays a one-time signed
-    // operator step.
-    // A compute/workstation node (a configured [sandbox]) starts its airlock
-    // gateway even with an empty store, so `cred add` takes effect without a
-    // restart.
-    let compute_node = sandbox.is_some();
-    let airlock_bits = match crate::airlock_serve::AirlockServe::resolve(storage, compute_node) {
-        None => None,
-        Some(Err(error)) => return Err(format!("airlock serve config: {error}").into()),
-        Some(Ok(serve)) if !sync_only && gateway_enabled => {
-            let listener = std::net::TcpListener::bind((
-                std::net::Ipv4Addr::LOCALHOST,
-                serve.port.unwrap_or(0),
-            ))?;
-            listener.set_nonblocking(true)?;
-            let port = listener.local_addr()?.port();
-            // A lending gateway (the self-host store) enforces its own on-chain
-            // grants: a session claiming an account that is neither the owner nor a
-            // grantee is refused at the owner's gateway, not just at the compute
-            // node's broker. The gate reads THIS node's committed gateway record
-            // over the actor lane. The TEE path is not lent, so it leaves it off.
-            let grant_check = serve
-                .grant_gated
-                .then(|| crate::airlock_serve::committed_grant_check(http_handle.command_sender()));
-            // Build — and thus ATTEST — BEFORE registering the route or claiming
-            // to listen: a node that cannot attest must fail boot loudly here,
-            // never register a route to a gateway that will not come up. The
-            // self-host store path (grant_gated) wires the lazy loader so a
-            // credential added after boot is served without a restart; the TEE
-            // env path (one fixed enclave credential) has no store to reload.
-            let (router, vendor) = if serve.grant_gated {
-                airlock::server::build_self_host_reloadable(
-                    serve.cfg,
-                    serve.seeds,
-                    grant_check,
-                    crate::airlock_serve::reload_from_store(storage),
-                )
-            } else {
-                airlock::server::build_seeded_gated(serve.cfg, serve.seeds, grant_check)
-            }
-            .map_err(|error| format!("airlock gateway: {error}"))?;
-            crate::gateway_routes::register(workspace, gateway::RouteName::named("airlock"), port)
-                .map_err(|error| format!("register airlock gateway route: {error}"))?;
-            tracing::info!(
-                target: "ducktape::gateway",
-                node = %label,
-                listen = %format_args!("127.0.0.1:{port}"),
-                route = "airlock",
-                attest = %vendor,
-                "airlock gateway listening"
-            );
-            Some((listener, router))
-        }
-        Some(Ok(_)) => {
-            tracing::warn!(
-                target: "ducktape::gateway",
-                node = %label,
-                reason = "gateway_plane_off",
-                "DUCKTAPE_AIRLOCK_SERVE set but airlock is not served"
-            );
-            None
-        }
     };
     let (gateway_lane, gateway_requests) = tokio::sync::mpsc::channel::<noded::GatewayJob>(32);
     // the guest-side remote-session lane: /v1/term/sessions with a `node` hands a
@@ -343,25 +269,6 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
                                             target: "ducktape::gateway",
                                             error = %error,
                                             "gateway browser server stopped"
-                                        );
-                                    }
-                                });
-                            }
-                            if let Some((airlock_listener, airlock_router)) = airlock_bits {
-                                let airlock_listener =
-                                    tokio::net::TcpListener::from_std(airlock_listener)
-                                        .expect("adopt airlock gateway listener");
-                                tokio::spawn(async move {
-                                    if let Err(error) = airlock::server::serve_router(
-                                        airlock_listener,
-                                        airlock_router,
-                                    )
-                                    .await
-                                    {
-                                        tracing::error!(
-                                            target: "ducktape::gateway",
-                                            error = %error,
-                                            "airlock gateway server stopped"
                                         );
                                     }
                                 });

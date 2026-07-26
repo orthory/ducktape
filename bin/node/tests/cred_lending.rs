@@ -1,9 +1,11 @@
 //! Two-node granted-credential lending over the gateway overlay, and the
 //! owner-gateway grant gate the flow forces.
 //!
-//! The OWNER node (0) co-hosts a self-host airlock gateway from its disk-backed
-//! credential store (the `user cred add` layout), registers the credential
-//! record on-chain, and grants it to the COMPUTE node's (1) account. The compute
+//! The OWNER node (0) runs the airlock LENDER DAEMON (`ducktape service run
+//! airlock`) beside it, serving its disk-backed credential store (the `user cred
+//! add` layout) on a loopback port the node reverse-proxies overlay ingress to.
+//! It registers the credential record on-chain and grants it to the COMPUTE
+//! node's (1) account. The compute
 //! node resolves the name from committed state, pins the on-chain seal_pk, and —
 //! claiming its GRANTED account — completes a proxied `/v1/messages` through the
 //! owner's gateway over the real WireGuard overlay to a mock Anthropic upstream.
@@ -226,8 +228,8 @@ fn query_credential(cluster: &Cluster, reader: usize, name: &str) -> Option<Cred
 }
 
 /// Seed the owner's disk-backed store with a claude credential dir (the layout the
-/// node's `load_seeds` reads: a `kind` marker + a `.credentials.json` refresh
-/// token). Done BEFORE the node spawns so its embedded gateway picks it up at boot.
+/// lender's `load_seeds` reads: a `kind` marker + a `.credentials.json` refresh
+/// token). Done BEFORE the daemon spawns so it is served from its first session.
 fn seed_claude_store(storage: &std::path::Path, name: &str, refresh: &str) {
     let dir = storage.join("airlock-creds").join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -239,9 +241,9 @@ fn seed_claude_store(storage: &std::path::Path, name: &str, refresh: &str) {
     .unwrap();
 }
 
-/// The seal PUBLIC key the owner's embedded gateway minted at boot — read from the
-/// store's `seal.key` (32-byte secret, 0600). This is the anchor the owner puts
-/// on-chain and the compute node pins.
+/// The seal PUBLIC key the owner's lender daemon minted when it opened the store
+/// — read from the store's `seal.key` (32-byte secret, 0600). This is the anchor
+/// the owner puts on-chain and the compute node pins.
 fn seal_pk_from_store(storage: &std::path::Path) -> [u8; 32] {
     let bytes = std::fs::read(storage.join("airlock-creds").join("seal.key")).expect("seal.key");
     let secret: [u8; 32] = bytes.as_slice().try_into().expect("32-byte seal secret");
@@ -313,14 +315,14 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
 
-    // The owner co-hosts the self-host store: seed the credential dir BEFORE spawn
-    // so the embedded gateway serves it at boot, and point its upstream + oauth at
-    // the mock (the same `DUCKTAPE_AIRLOCK_SERVE_*` overrides the TEE path honors).
+    // The owner co-hosts the store: seed the credential dir BEFORE the lender
+    // daemon starts so it is served from the first session, and point the
+    // daemon's upstream + oauth at the mock.
     let owner_storage = cluster.workspace(0);
     seed_claude_store(&owner_storage, "owner-claude-1", "rt-e2e");
     cluster.env[0] = vec![
-        ("DUCKTAPE_AIRLOCK_SERVE_ANTHROPIC_BASE".into(), upstream.clone()),
-        ("DUCKTAPE_AIRLOCK_SERVE_OAUTH_TOKEN_URL".into(), oauth_url.clone()),
+        ("DUCKTAPE_AIRLOCK_ANTHROPIC_BASE".into(), upstream.clone()),
+        ("DUCKTAPE_AIRLOCK_OAUTH_TOKEN_URL".into(), oauth_url.clone()),
     ];
 
     for index in 0..2 {
@@ -332,8 +334,12 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
         cluster.wait_marker(index, "peer handshake COMPLETE", READY);
         cluster.wait_marker(index, "gateway plane: overlay stream bound", READY);
     }
-    // The owner's embedded self-host gateway came up + registered its route.
-    cluster.wait_marker(0, "airlock gateway listening", READY);
+    // Only NOW start the lender: the daemon's first hello must land, so its
+    // node's http surface has to be listening before it starts. It opens the
+    // store (minting seal.key), binds loopback and registers its port as the
+    // `airlock` gateway route the node reverse-proxies to.
+    cluster.spawn_service(0, "airlock");
+    cluster.wait_service_marker(0, "airlock", "airlock daemon serving", READY);
 
     let owner = ed25519::PrivateKey::from_seed(42);
     let compute = ed25519::PrivateKey::from_seed(43);
@@ -370,8 +376,8 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
         });
     }
 
-    // Publish the signed airlock route (the one manual operator act; the node
-    // already registered the gateway's loopback port at boot).
+    // Publish the signed airlock route (the one manual operator act; the daemon
+    // already registered its loopback port).
     cluster.submit(
         0,
         "gateway",
@@ -382,7 +388,7 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     });
 
     // Register the credential record on-chain with the store's seal_pk, then grant
-    // it to the compute account. The seal.key exists once the gateway booted.
+    // it to the compute account. The seal.key exists once the daemon opened the store.
     let seal_pk = seal_pk_from_store(&owner_storage);
     cluster.submit(
         0,

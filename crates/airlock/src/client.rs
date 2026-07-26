@@ -1,6 +1,7 @@
-//! The async HTTP client side of the gateway protocol, shared by `airlock-cli`
-//! (the CLI roles) and `airlock-broker` (the Computation Provider's local
-//! api-snatch). Topology-agnostic: a `Gateway` is either LOCAL (same-machine
+//! The async HTTP client side of the gateway protocol, shared by
+//! `ducktape user cred inspect|seal` (the credential-provider verbs) and
+//! `broker-host` (the Computation Provider's local api-snatch).
+//! Topology-agnostic: a `Gateway` is either LOCAL (same-machine
 //! loopback) or REMOTE (a duckdns handle routed by the local node's
 //! browser-gateway, carried in `x-duck-authority`).
 //!
@@ -18,6 +19,36 @@ use crate::wire::{
     AttestationResponse, CredentialKind, CredentialPayload, CredentialUpload, SessionRequest,
     SessionResponse,
 };
+
+/// What failed AFTER the gateway's response arrived.
+///
+/// A caller classifying a failed handshake reads the `reqwest::Error` out of the
+/// error chain — but every step below happens once the response is in hand, so
+/// there is either no transport error at all or one with no status. Inferring
+/// "the token would not open" from that absence is wrong for a malformed body,
+/// and `gateway_seal_pk_mismatch` is the single most expensive name to guess.
+/// So the step tags itself, and the caller reads the tag instead of inferring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionResponseFault {
+    /// the response body was not the session wire shape: not JSON, wrong shape,
+    /// truncated, a non-base64 or non-utf8 token.
+    Malformed,
+    /// the body was well-formed and its sealed token would not open under the
+    /// key we handshook against — the real seal_pk mismatch.
+    TokenWouldNotOpen,
+}
+
+impl std::fmt::Display for SessionResponseFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed => f.write_str("the gateway's session response was malformed"),
+            Self::TokenWouldNotOpen => f.write_str(
+                "the sealed session token would not open (the gateway's seal key is not the \
+                 published one)",
+            ),
+        }
+    }
+}
 
 /// Topology-agnostic handle to a gateway.
 pub struct Gateway {
@@ -125,6 +156,9 @@ impl Gateway {
         account: Option<&[u8]>,
     ) -> Result<(String, handshake::SessionKeys)> {
         let (client_eph_pk, keys) = handshake::client_handshake(seal_pk);
+        // Everything from `.json()` down runs on an ARRIVED response, so each
+        // step tags itself (see [`SessionResponseFault`]) — the caller must not
+        // have to guess which one failed from an absent transport error.
         let resp: SessionResponse = self
             .route(self.http.post(self.url("/session")))
             .json(&SessionRequest {
@@ -137,12 +171,15 @@ impl Gateway {
             .await?
             .error_for_status()?
             .json()
-            .await?;
-        let sealed = BASE64.decode(&resp.sealed_token_b64).context("sealed token base64")?;
-        let token = handshake::open_token(&keys.session, &sealed).context(
-            "open session token (handshake key mismatch — quote not from the real enclave?)",
-        )?;
-        Ok((String::from_utf8(token).context("session token was not utf-8")?, keys))
+            .await
+            .context(SessionResponseFault::Malformed)?;
+        let sealed = BASE64
+            .decode(&resp.sealed_token_b64)
+            .context(SessionResponseFault::Malformed)?;
+        let token = handshake::open_token(&keys.session, &sealed)
+            .context(SessionResponseFault::TokenWouldNotOpen)?;
+        let token = String::from_utf8(token).context(SessionResponseFault::Malformed)?;
+        Ok((token, keys))
     }
 
     /// Seal `payload` (a refresh token or a static bearer) to the ALREADY-VERIFIED
