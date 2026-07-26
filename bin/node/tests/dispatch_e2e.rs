@@ -65,8 +65,8 @@ const CONVERGE: Duration = Duration::from_secs(180);
 /// budget for one submitted op to finalize and become readable elsewhere.
 const FINALIZE: Duration = Duration::from_secs(60);
 /// budget for a full mention -> execution -> delivery -> reply round trip
-/// (several blocks plus one container start — and, on a cold host, the pull
-/// that fills this daemon's private image store).
+/// (several blocks plus one container start — and, on a cold host, the image
+/// pull, which happens on FIRST RUN, not at daemon boot).
 const ROUND_TRIP: Duration = Duration::from_secs(300);
 
 /// one script-backed provider staged on disk for one node: an operator spec
@@ -208,9 +208,12 @@ fn boot(cluster: &mut Cluster) {
     assert_eq!(genesis[0], genesis[2], "genesis fork between nodes 0 and 2");
     for i in 0..3 {
         cluster.wait_marker(i, "converged root_hash=", CONVERGE);
-        // the daemon starts its private podman service and discovers its
-        // providers before it says this, so the marker also covers the image
-        // store and the provider set being ready to serve.
+        // What this marker covers, exactly: the daemon reached `PodmanService`
+        // + provider discovery. It does NOT cover the image — nothing is pulled
+        // at boot, so an unpullable tag passes here on every node and fails the
+        // run ~20s later. A dead libpod socket does not print it at all and
+        // burns the full budget. Neither is a skip: past `probe()` this suite
+        // has declared the host capable, so an unusable sandbox is a failure.
         cluster.wait_compute_marker(i, "compute daemon serving", CONVERGE);
     }
 }

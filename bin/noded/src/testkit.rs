@@ -79,10 +79,13 @@ impl InProcDaemon {
 
         // the readiness event, same contract as `bin/noded`'s daemon: genesis
         // runs on the actor thread and publishes the boot snapshot, and only
-        // THEN does the listener bind. Serving first would let `await_ready`
-        // (and any harness probing `/v1/status` for "up") take a 200 carrying
-        // `NodeStatus::default()` — version "", no modules, height 0 — as the
-        // node's real state, while genesis is still running behind it.
+        // THEN does anything SERVE. The listener is bound above (that is a
+        // socket, not a service — an unaccepted connect just sits in the
+        // backlog), but `crate::serve` is not spawned until this channel has
+        // fired. Serving first would let `await_ready` — and any harness probing
+        // `/v1/status` for "up" — take a 200 carrying `NodeStatus::default()`
+        // (version "", no modules, height 0) as the node's real state while
+        // genesis is still running behind it.
         let (booted_tx, booted_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let actor = std::thread::Builder::new()
             .name("inproc-actor".into())
@@ -128,14 +131,30 @@ impl InProcDaemon {
 
     /// Block until the server thread's runtime is actually accepting.
     ///
-    /// The LISTENER is already bound before this runs (see [`Self::start`]), so
-    /// this can no longer adopt a stranger: any answer on this port comes from
-    /// the socket this harness owns. What it still waits for is the runtime
-    /// spinning up behind it — a connect lands in the backlog immediately, but
-    /// the response does not come back until `serve` is polling.
+    /// Liveness FIRST, then the probe — the same order `bin/simnode`'s harness
+    /// needed, and for the same reason. Binding in [`Self::start`] means a
+    /// stranger cannot answer *while we hold the socket*, but that is not
+    /// unconditional: if the server thread dies (its runtime fails to build, or
+    /// `serve` panics) the listener drops with it, the port frees, and this loop
+    /// would keep polling it for the remaining 30s — long enough for another
+    /// harness to bind it and answer 200, which this would report as our node
+    /// being ready. Asking `JoinHandle::is_finished()` first makes a dead server
+    /// a named failure instead.
+    ///
+    /// What remains a genuine wait is the runtime spinning up: a connect lands
+    /// in the backlog immediately, but no response comes back until `serve` is
+    /// polling.
     fn await_ready(&self) {
         let deadline = Instant::now() + Duration::from_secs(30);
+        let server = self.server.as_ref().expect("the server thread is running");
         loop {
+            assert!(
+                !server.is_finished(),
+                "the in-proc server thread exited before answering /v1/status on \
+                 port {}; its listener is gone, so anything answering that port \
+                 now belongs to someone else",
+                self.port
+            );
             if nettest::http_status(self.port, "GET", "/v1/status") == Some(200) {
                 return;
             }

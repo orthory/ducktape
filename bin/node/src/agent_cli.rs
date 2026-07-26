@@ -437,8 +437,8 @@ fn submit(base: &str, target: &str, payload: serde_json::Value) -> AgentResult {
     Ok(())
 }
 
-/// A fresh 16-byte run nonce, hex — the dispatch id `run-output:<id>` keys on.
-/// A fresh dispatch id: 32 random bytes as 64 hex chars.
+/// A fresh dispatch id: 32 random bytes as 64 hex chars — what
+/// `run-output:<id>` keys on.
 ///
 /// The WIDTH is a wire contract, not a taste call. A run's live output reaches
 /// the node's ring through the ws `run_output` frame, whose admission gate
