@@ -55,7 +55,7 @@ view
             box w=fill h=1.0 bg=separator
               space w=1.0 h=1.0
             box w=fill pl=12.0 pr=12.0 pt=11.0 pb=6.0
-              button label="Search everything" w=fill h=31.0 p=0.0 @ghost_action -> toggle_palette
+              button label="Search everything" w=fill h=31.0 p=0.0 @icon_action -> toggle_palette
                 box w=fill h=fill pl=10.0 pr=10.0 align-y=center
                   row w=fill gap=7.0 align=center
                     Icon name="search" tone="hint" px=13.0
@@ -69,14 +69,13 @@ view
                 space w=fill
                 text len(channels) size=10.5 wrap=none font=code_medium @text-label
                 if !channel_create_open
-                  button label="New channel" disabled=(loading || mutation_phase != "idle" || !connected) w=18.0 h=18.0 p=0.0 @ghost_action -> toggle_channel_create
-                    box w=fill h=fill align-x=center align-y=center
-                      Icon name="plus" tone="label" px=13.0
+                  button label="New channel" disabled=(loading || mutation_phase != "idle" || !connected) p=0.0 @icon_action -> toggle_channel_create
+                    Icon name="plus" tone="label" px=16.0
                     active bg=transparent text=muted border=transparent border-w=1.0 r=5.0
                     hovered bg=separator text=fg
                     pressed bg=subtle text=fg
                 if channel_create_open
-                  button label="Close new channel" disabled=(loading || mutation_phase != "idle") w=18.0 h=18.0 p=0.0 @ghost_action -> toggle_channel_create
+                  button label="Close new channel" disabled=(loading || mutation_phase != "idle") w=18.0 h=18.0 p=0.0 @icon_action -> toggle_channel_create
                     box w=fill h=fill align-x=center align-y=center
                       text "×" size=13.0 wrap=none @text-muted
                     active bg=separator text=muted border=transparent border-w=1.0 r=5.0
@@ -89,9 +88,8 @@ view
                     active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
                     hovered bg=muted_bg border=control_line
                     disabled bg=muted_bg/54 value=muted
-                  button label="Create channel" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(channel_draft))) w=28.0 h=28.0 p=0.0 @primary_action -> create_channel_submit
-                    box w=fill h=fill align-x=center align-y=center
-                      Icon name="plus" tone="paper" px=14.0
+                  button label="Create channel" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(channel_draft))) p=6.0 @primary_action -> create_channel_submit
+                    Icon name="plus" tone="paper" px=15.0
                 button label="Members-only posting" w=fill h=24.0 p=4.0 @ghost_action -> toggle_channel_create_members_only
                   row w=fill h=fill gap=6.0 align=center
                     if channel_create_members_only
@@ -144,13 +142,13 @@ view
                         hovered bg=muted_bg border=control_line
                         disabled bg=transparent value=muted
                       if !empty(chat_search_hits)
-                        button label="Clear message search" w=27.0 h=25.0 p=0.0 @ghost_action -> clear_chat_search
+                        button label="Clear message search" w=27.0 h=25.0 p=0.0 @icon_action -> clear_chat_search
                           box w=fill h=fill align-x=center align-y=center
                             text "×" size=13.0 wrap=none @text-muted
                           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                           hovered bg=elevated text=fg
                           pressed bg=subtle text=fg
-                      button label="Channel details" w=27.0 h=25.0 p=0.0 @ghost_action -> toggle_channel_settings
+                      button label="Channel details" w=27.0 h=25.0 p=0.0 @icon_action -> toggle_channel_settings
                         box w=fill h=fill align-x=center align-y=center
                           text "⋯" size=14.0 wrap=none @text-muted
                         active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
@@ -284,7 +282,7 @@ view
                                     hovered bg=fg/4 border=fg/8
                                     disabled value=muted
                                   button "Save" label="Save message changes" disabled=(mutation_phase != "idle" || empty(trim(message_edit_draft))) h=28.0 p=6.0 @primary_action -> edit_message_submit
-                                  button label="Cancel message edit" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @secondary_action -> clear_message_selection
+                                  button label="Cancel message edit" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @icon_action -> clear_message_selection
                                     box w=fill h=fill align-x=center align-y=center
                                       text "×" size=14.0
                                     active bg=transparent text=muted r=7.0
@@ -310,7 +308,7 @@ view
                       active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
                       hovered bg=fg/14
                       pressed bg=fg/18
-                    button label="Dismiss unsent message" w=28.0 h=28.0 p=0.0 @ghost_action -> dismiss_failed_message
+                    button label="Dismiss unsent message" w=28.0 h=28.0 p=0.0 @icon_action -> dismiss_failed_message
                       box w=fill h=fill align-x=center align-y=center
                         text "×" size=14.0
                       active bg=transparent text=muted r=7.0
@@ -335,7 +333,7 @@ view
                 col w=fill h=fill gap=8.0
                   row w=fill h=28.0 gap=6.0 align=center
                     text "Channel details" w=fill size=14.0 font=display @text-fg
-                    button label="Close channel details" w=28.0 h=28.0 p=0.0 @secondary_action -> toggle_channel_settings
+                    button label="Close channel details" w=28.0 h=28.0 p=0.0 @icon_action -> toggle_channel_settings
                       box w=fill h=fill align-x=center align-y=center
                         text "×" size=14.0
                       active bg=transparent text=muted r=7.0
@@ -392,7 +390,7 @@ view
                           if thread_target_seq > 0
                             text "Thread result" w=fill size=14.0 font=display @text-fg
                           text len(thread_messages) size=12.0 font=code @text-muted
-                          button label="Close thread" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @secondary_action -> close_thread
+                          button label="Close thread" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @icon_action -> close_thread
                             box w=fill h=fill align-x=center align-y=center
                               text "×" size=14.0
                             active bg=transparent text=muted r=7.0
@@ -505,7 +503,7 @@ view
                                   hovered bg=fg/4 border=fg/8
                                   disabled value=muted
                                 button "Save" label="Save message changes" disabled=(mutation_phase != "idle" || empty(trim(thread_edit_draft))) h=28.0 p=6.0 @primary_action -> edit_thread_message_submit
-                                button label="Cancel message edit" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @secondary_action -> clear_thread_message_selection
+                                button label="Cancel message edit" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @icon_action -> clear_thread_message_selection
                                   box w=fill h=fill align-x=center align-y=center
                                     text "×" size=14.0
                                   active bg=transparent text=muted r=7.0
@@ -534,14 +532,13 @@ view
                 text len(pages) size=10.5 wrap=none font=code_medium @text-hint
                 space w=fill
                 if !page_create_open
-                  button label="New page" disabled=(loading || mutation_phase != "idle" || !connected) w=18.0 h=18.0 p=0.0 @ghost_action -> toggle_page_create
-                    box w=fill h=fill align-x=center align-y=center
-                      Icon name="plus" tone="label" px=13.0
+                  button label="New page" disabled=(loading || mutation_phase != "idle" || !connected) p=0.0 @icon_action -> toggle_page_create
+                    Icon name="plus" tone="label" px=16.0
                     active bg=transparent text=muted border=transparent border-w=1.0 r=5.0
                     hovered bg=separator text=fg
                     pressed bg=subtle text=fg
                 if page_create_open
-                  button label="Close new page" disabled=(loading || mutation_phase != "idle") w=18.0 h=18.0 p=0.0 @ghost_action -> toggle_page_create
+                  button label="Close new page" disabled=(loading || mutation_phase != "idle") w=18.0 h=18.0 p=0.0 @icon_action -> toggle_page_create
                     box w=fill h=fill align-x=center align-y=center
                       text "×" size=13.0 wrap=none @text-muted
                     active bg=separator text=muted border=transparent border-w=1.0 r=5.0
@@ -555,7 +552,7 @@ view
                   active bg=muted_bg border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
                   hovered bg=elevated border=fg/21
                   disabled bg=muted_bg/54 value=muted
-                button label="Create page" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(page_draft))) w=28.0 h=28.0 p=0.0 @primary_action -> create_page_submit
+                button label="Create page" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(page_draft))) w=28.0 h=28.0 p=0.0 @icon_action -> create_page_submit
                   box w=fill h=fill align-x=center align-y=center
                     text "+" size=14.0
             scroll dir=vertical w=fill h=fill
@@ -581,7 +578,7 @@ view
                           active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                           hovered bg=fg/5 text=fg
                           pressed bg=fg/8
-                        button "×" label="Close page tab" w=20.0 h=20.0 p=0.0 @secondary_action -> close_doc_tab(tab.id)
+                        button "×" label="Close page tab" w=20.0 h=20.0 p=0.0 @icon_action -> close_doc_tab(tab.id)
                           active bg=transparent text=muted r=6.0
                           hovered bg=fg/8 text=fg
                           pressed bg=fg/12
@@ -606,14 +603,14 @@ view
                           hovered bg=fg/5 border=fg/8
                           disabled value=muted
                         if !empty(page_search_hits)
-                          button label="Clear page search" w=28.0 h=28.0 p=0.0 @ghost_action -> clear_page_search
+                          button label="Clear page search" w=28.0 h=28.0 p=0.0 @icon_action -> clear_page_search
                             box w=fill h=fill align-x=center align-y=center
                               text "×" size=14.0
                             active bg=transparent text=muted r=7.0
                             hovered bg=fg/10 text=fg
                             pressed bg=fg/15
                         if !page_delete_armed
-                          button label="Page menu" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @ghost_action -> arm_page_delete
+                          button label="Page menu" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @icon_action -> arm_page_delete
                             box w=fill h=fill align-x=center align-y=center
                               text "•••" size=13.0
                             active bg=transparent text=muted r=7.0
@@ -787,7 +784,7 @@ view
           space w=1.0 h=1.0
         col w=fill h=fill p=18.0 gap=11.0
           row w=fill h=28.0 gap=8.0 align=center
-            button "↑" label="Parent directory" disabled=(fs_loading || empty(fs_path)) w=26.0 h=26.0 p=0.0 @ghost_action -> fs_open_parent
+            button "↑" label="Parent directory" disabled=(fs_loading || empty(fs_path)) w=26.0 h=26.0 p=0.0 @icon_action -> fs_open_parent
               active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=7.0
               hovered bg=fg/10 text=fg
               pressed bg=fg/14
@@ -1311,7 +1308,7 @@ view
     bell:
       stack w=fill h=fill
         if bell_open
-          button label="Close notifications" w=fill h=fill p=0.0 @secondary_action -> close_bell
+          button label="Close notifications" w=fill h=fill p=0.0 @icon_action -> close_bell
             space w=fill h=fill
             active bg=transparent border=transparent
         if bell_open

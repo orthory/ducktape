@@ -4,7 +4,7 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
   box w=fill pl=8.0 pr=8.0
     col w=fill
       if selected
-        button label=channel.name w=fill p=0.0 @ghost_action -> choose_channel(channel.id)
+        button label=channel.name w=fill p=0.0 @icon_action -> choose_channel(channel.id)
           box w=fill pl=10.0 pr=10.0 pt=7.0 pb=7.0
             row w=fill gap=7.0 align=center
               if channel.members_only
@@ -21,7 +21,7 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
           hovered bg=subtle text=fg
           pressed bg=rail_hover text=fg
       if !selected
-        button label=channel.name w=fill p=0.0 @ghost_action -> choose_channel(channel.id)
+        button label=channel.name w=fill p=0.0 @icon_action -> choose_channel(channel.id)
           box w=fill pl=10.0 pr=10.0 pt=7.0 pb=7.0
             row w=fill gap=7.0 align=center
               if channel.members_only
@@ -120,7 +120,7 @@ component MessageContents(message:ChatMessage)
       if message.reply_count > 0 || !empty(message.reactions)
         row w=fill gap=6.0 align=center
           if message.reply_count > 0
-            button label="Open thread" p=0.0 @ghost_action -> open_thread_for(message.seq)
+            button label="Open thread" p=0.0 @icon_action -> open_thread_for(message.seq)
               box pl=7.0 pr=9.0 pt=3.0 pb=3.0
                 row gap=6.0 align=center
                   Icon name="nav-chat" tone="accent" px=12.0
@@ -131,7 +131,7 @@ component MessageContents(message:ChatMessage)
               pressed bg=elevated text=brand
           for reaction in message.reactions
             if reaction.reacted_by_me
-              button label="Remove reaction" description=reaction.emoji p=0.0 @ghost_action -> remove_reaction_at(message.seq, reaction.emoji)
+              button label="Remove reaction" description=reaction.emoji p=0.0 @icon_action -> remove_reaction_at(message.seq, reaction.emoji)
                 box pl=6.0 pr=8.0 pt=1.0 pb=1.0
                   row gap=4.0 align=center
                     text reaction.emoji size=11.0 wrap=none font=code_medium @text-fg
@@ -140,7 +140,7 @@ component MessageContents(message:ChatMessage)
                 hovered bg=brand_bg text=brand border=brand
                 pressed bg=elevated text=brand border=brand
             if !reaction.reacted_by_me
-              button label="Add reaction" description=reaction.emoji p=0.0 @ghost_action -> add_reaction_at(message.seq, reaction.emoji)
+              button label="Add reaction" description=reaction.emoji p=0.0 @icon_action -> add_reaction_at(message.seq, reaction.emoji)
                 box pl=6.0 pr=8.0 pt=1.0 pb=1.0
                   row gap=4.0 align=center
                     text reaction.emoji size=11.0 wrap=none font=code_medium @text-fg
@@ -178,15 +178,13 @@ component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled
                 active bg=transparent text=muted r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
-              button label="Open thread" disabled=disabled w=27.0 h=25.0 p=0.0 @ghost_action -> open_thread_for(message.seq)
-                box w=fill h=fill align-x=center align-y=center
-                  Icon name="nav-chat" tone="muted" px=15.0
+              button label="Open thread" disabled=disabled p=5.0 @icon_action -> open_thread_for(message.seq)
+                Icon name="nav-chat" tone="muted" px=15.0
                 active bg=transparent text=muted r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
-              button label="Inspect event" disabled=disabled w=27.0 h=25.0 p=0.0 @ghost_action -> open_message_actions(message.seq, message.body, message.rev)
-                box w=fill h=fill align-x=center align-y=center
-                  Icon name="shield" tone="muted" px=15.0
+              button label="Inspect event" disabled=disabled p=5.0 @icon_action -> open_message_actions(message.seq, message.body, message.rev)
+                Icon name="shield" tone="muted" px=15.0
                 active bg=transparent text=muted r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
@@ -208,7 +206,7 @@ component ThreadMessageBody(message:ChatMessage)
         row w=fill gap=5.0 align=center
           for reaction in message.reactions
             if reaction.reacted_by_me
-              button label="Remove reaction" description=reaction.emoji p=0.0 @ghost_action -> remove_reaction_at(message.seq, reaction.emoji)
+              button label="Remove reaction" description=reaction.emoji p=0.0 @icon_action -> remove_reaction_at(message.seq, reaction.emoji)
                 box pl=6.0 pr=8.0 pt=1.0 pb=1.0
                   row gap=4.0 align=center
                     text reaction.emoji size=11.0 wrap=none font=code_medium @text-fg
@@ -217,7 +215,7 @@ component ThreadMessageBody(message:ChatMessage)
                 hovered bg=brand_bg text=brand border=brand
                 pressed bg=elevated text=brand border=brand
             if !reaction.reacted_by_me
-              button label="Add reaction" description=reaction.emoji p=0.0 @ghost_action -> add_reaction_at(message.seq, reaction.emoji)
+              button label="Add reaction" description=reaction.emoji p=0.0 @icon_action -> add_reaction_at(message.seq, reaction.emoji)
                 box pl=6.0 pr=8.0 pt=1.0 pb=1.0
                   row gap=4.0 align=center
                     text reaction.emoji size=11.0 wrap=none font=code_medium @text-fg

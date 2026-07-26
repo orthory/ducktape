@@ -157,13 +157,13 @@ component DocumentBlock(block:PageBlock, selected:bool, hovered:bool, disabled:b
               text block.prefix size=12.0 wrap=none font=code
             box w=56.0 h=28.0 bg=surface border=border border-w=1.0 r=7.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
               row w=fill gap=0.0 align=center
-                button label="Insert block below" disabled=disabled w=28.0 h=28.0 p=0.0 @ghost_action -> open_block_insert(block.key, block.id)
+                button label="Insert block below" disabled=disabled w=28.0 h=28.0 p=0.0 @icon_action -> open_block_insert(block.key, block.id)
                   box w=fill h=fill align-x=center align-y=center
                     text "+" size=14.0 font=medium
                   active bg=transparent text=muted r=5.0
                   hovered bg=fg/8 text=fg
                   pressed bg=fg/12 text=fg
-                button label="Block actions" disabled=disabled w=28.0 h=28.0 p=0.0 @ghost_action -> select_block(block.key, block.id, block.kind, block.text, block.checked, true)
+                button label="Block actions" disabled=disabled w=28.0 h=28.0 p=0.0 @icon_action -> select_block(block.key, block.id, block.kind, block.text, block.checked, true)
                   box w=fill h=fill align-x=center align-y=center
                     text "⋮⋮" size=13.0 font=medium
                   active bg=transparent text=muted r=5.0

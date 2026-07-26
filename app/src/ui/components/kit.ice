@@ -109,34 +109,37 @@ component RoleMarker(role:str)
         box px=7.0 py=3.0 bg=warning_bg border=warning_line border-w=1.0 r=5.0
           text role size=9.0 wrap=none font=code_semibold @text-warning
 
-// An agent registry card: who owns it, what it may do, and whether it is live.
+// An agent registry row: who it is, what capability it holds, who owns it, and
+// whether it is live. The artifact lists agents — it does not card them.
 component AgentCard(agent:AgentRow)
-  box #root w=fill p=15.0 bg=surface border=card_line border-w=1.0 r=11.0
-    col w=fill gap=9.0
-      row w=fill gap=10.0 align=center
-        AgentAvatar initials=initial_of(agent.name) plate=32.0 ink=10.0
-        col w=fill gap=2.0
-          text agent.name size=13.5 wrap=none font=display @text-fg
-          text agent.id size=10.0 wrap=none font=code_semibold @text-hint
-        if agent.status == "active"
-          Badge.Success label="active"
-        if agent.status != "active"
-          Badge.Warning label=agent.status
-      box w=fill h=1.0 bg=elevated
-        space w=1.0 h=1.0
-      row w=fill gap=13.0 align=start
-        col gap=3.0
-          text "CAPABILITY" size=9.0 wrap=none font=code_semibold @text-label
-          text agent.capability size=12.0 wrap=none font=code_medium @text-secondary_fg
-        col gap=3.0
-          text "OWNER" size=9.0 wrap=none font=code_semibold @text-label
-          text agent.owner size=12.0 wrap=none font=code_medium @text-secondary_fg
+  col #root w=fill
+    box w=fill pl=14.0 pr=14.0 pt=13.0 pb=13.0
+      row w=fill gap=13.0 align=center
+        AgentAvatar initials=initial_of(agent.name) plate=34.0 ink=11.0
         col w=fill gap=3.0
-          text "ALLOWED ACTIONS" size=9.0 wrap=none font=code_semibold @text-label
-          if empty(agent.actions)
-            text "none granted" size=12.5 @text-meta
+          row w=fill gap=8.0 align=center
+            text agent.name size=13.5 wrap=none font=display @text-fg
+            box px=7.0 py=2.0 bg=elevated r=5.0
+              text agent.capability size=10.0 wrap=none font=code_semibold @text-secondary_fg
           if !empty(agent.actions)
-            text agent.actions w=fill size=12.0 font=code_medium @text-secondary_fg
+            text agent.actions w=fill size=10.5 wrap=none font=code_medium @text-meta
+          if empty(agent.actions)
+            text "no actions granted" size=10.5 wrap=none font=code_medium @text-meta
+        text agent.owner size=10.5 wrap=none font=code_medium @text-hint
+        if agent.status == "active"
+          box px=8.0 py=3.0 bg=success_bg border=success_line border-w=1.0 r=6.0
+            row gap=5.0 align=center
+              box w=5.0 h=5.0 bg=success_dot r=2.5
+                space w=1.0 h=1.0
+              text "ACTIVE" size=9.0 wrap=none font=code_semibold @text-success
+        if agent.status != "active"
+          box px=8.0 py=3.0 bg=warning_bg border=warning_line border-w=1.0 r=6.0
+            row gap=5.0 align=center
+              box w=5.0 h=5.0 bg=warning_dot r=2.5
+                space w=1.0 h=1.0
+              text agent.status size=9.0 wrap=none font=code_semibold @text-warning
+    box w=fill h=1.0 bg=muted_bg
+      space w=1.0 h=1.0
 
 // An open proposal: what it does, who opened it, and how close the electorate
 // is to settling it. The dots are the tally — the number is the confirmation.

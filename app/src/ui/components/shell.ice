@@ -45,13 +45,12 @@ component TitleBar(network:str, status:str, height:i64, loading:bool, degraded:b
           hovered bg=surface text=fg border=border
           pressed bg=subtle
         stack w=26.0 h=24.0
-          button label="Alerts" w=26.0 h=24.0 p=0.0 @ghost_action -> toggle_bell
-            box w=fill h=fill align-x=center align-y=center
-              col align=center
-                if bell_badge > 0
-                  Icon name="bell" tone="strong-ink" px=15.0
-                if bell_badge <= 0
-                  Icon name="bell" tone="label" px=15.0
+          button label="Alerts" p=5.0 @icon_action -> toggle_bell
+            col align=center
+              if bell_badge > 0
+                Icon name="bell" tone="strong-ink" px=15.0
+              if bell_badge <= 0
+                Icon name="bell" tone="label" px=15.0
             active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
             hovered bg=surface text=fg border=transparent
             pressed bg=subtle
@@ -75,7 +74,7 @@ component ConnectionBanner(status:str)
 component RailButton(item:NavItem)
   stack #root w=58.0
     if item.active
-      button label=item.title w=58.0 p=0.0 @ghost_action -> select_shell_tab(item.id)
+      button label=item.title w=58.0 p=0.0 @icon_action -> select_shell_tab(item.id)
         col w=fill py=4.0 gap=4.0 align=center
           Icon name=item.icon tone="ink" px=19.0
           text item.title size=9.5 wrap=none font=display @text-strong_ink
@@ -83,7 +82,7 @@ component RailButton(item:NavItem)
         hovered bg=rail_hover text=fg
         pressed bg=subtle text=fg
     if !item.active
-      button label=item.title w=58.0 p=0.0 @ghost_action -> select_shell_tab(item.id)
+      button label=item.title w=58.0 p=0.0 @icon_action -> select_shell_tab(item.id)
         col w=fill py=4.0 gap=4.0 align=center
           Icon name=item.icon tone="idle" px=19.0
           text item.title size=9.5 wrap=none font=display @text-caption
@@ -106,23 +105,20 @@ component NavRail(tab:str, approvals:i64, account:str)
               RailButton item=item
         space w=1.0 h=6.0
         if tab == "settings"
-          button label="Settings" w=34.0 h=34.0 p=0.0 @ghost_action -> select_shell_tab("settings")
-            box w=fill h=fill align-x=center align-y=center
-              Icon name="gear" tone="ink" px=18.0
+          button label="Settings" p=8.0 @icon_action -> select_shell_tab("settings")
+            Icon name="gear" tone="ink" px=18.0
             active bg=subtle text=fg border=transparent border-w=1.0 r=9.0
             hovered bg=rail_hover text=fg
             pressed bg=subtle text=fg
         if tab != "settings"
-          button label="Settings" w=34.0 h=34.0 p=0.0 @ghost_action -> select_shell_tab("settings")
-            box w=fill h=fill align-x=center align-y=center
-              Icon name="gear" tone="idle" px=18.0
+          button label="Settings" p=8.0 @icon_action -> select_shell_tab("settings")
+            Icon name="gear" tone="idle" px=18.0
             active bg=transparent text=muted border=transparent border-w=1.0 r=9.0
             hovered bg=rail_hover text=fg
             pressed bg=subtle text=fg
         space w=1.0 h=6.0
-        button label="Account" w=28.0 h=28.0 p=0.0 @ghost_action -> select_shell_tab("settings")
-          box w=fill h=fill align-x=center align-y=center
-            PersonAvatar initials=initial_of(account) plate=28.0 ink=10.0
+        button label="Account" p=0.0 @icon_action -> select_shell_tab("settings")
+          PersonAvatar initials=initial_of(account) plate=28.0 ink=10.0
           active bg=transparent text=muted border=transparent border-w=1.0 r=14.0
           hovered bg=subtle text=fg
           pressed bg=rail_hover text=fg

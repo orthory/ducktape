@@ -81,3 +81,6 @@ recipe ghost_action for button
 
 recipe danger_action for button
   @px-16px py-11px bg-danger text-danger_fg rounded-9px hover:bg-danger/90 pressed:bg-danger/80 disabled:opacity-50
+
+recipe icon_action for button
+  @p-0px bg-transparent text-fg rounded-7px hover:bg-accent pressed:bg-border disabled:opacity-50

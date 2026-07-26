@@ -824,7 +824,10 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(toolbar.contains("-> open_message_actions_accessibly("));
         assert!(!toolbar.contains("hovered || selected"));
         assert_eq!(toolbar.matches("w=26.0 h=26.0").count(), 1);
-        assert_eq!(toolbar.matches("w=27.0 h=25.0").count(), 4);
+        assert_eq!(toolbar.matches("w=27.0 h=25.0").count(), 2);
+        // the two glyph buttons take the icon as a direct child; a `h=fill` wrapper
+        // inside a fixed-size button collapses an SVG to a hairline.
+        assert_eq!(toolbar.matches("p=5.0 @icon_action").count(), 2);
         assert!(components.contains(
             "text message.author size=13.0 wrap=none font=display @text-fg\n          if message.avatar_kind == \"agent\""
         ));
@@ -850,7 +853,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             assert!(toolbar.contains(&format!("label=\"{label}\"")));
         }
         assert!(components.contains(
-            "button label=\"Open thread\" p=0.0 @ghost_action -> open_thread_for(message.seq)"
+            "button label=\"Open thread\" p=0.0 @icon_action -> open_thread_for(message.seq)"
         ));
 
         let view = include_str!("ui/view.ice");
