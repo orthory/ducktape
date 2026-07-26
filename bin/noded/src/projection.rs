@@ -115,16 +115,6 @@ pub fn project_block(
                 latency_us = latency_us.saturating_add(op.latency_us);
                 dispatches.extend(op.dispatches.iter().cloned());
             }
-            // the envelope's released continuation: its dispatches join the
-            // block's op stream right after its parent's (the host's event
-            // order), INDEPENDENT of the parent's disposition — a rejected
-            // parent still releases, and an applied continuation is real work.
-            if let Some(cont) = frame.op.as_ref().and_then(|op| op.continuation.as_ref())
-                && cont.disposition == node::Disposition::Applied
-            {
-                applied = true;
-                dispatches.extend(cont.dispatches.iter().cloned());
-            }
             if let Some(op) = &frame.op
                 && op.target != NOP_TARGET
             {
@@ -151,29 +141,6 @@ pub fn project_block(
                     &op.dispatches,
                     disposition,
                 ));
-                // the continuation is its own row, right after its parent:
-                // `Origin::Module(parent_target)` is the sending lane, and its
-                // own disposition — not the parent's — is the row's.
-                if let Some(cont) = &op.continuation {
-                    let cont_disposition = match cont.disposition {
-                        node::Disposition::Applied => {
-                            applied_ops += 1;
-                            BlockDisposition::Applied
-                        }
-                        _ => {
-                            rejected_ops += 1;
-                            BlockDisposition::Rejected
-                        }
-                    };
-                    ops.push(project_root_op(
-                        blobs,
-                        &Origin::Module(op.target.clone()),
-                        &cont.target,
-                        &cont.payload,
-                        &cont.dispatches,
-                        cont_disposition,
-                    ));
-                }
             }
         }
         if let Some(system) = system_dispatches.remove(&height) {
@@ -266,28 +233,13 @@ mod tests {
         }
     }
 
-    fn cont(
-        target: &str,
-        payload: &[u8],
-        disposition: node::Disposition,
-        dispatches: Vec<host::DispatchRecord>,
-    ) -> node::DrainedContinuation {
-        node::DrainedContinuation {
-            target: target.into(),
-            payload: payload.to_vec(),
-            disposition,
-            dispatches,
-            reason: None,
-        }
-    }
-
     /// GOLDEN: the exact `block_row` bytes this seam produces, captured from the
     /// pre-extraction validator path (`bin/node`'s `block_actions`). Any change
     /// to the projection that shifts these bytes is a wire change to
     /// `GET /v1/blocks` and must be treated as one. Covers: applied member,
-    /// rejected member, System dispatch fold, multi-member block, envelope
-    /// continuation row ordering, and the two empty-batch-no-row shapes
-    /// (nop-only + System dispatch, and discarded-only).
+    /// rejected member, System dispatch fold, multi-member block, and the two
+    /// empty-batch-no-row shapes (nop-only + System dispatch, and
+    /// discarded-only).
     #[test]
     fn project_block_row_bytes_are_golden() {
         let blobs = BlobHandle::default();
@@ -307,7 +259,6 @@ mod tests {
                     payload: b"hello world".to_vec(),
                     dispatches: vec![member.clone()],
                     latency_us: 11,
-                    continuation: None,
                 }),
             ),
             drained(
@@ -321,11 +272,9 @@ mod tests {
                     payload: b"nope".to_vec(),
                     dispatches: Vec::new(),
                     latency_us: 99,
-                    continuation: None,
                 }),
             ),
-            // applied member carrying an applied continuation (an envelope): the
-            // continuation is its own row, right after its parent.
+            // a second applied member, at its own height.
             drained(
                 4,
                 8,
@@ -337,12 +286,6 @@ mod tests {
                     payload: b"parent".to_vec(),
                     dispatches: vec![member.clone()],
                     latency_us: 3,
-                    continuation: Some(cont(
-                        "pages",
-                        b"child",
-                        node::Disposition::Applied,
-                        vec![dispatch("pages", b"cont")],
-                    )),
                 }),
             ),
             // empty-batch-no-row: a nop-only height that still folds a System
@@ -358,7 +301,6 @@ mod tests {
                     payload: Vec::new(),
                     dispatches: Vec::new(),
                     latency_us: 0,
-                    continuation: None,
                 }),
             ),
             // discarded-only height: no row either.
@@ -387,7 +329,7 @@ mod tests {
             rows,
             vec![
                 (7, Some(r#"{"height":7,"hash":"0101010101010101010101010101010101010101010101010101010101010101","commit_hash":"0909090909090909090909090909090909090909090909090909090909090909","ops":[{"proposer":"010203","disposition":"applied","target":"chat","operations":[{"module":"chat","origin":"module:source","emitted_msgs":0,"emitted_events":0}],"payload":"hello world","op_hash":"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"},{"proposer":"040506","disposition":"rejected","target":"chat","operations":[],"payload":"nope","op_hash":"ca3704aa0b06f5954c79ee837faa152d84d6b2d42838f0637a15eda8337dbdce"}]}"#.to_string())),
-                (8, Some(r#"{"height":8,"hash":"0404040404040404040404040404040404040404040404040404040404040404","commit_hash":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","ops":[{"proposer":"07","disposition":"applied","target":"tasks","operations":[{"module":"chat","origin":"module:source","emitted_msgs":0,"emitted_events":0}],"payload":"parent","op_hash":"e47125968b3b71049fbc4802d1e40a71ea1359decfabacf70b34588037d4ff0c"},{"proposer":"module:tasks","disposition":"applied","target":"pages","operations":[{"module":"pages","origin":"module:source","emitted_msgs":0,"emitted_events":0}],"payload":"child","op_hash":"ddc9e669194254cef019a29d3619a2c16592e5d52e1a81e98b01bd52319149a3"}]}"#.to_string())),
+                (8, Some(r#"{"height":8,"hash":"0404040404040404040404040404040404040404040404040404040404040404","commit_hash":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","ops":[{"proposer":"07","disposition":"applied","target":"tasks","operations":[{"module":"chat","origin":"module:source","emitted_msgs":0,"emitted_events":0}],"payload":"parent","op_hash":"e47125968b3b71049fbc4802d1e40a71ea1359decfabacf70b34588037d4ff0c"}]}"#.to_string())),
                 (9, None),
                 (10, None),
             ]
@@ -396,11 +338,17 @@ mod tests {
         // the non-row facts the role loops fold: the System dispatch rides the
         // block's dispatch stream after the members; the nop-only height (9)
         // still carries its System dispatch; discarded (10) carries nothing.
-        assert_eq!(projections[0].dispatches, vec![member.clone(), system.clone()]);
-        assert_eq!((projections[0].applied_ops, projections[0].rejected_ops), (1, 1));
+        assert_eq!(
+            projections[0].dispatches,
+            vec![member.clone(), system.clone()]
+        );
+        assert_eq!(
+            (projections[0].applied_ops, projections[0].rejected_ops),
+            (1, 1)
+        );
         assert!(projections[0].applied);
         assert_eq!(projections[0].latency_us, 11);
-        assert_eq!(projections[1].dispatches, vec![member.clone(), dispatch("pages", b"cont")]);
+        assert_eq!(projections[1].dispatches, vec![member.clone()]);
         assert_eq!(projections[2].dispatches, vec![system]);
         assert!(!projections[2].applied);
         assert!(projections[3].dispatches.is_empty());

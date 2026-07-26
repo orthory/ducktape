@@ -120,24 +120,10 @@ pub struct Msg {
     pub payload: Vec<u8>,
 }
 
-/// hard cap on one envelope continuation's payload — a continuation is
-/// control-plane reentry, not a data lane (bulk bytes ride the parent op or
-/// the blob lanes), and deferred continuations commit this payload into
-/// registry state, so the cap bounds consensus state too. matches saga's
-/// `MAX_REPLY_PAYLOAD_BYTES` class.
-pub const MAX_CONTINUATION_BYTES: usize = 64 * 1024;
-
-/// hard cap on an op's declared output ([`Ctx::set_output`]) — the bytes a
-/// continuation's relay carries on the `Ok` arm. matches saga's
+/// hard cap on an op's declared output ([`Ctx::set_output`]) — matches saga's
 /// `MAX_RESULT_BYTES` class; an oversized output is a deterministic rejection
 /// of the op, never a truncation.
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-
-/// hard cap on the relay's `Err` string — a parent rejection reason that
-/// rides into a consensus op via the continuation lane. matches saga's
-/// `MAX_ERROR_BYTES`; over-cap reasons are truncated on a char boundary
-/// (identically on every node).
-pub const MAX_RELAY_ERROR_BYTES: usize = 16 * 1024;
 
 /// hard cap on a dispatch's assigned stamp ([`Ctx::set_assigned`]) — the
 /// module-assigned values of one applied op (a sequence, a revision), carried
@@ -145,39 +131,30 @@ pub const MAX_RELAY_ERROR_BYTES: usize = 16 * 1024;
 /// data lane; an oversized stamp is a deterministic rejection of the op.
 pub const MAX_ASSIGNED_BYTES: usize = 4 * 1024;
 
-/// one envelope continuation: the op dispatched after the enclosing
-/// transaction's semantic completion. DEPTH IS EXACTLY 1 BY SHAPE — this body
-/// deliberately has no continuation slot of its own, so nesting is
-/// unrepresentable rather than merely validated; module payloads are opaque
-/// and continuations exist only at the envelope layer, so a payload cannot
-/// smuggle one either. wire-facing surfaces name the field `continue`
-/// (a Rust keyword, hence `continuation` here).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Continuation {
-    pub target: ModuleId,
-    pub payload: Vec<u8>,
-}
-
-/// the relay slot a released continuation's dispatch carries — how the parent
-/// op's identity and outcome reach the continuation target WITHOUT splicing
-/// bytes into the opaque continuation payload. present iff the current
-/// dispatch IS a released continuation.
+/// DEAD SURFACE, awaiting one deletion outside this crate's PR boundary.
+///
+/// This was the relay slot of the ENVELOPE CONTINUATION LANE, which is
+/// deleted: an op frame can no longer carry a `continue` body, so the host
+/// never derives a continuation unit and NOTHING IN THE TREE CONSTRUCTS A
+/// `Relay`. [`Ctx::relay`] is therefore `None` on every dispatch, always.
+///
+/// The lane was a consensus takeover. The host derived the continuation's
+/// dispatch origin as `Origin::Module(parent_op_target)` — an attacker-chosen
+/// string on an attacker-signed frame — so any key with submit standing
+/// reached every `Origin::Module(_)`-gated arm in the tree, valset membership
+/// included. It fired even when the parent op was rejected and even when the
+/// module id did not exist.
+///
+/// This type and [`Ctx::relay`] survive only because
+/// `crates/modules/apps/runs/src/module_impl.rs` forwards `relay()` through a
+/// `Ctx` wrapper, and that file is out of scope here (a `crates/modules/`
+/// diff is a genesis flag day). Delete that forwarder, then delete these two.
+/// `no_continuation_lane.rs` fails the build if a constructor reappears first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Relay {
-    /// the AUTHENTICATED composer of the envelope: the parent frame's verified
-    /// signature origin, carried by the host — never module-supplied bytes.
-    /// the identity a target module MUST authorize against (see
-    /// [`Ctx::author_origin`]); `Origin`-typed for forward-compat with future
-    /// module-authored envelopes.
     pub author: Origin,
-    /// the parent op's target module — the sending LANE of the continuation
-    /// (`Origin::Module(parent_target)`), deliberately distinct from `author`.
     pub parent_target: ModuleId,
-    /// the parent envelope's content id (frame id), for correlation.
     pub parent_frame: [u8; 32],
-    /// the parent's outcome. `Ok`: the parent's declared output (empty unless
-    /// it called [`Ctx::set_output`]). `Err`: the parent's deterministic
-    /// rejection string, or a deferred resolution's error.
     pub outcome: Result<Vec<u8>, String>,
 }
 
@@ -381,19 +358,17 @@ pub trait Ctx {
     /// the host-side worker seam claims off-consensus work from).
     fn emit_event(&mut self, ev: Event);
 
-    /// the relay slot: `Some` iff the current dispatch is a released envelope
-    /// continuation. default `None` — read-only query ctxs and hosts without
-    /// the continuation lane never carry one.
+    /// DEAD SURFACE: always `None`. The envelope continuation lane that
+    /// populated it is deleted (see [`Relay`]), and nothing constructs a
+    /// `Relay`. Kept only for the `runs` forwarder; delete both together.
     fn relay(&self) -> Option<&Relay> {
         None
     }
 
-    /// declare this op's output — the bytes a continuation's relay carries on
-    /// its `Ok` arm. staged with the op (rolled back on rejection); capped at
-    /// [`MAX_OUTPUT_BYTES`], and exceeding the cap is a deterministic
-    /// rejection of the op. last write wins within one dispatch. the default
-    /// discards: a ctx without the continuation lane has no relay to feed,
-    /// and "no output" is the specified default (`Ok(vec![])`).
+    /// declare this op's output. staged with the op (rolled back on
+    /// rejection); capped at [`MAX_OUTPUT_BYTES`], and exceeding the cap is a
+    /// deterministic rejection of the op. last write wins within one dispatch.
+    /// the default discards.
     fn set_output(&mut self, _bytes: Vec<u8>) {}
 
     /// declare this dispatch's assigned stamp — the values the module ASSIGNED
@@ -407,19 +382,6 @@ pub trait Ctx {
     /// rejection of the op. last write wins within one dispatch. the default
     /// discards: read-only query ctxs never record a trace.
     fn set_assigned(&mut self, _bytes: Vec<u8>) {}
-
-    /// the identity to AUTHORIZE against: the relay's author for a
-    /// continuation dispatch, the dispatch origin otherwise — one call,
-    /// correct in both, so no module keys authz on the module-origin LANE of
-    /// a continuation by accident (that would make `continue` privilege
-    /// escalation: any external key could reach module-origin-gated arms by
-    /// bouncing off an innocent parent op).
-    fn author_origin(&self) -> &Origin {
-        match self.relay() {
-            Some(r) => &r.author,
-            None => &self.env().origin,
-        }
-    }
 }
 
 /// the deterministic merkle-KV storage surface a disk-backed module touches —

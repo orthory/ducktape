@@ -726,7 +726,6 @@ fn user_sign_frame(
             target: args.target,
             payload,
         },
-        None,
     );
     Ok(hex_bytes(&frame))
 }
@@ -1542,7 +1541,7 @@ mod userkey_verb_tests {
         )
         .unwrap();
 
-        let (origin, msg, _cont) =
+        let (origin, msg) =
             node::decode_frame(&config::unhex(&frame_hex).unwrap()).expect("frame verifies");
         let signer = ed25519::PrivateKey::decode([7u8; 32].as_slice()).unwrap();
         assert_eq!(

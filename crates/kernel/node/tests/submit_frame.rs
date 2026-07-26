@@ -47,11 +47,14 @@ fn submit_frame_takes_custody_and_keeps_signer_authorship() {
 
         // a frame signed by a key that is NOT this node's submitter.
         let author = sk(7);
-        let frame = node::encode_frame(&author, 0, &set("k", "v"), None);
+        let frame = node::encode_frame(&author, 0, &set("k", "v"));
         let expected_id = node::frame_id(&frame);
 
         let id = node.submit_frame(frame).await.expect("submit_frame");
-        assert_eq!(id, expected_id, "the returned id is the frame's content address");
+        assert_eq!(
+            id, expected_id,
+            "the returned id is the frame's content address"
+        );
 
         // enqueued at submit_frame; flush packs it into a batch, then it drains.
         node.flush_batch().await.expect("flush");
@@ -78,7 +81,7 @@ fn submit_frame_rejects_tampered_bytes_before_custody() {
         let host = Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
         let mut node = OrderedNode::new(host, RoundOrderer::new());
 
-        let mut frame = node::encode_frame(&sk(7), 0, &set("k", "v"), None);
+        let mut frame = node::encode_frame(&sk(7), 0, &set("k", "v"));
         // flip one payload byte: the signature no longer binds.
         let last = frame.len() - 1;
         frame[last] ^= 0x01;
@@ -100,8 +103,14 @@ fn submit_still_equals_sign_plus_submit_frame() {
         let mut node = OrderedNode::new(host, RoundOrderer::new());
 
         let signer = sk(1);
-        let via_submit = node.submit(&signer, 0, set("a", "1")).await.expect("submit");
-        let by_hand = node::frame_id(&node::encode_frame(&signer, 0, &set("a", "1"), None));
-        assert_eq!(via_submit, by_hand, "submit is sign + submit_frame, byte-identical");
+        let via_submit = node
+            .submit(&signer, 0, set("a", "1"))
+            .await
+            .expect("submit");
+        let by_hand = node::frame_id(&node::encode_frame(&signer, 0, &set("a", "1")));
+        assert_eq!(
+            via_submit, by_hand,
+            "submit is sign + submit_frame, byte-identical"
+        );
     });
 }

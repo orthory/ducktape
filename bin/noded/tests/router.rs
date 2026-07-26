@@ -53,7 +53,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                 // the frameless arm above uses.
                 NodeCommand::SubmitFrame { frame, reply } => {
                     let result = match node::decode_frame(&frame) {
-                        Ok((sdk::Origin::External(key), msg, _cont)) => {
+                        Ok((sdk::Origin::External(key), msg)) => {
                             assert_eq!(msg.target, "chat");
                             Ok(BlockSummary {
                                 height: 11,
@@ -173,7 +173,7 @@ async fn a_signed_frame_lands_with_the_signers_key_as_the_origin() {
     spawn_fake_actor(cmd_rx, None);
 
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
-    let frame = node::encode_frame(&signer, 1, &chat_op(), None);
+    let frame = node::encode_frame(&signer, 1, &chat_op());
     let response = noded::router(handle)
         .oneshot(post_frame(frame))
         .await
@@ -203,7 +203,7 @@ async fn a_tampered_frame_is_refused_before_it_reaches_the_actor() {
 
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
     let op = chat_op();
-    let mut frame = node::encode_frame(&signer, 1, &op, None);
+    let mut frame = node::encode_frame(&signer, 1, &op);
     // flip one byte of the PAYLOAD: the signature binds (origin, seq, target,
     // payload), so the frame no longer verifies — and the actor never sees it.
     // located by SEARCHING for the payload rather than counting back from the
@@ -240,7 +240,7 @@ async fn a_frame_cannot_claim_another_keys_origin() {
     // signed preimage, so B's key cannot be swapped in without breaking it.
     let a = commonware_cryptography::ed25519::PrivateKey::from_seed(1);
     let b = commonware_cryptography::ed25519::PrivateKey::from_seed(2);
-    let mut frame = node::encode_frame(&a, 1, &chat_op(), None);
+    let mut frame = node::encode_frame(&a, 1, &chat_op());
     let b_key = b.public_key();
     // the origin is the first length-prefixed field: 8 bytes of length, then the
     // 32 key bytes.
@@ -905,7 +905,11 @@ async fn public_admin_enforces_the_committed_owner_pop() {
         ))
         .await
         .unwrap();
-    assert_eq!(ok.status(), StatusCode::OK, "the node owner may drive control");
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "the node owner may drive control"
+    );
 }
 
 /// the loopback gate FAILS CLOSED: a request with no ConnectInfo at all (an

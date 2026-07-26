@@ -1615,10 +1615,7 @@ async fn apply_block_committing(
 /// roll-forward's backstop widener: a moved module whose member re-executes
 /// as a duplicate-reject on its own post-state records no dispatch, but the
 /// frame still explains it. undecodable members target nothing
-/// (deterministic no-ops live and on replay alike). includes an envelope's
-/// continuation target beside its parent's: a released continuation moves ITS
-/// module in the same block, and a widener may only over-explain, never
-/// under-explain.
+/// (deterministic no-ops live and on replay alike).
 fn frame_targets(frame: &[u8]) -> BTreeSet<ModuleId> {
     let Ok(members) = decode_batch(frame) else {
         return BTreeSet::new();
@@ -1626,7 +1623,7 @@ fn frame_targets(frame: &[u8]) -> BTreeSet<ModuleId> {
     members
         .iter()
         .filter_map(|m| node::decode_frame(m).ok())
-        .flat_map(|(_, msg, cont)| std::iter::once(msg.target).chain(cont.map(|c| c.target)))
+        .map(|(_, msg)| msg.target)
         .collect()
 }
 
@@ -1652,8 +1649,7 @@ async fn replay_batch(
     let Ok(members) = decode_batch(frame) else {
         return Ok((Disposition::Rejected, Vec::new()));
     };
-    // decode exactly as the live drain does — a journaled frame replays WITH
-    // its continuation (dropping it would fork the replayed root-hash).
+    // decode exactly as the live drain does, or the replayed root-hash forks.
     let mut ops = Vec::new();
     for member in &members {
         if let Ok(op) = node::decode_member(member) {
@@ -1681,8 +1677,8 @@ async fn replay_batch(
         }
     };
     // block-level disposition, DRAIN-based to match the live seal (node's
-    // `drain_delivered`): Applied iff the block ran real work — any member (or
-    // released continuation) applied, or a once-per-block System injection
+    // `drain_delivered`): Applied iff the block ran real work — any member
+    // applied, or a once-per-block System injection
     // dispatched. NEVER root-hash-based: a torn-heal (`commit_only = Some`)
     // commits only the rolled-back cohort and ABORTS the already-durable mover,
     // so the root-hash cannot move even though the block WAS applied — root-hash

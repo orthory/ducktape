@@ -84,15 +84,15 @@ use commonware_cryptography::{
     Signer as _, Verifier as _,
     ed25519::{PrivateKey, PublicKey, Signature},
 };
-use sdk::{Continuation, Origin};
+use sdk::Origin;
 
 /// the signing domain for op frames. domain-separated so an op signature can
 /// never double as a consensus vote, an endpoint advertisement, or any other
-/// signed artifact in the system. the ONE codec: length-prefixed fields plus a
-/// trailing continuation section (`cont_flag(u8)`, then `[len target][target]
-/// [len payload][payload]` when the flag is `1`). BOTH arms are inside the
-/// signed preimage: the signature binds the continuation to its parent op, so
-/// nobody can graft one onto (or strip one off) someone else's transaction.
+/// signed artifact in the system. the ONE codec: length-prefixed
+/// `(origin, seq, target, payload)` and nothing else. a frame carries EXACTLY
+/// ONE op — there is no envelope continuation section, so a frame cannot
+/// append a second op that dispatches under a caller-chosen `Origin::Module`
+/// (see `no_continuation_lane.rs`).
 const FRAME_NS: &[u8] = b"ducktape:op-frame:v1";
 
 /// the content address of an encoded frame — sha256 over the exact bytes the
@@ -166,23 +166,14 @@ fn take_slice<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
     Some(head)
 }
 
-/// read one byte off the front of `buf`.
-fn take_byte(buf: &mut &[u8]) -> Option<u8> {
-    let (head, rest) = buf.split_at_checked(1)?;
-    *buf = rest;
-    Some(head[0])
-}
-
 /// the signed preimage AND the frame's wire prefix: length-prefixed fields so
 /// no two (seq, target, payload) triples can collide across a moving
-/// boundary, plus the trailing continuation section. depth 1 is BY SHAPE —
-/// the continuation section has no continuation slot of its own, so a nested
-/// continuation is unrepresentable rather than merely validated. a frame is
-/// exactly these bytes with the signature appended, so [`decode_frame`]
-/// verifies against the received prefix without rebuilding anything.
-fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg, cont: Option<&Continuation>) -> Vec<u8> {
+/// boundary. a frame is exactly these bytes with the signature appended, so
+/// [`decode_frame`] verifies against the received prefix without rebuilding
+/// anything.
+fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg) -> Vec<u8> {
     let target = msg.target.as_bytes();
-    let mut out = Vec::with_capacity(8 * 4 + 1 + origin.len() + target.len() + msg.payload.len());
+    let mut out = Vec::with_capacity(8 * 3 + origin.len() + target.len() + msg.payload.len());
     out.extend_from_slice(&(origin.len() as u64).to_le_bytes());
     out.extend_from_slice(origin);
     out.extend_from_slice(&seq.to_le_bytes());
@@ -190,48 +181,31 @@ fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg, cont: Option<&Continuation
     out.extend_from_slice(target);
     out.extend_from_slice(&(msg.payload.len() as u64).to_le_bytes());
     out.extend_from_slice(&msg.payload);
-    match cont {
-        None => out.push(0),
-        Some(c) => {
-            out.push(1);
-            let target = c.target.as_bytes();
-            out.extend_from_slice(&(target.len() as u64).to_le_bytes());
-            out.extend_from_slice(target);
-            out.extend_from_slice(&(c.payload.len() as u64).to_le_bytes());
-            out.extend_from_slice(&c.payload);
-        }
-    }
     out
 }
 
-/// frame and SIGN a locally-originated msg for the ordered lane, with an
-/// optional envelope continuation. the signer's public key becomes the
-/// frame's origin; the frame bytes are the signed preimage with the signature
-/// appended.
-pub fn encode_frame(
-    signer: &PrivateKey,
-    seq: u64,
-    msg: &Msg,
-    cont: Option<&Continuation>,
-) -> Vec<u8> {
+/// frame and SIGN a locally-originated msg for the ordered lane. the signer's
+/// public key becomes the frame's origin; the frame bytes are the signed
+/// preimage with the signature appended.
+pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {
     let origin = signer.public_key();
-    let mut frame = frame_preimage(origin.as_ref(), seq, msg, cont);
+    let mut frame = frame_preimage(origin.as_ref(), seq, msg);
     let sig = signer.sign(FRAME_NS, &frame);
     frame.extend_from_slice(sig.as_ref());
     frame
 }
 
-/// decode a delivered frame back to `(Origin, Msg, Option<Continuation>)`,
-/// VERIFYING the signature first. rejects deterministically on: a parse
-/// failure, a `cont_flag` outside `{0, 1}` (exactly one valid encoding per
-/// frame), an origin that is not a valid ed25519 key, a signature that does
-/// not bind the WHOLE preimage (continuation included), or a continuation
-/// payload over [`sdk::MAX_CONTINUATION_BYTES`]. the ordered drain treats any
-/// rejection as a deterministic no-op: every honest validator rejects the
+/// decode a delivered frame back to `(Origin, Msg)`, VERIFYING the signature
+/// first. rejects deterministically on: a parse failure, TRAILING BYTES
+/// between the payload and the signature (exactly one valid encoding per
+/// frame — this is what makes an appended continuation section
+/// unrepresentable), an origin that is not a valid ed25519 key, or a
+/// signature that does not bind the whole preimage. the ordered drain treats
+/// any rejection as a deterministic no-op: every honest validator rejects the
 /// identical forged frame identically. the verified `origin` becomes the
-/// block's root `Origin::External(pubkey)` — authorship a module can trust;
-/// the `seq` is ordering/replay metadata, not surfaced.
-pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>), Error> {
+/// block's `Origin::External(pubkey)` — authorship a module can trust; the
+/// `seq` is ordering/replay metadata, not surfaced.
+pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
     let parse_err = || Error::Host(sdk::Error::Module("frame does not parse".into()));
     let mut buf = bytes;
     let origin = take_slice(&mut buf).ok_or_else(parse_err)?;
@@ -242,23 +216,6 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>),
     let target = std::str::from_utf8(take_slice(&mut buf).ok_or_else(parse_err)?)
         .map_err(|_| parse_err())?;
     let payload = take_slice(&mut buf).ok_or_else(parse_err)?;
-    let cont = match take_byte(&mut buf).ok_or_else(parse_err)? {
-        0 => None,
-        1 => {
-            let cont_target = std::str::from_utf8(take_slice(&mut buf).ok_or_else(parse_err)?)
-                .map_err(|_| parse_err())?;
-            let cont_payload = take_slice(&mut buf).ok_or_else(parse_err)?;
-            Some(Continuation {
-                target: cont_target.to_string(),
-                payload: cont_payload.to_vec(),
-            })
-        }
-        flag => {
-            return Err(Error::Host(sdk::Error::Module(format!(
-                "frame cont_flag {flag} is not 0|1"
-            ))));
-        }
-    };
     let preimage_len = bytes.len() - buf.len();
     let pubkey = PublicKey::decode(origin)
         .map_err(|e| Error::Host(sdk::Error::Module(format!("frame origin: {e}"))))?;
@@ -266,17 +223,8 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>),
         .map_err(|e| Error::Host(sdk::Error::Module(format!("frame signature: {e}"))))?;
     if !pubkey.verify(FRAME_NS, &bytes[..preimage_len], &sig) {
         return Err(Error::Host(sdk::Error::Module(
-            "frame signature does not bind this op (and continuation) to its origin".into(),
+            "frame signature does not bind this op to its origin".into(),
         )));
-    }
-    if let Some(c) = &cont
-        && c.payload.len() > sdk::MAX_CONTINUATION_BYTES
-    {
-        return Err(Error::Host(sdk::Error::Module(format!(
-            "continuation payload exceeds cap ({} > {})",
-            c.payload.len(),
-            sdk::MAX_CONTINUATION_BYTES
-        ))));
     }
     Ok((
         Origin::External(origin.to_vec()),
@@ -284,7 +232,6 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>),
             target: target.to_string(),
             payload: payload.to_vec(),
         },
-        cont,
     ))
 }
 
@@ -299,19 +246,16 @@ pub fn frame_origin_seq(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
     Some((origin.to_vec(), seq))
 }
 
-/// decode ONE batch member into the [`host::BlockOp`] the block applies — the
-/// envelope carrying its continuation (if any) onto the op.
+/// decode ONE batch member into the [`host::BlockOp`] the block applies.
 ///
-/// stamps `frame` with the member's content id HERE — the relay slot's
-/// `parent_frame` is consensus input a module may commit to state, so live
-/// drain, recovery replay, and suffix catch-up must all derive it from the ONE
-/// definition rather than each stamping (or forgetting) it at the call site.
+/// stamps `frame` with the member's content id HERE, from the ONE definition,
+/// so live drain, recovery replay, and suffix catch-up cannot each stamp (or
+/// forget) it differently at the call site.
 pub fn decode_member(bytes: &[u8]) -> Result<host::BlockOp, Error> {
-    let (origin, msg, continuation) = decode_frame(bytes)?;
+    let (origin, msg) = decode_frame(bytes)?;
     Ok(host::BlockOp {
         origin,
         msg,
-        continuation,
         frame: frame_id(bytes),
     })
 }
@@ -793,44 +737,16 @@ pub struct DrainedOp {
     /// (the apply-latency histogram), so it can never enter consensus. differs
     /// per node.
     pub latency_us: u64,
-    /// the envelope continuation this frame carried and its released outcome
-    /// (envelope frames only). the continuation ALWAYS fires — a rejected parent
-    /// still releases it with the `Err` relay — so this is present iff the
-    /// FRAME carried one, independent of the parent's own disposition.
-    pub continuation: Option<DrainedContinuation>,
 }
 
-/// the released continuation of one drained envelope frame: the
-/// `continue` body plus how the derived unit landed. its dispatches are part
-/// of the block's op stream exactly like a member's (the index consumer
-/// appends them right after the parent's — the [`host::BatchOutcome`] event
-/// order), and `Discarded` is unrepresentable here: a continuation only ever
-/// exists for a frame that resolved below the cutover ceiling.
-#[derive(Clone, Debug)]
-pub struct DrainedContinuation {
-    /// the continuation's target module.
-    pub target: sdk::ModuleId,
-    /// the continuation's opaque payload bytes.
-    pub payload: Vec<u8>,
-    /// how the derived unit landed: applied, or rejected in isolation (its
-    /// stage rolled back; the parent's committed stage survives).
-    pub disposition: Disposition,
-    /// the continuation unit's own dispatch trace — empty when rejected.
-    pub dispatches: Vec<host::DispatchRecord>,
-    /// node-local, NON-CONSENSUS: the rejection reason, unwrapped like a
-    /// member's ([`DrainedFrame::reason`]). `None` when applied.
-    pub reason: Option<String>,
-}
-
-/// one decoded member's identity and envelope, carried parallel to the block's
-/// ops (in member order) so the drained records can be built after the block
-/// settles — internal to [`OrderedNode::drain_delivered`].
+/// one decoded member's identity, carried parallel to the block's ops (in
+/// member order) so the drained records can be built after the block settles —
+/// internal to [`OrderedNode::drain_delivered`].
 struct MemberMeta {
     id: FrameId,
     origin: Origin,
     target: sdk::ModuleId,
     payload: Vec<u8>,
-    continuation: Option<Continuation>,
 }
 
 /// the durable outcome of one drained frame — everything a recovery journal
@@ -1318,7 +1234,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         seq: u64,
         msg: Msg,
     ) -> Result<FrameId, Error> {
-        let frame = encode_frame(signer, seq, &msg, None);
+        let frame = encode_frame(signer, seq, &msg);
         self.submit_frame(frame).await
     }
 
@@ -1578,7 +1494,6 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                             origin: op.origin.clone(),
                             target: op.msg.target.clone(),
                             payload: op.msg.payload.clone(),
-                            continuation: op.continuation.clone(),
                         });
                         ops.push(op);
                     }
@@ -1662,26 +1577,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             }
             let mut any_applied = false;
             let (mut applied_count, mut rejected_count) = (0usize, 0usize);
-            // the released continuation outcomes, re-keyed by parent INPUT
-            // index (the host reports them in release = input order, at most
-            // one per envelope).
-            let mut cont_outcomes: Vec<Option<MemberOutcome>> =
-                op_meta.iter().map(|_| None).collect();
-            for (parent, cont_outcome) in outcome.continuations {
-                cont_outcomes[parent] = Some(cont_outcome);
-            }
             // one record per applying member, in member (input/FIFO) order; the
             // host guarantees `members` is 1:1 with `ops` in input order. custody
             // ends for each resolved member.
-            for (i, (meta, member_outcome)) in
-                op_meta.into_iter().zip(outcome.members).enumerate()
-            {
+            for (meta, member_outcome) in op_meta.into_iter().zip(outcome.members) {
                 let MemberMeta {
                     id: mid,
                     origin: op_origin,
                     target: op_target,
                     payload: op_payload,
-                    continuation: op_cont,
                 } = meta;
                 self.outstanding.remove(&mid);
                 let (disposition, dispatches, reason) = match member_outcome {
@@ -1696,38 +1600,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     // client keys on "files: conflict:"). node-local only.
                     MemberOutcome::Rejected { reason } => {
                         rejected_count += 1;
-                        (Disposition::Rejected, Vec::new(), Some(member_reason(reason)))
+                        (
+                            Disposition::Rejected,
+                            Vec::new(),
+                            Some(member_reason(reason)),
+                        )
                     }
                 };
-                // the envelope's continuation ALWAYS fired (an applied parent
-                // relays Ok, a rejected one Err) — its outcome is a block fact
-                // like a member's, and an APPLIED continuation is real work:
-                // it moves state, so it must reach the seal disposition or a
-                // continuation-only block would seal Rejected with a moved
-                // root-hash and recovery could never reproduce it.
-                let continuation = op_cont.map(|cont| {
-                    let released = cont_outcomes[i]
-                        .take()
-                        .expect("host releases exactly one outcome per envelope continuation");
-                    let (disposition, dispatches, reason) = match released {
-                        MemberOutcome::Applied { dispatches } => {
-                            any_applied = true;
-                            applied_count += 1;
-                            (Disposition::Applied, dispatches, None)
-                        }
-                        MemberOutcome::Rejected { reason } => {
-                            rejected_count += 1;
-                            (Disposition::Rejected, Vec::new(), Some(member_reason(reason)))
-                        }
-                    };
-                    DrainedContinuation {
-                        target: cont.target,
-                        payload: cont.payload,
-                        disposition,
-                        dispatches,
-                        reason,
-                    }
-                });
                 self.drained.push(DrainedFrame {
                     id: mid,
                     height,
@@ -1739,7 +1618,6 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         payload: op_payload,
                         dispatches,
                         latency_us,
-                        continuation,
                     }),
                     reason,
                 });

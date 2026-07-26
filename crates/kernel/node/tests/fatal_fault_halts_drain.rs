@@ -122,11 +122,11 @@ fn a_deterministic_rejection_does_not_halt_the_drain() {
             payload: Vec::new(),
         };
         orderer
-            .submit(encode_batch(&[encode_frame(&sk(1), 0, &reject_op, None)]))
+            .submit(encode_batch(&[encode_frame(&sk(1), 0, &reject_op)]))
             .await
             .expect("batch 1");
         orderer
-            .submit(encode_batch(&[encode_frame(&sk(1), 1, &reject_op, None)]))
+            .submit(encode_batch(&[encode_frame(&sk(1), 1, &reject_op)]))
             .await
             .expect("batch 2");
         let mut node = OrderedNode::new(host, orderer);

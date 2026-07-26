@@ -50,18 +50,6 @@ pub(crate) fn sealed_frame_block_row(
             &[],
             disposition,
         ));
-        // an envelope's released continuation is its own op row, right after
-        // its parent — the live drain's row order (`noded::projection`).
-        if let Some(cont) = op.continuation {
-            ops.push(project_root_op(
-                blobs,
-                &sdk::Origin::Module(op.msg.target),
-                &cont.target,
-                &cont.payload,
-                &[],
-                disposition,
-            ));
-        }
     }
     if ops.is_empty() {
         // a pure nop/idle block — the explorer hides it (same rule as live).

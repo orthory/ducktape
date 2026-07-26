@@ -228,9 +228,7 @@ pub fn run_actor(
                 // forged/tampered frame is a rejection, not a block.
                 NodeCommand::SubmitFrame { frame, reply } => {
                     let result = match node::decode_frame(&frame) {
-                        Ok((origin, msg, _cont)) => {
-                            commit(&mut host, &mut height, origin, msg).await
-                        }
+                        Ok((origin, msg)) => commit(&mut host, &mut height, origin, msg).await,
                         Err(err) => Err(err.to_string()),
                     };
                     publish_status(&status, &host, &status_modules, height);
