@@ -177,7 +177,9 @@ mod interactive;
 #[cfg(unix)]
 pub(crate) use sandbox_host::podman_api;
 #[cfg(unix)]
-pub use sandbox_host::podman_api::{PodmanService, egress_nftables, reap_by_label, run_egress_hook};
+pub use sandbox_host::podman_api::{
+    PodmanService, egress_nftables, reap_by_label, reap_service_at, run_egress_hook,
+};
 pub(crate) use sandbox_host::sandbox;
 mod session;
 mod spec;
@@ -799,6 +801,35 @@ impl CliProvider {
 
         let client = podman_api::Podman::new(socket.clone());
         let id = client.create(&spec).await?;
+        // THE paid-execution guard, and the only cancellation check between
+        // `invoke`'s entry and the output loop.
+        //
+        // `create` is not quick and not bounded by anything this run controls: a
+        // store miss makes it PULL, which is a network wait long enough to
+        // outlive a lease (the default is 64 views ≈ 64s at 1s blocks). Lose the
+        // lease inside it and the saga has already retried — another node claimed
+        // the next attempt and is running the work. `AttemptControl::cancel` sets
+        // the flag for exactly this case, but a flag nobody reads until after
+        // `start` is not a cancellation: without this check the container starts
+        // anyway and the operator pays for the same unit of work twice, invisibly
+        // — the late `OracleResult` lands as a deterministic no-op, so committed
+        // state shows one result and two invoices.
+        //
+        // Checked AFTER create rather than racing it in a `select!` on purpose:
+        // dropping the create future mid-flight can leave a container podman made
+        // and we never learn the id of, and an orphan is a worse trade than the
+        // wait. Holding the id means this can remove it.
+        let cancelled = ctx
+            .cancellation
+            .as_ref()
+            .is_some_and(RunCancellation::is_cancelled);
+        if cancelled {
+            let _ = client.remove(&id).await;
+            return Err(format!(
+                "{} cancelled before start (its attempt was reassigned)",
+                self.bin.display()
+            ));
+        }
         if let Err(error) = client.start(&id).await {
             // a container that never started must not linger in the node store.
             let _ = client.remove(&id).await;
@@ -5614,6 +5645,32 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
         assert_eq!(
             portable_home, real_home,
             "a portable run ALSO inherits the ambient HOME so BYO-auth works"
+        );
+    }
+
+    /// The paid-execution guard must stay between `create` and `start`.
+    ///
+    /// A source-parsing lint (the `clock_lint` shape) because the SHAPE is the
+    /// property and no unit test can reach the seam — it needs a live podman
+    /// socket. What matters is only that nothing can start a container after the
+    /// run's attempt was reassigned. Delete the check and this fails, which is
+    /// the whole job: the bug it prevents costs a second paid provider call and
+    /// leaves no trace in committed state.
+    #[test]
+    fn a_cancelled_attempt_can_never_be_started_after_create() {
+        let src = include_str!("lib.rs");
+        let (_, after_create) = src
+            .split_once("let id = client.create(&spec).await?;")
+            .expect("the podman create call");
+        let (between, _) = after_create
+            .split_once("client.start(&id)")
+            .expect("the podman start call");
+        assert!(
+            between.contains("RunCancellation::is_cancelled"),
+            "no cancellation check between podman create and start: a run whose \
+             lease expired during create (a store miss makes it PULL, a network \
+             wait) would start its container anyway, paying twice for work \
+             another node already claimed"
         );
     }
 }

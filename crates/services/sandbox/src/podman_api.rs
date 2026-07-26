@@ -546,20 +546,87 @@ impl Podman {
     }
 
     /// create a container from `spec`; returns its id.
+    ///
+    /// libpod's create NEVER pulls. It resolves `image` against the local store
+    /// and answers 404 `image not known` when it is absent — whatever
+    /// `pull_policy` the spec carries (verified against podman 5.4). Image
+    /// acquisition was `podman run`'s implicit job, and it left with the CLI
+    /// path; meanwhile every service daemon runs its OWN private graph root
+    /// (`podman_data_dir`), which therefore starts EMPTY. Without this, the first
+    /// run of any image on a fresh node fails and no amount of retrying helps —
+    /// nothing else in the tree ever puts an image in that store.
+    ///
+    /// So a store miss pulls once and retries the create. A store hit costs
+    /// nothing: the pull is on the 404 path only.
     pub async fn create(&self, spec: &SpecGenerator) -> Result<String, String> {
         let body = serde_json::to_vec(spec).map_err(|e| format!("encode create spec: {e}"))?;
-        let resp = self
-            .request("POST", &format!("{API}/containers/create"), Some(&body))
-            .await?;
-        resp.ok()?;
-        #[derive(serde::Deserialize)]
-        struct Created {
-            #[serde(rename = "Id")]
-            id: String,
+        let resp = self.create_once(&body).await?;
+        // the only thing create resolves out of the store is the image (every
+        // mount here is a bind path, never a named volume), so its 404 is that.
+        let image_missing = resp.status == 404;
+        if !image_missing {
+            return created_id(&resp);
         }
-        let created: Created =
-            serde_json::from_slice(&resp.body).map_err(|e| format!("decode create reply: {e}"))?;
-        Ok(created.id)
+        self.pull(&spec.image).await?;
+        created_id(&self.create_once(&body).await?)
+    }
+
+    async fn create_once(&self, body: &[u8]) -> Result<HttpResponse, String> {
+        self.request("POST", &format!("{API}/containers/create"), Some(body))
+            .await
+    }
+
+    /// pull `image` into this service's private store.
+    ///
+    /// The endpoint streams progress lines and answers **200 even when the pull
+    /// FAILED** — an unreachable registry, a typo'd tag and a denied repository
+    /// all arrive as `{"error": ...}` inside a successful response. A bare status
+    /// check would therefore report a missing image as acquired and let the
+    /// retried create 404 again under a diagnosis that names the wrong thing, so
+    /// the stream's own error line is the verdict.
+    ///
+    /// BOUNDED, because this runs inside a run's lease window and [`Self::request`]
+    /// has no timeout of its own: a blackholed registry holds the socket open
+    /// indefinitely (measured at 123 s against TEST-NET before the caller even
+    /// noticed), and an unbounded network await inside a lease is the shape that
+    /// lets a lease expire under a run that then proceeds anyway. The caller's
+    /// cancellation check after `create` is the other half of that guard.
+    pub async fn pull(&self, image: &str) -> Result<(), String> {
+        tracing::info!(
+            target: "ducktape::sandbox",
+            image,
+            "pulling provider image into this service's store"
+        );
+        // `/` and `:` are legal query characters and podman parses the reference
+        // verbatim, so the image name travels as written.
+        let path = format!("{API}/images/pull?reference={image}");
+        let Ok(resp) = tokio::time::timeout(PULL_TIMEOUT, self.request("POST", &path, None)).await
+        else {
+            tracing::warn!(
+                target: "ducktape::sandbox",
+                image,
+                seconds = PULL_TIMEOUT.as_secs(),
+                reason = "pull_timeout",
+                "provider image pull gave up"
+            );
+            return Err(format!(
+                "pull {image}: no answer from the registry within {}s",
+                PULL_TIMEOUT.as_secs()
+            ));
+        };
+        let resp = resp?;
+        resp.ok()?;
+        if let Some(error) = pull_failure(&resp.body) {
+            tracing::warn!(
+                target: "ducktape::sandbox",
+                image,
+                reason = "pull_refused",
+                "provider image pull failed: {error}"
+            );
+            return Err(format!("pull {image}: {error}"));
+        }
+        tracing::info!(target: "ducktape::sandbox", image, "provider image pulled");
+        Ok(())
     }
 
     pub async fn start(&self, id: &str) -> Result<(), String> {
@@ -884,6 +951,36 @@ impl HttpResponse {
     }
 }
 
+/// How long a `pull` may hold a run's lease window before it is a failure.
+///
+/// Generous enough for a large image on a slow link (`node:22-slim` is ~200 MB;
+/// busybox measures ~2.4 s), short enough that "the registry is not answering"
+/// becomes a diagnosis instead of a wedge. Losing a lease to a slow pull is the
+/// caller's problem to detect, not this one's — see [`Podman::pull`].
+const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// the `error` a pull stream reported, if any — see [`Podman::pull`] for why a
+/// 200 is not an answer. Progress lines are ordinary and carry no `error`.
+fn pull_failure(body: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(body)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|line| line["error"].as_str().map(str::to_string))
+}
+
+/// the container id out of a create reply, or the API's own error text.
+fn created_id(resp: &HttpResponse) -> Result<String, String> {
+    resp.ok()?;
+    #[derive(serde::Deserialize)]
+    struct Created {
+        #[serde(rename = "Id")]
+        id: String,
+    }
+    serde_json::from_slice::<Created>(&resp.body)
+        .map(|created| created.id)
+        .map_err(|e| format!("decode create reply: {e}"))
+}
+
 /// parse a complete (Connection: close) HTTP/1.1 response: status line, headers,
 /// and a body that is either `Content-Length`-delimited, chunked, or read to
 /// EOF.
@@ -1041,6 +1138,26 @@ fn runs_exe(pid: u32, exe: &Path) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn runs_exe(_pid: u32, _exe: &Path) -> bool {
     false
+}
+
+/// Reap the `podman system service` a daemon recorded under `data_dir`.
+///
+/// A daemon killed by SIGKILL never runs [`PodmanService`]'s `kill_on_drop`, and
+/// the service is started `--time=0` — it never idle-exits — so it outlives its
+/// owner holding ~45 MB. [`PodmanService::claim`] reaps it when a SUCCESSOR boots
+/// on the same root, which covers a restarting node and nothing else: a root that
+/// never gets a successor (a torn-down test workspace, a moved node dir) keeps
+/// the process until the box reboots.
+///
+/// So this is that same reap, callable by whoever owns the daemon's lifetime
+/// instead of only by its replacement. Identity-verified by executable before any
+/// signal — never a pattern match on a command line. Best-effort and idempotent:
+/// no pid file, a dead pid, or a pid that is not podman are all nothing to do.
+pub fn reap_service_at(data_dir: &Path) {
+    let Some(pid) = read_pid(&data_dir.join("podman").join(PODMAN_PID_FILE)) else {
+        return;
+    };
+    reap_orphan_podman(pid);
 }
 
 /// kill a predecessor's orphaned `podman system service`, verified by executable
@@ -1495,5 +1612,25 @@ mod tests {
         let f2 = att.read_frame().await.unwrap().unwrap();
         assert_eq!(f2, (FrameStream::Stderr, b"!".to_vec()));
         assert!(att.read_frame().await.unwrap().is_none(), "EOF after frames");
+    }
+
+    /// a pull that FAILED still answers 200, so the stream's own error line is
+    /// the only verdict. Both bodies are verbatim podman 5.4 replies.
+    #[test]
+    fn a_failed_pull_is_read_out_of_a_successful_response() {
+        let denied = br#"{"error":"initializing source docker://nope:zzz: reading manifest zzz in docker.io/library/nope: requested access to the resource is denied"}"#;
+        assert!(
+            pull_failure(denied).is_some_and(|e| e.contains("access to the resource is denied")),
+            "a refused pull must not read as an acquired image"
+        );
+
+        let acquired = br#"{"stream":"Copying blob sha256:034d65\n"}
+{"stream":"Writing manifest to image destination\n"}
+{"images":["b116e1"],"id":"b116e1"}"#;
+        assert_eq!(
+            pull_failure(acquired),
+            None,
+            "progress lines are not failures"
+        );
     }
 }
