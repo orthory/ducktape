@@ -1,7 +1,21 @@
 # Wave 2 integration QA — the one terminal pass
 
 - **Date:** 2026-07-26. **Revised:** 2026-07-27 against `dev` @ `60d86b8ec`.
-- **Status:** runbook, not yet executed. **Nothing in it has been run.**
+  **Repaired:** 2026-07-27 against `dev` @ `feec0a6db`, from the findings of its
+  own first execution.
+- **Status:** **partially executed.** The five credential-free sections
+  (§Preconditions, §Isolation, §Podman co-tenancy, §Restart-and-skew,
+  §Invariants) were run against real nodes, daemons and containers on
+  2026-07-27. **They found more defects in the runbook than in the product** —
+  eight steps that could not fail, five that could not pass, seven stale
+  premises. Every one of those is corrected below and labelled where it sits.
+  **Tier 1, Tier 2 and cross-node placement have not been run.** They are what
+  this repair exists to make worth running.
+- **What the first execution changed structurally:** §0.1 grew from three rules
+  to six (rules 4–6 are hazards that pass hit); §0.5 is new (four known-open
+  product bugs, being fixed separately — do not re-file them); Tier 1 is no
+  longer "no airlock at runtime", because that claim does not survive the code
+  (T1-7); and §Isolation is no longer credential-free (§4's head note).
 - **Turns into an executable procedure:** the "Integration QA — one terminal
   pass" section of `2026-07-25-service-daemons.md`.
 - **Predecessors:** `2026-07-25-services-extraction.md` (wave 1),
@@ -26,22 +40,96 @@ absence of an error, it now names a post-state somebody has to look at.
 
 ## 0. Before anything
 
-### 0.1 The three rules this runbook never breaks
+### 0.1 The six rules this runbook never breaks
 
-1. **Never `pkill -f`, and never `until ! pgrep -f …`.** A pattern match has
-   already killed an agent's own shell in this repo, and a `pgrep -f` spin loop
-   is the same hazard wearing a wait's clothing — it matches the grep, the
-   editor, and this script. Every teardown here identifies a process by
-   **cwd + `/proc/<pid>/exe` + its `--config`/`--root` argument**, or asks the
-   node to stop itself.
+**Rules 4–6 were added after the first execution of §Preconditions, §Isolation,
+§Podman co-tenancy, §Restart-and-skew and §Invariants.** Every one of them is a
+hazard that pass actually hit, and rule 4's quiet case silently passed a step
+against a stranger's containers.
+
+1. **Never `pkill -f`, and never `pgrep -f` in a pass/fail expression.** A
+   pattern match has already killed an agent's own shell in this repo, and it
+   also **matches the invoking shell**: `pgrep -u "$USER" -f -c 'podman.*system
+   service'` returned **2** on a box with zero real podman processes, because
+   both hits were the shell running the command. That form sat inside P-4's own
+   pass block for a full revision. `pgrep -f` is acceptable as a *rough* count
+   in prose; it is never the thing a step asserts on. Assert with `pgrep -x
+   <exe>` plus an identity check (`/proc/<pid>/exe`, `--config`/`--root`), or
+   ask the node to stop itself.
 2. **Wait on events, never on durations.** Every wait below names a log line,
    a committed height, a file, or a ws frame. Where a poll loop is used it
    polls **for a state transition**, not for a clock.
 3. **A pass is an observed post-state, never the absence of an error.** `rm -rf`
-   that returns 0 having deleted nothing is the canonical failure of this rule
-   (§P-4). If a step's evidence is "no error appeared", it is not evidence.
+   that exits with an error having deleted 98% of the bytes is the canonical
+   failure of this rule (§P-4). If a step's evidence is "no error appeared", it
+   is not evidence.
+4. **Never glob `$XDG_RUNTIME_DIR/ducktape/*-<kind>.sock`.** The socket name is
+   `ducktape-<fnv1a32 of the data dir>-<kind>.sock`, so on a shared box the glob
+   returns **every** workspace's socket — three sections of the first pass hit
+   this. **The quiet case is the dangerous one:** if your daemon failed to start
+   while a stranger's is up, the glob resolves to exactly one path — *theirs* —
+   and the step asserts against someone else's containers **and passes**. Same
+   class as the port-collision bug that made one test silently drive another
+   node (§P-9). Resolve it from your own workspace instead:
 
-Helper used throughout (paste once per shell):
+   ```bash
+   # the ONLY sanctioned way to name a service socket in this runbook.
+   own_sock() {  # own_sock <kind>   e.g. own_sock compute
+     local root="$WS/storage/services/$1/podman"
+     local pid; pid=$(cat "$root/podman.pid" 2>/dev/null) || { echo "no podman.pid under $root" >&2; return 1; }
+     readlink "/proc/$pid/exe" 2>/dev/null | grep -q 'podman$' \
+       || { echo "pid $pid is not podman — stale $root/podman.pid" >&2; return 1; }
+     tr '\0' '\n' < "/proc/$pid/cmdline" | grep -m1 '^unix://' | sed 's|^unix://||'
+   }
+   CSOCK=$(own_sock compute) || exit 1
+   ASOCK=$(own_sock agent)   || exit 1
+   ```
+   `<data>/podman/podman.pid` is written by `PodmanService::start`
+   (`crates/services/sandbox/src/podman_api.rs`) and the service is spawned as
+   `podman --root <data>/podman/storage … system service --time=0
+   unix://<socket>`, so the pid file, the `--root` and the socket are one
+   verified chain rooted in **your** `$WS`. **A failed `own_sock` is a FAIL of
+   the step that needed it — never a reason to fall back to the glob.**
+5. **`podman service did not answer on <path> within 5s` is a duration, and it
+   fires under load.** `PodmanService::await_socket` polls `_ping` 100 × 50 ms
+   and then `FATAL`s + `exit(1)`; it is the one place the product itself breaks
+   rule 2, so a tester has to tell a slow box from a defect. Measured on this
+   box: **0.125 s warm / 0.163 s cold** when started alone — and **the 5 s
+   budget blown** at load average 19.8 with six concurrent services. Before
+   recording it as a product defect, re-run the same start **alone** and record
+   both numbers plus `uptime`. Timed out under load = record as
+   `FLAKE(load=<avg>, alone=<secs>)`; timed out alone on an idle box = a real
+   finding. Known-open (§0.5).
+6. **A stray environment variable silently changes what you are testing.**
+   Print this block into the report before the first step, and never set any of
+   them to make something go away:
+
+   ```bash
+   for v in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN DUCKTAPE_CRED_REUSE_ARTIFACT \
+            DUCKTAPE_ALLOW_MISSING_TOOLS DUCKTAPE_NODE DUCKTAPE_ADMIN \
+            DUCKTAPE_PODMAN_SOCKET OPENAI_API_KEY; do
+     printf '%-32s %s\n' "$v" "${!v:+SET}"      # SET/unset only — never the value
+   done
+   ```
+   - **`ANTHROPIC_API_KEY` preempts everything.** `AnthropicAuth::from_host`
+     (`crates/services/broker/src/lib.rs`) tries `ANTHROPIC_API_KEY`, then
+     `CLAUDE_CODE_OAUTH_TOKEN`, then `~/.claude/.credentials.json`. A stray key
+     turns the subscription path into the API-key path with no log line.
+   - **`DUCKTAPE_CRED_REUSE_ARTIFACT` validates nothing.** `cred add` does a
+     bare `std::fs::copy(&src, dir.join(provider.artifact()))` and then only
+     checks the destination **exists** (`bin/node/src/cred_cli.rs`). That is how
+     one agent ran the credential-dependent steps of the first pass against a
+     **fabricated** credential and got plausible-looking results. Anything it
+     produced is unverified — see T1-6's HOLD and T1-7's re-verification note.
+   - **`DUCKTAPE_ALLOW_MISSING_TOOLS=1`** is the escape hatch P-9 exists to
+     police. Must be unset.
+   - **`DUCKTAPE_NODE`** sits on the `--node` address ladder (#832) and will
+     silently retarget `user`/`fs`/`agent`.
+
+Helpers used throughout (paste once per shell). Two more are defined where they
+are first needed and are used by later sections: **`own_sock`** in rule 4 below
+(needs `$WS`, set in T1-1) and **`saga_get`** in T1-7 (the only correct read of
+an `agent sched` outcome — see that step's box).
 
 ```bash
 # wait until a line appears in a log file. Fails loudly, never silently.
@@ -55,11 +143,8 @@ await_line() {  # await_line <file> <grep-pattern> [max-polls]
 }
 
 # THE readiness gate for a node. NOT "does /v1/status return 200".
-# `ducktape node run` binds its HTTP listener at `boot::surfaces::bind`
-# (bin/node/src/main.rs) and does not publish its identity until the status
-# cell is filled several hundred lines later. `NodeStatus.public_key`
-# (bin/noded/src/lib.rs) is a plain non-Option String, so in that window
-# /v1/status answers 200 with public_key "".
+# A published identity is a STRICTLY stronger gate than a 200 — and it is still
+# NOT "committed state is loaded". See the correction under this block.
 await_published() {  # await_published <http base>
   local base="$1" n=0
   while [ $n -lt 600 ]; do
@@ -84,13 +169,31 @@ stop_by_config() {  # stop_by_config <substring of the process' --config/--root 
 }
 ```
 
-> **Why `await_published` survives.** #836 fixed exactly this bug — but in
-> **`bin/simnode`** ("`/v1/status` must never answer before the actor
-> published"), and #821 fixed it earlier in **`bin/noded`**. **`bin/node`, the
-> real `ducktape node run`, still binds before it publishes.** Two of the three
-> node binaries are closed and the one this pass drives is not. Use
-> `await_published`; never a 200 check. This is still the single most likely way
-> for this pass to start on a false premise.
+> **CORRECTION (measured, first pass). The bind-before-publish window this
+> runbook was built around is CLOSED on this tree — but `await_published` is
+> still the right gate, for a different reason.**
+>
+> The old claim was that `ducktape node run` answers `/v1/status` with a 200 and
+> `public_key: ""` for a window after `boot::surfaces::bind`. **Two boots,
+> ~750 polls at 5–10 ms: zero 200s with an empty `public_key`.** On a genesis
+> boot: 755 connection-refused polls, and the **first** 200 already carried the
+> key. The mechanism: `bind` spawns the app surface on its own OS thread that
+> must first build a whole multi-thread tokio runtime
+> (`bin/node/src/boot/surfaces.rs`), while `status.publish(NodeStatus { …
+> public_key … })` runs inline on the main task a few hundred lines later
+> (`bin/node/src/main.rs`). The publish wins by a wide margin, every time.
+> **Do not report a false green here as a finding, and do not spend the pass
+> trying to observe the window.**
+>
+> **What is still true, and is the reason the helper stays:** a published status
+> does **not** imply committed state is loaded. On a **warm restart** the first
+> 200 carried the key with `height=0, root_hash=""`, and committed height only
+> reappeared **+1.0 s later**. So:
+> - gate on a non-empty `public_key` — strictly better than a bare 200, and it
+>   is what `service run`/`service enable` themselves need (T1-2, T1-3);
+> - **never** read `height` or `root_hash` from the first published status. Any
+>   step that needs committed state polls for the transition to a non-zero
+>   height, and T1-1 records both timings.
 
 ### 0.2 What changed under this runbook — read before trusting any step
 
@@ -320,6 +423,20 @@ Naming them here stops a later reader adding a step that cannot fail.
   Apple Silicon. **Do not run this pass with `--ignored`**, and if you do, read
   their stdout.
 
+### 0.5 Known-open product bugs — record, do not re-file
+
+The first execution of the credential-free sections found these. **A separate
+PR is fixing them; they are not this pass's to fix and not this pass's to
+discover twice.** Where a step below touches one, it says so.
+
+| bug | what a step sees | steps that touch it |
+|---|---|---|
+| **the daemon orphans its podman service on every stop path** | `podman system service --time=0` survives SIGTERM *and* SIGKILL of its `service run`, so `$XDG_RUNTIME_DIR/ducktape/` accumulates live sockets across the pass — which is what makes rule 4's glob so dangerous | P-4, T1-4, C-2, C-3, R-1, R-4 |
+| **containers are killed rather than re-adopted across restart** | C-3's `reaped orphaned sandbox containers` fires where the design says the daemon should have re-adopted them; R-4's "re-adopts its container" half will not hold | C-3, R-4 |
+| **the singleton guard is keyed on exe path** | `PodmanService::claim`'s `runs_exe` comparison means a second daemon started from a *different* binary path (a rebuilt worktree, R-3's second binary) does **not** trip `another service daemon (pid N) already owns …` and both supervise one graph root | T1-4, R-3 |
+| **`service status` prints the CLI's own build stamp** | `service status` can render a `build` row that came from the CLI process rather than the catalog's hello, so a "builds agree" reading is not evidence | P-3, R-3 |
+| **the fixed 5 s podman-service budget** | §0.1 rule 5 | T1-4, K-1 |
+
 ---
 
 ## 1. Preconditions (P) — 9 steps
@@ -382,30 +499,70 @@ key.
 git -C . rev-parse HEAD          # record this; it is the pass's SHA
 git status --porcelain | head    # MUST be empty — a dirty tree changes the build stamp
 
-# take V-2's route baseline NOW, from the same tree that built the binary
+# V-2's inventory, from the same tree that built the binary. The BASELINE is
+# the checked-in list in V-2, not a second read of this tree — see V-2.
 LOGS="$HOME/wave2qa-logs"; mkdir -p "$LOGS"
-grep -oE '\.route\("(/v1[^"]*)"' bin/noded/src/lib.rs | sed 's/.*("//' | sort \
-  > "$LOGS/routes.baseline"
-wc -l < "$LOGS/routes.baseline"   # 33 on this tree — record it
+v1_routes() {   # multi-line aware, and it reads BOTH router files
+  cat bin/noded/src/lib.rs bin/noded/src/admin.rs \
+    | tr '\n' ' ' | grep -oE '\.route\( *"/v1[^"]*"' \
+    | sed 's/.*"\(.*\)"/\1/' | sort -u
+}
+v1_routes > "$LOGS/routes.now"
+wc -l < "$LOGS/routes.now"        # 44 on this tree — record it
 ```
 **Fail:** a non-empty `git status` (a dirty tree makes `DUCKTAPE_BUILD` a
 working-tree digest, which will read as skew in R-3 for the wrong reason).
+**Fail:** a route count other than 44 — go straight to V-2 and diff.
 
 **macmini:** same commit, native ARM build. It has no `cargo` by default —
 rustup was installed there previously. Binary at
 `~/dev/ducktape/target/release/ducktape`.
 
 ### P-3 — confirm both boxes are on the same build
-**Run on:** both.
+**Run on:** both. **Its observable was unreachable and has been replaced.**
 
 `DUCKTAPE_BUILD` is stamped at compile time by `bin/noded/build.rs` from the
 commit plus a working-tree digest when dirty. It is `option_env!`, so **setting
 it at runtime does nothing**.
 
-**Observable / pass:** both boxes print the same SHA from P-2, and
-`ducktape service status` later shows `build` with no `(this node: …)` suffix
-(§R-3). **Fail:** different SHAs — fix before proceeding; every later skew
-assertion becomes meaningless.
+> **What this step used to say, and why it could not be done.** It asked for the
+> stamp at precondition time. **There is no precondition-time reader for it.**
+> `ducktape --version` prints `ducktape 0.1.0` — the crate version, never the
+> build stamp — and `DUCKTAPE_BUILD` is exposed nowhere else on the CLI.
+> `build_identity()` (`bin/noded/src/services.rs`) is only ever read into a
+> `Hello`, the `/v1/services/hello` 200 body, and `service status`'s `build`
+> row, all of which need a **live node** and, for `service status`, a
+> **signaling daemon** as well — none of which exist yet at P-3.
+
+**So this step is now two halves, and the second one is deferred by design.**
+
+**a. at P-3 — the SHA and the boot stamp.** The commit is the thing both boxes
+must agree on; the build stamp is derived from it.
+```bash
+git -C . rev-parse HEAD          # both boxes: the SAME sha
+git status --porcelain | head    # both boxes: EMPTY (a dirty tree ≠ that sha)
+./target/release/ducktape --version   # `ducktape 0.1.0` — record it, it is NOT the stamp
+```
+**Fail:** different SHAs, or either tree dirty. Fix before proceeding; every
+later skew assertion becomes meaningless.
+
+**b. deferred to T1-4 — the stamp itself, off a live node.** The first moment
+the stamp is readable is when a daemon is signaling:
+```bash
+"$D" service status compute -n "$CHAIN" --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["build"])'
+```
+plus the node's own boot line, which carries the *derivation* and not the stamp:
+`INFO ducktape::node: … version=… profile=release binary=<path> built_unix=<epoch>`
+(`bin/node/src/boot/env.rs`). **Record `built_unix` and `binary` from both
+boxes** — with an identical SHA and a clean tree those are the honest
+cross-box evidence available before T1-4.
+
+> **[§0.5 known-open] `service status` can render the CLI's OWN stamp.** The
+> `build` row is meant to come from the catalog's hello (`live.build`,
+> `bin/node/src/services.rs`), but the CLI also stamps
+> `build_identity_or_unknown()` into its own hello on the same path. Until that
+> is fixed, **"builds agree" in `service status` is not evidence** — read R-3's
+> log line instead, which is a round trip through the node's 200 body.
 
 ### P-4 — reap the box's leaked state: processes, sockets, **and storage roots**
 **Run on:** dev box.
@@ -414,13 +571,24 @@ assertion becomes meaningless.
 clean, while leaving every test's **storage root** on the tmpfs. Both halves
 matter, and the second one is the half that fills `/tmp` (§0.3).
 
-**a. processes.** The PR test suites launch `podman system service --time=0`,
-which never idle-timeouts; 102 orphans parented to `init` were counted on this
-box in one day. Reap by verified identity, never by pattern:
+**a. processes. The pass criterion this step used to carry was itself a §0.1
+rule-1 violation.** `pgrep -u "$USER" -f -c 'podman.*system service'` returned
+**2** on a box with **zero** real podman processes: both hits were the shell
+that ran the command. A count that can never reach 0 is not a pass criterion —
+it is a step that always fails, which is the same defect as one that always
+passes. **Count and assert with `pgrep -x podman`**, and read each hit's
+identity out of `/proc`.
+
+The PR test suites launch `podman system service --time=0`, which never
+idle-timeouts; 102 orphans parented to `init` were counted on this box in one
+day. **[§0.5 known-open] the daemon also orphans its own podman service on
+every stop path**, so this dir grows during the pass, not only before it.
+
+Reap by verified identity, never by pattern:
 
 ```bash
 ls /run/user/1000/ducktape/ | wc -l
-pgrep -u "$USER" -f -c 'podman.*system service'     # count only — do NOT kill by pattern
+pgrep -u "$USER" -x podman | wc -l          # the REAL count. -x, never -f.
 
 for p in $(pgrep -u "$USER" -x podman); do
   args=$(tr '\0' ' ' < "/proc/$p/cmdline")
@@ -437,22 +605,32 @@ for s in /run/user/1000/ducktape/*.sock; do
 done
 ```
 
-**b. storage roots — and plain `rm -rf` CANNOT remove them.**
+**b. storage roots — plain `rm -rf` does not finish the job.**
+**`podman unshare` is still mandatory. The reasoning and the numbers this step
+used to give were both wrong, in a way that mattered.**
 
 Rootless podman chowns its overlay graph root into a **user namespace** (the
-subuid range). The unmapped user cannot traverse or unlink those directories, so
-`rm -rf` **walks what it can, removes that, and exits 0** — reporting success
-while leaving the bulk behind. Measured on this campaign: **~830 MB of an
-845 MB store survived a "successful" `rm -rf`.**
+subuid range), and the unmapped user cannot traverse or unlink some of those
+directories. What that actually does — measured twice, independently:
 
-The command is:
+| the old claim | what `rm -rf` really does |
+|---|---|
+| "exits 0, reporting success" | **exits 1**, with ~40 `Permission denied` lines. It is **loud**, not silent. |
+| "~830 MB of an 845 MB store survived" | it removes ~**98%** of the bytes: 253 M/8236 files → **5.2 M/60 files**; 237 M → **5.3 M** on a second box. A small residue survives and the directory is left standing. |
+| "`du` is blind to it" | **`du` is not blind.** Inside and outside the userns report the **same** size, so a `du` post-check is sound — and it is the post-state this step asserts on. |
+
+Why it still matters, and why the fix is unchanged: a 5 MB residue with the
+directory still standing is **not** an empty image store. K-1 restarts a daemon
+onto that root and reads its image list; the residue is exactly what makes a
+"cold" start ambiguous. So:
 
 ```bash
 podman unshare rm -rf <path>
 ```
 
 `podman unshare` re-enters the same user namespace the storage was created in,
-where those directories are owned by root and removable. Sweep the leftovers:
+where those directories are owned by root and removable. **The exit code is not
+the evidence either way — `du` is.** Sweep the leftovers:
 
 ```bash
 # the graph roots the suites leave behind: <data>/podman/{storage,run,hooks}
@@ -464,13 +642,15 @@ done
 
 **Observable / pass — a post-state, looked at, not an exit code:**
 ```bash
-pgrep -u "$USER" -f -c 'podman.*system service'   # -> 0
+pgrep -u "$USER" -x podman | wc -l                # -> 0   (-x; `-f` matches this shell)
 ls /run/user/1000/ducktape/ | wc -l               # -> 0
 ls -d /tmp/.tmp*/ 2>/dev/null | wc -l             # -> 0
 du -csh /tmp/.tmp* /tmp/dt-svc-check 2>/dev/null | tail -1   # -> nothing, or 0
 df -h /tmp | tail -1                              # record the free figure
 ```
-**`rm -rf` exiting 0 is NOT the pass.** Re-run `du` and read the number.
+**Neither `rm -rf`'s exit code nor `podman unshare`'s is the pass** — a bare
+`rm -rf` exits **1** having removed 98%, and that is a pass-shaped failure in
+both directions. Re-run `du` and read the number.
 **Fail:** a survivor whose cmdline points at a **workspace** (not `/tmp`) — that
 is a live node's service; investigate, do not kill.
 
@@ -482,8 +662,9 @@ state must name what it looks at afterwards. Swept for this revision:
 | **K-1** ("make the image store genuinely empty") | `rm -rf "$WS/…/podman/storage"` — **the same rootless-overlay path**, so the store was never emptied and the cold-start step proved nothing | `podman unshare rm -rf`, then `du -sh` the path and assert the image list is empty |
 | **I-3** (airlock SIGTERM) | already asserts the route is **gone** from `gateway-routes.json` and the file **removed** if it was the only one | kept — this one was already a post-state |
 | **I-4** (SIGKILL blast radius) | "poll for the state string" | kept, and the container list is re-read on both sockets |
-| **V-2** (`/v1` additive only) | a `git diff origin/dev...HEAD` grep that is **structurally empty on this tree** | replaced with a route inventory — see V-2 |
-| **V-3** (no secrets in logs) | greps expecting empty output | now asserts the log files are **non-empty first**, so a missing log cannot pass |
+| **V-2** (`/v1` additive only) | a route inventory diffed against a baseline taken **from the same immutable checkout**, so the diff was empty by construction — and the extractor missed 11 of 44 routes | baseline is now the **checked-in list in V-2**, and the extractor is multi-line-aware and reads `admin.rs` too |
+| **V-3** (no secrets in logs) | greps expecting empty output, and a pattern blind to both secrets this runbook mints | asserts the log files are **non-empty first**, and matches bare `[0-9a-f]{64}` |
+| **V-5** (no daemon holds the node key) | an fd probe that reads **0 for the node itself** | the structural lint test is the criterion; the fd probe is demoted to a note |
 
 ### P-5 — workspace layout, and the node config
 **Run on:** both.
@@ -537,41 +718,72 @@ computation on every `load`, so a corrupt or over-cap `services.toml` **fails
 the node boot**, not just the announce.
 
 ### P-6 — the `[sandbox]` table (the second trap)
-**Run on:** both.
+**Run on:** both. **Its edit instruction was self-defeating and is deleted.**
 
-`NodeToml.sandbox` is `Option<SandboxToml>` with `deny_unknown_fields`. The
-**retired flat spelling** (`sandbox = "podman"`) is a serde *type* error, not a
-bespoke message: the process dies with
-`FATAL: "<path>/node.toml": … invalid type: string "podman", expected struct SandboxToml`.
+> **DO NOT APPEND ANYTHING. `node init` already wrote this table.** Confirmed
+> independently by two agents on the first pass: `cli.rs`'s
+> `detect_platform_sandbox()` runs on `node init` **and** `node join`, probes the
+> platform adapter, and — when it resolves — writes a **byte-identical** table:
+> `runtime = "podman"`, `image = DEFAULT_PODMAN_IMAGE`
+> (`docker.io/library/node:22-slim`), `cores = 0`, `mem_gb = 0`
+> (`bin/node/src/config/resolve.rs`). It says so on stderr at init time:
+> `compute plane: podman found at <path> — writing a live [sandbox] table`.
+>
+> **Appending the old block verbatim produced a third state the step did not
+> describe:**
+> ```
+> FATAL: "<ws>/node.toml": … TOML parse error … duplicate key `sandbox`
+> ```
+> — which contains **neither** the step's fail assertion (`SandboxToml`) **nor**
+> its pass assertion (`compute_not_granted`). A literal follower lands somewhere
+> the runbook has no verdict for, and the most likely reading is "the node is
+> broken".
+>
+> **P-1 is what makes this work.** `detect_platform_sandbox` writes the table
+> only if `SandboxBackend::probe()` succeeds, and probe needs **podman + pasta +
+> nft + nsenter**. A `node init` run in a shell that skipped P-1's `PATH` export
+> silently writes **no** table — which is the one case where you do add one.
+
+**So this step is now a check, not an edit:**
+
+```bash
+grep -n -A5 '^\[sandbox\]' "$WS/node.toml"
+grep -c '^\[sandbox\]' "$WS/node.toml"      # MUST be exactly 1
+```
+
+| what you see | what to do |
+|---|---|
+| exactly one `[sandbox]` with the four keys above | **nothing.** This is the pass. |
+| **no** `[sandbox]` at all | P-1 was not in the shell that ran `node init`. **Re-run `node init` with the P-1 exports** — do not hand-add the table, because a hand-added one hides the fact that probe failed, and the daemon will then die at `sandbox: <detail>` in T1-2 with no explanation. |
+| two `[sandbox]` headers | someone appended. Delete the appended one. |
+
+macOS (Tart) writes the platform's own values, also at `init`:
+`runtime = "tart"`, `image = "ghcr.io/cirruslabs/macos-sonoma-base:latest"`.
+`cores`/`mem_gb` are `0` there too (`0` = probe the host); the old runbook's
+`cores = 2 / mem_gb = 4` was a hand-edit, not what init writes.
+
+**The deliberate-failure half — this is where the flat spelling belongs.**
+`NodeToml.sandbox` is `Option<SandboxToml>` with `deny_unknown_fields`, so the
+**retired flat spelling** is a serde *type* error, not a bespoke message. On a
+**copy** of the workspace, replace the whole table with `sandbox = "podman"` (do
+not append — that is the duplicate-key state above) and boot:
+```
+FATAL: "<path>/node.toml": … invalid type: string "podman", expected struct SandboxToml
+```
 **Assert on the substring `FATAL:` plus `SandboxToml`**, not on a full sentence —
-the span rendering is `toml` 0.8's and is not pinned by any test.
-
-The header must be **last** in `node.toml` (everything after a TOML table header
-belongs to it). All four keys required; `0` = probe the host.
-
-Dev box (Linux/podman):
-```toml
-[sandbox]
-runtime = "podman"
-image = "docker.io/library/node:22-slim"
-cores = 0
-mem_gb = 0
-```
-macmini (Tart):
-```toml
-[sandbox]
-runtime = "tart"
-image = "ghcr.io/cirruslabs/macos-sonoma-base:latest"
-cores = 2
-mem_gb = 4
-```
+the span rendering is `toml` 0.8's and is not pinned by any test. If you edit a
+table by hand for any reason, its header must be **last** in `node.toml`
+(everything after a TOML table header belongs to it).
 
 **Observable / pass:** the node boots and, with no compute grant yet, logs
 exactly:
 ```
 WARN ducktape::service: sandbox configured but the compute service is not enabled; this node will run no provider work and announce no capabilities — enable it with `ducktape service run compute` … reason="compute_not_granted"
 ```
-That warn is the proof the table parsed. **Fail:** `FATAL: … SandboxToml`.
+That warn is the proof the table parsed.
+**Fail:** `FATAL: … SandboxToml` on the unmodified workspace (the flat spelling
+leaked in), or `duplicate key` (someone appended), or **no warn at all** (no
+table — the middle row of the table above).
 
 ### P-7 — daemon logs are NOT in `daemon.log`
 
@@ -690,10 +902,21 @@ it is **someone setting the escape hatch to make a red box green.**
 # before ANY cargo test in this pass:
 env | grep -c DUCKTAPE_ALLOW_MISSING_TOOLS      # MUST be 0
 
-cargo test -p node-bin --test dispatch_e2e 2>&1 | tee dispatch.out
-grep -c '^SKIP ' dispatch.out                   # MUST be 0
-grep -c 'compute daemon serving' "$LOGS"/*.log  # MUST be >= 1
+cargo test -p node-bin --test dispatch_e2e 2>&1 | tee "$LOGS/dispatch.out"
+grep -c '^SKIP ' "$LOGS/dispatch.out"                # MUST be 0
+grep -c 'test result: ok' "$LOGS/dispatch.out"       # MUST be >= 1
+grep -cE '^test .* \.\.\. ok$' "$LOGS/dispatch.out"  # MUST be >= 1 — a binary with
+                                                     # ZERO tests also prints "ok"
 ```
+
+> **A third check used to sit here and was unsatisfiable by construction:**
+> `grep -c 'compute daemon serving' "$LOGS"/*.log` "MUST be >= 1". At
+> precondition time **no daemon has started in `$LOGS` at all** — the first one
+> is T1-4 — and `dispatch_e2e` spawns its own daemons into the **test's** temp
+> root, never `$LOGS`. It could only ever have been 0. It is deleted; the
+> `test result: ok` + per-test-`ok` pair above is what actually distinguishes
+> "ran something" from "built a binary with zero tests", which is the vacuum
+> #831 documented.
 
 **If a suite panics with `cannot run on this host`, that is a FAIL of P-1, not
 of the suite, and not a reason to set the variable.**
@@ -722,13 +945,23 @@ answers that port, it is NOT ours."* Mirror that here: before every
 
 ---
 
-## 2. Tier 1 — no airlock at runtime (T1) — 8 steps
+## 2. Tier 1 — single-box credential plane (T1) — 8 steps
 
-The claim under test: **airlock is a credential SOURCE, not a dependency.**
-broker-host is always in the path (per-run loopback + opaque bearer); the
-operator's own credential resolves locally and never touches an airlock.
+**This section used to be titled "no airlock at runtime", and that claim is
+false on this tree.** Every `agent sched --cred` run — including one drawing on
+the operator's **own** credential, on the **same** box — resolves through
+`AirlockConfig::self_host` and dials `airlock.<own-handle>.duck` over its own
+gateway proxy. There is no local branch (T1-7's head note traces the path).
 
-Topology for this tier: **dev box alone.** One node, both daemons.
+**The claim actually under test, restated:** *broker-host is always in the path
+(per-run loopback + opaque bearer), and a single box can lend to itself* — the
+same topology T2 runs across two boxes, collapsed to one. `service run airlock`
+is a **precondition** of T1-7, not a Tier 2 escalation.
+
+Topology for this tier: **dev box alone.** One node; compute, agent **and
+airlock** daemons.
+**Step order changed:** T1-1 → T1-2 → T1-3 → T1-4 → T1-5 → T1-6 → **T2-2** →
+T1-7 → T1-8.
 
 ### T1-1 — found the network, node up
 
@@ -766,11 +999,31 @@ gate.
   curl -s "http://127.0.0.1:9971/v1/status" | head -c 400
   ```
 
-**Record, do not fail on:** the size of the pre-publish window, from
-`boot::surfaces::bind` to the first `status.publish` in `bin/node/src/main.rs`.
-Measured on `ducktape-noded` before #821 it was ~1.3 s. **Worth timing here and
-reporting** — it is the window T1-2's exit lands in, and it is the one of the
-three node binaries still open (§0.1).
+**Record, do not fail on — and it is NOT the pre-publish window any more.** That
+window is closed (§0.1's correction): two boots, ~750 polls, zero 200s with an
+empty `public_key`. **The timing worth capturing here is the one that is still
+open** — the gap between the first published status and the first status
+carrying a **committed height**. Measured on a warm restart: the first 200
+carried the key with `height=0, root_hash=""`, and committed height reappeared
+**+1.0 s later**. On a genesis boot: 755 connection-refused polls, then the
+first 200 already had the key.
+
+```bash
+# poll fast, from the moment the process starts, and print the two transitions.
+python3 - <<'PY'
+import json,time,urllib.request
+t0=time.time(); pub=None
+while time.time()-t0 < 120:
+    try: s=json.load(urllib.request.urlopen("http://127.0.0.1:9971/v1/status",timeout=1))
+    except Exception: time.sleep(0.005); continue
+    if pub is None and s.get("public_key"): pub=time.time()-t0; print(f"published  +{pub:.3f}s")
+    if pub is not None and s.get("height",0) > 0:
+        print(f"committed  +{time.time()-t0:.3f}s  (gap {time.time()-t0-pub:.3f}s)"); break
+    time.sleep(0.005)
+PY
+```
+Report both numbers. **A non-zero gap is expected and is exactly why no step may
+read `height`/`root_hash` off the first published status** (§0.1).
 
 ### T1-2 — compute signals, and is refused nothing
 
@@ -783,11 +1036,28 @@ RUST_LOG=info,ducktape::service=debug,ducktape::saga=debug \
 keeps serving, which is what a systemd unit does.
 
 **Observable / pass:**
-- `compute.log` (stderr) carries the banner, **with no ANSI escapes** because
-  stderr is a file:
+- `compute.log` (stderr) carries the banner:
   `● compute · signaling to <CHAIN> · offering <tags>`
-- then exactly one hint line: `not enabled — enable it with: ducktape service enable compute`
+- then **two** hint lines, in this order — `--no-enable` is `EnableOffer::Never`,
+  which writes the first from `offer_enable` and the second from `serve_kind`
+  (`bin/node/src/services.rs`):
+  1. `not enabled — enable it with: ducktape service enable compute`
+  2. `not enabled — nothing will execute until it is enabled`
 - **no prompt, no spinner, no re-ask** — grep the file for `[Y/n]`: must be 0 hits.
+
+> **CORRECTION: "no ANSI escapes because stderr is a file" is false.** Only the
+> two `write_err` hint lines and the `●` banner are plain — and even those carry
+> SGR around the yellow `not enabled`. The *tracing* lines in the same file
+> **do** carry escapes: `log::init` applies `.with_ansi(false)` to the ring layer
+> and the daemon.log file layer but **not** to `stderr_layer`
+> (`bin/noded/src/log.rs`), and a `service run` daemon has only that layer
+> (P-7). So:
+> ```bash
+> grep -c $'\033\[' "$LOGS/compute.log"     # NON-ZERO is expected, not a finding
+> sed 's/\x1b\[[0-9;]*m//g' "$LOGS/compute.log" > "$LOGS/compute.plain.log"
+> ```
+> **Strip escapes before every grep in this runbook that matches a coloured
+> token**, or a `grep -c 'reason="build_skew"'` can miss a line that is there.
 - the catalog sees it:
   ```bash
   curl -s http://127.0.0.1:9971/v1/services | python3 -m json.tool
@@ -899,16 +1169,26 @@ RUST_LOG=info,ducktape::service=debug,ducktape::saga=debug \
 **Wait on:** `await_line "$LOGS/compute.log" 'compute daemon serving'`
 **Observable / pass:** the line carries `instance=compute#<hex8>`,
 `capabilities=<n>`, `concurrency=4` (or `$DUCKTAPE_MAX_CONCURRENT_RUNS`).
+**Record that `instance=` value — it is R-1's observable.**
 Its own podman service is up and answers:
 ```bash
 ls "$WS/storage/services/compute/podman/"        # storage run hooks owner.pid podman.pid
-SOCK=$(ls "$XDG_RUNTIME_DIR/ducktape/"*-compute.sock)
-curl -s --unix-socket "$SOCK" http://d/_ping     # -> OK
+CSOCK=$(own_sock compute) || exit 1              # §0.1 rule 4 — NEVER the glob
+curl -s --unix-socket "$CSOCK" http://d/_ping    # -> OK
+```
+**Also do P-3b here** — this is the first moment the build stamp is readable:
+```bash
+"$D" service status compute -n "$CHAIN" --json \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["build"])'
 ```
 **Fail:** `another service daemon (pid <N>) already owns <socket> — stop it
 before starting this one` → a previous daemon survived; use `stop_by_config`,
-never a pattern kill.
-**Fail:** `podman service did not answer on <path> within 5s`.
+never a pattern kill. **[§0.5 known-open] that guard is keyed on exe path**, so
+it does **not** fire between two daemons started from different binary paths —
+if you are also running R-3's second binary, check `owner.pid` by hand.
+**Fail:** `podman service did not answer on <path> within 5s` — **but read
+§0.1 rule 5 before recording it.** Re-run the same start alone and report
+`FLAKE(load=<avg>, alone=<secs>)` vs a real finding.
 
 ### T1-5 — agent signals and serves alongside compute
 
@@ -928,10 +1208,12 @@ RUST_LOG=info,ducktape::service=debug \
   `{"op":"service_attach","kind":"agent","token":"<service-link.token>"}`.
   The claim carries **no `build`** (#820 deleted the field); the node compares no
   stamp. Confirm no `link_refused` in `agent.log`.
-- two podman services now, two graph roots:
+- two podman services now, two graph roots — resolved by identity, **not** by
+  globbing the shared runtime dir (§0.1 rule 4):
   ```bash
   ls "$WS/storage/services/"                     # agent  compute
-  ls "$XDG_RUNTIME_DIR/ducktape/"*-agent.sock "$XDG_RUNTIME_DIR/ducktape/"*-compute.sock
+  ASOCK=$(own_sock agent) && CSOCK=$(own_sock compute) && echo "$ASOCK" "$CSOCK"
+  test "$ASOCK" != "$CSOCK"                      # two DISTINCT paths
   ```
 
 > **[#829] the auto-enable path does not die on a failed announce.** `service run
@@ -944,7 +1226,9 @@ RUST_LOG=info,ducktape::service=debug \
 `refused: present this node's service-link token, and only one agent service may
 attach` → the token was stale (the node restarted) or a second agent is running.
 
-### T1-6 — an operator-owned credential, no airlock in the path
+### T1-6 — an operator-owned credential, and the airlock route it publishes
+**Retitled. "No airlock in the path" was the tier's premise and it is wrong —
+see the correction at the head of T1-7 before running either step.**
 
 > **HOLD HERE. The credential is supplied by the user, not scavenged.**
 > This step needs a **throwaway** vendor credential that the user provides at
@@ -978,23 +1262,86 @@ imports it instead of driving the browser.
 > **From here the node has a committed owner.** Every later `/v1/admin/*` call
 > needs the owner PoP, not the token (P-8).
 
-### T1-7 — headless run, end to end, airlock-free
-**The ws leg changed under #827 — the old subscribe frame is now refused.**
+**And it published the airlock route.** `cred add` writes the on-chain `airlock`
+RouteStatement whether or not an airlock daemon ever runs. That route is the
+thing T1-7's runs will dial — read T1-7's head note now, not after a red run.
+
+### T1-7 — headless run, end to end
+
+> ## The tier's headline claim does not survive the code, and this step is
+> ## where it fails. Read this before running it.
+>
+> Tier 1 was written on the claim *"airlock is a credential SOURCE, not a
+> dependency — the operator's own credential resolves locally and never touches
+> an airlock."* **On this tree there is no local branch.** `agent sched`
+> **hard-requires** `--cred <NAME>` (`SchedArgs.cred: String`,
+> `bin/node/src/agent_cli.rs`), and every named credential goes through one
+> path with no alternative:
+>
+> `NodeCredentialResolver::resolve` (`bin/node/src/compute/cred.rs`) →
+> `build_airlock` → `AirlockConfig::self_host(&ResolvedCredential { authority:
+> "airlock.<owner-handle>.duck", via: <this node's browser gateway>, … })` →
+> `AirlockGateway::Remote`. There is **no arm** that returns a non-airlock
+> config. The credential's own owner, on the same box, still dials
+> `airlock.<own-handle>.duck` through its own gateway proxy.
+>
+> **Observed on the first pass:** with no airlock daemon running, **every**
+> `agent sched --cred` run failed `airlock_route_or_credential_absent` — the
+> gateway resolved the route T1-6 published, found no local loopback upstream in
+> `gateway-routes.json`, and returned 404 (`proxy_loopback`,
+> `bin/node/src/gateway_plane.rs`).
+>
+> **So T1-7's old pass criterion — "that grep must be 0" — asserted the opposite
+> of what the topology does.** It is inverted below. The genuinely airlock-free
+> path is `agent pty` with **no** `--cred`, which falls through to
+> `AnthropicAuth::from_host()` and reads the operator's live
+> `~/.claude/.credentials.json` — exactly what T1-6's HOLD forbids. That is the
+> whole reason the claim looked true and never was.
+>
+> **CAVEAT — re-verify when the real credential lands.** The observation above
+> was made with a **fabricated** credential imported through
+> `DUCKTAPE_CRED_REUSE_ARTIFACT`, which validates nothing (§0.1 rule 6). The
+> *refusal token* is a routing fact and does not depend on the credential being
+> real — but **re-run this step against the user-supplied throwaway and confirm
+> the token before writing it up as settled.** Record it as
+> `FINDING(needs re-verification)` until then.
+>
+> **This does not sink Tier 1.** It relocates it: T1-6 → T1-7 is exactly the
+> topology T2 builds, one box instead of two. Run T2-2 (`service run airlock`)
+> **before** T1-7 so the route it published has a listener, and T1-7 becomes
+> "the operator lends to itself, over its own gateway" — which is a real and
+> testable claim. What it is **not** is "no airlock at runtime".
+
+**Ordering, changed:** run **T2-2 (airlock daemon on this box)** before this
+step. Then:
 
 ```bash
 RUN=$("$D" agent sched claude --cred eddy-claude-1 -n "$CHAIN" --cpu 1 --mem 2 -- "reply with exactly: PONG")
 echo "$RUN"        # -> sched<0x1F><32 hex>   NOTE: literal ASCII unit separator
 DISPATCH=${RUN#*$'\x1f'}
+SAGA="$RUN"        # the saga id IS the whole string, separator included
 ```
 
 **Wait on — the events, in order:**
 1. `await_line "$LOGS/compute.log" 'compute daemon serving'` (already true)
-2. the run appears committed:
+2. **the saga transitions. `pending_runs`/`recent_runs` are the WRONG read —
+   see the box below.**
    ```bash
-   curl -s http://127.0.0.1:9971/v1/query -H 'content-type: application/json' \
-     -d '{"target":"runs","query":"pending_runs"}'
+   saga_get() {  # saga_get <saga id, unit separator and all>
+     python3 - "$1" <<'PY'
+import json,subprocess,sys
+q = {"target":"saga","query":{"get":{"saga_id":sys.argv[1]}}}
+out = subprocess.run(["curl","-s","http://127.0.0.1:9971/v1/query",
+      "-H","content-type: application/json","-d",json.dumps(q)],
+      capture_output=True,text=True).stdout
+v = json.loads(out).get("saga") or {}
+print(v.get("status"), "attempt=", v.get("attempt"), "assignee=", bool(v.get("assignee")))
+print("result:", bytes(v.get("result") or []).decode("utf-8","replace")[:400])
+print("error:", v.get("error"))
+PY
+   }
+   saga_get "$SAGA"     # poll THIS for the transition Pending -> Done
    ```
-   poll **for the transition** out of `pending_runs` and into `recent_runs`
 3. tail the live output ring. There is **no CLI verb** — this is the ws topic,
    and **`run-output:` is now `Admission::Workspace`**
    (`Topic::admission`, `bin/noded/src/stream.rs`). The subscribe frame must
@@ -1008,16 +1355,54 @@ DISPATCH=${RUN#*$'\x1f'}
    `ClientMsg` is `deny_unknown_fields`, so the field is spelled `token` and
    nothing else. The same secret `ServiceAttach` presents, deliberately.
 
+> ### `pending_runs` and `recent_runs` do not see a `sched` run. Do not use them.
+>
+> Measured on the first pass: **both returned `[]` for every run placed** —
+> including one whose saga had committed `Done` carrying `PONG`. It is not a
+> lag and it is not a defect; they read a different lane. `agent sched` submits
+> `saga::SagaMsg::Trigger { saga_id: "sched\x1f<dispatch>", reply_to: None, … }`
+> (`bin/node/src/agent_cli.rs`). `RunsQuery::PendingRuns` projects the *dispatch
+> correlation* table and `RecentRuns` the *delivered-runs ring*
+> (`crates/modules/apps/runs/src/module_impl.rs`) — both fed by the delivery
+> path a `reply_to: None` trigger never enters.
+>
+> **The outcome is readable only through `saga` `get`, on the full
+> `"sched\x1f" + <dispatch>` string** — the unit separator is part of the id.
+> As written, the old step left a tester two choices, and §0.1 rule 3 forbids
+> the second: record FAIL on a run that succeeded, or fall back to "no error
+> appeared".
+
 **Observable / pass:**
-- `recent_runs` carries this run with a success outcome and the model's `PONG`
-- **the same `PONG` crossed the run-output ring** — this is the positive half,
-  and it is what stops the step passing on the negative grep alone
+- `saga_get "$SAGA"` reports `status: Done` and its `result` decodes to text
+  carrying **`PONG`**. That is the step's primary evidence — nothing else here
+  substitutes for it.
+- **the same `PONG` crossed the run-output ring** — the second positive half,
+  and it is what stops the step passing on a committed-state read alone
 - a real container ran: a container labelled `io.ducktape.managed=compute#…`
-  appears on the compute socket during the run (C-1's query)
-- **the airlock daemon was never started and nothing 502'd**: `grep -cE
-  'airlock_gateway_unreachable|airlock_route_or_credential_absent|gateway_seal_pk_mismatch|airlock_caller_account_unverified'
-  "$LOGS"/*.log` → **0**. *This is the tier's whole point.*
+  appeared on `$(own_sock compute)` during the run (C-1's query)
 - `"$LOGS/compute.log"` has **no** `reason="worker_error"`
+- **the airlock refusal set is empty *because a listener answered*, not because
+  nothing dialled** — the inverted assertion:
+  ```bash
+  grep -cE 'airlock_gateway_unreachable|airlock_route_or_credential_absent|gateway_seal_pk_mismatch|airlock_caller_account_unverified' \
+    "$LOGS"/*.log                       # -> 0
+  grep -c 'airlock daemon serving' "$LOGS/airlock.log"   # -> 1  (T2-2 ran first)
+  grep -c 'credential=' "$LOGS/airlock.log"              # -> >= 1: the gate DECIDED
+  ```
+  A zero in the first grep with a **zero** in the third is not a pass — it means
+  the run never reached the gateway, and on this topology that cannot happen for
+  a `--cred` run.
+
+**Deliberate-failure half — the airlock dependency, proved in one stop.** Stop
+the airlock daemon (`stop_by_config "service run airlock"`) and submit the same
+run again.
+**Pass:** it fails, and the borrower-side token is
+**`airlock_route_or_credential_absent`** (HTTP 404 — the route is still
+published on chain but its local loopback upstream is gone from
+`gateway-routes.json`; see I-3 for why this is 404 and not 502). Record
+`EXPECTED-REFUSAL(T1-7)`. Restart the airlock daemon before continuing.
+**Fail:** the run succeeds — then a non-airlock credential path exists that the
+code review above did not find, and **that** is the headline finding.
 
 **Deliberate-failure half — the topic gate, in one frame.** Send the identical
 subscribe with the `token` field **omitted**.
@@ -1058,11 +1443,27 @@ broken (it is in this tree; #826 merged).
 **Fail:** any `airlock_*` reason token → airlock is on the runtime path, which
 contradicts the design claim. Report it as the headline finding.
 
-### T1-8 — interactive pty session, airlock-free
+### T1-8 — interactive pty session on the operator's own credential
+**Retitled: "airlock-free" was the same wrong premise as T1-7's.**
 
 ```bash
-"$D" agent pty claude -n "$CHAIN" --cpu 1 --mem 2
+"$D" agent pty claude --cred eddy-claude-1 -n "$CHAIN" --cpu 1 --mem 2
 ```
+
+> **`--cred` is now explicit here, and that is the change.** `agent pty`'s
+> `--cred` is `Option<String>`, so the old command line was legal — but a pty
+> with **no** credential does not take some airlock-free happy path: it reaches
+> the broker with `AirlockConfig` absent, falls through
+> `resolve_anthropic_upstream(None)` to `AnthropicAuth::from_host()`, and reads
+> `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / the operator's **live**
+> `~/.claude/.credentials.json` (`crates/services/broker/src/lib.rs`). That is
+> the host login **T1-6's HOLD forbids this pass from touching**, and it is
+> exactly the path that made "no airlock at runtime" look true.
+>
+> So: pass `--cred`, and this step goes through the same self-host airlock hop
+> T1-7 does — T2-2's daemon must be running. **If you want the credential-less
+> variant recorded, record it as `NOT-RUN(would read the operator's live
+> login)`.**
 
 > **[#827] `agent pty` reads the workspace secret before it creates a session.**
 > `let secret = workspace_secret(addr)?;` is the **first** statement of
@@ -1191,6 +1592,12 @@ in a DARK window can fail intermittently — if T2-5 fails once, re-run it and s
 so rather than recording a defect.
 
 ### T2-2 — the airlock plug on the LENDER
+**Run this BEFORE T1-7, on the dev box.** T1-7's head note explains why: every
+`agent sched --cred` run dials `airlock.<owner-handle>.duck` through its own
+node's gateway proxy, including one drawing on the operator's own credential on
+the same box. Without this daemon there is no listener behind the route T1-6
+published, and the run 404s. This step is a Tier 1 precondition that happens to
+also be Tier 2's first step.
 
 ```bash
 # dev box (lender)
@@ -1343,7 +1750,11 @@ deliberately, and each has a deliberate-failure half below that proves it.
 > rung.
 
 **Observable / pass:**
-- the run executes **on the borrower** and returns `PONG`
+- the run executes **on the borrower** and returns `PONG`, read the same way
+  T1-7 reads it: `saga_get "$SAGA"` on the **submitting** box reports
+  `status: Done` with `PONG` in the decoded `result`. **`pending_runs` /
+  `recent_runs` will be `[]` here too** — see T1-7's box; they are the wrong
+  lane for a `sched` saga on either box.
 - the borrower's broker opened a sealed airlock session: **zero** refusal
   tokens in the borrower's logs
 - the lender's `airlock.log` shows the grant gate *deciding*, at `debug`, target
@@ -1436,10 +1847,34 @@ refusal naming the account.
 
 ---
 
-## 4. On/off isolation matrix (I) — 6 steps
+## 4. On/off isolation matrix (I) — 7 steps
 
 **The claim:** separate processes mean separate failure domains. With all three
 enabled, toggle each independently and prove the others are unaffected.
+
+> **THIS SECTION IS NOT CREDENTIAL-FREE. It was scheduled as if it were, and it
+> is not.** I-1, I-2 and I-3 each need work in flight, and there is no
+> credential-free way to put work in flight:
+> - **`agent sched` hard-requires `--cred <NAME>`** (`SchedArgs.cred: String`,
+>   `bin/node/src/agent_cli.rs`) — I-2 and X-1 cannot be run without one;
+> - `agent pty`'s `--cred` is optional, but a pty with **no** credential falls
+>   through to `AnthropicAuth::from_host()` and reads the operator's live
+>   `~/.claude/.credentials.json`, which **T1-6's HOLD forbids** — so I-1 needs
+>   one too;
+> - I-3 is a lent-credential step by definition.
+>
+> **So I-1, I-2 and I-3 are Tier-1-dependent: they run after T1-6 and T2-2, on
+> the user-supplied throwaway credential, not before.** If the pass reaches this
+> section without one, record all three as
+> `BLOCKED(awaiting user-supplied throwaway credential)` — the same verdict as
+> T1-6 — and run I-0, I-4 and I-5, which genuinely need nothing.
+>
+> **The substitution, if a credential-free smoke of the isolation property is
+> wanted:** I-4 and I-5 already prove the blast-radius half with no work in
+> flight at all (SIGKILL a daemon, watch the others). What they do **not** prove
+> is the *in-flight survives a disable* half, and there is no credential-free
+> stand-in for that — do not invent one, and do not record I-1/I-2/I-3 as PASS
+> off I-4's evidence.
 
 ### I-0 — state what `disable` does and does not revoke
 **This is an assertion about truth, not a wish. #829 changed half of it.**
@@ -1479,7 +1914,9 @@ verify that it does, by restarting the node and polling the registry until the
 tag disappears. If it does not reconcile, that is the finding.
 
 ### I-1 — disable compute while an agent pty is live
-Start a pty session (T1-8). With it live, `service disable compute`.
+**Needs T1-6's credential** (see the section head). Start a pty session on it
+(`"$D" agent pty claude --cred eddy-claude-1 -n "$CHAIN"`, T1-8). With it live,
+`service disable compute`.
 **Pass:** the pty session **keeps running** — proved by typing into it and
 seeing the echo *after* the disable returned, not by the absence of a
 disconnect; and `service list` shows compute gone from the grants and agent
@@ -1487,17 +1924,53 @@ still `✓ enabled`.
 **Fail:** the pty drops, or input stops echoing.
 
 ### I-2 — disable agent while a compute run is in flight
-Submit a long `agent sched` run, then `service disable agent`.
-**Pass:** the run completes and **delivers its result into `recent_runs`** —
-read the outcome, do not infer it from the absence of an error.
+**Needs T1-6's credential.** Submit a long `agent sched --cred …` run, capture
+its `$SAGA`, then `service disable agent`.
+**Pass:** the run completes — `saga_get "$SAGA"` reaches `status: Done` with the
+expected text in the decoded `result`.
 
-### I-3 — disable airlock while a lent-credential run is in flight
-**Pass:** the in-flight session survives (`SESSION_TTL_SECS = 3600`,
-`MAX_REQUESTS = 4096` are per-session and fixed); a **new** session started
-after the daemon stops gets `airlock_gateway_unreachable`.
-**Also assert:** after a clean SIGTERM the `airlock` entry is **gone** from
-`gateway-routes.json` and, if it was the only route, the file is **removed**, not
-left as `{"routes":[]}`.
+> **`recent_runs` is the wrong read here, exactly as in T1-7.** This step used
+> to say "delivers its result into `recent_runs`". It never will: `agent sched`
+> triggers a saga with `reply_to: None`, and `RunsQuery::RecentRuns` projects
+> the delivered-runs ring, which that trigger does not enter. Measured `[]` for
+> every run placed on the first pass, including a committed `Done` carrying
+> `PONG`. Use `saga_get`.
+
+### I-3 — the airlock daemon goes away under a live session
+**Needs T1-6's credential.** **Split into two cases, because the version this
+step used to carry asserted both halves of a contradiction.**
+
+> **What was wrong.** It asserted (a) a clean SIGTERM removes the route from
+> `gateway-routes.json` *and* (b) a new session then gets
+> `airlock_gateway_unreachable`. **(b) is false *because* (a) is true.**
+> `proxy_loopback` (`bin/node/src/gateway_plane.rs`) looks the label up in
+> `gateway-routes.json`; a removed entry is
+> `GatewayFailure::NotFound("global gateway route has no local loopback
+> upstream")` → **404** → the broker's `of_status(404)` → `Absent` →
+> **`airlock_route_or_credential_absent`**. `airlock_gateway_unreachable` is
+> `of_status(502)`, which needs a route that is still **present** with nothing
+> listening — the **SIGKILL** case. The two cannot both hold on one teardown.
+
+**I-3a — clean SIGTERM.** `stop_by_config "service run airlock"`.
+**Pass, all three:**
+- the in-flight session survives (`SESSION_TTL_SECS = 3600`,
+  `MAX_REQUESTS = 4096` are per-session and fixed)
+- the `airlock` entry is **gone** from `gateway-routes.json`, and if it was the
+  only route the **file is removed**, not left as `{"routes":[]}`
+- a **new** `agent sched --cred` run is refused
+  **`airlock_route_or_credential_absent`** (404). Record `EXPECTED-REFUSAL`.
+
+**I-3b — SIGKILL** (this is the `airlock_gateway_unreachable` case, and it is
+the one I-4 also documents). Restart the airlock daemon, confirm the route is
+back in `gateway-routes.json`, then `kill -KILL` it by verified identity.
+**Pass:**
+- the route is **still in `gateway-routes.json`** — nothing evicts it
+- `ss -ltn "sport = :<N>"` shows nothing listening
+- a new run is refused **`airlock_gateway_unreachable`** (502 — the node
+  answered for a daemon it could not reach). Record `EXPECTED-REFUSAL`.
+
+**Fail (either case):** the token from the *other* case. That is the one outcome
+that says the 404/502 split is not wired the way the taxonomy claims.
 
 ### I-4 — kill a daemon uncleanly; prove the blast radius is one daemon
 Send **SIGKILL** to the compute daemon (identified via `stop_by_config`'s
@@ -1531,8 +2004,10 @@ daemon's shutdown cannot kill the other's.
 With compute and agent both serving and both busy:
 
 ```bash
-CSOCK=$(ls "$XDG_RUNTIME_DIR/ducktape/"*-compute.sock)
-ASOCK=$(ls "$XDG_RUNTIME_DIR/ducktape/"*-agent.sock)
+CSOCK=$(own_sock compute) || exit 1     # §0.1 rule 4. The glob this step used
+ASOCK=$(own_sock agent)   || exit 1     # to carry is how a shared box makes
+                                        # this step pass against a STRANGER's
+                                        # containers.
 for s in "$CSOCK" "$ASOCK"; do
   echo "== $s"
   curl -s --unix-socket "$s" 'http://d/v5.0.0/libpod/containers/json?all=true' \
@@ -1550,9 +2025,26 @@ done
 - graph roots are distinct dirs: `storage/services/compute/podman/storage` vs
   `.../agent/podman/storage`
 
-**Fail:** any container labelled `io.ducktape.managed=unscoped` — that is a
-provider built outside `discover(…, managed_owner)` and nothing will ever reap
-it.
+**Fail:** a container whose `io.ducktape.managed` value is **not** the display
+id of the daemon that owns that socket — i.e. `agent#…` seen on the compute
+socket, or a container with the label absent entirely.
+
+> **The `unscoped` FAIL condition this step used to carry is DELETED — no
+> production path can produce it.** `io.ducktape.managed=unscoped` comes from
+> `UNSCOPED_OWNER` (`crates/services/provider/src/lib.rs`), which is set in
+> exactly one place: `CliProvider::from_spec`'s struct literal. Every non-test
+> caller of `from_spec` is inside `discover_with_sink`, which chains
+> `.with_managed_owner(managed_owner)` on the very next line and overwrites it —
+> `discover(…, managed_owner)` is the only way a daemon builds a provider set.
+> The remaining `from_spec` callers are all `#[cfg(test)]`, and the ones that
+> could reach a create use `SandboxBackend::Bare`, which never creates a
+> container (`interactive.rs` reaches `unreachable!("interactive sessions never
+> run under the bare test harness")`).
+>
+> An assertion nothing can trip is worse than no assertion: it reads as
+> coverage of the "unreaped container" class and covers nothing. The real
+> mechanism — **per-service graph roots**, so neither socket can enumerate the
+> other's containers — is the third bullet above, and that one is observable.
 
 ### C-2 — one daemon's shutdown cannot kill the other's containers
 Stop the compute daemon (SIGTERM via `stop_by_config`), while an agent session
@@ -1564,15 +2056,33 @@ compute daemon and its podman service are gone.
 containers along. That is exactly why per-service services were chosen over
 labels.
 
-### C-3 — crash-orphan re-adoption across restart
+### C-3 — crash-orphan reap across restart
 SIGKILL the compute daemon mid-run so a container is left behind, then restart it.
 **Wait on:** `await_line "$LOGS/compute.log" 'reaped orphaned sandbox containers'`
-**Pass:** the line carries `removed=<n>` and `reason="own_orphans"`; the agent's
-containers are untouched. This is the second reason instance ids must survive a
-restart — a daemon re-adopts its own containers only if it returns with the
-**same** id, which it does because the id is the grant hash and the grant
-persists in `services.toml`.
-**Fail:** `reason="reap_failed"`, or the count includes the agent's containers.
+**Pass:** the line carries `removed=<n>` (n ≥ 1) and `reason="own_orphans"`, and
+**the same `$CSOCK` container list is shorter by n afterwards** — read it, do
+not infer it. This is the second reason instance ids must survive a restart: the
+daemon recognises its orphans only if it returns with the **same** id, which it
+does because the id is the grant hash and the grant persists in `services.toml`.
+**Fail:** `reason="reap_failed"`, or `removed=0` with a container still on the
+socket.
+
+> **The second FAIL clause — "or the count includes the agent's containers" — is
+> DELETED as unreachable.** `reap()` (`bin/node/src/compute/mod.rs`) destructures
+> the backend for its **own** `socket` and calls
+> `reap_by_label(socket, managed_label(grant.display_id()))`: the sweep is scoped
+> by **socket before the label is ever consulted**, and the agent daemon's
+> containers live in a different graph root that is **not enumerable through the
+> compute socket at all** (measured: 404). The function's own doc says so —
+> *"Unreachable by construction, not pending cleanup."* Assert the label scoping
+> in C-1, where it is observable, and assert the count here.
+>
+> **[§0.5 known-open] this step names a bug the design says should not happen.**
+> The design intent is re-**adoption**; the code reaps. The `reaped orphaned
+> sandbox containers` line firing is the *current* behaviour and the step's pass
+> criterion — but record it as evidence for the open "containers killed rather
+> than re-adopted across restart" bug, and do **not** also record R-4's
+> "re-adopts its container" half as a fresh finding.
 
 ---
 
@@ -1584,9 +2094,11 @@ persists in `services.toml`.
 Make the image store genuinely empty (do this **with the daemon stopped** —
 `PodmanService::claim` treats two supervisors on one root as the hazard it
 exists to prevent). **`rm -rf` does not work here**: this is a rootless overlay
-graph root, UID-mapped into a user namespace, so `rm -rf` exits 0 having removed
-the small readable fraction — leaving the images in place, so the "cold" run is
-warm, no pull happens, and the step passes having tested nothing.
+graph root, UID-mapped into a user namespace, so `rm -rf` **exits 1 having
+removed ~98% of the bytes** and left a small residue with the directory
+standing (P-4b has the measured numbers) — enough for the daemon to come back
+onto a store that is not empty, so the "cold" run may be warm, no pull happens,
+and the step passes having tested nothing.
 
 ```bash
 stop_by_config "service run compute"
@@ -1594,16 +2106,19 @@ podman unshare rm -rf "$WS/storage/services/compute/podman/storage"
 ```
 
 **Prove the store is actually empty before starting** — this assertion is the
-step:
+step, and per P-4b **`du` is trustworthy here**: it reports the same size inside
+and outside the user namespace.
 ```bash
 du -sh "$WS/storage/services/compute/podman/storage" 2>/dev/null   # gone, or ~0
 ```
 Restart the daemon, then:
 ```bash
+CSOCK=$(own_sock compute) || exit 1                                 # §0.1 rule 4
 curl -s --unix-socket "$CSOCK" http://d/v5.0.0/libpod/images/json   # MUST be []
 ```
 **If the image list is non-empty, the reap did not work and K-1 has not
-started.** Then submit one run (T1-7).
+started.** Then submit one run (T1-7) — **which needs T1-6's credential and a
+running airlock daemon** (T1-7's head note); K-1 is not credential-free either.
 
 **Expected behaviour, stated up front:**
 1. `create` POSTs `/containers/create`, gets **404 image not known**
@@ -1619,11 +2134,24 @@ started.** Then submit one run (T1-7).
 
 **Fail:** the run fails at create.
 
-> **The pull is completely invisible.** `crates/services/sandbox/src/podman_api.rs`
-> contains **zero `tracing::` calls**, so there is no "pull started"/"pull
-> finished" line and no duration. A cold first run looks exactly like a hang.
-> Budget several minutes for `node:22-slim` (~230-250 MiB) and say so in the
-> report; do not treat the silence as a wedge.
+> **CORRECTION: the pull is NOT invisible, and its two lines are this step's
+> best observable.** The old note said `podman_api.rs` contains *"zero
+> `tracing::` calls"*. It contains four, and three agents on the first pass
+> watched the pair fire, **~5–6 s per graph root** for `node:22-slim`:
+> ```
+> INFO ducktape::sandbox: pulling provider image into this service's store image=docker.io/library/node:22-slim
+> INFO ducktape::sandbox: provider image pulled image=docker.io/library/node:22-slim
+> ```
+> **Use them as the step's wait, not a stopwatch:**
+> ```bash
+> await_line "$LOGS/compute.log" 'pulling provider image into this service.s store'
+> await_line "$LOGS/compute.log" 'provider image pulled'
+> ```
+> They are `INFO` on `ducktape::sandbox`, so `RUST_LOG=info` is enough. Seeing
+> the **first** without the **second** is a genuinely stuck pull; seeing neither
+> means the store was not cold and the `podman unshare` reap above did not take.
+> Budget seconds, not "several minutes" — and if it does run long, it is a
+> network fact to report with a number, not a silence to excuse.
 
 > **A trap in the pull path itself:** libpod's pull endpoint returns **HTTP 200
 > on a *failed* pull** — the verdict is an `{"error":…}` line inside the
@@ -1637,11 +2165,26 @@ window, so a cold winner can lose its lease to its own image download.
 
 **The arithmetic does not support that story, and this step exists to settle
 it.** An agent run's lease is `RUN_LEASE_VIEWS = 1024` views
-(`crates/modules/apps/runs/src/lib.rs`) at `BLOCK_TIME = 1 s` ≈ **17
-minutes**; the host heartbeat fires every **10 s** (`compute/pool.rs`) and
-is `select`ed against the run future, so it covers the create/pull; and each
-renewal past the half-window resets expiry to `height + 1024`. No path was found
-that makes a `node:22-slim` pull outlast that.
+(`crates/modules/apps/runs/src/lib.rs`); the host heartbeat fires every **10 s**
+(`compute/pool.rs`) and is `select`ed against the run future, so it covers the
+create/pull; and each renewal past the half-window resets expiry to
+`height + 1024`. The measured pull is **~5–6 s** (K-1). Nothing comes close.
+
+> **CORRECTION: the window is ~8.5 minutes, not ~17.** The old figure multiplied
+> 1024 views by `BLOCK_TIME = 1 s`. `BLOCK_TIME` is the **idle** heartbeat only
+> — the constant's own doc says a busy chain *"has NO interval knob at all"* and
+> its rate is set by the network's agreement speed
+> (`crates/kernel/consensus/src/lib.rs`). **Measured on this chain: `height 2022
+> → 2042 over 10 s` — 2 blocks/s.** So 1024 views ≈ **8.5 min**, and the
+> conclusion is unchanged (a 6 s pull does not outlast 8.5 min) but **R-4's
+> "leave it down long enough for the lease to lapse" is a ~8.5 min wait, not
+> ~17.** Measure the rate on the day rather than trusting either number:
+> ```bash
+> h1=$("$D" node status -n "$CHAIN" --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["height"])')
+> read -r -t 10 </dev/zero; \
+> h2=$("$D" node status -n "$CHAIN" --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["height"])')
+> echo "blocks/s = $(( (h2 - h1) / 10 ));  lease window ≈ $(( 1024 * 10 / (h2 - h1) ))s"
+> ```
 
 > Do not confuse it with `JOB_RUN_LEASE_VIEWS = 1000` in the same file — a
 > different constant on the jobs lane.
@@ -1652,31 +2195,65 @@ lost.**
 **How to tell a pass from a failure:**
 - **PASS:** run completes; `grep -c 'lease_renew_failed' "$LOGS/compute.log"` = 0;
   the saga shows **one** attempt.
-- **RESIDUAL CONFIRMED (report loudly):** `recent_runs` shows the run on
-  `attempt: 1` or higher, **or** `lease_renew_failed` appears. Then capture
+- **RESIDUAL CONFIRMED (report loudly):** `saga_get "$SAGA"` shows `attempt=1`
+  or higher, **or** `lease_renew_failed` appears. Then capture
   `RUST_LOG=ducktape::saga=debug` output — the cause is either the `RenewLease`
   origin check refusing or the renew submit failing.
+  (**Not `recent_runs`** — it is `[]` for every `sched` saga; see T1-7's box.)
 - **NOTE:** on lease expiry the attempt is **cancelled and re-placed**, not
   dropped: `lease_and_request` recomputes the assignee by rendezvous over
   `(saga_id, attempt, height)`. `RUN_MAX_ATTEMPTS = 2`, so a *second* expiry
   fails the saga with `lease attempts exhausted`. Nothing is silently lost.
 - **There is no "lease lost" or "run re-placed" log line at all** — `saga` is a
   consensus module and emits no `tracing`. The only observable is committed
-  state via `SagaQuery`/`runs` queries.
+  state via `SagaQuery` `get`. (**`runs` queries are not an alternative here** —
+  a `sched` saga never enters either `runs` projection; T1-7's box.)
 
 ---
 
 ## 7. Restart and skew (R) — 4 steps
 
 ### R-1 — daemon restart keeps the instance id
+**Its stated observable could not fail. Replaced.**
+
+> **What was wrong.** It said *"`service status` shows the same
+> `compute#<hex8>`"*. `service status` renders the id out of the **grant file**,
+> and a daemon restart never touches `services.toml` — so that read returns the
+> same string whether or not the daemon came back, whether or not it came back
+> with the right id, and even if it never started. It is a read of the input,
+> presented as a read of the output.
+>
+> **The falsifiable observable is the daemon's own boot line.** `compute::serve`
+> logs `instance = %grant.display_id()` on `compute daemon serving`
+> (`bin/node/src/compute/mod.rs`) — a value the **restarted process** computed,
+> after re-reading and re-hashing the grant. That is what "the id survived a
+> restart" actually means.
+
 Stop and restart the compute daemon.
-**Pass:** `service status` shows the **same** `compute#<hex8>`; `services.toml`
-is unchanged; the daemon re-adopts its own containers (C-3).
-**Then** `service disable compute` + `service enable compute` and assert the id
-is **different** — a re-enable mints a fresh nonce and therefore a fresh id.
-That asymmetry is the consent-epoch property; both halves must hold.
-**[#829] Both halves now also report a height.** Record them; a re-enable that
-returns the same id *or* the same height would break the epoch property.
+```bash
+before=$(grep -o 'instance=compute#[0-9a-f]*' "$LOGS/compute.log" | tail -1)
+stop_by_config "service run compute"
+RUST_LOG=info,ducktape::service=debug,ducktape::saga=debug \
+  "$D" service run compute -n "$CHAIN" > "$LOGS/compute.out" 2>> "$LOGS/compute.log" &
+await_line "$LOGS/compute.log" 'compute daemon serving'
+after=$(grep -o 'instance=compute#[0-9a-f]*' "$LOGS/compute.log" | tail -1)
+echo "$before -> $after";  test "$before" = "$after"
+```
+**Pass:** two `compute daemon serving` lines from two different processes
+carrying the **same** `instance=`; `services.toml` unchanged (compare a hash).
+
+**Then** `service disable compute` + `service enable compute`, restart the
+daemon, and assert the **new** `compute daemon serving` line carries a
+**different** `instance=` — a re-enable mints a fresh nonce and therefore a
+fresh id. That asymmetry is the consent-epoch property; both halves must hold.
+**[#829] both halves also report a height** on the verb's stderr. Record them; a
+re-enable that returns the same id *or* the same height breaks the property.
+
+**Also record [§0.5 known-open]:** whether the old daemon's `podman system
+service` is still alive after `stop_by_config` returned
+(`pgrep -u "$USER" -x podman | wc -l` before and after). It is, today — that is
+the "daemon orphans its podman service on every stop path" bug, and it is why
+the restarted daemon can find a socket it did not create.
 
 ### R-2 — node restart, daemons still up
 
@@ -1739,8 +2316,37 @@ logs nothing**. Note the disagreement rather than treating either as the bug.
 **Two more behaviour changes to confirm while you are here:**
 - `service run` **does not refuse to start on a git-absent build**. It used to
   exit `this binary has no build identity; rebuild it from a git checkout`; it
-  now signals `build = "unknown"` and serves. Test it by building from a tarball
-  or with `.git` hidden.
+  now signals `build = "unknown"` and serves.
+
+  > **The method this step used to suggest — "with `.git` hidden" — silently
+  > produces a WRONG stamp, and a literal follower tests nothing.** `bin/noded/
+  > build.rs` shells out to `git`, and `git` **walks up**. Hiding a worktree's
+  > `.git` *file* does not make git absent: it finds the enclosing primary
+  > checkout and stamps **its** HEAD. You get a plausible-looking commit hash
+  > instead of `unknown`, the daemon signals a real build, and the step passes
+  > having exercised nothing. And `CLAUDE.md` **mandates** worktrees nested
+  > under the primary checkout (`<primary>/.worktree/<slug>`), so this is the
+  > normal case here, not an edge one.
+  >
+  > **Two methods that actually work:**
+  > ```bash
+  > # (a) a failing `git` shim, first on PATH — build.rs's git invocation fails,
+  > #     DUCKTAPE_BUILD is never emitted, build_identity() is None.
+  > mkdir -p "$TMPDIR/nogit" && printf '#!/bin/sh\nexit 127\n' > "$TMPDIR/nogit/git"
+  > chmod +x "$TMPDIR/nogit/git"
+  > PATH="$TMPDIR/nogit:$PATH" cargo build --release -p node-bin --bin ducktape
+  >
+  > # (b) a real tarball outside any checkout — no .git anywhere up the tree.
+  > git archive --format=tar HEAD | (mkdir -p "$TMPDIR/tarball" && tar -x -C "$TMPDIR/tarball")
+  > ```
+  > `$TMPDIR` is disk-backed and outside every worktree (§0.3), which method (b)
+  > requires and method (a) merely benefits from.
+  >
+  > **Confirm it before trusting it:** the daemon's hello must carry
+  > `build = "unknown"`, and `Skew::Unknown` **warns about nothing** — so the
+  > pass here is *`service run` starts and serves*, plus **zero**
+  > `reason="build_skew"` lines. A `build_skew` warn from this binary means git
+  > was not actually absent and you stamped the enclosing checkout.
 - the `enabled-but-absent` hint does not mention builds. It is
   `enabled but not signaling — is its daemon running (ducktape service run), and
   pointed at this node's http surface?` — **if you see the old text naming
@@ -1759,13 +2365,27 @@ P-2; both build refusals were deleted in this tree.
 > deliberately build an old binary.
 
 ### R-4 — restart inside vs beyond the lease window
+**Needs T1-6's credential** (`agent sched` requires `--cred`; §4's head note).
+
 Kill the compute daemon mid-run and restart it promptly.
-**Pass:** the daemon re-adopts its container and the saga stays on **attempt 0**
-(the lease is renewed from the restored heartbeat).
+**Pass:** the saga stays on **attempt 0** (the lease is renewed from the restored
+heartbeat), read with `saga_get "$SAGA"` — **`runs` queries do not see a `sched`
+saga at all** (T1-7's box), so `saga` `get` is the only read here, not
+"`runs`/`saga` queries".
+
+> **[§0.5 known-open] the "re-adopts its container" half will not hold today.**
+> The restarted daemon **reaps** its orphans rather than re-adopting them (C-3).
+> Record the reap, cite the open bug, and do **not** file it twice.
+
 Then repeat, leaving it down long enough for the lease to lapse: the attempt is
-cancelled and re-placed (attempt increments). With `RUN_MAX_ATTEMPTS = 2`, a
-second lapse fails the saga with `lease attempts exhausted`. Assert via
-`runs`/`saga` queries — there is no log line.
+cancelled and re-placed (`attempt` increments). With `RUN_MAX_ATTEMPTS = 2`, a
+second lapse fails the saga with `lease attempts exhausted`.
+
+**How long is "long enough": ~8.5 min on this chain, not the ~17 the old
+arithmetic implied** — `RUN_LEASE_VIEWS = 1024` at a **measured 2 blocks/s**
+(K-2 carries the one-liner that measures it; measure on the day). This is the
+longest single wait in the runbook — start it, and do something else.
+**Assert via `saga` `get` — there is no log line.**
 
 ---
 
@@ -1782,9 +2402,10 @@ second lapse fails the saga with `lease attempts exhausted`. Assert via
 > borrower to claim it. Under work admission's default the borrower will not bid
 > for a stranger's announcement — and an unpinned saga with no `deadline` can
 > never be cranked out of `Pending` (assumption-audit A9), so the symptom is a
-> **silent park**: no error, no timeout, nothing in `recent_runs`, forever. Run
-> the negative FIRST so the difference is observable, and never read "it is
-> still going" as slow.
+> **silent park**: no error, no timeout, `saga_get` stuck on `Pending` with
+> `assignee=False`, forever. Run the negative FIRST so the difference is
+> observable, and never read "it is still going" as slow.
+> (`recent_runs` is not the read here or anywhere in this runbook — T1-7's box.)
 
 **X-1a — the negative, before `node work admit`.** Disable compute on the dev
 box; leave it enabled and serving on the borrower. Submit an unpinned run from
@@ -1795,8 +2416,8 @@ refused`** (the claim lane's message, distinct from T2-5's `compute attempt
 refused`) for that saga — once, because the decision is latched — the saga stays
 `Pending` with `assignee: null`, and **no container is created**:
 ```bash
-curl -s http://127.0.0.1:9971/v1/query -H 'content-type: application/json' \
-  -d '{"target":"saga","query":{"get":{"saga_id":"'"$SAGA"'"}}}'
+saga_get "$SAGA"                                   # T1-7's helper
+CSOCK=$(own_sock compute) || exit 1                # on the BORROWER — §0.1 rule 4
 curl -s --unix-socket "$CSOCK" 'http://d/v5.0.0/libpod/containers/json?all=true'   # unchanged
 ```
 **Fail:** the run executes anyway (the claim lane is ungated), or the saga parks
@@ -1898,16 +2519,39 @@ make wasm-modules-check
 **Pass:** all three green.
 **Fail:** any difference → a service change reached consensus, which it must not.
 
-> **The test does not replace the cross-box comparison, and this is the one part
-> of V-1 that stays manual.** The pin proves *this tree's* composed genesis is
-> unmoved. It says nothing about whether box A and box B agree. Keep that half:
+> **THE PINNED HASH IS NOT THE HASH ANY REAL NODE LOGS. Do not compare them.**
+> `GENESIS_ROOT_HASH` is composed over `PIN_BINDINGS` — literally
+> `{ invite: b"parity-test", identity_chain_id: "parity-test" }` — and the
+> constant's own doc explains why: each binding rides its module's store as a
+> genesis `__config` record, so *"a real network's invite namespace and chain id
+> put it on its own root **by design**"*. A live `w2qa#…` node composes over its
+> **own** chain id and invite namespace and will log a different 64 hex
+> characters. An operator who diffs `daemon.log`'s `genesis root_hash=` against
+> the constant will conclude consensus moved. **It did not.** The two answer
+> different questions: the test says "this tree's genesis composition is
+> unmoved"; the cross-box comparison says "these two nodes agree with each
+> other".
+>
+> **The cross-box half stays manual, and it has a trap of its own.**
 > ```bash
 > grep 'genesis root_hash=' "$WS/daemon.log" | tail -1     # on BOTH boxes
 > "$D" node status -n "$CHAIN"                             # on BOTH boxes
 > ```
-> and assert the two are byte-identical. Drop the old "compare against T1-1"
-> half — the test covers it and does so without a human transcribing 64 hex
-> characters.
+> assert the two are byte-identical **to each other**, never to the constant.
+> But `genesis root_hash=` is logged **once, at genesis, and only on a fresh
+> boot**: `bin/node/src/validator/engine.rs` emits it under
+> `if resumed.is_none()`, and a restored boot prints its recovered line instead.
+> So on a **restarted** node, a **rotated** `daemon.log`, or a **state-synced
+> joiner**, that grep finds nothing — which is not a mismatch and is not
+> evidence of anything.
+>
+> **Capture it at T1-1, on each box's first boot, and carry the value forward.**
+> If you reach V-1 with an empty grep, say `NOT-CAPTURED(restarted/synced)` —
+> do **not** restart a node to make the line reappear, because a fresh genesis
+> is exactly what a restart does not produce.
+>
+> Drop the old "compare against T1-1" half of the *tree* pin — the test covers
+> it without a human transcribing 64 hex characters.
 
 > Do not confuse it with the sim pin. `DEFAULT_GENESIS_ROOT_HASH` in
 > `bin/simnode/tests/topology_set.rs` is a **different** hash over a
@@ -1917,32 +2561,124 @@ make wasm-modules-check
 > **not** the consensus pin.
 
 ### V-2 — `/v1` additive only
-**As written this could not fail. Re-anchored.**
+**Re-anchored TWICE. Both earlier forms could not fail, for different reasons.**
 
-The old form was `git diff origin/dev...HEAD -- bin/noded/src/lib.rs | grep '^-.*\.route('`.
-On this tree that diff is **empty by construction** — the pass runs *on* dev, so
-the grep returns 0 no matter what the route table says. It was a green light
-wired to nothing.
+> **Form 1 — `git diff origin/dev...HEAD -- bin/noded/src/lib.rs | grep '^-.*\.route('`.**
+> Empty by construction: the pass runs *on* dev.
+>
+> **Form 2 — baseline the route list at P-2, diff it at V-2.** Also empty by
+> construction, and this one *looked* like a real check. Both reads come from
+> **the same immutable checkout**, and P-2 asserts `git status --porcelain` is
+> empty, so the two files are identical no matter what the router does.
+> **Proven:** deleting the entire multi-line `/v1/files/stage` route block from a
+> scratch copy left the count at **33** and the diff **empty**.
+>
+> **Form 2's extractor was also blind to 11 of the 44 routes — 25%.**
+> `grep -oE '\.route\("(/v1[^"]*)"'` matches only when the path literal shares a
+> line with `.route(`, and it read only `lib.rs`. It missed:
+> - **six multi-line routes in `lib.rs`** — `/v1/gateway/proxy`,
+>   `/v1/files/blob`, `/v1/files/stage`, `/v1/files/object/{*path}`,
+>   `/v1/fs/workspaces/{id}/commit`, `/v1/fs/workspaces/{id}` (each wrapped
+>   because it carries a `DefaultBodyLimit` layer);
+> - **all five `/v1/admin/*` routes**, which live in `bin/noded/src/admin.rs` and
+>   are `merge`d into the same public router.
+>
+> A route-removal check that cannot see a quarter of the routes, comparing a
+> file against itself, is the exact shape §0.1 rule 3 forbids.
 
-Assert the route table itself instead:
+**The baseline is the committed list below** — this document is checked in, so
+the list is a real prior artifact rather than a second read of the tree under
+test. The extractor is multi-line-aware and reads **both** router files.
 
 ```bash
-# at P-2, once:
-routes() { grep -oE '\.route\("(/v1[^"]*)"' bin/noded/src/lib.rs | sed 's/.*("//' | sort; }
-routes > "$LOGS/routes.baseline"        # NOT /tmp — §0.3
-wc -l < "$LOGS/routes.baseline"         # 33 on this tree; record it
+# at P-2 (already run) and again at V-2:
+v1_routes() {
+  cat bin/noded/src/lib.rs bin/noded/src/admin.rs \
+    | tr '\n' ' ' | grep -oE '\.route\( *"/v1[^"]*"' \
+    | sed 's/.*"\(.*\)"/\1/' | sort -u
+}
+v1_routes > "$LOGS/routes.now"          # NOT /tmp — §0.3
+wc -l < "$LOGS/routes.now"              # 44
 
-# at V-2, at the end of the pass:
-routes > "$LOGS/routes.now"
+# save the block below as $LOGS/routes.baseline, then:
 diff "$LOGS/routes.baseline" "$LOGS/routes.now"
+```
+
+**The committed baseline — 44 routes, `dev` @ `feec0a6db`:**
+
+```
+/v1/admin/logs/tail
+/v1/admin/module-code/stage
+/v1/admin/module-code/{digest}
+/v1/admin/ping
+/v1/admin/shutdown
+/v1/blocks
+/v1/call/ws
+/v1/files/blob
+/v1/files/blob/{digest}
+/v1/files/commit
+/v1/files/diff
+/v1/files/find
+/v1/files/grep
+/v1/files/has-chunks
+/v1/files/history
+/v1/files/ls
+/v1/files/object/{*path}
+/v1/files/pin
+/v1/files/read
+/v1/files/refs
+/v1/files/stage
+/v1/files/stat
+/v1/files/watch
+/v1/fs/workspaces
+/v1/fs/workspaces/{id}
+/v1/fs/workspaces/{id}/commit
+/v1/gateway/browser
+/v1/gateway/proxy
+/v1/index/status
+/v1/index/{module}/ops
+/v1/index/{module}/scan
+/v1/index/{module}/view
+/v1/log-filter
+/v1/peers
+/v1/presence/ws
+/v1/query
+/v1/services
+/v1/services/hello
+/v1/status
+/v1/submit
+/v1/submit/frame
+/v1/term/sessions
+/v1/term/sessions/{id}/close
+/v1/ws
 ```
 
 **Pass:** `diff` is empty, **or** contains only `>` lines (additions). New routes
 are fine; a changed or removed one is a wire break.
-**Fail:** any `<` line — a route present at P-2 and gone at V-2.
+**Fail:** any `<` line — a route in the committed baseline and gone from the
+tree. **Also fail** on a count that is not 44 with an empty diff, which would
+mean the extractor itself broke.
 
-This also gives the report a concrete number — the `/v1` surface is 33 routes on
-this tree — instead of an unfalsifiable "additive only".
+**Self-check the check, once, before trusting it** — this is the cheapest thing
+in the runbook and it is what caught form 2:
+```bash
+cp bin/noded/src/lib.rs "$TMPDIR/lib.rs.bak"
+python3 - <<'PY'
+import re,pathlib
+p = pathlib.Path("bin/noded/src/lib.rs"); s = p.read_text()
+p.write_text(s.replace('"/v1/files/stage"', '"/v1/files/DELETED-CANARY"', 1))
+PY
+diff "$LOGS/routes.baseline" <(v1_routes)   # MUST show `< /v1/files/stage`
+cp "$TMPDIR/lib.rs.bak" bin/noded/src/lib.rs
+git diff --quiet bin/noded/src/lib.rs && echo "restored"
+```
+If that diff is empty, the extractor is broken and V-2 is worthless — fix the
+extractor before reading its verdict.
+
+This also gives the report a concrete number — **the `/v1` surface is 44 routes,
+39 public plus 5 under `/v1/admin/*`** — instead of an unfalsifiable "additive
+only". Note the admin five are only *mounted* when `exposure.enabled()`
+(V-4); they are in the source inventory either way.
 
 ### V-3 — no credential name or token in any log
 **Assert the logs exist first.** The old form was three greps expecting empty
@@ -1957,11 +2693,49 @@ wc -l "$WS/daemon.log" "$LOGS"/*.log     # record; a suspiciously short file is 
 
 Then:
 ```bash
-grep -rniE 'admin\.token|service-link|sk-|Bearer |accessToken|refreshToken' \
-     "$WS/daemon.log" "$LOGS"/*.log | grep -v 'admin.token in the node' | head
+# NOTE the [0-9a-f]{64} arm. Without it this grep cannot see either secret
+# this runbook actually mints — see the box below.
+grep -rniE 'admin\.token|service-link|sk-|Bearer |accessToken|refreshToken|[0-9a-f]{64}' \
+     "$WS/daemon.log" "$LOGS"/*.log | grep -v 'admin.token in the node' | head -40
 ```
-**Pass:** no secret **values**. A credential **name** legitimately appears
-(`credential=<name>` on the airlock grant gate) — that is by design; the
+
+> **The old pattern was blind to both secrets this pass creates.** `admin.token`
+> and `service-link.token` are **bare 64-lowercase-hex with no prefix** — no
+> `sk-`, no `Bearer `, no JSON key. Every alternative in the old pattern matched
+> only the **filename**, never the value. **Proven:** a synthetic log line
+> carrying a real 64-hex token was invisible to it. `[0-9a-f]{64}` is what
+> closes it.
+>
+> **It is a noisy arm, deliberately, and the noise is the work.** 64 hex also
+> matches root hashes, digests, saga ids and node keys — all of which are
+> legitimately logged. So this arm is a **review list, not a boolean**: read
+> every hit and classify it. To make that tractable, diff the hits against the
+> two values you already hold, without ever printing them:
+> ```bash
+> # exit 1 if either minted secret appears verbatim anywhere. Prints NO secret.
+> python3 - "$WS" "$LOGS" <<'PY'
+> import pathlib,sys,glob
+> ws, logs = pathlib.Path(sys.argv[1]), sys.argv[2]
+> secrets = {n: (ws/n).read_text().strip() for n in ("admin.token","service-link.token")
+>            if (ws/n).exists()}
+> bad = 0
+> for f in [str(ws/"daemon.log"), *glob.glob(logs+"/*.log")]:
+>     try: text = pathlib.Path(f).read_text(errors="replace")
+>     except OSError: continue
+>     for name, value in secrets.items():
+>         if value and value in text:
+>             print(f"LEAK: {name} appears verbatim in {f}"); bad = 1
+> print("clean" if not bad else "LEAKED"); sys.exit(bad)
+> PY
+> ```
+> That is the falsifiable half; the `head -40` above is the exploratory half.
+> **Run both. Neither replaces the other**, and note the pass must re-run the
+> exact-value check **after every node restart** (R-2 mints fresh ones, so a
+> check run only at the end tests only the last pair).
+
+**Pass:** the exact-value check exits 0, **and** every `[0-9a-f]{64}` hit is
+classified as a hash/id in the report. A credential **name** legitimately
+appears (`credential=<name>` on the airlock grant gate) — that is by design; the
 **account** never does, and neither does any token.
 
 Also assert the doctrine directly: **no URI path or query string is logged** —
@@ -1984,28 +2758,70 @@ the one under test:
 | wrong header value | **403** | `operator_token_mismatch` |
 | correct header | **200** | — |
 | from off-box (tailnet IP) | **403** | `admin_off_box` |
-| with `DUCKTAPE_ADMIN=off` | **404** | `admin_namespace_absent` |
+| with `DUCKTAPE_ADMIN=off` | **404** | **none — assert an EMPTY body** |
 
-Body shape is `{"error":…,"reason":…}`. **Node-side the refusal is logged at
-`debug`**, target `ducktape::admin` — set `RUST_LOG=ducktape::admin=debug` or you
-will see nothing.
+> **Row 5's `admin_namespace_absent` is unreachable on `ducktape node run`.**
+> `AdminExposure::Disabled` does map to `AdminRefusal::NamespaceAbsent` in
+> `admit_gate` — but under `DUCKTAPE_ADMIN=off` **that gate never runs**, because
+> `bin/noded/src/lib.rs` merges `admin::admin_router` only
+> `if handle.admin.exposure.enabled()`. The routes are never registered, so
+> axum's plain fallback answers: a **bare 404 with an empty body and no
+> `reason` field at all**. The comment at the merge says exactly this —
+> *"`Disabled` leaves the control surface simply ABSENT (a 404), not a
+> gated-but-present route."* The token is reachable only from a unit test.
+>
+> **Assert the 404 AND the empty body**, which is the observable difference
+> between "absent" and "present but refusing":
+> ```bash
+> DUCKTAPE_ADMIN=off  # on the NODE's environment, then restart it
+> curl -s -o "$TMPDIR/body" -w '%{http_code} %{size_download}\n' \
+>   "http://127.0.0.1:$HTTP/v1/admin/ping"      # -> `404 0`
+> ```
+> **Fail:** a 404 with a JSON body naming `admin_namespace_absent` — that would
+> mean the router is being mounted and then refusing, which is not the design.
+
+Body shape for every **other** row is `{"error":…,"reason":…}`. **Node-side the
+refusal is logged at `debug`**, target `ducktape::admin` — set
+`RUST_LOG=ducktape::admin=debug` or you will see nothing.
 On an **owned** node (post-T1-6) the same requests yield `not_the_owner` /
 `owner_signature_invalid` instead; assert that too, and that
 `ducktape user sign-admin` produces headers the node accepts.
 
 ### V-5 — no daemon holds the node private key
+**The fd probe could not fail. The structural test is now the pass criterion.**
+
+> **Why the fd probe proves nothing.** It counted `identity.key` in
+> `/proc/<pid>/fd` and expected `0` for each daemon. Measured on the first pass:
+> **`identity.key_fds` is `0` for the NODE ITSELF** — the process that
+> unambiguously does read the key. It opens the file, reads it, and **closes**
+> it, so an instantaneous fd scan sees nothing. **A daemon that stole the key
+> exactly as the node does would score 0 and pass.** The probe measures "is a
+> file handle open at this microsecond", which is not the property.
+
+**The pass criterion is the source-parsing lint test**, which is green on this
+tree and cannot be satisfied by timing:
+
+```bash
+cargo test -p node-bin --bin ducktape the_daemon_path_cannot_name_the_node_key
+```
+
+It parses `bin/node/src/services.rs` and fails the build if the daemon path
+*mentions* the key at all — a static property, unaffected by when anything is
+open. Alongside it: `ServiceConfig` has no field a secret could live in,
+`resolve_service` never opens `identity.key`, and containment runs one way
+(`Resolved` holds a `ServiceConfig`, never the reverse).
+
+**The fd probe is demoted to a note, not deleted** — it is still worth running
+because a **non-zero** count would be a real finding (a daemon holding the file
+open is unambiguously wrong). A **zero** is simply not evidence:
 ```bash
 for p in $(pgrep -u "$USER" -x ducktape); do
   tr '\0' ' ' < "/proc/$p/cmdline" | grep -q 'service run' || continue
-  # a daemon must never have identity.key open
-  ls -l "/proc/$p/fd" 2>/dev/null | grep -c 'identity.key'
+  printf 'pid %s identity.key fds: %s\n' "$p" \
+    "$(ls -l "/proc/$p/fd" 2>/dev/null | grep -c 'identity.key')"
 done
 ```
-**Pass:** `0` for every daemon process, and the **node** process is the one that
-answers for the identity. Structural proof: `ServiceConfig` has no field a secret
-could live in, `resolve_service` never opens `identity.key`, containment runs
-one way (`Resolved` holds a `ServiceConfig`, never the reverse), and there is a
-source-parsing lint test on it (`the_daemon_path_cannot_name_the_node_key`).
+Report it as `informational (0 is not evidence — the node scores 0 too)`.
 
 **Also assert the honest caveat**, and put it in the report next to §0.4's:
 `/v1/status` carries no auth, so a same-uid process that binds `http_listen`
@@ -2198,8 +3014,10 @@ Not exercised by any step here — see §0.4b.
   `pkill -f`. **It does not know about rootless podman storage** — a worktree it
   removes may leave a UID-mapped graph root behind (P-4b). Reap storage first.
 - **`ops/agent-system` — unaffected.** Only `/v1/query` and `/v1/submit`. Still
-  the fastest way to read `runs pending_runs` / `recent_runs` and
-  `capability all`.
+  the fastest way to read `capability all`. **But its `runs pending_runs` /
+  `recent_runs` reads are the wrong lane for an `agent sched` run** — both are
+  `[]` for every `sched` saga (T1-7's box). Use `saga get` on
+  `"sched\x1f<dispatch>"`. Worth a line in that script's own help.
 - **`ops/demo-seed.sh`, `demo-app.sh`, `demo-gateway.mjs`, `demo-kanban.mjs`,
   `dogfood-forge.sh` — unaffected.**
 - **`CLAUDE.md`'s `/v1/log-filter` recipe — still correct.** That route is not
@@ -2244,12 +3062,29 @@ For each step: `PASS` / `FAIL(<reason token or log line>)` /
 
 Plus, at the top:
 - the pass's SHA from P-2 and whether the tree was clean
-- the `/v1` route count from V-2, and the baseline diff
-- both boxes' genesis root hash (must match each other), and the result of
-  `production_genesis_root_hash_is_pinned`
-- the pre-publish window measured in T1-1
-- `df -h /tmp` before and after, and the P-4b storage figure
+- **§0.1 rule 6's environment block** — SET/unset for every variable, before the
+  first step
+- the `/v1` route count from V-2 (**44**), the baseline diff, and whether the
+  canary self-check showed `< /v1/files/stage`
+- both boxes' genesis root hash **compared to each other only** (V-1), and the
+  result of `production_genesis_root_hash_is_pinned` — **never the two compared
+  to one another**
+- the warm-restart publish→committed-height gap measured in T1-1 (the
+  pre-publish window is closed; §0.1)
+- the measured **blocks/s** and the derived lease window (K-2's one-liner)
+- `df -h /tmp` before and after, and the P-4b `du` figures (before/after,
+  **not** exit codes)
 - every step that was BLOCKED or EXPECTED-REFUSAL, and why
+- **which §0.5 known-open bugs this pass observed**, and where — they are not
+  new findings
+- **whether the credential was the user-supplied throwaway or something
+  else.** Anything imported through `DUCKTAPE_CRED_REUSE_ARTIFACT` without the
+  user's artifact is unverified and every credential-dependent verdict inherits
+  that (§0.1 rule 6, T1-7's caveat).
+- **the airlock-dependency finding, re-verified or not** (T1-7): whether an
+  `agent sched --cred` run reaches the provider with **no** airlock daemon
+  running. The first pass says it does not; that observation was made with a
+  fabricated credential and needs one more run.
 - **the honest list of what this did not prove** — copy §0.4 verbatim, including:
   - `/v1` is trusted-local; `origin_guard` passes every `Origin`-less caller
   - `grant.scopes` gates nothing
@@ -2270,15 +3105,45 @@ Plus, at the top:
 | 1. Preconditions (P) | 9 |
 | 2. Tier 1 (T1) | 8 |
 | 3. Tier 2 (T2) | 7 (incl. T2-4b) |
-| 4. On/off isolation (I) | 6 |
+| 4. On/off isolation (I) | 7 (I-3 split into I-3a/I-3b) |
 | 5. Podman co-tenancy (C) | 3 |
 | 6. Cold start (K) | 2 |
 | 7. Restart and skew (R) | 4 |
 | 8. Cross-node placement (X) | 3 (X-1 has two halves) |
 | 9. Invariants (V) | 5 |
-| **total** | **47** |
+| **total** | **48** |
 
-Twelve of those carry a **deliberate-failure half** that must be run first:
-T1-3, T1-7, T1-8, T2-4, T2-5, T2-6, I-0, K-1, R-3, X-1a, X-2, and P-9's
-`DUCKTAPE_ALLOW_MISSING_TOOLS` check. A pass that skipped the negatives has not
-established that any of the positives can fail.
+Fourteen carry a **deliberate-failure half** that must be run first: T1-3, T1-6
+(P-6's flat-spelling half), T1-7, T1-8, T2-4, T2-5, T2-6, I-0, I-3a, I-3b, K-1,
+R-3, X-1a, X-2, plus P-9's `DUCKTAPE_ALLOW_MISSING_TOOLS` check and V-2's
+canary. **A pass that skipped the negatives has not established that any of the
+positives can fail** — and the first execution is the proof: eight of this
+document's positives could not fail at all until it ran.
+
+### What the repair changed, by verdict
+
+Read this before comparing a report against an older run of the same step ids.
+
+**Steps whose pass criterion changed — an old PASS does not carry over:**
+P-3, P-4 (a+b), P-6, P-9, T1-2, T1-7, I-2, I-3 (now I-3a/I-3b), C-3, K-1, K-2,
+R-1, R-3, R-4, V-1, V-2, V-3, V-4, V-5.
+
+**Assertions deleted as unreachable, and why** (each is documented at its step —
+an assertion nothing can trip reads as coverage and is worse than none):
+- **C-1's `io.ducktape.managed=unscoped` FAIL** — `UNSCOPED_OWNER` is
+  overwritten on the next line by `discover_with_sink`; every other producer is
+  `#[cfg(test)]` on `SandboxBackend::Bare`, which never creates a container.
+- **C-3's "the count includes the agent's containers" FAIL** — the reap is
+  scoped by socket before the label is read, and the agent's containers are not
+  enumerable through the compute socket (measured: 404).
+- **V-4 row 5's `admin_namespace_absent` reason** — the admin router is not
+  merged under `DUCKTAPE_ADMIN=off`, so the gate never runs; replaced with the
+  bare-404-plus-empty-body assertion.
+- **P-9's `grep -c 'compute daemon serving' "$LOGS"/*.log`** — no daemon exists
+  in `$LOGS` at precondition time and `dispatch_e2e` logs elsewhere; replaced
+  with the zero-tests check.
+- **V-5's fd probe as a criterion** — the node itself scores 0; demoted to a
+  note, with the structural lint test as the criterion.
+- **R-1's `service status` id read** — a read of the grant file, presented as a
+  read of the daemon; replaced with the restarted process's own
+  `compute daemon serving instance=` line.
