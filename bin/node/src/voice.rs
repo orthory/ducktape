@@ -2047,24 +2047,25 @@ mod overlay_e2e {
             node_key,
             raw_key,
             ula,
-            // the two addresses here belong to DIFFERENT layers and must not be
-            // confused: `ula` is the tunnel INTERIOR `/128` (v6, above), while
-            // this is the UNDERLAY endpoint the peer dials — a real IPv4 socket,
-            // the same family production crosses. A v6 literal here sends every
-            // handshake initiation into a socket that cannot carry it, and the
-            // tunnel never comes up (HANDSHAKE(REKEY_TIMEOUT), forever).
+            // a placeholder: the real value is the bound underlay address,
+            // copied WHOLE below. The two addresses on this struct belong to
+            // DIFFERENT layers and must not be confused — `ula` is the tunnel
+            // INTERIOR `/128` (v6, above), this is the UNDERLAY endpoint a peer
+            // dials. Writing a v6 literal here sends every handshake initiation
+            // into a socket that cannot carry it, and the tunnel never comes up
+            // (HANDSHAKE(REKEY_TIMEOUT), forever, surfacing only as a timeout).
             endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         };
         node.effect.create_interface().expect("create interface");
         node.effect
             .apply(&config(&node, 0, Vec::new()))
             .expect("first apply binds the underlay");
-        let bound = node.effect.local_underlay_addr().expect("underlay bound");
-        assert!(
-            bound.is_ipv4(),
-            "the underlay must bind a real IPv4 socket, got {bound}"
-        );
-        node.endpoint.set_port(bound.port());
+        // take the whole bound address, not just its port: copying the port
+        // onto a hand-written literal is what let the family drift out of sync
+        // in the first place, and an assertion on the literal would still pass
+        // while the test timed out. Whatever the underlay actually bound IS the
+        // endpoint, by construction.
+        node.endpoint = node.effect.local_underlay_addr().expect("underlay bound");
         node
     }
 

@@ -75,11 +75,22 @@ impl Daemon {
     fn await_status(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
+            // liveness BEFORE the probe, never after. If our child lost a race
+            // for the port and exited, something else is listening on it — and
+            // a probe-first loop would take that stranger's 200 as our own
+            // readiness and silently drive ANOTHER test's daemon for the whole
+            // test. That failure surfaces far downstream as an impossible
+            // assertion (a height that moved on a daemon we never submitted
+            // to), which is exactly the kind of ghost that costs a day.
+            if let Some(status) = self.child.try_wait().expect("poll daemon") {
+                panic!(
+                    "daemon for port {} exited during startup ({status}) — see stderr above. \
+                     If something still answers that port, it is NOT ours.",
+                    self.port
+                );
+            }
             if let Ok((200, _)) = self.try_request("GET", "/v1/status", None) {
                 return;
-            }
-            if let Some(status) = self.child.try_wait().expect("poll daemon") {
-                panic!("daemon exited during startup ({status}) — see stderr above");
             }
             assert!(
                 Instant::now() < deadline,
@@ -947,8 +958,19 @@ fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
     );
 
     // the whole blob lane is off-consensus: no blocks, no root-hash movement.
+    //
+    // a non-zero height here means SOMETHING committed a block, and this test
+    // submits no op at all — so the interesting evidence is what that block
+    // holds, not the number. `/v1/blocks` names the op, which is what tells a
+    // real "the blob lane started committing" regression apart from this
+    // daemon not being ours at all.
     let status = daemon.status();
-    assert_eq!(status["height"], 0, "blob puts must not commit blocks");
+    let (_, blocks) = daemon.request("GET", "/v1/blocks", None);
+    assert_eq!(
+        status["height"], 0,
+        "blob puts must not commit blocks — height moved to {}, blocks: {}",
+        status["height"], blocks["blocks"]
+    );
     assert_eq!(
         status["root_hash"].as_str(),
         Some(genesis_hash.as_str()),

@@ -116,22 +116,57 @@ pub fn http_status(port: u16, method: &str, path: &str) -> Option<u16> {
         .map(|(status, _)| status)
 }
 
-/// one free localhost port. fine for a single port; for N distinct ports at
-/// once use [`alloc_ports`], which holds every listener so the OS can't hand the
-/// same port back twice.
+/// one free localhost port, never one this process already handed out.
 pub fn free_port() -> u16 {
     alloc_ports(1)[0]
 }
 
-/// `n` DISTINCT free localhost ports, allocated by holding every listener open
-/// AT ONCE — a sequential bind-drop loop can (and on a busy box does) hand the
-/// same port back twice, wedging two nodes onto one port.
+/// every port this process has ever handed out. a probe listener only reserves
+/// its port until it is dropped, and the caller does not bind for real until
+/// some time later — a spawned daemon takes a whole genesis to get there. In
+/// that gap the port is genuinely free, so the OS will hand it to the next
+/// `bind(:0)`, and TWO harnesses walk away believing they own it. This is the
+/// gap that a per-call listener set cannot see, because the collision is
+/// between DIFFERENT calls.
+static HANDED_OUT: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// `n` free localhost ports, distinct from each other AND from every port this
+/// process handed out earlier.
+///
+/// Two guards, for two different collisions. Holding all `n` listeners at once
+/// stops one call from returning the same port twice. [`HANDED_OUT`] stops it
+/// across calls — the case that actually bites, because the window is as long
+/// as the caller takes to bind, not as long as this function runs.
+///
+/// A port that loses the [`HANDED_OUT`] check is dropped IMMEDIATELY rather
+/// than held aside during the retry: its owner may be about to bind it for
+/// real, and squatting on it while we look for another would break the very
+/// daemon we are trying not to collide with.
 pub fn alloc_ports(n: usize) -> Vec<u16> {
-    let listeners: Vec<TcpListener> = (0..n)
-        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind port-0 probe"))
-        .collect();
-    listeners
-        .iter()
+    // one allocation at a time: two threads probing concurrently would each
+    // check `HANDED_OUT` before the other inserted, and hand out the same port.
+    let mut handed = HANDED_OUT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut keep: Vec<TcpListener> = Vec::with_capacity(n);
+    // the ephemeral range is tens of thousands wide and cycles, so a repeat is
+    // rare and a second probe effectively always advances; the cap turns an
+    // exhausted range into a named failure instead of a hang.
+    for _ in 0..(n + 1024) {
+        if keep.len() == n {
+            break;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind port-0 probe");
+        let port = listener.local_addr().expect("probe addr").port();
+        if handed.insert(port) {
+            keep.push(listener);
+        }
+    }
+    assert_eq!(
+        keep.len(),
+        n,
+        "could not find {n} localhost ports this process has not already used"
+    );
+    keep.iter()
         .map(|l| l.local_addr().expect("probe addr").port())
         .collect()
 }
