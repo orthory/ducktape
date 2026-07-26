@@ -702,14 +702,24 @@ impl Cluster {
 
     /// spawn node `idx`'s compute daemon, when it has a grant to act under.
     ///
-    /// It retries its node internally, so ordering against `spawn` does not
-    /// matter. `--config` points it at the SAME dev-shape config the node
-    /// reads (a dev workspace is its `storage_dir`, which does not contain the
-    /// config file, so `--workspace` cannot name it).
+    /// Waits for the node's app surface FIRST, and that is not politeness: the
+    /// daemon's opening move is a `/v1/services/hello` POST whose failure is
+    /// deliberately fatal (`run_service`: "the FIRST hello must land ... a build
+    /// mismatch or a down node is a loud exit, not a silent spin"). Only the
+    /// query lane retries. Launching both processes in the same breath therefore
+    /// killed the daemon outright whenever it won the race to the socket —
+    /// observed as `FATAL: POST http://…/v1/services/hello` — which is a
+    /// coin-flip, not a test. An operator starts a service against a node that
+    /// is already up, and so does this.
+    ///
+    /// `--config` points it at the SAME dev-shape config the node reads (a dev
+    /// workspace is its `storage_dir`, which does not contain the config file,
+    /// so `--workspace` cannot name it).
     fn spawn_compute(&mut self, idx: usize) {
         if self.compute_grant.is_none() {
             return;
         }
+        self.wait_marker(idx, "app surface listening", Duration::from_secs(90));
         let id = self.peer_ids[idx];
         let cfg = self.config_path(idx);
         let log = self.dir.path().join(format!("compute{id}.log"));
@@ -936,23 +946,92 @@ impl Cluster {
     /// poll node `idx`'s log until a line contains `marker`, returning the
     /// rest of that line. fails fast if the process exits without printing it.
     pub fn wait_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {
-        let deadline = Instant::now() + timeout;
+        // (in-seam refactor: the loop body is shared with the compute-daemon
+        // twin below, so it moved to `await_marker` verbatim.)
+        match await_marker(self.nodes[idx].as_mut().expect("node is running"), marker, timeout) {
+            Ok(rest) => rest,
+            Err(why) => panic!("node {why} without printing {marker:?};\n{}", self.all_log_tails(60)),
+        }
+    }
+
+    /// poll node `idx`'s COMPUTE DAEMON log until a line contains `marker`.
+    ///
+    /// The compute plane is a SEPARATE PROCESS with its own failure domain, and
+    /// without this the suite has no eye on it at all: a daemon that exits at
+    /// boot — an unconfigured `[sandbox]`, a podman it cannot probe, a hello that
+    /// raced its node — leaves a cluster that looks perfectly healthy, because
+    /// the node is. The suite then waits out a three-minute convergence budget
+    /// and fails on whatever unrelated predicate it happened to be holding,
+    /// while the daemon's one-line FATAL sits unread in a log nothing prints.
+    /// That is exactly how a compute plane that could not claim ANY work reached
+    /// review, so gating on the daemon's own lifecycle marker is the fix.
+    pub fn wait_compute_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {
+        let daemon = self.daemons[idx]
+            .as_mut()
+            .expect("node has a compute daemon (set `compute_grant` before spawn)");
+        let log = daemon.log.clone();
+        match await_marker(daemon, marker, timeout) {
+            Ok(rest) => rest,
+            Err(why) => panic!(
+                "compute daemon {why} without printing {marker:?};\n\
+                 --- compute daemon log ---\n{}",
+                log_tail(&std::fs::read_to_string(&log).unwrap_or_default(), 60),
+            ),
+        }
+    }
+
+    /// Wait until `probe` answers, re-evaluating it ONCE PER BLOCK.
+    ///
+    /// The event-driven replacement for a sleep-and-retry poll: the thread
+    /// blocks on node `idx`'s ws stream and re-reads committed state only when
+    /// the chain itself says a block landed (see [`BlockFeed`]). Committed state
+    /// cannot change without a block, so between two frames there is by
+    /// construction nothing new to find — which is exactly what makes a timed
+    /// poll of this predicate a disguised timeout, and this not one.
+    ///
+    /// Derived read models (`/v1/index/...`) apply BEHIND finalized state, so a
+    /// predicate over one simply satisfies a block or two later; the loop is
+    /// already per-block, so that costs nothing but patience.
+    pub fn await_committed<T>(
+        &self,
+        idx: usize,
+        what: &str,
+        timeout: Duration,
+        mut probe: impl FnMut() -> Option<T>,
+    ) -> T {
+        // committed state may already satisfy it — never wait on a block that
+        // has nothing left to deliver (and the chain may be idle-quiet).
+        if let Some(value) = probe() {
+            return value;
+        }
+        let mut blocks = self.block_feed(idx, timeout);
         loop {
-            let node = self.nodes[idx].as_mut().expect("node is running");
-            let text = std::fs::read_to_string(&node.log).unwrap_or_default();
-            if let Some(rest) = find_marker(&text, marker) {
-                return rest;
-            }
-            let exited = node.child.try_wait().expect("poll node").is_some();
-            if exited || Instant::now() >= deadline {
-                let id = node.id;
-                let verb = if exited { "exited" } else { "timed out" };
+            if let Err(why) = blocks.next_block() {
                 panic!(
-                    "node #{id} {verb} without printing {marker:?};\n{}",
-                    self.all_log_tails(60),
+                    "waiting for {what} via node idx {idx}: {why};\n{}",
+                    self.all_log_tails(60)
                 );
             }
-            std::thread::sleep(Duration::from_millis(300));
+            if let Some(value) = probe() {
+                return value;
+            }
+        }
+    }
+
+    /// Attach to node `idx`'s block-wake feed (see [`BlockFeed`]).
+    pub fn block_feed(&self, idx: usize, timeout: Duration) -> BlockFeed {
+        let url = format!("ws://127.0.0.1:{}/v1/ws", self.http_ports[idx]);
+        let (socket, _response) = tokio_tungstenite::tungstenite::connect(&url)
+            .unwrap_or_else(|e| panic!("attach to node idx {idx} block feed: {e}"));
+        // the failure path's bound, not a poll interval — see [`BlockFeed`].
+        if let tokio_tungstenite::tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_ref()
+        {
+            tcp.set_read_timeout(Some(timeout))
+                .expect("bound the block feed's failure path");
+        }
+        BlockFeed {
+            socket,
+            deadline: Instant::now() + timeout,
         }
     }
 
@@ -1149,6 +1228,72 @@ pub use nettest::poll_until;
 // `n` distinct free localhost ports, collision-safe (holds every listener at
 // once — sequential bind-drop could hand the same port back twice).
 use nettest::alloc_ports;
+
+/// Watch one child process's log for `marker`, returning the rest of the line.
+///
+/// `Err` carries only the reason phrase (`"#3 exited"`, `"timed out"`) so each
+/// caller can attach the log tails that make ITS failure diagnosable.
+fn await_marker(proc: &mut NodeProc, marker: &str, timeout: Duration) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let text = std::fs::read_to_string(&proc.log).unwrap_or_default();
+        if let Some(rest) = find_marker(&text, marker) {
+            return Ok(rest);
+        }
+        let exited = proc.child.try_wait().expect("poll child").is_some();
+        if exited {
+            return Err(format!("#{} exited", proc.id));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("#{} timed out", proc.id));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// A live feed of one node's block wakes — the harness's event seam for
+/// "committed state changed".
+///
+/// The node publishes a `heartbeat` frame to EVERY ws client on every block
+/// wake, nop fillers included, so an unsubscribed connection is already the
+/// changed feed (`bin/noded/src/stream.rs`, and the compute daemon's own intake
+/// rides the same frame). Blocking on that socket is waiting on the system's own
+/// event: a loaded CI box makes frames arrive later, it can never make the wait
+/// give up early, and nothing here consults a clock to decide when to look again.
+///
+/// The socket read timeout is the FAILURE path only — a node that has stopped
+/// producing blocks must fail with a diagnosis rather than hang CI forever. It
+/// is not a poll interval: no successful wait ever waits it out.
+pub struct BlockFeed {
+    socket: tokio_tungstenite::tungstenite::WebSocket<
+        tokio_tungstenite::tungstenite::stream::MaybeTlsStream<TcpStream>,
+    >,
+    deadline: Instant,
+}
+
+impl BlockFeed {
+    /// Block until the node reports its next block wake.
+    fn next_block(&mut self) -> Result<(), String> {
+        use tokio_tungstenite::tungstenite::Message;
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err("no block wake before the deadline".into());
+            }
+            let frame = self
+                .socket
+                .read()
+                .map_err(|error| format!("block feed read failed: {error}"))?;
+            // an unsubscribed connection carries heartbeats and nothing else,
+            // but a control frame still has to be stepped over.
+            let Message::Text(text) = frame else { continue };
+            let woke = serde_json::from_str::<serde_json::Value>(&text)
+                .is_ok_and(|value| value["type"] == "heartbeat");
+            if woke {
+                return Ok(());
+            }
+        }
+    }
+}
 
 fn find_marker(text: &str, marker: &str) -> Option<String> {
     text.lines().find_map(|line| {

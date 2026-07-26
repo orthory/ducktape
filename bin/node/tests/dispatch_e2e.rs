@@ -22,9 +22,26 @@
 //!   race `SagaMsg::Accept`; consensus order seats exactly one winner, the
 //!   loser's accept finalizes as a deterministic no-op, and the work runs
 //!   ONCE — the double-execution safety property, live across processes.
+//!
+//! ## the compute plane is a real, sandboxed, out-of-process one
+//!
+//! Both scenarios run each node's `ducktape service run compute` daemon beside
+//! it and execute the provider INSIDE a container, because that is the only
+//! compute plane there is. Two consequences shape the fixture:
+//!
+//! - every node needs a `[sandbox]` table. Without one the daemon exits at boot
+//!   (`no [sandbox] table in node.toml`) and there is no compute plane at all —
+//!   which is exactly the state this suite was silently in, passing nothing and
+//!   failing three minutes later on an unrelated predicate. [`boot`] now gates
+//!   on each daemon's own serving marker, so a dead one is named immediately.
+//! - a host path is not a shared surface any more. The old exactly-once evidence
+//!   was an `exec.log` each script appended to; inside a container's mount
+//!   namespace that path does not exist. The count moved onto the chain, where
+//!   it is a stronger claim anyway — see [`results_per_attempt`].
 
 mod common;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -32,7 +49,7 @@ use agent::{ACTION_CHAT_POST, AgentMsg};
 use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
-use common::{Cluster, poll_until, serial};
+use common::{Cluster, serial};
 use dispatch::{DispatchQuery, DispatchReply, DispatchStatus};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
@@ -41,21 +58,69 @@ const CONVERGE: Duration = Duration::from_secs(180);
 /// budget for one submitted op to finalize and become readable elsewhere.
 const FINALIZE: Duration = Duration::from_secs(60);
 /// budget for a full mention -> execution -> delivery -> reply round trip
-/// (several blocks plus one provider process spawn).
-const ROUND_TRIP: Duration = Duration::from_secs(120);
+/// (several blocks plus one container start — and, on a cold host, the pull
+/// that fills this daemon's private image store).
+const ROUND_TRIP: Duration = Duration::from_secs(300);
+
+/// The provider environment every run is sandboxed into.
+///
+/// The SMALLEST image that proves execution end to end: the container's command
+/// is the executor binary itself, so all a script provider needs of an image is
+/// a `/bin/sh` for its shebang. Size is not cosmetic here — each service daemon
+/// keeps its OWN private podman graph root, so a three-node cluster pulls this
+/// three times, into three empty stores, on every run of the suite. busybox is
+/// ~4 MB where the default `node:22-slim` is ~200 MB.
+const SANDBOX_IMAGE: &str = "docker.io/library/busybox:stable";
+
+/// the `[sandbox]` table each cluster node boots with — appended LAST to the
+/// generated toml (nothing may follow a toml table header).
+fn sandbox_toml() -> Vec<String> {
+    vec![
+        "[sandbox]".into(),
+        "runtime = \"podman\"".into(),
+        format!("image = {SANDBOX_IMAGE:?}"),
+        "cores = 0".into(),
+        "mem_gb = 0".into(),
+    ]
+}
+
+/// Can this host isolate a run the way the compute daemon demands?
+///
+/// Asks the PRODUCT'S OWN predicate rather than `podman version`, and the
+/// difference is not academic: podman on `PATH` is only one of four things the
+/// Podman backend requires (`pasta` for the netns, `nft` + `nsenter` for the
+/// egress firewall). A box with a portable podman install has the binary on
+/// `PATH` and its helpers only inside the install prefix — `podman version`
+/// says yes, the daemon exits `FATAL: sandbox: pasta is not executable`, and a
+/// suite gated on the weaker question runs anyway and fails. Gating on
+/// `probe()` means the suite skips when, and only when, a real node would
+/// refuse to serve compute.
+fn unsandboxable_host() -> Option<String> {
+    provider_host::SandboxBackend::Podman {
+        image: SANDBOX_IMAGE.into(),
+        socket: PathBuf::new(),
+    }
+    .probe()
+    .err()
+}
 
 /// one script-backed provider staged on disk for one node: an operator spec
 /// dir holding a single capability spec whose `detect.env` points at an
-/// executable script. the script appends one line to `exec_log` per
-/// invocation (the exactly-once evidence) and answers on stdout in the
-/// spec's declared output format — a REAL provider through the full
-/// capability-host path, minus the LLM bill.
+/// executable script. the script answers on stdout in the spec's declared
+/// output format — a REAL provider through the full capability-host path
+/// (discovery, announce, resolve, sandboxed spawn), minus the LLM bill.
+///
+/// The script runs INSIDE the run's container, mounted read-only at
+/// `/ducktape/bin/`, so it must be self-contained: no host paths (they do not
+/// exist in that mount namespace) and nothing beyond what the image provides —
+/// which for [`SANDBOX_IMAGE`] is a busybox `sh`. Its `stdout` is therefore the
+/// whole of its observable behaviour, and giving each provider a DISTINCT
+/// answer is what makes the reply name the node that ran it.
 struct ScriptProvider {
     tag: String,
     spec_dir: PathBuf,
     env_var: String,
     script: PathBuf,
-    exec_log: PathBuf,
 }
 
 impl ScriptProvider {
@@ -67,18 +132,16 @@ impl ScriptProvider {
         let dir = root.join(name);
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-        let exec_log = dir.join("exec.log");
         let script = dir.join("provider.sh");
         std::fs::write(
             &script,
             format!(
                 "#!/bin/sh\n\
-                 # a test executor: drain the payload, log the invocation,\n\
-                 # answer in the spec's output format.\n\
+                 # a test executor, running in the sandbox: drain the payload\n\
+                 # and answer in the spec's output format. busybox `sh` and\n\
+                 # `cat` are the whole of its dependencies.\n\
                  cat > /dev/null\n\
-                 echo ran >> {log}\n\
                  printf '%s\\n' '{stdout}'\n",
-                log = exec_log.display(),
             ),
         )
         .expect("write provider script");
@@ -115,7 +178,6 @@ impl ScriptProvider {
             spec_dir,
             env_var,
             script,
-            exec_log,
         }
     }
 
@@ -133,12 +195,6 @@ impl ScriptProvider {
         ]
     }
 
-    /// how many times the script actually ran on its node.
-    fn executions(&self) -> usize {
-        std::fs::read_to_string(&self.exec_log)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
-    }
 }
 
 /// env that keeps a node OUT of the provider business regardless of what the
@@ -167,8 +223,14 @@ fn hide_builtins(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// boot the 3-validator cluster and wait for genesis agreement + liveness —
-/// the shared preamble of both scenarios.
+/// boot the 3-validator cluster and wait for genesis agreement, liveness, and
+/// a LIVE COMPUTE PLANE on every node — the shared preamble of both scenarios.
+///
+/// The last of those is the one this suite used to skip, and skipping it is what
+/// let a compute plane that could claim nothing look exactly like a healthy
+/// cluster: the nodes converge, the chain runs, and every assertion that needs a
+/// provider times out minutes later naming something else. A daemon is a
+/// separate process — so wait for the process to SAY it is serving.
 fn boot(cluster: &mut Cluster) {
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
@@ -181,7 +243,76 @@ fn boot(cluster: &mut Cluster) {
     assert_eq!(genesis[0], genesis[2], "genesis fork between nodes 0 and 2");
     for i in 0..3 {
         cluster.wait_marker(i, "converged root_hash=", CONVERGE);
+        // the daemon starts its private podman service and discovers its
+        // providers before it says this, so the marker also covers the image
+        // store and the provider set being ready to serve.
+        cluster.wait_compute_marker(i, "compute daemon serving", CONVERGE);
     }
+}
+
+/// how many `OracleResult` ops committed for each ATTEMPT of `saga_id`.
+///
+/// The cluster-level replacement for counting executions in a host-side log, and
+/// a strictly stronger claim than the log ever made: a dispatch attempt is
+/// executed by exactly one node and only the node that executed it submits the
+/// result, so a SECOND result op for ONE attempt IS a second execution — even
+/// though the saga's result singularity collapses it into a deterministic no-op.
+/// The op index records ops rather than effects, which is precisely why the
+/// duplicate is visible here and nowhere else in committed state.
+///
+/// Keyed BY ATTEMPT, and that is the whole subtlety. Two results under two
+/// different attempts are the designed recovery, not a safety violation: a lease
+/// expired, the saga re-announced, and a node claimed the new attempt. Summing
+/// across attempts would call that retry a double execution — which a cold host
+/// reaches routinely, because the winner's very first run waits out an image
+/// pull and can lose its lease doing it.
+///
+/// (The host-side log could not survive the move into a container: the run's
+/// mount namespace has no path to the fixture directory.)
+fn results_per_attempt(cluster: &Cluster, idx: usize, saga_id: &str) -> BTreeMap<u64, usize> {
+    let mut per_attempt = BTreeMap::new();
+    for row in index_ops(cluster, idx, "saga") {
+        let result = &row["payload"]["oracle_result"];
+        if result["saga_id"] != saga_id {
+            continue;
+        }
+        let Some(attempt) = result["attempt"].as_u64() else {
+            continue;
+        };
+        *per_attempt.entry(attempt).or_insert(0usize) += 1;
+    }
+    per_attempt
+}
+
+/// Assert the run behind `saga_id` executed at most ONCE PER ATTEMPT.
+fn assert_executed_once_per_attempt(cluster: &Cluster, idx: usize, saga_id: &str, what: &str) {
+    let per_attempt = cluster.await_committed(idx, "the result op to index", FINALIZE, || {
+        let per_attempt = results_per_attempt(cluster, idx, saga_id);
+        (!per_attempt.is_empty()).then_some(per_attempt)
+    });
+    assert!(
+        per_attempt.values().all(|results| *results == 1),
+        "{what} must collapse to a single execution per attempt, \
+         got attempt->results {per_attempt:?} for {saga_id}"
+    );
+}
+
+/// the distinct origins of every `Accept` committed on `idx`.
+///
+/// Op-index rows carry the VERIFIED frame origin, so this names who bid rather
+/// than merely how many bids landed — the difference between "the claim lane
+/// works" and "the claim lane admits only nodes that may claim".
+fn accept_origins(cluster: &Cluster, idx: usize) -> BTreeSet<String> {
+    index_ops(cluster, idx, "saga")
+        .iter()
+        .filter(|row| row["payload"].get("accept").is_some())
+        .filter_map(|row| row["origin"]["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// the saga a `runs` dispatch rides — `runs::sink`'s documented id shape.
+fn saga_of_run(run_id: &str) -> String {
+    format!("dispatch\u{1f}runs\u{1f}{}", runs::dispatch_id_for(run_id))
 }
 
 /// the tag's committed provider pool on `idx`, sorted by key.
@@ -240,7 +371,7 @@ fn register_and_mention(
     );
     // the watch must be committed before the mention posts, or the tagging
     // plane has no subscriber to engage.
-    poll_until("the channel watch to commit", FINALIZE, || {
+    cluster.await_committed(idx, "the channel watch to commit", FINALIZE, || {
         let reply = cluster.query(
             idx,
             "runs",
@@ -279,7 +410,7 @@ fn register_and_mention(
 /// poll `channel` on `idx` until the agent's reply to `run_id` exists, and
 /// return its plain text.
 fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) -> String {
-    poll_until("the agent reply to post", ROUND_TRIP, || {
+    cluster.await_committed(idx, "the agent reply to post", ROUND_TRIP, || {
         let reply = cluster.query(
             idx,
             "chat",
@@ -321,7 +452,7 @@ fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) ->
 /// the run's dispatch record once Delivered — the lifecycle ledger the agent
 /// module intentionally does not keep.
 fn wait_for_delivered(cluster: &Cluster, idx: usize, run_id: &str) {
-    poll_until("the dispatch to reach Delivered", ROUND_TRIP, || {
+    cluster.await_committed(idx, "the dispatch to reach Delivered", ROUND_TRIP, || {
         let reply = cluster.query(
             idx,
             "dispatch",
@@ -357,6 +488,10 @@ fn op_height(ops: &[serde_json::Value], pick: impl Fn(&serde_json::Value) -> boo
 
 #[test]
 fn mention_routes_to_the_announced_provider_across_nodes() {
+    if let Some(why) = unsandboxable_host() {
+        eprintln!("skipping mention_routes_to_the_announced_provider_across_nodes: {why}");
+        return;
+    }
     let _serial = serial();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
     // heterogeneous REAL providers: a `text` executor on node 1 and a
@@ -382,6 +517,10 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // pool, so it grants every node compute with both tags announced. Each
     // node announces that set intersected with what it actually discovers.
     cluster.compute_grant = Some(vec![text_provider.tag.clone(), json_provider.tag.clone()]);
+    // HOW a run is isolated (the table) is independent of WHETHER this node runs
+    // any (the grant); the compute daemon needs both, and refuses to boot
+    // without the table. Appended LAST — nothing may follow a toml table header.
+    cluster.extra_toml.extend(sandbox_toml());
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
     cluster.env[1] = [text_provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.env[2] = [json_provider.env(), hide_builtins(fixtures.path(), "node2")].concat();
@@ -389,7 +528,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
 
     // both hosts announce their discovered set on boot; the registry maps
     // tag -> exactly the node that provides it.
-    poll_until("both providers to announce", FINALIZE, || {
+    cluster.await_committed(0, "both providers to announce", FINALIZE, || {
         let text_pool = providers(&cluster, 0, &text_provider.tag)?;
         let json_pool = providers(&cluster, 0, &json_provider.tag)?;
         (text_pool == vec![Cluster::identity(1)] && json_pool == vec![Cluster::identity(2)])
@@ -426,15 +565,23 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     );
     wait_for_delivered(&cluster, 2, &run_json);
 
-    // exactly one execution per run, each on the node that provides the tag.
-    assert_eq!(text_provider.executions(), 1, "text provider ran once");
-    assert_eq!(json_provider.executions(), 1, "json provider ran once");
+    // exactly one execution per run. WHICH node ran each is already settled
+    // above — a provider's answer is unique to it, and the reply carries it —
+    // so what is left to prove is that neither ran twice.
+    for (run, label) in [(&run_text, "text"), (&run_json, "json")] {
+        assert_executed_once_per_attempt(
+            &cluster,
+            0,
+            &saga_of_run(run),
+            &format!("the {label} provider's run"),
+        );
+    }
 
     // the READ-MODEL lane end to end: the same conversation through
     // `/v1/index/chat/view` — the surface every human/agent list rides now.
     // the fold applies block-by-block behind finalized state, so both view
     // probes poll instead of racing the indexer.
-    poll_until("the channel list view to fold", FINALIZE, || {
+    cluster.await_committed(0, "the channel list view to fold", FINALIZE, || {
         let (status, body) = cluster.http(
             0,
             "POST",
@@ -449,7 +596,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
             .find(|c| c["id"] == "dispatch" && c["head_seq"].as_u64() >= Some(4))
             .map(|_| ())
     });
-    poll_until("the message page view to fold", FINALIZE, || {
+    cluster.await_committed(0, "the message page view to fold", FINALIZE, || {
         let (status, body) = cluster.http(
             0,
             "POST",
@@ -469,12 +616,12 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // and its consumption. the derived op index applies block-by-block
     // BEHIND finalized state (the reply was already read from chat state
     // above), so both lookups poll instead of racing the indexer.
-    let result_height = poll_until("the OracleResult op to index", FINALIZE, || {
+    let result_height = cluster.await_committed(0, "the OracleResult op to index", FINALIZE, || {
         op_height(&index_ops(&cluster, 0, "saga"), |p| {
             p.get("oracle_result").is_some()
         })
     });
-    let reply_height = poll_until("the agent reply post to index", FINALIZE, || {
+    let reply_height = cluster.await_committed(0, "the agent reply post to index", FINALIZE, || {
         op_height(&index_ops(&cluster, 0, "chat"), |p| {
             p.get("post_message")
                 .and_then(|m| m["message_id"].as_str())
@@ -504,6 +651,10 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
 
 #[test]
 fn unannounced_capable_nodes_race_accept_and_execute_once() {
+    if let Some(why) = unsandboxable_host() {
+        eprintln!("skipping unannounced_capable_nodes_race_accept_and_execute_once: {why}");
+        return;
+    }
     let _serial = serial();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
     // the SAME tag on two nodes, both accept-lane-only: the rendezvous pool
@@ -528,13 +679,16 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     // a grant that announces NO tags: the accept-lane-only provider — it can
     // still execute claimed work, but never enters a tag's rendezvous pool.
     cluster.compute_grant = Some(vec![]);
+    // and the table that says HOW it isolates one. Without it the daemon exits
+    // at boot and this whole scenario silently exercises nothing.
+    cluster.extra_toml.extend(sandbox_toml());
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
     cluster.env[1] = [racer_one.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.env[2] = [racer_two.env(), hide_builtins(fixtures.path(), "node2")].concat();
     boot(&mut cluster);
 
     // the knob holds: capable hosts, empty pool.
-    let pool = poll_until("the capability registry to answer", FINALIZE, || {
+    let pool = cluster.await_committed(0, "the capability registry to answer", FINALIZE, || {
         providers(&cluster, 0, "quack-race")
     });
     assert!(
@@ -554,7 +708,43 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     register_and_mention(&cluster, 0, "race", "racer", "quack-race", "m1");
     let run_id = runs::run_id_for("race", 1, "racer");
 
-    // one winner executes, one reply posts — whichever node won the claim.
+    // ==================================================================
+    // THE claim-lane assertion — the one that goes red on the regression this
+    // suite exists to catch, and asserted FIRST because it comes first
+    // causally: claim -> Accept -> execute -> result.
+    //
+    // A capable node BID for work that no node held: a `SagaMsg::Accept` from
+    // the compute plane reached consensus. With nothing able to emit one this
+    // counts zero and keeps counting zero — and saying so HERE, before the
+    // reply, is what makes that failure legible. Downstream the identical bug
+    // only ever surfaced as a reply that never came, which times out minutes
+    // later naming the chat plane for a bug in the claim gate. (Verified by
+    // simulation: with `tick_claims` removed, this is the assertion that fires.)
+    //
+    // ONE bid is what the architecture guarantees, not two. An announcement
+    // leaves `UnassignedPending` the instant the first Accept commits, and each
+    // compute daemon re-reads that projection on its own node's block
+    // heartbeat — so a daemon whose tick lands after the winner's Accept never
+    // sees the announcement, and never bids. Measured: two bidders in two runs
+    // of three, one in the third. Demanding both would assert that neither
+    // daemon was late, which is a coin flip rather than a property. The
+    // properties are that ONLY a capable node may bid (here) and that however
+    // many bid, the work runs ONCE (below) — and neither is a race.
+    // ==================================================================
+    let bidders = cluster.await_committed(0, "a capable node to bid Accept", ROUND_TRIP, || {
+        let bidders = accept_origins(&cluster, 0);
+        (!bidders.is_empty()).then_some(bidders)
+    });
+    let capable: BTreeSet<String> = [1u64, 2]
+        .iter()
+        .map(|seed| indexer::user_handle(&Cluster::identity(*seed)))
+        .collect();
+    assert!(
+        bidders.is_subset(&capable),
+        "only a capable validator may claim unassigned work: bid {bidders:?}, capable {capable:?}"
+    );
+
+    // the winner then EXECUTES what it claimed, and one reply posts.
     let reply = wait_for_reply(&cluster, 0, "race", &run_id);
     assert!(
         reply == "claimed by node one" || reply == "claimed by node two",
@@ -563,40 +753,10 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     wait_for_delivered(&cluster, 0, &run_id);
 
     // exactly ONE execution across both capable hosts — the whole point of
-    // accept-to-claim: N capable nodes, one paid run.
-    assert_eq!(
-        racer_one.executions() + racer_two.executions(),
-        1,
-        "the claim race must collapse to a single execution \
-         (node1: {}, node2: {})",
-        racer_one.executions(),
-        racer_two.executions(),
-    );
-    // and the reply came from the node that actually ran.
-    let winner_ran_and_replied = (racer_one.executions() == 1
-        && reply == "claimed by node one")
-        || (racer_two.executions() == 1 && reply == "claimed by node two");
-    assert!(winner_ran_and_replied, "the winner's answer is the reply");
-
-    // BOTH nodes raced: two Accept ops finalized, from two distinct external
-    // origins — the loser's landing as a deterministic no-op. the op index
-    // is the proof surface (rows carry the verified frame origin).
-    poll_until("both accepts to finalize", FINALIZE, || {
-        let accepts: Vec<String> = index_ops(&cluster, 0, "saga")
-            .iter()
-            .filter(|row| row["payload"].get("accept").is_some())
-            .filter_map(|row| row["origin"]["id"].as_str().map(str::to_string))
-            .collect();
-        (accepts.len() == 2).then(|| {
-            let expected: std::collections::BTreeSet<String> = [1u64, 2]
-                .iter()
-                .map(|s| indexer::user_handle(&Cluster::identity(*s)))
-                .collect();
-            let actual: std::collections::BTreeSet<String> = accepts.into_iter().collect();
-            assert_eq!(
-                actual, expected,
-                "the two accepts must come from the two capable validators"
-            );
-        })
-    });
+    // accept-to-claim: N capable nodes, one paid run. Each racer's answer is
+    // unique to it, so the reply above already named the node that ran; one
+    // committed result op is the proof that the other did not also run. When
+    // both bid (the usual case, `bidders.len() == 2`) this is also the loser's
+    // Accept finalizing as a deterministic no-op: two claims, one execution.
+    assert_executed_once_per_attempt(&cluster, 0, &saga_of_run(&run_id), "the claim race");
 }

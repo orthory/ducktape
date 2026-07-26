@@ -546,20 +546,55 @@ impl Podman {
     }
 
     /// create a container from `spec`; returns its id.
+    ///
+    /// libpod's create NEVER pulls. It resolves `image` against the local store
+    /// and answers 404 `image not known` when it is absent — whatever
+    /// `pull_policy` the spec carries (verified against podman 5.4). Image
+    /// acquisition was `podman run`'s implicit job, and it left with the CLI
+    /// path; meanwhile every service daemon runs its OWN private graph root
+    /// (`podman_data_dir`), which therefore starts EMPTY. Without this, the first
+    /// run of any image on a fresh node fails and no amount of retrying helps —
+    /// nothing else in the tree ever puts an image in that store.
+    ///
+    /// So a store miss pulls once and retries the create. A store hit costs
+    /// nothing: the pull is on the 404 path only.
     pub async fn create(&self, spec: &SpecGenerator) -> Result<String, String> {
         let body = serde_json::to_vec(spec).map_err(|e| format!("encode create spec: {e}"))?;
+        let resp = self.create_once(&body).await?;
+        // the only thing create resolves out of the store is the image (every
+        // mount here is a bind path, never a named volume), so its 404 is that.
+        let image_missing = resp.status == 404;
+        if !image_missing {
+            return created_id(&resp);
+        }
+        self.pull(&spec.image).await?;
+        created_id(&self.create_once(&body).await?)
+    }
+
+    async fn create_once(&self, body: &[u8]) -> Result<HttpResponse, String> {
+        self.request("POST", &format!("{API}/containers/create"), Some(body))
+            .await
+    }
+
+    /// pull `image` into this service's private store.
+    ///
+    /// The endpoint streams progress lines and answers **200 even when the pull
+    /// FAILED** — an unreachable registry, a typo'd tag and a denied repository
+    /// all arrive as `{"error": ...}` inside a successful response. A bare status
+    /// check would therefore report a missing image as acquired and let the
+    /// retried create 404 again under a diagnosis that names the wrong thing, so
+    /// the stream's own error line is the verdict.
+    pub async fn pull(&self, image: &str) -> Result<(), String> {
+        // `/` and `:` are legal query characters and podman parses the reference
+        // verbatim, so the image name travels as written.
         let resp = self
-            .request("POST", &format!("{API}/containers/create"), Some(&body))
+            .request("POST", &format!("{API}/images/pull?reference={image}"), None)
             .await?;
         resp.ok()?;
-        #[derive(serde::Deserialize)]
-        struct Created {
-            #[serde(rename = "Id")]
-            id: String,
+        match pull_failure(&resp.body) {
+            Some(error) => Err(format!("pull {image}: {error}")),
+            None => Ok(()),
         }
-        let created: Created =
-            serde_json::from_slice(&resp.body).map_err(|e| format!("decode create reply: {e}"))?;
-        Ok(created.id)
     }
 
     pub async fn start(&self, id: &str) -> Result<(), String> {
@@ -882,6 +917,28 @@ impl HttpResponse {
             ))
         }
     }
+}
+
+/// the `error` a pull stream reported, if any — see [`Podman::pull`] for why a
+/// 200 is not an answer. Progress lines are ordinary and carry no `error`.
+fn pull_failure(body: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(body)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|line| line["error"].as_str().map(str::to_string))
+}
+
+/// the container id out of a create reply, or the API's own error text.
+fn created_id(resp: &HttpResponse) -> Result<String, String> {
+    resp.ok()?;
+    #[derive(serde::Deserialize)]
+    struct Created {
+        #[serde(rename = "Id")]
+        id: String,
+    }
+    serde_json::from_slice::<Created>(&resp.body)
+        .map(|created| created.id)
+        .map_err(|e| format!("decode create reply: {e}"))
 }
 
 /// parse a complete (Connection: close) HTTP/1.1 response: status line, headers,
@@ -1495,5 +1552,25 @@ mod tests {
         let f2 = att.read_frame().await.unwrap().unwrap();
         assert_eq!(f2, (FrameStream::Stderr, b"!".to_vec()));
         assert!(att.read_frame().await.unwrap().is_none(), "EOF after frames");
+    }
+
+    /// a pull that FAILED still answers 200, so the stream's own error line is
+    /// the only verdict. Both bodies are verbatim podman 5.4 replies.
+    #[test]
+    fn a_failed_pull_is_read_out_of_a_successful_response() {
+        let denied = br#"{"error":"initializing source docker://nope:zzz: reading manifest zzz in docker.io/library/nope: requested access to the resource is denied"}"#;
+        assert!(
+            pull_failure(denied).is_some_and(|e| e.contains("access to the resource is denied")),
+            "a refused pull must not read as an acquired image"
+        );
+
+        let acquired = br#"{"stream":"Copying blob sha256:034d65\n"}
+{"stream":"Writing manifest to image destination\n"}
+{"images":["b116e1"],"id":"b116e1"}"#;
+        assert_eq!(
+            pull_failure(acquired),
+            None,
+            "progress lines are not failures"
+        );
     }
 }
