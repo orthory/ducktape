@@ -392,6 +392,14 @@ pub struct ServiceRow {
     pub instance: Option<String>,
     /// the signaling daemon's version; `None` when it is not signaling.
     pub version: Option<String>,
+    /// the signaling daemon's build stamp; `None` when it is not signaling.
+    ///
+    /// This is the diagnostic that replaced the build gate. `service status`
+    /// prints it beside this node's own, so the ordinary dev-loop skew (edit,
+    /// rebuild the node, yesterday's daemon still running) is VISIBLE — where
+    /// it used to be a refusal that kept the daemon out of the catalog and
+    /// therefore out of this table entirely.
+    pub build: Option<String>,
     pub capabilities: Vec<String>,
     pub scopes: Vec<String>,
     /// service kinds this daemon declared it wants present, and the subset of
@@ -438,6 +446,7 @@ pub fn rows(signaling: &[noded::services::Signaling], grants: &[ServiceGrant]) -
                 },
                 instance: granted.map(ServiceGrant::display_id),
                 version: Some(live.version.clone()),
+                build: Some(live.build.clone()),
                 capabilities: live.capabilities.clone(),
                 scopes: live.scopes.clone(),
             }
@@ -451,6 +460,9 @@ pub fn rows(signaling: &[noded::services::Signaling], grants: &[ServiceGrant]) -
             state: ServiceState::EnabledAbsent,
             instance: Some(grant.display_id()),
             version: None,
+            // a grant records no build: it is hello metadata, and nothing is
+            // signaling for this kind.
+            build: None,
             capabilities: grant.capabilities.clone(),
             scopes: grant.scopes.clone(),
             // needs are live hello metadata; an absent daemon declares none.
@@ -566,6 +578,24 @@ fn unmet_hint(row: &ServiceRow) -> Option<String> {
     ))
 }
 
+/// The build column: the signaling daemon's stamp, and — only when it differs
+/// from this node's — the node's beside it.
+///
+/// This IS the diagnostic that replaced the build gate. Skew is now visible
+/// and informational; it used to keep the daemon out of the catalog entirely,
+/// so this row could not have existed to show it.
+fn render_build(daemon: Option<&str>) -> String {
+    let Some(daemon) = daemon else {
+        return "-".into();
+    };
+    let mine = noded::services::build_identity_or_unknown();
+    let matches_this_node = daemon == mine;
+    if matches_this_node {
+        return daemon.to_string();
+    }
+    format!("{daemon} {}", paint(YELLOW, &format!("(this node: {mine})")))
+}
+
 /// `service status` — a readable block per service rather than a flat dump.
 fn render_status(rows: &[ServiceRow]) -> String {
     if rows.is_empty() {
@@ -585,6 +615,7 @@ fn render_status(rows: &[ServiceRow]) -> String {
         let fields = [
             ("instance", row.instance.as_deref().unwrap_or("-").to_string()),
             ("version", row.version.as_deref().unwrap_or("-").to_string()),
+            ("build", render_build(row.build.as_deref())),
             ("offers", join_or_dash(&row.capabilities)),
             ("scopes", join_or_dash(&row.scopes)),
             ("needs", join_or_dash(&row.needs)),
@@ -593,18 +624,14 @@ fn render_status(rows: &[ServiceRow]) -> String {
             out.push_str(&format!("    {} {value}\n", column(name, 10, DIM)));
         }
         if row.state == ServiceState::EnabledAbsent {
-            // a daemon refused for build skew never reaches the catalog, so it
-            // looks identical to one that is simply down. Name both causes
-            // here — it is the only place an operator would look.
+            // absence has exactly one shape now that no build gate can hide a
+            // daemon from the catalog: nothing is signaling for this kind.
             out.push_str(&format!(
                 "    {}\n",
                 paint(
                     YELLOW,
-                    &format!(
-                        "enabled but not signaling — is its daemon running, and on build {}? \
-                         (a different build is refused: reason build_mismatch)",
-                        noded::services::build_identity().unwrap_or("unknown")
-                    )
+                    "enabled but not signaling — is its daemon running \
+                     (ducktape service run), and pointed at this node's http surface?"
                 )
             ));
         }
@@ -1047,9 +1074,9 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let hello = discover_hello(&kind, &service, &node_key)?;
     // the FIRST hello must land: a daemon that cannot signal has nothing to
-    // offer and must not sit in a retry loop pretending otherwise. A build
-    // mismatch or a down node is a loud exit, not a silent spin.
-    send_hello(&base, &hello)?;
+    // offer and must not sit in a retry loop pretending otherwise. A down node
+    // is a loud exit, not a silent spin.
+    let skew = send_hello(&base, &hello)?;
     write_err(&format!(
         "{} {} · signaling to {} · offering {}\n",
         paint(GREEN, "●"),
@@ -1066,7 +1093,7 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let beat_base = base.clone();
     std::thread::Builder::new()
         .name("service-hello".into())
-        .spawn(move || heartbeat(&beat_base, &hello))?;
+        .spawn(move || heartbeat(&beat_base, &hello, skew))?;
 
     match serve_kind(&kind, &workspace, service, &base, node_key)? {
         // nothing to execute (an ungranted kind, or a kind with no first-party
@@ -1182,12 +1209,12 @@ fn discover_hello(
         backend,
         kind,
     )?;
-    let build = noded::services::build_identity()
-        .ok_or("this binary has no build identity; rebuild it from a git checkout")?;
     Ok(noded::services::Hello {
         kind: kind.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        build: build.to_string(),
+        // metadata, so an unidentifiable build says so instead of refusing to
+        // start. A tarball or vendored build signals and serves like any other.
+        build: noded::services::build_identity_or_unknown().to_string(),
         capabilities: providers.capabilities(),
         scopes: scopes_for(kind),
         // agent declares no needs: an interactive pty session is self-contained,
@@ -1197,10 +1224,75 @@ fn discover_hello(
     })
 }
 
-fn send_hello(base: &str, hello: &noded::services::Hello) -> Result<(), String> {
-    crate::node_http::post_json(base, "/v1/services/hello", &serde_json::to_value(hello).unwrap())
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+/// Signal once, and report whether the node that answered is on our build.
+///
+/// The node returns its own stamp in the OK body. That is what makes skew a
+/// diagnostic the daemon can NAME rather than a refusal it merely suffers.
+/// When either side cannot identify its build the answer is
+/// [`Skew::Unknown`] — which says nothing and warns about nothing, rather than
+/// inventing a disagreement out of two "unknown"s.
+fn send_hello(base: &str, hello: &noded::services::Hello) -> Result<Skew, String> {
+    let body = crate::node_http::post_json(
+        base,
+        "/v1/services/hello",
+        &serde_json::to_value(hello).unwrap(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(Skew::between(&hello.build, body.get("build").and_then(|v| v.as_str())))
+}
+
+/// Whether the daemon and the node it signals to are the same build. ONE
+/// discriminant so the latch below compares states rather than juggling flags.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Skew {
+    /// same stamp on both sides.
+    Matched,
+    /// the two stamps differ — the ordinary dev loop (rebuild the node, leave
+    /// yesterday's daemon running). Informational: nothing is refused for it.
+    Skewed,
+    /// at least one side could not name its build, so there is nothing to
+    /// compare. Never warned about — an unknown build is not evidence of skew.
+    Unknown,
+}
+
+impl Skew {
+    fn between(mine: &str, theirs: Option<&str>) -> Skew {
+        let unknown = noded::services::UNKNOWN_BUILD;
+        let Some(theirs) = theirs.filter(|it| *it != unknown) else {
+            return Skew::Unknown;
+        };
+        if mine == unknown {
+            return Skew::Unknown;
+        }
+        match mine == theirs {
+            true => Skew::Matched,
+            false => Skew::Skewed,
+        }
+    }
+}
+
+/// Log a build-skew TRANSITION and nothing else.
+///
+/// Latched against the last observed state, the way `CapabilityAnnouncer`
+/// latches `grant_unreadable`: this runs on every heartbeat, and one warn per
+/// beat would evict the ring it is supposed to help you read.
+fn note_skew(kind: &str, last: &mut Option<Skew>, now: Skew) {
+    if last.replace(now) == Some(now) {
+        return;
+    }
+    match now {
+        Skew::Skewed => tracing::warn!(
+            target: "ducktape::service",
+            %kind,
+            reason = "build_skew",
+            "this daemon and its node are different builds; restart the daemon \
+             from the node's build if they disagree about the protocol"
+        ),
+        Skew::Matched => {
+            tracing::info!(target: "ducktape::service", %kind, "daemon and node builds agree")
+        }
+        Skew::Unknown => {}
+    }
 }
 
 /// Offer enablement once, at startup, per the posture the operator chose.
@@ -1251,17 +1343,22 @@ fn offer_enable(
 /// ages out and returns. Logged on the first failure and every 30th after it,
 /// carrying the attempt count — an unconditional warn here would be a log bomb
 /// on a node that stays down.
-fn heartbeat(base: &str, hello: &noded::services::Hello) -> ! {
+fn heartbeat(base: &str, hello: &noded::services::Hello, initial: Skew) -> ! {
     const LOG_EVERY: u64 = 30;
     let mut failures: u64 = 0;
+    // seeded from the startup beat, so skew is named once at startup and then
+    // only when it CHANGES — never once per beat.
+    let mut skew: Option<Skew> = None;
+    note_skew(&hello.kind, &mut skew, initial);
     loop {
         std::thread::sleep(HEARTBEAT);
         match send_hello(base, hello) {
-            Ok(()) => {
+            Ok(observed) => {
                 if failures > 0 {
                     tracing::info!(target: "ducktape::service", kind = %hello.kind, "signal restored");
                 }
                 failures = 0;
+                note_skew(&hello.kind, &mut skew, observed);
             }
             Err(error) => {
                 failures += 1;
@@ -1382,6 +1479,7 @@ mod tests {
         noded::services::Signaling {
             kind: kind.into(),
             version: "1.2.3".into(),
+            build: "deadbeef".into(),
             capabilities: vec!["agent.codex".into()],
             scopes: vec![],
             needs: vec![],
@@ -1666,6 +1764,42 @@ mod tests {
             "only names taken out of `config` are banned: {:?}",
             config_names(&legal)
         );
+    }
+
+    /// Build skew is a DIAGNOSTIC now, not a refusal: a daemon on another build
+    /// still signals, still enables, and `service status` names the difference.
+    #[test]
+    fn a_skewed_build_is_rendered_beside_this_node_s_own_and_refuses_nothing() {
+        let mine = noded::services::build_identity_or_unknown();
+
+        // not signaling: nothing to show, and no skew claim invented.
+        assert_eq!(render_build(None), "-");
+        // agreeing: the stamp alone, with no noise on the ordinary case.
+        assert_eq!(render_build(Some(mine)), mine);
+        // disagreeing: both stamps, so the operator can act on it.
+        let skewed = render_build(Some("0.0.0-ancient"));
+        assert!(skewed.contains("0.0.0-ancient"), "{skewed}");
+        assert!(skewed.contains(mine), "{skewed}");
+
+        // and the row itself is `enabled`, never withheld: the old gate kept a
+        // skewed daemon out of the catalog entirely, so it could not be seen.
+        let mut live = signaling("compute");
+        live.build = "0.0.0-ancient".into();
+        let rows = rows(&[live], &[grant("compute", mint_instance(&NODE_A, "compute", &NONCE))]);
+        assert_eq!(rows[0].state, ServiceState::Enabled);
+        assert_eq!(rows[0].build.as_deref(), Some("0.0.0-ancient"));
+    }
+
+    #[test]
+    fn skew_is_only_claimed_when_both_sides_actually_named_a_build() {
+        let unknown = noded::services::UNKNOWN_BUILD;
+        assert_eq!(Skew::between("abc123", Some("abc123")), Skew::Matched);
+        assert_eq!(Skew::between("abc123", Some("def456")), Skew::Skewed);
+        // a side that cannot name its build proves nothing either way — the
+        // git-absent build must not spend its life warning about itself.
+        assert_eq!(Skew::between("abc123", Some(unknown)), Skew::Unknown);
+        assert_eq!(Skew::between(unknown, Some("abc123")), Skew::Unknown);
+        assert_eq!(Skew::between("abc123", None), Skew::Unknown);
     }
 
     #[test]

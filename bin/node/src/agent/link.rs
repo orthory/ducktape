@@ -10,8 +10,9 @@
 //!
 //! The daemon claims the link with one `service_attach` frame before anything
 //! else. Until the node accepts it, this connection is an ordinary ws client
-//! with no interactive plane behind it; if the node refuses (build skew,
-//! another daemon already attached), it says so and this connection ends.
+//! with no interactive plane behind it; if the node refuses (an unreadable or
+//! stale link token, another daemon already attached), it says so and this
+//! connection ends.
 //!
 //! A dropped socket is ordinary — the node restarts, the operator upgrades — so
 //! the task reconnects forever, logging attempt 1 and every Nth with an
@@ -94,13 +95,9 @@ async fn pump<S>(
 {
     use tokio_tungstenite::tungstenite::Message;
     let (mut tx, mut rx) = socket.split();
-    // claim the link FIRST. `build` is the skew gate: node and daemon restart
-    // independently, so a mismatch is refused with a nameable reason rather than
-    // negotiated. `None` here means this binary has no build identity at all,
-    // which `run` already refused before serving.
-    let Some(build) = noded::services::build_identity() else {
-        return;
-    };
+    // claim the link FIRST. The claim carries no build stamp: the node does not
+    // gate on one, so sending it would only be a field nobody reads.
+    //
     // re-read per attach, never latched: a node restart mints a fresh token, and
     // a daemon holding a stale one would be refused forever.
     let token = match noded::services::read_link_token(workspace) {
@@ -117,7 +114,6 @@ async fn pump<S>(
     let claim = serde_json::json!({
         "op": "service_attach",
         "kind": noded::services::AGENT_KIND,
-        "build": build,
         "token": token,
     })
     .to_string();
@@ -140,9 +136,9 @@ async fn pump<S>(
                     Incoming::Refused(detail) => {
                         // the only errors this connection can earn are refusals
                         // of its claim, and none self-heals on this socket: a
-                        // build mismatch needs a restart, another daemon holding
-                        // the link needs that daemon to go. Redialing is the
-                        // honest retry.
+                        // stale token needs a re-read of the node's freshly
+                        // minted one, another daemon holding the link needs that
+                        // daemon to go. Redialing is the honest retry.
                         tracing::error!(
                             target: "ducktape::service",
                             reason = "link_refused",
@@ -182,6 +178,28 @@ fn classify(text: &str) -> Incoming {
         Some("service_command") => {
             match serde_json::from_value::<wire::Command>(frame["command"].clone()) {
                 Ok(command) => Incoming::Command(command),
+                // KNOWN GAP, and the one direction that does not refuse
+                // cleanly. Daemon→node skew is a named refusal the sender sees:
+                // an undecodable frame earns a `BadFrame` carrying `unknown
+                // field ...` and the socket stays open. This direction only
+                // drops. A `TermCreate` this daemon cannot decode is warned
+                // about HERE, where nobody is waiting, while the node's
+                // `TerminalSessions::start` awaits a reply that will never come
+                // — and it awaits with no timeout on purpose (a cold image pull
+                // takes minutes), so the operator's `agent pty` hangs.
+                //
+                // Left as-is deliberately: reaching it needs a node and a
+                // daemon built from DIFFERENT trees, nothing here owes that
+                // support, and what it replaced was worse — before
+                // `deny_unknown_fields` the extra field was dropped and the
+                // session RAN without the restriction the node named. Hanging
+                // is a worse failure than a fast refusal and a better one than
+                // a silently weakened session.
+                //
+                // The fix, when it is worth doing, is session-scoped: recover
+                // the `session` id out of the undecodable frame and answer
+                // `TermRefused` on it, so the create fails fast with a
+                // nameable reason instead of waiting.
                 Err(_) => {
                     tracing::warn!(
                         target: "ducktape::service",
@@ -247,15 +265,18 @@ mod tests {
 
     #[test]
     fn an_error_frame_ends_the_connection_with_its_detail() {
+        // a refusal the node can actually emit: `take_service_link` names the
+        // token and the single-holder rule, and nothing else. There is no build
+        // mismatch to report — this node compares no stamp.
         let frame = serde_json::json!({
             "type": "error",
-            "detail": "build mismatch: restart the agent daemon on this node's build",
+            "detail": "refused: present this node's service-link token, and only one agent service may attach",
         })
         .to_string();
         let Incoming::Refused(detail) = classify(&frame) else {
             panic!("an error frame is a refusal");
         };
-        assert!(detail.contains("build mismatch"), "{detail}");
+        assert!(detail.contains("service-link token"), "{detail}");
     }
 
     #[test]
