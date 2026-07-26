@@ -76,8 +76,12 @@ pub enum SessionControlRequest {
 }
 
 /// the host's reply to a [`SessionControlRequest`]. Refusal `reason`s are stable
-/// snake_case tokens: `no_sandbox`, `unknown_credential`, `credential_not_granted`,
-/// `provider_kind_mismatch`, `at_capacity`, `unknown_provider`.
+/// snake_case tokens, in two families. **Whose work this host runs**:
+/// `work_not_admitted`, `work_caller_unbound`, `work_policy_unreadable`,
+/// `work_authority_unavailable` (see [`crate::work_admission`]). **What this
+/// host can do with it**: `no_sandbox`, `unknown_credential`,
+/// `provider_kind_mismatch`, `limits_exceed_host_ceiling`, `at_capacity`,
+/// `unknown_provider`, `spawn_failed`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum SessionControlReply {
@@ -144,6 +148,19 @@ struct ControlState {
     commands: fmpsc::Sender<NodeCommand>,
     local_gateway_via: String,
     me: [u8; 32],
+    /// where this node's `work-admit.toml` lives. Re-read on every create, so
+    /// `ducktape node work admit` takes effect without a restart — and takes
+    /// effect at the same instant on the compute lane, which reads the same
+    /// file the same way.
+    workspace: std::path::PathBuf,
+}
+
+/// the node actor's query lane, behind the one method the admission needs.
+#[async_trait::async_trait]
+impl crate::work_admission::CommittedReader for fmpsc::Sender<NodeCommand> {
+    async fn read(&self, target: &str, request: Vec<u8>) -> Result<Vec<u8>, String> {
+        query(self, target, request).await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -159,6 +176,7 @@ pub(crate) fn spawn(
     sessions: Option<TerminalSessions>,
     commands: fmpsc::Sender<NodeCommand>,
     local_gateway_via: String,
+    workspace: std::path::PathBuf,
     jobs: tokio::sync::mpsc::Receiver<SessionJob>,
 ) {
     tokio::spawn(async move {
@@ -193,6 +211,7 @@ pub(crate) fn spawn(
             commands,
             local_gateway_via,
             me,
+            workspace,
         });
         run_bound(
             plane,
@@ -496,11 +515,20 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
 /// drawing on the guest's self-host gateway. Every refusal carries a stable
 /// snake_case `reason`.
 ///
-/// It deliberately does NOT resolve the creator's account. Whether the credential
-/// may be drawn on is the LENDER's decision, made against the account its own
-/// node stamps when this session's traffic makes the gateway hop — which is this
-/// host, not the peer. `peer` is still used, for the one thing it can settle
-/// locally: binding the session's input frames to the node that created it.
+/// It deliberately does NOT resolve the creator's account *to ship to the
+/// lender*. Whether the credential may be drawn on is the LENDER's decision,
+/// made against the account its own node stamps when this session's traffic
+/// makes the gateway hop — which is this host, not the peer.
+///
+/// It DOES ask its own [`crate::work_admission`] policy whether it runs this
+/// peer's work at all. That is the opposite direction and a different question:
+/// not a claim about who a session acts for, but this host's own answer about
+/// whose workload it hosts. Without it, "a grant lends to that account's node,
+/// for whatever workload it runs" means any mesh peer naming any registered
+/// credential gets a container here, on this node's grants.
+///
+/// `peer` is also still used for the one thing it settles locally: binding the
+/// session's input frames to the node that created it.
 async fn serve_create(
     control: &ControlState,
     peer: PeerId,
@@ -509,6 +537,49 @@ async fn serve_create(
     cpu: Option<u64>,
     mem_gb: Option<u64>,
 ) -> SessionControlReply {
+    // Whose work does this host run? Asked FIRST, because it depends on nothing
+    // about the credential and refusing later would mean reading committed
+    // state on a stranger's behalf. `peer.0` is mesh-authenticated (the plane's
+    // `permits` gate ran before this stream was accepted) or, on the own-node
+    // loopback, this node's own key — derived either way, never asserted.
+    match crate::work_admission::admit(
+        &control.commands,
+        &control.workspace,
+        &control.me,
+        crate::work_admission::WorkSource::Peer(&peer.0),
+    )
+    .await
+    {
+        crate::work_admission::WorkVerdict::Admitted => {}
+        crate::work_admission::WorkVerdict::Refused(refusal) => {
+            // the peer's NODE key, never its account: a node key is public
+            // routing metadata already logged at boot, and without it the
+            // operator is told "someone was refused" with no way to find out
+            // whom to admit.
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = refusal.reason(),
+                node = %crate::config::hex_bytes(&peer.0[..4]),
+                "peer session create refused"
+            );
+            return refused(refusal.reason(), refusal.detail());
+        }
+        // not a refusal: nothing is known about the policy's subject, so the
+        // caller is told to retry rather than sent to fix an admission that may
+        // already exist.
+        crate::work_admission::WorkVerdict::AuthorityUnavailable => {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "work_authority_unavailable",
+                node = %crate::config::hex_bytes(&peer.0[..4]),
+                "peer session create not decided"
+            );
+            return refused(
+                "work_authority_unavailable",
+                "this node could not read committed identity to decide whose work it runs",
+            );
+        }
+    }
     let Some(sessions) = control.sessions.clone() else {
         tracing::warn!(target: "ducktape::term", reason = "no_sandbox", "peer session create refused");
         return refused("no_sandbox", "this node hosts no terminal sessions");
@@ -1216,6 +1287,122 @@ mod tests {
         assert!(!input_permitted(None, PeerId([7u8; 32])));
     }
 
+    /// a fake identity module: answers `OfNode` by mapping a node key to an
+    /// account id derived from it, so two different nodes are two different
+    /// accounts. Runs until the command channel closes.
+    async fn answer_identity(mut rx: fmpsc::Receiver<NodeCommand>) {
+        use futures::StreamExt as _;
+        while let Some(command) = rx.next().await {
+            let NodeCommand::Query { req, reply, .. } = command else {
+                continue;
+            };
+            let identity::IdentityQuery::OfNode { node_key } =
+                identity::decode_query(&req).expect("an identity query")
+            else {
+                continue;
+            };
+            let view = identity::AccountView {
+                account_id: node_key.iter().map(|b| b ^ 0xaa).collect(),
+                display_name: None,
+                avatar: None,
+                bio: None,
+                nonce: 0,
+                member_keys: Vec::new(),
+                nodes: Vec::new(),
+                updated_at: 0,
+            };
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(view)),
+            )));
+        }
+    }
+
+    /// **The work-admission call site, behaviourally.**
+    ///
+    /// A mesh peer whose account this node does not admit is refused at the
+    /// door — before the credential record is read, before any host capability
+    /// is disclosed. This is the hole #833 left open: without it, "a grant lends
+    /// to that account's node for whatever workload it runs" means any admitted
+    /// member naming any registered credential gets a container here.
+    #[tokio::test]
+    async fn a_peer_this_node_does_not_admit_is_refused_before_any_credential_read() {
+        let workspace = std::env::temp_dir().join(format!(
+            "ducktape-term-admit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).expect("scratch workspace");
+
+        let (commands, rx) = fmpsc::channel(4);
+        let identity = tokio::spawn(answer_identity(rx));
+        let control = Arc::new(ControlState {
+            // a live manager would still never be reached: the refusal is
+            // upstream of every host-capability question.
+            sessions: None,
+            commands,
+            local_gateway_via: String::new(),
+            me: [1u8; 32],
+            workspace: workspace.clone(),
+        });
+
+        let (server, mut caller) = tokio::io::duplex(64 * 1024);
+        let serving = Arc::clone(&control);
+        tokio::spawn(async move {
+            let _ = serve_control(server, PeerId([9u8; 32]), serving).await;
+        });
+        write_frame(
+            &mut caller,
+            &SessionControlRequest::Create {
+                provider: "claude".into(),
+                cred: "c".into(),
+                cpu: None,
+                mem_gb: None,
+            },
+        )
+        .await
+        .unwrap();
+        let reply: SessionControlReply = read_frame(&mut caller).await.unwrap().unwrap();
+        let SessionControlReply::Refused { reason, detail } = reply else {
+            panic!("an unadmitted peer must be refused");
+        };
+        assert_eq!(reason, "work_not_admitted");
+        assert!(
+            !detail.contains("account") || detail.contains("<account>"),
+            "a refusal never echoes the account that would have been accepted: {detail:?}"
+        );
+
+        // and the SAME peer is served once its account is admitted — the policy
+        // is re-read per create, so no restart is involved.
+        let admitted: Vec<u8> = [9u8; 32].iter().map(|b| b ^ 0xaa).collect();
+        crate::work_admission::admit_account_fixture(&workspace, &admitted).expect("save policy");
+        let (server, mut caller) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = serve_control(server, PeerId([9u8; 32]), control).await;
+        });
+        write_frame(
+            &mut caller,
+            &SessionControlRequest::Create {
+                provider: "claude".into(),
+                cred: "c".into(),
+                cpu: None,
+                mem_gb: None,
+            },
+        )
+        .await
+        .unwrap();
+        let reply: SessionControlReply = read_frame(&mut caller).await.unwrap().unwrap();
+        assert_eq!(
+            reply,
+            SessionControlReply::Refused {
+                reason: "no_sandbox".into(),
+                detail: "this node hosts no terminal sessions".into(),
+            },
+            "an admitted peer passes the door and is refused only on this host's own capability"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+        identity.abort();
+    }
+
     #[tokio::test]
     async fn serve_control_refuses_create_without_a_sandbox_and_acks_close() {
         // no session manager (a sync-only / Direct node) → a create is refused
@@ -1226,7 +1413,11 @@ mod tests {
             sessions: None,
             commands,
             local_gateway_via: String::new(),
-            me: [0u8; 32],
+            // the peer IS this node (the own-node loopback), so the work
+            // admission takes its zero-query `ThisNode` path and this test stays
+            // about `no_sandbox`. The refusing case is the test below.
+            me: [7u8; 32],
+            workspace: std::path::PathBuf::from("/nonexistent-work-admission-workspace"),
         });
 
         let (server, mut caller) = tokio::io::duplex(64 * 1024);

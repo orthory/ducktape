@@ -322,7 +322,7 @@ async fn build_pool(
     .with_credential_resolver(resolver);
     let control = pool.attempt_control();
     Ok((
-        intake::WorkPump::new(Box::new(pool), control, node_key),
+        intake::WorkPump::new(Box::new(pool), control, node_key, service.workspace.clone()),
         rx,
     ))
 }

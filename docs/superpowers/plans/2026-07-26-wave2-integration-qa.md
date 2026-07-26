@@ -143,6 +143,19 @@ State these in the report so a green run is not over-read:
 - **After #822 a daemon holds no node private key.** That is a real narrowing
   and worth asserting (V-5). It is *not* the same as the daemon being
   authorized, because there is nothing to be authorized against yet.
+- **Work admission gates only the CALLER-CHOSEN lanes.** `feat/work-admission`
+  decides whose work a node runs for a pinned/announced saga (`agent sched`) and
+  a cross-node pty (`agent pty`). A run reaching a node through `RequestRun`, a
+  chat mention, a pages comment, forge or the jobs board carries a MODULE saga
+  origin (`dispatch`), is not attributable to an account at that layer, and is
+  **admitted**. Those lanes cannot name a credential — their payload is composed
+  in consensus — so the residual is free compute, not a credential draw. Do not
+  assert that admission gates them.
+- **Work admission is bounded by `/v1`'s exposure.** `POST /v1/submit` re-signs
+  as THIS node, so anything that can reach the node's HTTP or RPC port is
+  admitted by construction. Keeping those ports loopback-bound is what makes the
+  admission mean anything; making un-tokened `/v1` callers refused is
+  `2026-07-26-wave3-scope-enforcement.md`, not this.
 - **Tart has no egress firewall.** The nft path is podman-only. A macmini Tart
   run can still reach the host's tailnet. Deferred by decision, not a finding.
 - **The lent-credential last mile for interactive `claude` on macOS is a known
@@ -760,7 +773,7 @@ it diagnosable at all.
 
 ---
 
-## 3. Tier 2 — credential lending through the airlock daemon (T2) — 6 steps
+## 3. Tier 2 — credential lending through the airlock daemon (T2) — 7 steps
 
 Cross-box. **Lender = dev box** (holds the credential, runs `service run
 airlock`). **Borrower = macmini** (runs compute/agent, executes the run).
@@ -857,6 +870,35 @@ list`/`status` read the *local* catalog, never the committed registry.
 **Observable / pass:** the `gateway` module's credential record lists the
 grantee. **Do not assert that any scope is enforced** (§0.4).
 
+### T2-4b — admit the submitter's work on the EXECUTING node
+**Needs:** `feat/work-admission`.
+
+**A credential grant and a work admission are two consents in OPPOSITE
+directions, and conflating them is the first thing to get wrong.** T2-4 is the
+LENDER saying *which node may draw on my credential*. This step is the EXECUTOR
+saying *whose work I will run at all*. A cross-node run needs both, on different
+boxes — the grant on the dev box, the admission on the macmini.
+
+Since `feat/work-admission` a node runs only its OWNER's work and its own by
+default, and these two boxes are two accounts (`eddy` on the dev box from T1-6,
+`duke` on the macmini from T2-4). So without this step T2-5, T2-6 and X-1 all
+fail — deliberately, and each has a deliberate-failure half below that proves it.
+
+```bash
+# macmini (the EXECUTOR) — the dev box's account, not the credential owner's
+"$D" node work admit <dev-box-account-hex> -n "$CHAIN"
+"$D" node work list -n "$CHAIN"
+```
+
+**Observable / pass:**
+- `node work list` prints `owner, plus 1 admitted account(s):` and the hex
+- `$WS/work-admit.toml` exists on the macmini with that one `admit` entry
+- **no restart of anything** — the policy is re-read on every decision, by both
+  the node (pty lane) and the compute daemon (sched lane)
+
+**Fail:** `no account named …` → pass the hex account id, or a display name the
+`identity` module has committed.
+
 ### T2-5 — a lent-credential run, cross-box
 **Needs:** #818, #819, #826.
 
@@ -874,6 +916,23 @@ grantee. **Do not assert that any scope is enforced** (§0.4).
 
 **This is the step most likely to catch something.** The failure surface is the
 whole point of #818's taxonomy; §5 maps each token to its cause.
+
+**Deliberate-failure half — run this BEFORE T2-4b.** With the grant in place but
+the admission absent, the same command must fail, and fail *loudly*:
+
+```bash
+# macmini, before `node work admit`
+grep -c 'reason="work_not_admitted"' "$LOGS/compute.log"   # MUST be >= 1
+```
+**Pass:** the saga reaches `Failed` after `max_attempts` carrying
+`work_not_admitted`, the macmini's `compute.log` has that warn **once per
+attempt** (never once per 15 s tick), and **no container was created** — check
+the compute socket's container list is unchanged (C-1's query).
+**Fail:** the run succeeds (the admission is not wired), or the saga sits
+`Pending` forever with no warn (a silent park — see X-1).
+
+Then run T2-4b and re-run this step: it must now pass, **with no restart of the
+node or either daemon**. That single variable is the whole point of the step.
 
 ### T2-6 — interactive pty on a lent credential
 **Needs:** #818.
@@ -896,6 +955,19 @@ from the login keychain, and its TUI auth gate checks full account metadata
 
 If the macmini Tart backend is the blocker, the honest fallback is a
 Linux/podman borrower, where the headless token-only path is already proven.
+
+**Deliberate-failure half — cheaper and sharper than T2-5's, so do it first.**
+Before T2-4b, the same command is refused **immediately**: the work admission is
+the first thing `serve_create` asks, ahead of the credential lookup and every
+host-capability question.
+
+**Pass:** the CLI prints `work_not_admitted: this node does not run work for that
+account — its operator admits one with \`ducktape node work admit <account>\``,
+in under a second, with **no attempt burned and no timeout**. The macmini's
+`daemon.log` carries one `WARN ducktape::term … reason="work_not_admitted"
+node=<8 hex>` — the peer's NODE key prefix, **never an account**.
+**Fail:** a hang (the refusal is not upstream of the credential read), or any
+refusal naming the account.
 
 ---
 
@@ -1192,10 +1264,35 @@ second lapse fails the saga with `lease attempts exhausted`. Assert via
 ## 8. Cross-node placement (X) — 3 steps
 
 ### X-1 — agent on A, compute only on B
-**Needs:** #819, #826.
+**Needs:** #819, #826, `feat/work-admission`.
 
-Disable compute on the dev box; leave it enabled and serving on the macmini.
-Submit an unpinned run from the dev box.
+> **This step could not fail before it was amended, and that is exactly the
+> hazard P-9 exists to catch.** It submits an *unpinned* run and waits for the
+> macmini to claim it. Under work admission's default the macmini will not bid
+> for a stranger's announcement — and an unpinned saga with no `deadline` can
+> never be cranked out of `Pending` (assumption-audit A9), so the symptom is a
+> **silent park**: no error, no timeout, nothing in `recent_runs`, forever. Run
+> the negative FIRST so the difference is observable, and never read "it is
+> still going" as slow.
+
+**X-1a — the negative, before `node work admit`.** Disable compute on the dev
+box; leave it enabled and serving on the macmini. Submit an unpinned run from
+the dev box.
+**Pass:** the macmini's `compute.log` carries exactly one
+`WARN … reason="work_not_admitted"` for that saga (once — the announcement is
+latched, not re-logged every tick), the saga stays `Pending` with
+`assignee: null`, and **no container is created**:
+```bash
+curl -s http://127.0.0.1:9971/v1/query -H 'content-type: application/json' \
+  -d '{"target":"saga","query":{"get":{"saga_id":"'"$SAGA"'"}}}'
+```
+**Fail:** the run executes anyway (the claim lane is ungated), or the saga parks
+with **no** warn — a silent refusal is the one outcome this amendment exists to
+forbid.
+
+**X-1b — then admit and re-run.** On the macmini,
+`"$D" node work admit <dev-box-account-hex> -n "$CHAIN"` (T2-4b), then submit a
+fresh unpinned run **with no restart of anything**.
 **Pass:** the run executes on the macmini and its result commits. Proof the
 placement was real, not local:
 ```bash
@@ -1470,11 +1567,11 @@ Plus, at the top:
 |---|---|
 | 1. Preconditions (P) | 9 |
 | 2. Tier 1 (T1) | 8 |
-| 3. Tier 2 (T2) | 6 |
+| 3. Tier 2 (T2) | 7 |
 | 4. On/off isolation (I) | 6 |
 | 5. Podman co-tenancy (C) | 3 |
 | 6. Cold start (K) | 2 |
 | 7. Restart and skew (R) | 4 |
-| 8. Cross-node placement (X) | 3 |
+| 8. Cross-node placement (X) | 3 (X-1 now has two halves) |
 | 9. Invariants (V) | 5 |
-| **total** | **46** |
+| **total** | **47** |

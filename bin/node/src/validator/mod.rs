@@ -251,6 +251,7 @@ pub(crate) async fn run_validator(
             session_manager,
             gateway_commands,
             local_gateway_via,
+            gateway_workspace,
             session_requests,
         );
         // the module-code plane: serves push/pull transfers and drains the

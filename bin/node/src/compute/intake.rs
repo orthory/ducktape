@@ -34,8 +34,20 @@ use std::collections::{HashMap, HashSet};
 use compute_service::AttemptControl;
 use host::worker::{WorkOutcome, Worker};
 use noded::node_link::NodeLink;
-use saga::{SagaMsg, SagaQuery, SagaReply, WorkerRequest};
+use saga::{SagaMsg, SagaOrigin, SagaQuery, SagaReply, WorkerRequest};
 use sdk::{Event, Msg};
+
+use crate::work_admission::{self, WorkSource, WorkVerdict};
+
+/// the daemon's committed-read transport, behind the one method the work
+/// admission needs. The node's own actor lane wears the same trait in
+/// `term_plane`, so both lanes reach one decision through one seam.
+#[async_trait::async_trait]
+impl work_admission::CommittedReader for NodeLink {
+    async fn read(&self, target: &str, request: Vec<u8>) -> Result<Vec<u8>, String> {
+        self.query(target, &request).await
+    }
+}
 
 /// one attempt's idempotency key — what the worker echoes into its result.
 type AttemptKey = (String, u32);
@@ -44,6 +56,21 @@ type AttemptKey = (String, u32);
 enum AttemptProjection {
     Active,
     Retired,
+}
+
+/// why an announcement needs no further bid from this pump. ONE discriminant —
+/// the two reasons are settled differently and must not be confused: a bid we
+/// won arrives back through the lease lane, a refusal never does.
+enum ClaimState {
+    /// an `Accept` was submitted; the saga's first-accept-wins rule decides.
+    Bid,
+    /// this node does not run that submitter's work.
+    ///
+    /// ponytail: the DECISION is latched, not just its log — so admitting the
+    /// submitter later does not re-open an announcement already seen (the
+    /// saga's next attempt, a new key, is decided fresh). Re-deciding every
+    /// pass would cost two committed reads per refused announcement per tick.
+    NotAdmitted,
 }
 
 /// where one assigned attempt sits in the execute-then-submit lifecycle.
@@ -77,7 +104,8 @@ pub(crate) struct WorkPump {
     /// the identity `/v1/submit` stamps on every op this pump sends.
     me: Vec<u8>,
     work: HashMap<AttemptKey, Entry>,
-    /// announcements this pump has already submitted an `Accept` for.
+    /// announcements this pump has already settled: bid for, or refused
+    /// admission.
     ///
     /// SEPARATE from `work`, and that separation is load-bearing: `Accept`
     /// keeps the announcement's `(saga_id, attempt)` and merely fills in the
@@ -85,7 +113,13 @@ pub(crate) struct WorkPump {
     /// under the exact same key. Sharing one latch would leave the winner's
     /// entry settled-by-the-claim and the run would never execute — a silent
     /// no-op, which is the worst possible shape for this bug.
-    claimed: HashSet<AttemptKey>,
+    claims: HashMap<AttemptKey, ClaimState>,
+    /// this workspace, for the work-admission policy. Read on every FIRST
+    /// SIGHTING rather than latched at boot: the node's own terminal lane reads
+    /// the same file the same way, and a boot-time copy here would make one
+    /// process see `ducktape node work admit` immediately and the other only
+    /// after a restart.
+    workspace: std::path::PathBuf,
     /// whether the last lease read failed. Latched so an unreachable node says
     /// so ONCE and again when it recovers: a silent return would make a node
     /// that cannot be read look exactly like an idle one, which is the single
@@ -94,13 +128,19 @@ pub(crate) struct WorkPump {
 }
 
 impl WorkPump {
-    pub(crate) fn new(pool: Box<dyn Worker>, control: AttemptControl, me: Vec<u8>) -> Self {
+    pub(crate) fn new(
+        pool: Box<dyn Worker>,
+        control: AttemptControl,
+        me: Vec<u8>,
+        workspace: std::path::PathBuf,
+    ) -> Self {
         Self {
             pool,
             control,
             me,
             work: HashMap::new(),
-            claimed: HashSet::new(),
+            claims: HashMap::new(),
+            workspace,
             unreadable: false,
         }
     }
@@ -165,10 +205,97 @@ impl WorkPump {
                 None => {}
             }
         }
-        let due = self.plan(assigned, &retired, &active).await;
+        let decided = self.gate(node, assigned).await;
+        let due = self.plan(decided, &retired, &active).await;
         for (key, msg) in due {
             self.send(node, &key, msg).await;
         }
+    }
+
+    /// This node's work admission, applied to FIRST SIGHTINGS only — before
+    /// anything is offered to the pool, so upstream of workspace provisioning
+    /// and of any paid call. An attempt already tracked is never re-decided:
+    /// its verdict has already become an offer or a refusal op.
+    ///
+    /// Refused work stays in the returned list and gains an entry carrying its
+    /// refusal op, so the pump's ordinary `Due` machinery submits it: a pinned
+    /// saga aimed at a host that will never run it reaches `Failed` with a
+    /// named reason rather than parking. Undecided work is DROPPED from this
+    /// pass and reconsidered on the next — never burn an attempt on a read that
+    /// did not answer.
+    async fn gate(&mut self, node: &NodeLink, assigned: Vec<WorkerRequest>) -> Vec<WorkerRequest> {
+        let mut decided = Vec::with_capacity(assigned.len());
+        for request in assigned {
+            let key = (request.saga_id.clone(), request.attempt);
+            if self.work.contains_key(&key) {
+                decided.push(request);
+                continue;
+            }
+            let verdict = self.admits(node, &request.saga_id).await;
+            self.record(request, key, verdict, &mut decided);
+        }
+        decided
+    }
+
+    /// The WRITE half of the lease gate — no I/O, so all three verdicts are
+    /// unit-testable without a node. `gate` reads, this writes; neither does the
+    /// other's job.
+    fn record(
+        &mut self,
+        request: WorkerRequest,
+        key: AttemptKey,
+        verdict: WorkVerdict,
+        decided: &mut Vec<WorkerRequest>,
+    ) {
+        match verdict {
+            WorkVerdict::Admitted => decided.push(request),
+            WorkVerdict::Refused(refusal) => {
+                // once per attempt: the entry below is what stops this firing
+                // again on every pass. Never the account, only the attempt.
+                tracing::warn!(
+                    target: "ducktape::saga",
+                    attempt = ?key,
+                    reason = refusal.reason(),
+                    "compute attempt refused"
+                );
+                let stage = Stage::Due(refusal_op(&request, refusal.reason()));
+                self.work.insert(
+                    key,
+                    Entry {
+                        stage,
+                        missed: false,
+                    },
+                );
+                // kept in the list so `plan` sees it live and RETAINS the entry
+                // it just made; the entry is what stops it reaching the pool.
+                decided.push(request);
+            }
+            // dropped from this pass and reconsidered on the next. NOT tracked,
+            // so no attempt is burned on a read that simply did not answer.
+            WorkVerdict::AuthorityUnavailable => tracing::debug!(
+                target: "ducktape::saga",
+                attempt = ?key,
+                reason = "work_authority_unavailable",
+                "compute attempt not decided; retrying"
+            ),
+        }
+    }
+
+    /// **The** admission decision for this daemon: one call site, both lanes.
+    /// `work_admission::both_lanes_route_through_one_verdict` pins that shape.
+    ///
+    /// The subject is the saga's COMMITTED origin. `/v1/submit` discards a
+    /// caller's claimed submitter id and re-signs with the submitting node's own
+    /// key, so an `External` origin is a proven node identity — derived, never
+    /// asserted.
+    async fn admits(&self, node: &NodeLink, saga_id: &str) -> WorkVerdict {
+        // no origin to decide on: the read failed, or committed state no longer
+        // names the saga. Neither is a refusal — the retire sweep owns the
+        // second case and the next pass owns the first.
+        let Some(origin) = saga_origin(node, saga_id).await else {
+            return WorkVerdict::AuthorityUnavailable;
+        };
+        work_admission::admit(node, &self.workspace, &self.me, WorkSource::Saga(&origin)).await
     }
 
     /// the CLAIM lane: announcements no node holds a lease on.
@@ -189,13 +316,32 @@ impl WorkPump {
             .map(|request| (request.saga_id.clone(), request.attempt))
             .collect();
         // an announcement that left the projection was claimed (by us or by
-        // someone else) or retired: either way the bid latch is spent.
-        self.claimed.retain(|key| live.contains(key));
+        // someone else) or retired: either way the latch is spent.
+        self.claims.retain(|key, _| live.contains(key));
 
         for request in announcements {
             let key = (request.saga_id.clone(), request.attempt);
-            if self.claimed.contains(&key) {
+            if self.claims.contains_key(&key) {
                 continue;
+            }
+            // whose work, before what work: an announcement this node will not
+            // run is never bid for, which costs the saga NOTHING — no attempt
+            // is burned and another node may still claim it.
+            match self.admits(node, &request.saga_id).await {
+                WorkVerdict::Admitted => {}
+                WorkVerdict::Refused(refusal) => {
+                    tracing::warn!(
+                        target: "ducktape::saga",
+                        attempt = ?key,
+                        reason = refusal.reason(),
+                        "compute claim refused"
+                    );
+                    self.claims.insert(key, ClaimState::NotAdmitted);
+                    continue;
+                }
+                // NOT latched: a read that did not answer must not settle an
+                // announcement this node might well run.
+                WorkVerdict::AuthorityUnavailable => continue,
             }
             // a skip (no provider, no capacity) is deliberately NOT latched:
             // capacity frees up, and re-gating is a pure, cheap decision.
@@ -203,7 +349,7 @@ impl WorkPump {
                 continue;
             };
             if node.submit(&bid.target, &bid.payload).await.is_ok() {
-                self.claimed.insert(key);
+                self.claims.insert(key, ClaimState::Bid);
             }
         }
     }
@@ -426,6 +572,42 @@ async fn pending(node: &NodeLink, me: &[u8], lane: Lane) -> Option<Vec<WorkerReq
     }
 }
 
+/// The op that fails a refused attempt. Without it a pinned saga aimed at a
+/// host that will never run it would sit `Pending` forever — and with no
+/// `deadline` the `Crank` can never terminate it either, so a silent skip
+/// leaks one consensus record per refusal. The `reason` is the stable token,
+/// not prose, and it names no account.
+fn refusal_op(request: &WorkerRequest, reason: &str) -> Msg {
+    Msg {
+        target: "saga".into(),
+        payload: saga::encode_msg(&SagaMsg::OracleResult {
+            saga_id: request.saga_id.clone(),
+            attempt: request.attempt,
+            outcome: Err(reason.to_string()),
+            usage: None,
+        }),
+    }
+}
+
+/// one saga's committed origin — the work-admission subject.
+async fn saga_origin(node: &NodeLink, saga_id: &str) -> Option<SagaOrigin> {
+    let reply = node
+        .query(
+            "saga",
+            &saga::encode_query(&SagaQuery::Get {
+                saga_id: saga_id.to_string(),
+            }),
+        )
+        .await
+        .ok()?;
+    match saga::decode_reply(&reply).ok()? {
+        SagaReply::Saga(view) => view.map(|view| view.origin),
+        SagaReply::NextExpiry(_)
+        | SagaReply::AssignedPending(_)
+        | SagaReply::UnassignedPending(_) => None,
+    }
+}
+
 /// Confirm WHY an assigned attempt disappeared. `AssignedPending` cannot show a
 /// retry that moved to another node; the per-saga view can. An unreadable or
 /// older view is inconclusive and preserves the two-read flap tolerance.
@@ -592,7 +774,15 @@ mod tests {
         );
         let control = pool.attempt_control();
         (
-            WorkPump::new(Box::new(worker), control, ME.to_vec()),
+            // a workspace with no `work-admit.toml` is the default policy; these
+            // tests drive `plan`/`bid` directly, so the gate is exercised by its
+            // own unit tests in `work_admission`.
+            WorkPump::new(
+                Box::new(worker),
+                control,
+                ME.to_vec(),
+                std::path::PathBuf::from("/nonexistent-work-admission-workspace"),
+            ),
             offers,
         )
     }
@@ -699,7 +889,7 @@ mod tests {
             Ok(SagaMsg::Accept { .. })
         ));
         // ... and latches it, exactly as a successful submit would.
-        pump.claimed.insert(("s".to_string(), 0));
+        pump.claims.insert(("s".to_string(), 0), ClaimState::Bid);
 
         // now the SAME key comes back as this node's lease. It must still be
         // offered to the pool and reach Executing.
@@ -732,7 +922,70 @@ mod tests {
             pump.bid(announcement("s", 0), &("s".into(), 0)).await.is_none(),
             "an unservable announcement produces no bid"
         );
-        assert!(pump.claimed.is_empty(), "a skip is never latched");
+        assert!(pump.claims.is_empty(), "a skip is never latched");
+    }
+
+    /// **The lease gate's three writes** — the rules themselves, not their
+    /// routing.
+    ///
+    /// Admitted work reaches the pool. REFUSED work becomes a due
+    /// `OracleResult(Err)` so a pinned saga aimed at a host that will never run
+    /// it reaches `Failed` with a named reason instead of parking forever (a
+    /// saga with no `deadline` can never be cranked out of `Pending`, so a
+    /// silent skip would leak one consensus record per refusal). UNDECIDED work
+    /// is dropped untracked, so a read that did not answer never burns an
+    /// attempt.
+    #[tokio::test]
+    async fn the_lease_gate_writes_one_effect_per_verdict() {
+        let (mut pump, _) = new_pump(true);
+
+        let mut decided = Vec::new();
+        pump.record(
+            request("admitted", 0),
+            ("admitted".into(), 0),
+            WorkVerdict::Admitted,
+            &mut decided,
+        );
+        assert_eq!(decided.len(), 1, "admitted work goes on to the pool");
+        assert_eq!(pump.tracked(), 0, "and is tracked by `plan`, not by the gate");
+
+        pump.record(
+            request("refused", 0),
+            ("refused".into(), 0),
+            WorkVerdict::Refused(work_admission::WorkRefusal::NotAdmitted),
+            &mut decided,
+        );
+        assert_eq!(
+            decided.len(),
+            2,
+            "refused work stays in the list so `plan` retains the entry just made"
+        );
+        let Some(Entry {
+            stage: Stage::Due(msg),
+            ..
+        }) = pump.work.get(&("refused".to_string(), 0))
+        else {
+            panic!("a refused attempt must carry a due op, or the saga parks forever");
+        };
+        let Ok(SagaMsg::OracleResult { outcome, attempt, .. }) = saga::decode_msg(&msg.payload)
+        else {
+            panic!("the refusal op must be an OracleResult");
+        };
+        assert_eq!(attempt, 0);
+        assert_eq!(outcome, Err("work_not_admitted".to_string()));
+
+        pump.record(
+            request("undecided", 0),
+            ("undecided".into(), 0),
+            WorkVerdict::AuthorityUnavailable,
+            &mut decided,
+        );
+        assert_eq!(decided.len(), 2, "an undecided attempt is dropped from the pass");
+        assert!(
+            !pump.work.contains_key(&("undecided".to_string(), 0)),
+            "an undecided attempt is NOT tracked: nothing may burn an attempt on a read \
+             that did not answer"
+        );
     }
 
     #[test]

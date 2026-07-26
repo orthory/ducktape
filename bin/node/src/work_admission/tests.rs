@@ -1,0 +1,449 @@
+//! Work-admission unit tests: the pure decision, the policy file, and the
+//! source-parsing lint that keeps ONE verdict serving both lanes.
+
+use std::path::{Path, PathBuf};
+
+use super::*;
+
+const OWNER: &[u8] = b"owner-account";
+const FRIEND: &[u8] = b"friend-account";
+const STRANGER: &[u8] = b"stranger-account";
+
+fn accounts(ids: &[&[u8]]) -> WorkAdmission {
+    WorkAdmission::Accounts(ids.iter().map(|id| id.to_vec()).collect())
+}
+
+fn caller(id: &[u8]) -> WorkCaller {
+    WorkCaller::Account(id.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// the pure decision
+// ---------------------------------------------------------------------------
+
+/// The default. A node runs its owner's work and refuses everyone else — the
+/// whole point, and the one assertion a forced-open `verdict` must redden.
+#[test]
+fn the_default_admits_the_owner_and_refuses_a_stranger() {
+    let policy = WorkAdmission::Owner;
+    assert_eq!(
+        verdict(&policy, Some(OWNER), &caller(OWNER)),
+        WorkVerdict::Admitted
+    );
+    assert_eq!(
+        verdict(&policy, Some(OWNER), &caller(STRANGER)),
+        WorkVerdict::Refused(WorkRefusal::NotAdmitted)
+    );
+}
+
+/// An admitted account is admitted, and the owner still is — an `Accounts`
+/// policy ADDS, it never replaces the implicit owner. Same shape as
+/// `gateway::credential_use_allowed`.
+#[test]
+fn an_admitted_account_is_admitted_and_the_owner_stays_implicit() {
+    let policy = accounts(&[FRIEND]);
+    assert_eq!(
+        verdict(&policy, Some(OWNER), &caller(FRIEND)),
+        WorkVerdict::Admitted
+    );
+    assert_eq!(
+        verdict(&policy, Some(OWNER), &caller(OWNER)),
+        WorkVerdict::Admitted
+    );
+    assert_eq!(
+        verdict(&policy, Some(OWNER), &caller(STRANGER)),
+        WorkVerdict::Refused(WorkRefusal::NotAdmitted)
+    );
+}
+
+/// This node's own submissions never consult anything: no policy, no owner, no
+/// identity read. It is what keeps a single-node workspace and the whole
+/// pre-`account-init` window working.
+#[test]
+fn our_own_work_needs_no_policy_and_no_owner() {
+    for policy in [WorkAdmission::Owner, accounts(&[FRIEND])] {
+        assert_eq!(
+            verdict(&policy, None, &WorkCaller::ThisNode),
+            WorkVerdict::Admitted
+        );
+    }
+}
+
+/// A module-triggered saga (the chat/pages/forge/jobs family) has no account
+/// origin at this layer and is admitted. Documented as the residual, and
+/// asserted so it cannot change silently.
+#[test]
+fn a_module_triggered_saga_is_admitted_and_that_is_the_named_residual() {
+    assert_eq!(
+        verdict(
+            &WorkAdmission::Owner,
+            Some(OWNER),
+            &WorkCaller::NotAnAccountOrigin
+        ),
+        WorkVerdict::Admitted
+    );
+}
+
+/// A failed identity read is NOT a refusal. On the saga lane a refusal would
+/// burn an attempt against a read that simply did not answer, and on the term
+/// lane it would send the caller to fix an admission that may already exist.
+#[test]
+fn an_unresolved_caller_is_unavailable_not_refused() {
+    assert_eq!(
+        verdict(&WorkAdmission::Owner, Some(OWNER), &WorkCaller::Unresolved),
+        WorkVerdict::AuthorityUnavailable
+    );
+}
+
+/// `Anyone` decides BEFORE the caller is considered — so a node that admits
+/// everyone keeps working while the identity module is unreachable. Policy
+/// first, caller second, and this is why.
+#[test]
+fn anyone_admits_even_when_the_caller_cannot_be_resolved() {
+    for caller in [
+        WorkCaller::Unresolved,
+        WorkCaller::NodeWithoutAccount,
+        caller(STRANGER),
+    ] {
+        assert_eq!(
+            verdict(&WorkAdmission::Anyone, None, &caller),
+            WorkVerdict::Admitted
+        );
+    }
+}
+
+/// A node bound to no account cannot be named by any admission, so it gets its
+/// OWN reason: the operator's fix is `user account-init` there, not
+/// `node work admit` here.
+#[test]
+fn a_node_with_no_account_is_refused_with_its_own_reason() {
+    assert_eq!(
+        verdict(
+            &WorkAdmission::Owner,
+            Some(OWNER),
+            &WorkCaller::NodeWithoutAccount
+        ),
+        WorkVerdict::Refused(WorkRefusal::CallerUnbound)
+    );
+}
+
+/// A node with no owner yet admits nobody but itself — an unresolvable owner
+/// must never match an account, or the bootstrap window would admit everyone.
+#[test]
+fn an_ownerless_node_admits_no_account() {
+    assert_eq!(
+        verdict(&WorkAdmission::Owner, None, &caller(OWNER)),
+        WorkVerdict::Refused(WorkRefusal::NotAdmitted)
+    );
+}
+
+/// Every refusal token is stable, distinct, and snake_case; none of them can
+/// carry an account.
+#[test]
+fn refusal_reasons_are_distinct_stable_tokens() {
+    let reasons = [
+        WorkRefusal::NotAdmitted.reason(),
+        WorkRefusal::CallerUnbound.reason(),
+        WorkRefusal::PolicyUnreadable.reason(),
+    ];
+    assert_eq!(
+        reasons,
+        ["work_not_admitted", "work_caller_unbound", "work_policy_unreadable"]
+    );
+    for reason in reasons {
+        assert!(
+            reason.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "{reason} is not a snake_case token"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// attribution
+// ---------------------------------------------------------------------------
+
+/// The two sources a lane can offer, and the one origin shape that is not
+/// attributable. A new `SagaOrigin` variant fails the build in `attributable`
+/// rather than defaulting to admitted.
+#[test]
+fn only_an_external_origin_and_a_mesh_peer_are_attributable() {
+    let external = SagaOrigin::External(b"peer-node".to_vec());
+    assert!(matches!(
+        attributable(&WorkSource::Saga(&external)),
+        Attributable::Node(key) if key == b"peer-node"
+    ));
+    assert!(matches!(
+        attributable(&WorkSource::Peer(b"peer-node")),
+        Attributable::Node(key) if key == b"peer-node"
+    ));
+    assert!(matches!(
+        attributable(&WorkSource::Saga(&SagaOrigin::Module("dispatch".into()))),
+        Attributable::No
+    ));
+    assert!(matches!(
+        attributable(&WorkSource::Saga(&SagaOrigin::System)),
+        Attributable::No
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// the zero-read path
+// ---------------------------------------------------------------------------
+
+/// a reader that fails the test if anything reads through it.
+struct NoReads;
+
+#[async_trait::async_trait]
+impl CommittedReader for NoReads {
+    async fn read(&self, target: &str, _request: Vec<u8>) -> Result<Vec<u8>, String> {
+        panic!("work admission read {target:?} on a path that must make no committed read");
+    }
+}
+
+/// **This node's own work costs ZERO committed reads.** Not an optimization: a
+/// read here would make a single-node workspace — and every node in the window
+/// before `user account-init` — depend on an identity module that has nothing
+/// to say yet. The reader panics, so a reintroduced owner lookup fails loudly
+/// instead of quietly hanging a create.
+#[tokio::test]
+async fn our_own_work_makes_no_committed_read() {
+    let dir = scratch("noreads");
+    let me = b"this-node";
+    let external = SagaOrigin::External(me.to_vec());
+    assert_eq!(
+        admit(&NoReads, &dir, me, WorkSource::Saga(&external)).await,
+        WorkVerdict::Admitted
+    );
+    assert_eq!(
+        admit(&NoReads, &dir, me, WorkSource::Peer(me)).await,
+        WorkVerdict::Admitted
+    );
+    // and a module-triggered saga names no node at all, so it reads nothing either.
+    let module = SagaOrigin::Module("dispatch".into());
+    assert_eq!(
+        admit(&NoReads, &dir, me, WorkSource::Saga(&module)).await,
+        WorkVerdict::Admitted
+    );
+}
+
+/// An unreadable policy refuses — loudly and by its own name — rather than
+/// admitting or retrying forever. It also short-circuits BEFORE any read.
+#[tokio::test]
+async fn an_unreadable_policy_refuses_without_reading_anything() {
+    let dir = scratch("broken");
+    std::fs::write(policy_path(&dir), "admit = \"not-a-list\"\n").expect("write");
+    assert_eq!(
+        admit(&NoReads, &dir, b"me", WorkSource::Peer(b"stranger")).await,
+        WorkVerdict::Refused(WorkRefusal::PolicyUnreadable)
+    );
+}
+
+/// a reader that answers the CALLER lookup and fails the OWNER lookup — the
+/// asymmetric half-failure, which is the one a two-state verdict reports as
+/// "not admitted".
+struct OwnerReadFails {
+    me: Vec<u8>,
+}
+
+#[async_trait::async_trait]
+impl CommittedReader for OwnerReadFails {
+    async fn read(&self, _target: &str, request: Vec<u8>) -> Result<Vec<u8>, String> {
+        let identity::IdentityQuery::OfNode { node_key } =
+            identity::decode_query(&request).expect("an identity query")
+        else {
+            panic!("work admission asks only OfNode");
+        };
+        if node_key == self.me {
+            return Err("identity module did not answer".into());
+        }
+        Ok(identity::encode_reply(&identity::IdentityReply::Account(
+            Some(identity::AccountView {
+                account_id: b"caller-account".to_vec(),
+                display_name: None,
+                avatar: None,
+                bio: None,
+                nonce: 0,
+                member_keys: Vec::new(),
+                nodes: Vec::new(),
+                updated_at: 0,
+            }),
+        )))
+    }
+}
+
+/// **A failed OWNER read is not a refusal either.** The owner is half the
+/// comparison for an account caller, so folding its failure into
+/// `work_not_admitted` would tell the operator to admit an account that might
+/// already BE the owner — the exact misdiagnosis `GrantAnswer`'s third state
+/// exists to prevent, one read over.
+#[tokio::test]
+async fn a_failed_owner_read_is_unavailable_not_refused() {
+    let dir = scratch("ownerfail");
+    let reader = OwnerReadFails { me: b"me".to_vec() };
+    assert_eq!(
+        admit(&reader, &dir, b"me", WorkSource::Peer(b"stranger")).await,
+        WorkVerdict::AuthorityUnavailable
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the policy file
+// ---------------------------------------------------------------------------
+
+fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("ducktape-work-admit-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch workspace");
+    dir
+}
+
+/// A missing file IS the default — the `services.toml` convention, and what
+/// makes this change additive to every existing workspace.
+#[test]
+fn a_workspace_with_no_policy_file_runs_its_owners_work() {
+    let dir = scratch("absent");
+    assert_eq!(load(&dir).expect("absent is the default"), WorkAdmission::Owner);
+}
+
+/// Round trip, and `Owner` REMOVES the file: one representation per policy, no
+/// husk to read stale.
+#[test]
+fn the_policy_round_trips_and_owner_leaves_no_file() {
+    let dir = scratch("roundtrip");
+    let policy = accounts(&[FRIEND, STRANGER]);
+    save(&dir, &policy).expect("save");
+    assert_eq!(load(&dir).expect("load"), policy);
+
+    save(&dir, &WorkAdmission::Anyone).expect("save anyone");
+    assert_eq!(load(&dir).expect("load anyone"), WorkAdmission::Anyone);
+
+    save(&dir, &WorkAdmission::Owner).expect("save owner");
+    assert!(!policy_path(&dir).exists(), "owner must leave no file behind");
+    assert_eq!(load(&dir).expect("load owner"), WorkAdmission::Owner);
+}
+
+/// Revoking the last account narrows back to `Owner`, so `admit = []` can never
+/// be written — one representation, no third state a reader could invent.
+#[test]
+fn revoking_the_last_account_narrows_back_to_owner() {
+    let policy = accounts(&[FRIEND]).without(AdmitTarget::Account(FRIEND.to_vec()));
+    assert_eq!(policy, WorkAdmission::Owner);
+    assert!(policy.entries().is_empty());
+}
+
+/// `anyone` absorbs and `revoke anyone` narrows all the way back.
+#[test]
+fn anyone_absorbs_and_revoking_it_returns_to_owner() {
+    let widened = accounts(&[FRIEND]).with(AdmitTarget::Anyone);
+    assert_eq!(widened, WorkAdmission::Anyone);
+    assert_eq!(widened.with(AdmitTarget::Account(FRIEND.to_vec())), WorkAdmission::Anyone);
+    assert_eq!(
+        WorkAdmission::Anyone.without(AdmitTarget::Anyone),
+        WorkAdmission::Owner
+    );
+}
+
+/// The wildcard is a STATEMENT, not an entry: mixing it with account ids is a
+/// refusal at parse, not a silently-widened policy.
+#[test]
+fn admit_cannot_mix_the_wildcard_with_accounts() {
+    let mixed = parse(&[ANYONE.to_string(), config::hex_bytes(FRIEND)]).unwrap_err();
+    assert!(mixed.contains("statement, not an entry"), "got {mixed:?}");
+    assert_eq!(parse(&[ANYONE.to_string()]).expect("bare wildcard"), WorkAdmission::Anyone);
+}
+
+/// A hand-edited file that is not hex is a loud refusal, never a silently
+/// dropped entry — a dropped entry would read as "admitted" going one way and
+/// "refused" going the other.
+#[test]
+fn a_non_hex_admit_entry_is_refused() {
+    let error = parse(&["not-hex".to_string()]).unwrap_err();
+    assert!(error.contains("not a hex account id"), "got {error:?}");
+}
+
+/// An unknown key in the file is a decode error, not tolerance.
+#[test]
+fn the_policy_file_is_strict() {
+    let dir = scratch("strict");
+    std::fs::write(policy_path(&dir), "admit = []\nspend_cap = 10\n").expect("write");
+    let error = load(&dir).unwrap_err();
+    assert!(error.contains("spend_cap"), "got {error:?}");
+}
+
+// ---------------------------------------------------------------------------
+// the shape lint
+// ---------------------------------------------------------------------------
+
+fn source(relative: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    // a lint on CODE: the doc comments deliberately name what they forbid.
+    text.lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// **The single-verdict shape, parsed rather than promised.**
+///
+/// Two admission checks that must agree is the dual-path defect this repo
+/// forbids; one function called twice is not. So each lane reaches the policy
+/// through exactly ONE `work_admission::admit(` call and names no policy type
+/// of its own — a second call site, or a lane that loaded the policy and
+/// decided for itself, fails here.
+#[test]
+fn both_lanes_route_through_one_verdict() {
+    const LANES: [(&str, &str); 2] = [
+        ("src/term_plane.rs", "the terminal plane"),
+        ("src/compute/intake.rs", "the compute intake"),
+    ];
+    for (relative, lane) in LANES {
+        let code = source(relative);
+        let calls = code.matches("work_admission::admit(").count();
+        assert_eq!(
+            calls, 1,
+            "{lane} reaches work admission through {calls} call sites; it must be exactly \
+             one — every path into this lane routes through the same decision"
+        );
+        // the three tokens that mean "I touched the policy myself". A lane may
+        // freely NAME a `WorkVerdict`/`WorkRefusal` — it has to, to consume one
+        // — but reading the policy or calling the decision directly is the
+        // second check that could disagree with the first.
+        for forbidden in [
+            "WorkAdmission::",
+            "work_admission::load(",
+            "work_admission::verdict",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "{lane} names `{forbidden}`: the policy is decided in `work_admission` and \
+                 consumed as a `WorkVerdict` — a call site that re-decides is the \
+                 two-checks-that-must-agree defect"
+            );
+        }
+    }
+    let own = source("src/work_admission.rs");
+    assert_eq!(
+        own.matches("fn verdict(").count(),
+        1,
+        "there is exactly one verdict function, and both lanes reach it through `admit`"
+    );
+}
+
+/// **The premise the whole module rests on.** `/v1/submit` must keep discarding
+/// the caller's claimed origin and re-signing with the node's own key: that is
+/// what makes a saga's committed `External` origin a DERIVED node identity
+/// rather than an asserted one. If this lane ever stamped a caller-supplied
+/// origin, the compute-lane admission would silently become decorative.
+#[test]
+fn the_submit_lane_still_resigns_with_the_node_key() {
+    let code = source("src/validator/run/ingress.rs");
+    assert!(
+        code.contains("origin: _,"),
+        "the validator submit lane must IGNORE the caller's claimed origin"
+    );
+    assert!(
+        code.contains("node::encode_frame(&self.signer,"),
+        "the validator submit lane must re-sign with this node's own signer"
+    );
+}
