@@ -59,29 +59,22 @@ pub(crate) struct AnnounceSet {
 /// what `plan_enable` refuses, so that an operator is never asked to approve a
 /// consent screen listing tags this node will never announce.
 ///
-/// The two are NOT equally unreachable from the watcher, and the difference is
-/// worth stating precisely because it is easy to assume symmetry:
+/// Both arms are unreachable from the watcher, and both for the SAME reason —
+/// they are properties of the FILE, not of whichever code path wrote it.
+/// `Services::validate` runs this very function over [`widest`] on every
+/// `load`, so no `services.toml` this node will read can carry an illegal tag or
+/// imply more tags than the registry accepts. Every live derivation is a subset
+/// of that bound.
 ///
-/// - `IllegalTags` is unreachable as a **property of the file**.
-///   `Services::validate` rejects a grant carrying an illegal tag on every
-///   `load`, and [`announced_set`] only ever emits tags drawn from
-///   `grant.capabilities`. So no `services.toml` this node will read can produce
-///   one, whoever wrote it.
-/// - `OverCap` is unreachable only as a **property of the writer**.
-///   `plan_enable` bounds the WIDEST set the grants could ever produce
-///   ([`widest`]), and every live derivation is a subset of that bound — but
-///   `Services::validate` enforces no cap on tag COUNT, so a `services.toml`
-///   written by anything other than `plan_enable` (a hand edit, a restored
-///   backup, a future verb) hands the watcher a permanently undecidable set:
-///   every tick refuses, nothing is announced, and the only signal is a
-///   throttled warn.
+/// The consequence is deliberate and worth knowing before it surprises someone:
+/// an over-cap or ill-tagged file fails the node's BOOT, not merely its
+/// announce. That is the louder half of the trade. The state it replaces is the
+/// one this campaign has hit repeatedly — a node that boots, looks healthy, and
+/// silently announces nothing behind a warn throttled to one line per five
+/// minutes.
 ///
-/// Closing that gap means teaching `validate` the cap, which would make an
-/// over-cap file fail the NODE'S BOOT rather than only its announce — a
-/// deliberately harsher trade than it looks, and not one to make as a side
-/// effect. Until then: if `OverCap` ever fires on the watcher path, the fix is
-/// upstream at whatever wrote the file, never a trim here, which would only
-/// hide it.
+/// So if either arm ever fires on the watcher path, it is not a set to trim
+/// here — it means `validate` was bypassed, and the fix is upstream.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     /// tags the registry's own grammar rejects. The hello boundary's item rule

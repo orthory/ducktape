@@ -264,23 +264,28 @@ impl Services {
                     GRANT_NONCE_LEN * 2
                 ));
             }
-            // the consented tags must be announceable, checked HERE as well as
-            // at the consent boundary: that makes "an announce can never carry
-            // an illegal tag" a property of the file rather than of one code
-            // path, so nothing downstream has to filter. Fail-closed on a file
-            // only this CLI writes.
-            if let Some(bad) = grant
-                .capabilities
-                .iter()
-                .find(|tag| capability::validate_tag(tag).is_err())
-            {
-                return Err(format!(
-                    "services: {} grants {bad:?}, which the capability registry refuses (a tag \
-                     is 1..64 bytes of [a-z0-9._-])",
-                    grant.kind
-                ));
-            }
         }
+        // THE announce these grants imply must be one the registry would take —
+        // checked with the very function that derives it, over the WIDEST set
+        // they could ever produce.
+        //
+        // This is what makes both `announce::Refusal` arms properties of the
+        // FILE rather than of whichever code path happened to write it: no
+        // `services.toml` this node will load can carry an illegal tag or imply
+        // more tags than the registry accepts, whoever wrote it. Nothing
+        // downstream has to filter, and the watcher's refusal arms are
+        // unreachable rather than merely unlikely.
+        //
+        // Deliberately ONE call rather than a re-implementation of the two
+        // rules: a second copy is how a bound drifts from the thing it bounds
+        // (the same defect that let a retuned `HEARTBEAT` pass a test pinning
+        // it). Capacity is empty here because neither refusal reads it.
+        crate::announce::announced_set(
+            &self.grants,
+            &crate::announce::widest(&self.grants),
+            &std::collections::BTreeMap::new(),
+        )
+        .map_err(|refusal| format!("services: {refusal}"))?;
         Ok(())
     }
 
@@ -1814,6 +1819,75 @@ mod tests {
         .expect("a union well under the cap plans fine");
         assert_eq!(plan.grant.kind, "compute");
         assert_eq!(plan.grant.capabilities, vec!["codex".to_string()]);
+    }
+
+    /// A file the registry would refuse must not LOAD, which means it fails the
+    /// node's boot rather than only its announce.
+    ///
+    /// The state this replaces is the one to keep in mind: before it, an
+    /// over-cap `services.toml` booted a healthy-looking node whose watcher then
+    /// refused every tick behind a warn throttled to one line per five minutes —
+    /// boots, looks fine, silently does nothing. Refusing loudly is strictly
+    /// better, and the only writer of this file already bounds it, so a file
+    /// that exceeds the cap means a hand edit or a bug. Both deserve to be loud.
+    #[test]
+    fn a_file_the_registry_would_refuse_does_not_load() {
+        let over_cap = Services {
+            version: FORMAT_VERSION,
+            grants: vec![ServiceGrant {
+                kind: "compute".into(),
+                instance: "aa".repeat(32),
+                nonce: "bb".repeat(16),
+                granted_unix: 1,
+                // 64 executors + the kind tag = one over the registry's cap.
+                capabilities: (0..64).map(|n| format!("e{n}")).collect(),
+                scopes: Vec::new(),
+            }],
+        };
+        let error = over_cap
+            .validate()
+            .expect_err("an over-cap grant set must not load");
+        assert!(
+            error.contains("64"),
+            "the refusal names the registry's cap: {error}"
+        );
+
+        let illegal = Services {
+            version: FORMAT_VERSION,
+            grants: vec![ServiceGrant {
+                kind: "compute".into(),
+                instance: "aa".repeat(32),
+                nonce: "bb".repeat(16),
+                granted_unix: 1,
+                capabilities: vec!["Claude Sonnet".into()],
+                scopes: Vec::new(),
+            }],
+        };
+        let error = illegal
+            .validate()
+            .expect_err("a tag the registry refuses must not load");
+        assert!(
+            error.contains("Claude Sonnet"),
+            "the offending tag is named: {error}"
+        );
+    }
+
+    #[test]
+    fn a_grant_set_within_the_cap_loads() {
+        // so the test above pins the bound rather than a file that could never
+        // load: one under the cap is fine.
+        let ok = Services {
+            version: FORMAT_VERSION,
+            grants: vec![ServiceGrant {
+                kind: "compute".into(),
+                instance: "aa".repeat(32),
+                nonce: "bb".repeat(16),
+                granted_unix: 1,
+                capabilities: (0..63).map(|n| format!("e{n}")).collect(),
+                scopes: Vec::new(),
+            }],
+        };
+        ok.validate().expect("63 executors + the kind tag is exactly the cap");
     }
 
     /// Consent lands on DISK before it lands on chain, in both verbs.
