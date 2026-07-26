@@ -1,28 +1,47 @@
 //! the agent dogfooding loop (M1), end to end on REAL `ducktape`
-//! validators: issue mention → forge-worktree run → PR, then the PR channel
-//! as a SESSION, then a deterministic concurrent-advance rebase.
+//! validators: issue mention → forge-workspace run → PR, then the PR channel as
+//! a SESSION.
 //!
 //!   1. a repo is born by its first push; an issue opens (item #1, hidden
 //!      channel `forge:<repo>:1`); the agent is registered with forge caps
 //!      and the channel is watched.
-//!   2. mentioning the agent runs the provider INSIDE a real git worktree of
-//!      the repo at the pinned dev tip; the host commits + pushes branch
+//!   2. mentioning the agent runs the provider INSIDE a real git clone of the
+//!      repo, detached at the pinned dev tip; the host commits + pushes branch
 //!      `agent/item-1` through consensus and the PR sink opens a PR whose
 //!      title is the bound Forge issue title.
 //!   3. re-mentioning in the PR's OWN channel forks the branch TIP: a second
 //!      commit lands on the SAME branch (parent = the first), and the
 //!      duplicate guard opens NO second PR.
-//!   4. the ordering proof: the provider itself advances the work branch
-//!      through the loopback remote (clone → empty commit → push) and
-//!      CONDITION-POLLS `git ls-remote` until the advertisement (COMMITTED
-//!      refs) carries its tip — the happens-before that makes the race
-//!      deterministic (a push alone does not order the two ops). the run's
-//!      worktree is DETACHED at the pin, so the host commits on the stale
-//!      base, its push rejects against the moved tip, and the provisioner
-//!      REBASES the run's commit onto the interloper and re-pushes: the run
-//!      delivers clean (not degraded) with the receipt's `rebased` flag
-//!      set, and the branch tip is the rebased commit whose PARENT is the
-//!      interloper — nobody's work clobbered.
+//!
+//! ## a run is sandboxed, and that changed what this test can see
+//!
+//! The provider executes INSIDE a container now, so this suite needs a
+//! `[sandbox]` table (without one every compute daemon exits at boot — the
+//! reason this file spent weeks passing nothing) and its script cannot touch a
+//! host path: the fixture directory does not exist in the run's mount
+//! namespace. The evidence moved onto the one surface that DOES cross the
+//! boundary — the run workspace itself, which is a bind mount the host then
+//! commits and pushes. Each run writes [`HEAD_FILE`], and the test reads it back
+//! out of committed git history, which is a stronger claim than the old
+//! host-side trace log: it is signed into the branch the run produced.
+//!
+//! `.git/HEAD` is read with `cat`, not `git rev-parse`: a detached HEAD holds
+//! the raw oid, so the whole proof (WHICH commit, and that it is DETACHED) is
+//! one file read, and the image stays a 4 MB busybox instead of something
+//! carrying a git client.
+//!
+//! ## what this file no longer covers, and why
+//!
+//! It used to end with an ordering proof: the provider script itself advanced
+//! the work branch through the node's loopback forge remote, so the host's push
+//! rejected and the provisioner had to rebase. A run's container has no route
+//! to its own node — the egress firewall allows this run's broker port and
+//! nothing else — so a provider CANNOT race a push any more, and a scenario
+//! that cannot happen is not a regression this suite can hold. The property
+//! itself is covered where it lives, against the provisioner:
+//! `bin/noded/src/agent_provision/forge_tests.rs`'s
+//! `a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed` (plus the
+//! merge-preserving and author-preservation variants beside it).
 //!
 //! run alone (cluster e2es flake under parallel load):
 //!   cargo test -p node-bin --test dogfood_loop_e2e -- --nocapture
@@ -36,12 +55,21 @@ use std::time::Duration;
 use agent::{ACTION_CHAT_POST, AgentMsg, ResourceCaps};
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, Span};
-use common::{Cluster, poll_until, serial};
+use common::{Cluster, SANDBOX_IMAGE, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
 use runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 
 const CONVERGE: Duration = Duration::from_secs(180);
 const FINALIZE: Duration = Duration::from_secs(60);
 const ROUND_TRIP: Duration = Duration::from_secs(120);
+
+/// the file each run writes into its workspace, carrying `pwd` and the raw
+/// `.git/HEAD` of the clone it was handed. The host stages everything under the
+/// workspace, so it rides the run's own commit into the branch — readable from
+/// any node, forever, instead of from a host path the container cannot see.
+const HEAD_FILE: &str = ".dogfood-run";
+/// the neutral guest cwd every sandboxed run gets (`podman_api::GUEST_ROOT`),
+/// which is the point: the operator's real layout never reaches the workload.
+const GUEST_WORKDIR: &str = "/ducktape/workspace";
 
 const AGENT_ID: &str = "quacker-dogfood";
 const REPO: &str = "dogfood";
@@ -49,22 +77,18 @@ const WORK_BRANCH: &str = "agent/item-1";
 /// the worker script's single-line reply; it belongs in the published body.
 const REPLY_TITLE: &str = "Dogfood loop proof";
 const ISSUE_TITLE: &str = "prove the dogfood loop";
-const RACE_REPLY: &str = "raced an interloper";
 
-/// one script-backed provider standing in for a coding agent. the script FILE
-/// is rewritten between phases (the env var pins the path, not the content):
-/// the worker records its provisioned worktree and edits it; the interloper
-/// additionally advances the work branch through the loopback remote first.
+/// one script-backed provider standing in for a coding agent.
+///
+/// It runs INSIDE the run's container, so `sh`, `cat` and `printf` are the whole
+/// of its dependencies and its only writable surface is the workspace it was
+/// handed. It records `pwd|HEAD` into [`HEAD_FILE`] — which the host commits —
+/// and answers on stdout.
 struct DogfoodProvider {
     tag: String,
     spec_dir: PathBuf,
     env_var: String,
     script: PathBuf,
-    /// one `pwd|ref|head` line per provider execution (`ref` is
-    /// `--abbrev-ref HEAD`: literally "HEAD" — the worktree is detached).
-    trace_log: PathBuf,
-    /// the interloper's pushed commit oid (written only after its push).
-    interloper_log: PathBuf,
 }
 
 impl DogfoodProvider {
@@ -93,86 +117,36 @@ impl DogfoodProvider {
             ),
         )
         .expect("write provider spec");
-        let provider = Self {
+        let script = dir.join("provider.sh");
+        // Everything the script needs of its image: `sh`, `cat`, `printf`.
+        //
+        // `.git/HEAD` is read RAW rather than through `git rev-parse`. The run
+        // workspace is a self-contained clone (`.git` lives inside the bind
+        // mount), detached at the pin — so that file holds the bare oid, and
+        // reading it proves BOTH which commit the run forked and that the
+        // checkout is detached: a branch checkout would hold `ref: refs/…`
+        // instead, and the assertions below would name it.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 set -e\n\
+                 cat > /dev/null\n\
+                 printf '%s|%s\\n' \"$(pwd)\" \"$(cat .git/HEAD)\" > {HEAD_FILE}\n\
+                 printf '%s\\n' '{REPLY_TITLE}'\n"
+            ),
+        )
+        .expect("write provider script");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = std::fs::metadata(&script).expect("script metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod provider script");
+        Self {
             tag: tag.into(),
             spec_dir,
             env_var,
-            script: dir.join("provider.sh"),
-            trace_log: dir.join("trace.log"),
-            interloper_log: dir.join("interloper.log"),
-        };
-        provider.write_worker_script();
-        provider
-    }
-
-    fn write_script(&self, body: &str) {
-        std::fs::write(&self.script, body).expect("write provider script");
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&self.script)
-            .expect("script metadata")
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&self.script, perms).expect("chmod provider script");
-    }
-
-    /// runs 1+2: record the provisioned worktree (cwd, ref, HEAD), edit it
-    /// (the file content differs per run — it carries the pinned HEAD), reply.
-    fn write_worker_script(&self) {
-        self.write_script(&format!(
-            "#!/bin/sh\n\
-             set -e\n\
-             cat > /dev/null\n\
-             echo \"$(pwd)|$(git rev-parse --abbrev-ref HEAD)|$(git rev-parse HEAD)\" >> {trace}\n\
-             git rev-parse HEAD > pinned-base.txt\n\
-             printf '%s\\n' '{reply}'\n",
-            trace = self.trace_log.display(),
-            reply = REPLY_TITLE,
-        ));
-    }
-
-    /// run 3, two deterministic steps (no sleeps — every wait is a
-    /// condition):
-    /// 1. advance the work branch through the loopback remote (clone →
-    ///    empty commit → push), then CONDITION-POLL `ls-remote` (bounded,
-    ///    30 × 1s) until the advertisement — COMMITTED refs — carries the
-    ///    interloper tip. the run's worktree is DETACHED at the pin, so the
-    ///    committed-ref catch-up cannot reparent the host's later commit.
-    /// 2. edit the workspace and reply — the host's commit forks the stale
-    ///    pin, its push rejects against the moved tip, and the provisioner
-    ///    must rebase-and-re-push.
-    fn write_interloper_script(&self, forge_base: &str) {
-        self.write_script(&format!(
-            "#!/bin/sh\n\
-             set -e\n\
-             cat > /dev/null\n\
-             work=$(pwd)\n\
-             echo \"$work|$(git rev-parse --abbrev-ref HEAD)|$(git rev-parse HEAD)\" >> {trace}\n\
-             export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0\n\
-             tmp=$(mktemp -d)\n\
-             git clone -q --branch {branch} {base_url}/{repo} \"$tmp/clone\"\n\
-             cd \"$tmp/clone\"\n\
-             git -c user.name=interloper -c user.email=i@test.local -c commit.gpgsign=false \\\n\
-                 commit -q --allow-empty -m interloper\n\
-             tip=$(git rev-parse HEAD)\n\
-             git push -q origin {branch}\n\
-             n=0\n\
-             until [ \"$(git ls-remote origin refs/heads/{branch} | cut -f1)\" = \"$tip\" ]; do\n\
-                 n=$((n+1))\n\
-                 [ \"$n\" -le 30 ]\n\
-                 sleep 1\n\
-             done\n\
-             printf '%s\\n' \"$tip\" > {interloper}\n\
-             cd \"$work\"\n\
-             rm -rf \"$tmp\"\n\
-             echo stale-pin-run > pinned-base.txt\n\
-             printf '%s\\n' '{reply}'\n",
-            trace = self.trace_log.display(),
-            branch = WORK_BRANCH,
-            base_url = forge_base,
-            repo = REPO,
-            interloper = self.interloper_log.display(),
-            reply = RACE_REPLY,
-        ));
+            script,
+        }
     }
 
     fn env(&self) -> Vec<(String, String)> {
@@ -184,30 +158,16 @@ impl DogfoodProvider {
             (self.env_var.clone(), self.script.display().to_string()),
         ]
     }
-
-    /// every provider execution's `pwd|ref|head` line, in order.
-    fn trace(&self) -> Vec<String> {
-        std::fs::read_to_string(&self.trace_log)
-            .map(|s| s.lines().map(str::to_string).collect())
-            .unwrap_or_default()
-    }
-
-    fn interloper_oid(&self) -> String {
-        std::fs::read_to_string(&self.interloper_log)
-            .expect("the interloper pushed and recorded its oid")
-            .trim()
-            .to_string()
-    }
 }
 
-/// `pwd|ref|head` → its three fields.
-fn trace_parts(line: &str) -> (String, String, String) {
-    let mut parts = line.splitn(3, '|').map(str::to_string);
-    (
-        parts.next().expect("trace pwd"),
-        parts.next().expect("trace branch"),
-        parts.next().expect("trace head"),
-    )
+/// the `pwd|HEAD` [`HEAD_FILE`] the run at `commit` committed, read out of a
+/// clone of the branch — committed evidence, from a node that executed nothing.
+fn run_evidence(checkout: &Path, commit: &str) -> (String, String) {
+    let line = git_stdout(checkout, &["show", &format!("{commit}:{HEAD_FILE}")]);
+    let (cwd, head) = line
+        .split_once('|')
+        .unwrap_or_else(|| panic!("{HEAD_FILE} at {commit} is `pwd|HEAD`, got {line:?}"));
+    (cwd.to_string(), head.to_string())
 }
 
 /// hermetic env for a node that must provide NOTHING (see dispatch_e2e).
@@ -242,6 +202,11 @@ fn boot(cluster: &mut Cluster) {
     assert_eq!(genesis[0], genesis[2], "genesis fork between nodes 0 and 2");
     for i in 0..3 {
         cluster.wait_marker(i, "converged root_hash=", CONVERGE);
+        // the compute plane is a separate process with its own failure domain:
+        // gate on ITS lifecycle marker, or a daemon that died at boot leaves a
+        // cluster that looks healthy until an unrelated predicate times out
+        // three minutes later.
+        cluster.wait_compute_marker(i, "compute daemon serving", CONVERGE);
     }
 }
 
@@ -390,28 +355,6 @@ fn run_record(cluster: &Cluster, idx: usize, run_id: &str) -> Option<RunRecord> 
     }
 }
 
-/// the run's `workspace_receipt.rebased` flag, read off the RETAINED dispatch
-/// outcome (the ring does not carry it; this is the narrowest committed
-/// surface that does — the dispatch record keeps the runner-result bytes
-/// after delivery).
-fn run_receipt_rebased(cluster: &Cluster, idx: usize, run_id: &str) -> Option<bool> {
-    let reply = cluster.query(
-        idx,
-        "dispatch",
-        &dispatch::encode_query(&dispatch::DispatchQuery::Dispatch {
-            receiver: "runs".into(),
-            dispatch_id: runs::dispatch_id_for(run_id),
-        }),
-    )?;
-    let dispatch::DispatchReply::Dispatch(Some(view)) = dispatch::decode_reply(&reply).ok()?
-    else {
-        return None;
-    };
-    let bytes = view.outcome?.ok()?;
-    let result: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    result["workspace_receipt"]["rebased"].as_bool()
-}
-
 fn open_pr_count(cluster: &Cluster, idx: usize) -> usize {
     tracker_items(cluster, idx)
         .iter()
@@ -471,7 +414,24 @@ fn git_stdout(dir: &Path, args: &[&str]) -> String {
 }
 
 #[test]
-fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_race() {
+fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
+    if skip_unless_sandboxed(
+        "issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session",
+    )
+    .is_some()
+    {
+        return;
+    }
+    // the fixture seeds and inspects the repo with the HOST git; the run inside
+    // the container needs none.
+    if nettest::skip_without(
+        "issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session",
+        nettest::missing_tool("git"),
+    )
+    .is_some()
+    {
+        return;
+    }
     let _serial = serial();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
     let provider = DogfoodProvider::stage(fixtures.path());
@@ -486,6 +446,10 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     // rendezvous pool, so every node opts in.
     // serving is opt-in: the compute grant is what puts a node in the pool.
     cluster.compute_grant = Some(vec![provider.tag.clone()]);
+    // HOW a run is isolated (the table) is independent of WHETHER this node runs
+    // any (the grant); the compute daemon needs both and refuses to boot without
+    // the table. Appended LAST — nothing may follow a toml table header.
+    cluster.extra_toml.extend(sandbox_toml(SANDBOX_IMAGE));
     cluster.env[0] = [hermetic_env(fixtures.path(), "node0"), vec![runs_root_env.clone()]].concat();
     cluster.env[1] = [
         provider.env(),
@@ -601,17 +565,6 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     };
     assert_ne!(run1_oid, dev_tip, "the run pushed a NEW commit");
 
-    // the provider ran in a REAL worktree: DETACHED at the pinned dev tip
-    // (the work branch is push-time only), under the operator-rooted run tree.
-    let trace = provider.trace();
-    assert_eq!(trace.len(), 1, "one provider execution so far: {trace:?}");
-    let (cwd, head_ref, head) = trace_parts(&trace[0]);
-    assert!(
-        PathBuf::from(&cwd).starts_with(&runs_root),
-        "the worktree honors DUCKTAPE_AGENT_RUNS_ROOT: {cwd}"
-    );
-    assert_eq!(head_ref, "HEAD", "the worktree is DETACHED at the pin");
-    assert_eq!(head, dev_tip, "run 1 forks the pinned dev tip");
 
     // the PR: opened by the sink, titled from verified bound issue metadata.
     let pr_number = poll_until("the PR to open", FINALIZE, || {
@@ -654,11 +607,6 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     let run2_oid = poll_until("the branch tip to advance", FINALIZE, || {
         branch_tip(&cluster, 0, WORK_BRANCH).filter(|tip| *tip != run1_oid)
     });
-    let trace = provider.trace();
-    assert_eq!(trace.len(), 2, "two provider executions: {trace:?}");
-    let (_, _, head) = trace_parts(&trace[1]);
-    assert_eq!(head, run1_oid, "run 2 forks the branch TIP (the session continues)");
-
     // parent chain, proven from a node that executed nothing: run2 → run1 →
     // seed — the objects fanned out with the refs.
     let checkout = tempfile::tempdir().expect("git checkout parent");
@@ -672,72 +620,28 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD^"]), run1_oid, "run 2's parent is run 1's commit");
     assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD~2"]), dev_tip);
 
+    // What each run SAW, read out of the commit it produced: the sandboxed
+    // neutral cwd, and a detached `.git/HEAD` naming the commit it forked. Run 1
+    // forks the pinned dev tip; run 2 forks the branch TIP, which is what makes
+    // the PR channel a session rather than a second independent run.
+    for (commit, pinned_at, which) in
+        [(&run1_oid, &dev_tip, "run 1"), (&run2_oid, &run1_oid, "run 2")]
+    {
+        let (cwd, head) = run_evidence(&dest, commit);
+        assert_eq!(cwd, GUEST_WORKDIR, "{which} ran at the neutral sandbox cwd");
+        assert_eq!(
+            &head, pinned_at,
+            "{which}'s .git/HEAD is the RAW oid it forked — a `ref: refs/…` here \
+             would mean the checkout was not detached"
+        );
+    }
+
     assert_eq!(open_pr_count(&cluster, 0), 1, "the duplicate guard opened NO second PR");
     let record = poll_until("run 2 in the delivered-runs ring", FINALIZE, || {
         run_record(&cluster, 0, &run_2)
     });
+    assert_eq!(record.outcome, RunOutcome::Delivered);
     assert!(!record.degraded, "run 2 is clean: {record:?}");
     assert_eq!(record.output_ref.as_deref(), Some(format!("{WORK_BRANCH}@{run2_oid}").as_str()));
     assert_eq!(record.pr_number, Some(pr_number), "the ring names the UPDATED PR");
-
-    // ---- run 3: the ordering proof. the interloper script advances the
-    //      branch through node 1's loopback remote and awaits its committed
-    //      visibility (see its doc) — the detached host commit then forks
-    //      the stale pin, its push rejects against the moved tip, and the
-    //      provisioner rebases onto the interloper and re-pushes.
-    provider.write_interloper_script(&format!("http://127.0.0.1:{}/forge", cluster.http_ports[1]));
-    post_mention(&cluster, 0, &pr_channel, "m3");
-    let run_3 = runs::run_id_for(&pr_channel, seq_of(&cluster, 0, &pr_channel, "m3"), AGENT_ID);
-    assert_eq!(
-        wait_for_reply(&cluster, 0, &pr_channel, &run_3),
-        RACE_REPLY,
-        "the raced run still delivers its reply"
-    );
-
-    let interloper_oid = provider.interloper_oid();
-    assert_ne!(interloper_oid, run2_oid, "the interloper minted a new commit");
-    let record = poll_until("run 3 in the delivered-runs ring", FINALIZE, || {
-        run_record(&cluster, 0, &run_3)
-    });
-    assert_eq!(record.outcome, RunOutcome::Delivered);
-    assert!(!record.degraded, "ordering is solved by rebase, never a degrade: {record:?}");
-    assert_eq!(record.pr_number, Some(pr_number), "still the ONE open PR");
-    let run3_oid = record
-        .output_ref
-        .as_deref()
-        .and_then(|r| r.strip_prefix(&format!("{WORK_BRANCH}@")))
-        .unwrap_or_else(|| panic!("run 3 pushed its rebased commit: {record:?}"))
-        .to_string();
-    assert_ne!(run3_oid, interloper_oid, "the run's own commit landed, rebased");
-    assert_eq!(
-        run_receipt_rebased(&cluster, 0, &run_3),
-        Some(true),
-        "the receipt carries the rebased flag"
-    );
-
-    // the committed tip is the run's REBASED commit and the interloper is
-    // its parent — both bodies of work survive, in interloper-first order.
-    assert_eq!(
-        branch_tip(&cluster, 0, WORK_BRANCH),
-        Some(run3_oid.clone()),
-        "the rebased push moved the branch"
-    );
-    let dest = checkout.path().join("after-run3");
-    git_ok(
-        checkout.path(),
-        &["clone", "--quiet", "--branch", WORK_BRANCH, &clone_url, dest.to_str().unwrap()],
-    );
-    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD"]), run3_oid);
-    assert_eq!(
-        git_stdout(&dest, &["rev-parse", "HEAD^"]),
-        interloper_oid,
-        "the rebase parented the run's commit on the interloper"
-    );
-    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD~2"]), run2_oid);
-
-    let trace = provider.trace();
-    assert_eq!(trace.len(), 3, "three provider executions: {trace:?}");
-    let (_, _, head) = trace_parts(&trace[2]);
-    assert_eq!(head, run2_oid, "run 3 was pinned at run 2's tip (pre-interloper)");
-    assert_eq!(open_pr_count(&cluster, 0), 1, "no PR was born from the raced run");
 }
