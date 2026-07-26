@@ -5,7 +5,7 @@ extern crate::backend
   ChannelRead(channel:str, seq:i64)
   ChatSpan(text:str, bold:bool, italic:bool, highlight:bool, link:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
-  ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_r:f64, avatar_g:f64, avatar_b:f64, reactions:[ChatReaction])
+  ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, reactions:[ChatReaction])
   ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
   SendReceipt(operation_id:str, channel_id:str)
   ChatDelta(kind:str, channel_id:str, seq:i64, root_seq:i64, message:ChatMessage, channel:ChatChannel, name:str, archived:bool, emoji:str, added:bool, reactor:str, by_me:bool, member:ChatMember)
@@ -44,11 +44,8 @@ extern crate::backend
   AppError(message:str, committed:bool)
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)
   HydrationError(generation:i64, message:str)
-  container-style avatar_style(r:f64, g:f64, b:f64)
-  container-style card_style()
-  container-style raised_style()
-  container-style well_style()
-  container-style inset_style()
+  box-style card_style()
+  box-style raised_style()
   editor-binding composer_keys() -> ComposerCmd
   connect(rpc:str) -> WorkspaceData ! AppError
   stream live_events(rpc:str) -> LiveUpdate
@@ -79,8 +76,8 @@ extern crate::backend
   sync remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
   sync connection_degraded(status:str) -> bool
-  sync palette_key_action(physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  NavItem(id:str, title:str, icon:str, active:bool)
+  sync palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
+  NavItem(id:str, title:str, active:bool)
   FsEntry(path:str, name:str, kind:str, size:i64)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
   FsListing(generation:i64, path:str, entries:[FsEntry])

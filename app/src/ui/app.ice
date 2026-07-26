@@ -1,26 +1,30 @@
 app Ducktape
   title "Ducktape"
   theme app_theme
-  bg app_background
+  bg "#00000000"
   fg app_text
   id "dev.ducktape.app"
   font "../../../crates/design/assets/fonts/Geist[wght].ttf"
   font "../../../crates/design/assets/fonts/GeistMono[wght].ttf"
-  font "../../../crates/design/assets/fonts/NotoSansKR[wght].ttf"
-  default-text-size 14
+  font "../../../crates/design/assets/fonts/IBMPlexSansKR-Regular.ttf"
+  font "../../../crates/design/assets/fonts/IBMPlexSansKR-Medium.ttf"
+  font "../../../crates/design/assets/fonts/IBMPlexSansKR-SemiBold.ttf"
+  text-size 13.5
   antialiasing true
   window
-    size 1120 720
+    size 1280 800
     min-size 820 540
     position centered
+    transparent true
+    blur true
     platform macos
       title-hidden true
       titlebar-transparent true
       fullsize-content-view true
 
 use "backend.ice"
+use "ducktape-ui/default.ice"
 use "theme.ice"
-use "../../../crates/design/ice/kit.ice"
 use "state.ice"
 use "components/shell.ice"
 use "components/chat.ice"
@@ -29,3 +33,4 @@ use "handlers/lifecycle.ice"
 use "handlers/chat.ice"
 use "handlers/pages.ice"
 use "view.ice"
+use "tests.ice"

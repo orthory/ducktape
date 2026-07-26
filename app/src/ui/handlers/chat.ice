@@ -101,7 +101,7 @@ on toggle_channel_create_members_only
 on toggle_channel_create
   channel_create_open = !channel_create_open
   return if !channel_create_open
-  task widget focus #workspace-tabs/new-channel
+  task widget focus #workspace-tabs/sidebar/new-channel
 
 on toggle_channel_settings
   return if empty(active_channel)
@@ -287,7 +287,7 @@ on channel_created(next)
   thread_loading = false
   error = ""
 
-on chat_acked(_)
+on chat_acked(_result)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, true)
   selected_message_rev = message_seq_after_failure(selected_message_rev, mutation_phase, true)
   message_action = message_action_after_failure(message_action, mutation_phase, true)
@@ -307,10 +307,10 @@ on message_exited(seq)
   return if hovered_message_seq != seq
   hovered_message_seq = 0
 
-on chat_pointer_moved(_, y)
+on chat_pointer_moved(_x, y)
   chat_pointer_y = y
 
-on chat_resized(_, height)
+on chat_resized(_width, height)
   chat_height = height
 
 on thread_message_entered(seq)
@@ -320,10 +320,10 @@ on thread_message_exited(seq)
   return if thread_hovered_seq != seq
   thread_hovered_seq = 0
 
-on thread_pointer_moved(_, y)
+on thread_pointer_moved(_x, y)
   thread_pointer_y = y
 
-on thread_resized(_, height)
+on thread_resized(_width, height)
   thread_height = height
 
 on open_thread_message_actions(seq, body, rev)
@@ -334,7 +334,7 @@ on open_thread_message_actions(seq, body, rev)
   thread_message_action = "more"
   thread_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/thread-action-focus
+    task widget focus #workspace-tabs/content/thread-action-focus
     task widget focus-next
 
 on open_thread_message_reactions(seq, body, rev)
@@ -345,7 +345,7 @@ on open_thread_message_reactions(seq, body, rev)
   thread_message_action = "reactions"
   thread_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/thread-reaction-focus
+    task widget focus #workspace-tabs/content/thread-reaction-focus
     task widget focus-next
 
 on arm_thread_message_delete(seq, body, rev)
@@ -355,7 +355,7 @@ on arm_thread_message_delete(seq, body, rev)
   thread_message_action = "delete"
   thread_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/thread-delete-focus
+    task widget focus #workspace-tabs/content/thread-delete-focus
     task widget focus-next
 
 on begin_thread_message_edit(seq, body, rev)
@@ -364,7 +364,7 @@ on begin_thread_message_edit(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = "editing"
   thread_edit_draft = body
-  task widget focus #workspace-tabs/thread-edit
+  task widget focus #workspace-tabs/content/thread-edit
 
 on clear_thread_message_selection
   thread_selected_seq = 0
@@ -398,7 +398,7 @@ on open_message_actions(seq, body, rev)
   message_action = "more"
   message_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/message-action-focus
+    task widget focus #workspace-tabs/content/message-action-focus
     task widget focus-next
 
 on open_message_actions_accessibly(seq, body, rev)
@@ -409,7 +409,7 @@ on open_message_actions_accessibly(seq, body, rev)
   message_action = "more"
   message_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/message-action-focus
+    task widget focus #workspace-tabs/content/message-action-focus
     task widget focus-next
 
 on open_message_reactions(seq, body, rev)
@@ -420,7 +420,7 @@ on open_message_reactions(seq, body, rev)
   message_action = "reactions"
   message_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/message-reaction-focus
+    task widget focus #workspace-tabs/content/message-reaction-focus
     task widget focus-next
 
 on arm_message_delete(seq, body, rev)
@@ -430,7 +430,7 @@ on arm_message_delete(seq, body, rev)
   message_action = "delete"
   message_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/message-delete-focus
+    task widget focus #workspace-tabs/content/message-delete-focus
     task widget focus-next
 
 on begin_message_edit(seq, body, rev)
@@ -439,7 +439,7 @@ on begin_message_edit(seq, body, rev)
   selected_message_rev = rev
   message_action = "editing"
   message_edit_draft = body
-  task widget focus #workspace-tabs/message-edit
+  task widget focus #workspace-tabs/content/message-edit
 
 on open_thread_for(seq)
   return if seq <= 0 || empty(active_channel)

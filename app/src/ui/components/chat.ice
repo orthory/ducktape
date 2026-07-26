@@ -1,247 +1,251 @@
 component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
-  col width=fill
+  col w=fill
     if selected
-      button label=channel.name width=fill height=34.0 padding=7.0 -> choose_channel(channel.id)
-        row width=fill height=fill spacing=9.0 align=center
+      button label=channel.name w=fill h=34.0 p=7.0 @ghost_action -> choose_channel(channel.id)
+        row w=fill h=fill gap=9.0 align=center
           if channel.members_only
-            text "◆" width=16.0 size=12.0 align-x=center @text-primary
+            text "◆" w=16.0 size=12.0 align-x=center @text-brand
           if !channel.members_only
-            text "#" width=16.0 size=15.0 align-x=center font=medium @text-primary
-          text channel.name width=fill size=14.0 wrapping=none font=medium @text-fg
+            text "#" w=16.0 size=13.0 align-x=center font=medium @text-brand
+          text channel.name w=fill size=13.0 wrap=none font=medium @text-fg
           if channel.huddle_count > 0
-            text channel.huddle_count size=12.0 font=medium @text-primary
-        active bg=primary/16 text=fg border=primary/26 border-w=1.0 r=9.0
-        hovered bg=primary/22 text=fg border=primary/34
-        pressed bg=primary/30 text=fg border=primary/40
+            text channel.huddle_count size=9.0 font=code_semibold @text-brand
+        active bg=subtle text=fg border=transparent border-w=1.0 r=9.0
+        hovered bg=rail_hover text=fg
+        pressed bg=subtle text=fg
     if !selected
-      button label=channel.name width=fill height=34.0 padding=7.0 -> choose_channel(channel.id)
-        row width=fill height=fill spacing=9.0 align=center
+      button label=channel.name w=fill h=34.0 p=7.0 @ghost_action -> choose_channel(channel.id)
+        row w=fill h=fill gap=9.0 align=center
           if channel.members_only && unread
-            text "◆" width=16.0 size=12.0 align-x=center @text-primaryhi
+            text "◆" w=16.0 size=12.0 align-x=center @text-brand
           if channel.members_only && !unread
-            text "◆" width=16.0 size=12.0 align-x=center @text-muted
+            text "◆" w=16.0 size=12.0 align-x=center @text-muted
           if !channel.members_only && unread
-            text "#" width=16.0 size=15.0 align-x=center font=medium @text-primaryhi
+            text "#" w=16.0 size=13.0 align-x=center font=medium @text-brand
           if !channel.members_only && !unread
-            text "#" width=16.0 size=15.0 align-x=center @text-muted
+            text "#" w=16.0 size=13.0 align-x=center @text-muted
           if unread
-            text channel.name width=fill size=14.0 wrapping=none font=medium @text-fg
+            text channel.name w=fill size=13.0 wrap=none font=medium @text-fg
           if !unread
-            text channel.name width=fill size=14.0 wrapping=none @text-muted
+            text channel.name w=fill size=13.0 wrap=none @text-muted
           if channel.archived
-            container padding=2.0 padding-left=6.0 padding-right=6.0 bg=fg/6 border=fg/12 border-w=1.0 r=6.0
-              text "Archived" size=12.0 font=medium @text-muted
+            box p=2.0 pl=6.0 pr=6.0 bg=fg/6 border=fg/12 border-w=1.0 r=6.0
+              text "Archived" size=9.0 font=code_semibold @text-muted
           if !channel.archived && channel.huddle_count > 0
-            text channel.huddle_count size=12.0 @text-muted
+            text channel.huddle_count size=9.0 font=code_semibold @text-muted
           if unread
-            container width=8.0 height=8.0 bg=primaryhi r=4.0
+            box w=8.0 h=8.0 bg=brand r=4.0
               text ""
         active bg=transparent text=muted border=transparent border-w=1.0 r=9.0
         hovered bg=fg/6 text=fg border=fg/9
         pressed bg=fg/10 text=fg border=fg/12
 
 component ChatMemberRow(member:ChatMember, disabled:bool)
-  row width=fill spacing=6.0 align=center
-    text member.label width=fill size=12.0 font=mono @text-muted
-    button "Remove" description=member.label disabled=disabled height=28.0 padding=5.0 -> remove_channel_member_submit(member.key)
-      active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
-      hovered bg=danger/18 text=fg border=danger/28
-      pressed bg=danger/26 text=fg border=danger/34
+  row w=fill gap=6.0 align=center
+    text member.label w=fill size=12.0 font=code @text-muted
+    button "Remove" description=member.label disabled=disabled h=28.0 p=5.0 @danger_action -> remove_channel_member_submit(member.key)
 
 component RichLine(block:ChatBlock)
-  flex width=fill wrap column-gap=0.0 row-gap=4.0 align-items=start
+  flex w=fill wrap=wrap gap-x=0.0 gap-y=4.0 items=start
     for span in block.spans
       if span.highlight
-        text span.text size=14.0 line-height=1.45 font=medium @text-primary
+        text span.text size=13.5 line-h=1.45 font=medium @text-brand
       if !span.highlight && span.bold && span.italic
-        text span.text size=14.0 line-height=1.45 font=strongitalic @text-fg
+        text span.text size=13.5 line-h=1.45 font=strongitalic @text-fg
       if !span.highlight && span.bold && !span.italic
-        text span.text size=14.0 line-height=1.45 font=display @text-fg
+        text span.text size=13.5 line-h=1.45 font=strong @text-fg
       if !span.highlight && !span.bold && span.italic
-        text span.text size=14.0 line-height=1.45 font=italic @text-fg
+        text span.text size=13.5 line-h=1.45 font=italic @text-fg
       if !span.highlight && !span.bold && !span.italic
-        text span.text size=14.0 line-height=1.45 @text-fg
+        text span.text size=13.5 line-h=1.45 @text-fg
 
 component MessageBody(message:ChatMessage)
-  col width=fill spacing=5.0
+  col w=fill gap=5.0
     for block in message.blocks
       if block.kind == "divider"
-        container width=fill height=1.0 bg=separator
-          text ""
+        Separator
       if block.kind == "code"
-        container width=fill padding=11.0 bg=black/26 border=fg/11 border-w=1.0 r=9.0
-          col width=fill spacing=5.0
+        box w=fill p=11.0 bg=black/26 border=fg/11 border-w=1.0 r=9.0
+          col w=fill gap=5.0
             if !empty(block.lang)
-              text block.lang size=12.0 wrapping=none font=medium @text-muted
-            text block.text width=fill size=13.0 line-height=1.5 font=mono wrapping=word @text-fg
+              text block.lang size=10.5 wrap=none font=code_medium @text-muted
+            text block.text w=fill size=12.0 line-h=1.5 font=code wrap=word @text-fg
       if block.kind == "quote"
-        container width=fill padding=9.0 padding-left=13.0 bg=primary/9 border=primary/20 border-w=1.0 r=8.0
-          col width=fill
+        box w=fill p=9.0 pl=13.0 bg=brand/9 border=brand/20 border-w=1.0 r=8.0
+          col w=fill
             if block.rich
               RichLine block=block
             if !block.rich
-              text block.text width=fill size=14.0 line-height=1.45 wrapping=word @text-fg
+              text block.text w=fill size=13.5 line-h=1.45 wrap=word @text-fg
       if block.kind == "paragraph"
         if block.rich
           RichLine block=block
         if !block.rich
-          text block.text width=fill size=14.0 line-height=1.45 wrapping=word @text-fg
+          text block.text w=fill size=13.5 line-h=1.45 wrap=word @text-fg
+
+component MessageAvatar(initials:str, kind:str)
+  stack #root w=30.0 h=30.0
+    match kind
+      "human"
+        Avatar initials=initials
+      "agent"
+        Avatar.Agent initials=initials
+      _
+        Avatar.Agent initials=initials
 
 component MessageContents(message:ChatMessage)
-  row width=fill spacing=11.0 align=start
+  row w=fill gap=11.0 align=start
     if message.show_author
-      container width=36.0 height=36.0 align-x=center align-y=center style=avatar_style(message.avatar_r, message.avatar_g, message.avatar_b)
-        text message.initial size=15.0 font=display @text-fg
+      MessageAvatar initials=message.initial kind=message.avatar_kind
     if !message.show_author
-      space width=36.0
-    col width=fill spacing=3.0
+      space w=30.0
+    col w=fill gap=3.0
       if message.show_author
-        row width=fill spacing=7.0 align=center
-          text message.author size=15.0 wrapping=none font=display @text-fg
-          text message.meta size=12.0 wrapping=none @text-muted
-          space width=fill
+        row w=fill gap=7.0 align=center
+          text message.author size=14.0 wrap=none font=display @text-fg
+          text message.meta size=11.0 wrap=none font=code_medium @text-muted
+          space w=fill
       MessageBody message=message
       if message.reply_count > 0 || !empty(message.reactions)
-        row width=fill spacing=6.0 align=center
+        row w=fill gap=6.0 align=center
           if message.reply_count > 0
-            button label="Open thread" padding=4.0 -> open_thread_for(message.seq)
-              row spacing=5.0 align=center
-                text "Thread" size=12.0 font=medium
-                text message.reply_count size=12.0
-              active bg=primary/14 text=primaryhi border=primary/24 border-w=1.0 r=8.0
-              hovered bg=primary/22 text=fg border=primary/34
-              pressed bg=primary/30 text=fg border=primary/40
+            button label="Open thread" p=4.0 @ghost_action -> open_thread_for(message.seq)
+              row gap=5.0 align=center
+                text "Thread" size=13.0 font=medium
+                text message.reply_count size=12.0 font=code
+              active bg=brand/14 text=brand border=brand/24 border-w=1.0 r=8.0
+              hovered bg=brand/22 text=fg border=brand/34
+              pressed bg=brand/30 text=fg border=brand/40
           for reaction in message.reactions
             if reaction.reacted_by_me
-              button label="Remove reaction" description=reaction.emoji padding=0.0 -> remove_reaction_at(message.seq, reaction.emoji)
-                container padding=3.0 padding-left=8.0 padding-right=8.0
-                  row spacing=5.0 align=center
+              button label="Remove reaction" description=reaction.emoji p=0.0 @ghost_action -> remove_reaction_at(message.seq, reaction.emoji)
+                box p=3.0 pl=8.0 pr=8.0
+                  row gap=5.0 align=center
                     text reaction.emoji size=13.0 @text-fg
-                    text reaction.count size=12.0 font=medium @text-primaryhi
-                active bg=primary/18 text=fg border=primary/36 border-w=1.0 r=9.0
-                hovered bg=primary/26 text=fg border=primary/46
-                pressed bg=primary/32 text=fg
+                    text reaction.count size=12.0 font=code @text-brand
+                active bg=brand/18 text=fg border=brand/36 border-w=1.0 r=9.0
+                hovered bg=brand/26 text=fg border=brand/46
+                pressed bg=brand/32 text=fg
             if !reaction.reacted_by_me
-              button label="Add reaction" description=reaction.emoji padding=0.0 -> add_reaction_at(message.seq, reaction.emoji)
-                container padding=3.0 padding-left=8.0 padding-right=8.0
-                  row spacing=5.0 align=center
+              button label="Add reaction" description=reaction.emoji p=0.0 @ghost_action -> add_reaction_at(message.seq, reaction.emoji)
+                box p=3.0 pl=8.0 pr=8.0
+                  row gap=5.0 align=center
                     text reaction.emoji size=13.0 @text-fg
-                    text reaction.count size=12.0 font=medium @text-muted
+                    text reaction.count size=12.0 font=code @text-muted
                 active bg=fg/6 text=fg border=fg/13 border-w=1.0 r=9.0
                 hovered bg=fg/12 text=fg border=fg/18
                 pressed bg=fg/16 text=fg
 
 component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled:bool)
   mouse enter=message_entered(message.seq) exit=message_exited(message.seq)
-    stack width=fill
+    stack w=fill
       if message.deleted
-        container width=fill padding=8.0 padding-left=10.0 padding-right=10.0 bg=transparent border=transparent border-w=1.0 r=10.0
+        box w=fill p=8.0 pl=10.0 pr=10.0 bg=transparent border=transparent border-w=1.0 r=10.0
           MessageContents message=message
       if !message.deleted && selected
-        container width=fill padding=8.0 padding-left=10.0 padding-right=10.0 bg=primary/10 border=primary/22 border-w=1.0 r=10.0
+        box w=fill p=8.0 pl=10.0 pr=10.0 bg=brand/10 border=brand/22 border-w=1.0 r=10.0
           MessageContents message=message
       if !message.deleted && !selected && hovered
-        container width=fill padding=8.0 padding-left=10.0 padding-right=10.0 bg=fg/4 border=fg/7 border-w=1.0 r=10.0
+        box w=fill p=8.0 pl=10.0 pr=10.0 bg=fg/4 border=fg/7 border-w=1.0 r=10.0
           MessageContents message=message
       if !message.deleted && !selected && !hovered
-        container width=fill padding=8.0 padding-left=10.0 padding-right=10.0 bg=transparent border=transparent border-w=1.0 r=10.0
+        box w=fill p=8.0 pl=10.0 pr=10.0 bg=transparent border=transparent border-w=1.0 r=10.0
           MessageContents message=message
       if !message.deleted && !message.pending && !hovered
-        container width=fill align-x=end align-y=start padding-top=3.0 padding-right=9.0
-          button "…" label="More message actions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_message_actions_accessibly(message.seq, message.body, message.rev)
+        box w=fill align-x=end align-y=start pt=3.0 pr=9.0
+          button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> open_message_actions_accessibly(message.seq, message.body, message.rev)
             active bg=transparent text=muted r=7.0
             hovered bg=fg/9 text=fg
             pressed bg=fg/13 text=fg
       if !message.deleted && !message.pending && hovered
-        container width=fill align-x=end align-y=start padding-top=3.0 padding-right=9.0
-          container padding=2.0 style=raised_style()
-            row spacing=1.0 align=center
-              button "♡" label="Manage reactions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_message_reactions(message.seq, message.body, message.rev)
+        box w=fill align-x=end align-y=start pt=3.0 pr=9.0
+          box p=2.0 style=raised_style()
+            row gap=1.0 align=center
+              button "♡" label="Manage reactions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> open_message_reactions(message.seq, message.body, message.rev)
                 active bg=transparent text=muted r=6.0
                 hovered bg=fg/10 text=fg
                 pressed bg=fg/14 text=fg
-              button "↳" label="Open thread" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_thread_for(message.seq)
+              button "↳" label="Open thread" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> open_thread_for(message.seq)
                 active bg=transparent text=muted r=6.0
                 hovered bg=fg/10 text=fg
                 pressed bg=fg/14 text=fg
-              button "…" label="More message actions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_message_actions(message.seq, message.body, message.rev)
+              button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> open_message_actions(message.seq, message.body, message.rev)
                 active bg=transparent text=muted r=6.0
                 hovered bg=fg/10 text=fg
                 pressed bg=fg/14 text=fg
 
 component ThreadMessageBody(message:ChatMessage)
-  row width=fill spacing=10.0 align=start
-    container width=32.0 height=32.0 align-x=center align-y=center style=avatar_style(message.avatar_r, message.avatar_g, message.avatar_b)
-      text message.initial size=14.0 font=display @text-fg
-    col width=fill spacing=3.0
-      row width=fill spacing=6.0 align=center
-        text message.author size=14.0 wrapping=none font=display @text-fg
-        text message.meta size=12.0 wrapping=none @text-muted
-        space width=fill
+  row w=fill gap=10.0 align=start
+    MessageAvatar initials=message.initial kind=message.avatar_kind
+    col w=fill gap=3.0
+      row w=fill gap=6.0 align=center
+        text message.author size=14.0 wrap=none font=display @text-fg
+        text message.meta size=11.0 wrap=none font=code_medium @text-muted
+        space w=fill
       MessageBody message=message
       if !empty(message.reactions)
-        row width=fill spacing=5.0 align=center
+        row w=fill gap=5.0 align=center
           for reaction in message.reactions
             if reaction.reacted_by_me
-              button label="Remove reaction" description=reaction.emoji padding=0.0 -> remove_reaction_at(message.seq, reaction.emoji)
-                container padding=3.0 padding-left=8.0 padding-right=8.0
-                  row spacing=5.0 align=center
+              button label="Remove reaction" description=reaction.emoji p=0.0 @ghost_action -> remove_reaction_at(message.seq, reaction.emoji)
+                box p=3.0 pl=8.0 pr=8.0
+                  row gap=5.0 align=center
                     text reaction.emoji size=13.0 @text-fg
-                    text reaction.count size=12.0 font=medium @text-primaryhi
-                active bg=primary/18 text=fg border=primary/36 border-w=1.0 r=9.0
-                hovered bg=primary/26 text=fg border=primary/46
-                pressed bg=primary/32 text=fg
+                    text reaction.count size=12.0 font=code @text-brand
+                active bg=brand/18 text=fg border=brand/36 border-w=1.0 r=9.0
+                hovered bg=brand/26 text=fg border=brand/46
+                pressed bg=brand/32 text=fg
             if !reaction.reacted_by_me
-              button label="Add reaction" description=reaction.emoji padding=0.0 -> add_reaction_at(message.seq, reaction.emoji)
-                container padding=3.0 padding-left=8.0 padding-right=8.0
-                  row spacing=5.0 align=center
+              button label="Add reaction" description=reaction.emoji p=0.0 @ghost_action -> add_reaction_at(message.seq, reaction.emoji)
+                box p=3.0 pl=8.0 pr=8.0
+                  row gap=5.0 align=center
                     text reaction.emoji size=13.0 @text-fg
-                    text reaction.count size=12.0 font=medium @text-muted
+                    text reaction.count size=12.0 font=code @text-muted
                 active bg=fg/6 text=fg border=fg/13 border-w=1.0 r=9.0
                 hovered bg=fg/12 text=fg border=fg/18
                 pressed bg=fg/16 text=fg
 
 component ThreadMessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled:bool)
   mouse enter=thread_message_entered(message.seq) exit=thread_message_exited(message.seq)
-    stack width=fill
+    stack w=fill
       if message.deleted
-        container width=fill padding=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
+        box w=fill p=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
           ThreadMessageBody message=message
       if !message.deleted && selected
-        container width=fill padding=8.0 bg=primary/10 border=primary/22 border-w=1.0 r=9.0
+        box w=fill p=8.0 bg=brand/10 border=brand/22 border-w=1.0 r=9.0
           ThreadMessageBody message=message
       if !message.deleted && !selected && hovered
-        container width=fill padding=8.0 bg=fg/4 border=fg/7 border-w=1.0 r=9.0
+        box w=fill p=8.0 bg=fg/4 border=fg/7 border-w=1.0 r=9.0
           ThreadMessageBody message=message
       if !message.deleted && !selected && !hovered
-        container width=fill padding=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
+        box w=fill p=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
           ThreadMessageBody message=message
       if !message.deleted && !message.pending && !hovered
-        container width=fill align-x=end align-y=start padding-top=3.0 padding-right=9.0
-          button "…" label="More message actions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_thread_message_actions(message.seq, message.body, message.rev)
+        box w=fill align-x=end align-y=start pt=3.0 pr=9.0
+          button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> open_thread_message_actions(message.seq, message.body, message.rev)
             active bg=transparent text=muted r=7.0
             hovered bg=fg/9 text=fg
             pressed bg=fg/13 text=fg
       if !message.deleted && !message.pending && hovered
-        container width=fill align-x=end align-y=start padding-top=3.0 padding-right=9.0
-          container padding=2.0 style=raised_style()
-            row spacing=1.0 align=center
-              button "♡" label="Manage reactions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_thread_message_reactions(message.seq, message.body, message.rev)
+        box w=fill align-x=end align-y=start pt=3.0 pr=9.0
+          box p=2.0 style=raised_style()
+            row gap=1.0 align=center
+              button "♡" label="Manage reactions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> open_thread_message_reactions(message.seq, message.body, message.rev)
                 active bg=transparent text=muted r=6.0
                 hovered bg=fg/10 text=fg
                 pressed bg=fg/14 text=fg
-              button "…" label="More message actions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_thread_message_actions(message.seq, message.body, message.rev)
+              button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> open_thread_message_actions(message.seq, message.body, message.rev)
                 active bg=transparent text=muted r=6.0
                 hovered bg=fg/10 text=fg
                 pressed bg=fg/14 text=fg
 
 component ChatSearchResult(hit:ChatSearchHit)
-  button label=hit.text width=fill padding=8.0 -> open_chat_search_hit(hit.channel_id, hit.root_seq, hit.seq)
-    col width=fill spacing=3.0
-      row width=fill spacing=7.0 align=center
-        text hit.author width=fill size=12.0 font=medium @text-fg
-        text hit.meta size=12.0 @text-muted
-      text hit.text width=fill size=14.0 wrapping=word @text-fg
+  button label=hit.text w=fill p=8.0 @ghost_action -> open_chat_search_hit(hit.channel_id, hit.root_seq, hit.seq)
+    col w=fill gap=3.0
+      row w=fill gap=7.0 align=center
+        text hit.author w=fill size=13.0 font=medium @text-fg
+        text hit.meta size=11.0 font=code_medium @text-muted
+      text hit.text w=fill size=13.5 wrap=word @text-fg
     active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
     hovered bg=fg/6 text=fg border=fg/9
     pressed bg=fg/10 text=fg border=fg/13

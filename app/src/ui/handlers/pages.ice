@@ -120,7 +120,7 @@ on create_page_submit
 on toggle_page_create
   page_create_open = !page_create_open
   return if !page_create_open
-  task widget focus #workspace-tabs/new-page
+  task widget focus #workspace-tabs/sidebar/new-page
 
 on arm_page_delete
   return if loading || mutation_phase != "idle" || empty(active_page)
@@ -141,7 +141,7 @@ on new_block_kind_changed(next)
 on pick_slash_kind(kind)
   new_block_kind = kind
   block_draft = ""
-  task widget focus #workspace-tabs/block-insert-row(block_insert_after_id)/block-insert
+  task widget focus #workspace-tabs/content/block-insert-row(block_insert_after_id)/block-insert
 
 on block_entered(id)
   hovered_block_id = id
@@ -154,20 +154,20 @@ on pages_pointer_moved(x, y)
   pages_pointer_x = x
   pages_pointer_y = y
 
-on pages_resized(_, height)
+on pages_resized(_width, height)
   pages_height = height
 
 on open_block_insert(key, after_id)
   return if loading || empty(active_page)
   block_insert_after_id = after_id
   block_insert_open = true
-  task widget focus #workspace-tabs/key(key)/block-insert-row(block_insert_after_id)/block-insert
+  task widget focus #workspace-tabs/content/key(key)/block-insert-row(block_insert_after_id)/block-insert
 
 on open_root_block_insert
   return if loading || empty(active_page)
   block_insert_after_id = ""
   block_insert_open = true
-  task widget focus #workspace-tabs/block-insert-row(block_insert_after_id)/block-insert
+  task widget focus #workspace-tabs/content/block-insert-row(block_insert_after_id)/block-insert
 
 on close_block_insert
   block_insert_open = false
@@ -256,7 +256,7 @@ on select_block(key, id, kind, text, checked, open_actions)
   block_autosave_status = "idle"
   block_delete_armed = false
   return if open_actions
-  task widget focus #workspace-tabs/key(key)/block(selected_block_id)/BlockLine/block-edit
+  task widget focus #workspace-tabs/content/key(key)/block(selected_block_id)/line/block-edit
 
 on close_block_actions
   block_actions_open = false
@@ -585,7 +585,7 @@ on pages_mutated(next)
   mutation_phase = "idle"
   error = ""
 
-on doc_tabs_saved(_)
+on doc_tabs_saved(_result)
   error = error
 
 on doc_tabs_loaded(tabs)

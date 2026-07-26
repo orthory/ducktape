@@ -26,9 +26,7 @@ mod tests {
             thread_seq: 0,
             show_author: true,
             initial: "U".into(),
-            avatar_r: 0.4,
-            avatar_g: 0.4,
-            avatar_b: 0.9,
+            avatar_kind: "human".into(),
             reactions: Vec::new(),
         }
     }
@@ -43,6 +41,36 @@ mod tests {
 
     fn reply_composer(app: &Ducktape) -> String {
         app.reply_editor.text().trim().to_string()
+    }
+
+    fn default_ice_color(name: &str) -> iced::Color {
+        let source = include_str!("ui/ducktape-ui/default.ice");
+        let value = source
+            .lines()
+            .find_map(|line| {
+                let mut parts = line.split_ascii_whitespace();
+                (parts.next() == Some(name)).then(|| parts.next()).flatten()
+            })
+            .unwrap_or_else(|| panic!("default.ice is missing `{name}`"));
+        let hex = value
+            .strip_prefix('#')
+            .expect("default Ice colors use hexadecimal literals");
+        let value = u32::from_str_radix(hex, 16)
+            .expect("default Ice colors are valid hexadecimal literals");
+        match hex.len() {
+            6 => iced::Color::from_rgb8(
+                ((value >> 16) & 0xff) as u8,
+                ((value >> 8) & 0xff) as u8,
+                (value & 0xff) as u8,
+            ),
+            8 => iced::Color::from_rgba8(
+                ((value >> 24) & 0xff) as u8,
+                ((value >> 16) & 0xff) as u8,
+                ((value >> 8) & 0xff) as u8,
+                (value & 0xff) as f32 / 255.0,
+            ),
+            _ => panic!("default Ice colors use #RRGGBB or #RRGGBBAA"),
+        }
     }
 
     fn live_refresh(
@@ -121,11 +149,7 @@ mod tests {
         app.mutation_phase = "idle".into();
         app.connected_rpc = "http://node".into();
         app.palette_open = true;
-        let _ = app.__update(__DucktapeMessage::OpenChatSearchHit(
-            "general".into(),
-            7,
-            7,
-        ));
+        let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7, 7));
         assert!(!app.palette_open);
         assert_eq!(app.shell_tab, "chat");
     }
@@ -179,7 +203,9 @@ mod tests {
         // live surfaces (chat/pages) never need a manual refresh — the delta
         // stream keeps them current. The explorer's recent-window reload is
         // the one legitimate refresh affordance.
-        let before_explorer = view.split_once("    explorer:").map_or(view, |(head, _)| head);
+        let before_explorer = view
+            .split_once("    explorer:")
+            .map_or(view, |(head, _)| head);
         assert!(!before_explorer.contains("button \"Refresh\""));
 
         let refresh = lifecycle
@@ -650,7 +676,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(app.messages[1].pending);
 
         let view = include_str!("ui/view.ice");
-        assert!(view.contains("stack #message(message.id) width=fill"));
+        assert!(view.contains("stack #message(message.id) w=fill"));
         assert!(!view.contains("#message(message.seq)"));
     }
 
@@ -784,35 +810,33 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(toolbar.contains("if !message.deleted && !message.pending && !hovered"));
         assert!(toolbar.contains("-> open_message_actions_accessibly("));
         assert!(!toolbar.contains("hovered || selected"));
-        assert_eq!(toolbar.matches("width=26.0 height=26.0").count(), 4);
+        assert_eq!(toolbar.matches("w=26.0 h=26.0").count(), 4);
         assert!(components.contains(
-            "text message.author size=15.0 wrapping=none font=display @text-fg\n          text message.meta size=12.0 wrapping=none @text-muted\n          space width=fill"
+            "text message.author size=14.0 wrap=none font=display @text-fg\n          text message.meta size=11.0 wrap=none font=code_medium @text-muted\n          space w=fill"
         ));
-        // Slack-style grouping: the colored avatar + author header only renders
+        // Slack-style grouping: the shared avatar + author header only renders
         // for a run's first message; continuations keep the body aligned via a
         // gutter that matches the avatar's width.
-        assert!(components.contains("if message.show_author\n      container width=36.0 height=36.0"));
-        assert!(components.contains("if !message.show_author\n      space width=36.0"));
-        // The per-author avatar tint rides in through a container-style extern
-        // because `bg=` only takes static colors.
         assert!(components.contains(
-            "style=avatar_style(message.avatar_r, message.avatar_g, message.avatar_b)"
+            "if message.show_author\n      MessageAvatar initials=message.initial kind=message.avatar_kind"
         ));
+        assert!(components.contains("if !message.show_author\n      space w=30.0"));
+        assert!(components.contains("\"human\"\n        Avatar initials=initials"));
+        assert!(components.contains("\"agent\"\n        Avatar.Agent initials=initials"));
+        assert!(!components.contains("avatar_style"));
         // Rich bodies render structured blocks, not one flattened string.
         assert!(components.contains("for block in message.blocks"));
         assert!(components.contains("if block.kind == \"code\""));
-        assert!(components.contains("flex width=fill wrap"));
-        // the hover toolbar floats on the design crate's raised paper recipe
-        // (opaque popover fill + warm shadow) instead of inline materials.
+        assert!(components.contains("flex w=fill wrap=wrap"));
+        // The hover toolbar uses the shared glass/popover depth role instead
+        // of carrying another inline shadow variant.
         assert!(toolbar.contains("style=raised_style()"));
         for label in ["Open thread", "Manage reactions", "More message actions"] {
             assert!(toolbar.contains(&format!("label=\"{label}\"")));
         }
-        assert!(
-            components.contains(
-                "button label=\"Open thread\" padding=4.0 -> open_thread_for(message.seq)"
-            )
-        );
+        assert!(components.contains(
+            "button label=\"Open thread\" p=4.0 @ghost_action -> open_thread_for(message.seq)"
+        ));
 
         let view = include_str!("ui/view.ice");
         let chat = view
@@ -831,9 +855,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(chat.contains("mouse move=chat_pointer_moved"));
         assert!(chat.contains("sensor show=chat_resized resize=chat_resized"));
         assert!(chat.contains("float x=0.0 y=message_menu_y"));
-        assert!(chat.contains(
-            "stack width=fill height=fill\n                mouse move=chat_pointer_moved"
-        ));
+        assert!(
+            chat.contains("stack w=fill h=fill\n                mouse move=chat_pointer_moved")
+        );
         let overlay_content = chat
             .split_once("                  content\n")
             .unwrap()
@@ -841,7 +865,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .split_once("                  layer\n")
             .unwrap()
             .0;
-        assert!(overlay_content.contains("space width=fill height=fill"));
+        assert!(overlay_content.contains("space w=fill h=fill"));
         assert!(!overlay_content.contains("message_action =="));
         let more = view
             .split_once("message_action == \"more\"")
@@ -858,9 +882,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
 
         let handlers = include_str!("ui/handlers/chat.ice");
         for focus in [
-            "#workspace-tabs/message-action-focus",
-            "#workspace-tabs/message-reaction-focus",
-            "#workspace-tabs/message-delete-focus",
+            "#workspace-tabs/content/message-action-focus",
+            "#workspace-tabs/content/message-reaction-focus",
+            "#workspace-tabs/content/message-delete-focus",
         ] {
             assert!(handlers.contains(focus));
         }
@@ -880,7 +904,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .split_once("\non ")
             .unwrap()
             .0;
-        assert!(activate.contains("task widget focus #workspace-tabs/message-edit"));
+        assert!(activate.contains("task widget focus #workspace-tabs/content/message-edit"));
     }
 
     #[test]
@@ -893,12 +917,14 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(card.contains(
             "mouse enter=thread_message_entered(message.seq) exit=thread_message_exited(message.seq)"
         ));
-        assert!(card.contains(
-            "-> open_thread_message_reactions(message.seq, message.body, message.rev)"
-        ));
-        assert!(card.contains(
-            "-> open_thread_message_actions(message.seq, message.body, message.rev)"
-        ));
+        assert!(
+            card.contains(
+                "-> open_thread_message_reactions(message.seq, message.body, message.rev)"
+            )
+        );
+        assert!(
+            card.contains("-> open_thread_message_actions(message.seq, message.body, message.rev)")
+        );
         // No open-thread action from inside a thread you are already reading.
         assert!(!card.contains("open_thread_for"));
 
@@ -979,7 +1005,11 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         // Opening a thread action must not touch the main message menu.
         app.thread_pointer_y = 400.0;
         app.thread_height = 500.0;
-        let _ = app.__update(__DucktapeMessage::OpenThreadMessageActions(2, "reply".into(), 3));
+        let _ = app.__update(__DucktapeMessage::OpenThreadMessageActions(
+            2,
+            "reply".into(),
+            3,
+        ));
         assert_eq!(app.thread_selected_seq, 2);
         assert_eq!(app.thread_message_action, "more");
         assert_eq!(app.thread_menu_y, 210.0);
@@ -1048,9 +1078,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             thread_seq,
             show_author: true,
             initial: "U".into(),
-            avatar_r: 0.4,
-            avatar_g: 0.4,
-            avatar_b: 0.9,
+            avatar_kind: "human".into(),
             reactions: Vec::new(),
         };
         let (mut app, _) = Ducktape::__boot();
@@ -1194,7 +1222,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         let view = include_str!("ui/view.ice");
         assert!(view.contains("if !block.pending && block.kind == \"Page\""));
         assert!(view.contains(
-            "button label=block.kind description=block.text width=fill padding=5.0 -> choose_page(block.id)"
+            "button label=block.kind description=block.text w=fill p=5.0 @ghost_action -> choose_page(block.id)"
         ));
         assert!(view.contains(
             "if !block.pending && block.kind != \"Page\" && block.id == selected_block_id"
@@ -1219,18 +1247,16 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(view.contains("BlockActionsMenu block_id=selected_block_id"));
         assert!(view.matches("button \"Insert divider\"").count() == 2);
 
-        assert!(components.contains("text block.prefix size=14.0"));
+        assert!(components.contains("text block.prefix size=12.0"));
         assert!(components.contains(
             "component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)"
         ));
         assert!(view.contains("prefix=block.prefix #block-insert-row"));
-        assert!(view.contains(
-            "container width=fill padding-left=56.0\n                      PageTitleEditor"
-        ));
+        assert!(view.contains("box w=fill pl=56.0\n                      PageTitleEditor"));
     }
 
     #[test]
-    fn shell_uses_warm_opaque_materials() {
+    fn shell_uses_canonical_glass_and_opaque_content() {
         let ui = concat!(
             include_str!("ui/app.ice"),
             include_str!("ui/backend.ice"),
@@ -1247,61 +1273,86 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         for gradient in ["linear(", "radial(", "conic("] {
             assert!(!ui.contains(gradient), "{gradient}");
         }
-        // fully opaque: no window transparency, no blur, no white-alpha glass
-        // overlays — light-theme chrome responds with ink (`fg/N`) and tokens.
+        // Functional chrome uses the native window blur behind the three glass
+        // alpha tiers; content surfaces remain opaque paper.
         let app = include_str!("ui/app.ice");
-        assert!(!app.contains("\n    transparent true"));
-        assert!(!app.contains("\n    blur true"));
+        assert!(app.contains("\n    transparent true"));
+        assert!(app.contains("\n    blur true"));
         assert!(app.contains("titlebar-transparent true"));
         assert!(app.contains("fullsize-content-view true"));
         assert!(app.contains("font \"../../../crates/design/assets/fonts/Geist[wght].ttf\""));
         assert!(!ui.contains("white/"));
 
+        let defaults = include_str!("ui/ducktape-ui/default.ice");
+        for material in [
+            "bg         #fdfdfb",
+            "surface    #ffffff",
+            "fg         #2c2b27",
+            "muted_bg   #f6f5f2",
+            "primary    #26251f",
+            "brand      #a05a3c",
+            "ring       #26251f",
+            "glass_thin #fdfcfa80",
+            "glass_regular #fdfcfa9e",
+            "glass_sheet #fdfcfadb",
+            "shadow_popover #28262221",
+            "shadow_toast #28262238",
+            "shadow_modal #2826224d",
+        ] {
+            assert!(defaults.contains(material), "{material}");
+        }
         let theme = include_str!("ui/theme.ice");
         assert!(theme.contains("font ui family=\"Geist\" weight=normal"));
-        for material in [
-            "bg #fcfcfc",
-            "surface #f5f5f5",
-            "popover #ffffff",
-            "sidebar #f9f9f9",
-            "elevated #efefef",
-            "fg #2c2b27",
+        assert!(theme.contains("font display family=\"Geist\" weight=semibold"));
+        assert!(theme.contains("font strong family=\"Geist\" weight=bold"));
+        assert!(theme.contains("font code_medium family=\"Geist Mono\" weight=medium"));
+        assert!(theme.contains("font code_semibold family=\"Geist Mono\" weight=semibold"));
+        for app_token in [
+            "glass_rim #ffffffb3",
+            "sidebar #fbfbf9",
+            "elevated #f3f2ef",
+            "subtle #ecebe6",
+            "rail_hover #f0efea",
+            "separator #efeee9",
+            "scrim #28262257",
         ] {
-            assert!(theme.contains(material), "{material}");
-        }
-        // the terracotta accent is the single color voice of the warm palette.
-        for accent in ["primary #a05a3c", "primaryhi #8a4a2e"] {
-            assert!(theme.contains(accent), "{accent}");
+            assert!(theme.contains(app_token), "{app_token}");
         }
 
         let shell = include_str!("ui/components/shell.ice");
         // the shell is titlebar + optional degradation banner over the panes.
-        assert!(shell.contains("component TitleBar(status:str, loading:bool, bell_badge:i64)"));
+        assert!(shell.contains(
+            "component TitleBar(status:str, loading:bool, degraded:bool, bell_badge:i64)"
+        ));
         assert!(shell.contains("component ConnectionBanner(status:str)"));
         assert!(shell.contains("if degraded\n          ConnectionBanner status=status"));
-        assert!(shell.contains(
-            "container width=sidebar_width height=fill padding=12.0 bg=sidebar"
-        ));
-        // the rail width is drag-resizable via the divider resize-handle.
-        assert!(shell.contains("resize-handle drag=sidebar_dragged cursor=resize-horizontal"));
+        assert!(
+            shell.contains(
+                "box #sidebar w=236.0 h=fill px=8.0 py=9.0 bg=glass_thin border=glass_rim"
+            )
+        );
 
         let view = include_str!("ui/view.ice");
-        assert!(view.contains("container width=fill padding=6.0 bg=transparent border=fg/11"));
+        assert!(view.contains("box w=fill p=6.0 bg=transparent border=fg/11"));
         assert!(view.contains("if active_thread_seq > 0 && !channel_settings_open"));
-        assert!(view.contains("container width=fill padding=5.0 bg=transparent border=fg/12"));
+        assert!(view.contains("box w=fill p=5.0 bg=transparent border=fg/12"));
+        assert!(view.contains("bg=glass_sheet border=fg/14 border-w=1.0 r=14.0 shadow=shadow_modal shadow-y=24.0 shadow-blur=60.0"));
+
+        for authored in [shell, include_str!("ui/components/pages.ice"), view] {
+            assert!(!authored.contains("shadow=black/"));
+            assert!(!authored.contains("shadow=shadow "));
+        }
     }
 
     #[test]
     fn compact_controls_share_a_single_geometry_and_type_scale() {
         let view = include_str!("ui/view.ice");
-        assert!(view.contains("padding=6.2 text-size=13.0 line-height=1.2"));
-        assert!(view.contains(
-            "min-height=44.0 max-height=150.0 size=14.0 line-height=1.3 padding=6.6 wrapping=word"
-        ));
+        assert!(view.contains("p=6.2 text-size=13.0 line-h=1.2"));
+        assert!(view.contains("min-h=44.0 max-h=150.0 size=13.5 line-h=1.3 p=6.6 wrap=word"));
         assert!(view.contains("button \"Send\" disabled="));
-        assert!(view.contains("height=30.0 padding=7.0 -> send_message_submit"));
+        assert!(view.contains("h=30.0 p=7.0 @primary_action -> send_message_submit"));
         assert!(
-            view.matches("container width=fill height=fill align-x=center align-y=center")
+            view.matches("box w=fill h=fill align-x=center align-y=center")
                 .count()
                 >= 10
         );
@@ -1309,7 +1360,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .lines()
             .filter(|line| line.trim_start().starts_with("input "))
         {
-            assert!(!line.contains(" height="), "{line}");
+            assert!(!line.contains(" h="), "{line}");
         }
 
         let components = concat!(
@@ -1317,10 +1368,12 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             include_str!("ui/components/chat.ice"),
             include_str!("ui/components/pages.ice"),
         );
-        assert!(components.contains("row width=fill height=fill spacing=9.0 align=center"));
-        assert!(components.contains(
-            "button label=\"Insert block below\" disabled=disabled width=28.0 height=28.0 padding=0.0"
-        ));
+        assert!(components.contains("row w=fill h=fill gap=9.0 align=center"));
+        assert!(
+            components.contains(
+                "button label=\"Insert block below\" disabled=disabled w=28.0 h=28.0 p=0.0"
+            )
+        );
         for line in view.lines().chain(components.lines()).filter(|line| {
             [
                 "button \"+\" label",
@@ -1330,23 +1383,163 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .iter()
             .any(|needle| line.contains(needle))
         }) {
-            assert!(line.contains("width="), "{line}");
-            assert!(line.contains("height="), "{line}");
+            assert!(line.contains("w="), "{line}");
+            assert!(line.contains("h="), "{line}");
         }
     }
 
-    /// Every text size in every `.ice` source must be a step of the design
-    /// crate's type scale — the crate is the contract, this test is the
-    /// leash. A new size is a design-system change, made in `design`, never
-    /// an inline exception.
     #[test]
-    fn ice_sources_hold_to_the_design_crate() {
+    fn semantic_recipes_own_action_focus_and_status_colors() {
+        fn assert_recipe_owns_states(name: &str, source: &str, recipe: &str) {
+            let lines: Vec<_> = source.lines().collect();
+            for (index, line) in lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.contains(recipe))
+            {
+                let indentation = line.len() - line.trim_start().len();
+                for child in &lines[index + 1..] {
+                    let trimmed = child.trim_start();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let child_indentation = child.len() - trimmed.len();
+                    if child_indentation <= indentation {
+                        break;
+                    }
+                    let is_direct_state = child_indentation == indentation + 2
+                        && ["active ", "hovered ", "pressed ", "disabled "]
+                            .iter()
+                            .any(|state| trimmed.starts_with(state));
+                    assert!(
+                        !is_direct_state,
+                        "{name}: {recipe} must own its state colors: {child:?}"
+                    );
+                }
+            }
+        }
+
+        fn assert_controls_inherit_focus(name: &str, source: &str) {
+            let lines: Vec<_> = source.lines().collect();
+            for (index, line) in lines.iter().enumerate().filter(|(_, line)| {
+                line.trim_start().starts_with("input ") && line.contains("@control")
+            }) {
+                let indentation = line.len() - line.trim_start().len();
+                for child in &lines[index + 1..] {
+                    let trimmed = child.trim_start();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let child_indentation = child.len() - trimmed.len();
+                    if child_indentation <= indentation {
+                        break;
+                    }
+                    assert!(
+                        !trimmed.starts_with("focused "),
+                        "{name}: @control must inherit focus:border-ring: {child:?}"
+                    );
+                }
+            }
+        }
+
+        let view = include_str!("ui/view.ice");
+        let chat = include_str!("ui/components/chat.ice");
+        let pages = include_str!("ui/components/pages.ice");
+
+        assert_recipe_owns_states("view.ice", view, "@primary_action");
+        assert_recipe_owns_states("view.ice", view, "@danger_action");
+        assert_recipe_owns_states("chat.ice", chat, "@danger_action");
+        assert_recipe_owns_states("pages.ice", pages, "@danger_action");
+        assert!(!view.contains("active bg=brand text=fg"));
+
+        for target in [
+            "rename_channel_submit",
+            "add_channel_member_submit",
+            "fs_mkdir_submit",
+            "fs_new_file_submit",
+            "gov_execute",
+            "account_rename_submit",
+        ] {
+            let action = view
+                .lines()
+                .find(|line| line.trim_start().starts_with("button ") && line.contains(target))
+                .unwrap_or_else(|| panic!("missing action target {target}"));
+            assert!(action.contains("@secondary_action"), "{action}");
+        }
+        let divider_actions: Vec<_> = view
+            .lines()
+            .filter(|line| line.contains("button \"Insert divider\""))
+            .collect();
+        assert_eq!(divider_actions.len(), 2);
+        assert!(
+            divider_actions
+                .iter()
+                .all(|line| line.contains("@secondary_action"))
+        );
+
+        assert_controls_inherit_focus("view.ice", view);
+        assert_controls_inherit_focus("pages.ice", pages);
+        assert_eq!(
+            view.lines()
+                .filter(|line| line.trim_start().starts_with("focused ")
+                    && line.contains("border=ring"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            pages
+                .matches("opened text=fg placeholder=muted handle=fg bg=fg/11 border=ring")
+                .count(),
+            2
+        );
+        assert!(!view.contains("selection=brand"));
+        assert_eq!(
+            view.matches(
+                "focused bg=transparent border=transparent value=transparent border-w=0.0"
+            )
+            .count(),
+            6
+        );
+
+        for binding in [
+            "StatusBadge label=agent.status",
+            "StatusBadge label=item.state",
+            "StatusBadge label=forge_item_state",
+            "StatusBadge label=proposal.status",
+            "StatusBadge label=op.disposition",
+        ] {
+            assert!(view.contains(binding), "{binding}");
+        }
+        for mapping in [
+            "\"active\"\n        Badge.Success label=label",
+            "\"paused\"\n        Badge.Warning label=label",
+            "\"open\"\n        Badge.Warning label=label",
+            "\"closed\"\n        Badge.Outline label=label",
+            "\"merged\"\n        Badge.Success label=label",
+            "\"passed\"\n        Badge.Success label=label",
+            "\"rejected\"\n        Badge.Destructive label=label",
+            "\"applied\"\n        Badge.Success label=label",
+            "\"discarded\"\n        Badge.Warning label=label",
+        ] {
+            assert!(view.contains(mapping), "{mapping}");
+        }
+        assert!(view.contains("bg=danger_bg border=danger_line"));
+        assert!(view.contains("bg=danger_dot"));
+        assert!(view.contains("bg=success_bg border=success_line"));
+        assert!(view.contains("bg=success_dot"));
+        assert!(!view.contains("bg=success/"));
+        assert!(!view.contains("border=success/"));
+    }
+
+    /// App-authored text sizes stay on the app design scale, while the shared
+    /// Ice palette stays identical to the retained ducktape-ui theme.
+    #[test]
+    fn ice_sources_hold_to_the_design_system() {
         let sources = [
             ("view.ice", include_str!("ui/view.ice")),
             ("shell.ice", include_str!("ui/components/shell.ice")),
             ("chat.ice", include_str!("ui/components/chat.ice")),
             ("pages.ice", include_str!("ui/components/pages.ice")),
-            ("kit.ice", include_str!("../../crates/design/ice/kit.ice")),
         ];
         for (name, source) in sources {
             for line in source.lines() {
@@ -1380,30 +1573,50 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
                 "app.ice must embed {asset}"
             );
         }
-        assert!(app.contains(&format!(
-            "default-text-size {}",
-            design::type_scale::BODY as i64
-        )));
+        assert!(app.contains(&format!("text-size {}", design::type_scale::BODY)));
 
-        // the palette leash: theme.ice literals mirror design::palette.
-        for (token, rgb) in [
-            ("bg", design::palette::BG),
-            ("surface", design::palette::SURFACE),
-            ("popover", design::palette::POPOVER),
-            ("sidebar", design::palette::SIDEBAR),
-            ("elevated", design::palette::ELEVATED),
-            ("fg", design::palette::FG),
-            ("muted", design::palette::MUTED),
-            ("primary", design::palette::PRIMARY),
-            ("primaryhi", design::palette::PRIMARY_HI),
-            ("danger", design::palette::DANGER),
-            ("success", design::palette::SUCCESS),
-            ("border", design::palette::BORDER),
+        let palette = ducktape_ui::ui::theme::LIGHT.palette;
+        for (token, color) in [
+            ("bg", palette.background),
+            ("surface", palette.card),
+            ("fg", palette.foreground),
+            ("muted", palette.muted_foreground),
+            ("muted_bg", palette.muted),
+            ("primary", palette.primary),
+            ("primary_fg", palette.primary_foreground),
+            ("secondary", palette.secondary),
+            ("secondary_fg", palette.secondary_foreground),
+            ("accent", palette.accent),
+            ("accent_fg", palette.accent_foreground),
+            ("brand", palette.brand),
+            ("brand_fg", palette.brand_foreground),
+            ("brand_bg", palette.brand_background),
+            ("brand_line", palette.brand_line),
+            ("danger", palette.destructive),
+            ("danger_fg", palette.destructive_foreground),
+            ("danger_bg", palette.destructive_background),
+            ("danger_line", palette.destructive_line),
+            ("danger_dot", palette.destructive_dot),
+            ("success", palette.success),
+            ("success_fg", palette.success_foreground),
+            ("success_bg", palette.success_background),
+            ("success_line", palette.success_line),
+            ("success_dot", palette.success_dot),
+            ("warning", palette.warning),
+            ("warning_fg", palette.warning_foreground),
+            ("warning_bg", palette.warning_background),
+            ("warning_line", palette.warning_line),
+            ("warning_dot", palette.warning_dot),
+            ("avatar_bg", palette.avatar),
+            ("avatar_fg", palette.avatar_foreground),
+            ("toast_bg", palette.toast_background),
+            ("toast_fg", palette.toast_foreground),
+            ("border", palette.border),
+            ("control_line", palette.control_line),
+            ("input", palette.input),
+            ("ring", palette.ring),
         ] {
-            assert!(
-                theme.contains(&format!("{token} #{rgb:06x}")),
-                "theme.ice {token} drifted from design::palette"
-            );
+            assert_eq!(default_ice_color(token), color, "{token}");
         }
     }
 
@@ -1458,8 +1671,10 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         );
         assert!(pages.contains("dismiss=close_block_comments backdrop=transparent"));
         assert!(pages.contains("align-x=end align-y=start"));
-        assert!(pages.contains("width=300.0 height=380.0"));
-        assert!(pages.contains("bg=popover"));
+        assert!(pages.contains("w=300.0 h=380.0"));
+        assert!(pages.contains(
+            "bg=glass_regular border=fg/15 border-w=1.0 r=11.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0"
+        ));
         assert!(pages.contains("#block-comment(scope_key(connected_rpc, selected_block_id))"));
         assert!(!pages.contains("button \"Save\""));
         assert!(!pages.contains("Saving"));
@@ -2324,20 +2539,16 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     #[test]
     fn unread_indicators_are_wired_client_local_only() {
         // Sidebar badge: ChannelButton takes an `unread` flag and paints the
-        // accent (primaryhi) treatment + dot when set.
+        // brand treatment + dot when set.
         let components = include_str!("ui/components/chat.ice");
         assert!(
             components.contains(
                 "component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)"
             )
         );
-        assert!(
-            components.contains(
-                "if unread\n            container width=8.0 height=8.0 bg=primaryhi r=4.0"
-            )
-        );
+        assert!(components.contains("if unread\n            box w=8.0 h=8.0 bg=brand r=4.0"));
         assert!(components.contains(
-            "if unread\n            text channel.name width=fill size=14.0 wrapping=none font=medium @text-fg"
+            "if unread\n            text channel.name w=fill size=13.0 wrap=none font=medium @text-fg"
         ));
 
         let view = include_str!("ui/view.ice");
@@ -2348,11 +2559,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(view.contains(
             "if unread_boundary > 0 && message.seq == first_unread_seq(messages, unread_boundary)"
         ));
-        assert!(
-            view.contains(
-                "text \"New messages\" size=12.0 wrapping=none font=medium @text-primaryhi"
-            )
-        );
+        assert!(view.contains("text \"New messages\" size=12.5 wrap=none @text-brand"));
 
         // Freeze happens on a real channel change; connect seeds caught-up.
         let lifecycle = include_str!("ui/handlers/lifecycle.ice");

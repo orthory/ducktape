@@ -377,7 +377,7 @@ on forge_review_submit
   forge_review_busy = true
   run submit_forge_review(connected_rpc, password, forge_repo, forge_item_number, forge_review_verdict, forge_review_draft, forge_item_source_oid) -> forge_review_submitted _ | forge_review_failed _
 
-on forge_review_submitted(_)
+on forge_review_submitted(_result)
   forge_review_busy = false
   forge_review_draft = ""
   forge_review_verdict = "comment"
@@ -474,7 +474,7 @@ on account_rename_submit
   error = ""
   run set_account_name(connected_rpc, password, trim(account_name_draft)) -> account_renamed _ | account_rename_failed _
 
-on account_renamed(_)
+on account_renamed(_result)
   account_renaming = false
   account_name_draft = ""
   account_generation = account_generation + 1
@@ -537,7 +537,7 @@ on gov_execute(proposal_id)
   gov_voting = proposal_id
   run governance_execute(connected_rpc, password, gov_voting) -> gov_acted _ | gov_act_failed _
 
-on gov_acted(_)
+on gov_acted(_result)
   gov_voting = ""
   gov_generation = gov_generation + 1
   run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
@@ -644,7 +644,7 @@ on fs_save_edit
   error = ""
   run files_write_text(connected_rpc, fs_preview_path, editor_text(fs_editor)) -> fs_wrote _ | fs_write_failed _
 
-on fs_wrote(_)
+on fs_wrote(_result)
   fs_new_name = ""
   fs_delete_target = ""
   fs_generation = fs_generation + 1
@@ -727,12 +727,13 @@ on bell_loaded(next)
 on bell_failed(cause)
   return if cause.generation != bell_generation
 
-on bell_marked(_)
+on bell_marked(_result)
   error = error
 
 on global_key_pressed(event)
-  palette_key = palette_key_action(event.physical_key, event.modifiers, palette_open)
-  return if palette_key == "none" || !connected
+  palette_key = palette_key_action(event.key, event.physical_key, event.modifiers, palette_open)
+  return if palette_key == "none"
+  return if palette_key == "open" && !connected
   palette_open = palette_key == "open"
   palette_key = ""
   palette_draft = ""
@@ -768,7 +769,7 @@ on palette_search_failed(cause)
 
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
-  keyboard press when connected -> global_key_pressed _
+  keyboard press when (connected || palette_open) -> global_key_pressed _
   window file-dropped -> fs_file_dropped _
   run node_logs(connected_rpc) when (connected && shell_tab == "node") -> node_log_line _
 
@@ -810,7 +811,7 @@ on restore_failed_reply
   reply_draft = failed_reply_draft
   reply_editor = editor(reply_draft)
   failed_reply_draft = ""
-  task widget focus #workspace-tabs/reply
+  task widget focus #workspace-tabs/content/reply
 
 on dismiss_failed_reply
   failed_reply_draft = ""
