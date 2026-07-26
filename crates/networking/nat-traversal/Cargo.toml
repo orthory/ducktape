@@ -16,6 +16,12 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "time", "io-util"] }
 
 [dev-dependencies]
+# a SELF dev-dependency (the `data-plane` pattern): `tests/simnat_ci.rs` imports
+# `SimNat`/`drive_simulated`, which live behind `simnat`, and carries no cfg or
+# `required-features` — so `cargo test -p nat-traversal` does not merely skip it,
+# it FAILS TO COMPILE the package. Turning the feature on for our own test build
+# makes the focused invocation work and run the suite (6 tests) instead.
+nat-traversal = { path = ".", features = ["simnat"] }
 tokio = { workspace = true, features = [
     "net",
     "rt",
