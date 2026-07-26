@@ -1347,14 +1347,28 @@ mod tests {
     use super::*;
     use crate::constants::MODULE_IDS;
 
-    /// the registry ↔ topology parity pin. [`ProductionModules`] already forces
-    /// genesis, restore, and state sync onto one module set at compile time;
-    /// this test pins that set to `MODULE_IDS` — the `production` selection of
-    /// the single-source `host::topology` the status/index surfaces iterate — so
-    /// adding a module to one but not the other fails here instead of silently
-    /// misreporting.
-    #[test]
-    fn genesis_registry_matches_module_ids() {
+    /// The PRODUCTION genesis root hash over [`PIN_BINDINGS`] and an EMPTY
+    /// validator set — the consensus root every node of such a network computes
+    /// at block zero, pinned so that moving it is a decision instead of an
+    /// accident. Update it ONLY as the deliberate half of a flag day (see
+    /// [`production_genesis_root_hash_is_pinned`]).
+    const GENESIS_ROOT_HASH: &str =
+        "b6db4000cdcbcd66d1ab02489146ee783ab79b3fa33ea919a9b273d5bcfcd9e8";
+
+    /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
+    /// because they are NOT: each rides its module's store as a genesis
+    /// `__config` record ([`seed_store_config`]), so a real network's invite
+    /// namespace and chain id put it on its own root by design. Pinning a hash
+    /// only says anything against fixed ones.
+    const PIN_BINDINGS: NetworkBindings<'static> = NetworkBindings {
+        invite: b"parity-test",
+        identity_chain_id: "parity-test",
+    };
+
+    /// Compose the production genesis host in a throwaway storage root and
+    /// return `(module ids sorted, root hash hex)` — everything both pins below
+    /// need, so neither has to keep its own copy of the construction.
+    fn genesis_facts() -> (Vec<String>, String) {
         let dir = tempfile::tempdir().expect("tempdir");
         let forge_repo = dir.path().join("forge");
         let duckfs_dir = dir.path().join("duckfs");
@@ -1367,18 +1381,82 @@ mod tests {
                 &forge_repo,
                 &duckfs_dir,
                 &[],
-                NetworkBindings {
-                    invite: b"parity-test",
-                    identity_chain_id: "parity-test",
-                },
+                PIN_BINDINGS,
                 blobstore::BlobHandle::default(),
             )
             .await;
             // module_roots iterates the host's BTreeMap — sorted by id.
-            let got: Vec<String> = host.module_roots().into_iter().map(|(id, _)| id).collect();
-            let mut want: Vec<String> = MODULE_IDS.iter().map(|s| s.to_string()).collect();
-            want.sort_unstable();
-            assert_eq!(got, want);
-        });
+            let ids = host.module_roots().into_iter().map(|(id, _)| id).collect();
+            (ids, hex(&host.root_hash()))
+        })
+    }
+
+    /// the registry ↔ topology parity pin. [`ProductionModules`] already forces
+    /// genesis, restore, and state sync onto one module set at compile time;
+    /// this test pins that set to `MODULE_IDS` — the `production` selection of
+    /// the single-source `host::topology` the status/index surfaces iterate — so
+    /// adding a module to one but not the other fails here instead of silently
+    /// misreporting.
+    #[test]
+    fn genesis_registry_matches_module_ids() {
+        let (got, _root) = genesis_facts();
+        let mut want: Vec<String> = MODULE_IDS.iter().map(|s| s.to_string()).collect();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    /// THE consensus pin: the production genesis root hash is a constant.
+    ///
+    /// It is the only ABSOLUTE one in the tree, and until it existed every claim
+    /// that "the root hash did not move" was relative and therefore weak.
+    /// `bin/simnode/tests/topology_set.rs` pins the 14-module NATIVE sim
+    /// composition — which excludes `capability`, `hello`, `governance` and
+    /// `lifecycle`, and is not what a node runs. And `git diff crates/modules/`
+    /// on a committed tree is EMPTY BY CONSTRUCTION, so quoting it proves
+    /// nothing at all. Neither would have noticed a module's bytes changing.
+    ///
+    /// ## the mechanism, because it surprises everyone once
+    ///
+    /// What this covers is wider than the module SET. [`seeded_lifecycle`]
+    /// commits `sha256(component.wasm)` for every wasm tenant into the lifecycle
+    /// module's MerkleStore, so each guest's CODE DIGEST is consensus state
+    /// itself. That means a module's SOURCE is consensus-relevant the moment its
+    /// component is rebuilt — even for a change that alters no behaviour, even a
+    /// comment — and it means `make wasm-modules` can ship a sixteen-module flag
+    /// day as a side effect of touching one guest. That is correct, and it is
+    /// exactly the event that must never happen silently.
+    ///
+    /// ## when this fails
+    ///
+    /// You are in one of two situations and the message says so, because they
+    /// need opposite responses:
+    ///
+    /// - **On purpose.** A module was added or removed, a guest was rebuilt, a
+    ///   genesis-seeded record changed. Then this hash SHOULD move: update the
+    ///   constant in the same commit, and say in the commit message which change
+    ///   moved it. A flag day is cheap — there is no live chain — but it has to
+    ///   be a stated act.
+    /// - **By accident.** You did not mean to touch consensus, and you did. The
+    ///   usual cause is a rebuilt `component.wasm` riding along in the diff.
+    #[test]
+    fn production_genesis_root_hash_is_pinned() {
+        let (_ids, root) = genesis_facts();
+        assert_eq!(
+            root, GENESIS_ROOT_HASH,
+            "the production genesis root hash MOVED.\n\
+             Every node computes this at block zero, so a network whose members \
+             do not all agree on it forks at genesis.\n\
+             \n\
+             DID YOU MEAN TO? A module added/removed, a guest rebuilt, a \
+             genesis-seeded record changed — then yes, and this is a deliberate \
+             flag day: set GENESIS_ROOT_HASH to {root} in the SAME commit as the \
+             change that moved it, and name that change in the commit message.\n\
+             \n\
+             DID YOU NOT? Then you have moved consensus by accident. Look for a \
+             rebuilt component.wasm in your diff — a guest's code digest is \
+             consensus state, so `make wasm-modules` moves this hash even when \
+             the source change was cosmetic:\n\
+             \x20 git diff origin/dev --name-only crates/modules/ crates/guests/ crates/examples/"
+        );
     }
 }
