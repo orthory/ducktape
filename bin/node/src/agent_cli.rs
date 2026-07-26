@@ -101,7 +101,11 @@ pub(crate) fn run(args: AgentArgs) -> AgentResult {
     let AgentArgs { cmd, addr } = args;
     let base = addr.resolve()?;
     match cmd {
-        AgentCmd::Pty(pty) => cmd_pty(pty, &base),
+        // pty takes the whole group, not just the resolved base: attaching needs
+        // the node's WORKSPACE too (its 0600 service-link token admits the
+        // session's ws topic), and only the ladder knows which workspace the
+        // address it just resolved belongs to.
+        AgentCmd::Pty(pty) => cmd_pty(pty, &base, &addr),
         AgentCmd::Sched(sched) => cmd_sched(sched, &base),
     }
 }
@@ -110,7 +114,11 @@ pub(crate) fn run(args: AgentArgs) -> AgentResult {
 // pty — create the session, then attach this terminal in raw mode
 // ============================================================================
 
-fn cmd_pty(args: PtyArgs, base: &str) -> AgentResult {
+fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
+    // read BEFORE the create: the ws surface admits a session's topic against
+    // this secret, so a workspace we cannot read is a session we could never
+    // attach to — and failing here costs no container.
+    let secret = workspace_secret(addr)?;
     let provider = resolve_provider(base, args.provider, args.cred.as_deref())?;
     let host_hex = match args.host_node.as_deref() {
         Some(name) => Some(hex_bytes(&resolve_host_node(base, name)?)),
@@ -134,7 +142,8 @@ fn cmd_pty(args: PtyArgs, base: &str) -> AgentResult {
         .enable_all()
         .build()
         .map_err(|e| format!("attach runtime: {e}"))?;
-    let outcome = runtime.block_on(attach(base, &created.session_id, &created.topic));
+    let outcome =
+        runtime.block_on(attach(base, &created.session_id, &created.topic, &secret));
     // `shutdown_background`, NOT drop: the attach loop's stdin forwarder reads
     // `tokio::io::stdin()`, which parks a BLOCKING thread on `read(0)`. On a real
     // tty that read never returns, and `abort()` cannot interrupt an OS-level
@@ -214,7 +223,7 @@ fn close_session(base: &str, session_id: &str) -> Result<(), Box<dyn std::error:
 /// Attach this terminal to the session's ws output topic and forward keystrokes
 /// and resizes. Raw mode is entered on this stack so its guard restores the tty
 /// whichever way this future ends.
-async fn attach(base: &str, session_id: &str, topic: &str) -> AgentResult {
+async fn attach(base: &str, session_id: &str, topic: &str, secret: &str) -> AgentResult {
     use futures::{SinkExt as _, StreamExt as _};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::signal::unix::{SignalKind, signal};
@@ -229,10 +238,11 @@ async fn attach(base: &str, session_id: &str, topic: &str) -> AgentResult {
     let _raw = crate::tty::RawGuard::enter();
     let stdin_fd = libc::STDIN_FILENO;
 
-    // one outbound lane: subscribe (the entitlement gate) must reach the node
-    // before any input, so every client frame funnels through this ordered mpsc.
+    // one outbound lane: the subscribe carries the node's workspace secret and
+    // is what ADMITS this connection to the session, so it must reach the node
+    // before any input — every client frame funnels through this ordered mpsc.
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(256);
-    out_tx.send(subscribe_frame(topic)).await.ok();
+    out_tx.send(subscribe_frame(topic, secret)).await.ok();
     let (cols, rows) = window_size(stdin_fd);
     out_tx.send(resize_frame(session_id, cols, rows)).await.ok();
 
@@ -271,6 +281,9 @@ async fn attach(base: &str, session_id: &str, topic: &str) -> AgentResult {
     let mut hup = signal(SignalKind::hangup()).map_err(|e| format!("SIGHUP: {e}"))?;
     let mut stdout = tokio::io::stdout();
 
+    // the loop's outcome, not a steering flag: `Some` means the node refused
+    // this attach's topic, which every other exit path is not.
+    let mut refused = None;
     loop {
         tokio::select! {
             frame = ws_rx.next() => {
@@ -279,6 +292,16 @@ async fn attach(base: &str, session_id: &str, topic: &str) -> AgentResult {
                     break;
                 }
                 if let Message::Text(text) = message {
+                    // the node refused the subscription — this attach can never
+                    // receive a byte, and every keystroke it sends is dropped.
+                    // Ctrl-C is a keystroke, so without this the terminal is
+                    // black and unkillable until SIGTERM: the same wedge class
+                    // the `term_ended` signal below closed, through a path the
+                    // ws topic gate made reachable for the first time.
+                    if let Some(detail) = topic_refusal(&text, topic) {
+                        refused = Some(detail);
+                        break;
+                    }
                     // the session's child exited — the node signals the topic is
                     // over. Stop attaching (the wedge fix): without this the loop
                     // blocks on a dead topic and no keystroke, not even Ctrl-C,
@@ -302,7 +325,10 @@ async fn attach(base: &str, session_id: &str, topic: &str) -> AgentResult {
     }
     stdin_task.abort();
     writer.abort();
-    Ok(())
+    match refused {
+        Some(detail) => Err(detail.into()),
+        None => Ok(()),
+    }
 }
 
 
@@ -422,6 +448,22 @@ fn fresh_dispatch_id() -> String {
 // shared resolution
 // ============================================================================
 
+
+/// the service-link secret of the node this CLI is dialling — what its ws
+/// surface admits a session's `term:<id>` topic against.
+///
+/// Reading it is the whole proof: the file is 0600 beside `node.toml`, so a
+/// caller that can read it is the operator of that node — the same bar the node
+/// key already sets, and the same secret the agent daemon presents to attach.
+/// The DIRECTORY comes from the shared addressing ladder
+/// ([`NodeAddr::workspace`]), so "which node" is answered once for both the url
+/// this CLI dials and the files behind it.
+fn workspace_secret(addr: &NodeAddr) -> Result<String, Box<dyn std::error::Error>> {
+    let workspace = addr
+        .workspace()
+        .map_err(|why| format!("attaching a pty needs this node's workspace: {why}"))?;
+    noded::services::read_link_token(&workspace).map_err(Into::into)
+}
 
 /// This node's own 32-byte mesh key, from `/v1/status`'s `public_key`.
 fn own_node_key(base: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -572,8 +614,11 @@ fn error_field(body: &str) -> String {
         .unwrap_or_else(|| body.to_string())
 }
 
-fn subscribe_frame(topic: &str) -> String {
-    serde_json::json!({ "op": "subscribe", "topics": [topic] }).to_string()
+/// the subscribe that ADMITS this connection to a session's output topic. The
+/// `token` is the node's own 0600 service-link secret; without it the node
+/// refuses the topic and this connection has nothing to send keystrokes on.
+fn subscribe_frame(topic: &str, token: &str) -> String {
+    serde_json::json!({ "op": "subscribe", "topics": [topic], "token": token }).to_string()
 }
 
 fn input_frame(session: &str, data_b64: &str) -> String {
@@ -594,6 +639,28 @@ fn decode_term_chunk(text: &str) -> Option<Vec<u8>> {
     }
     let item = value["item"].as_str()?;
     STANDARD.decode(item).ok()
+}
+
+/// The node's refusal of THIS attach's topic, if that is what this frame is.
+///
+/// `ServerFrame::Error` is `{type:"error", topic, code, detail}`; the `detail`
+/// is the node's own sentence and reaches the operator verbatim, like every
+/// other refusal string this CLI surfaces.
+///
+/// Matched on the topic, not just the type: an error about some other topic on
+/// a shared connection is not this attach's business. `agent pty` holds one
+/// topic, but keying on it is what keeps that true.
+fn topic_refusal(text: &str, topic: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let is_our_refusal =
+        value["type"].as_str() == Some("error") && value["topic"].as_str() == Some(topic);
+    if !is_our_refusal {
+        return None;
+    }
+    let detail = value["detail"]
+        .as_str()
+        .unwrap_or("the node refused this session's topic");
+    Some(detail.to_string())
 }
 
 /// the node's terminal frame for this topic: the session's child exited and the
@@ -671,11 +738,63 @@ mod tests {
         assert!(!is_term_ended(&serde_json::json!({ "type": "heartbeat" }).to_string()));
     }
 
+    /// The node's refusal must END the attach, not be swallowed.
+    ///
+    /// By the time a topic refusal can arrive, `cmd_pty` has already created a
+    /// real pty holding a lent credential, entered raw mode and printed
+    /// "attached". Every keystroke after that is dropped by the node — Ctrl-C
+    /// included, since it is just a keystroke — so ignoring this frame is a
+    /// black, unkillable terminal, the same wedge class the `term_ended` signal
+    /// closed. The ws topic gate is what made this frame reachable for `term:`
+    /// at all, so the handler ships with it.
+    #[test]
+    fn a_topic_refusal_ends_the_attach_and_carries_the_nodes_own_sentence() {
+        let refusal = serde_json::json!({
+            "type": "error",
+            "topic": "term:abc",
+            "code": "forbidden",
+            "detail": "this topic requires the node's service-link token",
+        })
+        .to_string();
+        assert_eq!(
+            topic_refusal(&refusal, "term:abc").as_deref(),
+            Some("this topic requires the node's service-link token"),
+            "the node's sentence must reach the operator verbatim"
+        );
+
+        // an error about ANOTHER topic is not this attach's business ...
+        assert_eq!(topic_refusal(&refusal, "term:other"), None);
+        // ... and no ordinary frame is mistaken for one. A term chunk in
+        // particular rides `type:"event"` on the very same topic.
+        for benign in [
+            serde_json::json!({ "type": "event", "topic": "term:abc", "item": "aGk=" }),
+            serde_json::json!({ "type": "term_ended", "topic": "term:abc" }),
+            serde_json::json!({ "type": "subscribed", "topics": { "term:abc": "0" } }),
+            serde_json::json!({ "type": "heartbeat", "height": 1 }),
+        ] {
+            assert_eq!(
+                topic_refusal(&benign.to_string(), "term:abc"),
+                None,
+                "{benign}"
+            );
+        }
+        assert_eq!(topic_refusal("not json", "term:abc"), None);
+
+        // a refusal with no detail still ends the attach rather than wedging it.
+        let bare = serde_json::json!({ "type": "error", "topic": "term:abc" }).to_string();
+        assert!(topic_refusal(&bare, "term:abc").is_some());
+    }
+
     #[test]
     fn client_frames_carry_the_snake_case_op_tags() {
-        let sub: serde_json::Value = serde_json::from_str(&subscribe_frame("term:x")).unwrap();
+        let sub: serde_json::Value =
+            serde_json::from_str(&subscribe_frame("term:x", "s3cr3t")).unwrap();
         assert_eq!(sub["op"], "subscribe");
         assert_eq!(sub["topics"][0], "term:x");
+        // the field the node's topic gate reads. Without it the node refuses
+        // `term:` and this client has nothing to send keystrokes on, so its
+        // absence is a broken pty, not a cosmetic omission.
+        assert_eq!(sub["token"], "s3cr3t");
 
         let input: serde_json::Value =
             serde_json::from_str(&input_frame("sid", "ZGF0YQ==")).unwrap();

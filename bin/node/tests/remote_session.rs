@@ -156,20 +156,30 @@ args = []
 
 /// subscribe the guest ws to the session topic, forward `ping\n`, and return
 /// whether the echoed bytes land back on that topic. Event-driven throughout:
-/// it awaits the `subscribed` frame before sending input (the entitlement gate),
+/// it awaits the `subscribed` frame before sending input (the admission gate),
 /// then awaits ws frames until the echo arrives — bounded only by an overall
 /// deadline so a broken lane fails the test instead of hanging.
-async fn drive_and_observe_echo(port: u16, session_id: &str, topic: &str) -> bool {
+///
+/// `secret` is the guest node's own 0600 service-link token: `term:` is a
+/// workspace-gated topic, so without it the subscribe is refused and this
+/// connection has nothing to send a keystroke on.
+async fn drive_and_observe_echo(
+    port: u16,
+    session_id: &str,
+    topic: &str,
+    secret: &str,
+) -> bool {
     let url = format!("ws://127.0.0.1:{port}/v1/ws");
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
         .await
         .expect("guest ws connect");
 
-    let subscribe = json!({ "op": "subscribe", "topics": [topic] }).to_string();
+    let subscribe =
+        json!({ "op": "subscribe", "topics": [topic], "token": secret }).to_string();
     ws.send(Message::Text(subscribe)).await.expect("ws subscribe");
 
-    // the input handler's entitlement gate needs the subscription registered, so
-    // wait for the ack before forwarding a keystroke.
+    // the input handler needs the ADMITTED handle registered, so wait for the
+    // ack before forwarding a keystroke.
     loop {
         let frame = ws.next().await.expect("ws stays open").expect("ws frame");
         if let Message::Text(text) = frame {
@@ -326,13 +336,20 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
         .expect("create reply carries a topic")
         .to_string();
 
+    // the guest node's own 0600 service-link token, minted at boot beside its
+    // node.toml. `term:` is workspace-gated on the ws surface, so reading this
+    // file is what admits the attach below — the same proof the agent daemon
+    // gives to take the interactive plane.
+    let secret = noded::services::read_link_token(&cluster.workspace(0))
+        .expect("the guest node minted its service-link token");
+
     // the guest forwards a keystroke over the INPUT lane; the host writes it to
     // the child's pty, the child echoes, and the output fans back to the guest's
     // OWN term topic.
     let echoed = rt.block_on(async {
         tokio::time::timeout(
             ECHO,
-            drive_and_observe_echo(cluster.http_ports[0], &session_id, &topic),
+            drive_and_observe_echo(cluster.http_ports[0], &session_id, &topic, &secret),
         )
         .await
         .unwrap_or(false)

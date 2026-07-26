@@ -344,6 +344,24 @@ impl NodeHandle {
         self.terminals.as_ref()
     }
 
+    /// Has this caller proved it can read the node's OWN workspace?
+    ///
+    /// The one such proof the node has: the 0600 `service-link.token` a real
+    /// serve path mints beside `node.toml`. The ws surface has no per-caller
+    /// identity beyond it — `origin_guard` passes every `Origin`-less caller and
+    /// a signaling hello confers nothing — so this is what a topic gate
+    /// (`crate::stream::Admission::Workspace`) stands on. Reusing it invents no
+    /// second scheme and adds no second secret file: a holder already owns the
+    /// whole interactive plane via `ServiceAttach`.
+    ///
+    /// Constant-time. `false` on a node that minted none (no workspace, or no
+    /// terminal plane wired) — fails closed.
+    pub(crate) fn workspace_secret_matches(&self, presented: &str) -> bool {
+        self.terminals
+            .as_ref()
+            .is_some_and(|terminals| terminals.link_token_matches(presented))
+    }
+
     /// wire the guest-side remote-session request lane so a cross-node create/
     /// close/input can reach the overlay client half. only the daemon that owns a
     /// mesh wires one; a handle without it 503s a cross-node create.
