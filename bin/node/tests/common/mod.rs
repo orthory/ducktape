@@ -347,6 +347,64 @@ impl NetworkShapeCluster {
         });
     }
 
+    /// keep node `idx`'s `<kind>` hello alive — a service daemon's ENTIRE
+    /// contribution to the capability-announce lane, without the daemon.
+    ///
+    /// The daemon PROCESS is deliberately not spawned: `ducktape service run
+    /// compute` resolves its sandbox backend and `probe()`s it BEFORE its
+    /// first hello, so on a host with no `[sandbox]` table in node.toml (no
+    /// generated test config writes one) or without podman + pasta + nft on
+    /// PATH it FATALs before signaling anything. A spawned daemon would die
+    /// before the lane under test is reached and the test would assert
+    /// nothing. What it contributes to `grant ∩ live hello` is exactly this
+    /// POST, refreshed inside [`noded::services::HELLO_TTL`].
+    ///
+    /// The FIRST hello is synchronous and asserted — that IS the readiness
+    /// event; the refresh then rides a heartbeat thread like the daemon's.
+    pub fn signal_service(&mut self, idx: usize, kind: &str, capabilities: &[&str]) {
+        let hello = noded::services::Hello {
+            kind: kind.into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            build: noded::services::build_identity()
+                .expect("tests run from a git checkout")
+                .into(),
+            capabilities: capabilities.iter().map(|tag| tag.to_string()).collect(),
+            scopes: Vec::new(),
+            needs: Vec::new(),
+        };
+        let body = serde_json::to_value(&hello).expect("a hello serializes");
+        let port = self.http_ports[idx];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match nettest::try_http_json(port, "POST", "/v1/services/hello", Some(&body)) {
+                Ok((200, _)) => break,
+                other => assert!(
+                    Instant::now() < deadline,
+                    "node idx {idx} never accepted a {kind:?} hello ({other:?});\n{}",
+                    self.all_log_tails(60),
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        // detached like the daemon's own heartbeat thread: it outlives this
+        // call, ignores a post to a node that has gone away, and dies with the
+        // test process.
+        std::thread::Builder::new()
+            .name(format!("hello-{kind}-{idx}"))
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(noded::services::HELLO_TTL / 3);
+                    let _ = nettest::try_http_json(
+                        port,
+                        "POST",
+                        "/v1/services/hello",
+                        Some(&body),
+                    );
+                }
+            })
+            .expect("spawn the hello heartbeat");
+    }
+
     /// kill node `idx`'s process (reaped by NodeProc's drop).
     pub fn kill(&mut self, idx: usize) {
         self.nodes[idx] = None;

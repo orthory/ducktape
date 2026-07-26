@@ -384,6 +384,10 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         workspace,
         services,
         sandbox_capacity,
+        // this tier submits into its OWN orderer and the drain routes every
+        // frame's fate back, so its liveness backstop is charged in blocks,
+        // not seconds — see `Rearm`.
+        super::announce::Rearm::Unordered,
     );
     // graceful checkpoint on process signals (SIGTERM/SIGINT): the desktop
     // shell SIGTERMs the daemon on quit, so it must take the SAME safe path

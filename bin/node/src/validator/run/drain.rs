@@ -11,7 +11,7 @@ use directory::{DirQuery, DirReply, decode_reply, encode_query};
 use recovery::Manifest;
 use sdk::Msg;
 
-use super::super::announce::{dispatch_pending_deliveries, saga_next_expiry};
+use super::super::announce::{Fate, dispatch_pending_deliveries, saga_next_expiry};
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET};
 use crate::drain_actions::{CutoverTrigger, EpochActions};
@@ -124,12 +124,13 @@ impl ValidatorRuntime<'_> {
         // batch's member count. count DISTINCT sealed heights so the
         // checkpoint cadence stays per-block; applied and rejected
         // members both seal, discarded frames never sealed a height.
-        *blocks_since_checkpoint += drained
+        let sealed_heights = drained
             .iter()
             .filter(|d| d.disposition != node::Disposition::Discarded)
             .map(|d| d.height)
             .collect::<std::collections::BTreeSet<u64>>()
             .len() as u64;
+        *blocks_since_checkpoint += sealed_heights;
         // The orderer-independent projection keeps member/System order,
         // explorer rows, and discard handling identical to the replica.
         for projection in project_block(&drained, node.take_system_dispatches(), blobs) {
@@ -285,25 +286,35 @@ impl ValidatorRuntime<'_> {
             // never took: the offered set has not changed, so every later tick
             // matches the latch and stays quiet, and the node announces nothing
             // again EVER.
-            if let Some(applied) =
+            //
+            // read BEFORE the route consumes the latch: the generic
+            // "op rejected in consensus" warn at the bottom must not
+            // double-report a frame this route already reports, with the
+            // module's own detail AND the retry counter.
+            let announce_is_ours = announcer.owns(&d.id);
+            if let Some(fate) =
                 announcer.on_outcome(&d.id, d.disposition == node::Disposition::Applied)
             {
-                match applied {
-                    true => tracing::info!(
+                match fate {
+                    Fate::Applied { capabilities } => tracing::info!(
                         target: "ducktape::modules",
                         node = %label,
                         height = d.height,
-                        capabilities = ?announcer.offered(),
+                        capabilities = ?capabilities,
                         "capabilities announced"
                     ),
-                    false => tracing::warn!(
+                    Fate::Rejected { attempts } => tracing::warn!(
                         target: "ducktape::modules",
                         node = %label,
                         height = d.height,
+                        attempts,
                         reason = "capability_announce_rejected",
                         detail = %d.reason.as_deref().unwrap_or("deterministic_no_op"),
                         "capability announce did not apply; retrying"
                     ),
+                    // counted, not logged — the retry loop would otherwise
+                    // evict the whole ring between one operator and the next.
+                    Fate::RejectedQuietly => {}
                 }
             }
             // BEFORE the pending_submits lookup, deliberately. An op rejected in
@@ -322,7 +333,9 @@ impl ValidatorRuntime<'_> {
             // that deliberately does not exist. warning on it would fire every block
             // forever on an idle chain, evicting the whole 4096-line ring in ~68
             // minutes and drowning the very evidence someone came to read.
-            if d.disposition == node::Disposition::Rejected && module != NOP_TARGET {
+            let rejected = d.disposition == node::Disposition::Rejected;
+            let is_idle_nop = module == NOP_TARGET;
+            if rejected && !is_idle_nop && !announce_is_ours {
                 tracing::warn!(
                     target: "ducktape::submit",
                     node = %label,
@@ -356,6 +369,13 @@ impl ValidatorRuntime<'_> {
                 node::Disposition::Discarded => continue,
             });
         }
+        // AFTER the per-frame routing above, so a fate that arrived in this
+        // very drain settles the flight before its budget is charged: the
+        // validator lane loses an announce by having blocks go by WITHOUT it,
+        // never by wall-clock silence (a chain that is not finalizing is
+        // stalled, and a duplicate announce into the same `outstanding` is
+        // exactly what a stall does not need).
+        announcer.on_blocks(sealed_heights);
         validator_relay.expire(context.current(), relay_tx);
         // expire holds the mesh never finalized in time. the op may
         // still land later — clients re-query on block events.

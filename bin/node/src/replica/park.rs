@@ -26,7 +26,7 @@ use crate::host_state::{SyncSubstrates, restore_host, sync_all_modules};
 use crate::relay;
 use crate::relay_runtime;
 use crate::replica;
-use crate::validator::announce::CapabilityAnnouncer;
+use crate::validator::announce::{CapabilityAnnouncer, Fate, Rearm};
 use crate::rpc::{JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
 use crate::sync::catchup::{PostRebootCatchupError, catch_up_post_reboot_frames};
 use crate::sync::serve::{
@@ -685,6 +685,9 @@ pub(super) async fn park(
         grant_workspace,
         services,
         sandbox_capacity,
+        // this tier's frame rides the LOSSY relay lane in another node's
+        // custody, so wall-clock silence is the only evidence it has.
+        Rearm::Silence,
     );
 
     // ── THE JOIN GATE rides first contact now (join ADR §4) ────────────────
@@ -947,22 +950,29 @@ pub(super) async fn park(
                         // resident-owned capability announce pump.
                         let applied =
                             matches!(outcome, relay::RelayOutcome::Applied { .. });
-                        if let Some(ok) = resident_announcer.on_outcome(&frame_id, applied) {
-                            if ok {
-                                tracing::info!(
+                        // the validator tier's twin of this route lives in
+                        // `validator::run::drain`; both report the SAME three
+                        // fates in the same places, so a log contract fixed on
+                        // one tier cannot drift on the other.
+                        if let Some(fate) = resident_announcer.on_outcome(&frame_id, applied) {
+                            match fate {
+                                Fate::Applied { capabilities } => tracing::info!(
                                     target: "ducktape::modules",
                                     node = %label,
-                                    capabilities = ?resident_announcer.offered(),
+                                    capabilities = ?capabilities,
                                     "resident: announced capabilities"
-                                );
-                            } else {
-                                tracing::warn!(
+                                ),
+                                Fate::Rejected { attempts } => tracing::warn!(
                                     target: "ducktape::modules",
                                     node = %label,
+                                    attempts,
                                     outcome = ?outcome,
                                     reason = "capability_announce_rejected",
                                     "resident capability announce did not apply; retrying"
-                                );
+                                ),
+                                // counted, not logged: a permanently-rejected
+                                // announce retries forever.
+                                Fate::RejectedQuietly => {}
                             }
                         }
                     }
@@ -2088,10 +2098,13 @@ pub(super) async fn park(
                         ) {
                             Ok(id) => {
                                 resident_announcer.sent(id, now);
-                                tracing::info!(
+                                // RELAYED, not announced: the registry has
+                                // agreed to nothing yet. The info belongs on
+                                // the applied outcome, where it is true — the
+                                // validator tier says it in the same place.
+                                tracing::debug!(
                                     target: "ducktape::modules",
                                     node = %label,
-                                    capabilities = ?resident_announcer.offered(),
                                     "resident: capability announce relayed"
                                 );
                             }
