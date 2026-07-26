@@ -2956,6 +2956,12 @@ mod tests {
     /// A mock provider upstream that accepts ONLY `Bearer {expect}` (proving the
     /// gateway swapped the session token for the seeded static bearer) and streams
     /// a vendor-tagged SSE reply on both the claude and codex paths.
+    ///
+    /// The two paths differ EXACTLY as the real vendors do, which is what the
+    /// gateway's `upstream_path` mapping exists for: anthropic serves the
+    /// `/v1/...` shape the caller sends, while the ChatGPT codex backend serves
+    /// `/responses` with no `/v1` (the gateway strips it). A fixture that served
+    /// `/v1/responses` would 404 the codex lane against the real mapping.
     async fn bearer_upstream(expect: &'static str) -> String {
         use axum::response::IntoResponse;
         let guard = move |body: &'static str| {
@@ -2978,7 +2984,7 @@ mod tests {
                 post(guard("event: content_block_delta\ndata: AIRLOCK-OK\n\n")),
             )
             .route(
-                "/v1/responses",
+                "/responses",
                 post(guard("event: response.output_text.delta\ndata: CODEX-OK\n\n")),
             );
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))

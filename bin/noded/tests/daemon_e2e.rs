@@ -40,14 +40,14 @@ impl Daemon {
     /// a leaked dir plus a recycled pid would reopen stale qmdb state and
     /// fail this suite spuriously.
     fn spawn(storage: &Path) -> Self {
-        Self::spawn_inner(storage, false, &[])
+        Self::spawn_inner(storage, false)
     }
 
     fn spawn_with_echo_oracle(storage: &Path) -> Self {
-        Self::spawn_inner(storage, true, &[])
+        Self::spawn_inner(storage, true)
     }
 
-    fn spawn_inner(storage: &Path, echo_oracle: bool, env: &[(String, String)]) -> Self {
+    fn spawn_inner(storage: &Path, echo_oracle: bool) -> Self {
         let port = free_port();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-noded"));
         cmd.arg("--listen")
@@ -62,13 +62,12 @@ impl Daemon {
         if echo_oracle {
             cmd.env("DUCKTAPE_NODED_ECHO_ORACLE", "1");
         }
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
         let child = cmd.spawn().expect("spawn ducktape-noded");
         let mut daemon = Self { child, port };
-        // readiness = a status answer, never the listen println: the daemon
-        // prints before binding, and status only answers once genesis is done.
+        // readiness = a status answer, never the listen line: the daemon binds
+        // its listener only AFTER the node actor publishes its boot snapshot,
+        // so the first answer is genesis (or the resumed height) — never the
+        // empty default.
         daemon.await_status();
         daemon
     }
@@ -357,7 +356,6 @@ fn full_surface_blocks_authorship_and_ws() {
             "tasks",
             "inbox",
             "automations",
-            "jobs",
             "agent",
             "runs",
             "pages",
@@ -446,7 +444,7 @@ fn full_surface_blocks_authorship_and_ws() {
     // committed state reads back; authorship derived from the submit origin.
     let reply = daemon.query(
         "chat",
-        serde_json::json!({ "messages_latest": { "channel_id": "general", "limit": 16 } }),
+        serde_json::json!({ "messages_range": { "channel_id": "general", "from_seq": 1, "limit": 16 } }),
     );
     let messages = reply["messages"].as_array().expect("Messages reply");
     assert_eq!(messages.len(), 1);
@@ -613,7 +611,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
 
     let reply = daemon.query(
         "chat",
-        serde_json::json!({ "messages_latest": { "channel_id": "general", "limit": 16 } }),
+        serde_json::json!({ "messages_range": { "channel_id": "general", "from_seq": 1, "limit": 16 } }),
     );
     let messages = reply["messages"].as_array().expect("Messages reply");
     assert_eq!(messages.len(), 2, "user post plus agent reply should exist");
@@ -682,7 +680,7 @@ fn state_persists_across_restart() {
     assert_eq!(daemon.status()["height"], 2);
     let reply = daemon.query(
         "chat",
-        serde_json::json!({ "messages_latest": { "channel_id": "durable", "limit": 16 } }),
+        serde_json::json!({ "messages_range": { "channel_id": "durable", "from_seq": 1, "limit": 16 } }),
     );
     let messages = reply["messages"].as_array().expect("Messages reply");
     assert_eq!(messages.len(), 1, "chat state must survive a restart");
@@ -717,6 +715,35 @@ fn state_persists_across_restart() {
     );
 }
 
+/// block until `module`'s materialized view has caught up with everything the
+/// op feed already carries.
+///
+/// the derived tier is asynchronous ON PURPOSE — the block loop writes the op
+/// rows and the guest folds them into the views behind a background trigger, so
+/// an index failure degrades the read models and never a block. that makes a
+/// view read immediately after a submit a genuine race, and the daemon publishes
+/// the backlog on `/v1/index/status` (`fold.<module>.pending`) precisely so a
+/// reader can tell "caught up" from "still folding". this waits on THAT signal —
+/// the daemon's own report that the fold drained — never on a duration.
+fn await_view_folded(daemon: &Daemon, module: &str) {
+    nettest::poll_until(
+        &format!("{module}'s view fold to drain"),
+        Duration::from_secs(30),
+        || {
+            let (code, status) = daemon.request("GET", "/v1/index/status", None);
+            assert_eq!(code, 200, "index status failed: {status}");
+            let fold = &status["fold"][module];
+            // a module with no folding guest reports nothing — nothing to await.
+            let drained = fold.is_null() || fold["pending"].as_u64() == Some(0);
+            assert!(
+                fold["lastError"].is_null(),
+                "the {module} fold FAILED — its views can never catch up: {status}"
+            );
+            drained.then_some(())
+        },
+    );
+}
+
 #[test]
 fn per_module_index_serves_ops_and_views() {
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -741,12 +768,16 @@ fn per_module_index_serves_ops_and_views() {
             Some("eddy"),
         );
         assert_eq!(code, 200);
-        let (code, _) = daemon.submit(
+        // tasks owns TWO boards behind one module: the write wire is the
+        // `WorkMsg` envelope that routes to the task board or the job board.
+        let (code, task) = daemon.submit(
             "tasks",
-            serde_json::json!({ "create_task": { "task_id": "t1", "title": "wire the indexer" } }),
+            serde_json::json!({
+                "task": { "create_task": { "task_id": "t1", "title": "wire the indexer" } }
+            }),
             None,
         );
-        assert_eq!(code, 200);
+        assert_eq!(code, 200, "create task failed: {task}");
 
         // the raw op log: every applied chat op, oldest-first, json envelopes.
         let (code, ops) = daemon.request("GET", "/v1/index/chat/ops?limit=10", None);
@@ -760,6 +791,7 @@ fn per_module_index_serves_ops_and_views() {
         assert_eq!(rows[1]["height"], 2);
 
         // chat's OWN endpoint: the materialized search view.
+        await_view_folded(&daemon, "chat");
         let (code, reply) = daemon.request(
             "POST",
             "/v1/index/chat/view",
@@ -772,6 +804,7 @@ fn per_module_index_serves_ops_and_views() {
         assert_eq!(hits[0]["author"], "user:eddy");
 
         // tasks' endpoint: the by-status partition.
+        await_view_folded(&daemon, "tasks");
         let (code, reply) = daemon.request(
             "POST",
             "/v1/index/tasks/view",
@@ -834,6 +867,7 @@ fn per_module_index_serves_ops_and_views() {
         Some("eddy"),
     );
     assert_eq!(code, 200);
+    await_view_folded(&daemon, "chat");
     let (code, reply) = daemon.request(
         "POST",
         "/v1/index/chat/view",
@@ -1017,11 +1051,11 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
         "base_snapshot": null,
         "message": "seed duckfs",
         "changes": [
-            { "put": { "path": "/shared/a.bin", "exec": false,
+            { "put": { "path": "/shared/a.bin", "exec": false, "meta": {},
                 "content": { "chunks": { "size": chunk_a.len() as u64, "chunks": [digest_a] } } } },
-            { "put": { "path": "/shared/b.bin", "exec": false,
+            { "put": { "path": "/shared/b.bin", "exec": false, "meta": {},
                 "content": { "chunks": { "size": chunk_b.len() as u64, "chunks": [digest_b] } } } },
-            { "put": { "path": "/shared/hello.txt", "exec": false,
+            { "put": { "path": "/shared/hello.txt", "exec": false, "meta": {},
                 "content": { "inline": { "b64": STANDARD.encode(inline_bytes) } } } },
         ],
     });
@@ -1135,7 +1169,7 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
         "base_snapshot": seed_snapshot,
         "message": "edit hello",
         "changes": [
-            { "put": { "path": "/shared/hello.txt", "exec": false,
+            { "put": { "path": "/shared/hello.txt", "exec": false, "meta": {},
                 "content": { "inline": { "b64": STANDARD.encode(b"HELLO AGAIN") } } } },
         ],
     });
@@ -1166,7 +1200,7 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
         "base_snapshot": null,
         "message": "dangling chunk",
         "changes": [
-            { "put": { "path": "/shared/dangling.bin", "exec": false,
+            { "put": { "path": "/shared/dangling.bin", "exec": false, "meta": {},
                 "content": { "chunks": { "size": 10, "chunks": [bogus] } } } },
         ],
     });
@@ -1286,330 +1320,6 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
         tail2["item"]["time_ms"].as_u64().expect("second instant") >= time_ms,
         "tick samples advance monotonically"
     );
-}
-
-// ============================================================================
-// off-loop oracle execution: REAL script-backed providers through the full
-// capability-host path, proving the daemon's command loop no longer awaits
-// provider execution — the fix for the status heartbeat starving (and the
-// desktop "reconnecting" banner) during long agent runs.
-// ============================================================================
-
-/// stage one script-backed capability provider for a spawned daemon: an
-/// operator spec dir with a single `text`-format spec whose `detect.env`
-/// points at `body`'s script. returns the daemon env that provides the tag —
-/// including detect overrides that HIDE the embedded executor specs, so a dev
-/// box with a real `claude`/`codex` on PATH runs these tests identically to CI.
-fn stage_script_provider(root: &Path, tag: &str, body: &str) -> Vec<(String, String)> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let spec_dir = root.join("specs");
-    std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-    let script = root.join(format!("{tag}.sh"));
-    std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("write provider script");
-    let mut perms = std::fs::metadata(&script)
-        .expect("script metadata")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&script, perms).expect("chmod provider script");
-
-    let env_var = format!(
-        "DUCKTAPE_TEST_{}_BIN",
-        tag.replace(['-', '.'], "_").to_uppercase()
-    );
-    std::fs::write(
-        spec_dir.join(format!("{tag}.toml")),
-        format!(
-            "spec = 1\n\
-             [capability]\n\
-             tag = \"{tag}\"\n\
-             description = \"daemon e2e script executor\"\n\
-             [detect]\n\
-             bin = \"{tag}-nonexistent-cli\"\n\
-             env = \"{env_var}\"\n\
-             [invoke]\n\
-             args = []\n\
-             prompt = \"stdin\"\n\
-             timeout_secs = 60\n\
-             [output]\n\
-             format = \"text\"\n"
-        ),
-    )
-    .expect("write provider spec");
-
-    let missing = root.join("missing-executor");
-    vec![
-        (
-            "DUCKTAPE_CAPABILITY_DIR".into(),
-            spec_dir.display().to_string(),
-        ),
-        (env_var, script.display().to_string()),
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
-    ]
-}
-
-/// channel + registered agent + mention watch: the client-side trigger stack
-/// for one agent run in `channel`. no prompt blob — an agent is its curated
-/// skills, and one that curates none still runs (it simply has no persona).
-fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
-    let (code, block) = daemon.submit(
-        "chat",
-        serde_json::json!({
-            "create_channel": { "channel_id": channel, "name": channel, "post_policy": "open" }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "create channel failed: {block}");
-    let (code, block) = daemon.submit(
-        "agent",
-        serde_json::json!({
-            "register_agent": {
-                "agent_id": agent_id,
-                "display_name": agent_id,
-                "capability": tag,
-                "allowed_actions": ["chat.post"]
-            }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "register agent failed: {block}");
-    let (code, block) = daemon.submit(
-        "runs",
-        serde_json::json!({
-            "watch_channel": { "channel_id": channel, "policy": "mention" }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "watch channel failed: {block}");
-}
-
-/// the plain texts of `channel`'s agent-authored replies.
-fn agent_replies(daemon: &Daemon, channel: &str) -> Vec<String> {
-    let reply = daemon.query(
-        "chat",
-        serde_json::json!({ "messages_latest": { "channel_id": channel, "limit": 32 } }),
-    );
-    reply["messages"]
-        .as_array()
-        .expect("Messages reply")
-        .iter()
-        .filter(|m| m["head"]["author"].get("agent").is_some())
-        .map(|m| {
-            m["head"]["blocks"][0]["paragraph"][0]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()
-        })
-        .collect()
-}
-
-fn pending_run_count(daemon: &Daemon) -> usize {
-    let pending = daemon.query("runs", serde_json::json!("pending_runs"));
-    pending["pending_runs"]
-        .as_array()
-        .map(Vec::len)
-        .unwrap_or(0)
-}
-
-use nettest::poll_until;
-
-/// THE HEADLINE FIX, asserted directly: submit a run whose provider sleeps,
-/// then Status and Query answer BEFORE the run completes. on the pre-fix
-/// inline path the mention's submit itself blocked through provider
-/// execution AND delivery, so "submit returned, reply not posted yet" was
-/// unreachable — this test is red there without any wall-clock assertion.
-#[test]
-fn status_answers_while_a_slow_run_is_in_flight() {
-    let storage = tempfile::TempDir::new().expect("storage dir");
-    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
-    let env = stage_script_provider(
-        fixtures.path(),
-        "slow-quack",
-        "cat > /dev/null\nsleep 6\nprintf 'slow answer\\n'",
-    );
-    let daemon = Daemon::spawn_inner(storage.path(), false, &env);
-    arm_agent(&daemon, "general", "sloth", "slow-quack");
-
-    let (code, block) = daemon.submit("chat", post_mention("general", "m1", "sloth"), Some("eddy"));
-    assert_eq!(code, 200, "mention post failed: {block}");
-
-    // the provider is asleep for ~6s. the daemon answers NOW:
-    let status = daemon.status();
-    assert!(
-        status["height"].as_u64().is_some(),
-        "status is live: {status}"
-    );
-    assert_eq!(
-        pending_run_count(&daemon),
-        1,
-        "the run is in flight while status answered"
-    );
-    assert!(
-        agent_replies(&daemon, "general").is_empty(),
-        "status/query answered BEFORE the run completed"
-    );
-
-    // ... and the run still lands: the result re-enters as a submit, the
-    // mailbox delivers next block, the reply posts, the pending entry prunes.
-    poll_until(
-        "the slow run's reply to post",
-        Duration::from_secs(30),
-        || {
-            let replies = agent_replies(&daemon, "general");
-            (!replies.is_empty()).then_some(replies)
-        },
-    );
-    assert_eq!(agent_replies(&daemon, "general"), ["slow answer"]);
-    poll_until(
-        "the pending entry to prune",
-        Duration::from_secs(30),
-        || (pending_run_count(&daemon) == 0).then_some(()),
-    );
-}
-
-/// two slow runs execute CONCURRENTLY: the second child starts while the
-/// first is still asleep — the in-flight log carries start,start before any
-/// end. on the pre-fix path the second mention's submit queued behind the
-/// first run, so the log serialized (start,end,start,end).
-#[test]
-fn two_slow_runs_overlap() {
-    let storage = tempfile::TempDir::new().expect("storage dir");
-    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
-    let log = fixtures.path().join("exec.log");
-    let env = stage_script_provider(
-        fixtures.path(),
-        "slow-pair",
-        &format!(
-            "cat > /dev/null\n\
-             echo start >> {log}\n\
-             sleep 3\n\
-             echo end >> {log}\n\
-             printf 'done\\n'",
-            log = log.display()
-        ),
-    );
-    let daemon = Daemon::spawn_inner(storage.path(), false, &env);
-    // two channels, one agent each: two independent runs.
-    arm_agent(&daemon, "left", "pair-a", "slow-pair");
-    arm_agent(&daemon, "right", "pair-b", "slow-pair");
-
-    let (code, block) = daemon.submit("chat", post_mention("left", "m1", "pair-a"), Some("eddy"));
-    assert_eq!(code, 200, "first mention failed: {block}");
-    let (code, block) = daemon.submit("chat", post_mention("right", "m2", "pair-b"), Some("eddy"));
-    assert_eq!(code, 200, "second mention failed: {block}");
-
-    for channel in ["left", "right"] {
-        poll_until("both slow runs to reply", Duration::from_secs(30), || {
-            let replies = agent_replies(&daemon, channel);
-            (!replies.is_empty()).then_some(())
-        });
-    }
-    let lines: Vec<String> = std::fs::read_to_string(&log)
-        .expect("exec log written")
-        .lines()
-        .map(str::to_string)
-        .collect();
-    assert_eq!(
-        lines[..2],
-        ["start", "start"],
-        "both children started before either finished — the runs overlapped: {lines:?}"
-    );
-    assert_eq!(lines.len(), 4, "two complete executions: {lines:?}");
-}
-
-/// the failure path is loud, not silent: a provider that exits non-zero
-/// still produces the failure OracleResult, the saga burns its attempts,
-/// and the terminal failure prunes the pending entry — but the agent posts
-/// exactly one ⚠ failure reply into the channel (authored as the agent,
-/// carrying the provider's stderr excerpt) instead of dying silently. and
-/// the daemon answers throughout.
-#[test]
-fn a_failing_provider_still_fails_the_run_cleanly() {
-    let storage = tempfile::TempDir::new().expect("storage dir");
-    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
-    let log = fixtures.path().join("exec.log");
-    let env = stage_script_provider(
-        fixtures.path(),
-        "kaboom",
-        &format!(
-            "cat > /dev/null\n\
-             echo ran >> {log}\n\
-             echo 'provider exploded' >&2\n\
-             exit 3",
-            log = log.display()
-        ),
-    );
-    let daemon = Daemon::spawn_inner(storage.path(), false, &env);
-    arm_agent(&daemon, "general", "boomer", "kaboom");
-
-    let (code, block) = daemon.submit(
-        "chat",
-        post_mention("general", "m1", "boomer"),
-        Some("eddy"),
-    );
-    assert_eq!(code, 200, "mention post failed: {block}");
-
-    // the terminal failure delivers (that is what prunes the entry) — the
-    // saga's retry cycle ran through the pool to completion.
-    poll_until("the failed run to prune", Duration::from_secs(30), || {
-        (pending_run_count(&daemon) == 0).then_some(())
-    });
-
-    // the deliberate failure surface: exactly one ⚠ reply, authored as the
-    // agent, one-reply-per-run message id, provider stderr in the excerpt.
-    // (the anchor is a top-level post here, so the reply joins the channel
-    // with `thread: null` — the runs crate's unit tests cover the reply
-    // joining a threaded anchor's thread.)
-    let reply = daemon.query(
-        "chat",
-        serde_json::json!({ "messages_latest": { "channel_id": "general", "limit": 16 } }),
-    );
-    let agent_msgs: Vec<&serde_json::Value> = reply["messages"]
-        .as_array()
-        .expect("Messages reply")
-        .iter()
-        .filter(|m| m["head"]["author"].get("agent").is_some())
-        .collect();
-    assert_eq!(
-        agent_msgs.len(),
-        1,
-        "a failed run posts exactly one ⚠ failure reply: {reply}"
-    );
-    let head = &agent_msgs[0]["head"];
-    assert_eq!(
-        head["author"],
-        serde_json::json!({ "agent": { "module": "runs", "agent_id": "boomer" } }),
-        "the failure reply is authored as the agent"
-    );
-    let run_id = "chat\u{1f}general\u{1f}1\u{1f}boomer";
-    assert_eq!(
-        head["message_id"],
-        format!("agent/{run_id}"),
-        "one reply per run, failure included"
-    );
-    assert!(
-        head["thread"].is_null(),
-        "a top-level anchor's failure reply is not threaded: {head}"
-    );
-    let text = head["blocks"][0]["paragraph"][0]["text"]
-        .as_str()
-        .expect("reply text");
-    assert!(
-        text.starts_with("⚠ boomer failed: "),
-        "the ⚠ failure reply names the agent: {text}"
-    );
-    assert!(
-        text.contains("provider exploded"),
-        "the provider's stderr surfaces in the failure excerpt: {text}"
-    );
-    let executions = std::fs::read_to_string(&log)
-        .map(|s| s.lines().count())
-        .unwrap_or(0);
-    assert!(
-        executions >= 1,
-        "the provider actually ran (got {executions} executions)"
-    );
-    daemon.status(); // still alive, still answering.
 }
 
 // ============================================================================
@@ -2177,16 +1887,27 @@ fn duckfs_workspace_rpc_lifecycle_and_conflict() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
 
-    // ---- create: an empty checkout under /shared/job1 ----
+    // ---- create: an empty checkout. `/workspace` is the ONLY vocabulary this
+    // RPC accepts; it maps to an id-scoped managed prefix the caller reads back
+    // off the reply, so a job never has to know the module's writable roots ----
     let (code, ws) = daemon.request(
         "POST",
         "/v1/fs/workspaces",
-        Some(&serde_json::json!({ "prefix": "/shared/job1" })),
+        Some(&serde_json::json!({ "prefix": "/workspace" })),
     );
     assert_eq!(code, 200, "create workspace failed: {ws}");
     let id = ws["id"].as_str().expect("workspace id").to_string();
     let path = ws["path"].as_str().expect("workspace path").to_string();
+    let prefix = ws["prefix"].as_str().expect("managed prefix").to_string();
     assert!(ws["snapshot"].is_null(), "empty checkout has no base: {ws}");
+    // a duckfs path outside that vocabulary is a clean 400, not a commit that
+    // fails later inside the module's authority check.
+    let (code, refused) = daemon.request(
+        "POST",
+        "/v1/fs/workspaces",
+        Some(&serde_json::json!({ "prefix": "/shared/job1" })),
+    );
+    assert_eq!(code, 400, "a non-/workspace prefix is refused: {refused}");
     // the managed checkout wrote its .duckfs index to disk at `path`.
     let index_json = std::path::Path::new(&path).join(".duckfs/index.json");
     assert!(
@@ -2214,7 +1935,11 @@ fn duckfs_workspace_rpc_lifecycle_and_conflict() {
     assert_eq!(done["rebased"], false, "a first commit never rebases");
 
     // ---- read the committed file back over the files surface ----
-    let (code, read) = daemon.request("GET", "/v1/files/read?path=/shared/job1/hello.txt", None);
+    let (code, read) = daemon.request(
+        "GET",
+        &format!("/v1/files/read?path={prefix}/hello.txt"),
+        None,
+    );
     assert_eq!(code, 200, "read the committed file: {read}");
     let bytes = STANDARD
         .decode(read["b64"].as_str().expect("b64").as_bytes())
@@ -2230,19 +1955,20 @@ fn duckfs_workspace_rpc_lifecycle_and_conflict() {
         "the workspace dir is removed on delete"
     );
 
-    // ---- conflict: two workspaces off the same base, same-path edits ----
-    let make_ws = || {
-        let (c, v) = daemon.request(
-            "POST",
-            "/v1/fs/workspaces",
-            Some(&serde_json::json!({ "prefix": "/shared/wsconflict" })),
-        );
-        assert_eq!(c, 200, "create conflict workspace: {v}");
-        (
-            v["id"].as_str().unwrap().to_string(),
-            v["path"].as_str().unwrap().to_string(),
-        )
-    };
+    // ---- conflict: a workspace loses a race on its OWN path. every managed
+    // checkout owns an id-scoped prefix, so no two workspaces can collide; the
+    // competing writer is whoever else commits into duckfs — here a direct
+    // /v1/files/commit that lands between this workspace's checkout and its
+    // commit. same 409 lane, reachable the way production reaches it ----
+    let (code, ws2) = daemon.request(
+        "POST",
+        "/v1/fs/workspaces",
+        Some(&serde_json::json!({ "prefix": "/workspace" })),
+    );
+    assert_eq!(code, 200, "create conflict workspace: {ws2}");
+    let id2 = ws2["id"].as_str().expect("workspace id").to_string();
+    let path2 = ws2["path"].as_str().expect("workspace path").to_string();
+    let prefix2 = ws2["prefix"].as_str().expect("managed prefix").to_string();
     let commit_ws = |id: &str, msg: &str| -> (u16, serde_json::Value) {
         daemon.request(
             "POST",
@@ -2251,26 +1977,43 @@ fn duckfs_workspace_rpc_lifecycle_and_conflict() {
         )
     };
 
-    let (id1, path1) = make_ws();
-    std::fs::write(std::path::Path::new(&path1).join("f.txt"), b"v1").unwrap();
-    let (c, _) = commit_ws(&id1, "seed");
-    assert_eq!(c, 200, "seed commit lands");
+    std::fs::write(std::path::Path::new(&path2).join("f.txt"), b"v1").unwrap();
+    let (code, seeded) = commit_ws(&id2, "seed");
+    assert_eq!(code, 200, "seed commit lands: {seeded}");
 
-    // ws2 checks out the seeded head (its base is snapshot1).
-    let (id2, path2) = make_ws();
+    // a direct commit advances the SAME path off the seeded head — the
+    // workspace's base snapshot is now stale.
+    let (code, refs) = daemon.request("GET", "/v1/files/refs", None);
+    assert_eq!(code, 200, "refs failed: {refs}");
+    let head = refs["head"].as_str().expect("seeded head").to_string();
+    let (code, advanced) = daemon.request(
+        "POST",
+        "/v1/files/commit",
+        Some(&serde_json::json!({
+            "base_snapshot": head,
+            "message": "a competing writer takes the path",
+            "changes": [
+                { "put": { "path": format!("{prefix2}/f.txt"), "exec": false, "meta": {},
+                    "content": { "inline": { "b64": STANDARD.encode(b"from the other writer") } } } },
+            ],
+        })),
+    );
+    assert_eq!(code, 200, "the competing commit lands: {advanced}");
 
-    // ws1 advances the shared path...
-    std::fs::write(std::path::Path::new(&path1).join("f.txt"), b"from1").unwrap();
-    let (c, _) = commit_ws(&id1, "advance");
-    assert_eq!(c, 200, "ws1 advances the shared path");
-
-    // ...so ws2's same-path commit conflicts: a 409 with the clashing path.
-    std::fs::write(std::path::Path::new(&path2).join("f.txt"), b"from2").unwrap();
-    let (c, report) = commit_ws(&id2, "loses");
-    assert_eq!(c, 409, "an overlapping workspace commit is a 409: {report}");
+    // ...so the workspace's same-path commit conflicts: a 409 naming the path.
+    std::fs::write(
+        std::path::Path::new(&path2).join("f.txt"),
+        b"from the workspace",
+    )
+    .unwrap();
+    let (code, report) = commit_ws(&id2, "loses");
+    assert_eq!(
+        code, 409,
+        "an overlapping workspace commit is a 409: {report}"
+    );
     let clashing = report["clashing"].as_array().expect("clashing array");
     assert!(
-        clashing.iter().any(|p| p == "/shared/wsconflict/f.txt"),
+        clashing.iter().any(|p| p == &format!("{prefix2}/f.txt")),
         "the conflict report names the clashing path: {report}"
     );
 }

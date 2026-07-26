@@ -202,11 +202,19 @@ async fn a_tampered_frame_is_refused_before_it_reaches_the_actor() {
     spawn_fake_actor(cmd_rx, None);
 
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
-    let mut frame = node::encode_frame(&signer, 1, &chat_op(), None);
+    let op = chat_op();
+    let mut frame = node::encode_frame(&signer, 1, &op, None);
     // flip one byte of the PAYLOAD: the signature binds (origin, seq, target,
     // payload), so the frame no longer verifies — and the actor never sees it.
-    let last = frame.len() - 65;
-    frame[last] ^= 0x01;
+    // located by SEARCHING for the payload rather than counting back from the
+    // tail: an offset measured against the frame's trailer silently slides onto
+    // a structural byte when the layout gains a field, and the refusal becomes
+    // "does not parse" — a different gate than the one under test.
+    let at = frame
+        .windows(op.payload.len())
+        .position(|window| window == op.payload.as_slice())
+        .expect("the frame carries the op payload verbatim");
+    frame[at] ^= 0x01;
 
     let response = noded::router(handle)
         .oneshot(post_frame(frame))
@@ -843,6 +851,7 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
                 "path_and_query": "/api/items",
                 "headers": [{ "name": "content-type", "value": "application/json" }],
                 "body_len": request_body.len(),
+                "upgrade": false,
             },
             "body_b64": base64::engine::general_purpose::STANDARD.encode(request_body),
         }),
