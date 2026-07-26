@@ -1032,8 +1032,10 @@ pub(crate) fn commit_enable(
 }
 
 /// How often the daemon re-signals. A third of the TTL, so two consecutive
-/// lost heartbeats still leave the entry alive.
-const HEARTBEAT: std::time::Duration =
+/// lost heartbeats still leave the entry alive. Also the beat the airlock
+/// daemon re-asserts its gateway route on, so a daemon's two liveness signals
+/// travel together.
+pub(crate) const HEARTBEAT: std::time::Duration =
     std::time::Duration::from_secs(noded::services::HELLO_TTL.as_secs() / 3);
 
 /// `ducktape service run <kind>` — the first-party launcher.

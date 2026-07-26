@@ -42,17 +42,27 @@
 //! node is often a laptop with no container runtime at all, which is exactly
 //! why the hello path must not demand one.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gateway::{GatewayQuery, GatewayReply, credential_use_allowed};
 use noded::node_link::NodeLink;
 
 use crate::config;
-use crate::services::ServiceGrant;
+use crate::services::{AIRLOCK_KIND, ServiceGrant};
 
 /// The gateway route label this daemon publishes its loopback port under. A
 /// borrower resolves `<AIRLOCK_ROUTE>.<owner-handle>.duck` to it.
 pub(crate) const AIRLOCK_ROUTE: &str = "airlock";
+
+/// How long the grant gate waits on its node.
+///
+/// A session-open is INTERACTIVE — a borrower's run is blocked on this read —
+/// and the read is one committed query against a process on this same host, so
+/// a node that cannot answer in seconds is wedged or restarting. [`NodeLink`]'s
+/// own ceiling is sized for a submit that rides consensus; inheriting it would
+/// make every session-open cost two minutes before failing closed.
+const GRANT_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Everything the daemon needs, resolved before any of it runs.
 pub(crate) struct Airlock {
@@ -88,12 +98,13 @@ async fn run(airlock: Airlock) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
 
-    let node = NodeLink::new(http_base);
+    let node = NodeLink::new(http_base).with_timeout(GRANT_QUERY_TIMEOUT);
     let router = store.router(committed_grant_check(node))?;
 
     // Register the loopback port only once the router exists: a route pointing
     // at a gateway that never came up is worse than no route at all.
-    crate::gateway_routes::register(&workspace, gateway::RouteName::named(AIRLOCK_ROUTE), port)
+    let route = gateway::RouteName::named(AIRLOCK_ROUTE);
+    crate::gateway_routes::register(&workspace, route.clone(), port)
         .map_err(|error| format!("register airlock gateway route: {error}"))?;
 
     tracing::info!(
@@ -111,8 +122,111 @@ async fn run(airlock: Airlock) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    airlock::server::serve_router(listener, router).await?;
-    Ok(())
+    // The registered port is a standing instruction to the node: reverse-proxy
+    // RouteStatement-authorized overlay ingress to THIS loopback port. So the
+    // entry must not outlive the process that owns it — a dead daemon's port is
+    // one any local process may subsequently bind. Re-assert it on a beat (a
+    // hand `gateway unbind`, or another registrar, is corrected within one) and
+    // retire it on the way out.
+    let refresh = tokio::spawn(refresh_route(workspace.clone(), route.clone(), port));
+    let served = tokio::select! {
+        served = airlock::server::serve_router(listener, router) => served.map_err(Into::into),
+        () = stop_requested() => Ok(()),
+    };
+    refresh.abort();
+    // JOIN before retiring, not just abort: cancellation only lands at the
+    // task's next await, so a re-register already in flight has to finish
+    // first — otherwise it restores the entry right after we removed it.
+    let _ = refresh.await;
+    retire_route(&workspace, &route);
+    served
+}
+
+/// Resolve when the operator stops this daemon: SIGTERM is what systemd and a
+/// killed shell send, SIGINT is Ctrl-C.
+///
+/// A handler that will not install is NOT fatal — the daemon then dies without
+/// retiring its route, which is the behavior before this arm existed, not a new
+/// failure. It parks so the server keeps owning the process.
+async fn stop_requested() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut terminate), Ok(mut interrupt)) =
+        (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
+    else {
+        tracing::warn!(
+            target: "ducktape::gateway",
+            reason = "signal_handler_install_failed",
+            "the airlock gateway route will not be retired on exit"
+        );
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = interrupt.recv() => {}
+    }
+}
+
+/// Re-assert the loopback route on the service heartbeat, so the port the node
+/// proxies to can never disagree with the port this process serves on for
+/// longer than one beat. Attempt-counted like every other forever-retry loop.
+async fn refresh_route(workspace: PathBuf, route: gateway::RouteName, port: u16) -> ! {
+    const LOG_EVERY: u64 = 30;
+    let mut failures: u64 = 0;
+    loop {
+        tokio::time::sleep(crate::services::HEARTBEAT).await;
+        let Err(error) = crate::gateway_routes::register(&workspace, route.clone(), port) else {
+            failures = 0;
+            continue;
+        };
+        failures += 1;
+        if failures == 1 || failures.is_multiple_of(LOG_EVERY) {
+            tracing::warn!(
+                target: "ducktape::gateway",
+                attempts = failures,
+                reason = "route_refresh_failed",
+                "airlock gateway route not re-registered: {error}"
+            );
+        }
+    }
+}
+
+/// Drop the loopback route on the way out. Best effort: a workspace that has
+/// become unwritable must not turn a clean stop into a failed one, but leaving
+/// a live route pointing at a port nothing serves is worth a line.
+fn retire_route(workspace: &Path, route: &gateway::RouteName) {
+    let Err(error) = crate::gateway_routes::unregister(workspace, route) else {
+        return;
+    };
+    tracing::warn!(
+        target: "ducktape::gateway",
+        reason = "route_retire_failed",
+        "airlock gateway route left registered: {error}"
+    );
+}
+
+/// Whether this node LENDS nothing although it was asked to: the operator's
+/// credential store holds registered credentials and no airlock grant exists,
+/// so no daemon will ever serve them. `Some(count)` = say so; `None` = nothing
+/// to lend, or the service is granted and the daemon's own absence is what
+/// `service status` reports.
+///
+/// A store that cannot be READ is not evidence of lending: the daemon fails
+/// loudly on a broken store, and a node boot must not.
+pub(crate) fn lending_without_a_grant(storage: &Path, workspace: &Path) -> Option<usize> {
+    let credentials = airlock_service::load_seeds(&airlock_service::cred_store_root(storage))
+        .unwrap_or_default()
+        .len();
+    let lends_nothing = credentials == 0;
+    if lends_nothing {
+        return None;
+    }
+    let granted = crate::services::grant_for(workspace, AIRLOCK_KIND)
+        .unwrap_or(None)
+        .is_some();
+    if granted {
+        return None;
+    }
+    Some(credentials)
 }
 
 /// The committed-state grant gate the owner's own gateway enforces: given a
@@ -175,5 +289,56 @@ async fn committed_credential_record(
     match gateway::decode_reply(&bytes)? {
         GatewayReply::Credential(record) => Ok(record),
         other => Err(format!("gateway returned an unexpected reply: {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// one complete credential dir under `<storage>/airlock-creds/<name>/`,
+    /// exactly the shape `ducktape user cred add` writes.
+    fn seed_credential(storage: &Path, name: &str) {
+        let dir = airlock_service::cred_store_root(storage).join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("kind"), "codex\n").unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"tokens":{"access_token":"tok"}}"#,
+        )
+        .unwrap();
+    }
+
+    fn grant_airlock(workspace: &Path) {
+        std::fs::write(
+            workspace.join(crate::services::FILE_NAME),
+            "version = 1\n\n[[service]]\nkind = \"airlock\"\ninstance = \"".to_string()
+                + &"ab".repeat(32)
+                + "\"\nnonce = \""
+                + &"cd".repeat(16)
+                + "\"\ngranted_unix = 1700000000\ncapabilities = []\nscopes = []\n",
+        )
+        .unwrap();
+    }
+
+    /// The upgrade an operator lands in without asking: credentials registered,
+    /// no grant, so nothing lends them and every other diagnostic still looks
+    /// healthy. This predicate is the only thing that notices.
+    #[test]
+    fn a_populated_store_with_no_grant_is_the_one_state_worth_warning_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+
+        // nothing registered: there is nothing to lend, so nothing to say.
+        assert_eq!(lending_without_a_grant(workspace, workspace), None);
+
+        // a credential and no grant — the silent-loss shape.
+        seed_credential(workspace, "owner-codex-1");
+        assert_eq!(lending_without_a_grant(workspace, workspace), Some(1));
+
+        // granted: the daemon's absence is `service status`'s job to report,
+        // not this line's.
+        grant_airlock(workspace);
+        assert_eq!(lending_without_a_grant(workspace, workspace), None);
     }
 }

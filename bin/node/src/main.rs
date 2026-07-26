@@ -351,6 +351,25 @@ fn run_node(
         );
     }
 
+    // The LENDER twin of the same silence. An operator whose credentials are
+    // registered and granted on chain lends exactly nothing without an airlock
+    // daemon, and every other diagnostic still reads healthy: `user cred list`
+    // shows the records, `gateway list` shows the route, and `service
+    // list`/`status` render no airlock row at all (they fold signaling ∪
+    // grants, and an ungranted, unstarted service is in neither). This line is
+    // the only place that says so.
+    if let Some(credentials) = crate::airlock::lending_without_a_grant(&storage, &workspace) {
+        tracing::warn!(
+            target: "ducktape::service",
+            node = %label,
+            credentials,
+            reason = "airlock_not_granted",
+            "credentials are registered but the airlock service is not enabled; nothing will \
+             lend them and a borrower's session will not connect — enable it with `ducktape \
+             service run airlock`"
+        );
+    }
+
     // There is NO sandbox probe here any more, and its absence is the point:
     // this process runs nothing in a sandbox. Both planes that did — compute's
     // headless runs and agent's interactive ptys — are separate daemons that

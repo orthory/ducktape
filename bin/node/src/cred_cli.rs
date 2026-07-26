@@ -464,6 +464,14 @@ fn cmd_add(
     // serves every credential this account co-hosts), so publish it once and
     // skip on later `cred add`s — the operator never hand-signs a RouteStatement.
     ensure_airlock_route(&base, &user, &resolved, &account.account_id)?;
+    // The record and the route are committed, but neither LENDS anything: the
+    // credential is only reachable while the daemon that serves the store runs,
+    // and nothing else in this flow — nor `cred list`, nor `gateway list` —
+    // ever mentions it.
+    println!(
+        "lend it by running: ducktape service run {}",
+        crate::services::AIRLOCK_KIND
+    );
     Ok(())
 }
 

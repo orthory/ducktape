@@ -716,24 +716,28 @@ impl Cluster {
         let workspace = self.workspace(idx);
         std::fs::create_dir_all(&workspace).expect("create workspace dir");
         let path = workspace.join("services.toml");
+        // A MAP, so `services.toml`'s own rule — kinds unique and sorted — holds
+        // by construction rather than by everyone remembering it: two grants of
+        // one kind cannot be expressed, and iteration is already sorted. A
+        // duplicate `[[service]]` would make the node under test refuse the file
+        // at load and fail to boot, with the reason nowhere near the cause.
+        //
         // the compute grant announces tags; every explicitly spawned kind
         // announces none (airlock, the lender, discovers no capability at all).
-        let mut granted: Vec<(&str, &[String])> = Vec::new();
+        let mut granted: std::collections::BTreeMap<&str, &[String]> =
+            std::collections::BTreeMap::new();
         if let Some(tags) = &self.compute_grant {
-            granted.push(("compute", tags));
+            granted.insert("compute", tags);
         }
-        granted.extend(
-            self.service_kinds[idx]
-                .iter()
-                .map(|kind| (kind.as_str(), &[] as &[String])),
-        );
+        for kind in &self.service_kinds[idx] {
+            granted.entry(kind.as_str()).or_insert(&[]);
+        }
         if granted.is_empty() {
             let _ = std::fs::remove_file(&path);
             return;
         }
-        granted.sort_by_key(|(kind, _)| *kind);
         let mut file = "version = 1\n".to_string();
-        for (kind, tags) in granted {
+        for (position, (kind, tags)) in granted.iter().enumerate() {
             let announced = tags
                 .iter()
                 .map(|tag| format!("{tag:?}"))
@@ -741,8 +745,10 @@ impl Cluster {
                 .join(", ");
             // any well-formed id/nonce pair does: the node asks WHETHER a grant
             // of that kind exists and WHAT it announces, never re-deriving the
-            // id. The bytes are kind-derived only so two grants never collide.
-            let byte = format!("{:02x}", kind.as_bytes()[0]);
+            // id. The bytes come from the grant's POSITION, which is unique by
+            // construction — a first-byte-of-kind derivation collided outright
+            // ("agent" and "airlock" are both 0x61).
+            let byte = format!("{:02x}", position + 1);
             file.push_str(&format!(
                 "\n[[service]]\nkind = \"{kind}\"\ninstance = \"{}\"\n\
                  nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = [{announced}]\n\
@@ -826,6 +832,16 @@ impl Cluster {
     /// and only the test knows when it has waited for that.
     pub fn spawn_service(&mut self, idx: usize, kind: &str) {
         let id = self.peer_ids[idx];
+        // One grant per kind is the file's rule and one daemon per kind is the
+        // operator's: a second `service run <kind>` beside the same node would
+        // be two processes sharing one grant, which is a test bug, not a
+        // scenario. Refuse it here, where the cause is visible.
+        let already_running = self.services[idx].iter().any(|service| service.kind == kind);
+        let compute_rides_along = kind == "compute" && self.compute_grant.is_some();
+        assert!(
+            !already_running && !compute_rides_along,
+            "a {kind} daemon already runs beside node idx {idx}"
+        );
         // `config_file`, not `config_path`: the latter REWRITES node.toml and
         // services.toml, which would drop the grant appended just below.
         let cfg = self.config_file(idx);

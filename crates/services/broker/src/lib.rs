@@ -1224,15 +1224,15 @@ async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, Str
     // verifies the TEE quote and reads the seal_pk out of the attested
     // REPORTDATA; `PinnedSealPk` is the self-host anchor — the on-chain seal_pk
     // pinned directly, no quote to verify.
-    let (seal_pk, pinned) = match &cfg.trust {
+    let seal_pk = match &cfg.trust {
         AirlockTrust::Attested { measurement, attest } => {
             let mode: AttestMode =
                 attest.parse().map_err(|e| format!("airlock attest mode: {e}"))?;
             let expected = Measurement::from_hex(measurement)
                 .map_err(|e| format!("airlock measurement: {e}"))?;
-            (verify_gateway(&gateway, &cfg, mode, &expected).await?, false)
+            verify_gateway(&gateway, &cfg, mode, &expected).await?
         }
-        AirlockTrust::PinnedSealPk(pk) => (*pk, true),
+        AirlockTrust::PinnedSealPk(pk) => *pk,
     };
     // A lending session names the account it draws the grant on behalf of, so the
     // owner's gateway can check it against the on-chain record and 403 an
@@ -1242,14 +1242,84 @@ async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, Str
         Some(account) => gateway.open_session_sealed_as(&seal_pk, &cfg.sub, account).await,
         None => gateway.open_session_sealed(&seal_pk, &cfg.sub).await,
     };
-    // On the pinned path a handshake failure IS the trust failure: the gateway's
-    // real seal key differs from the pin, so the sealed session token cannot be
-    // opened. Surface it as a named error BEFORE any credentialed request.
-    let (token, keys) = handshake.map_err(|e| match pinned {
-        true => "gateway_seal_pk_mismatch".to_string(),
-        false => format!("airlock handshake: {e}"),
-    })?;
+    // A handshake failure is named for WHAT failed, before any credentialed
+    // request. Every distinguishable cause has its own reason: the lender's
+    // daemon not running, its route or credential absent, its grant gate saying
+    // no — and only a token that will not unseal is a seal_pk mismatch.
+    let (token, keys) = match handshake {
+        Ok(opened) => opened,
+        Err(error) => {
+            // the transport error the handshake failed with, if it failed in
+            // transport at all. `?` in the client adds no context to a reqwest
+            // error, so it is still in the chain verbatim.
+            let transport = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<reqwest::Error>());
+            let refusal = SessionRefusal::of(transport);
+            tracing::warn!(
+                target: "ducktape::gateway",
+                reason = refusal.reason(),
+                "airlock session not opened: {error}"
+            );
+            return Err(refusal.reason().to_string());
+        }
+    };
     Ok((AirlockSession { gateway, seal_pk, sub: cfg.sub, token, keys }, base))
+}
+
+/// Why a lender's gateway would not open a session.
+///
+/// Every arm is a DIFFERENT thing for the operator to fix, and collapsing them
+/// into one name reports the most likely new failure ("I did not start the
+/// daemon") as the one thing that is provably not wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionRefusal {
+    /// nothing answered: the lender's airlock daemon is not running, or the
+    /// node that reverse-proxies to it is down.
+    Unreachable,
+    /// the lender answered 404 — its account published no `airlock` route, its
+    /// node has no local upstream registered for one, or its store holds no
+    /// credential by that name.
+    Absent,
+    /// the lender's own grant gate refused this account (403).
+    NotGranted,
+    /// the lender refused with some other status.
+    Refused,
+    /// the session response arrived and its sealed token would not open under
+    /// the pinned key: the gateway's real seal key is not the published one.
+    SealPkMismatch,
+}
+
+impl SessionRefusal {
+    /// Classify from the transport error, when the failure WAS in transport.
+    /// No transport error means a response arrived and the token is what failed.
+    fn of(transport: Option<&reqwest::Error>) -> Self {
+        let Some(transport) = transport else {
+            return Self::SealPkMismatch;
+        };
+        let Some(status) = transport.status() else {
+            return Self::Unreachable;
+        };
+        // HTTP status is an open set, so the trailing arm is a named catch-all
+        // rather than a hole in a closed enum.
+        match status.as_u16() {
+            403 => Self::NotGranted,
+            404 => Self::Absent,
+            _other => Self::Refused,
+        }
+    }
+
+    /// the stable snake_case token the caller returns. No prose and no upstream
+    /// detail: that rides the log line beside it.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Unreachable => "airlock_gateway_unreachable",
+            Self::Absent => "airlock_route_or_credential_absent",
+            Self::NotGranted => "credential_not_granted",
+            Self::Refused => "airlock_gateway_refused",
+            Self::SealPkMismatch => "gateway_seal_pk_mismatch",
+        }
+    }
 }
 
 /// Where the airlock gateway lives.
@@ -3163,7 +3233,56 @@ mod tests {
         let mut rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
         rc.account = b"stranger".to_vec();
         let refused = AnthropicAuth::airlock(AirlockConfig::self_host(&rc)).await;
-        assert!(refused.is_err(), "an ungranted account must not open a session");
+        // and it is named for what happened. The grant gate's refusal is the
+        // headline feature of the lending path; reporting it as a seal_pk
+        // mismatch (the pre-fix behavior) sent the operator after the one thing
+        // that was provably fine.
+        assert_eq!(refused.err().as_deref(), Some("credential_not_granted"));
+    }
+
+    /// The failure an upgrade actually produces: the lender's daemon is not
+    /// running, so nothing answers on the port its route points at. It must NOT
+    /// be reported as a seal_pk mismatch — the pinned key is fine and the
+    /// operator would go hunting the one thing that is not wrong.
+    #[tokio::test]
+    async fn a_lender_whose_daemon_is_not_running_is_named_unreachable() {
+        // a port nothing serves: bound, then released, so the connect is refused
+        // rather than left hanging on an unrouted address.
+        let dead = {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            listener.local_addr().unwrap()
+        };
+        let cfg = AirlockConfig::self_host(&resolved(
+            "owner-claude-1",
+            CredentialKind::Claude,
+            &format!("http://{dead}"),
+            [7u8; 32],
+        ));
+        let refused = AnthropicAuth::airlock(cfg).await;
+        assert_eq!(refused.err().as_deref(), Some("airlock_gateway_unreachable"));
+    }
+
+    /// A lender that is up but holds no such credential answers 404, which is a
+    /// third distinct thing to fix (`user cred add` on the LENDER) — and the
+    /// same status the node returns when no `airlock` route resolves.
+    #[tokio::test]
+    async fn an_unknown_credential_is_named_absent_not_a_mismatch() {
+        let upstream = bearer_upstream("tok-absent").await;
+        let (kp, seal_pk) = seal_pair();
+        let gateway_url = boot_self_host_gateway(&upstream, kp, Vec::new()).await;
+        let cfg = AirlockConfig::self_host(&resolved(
+            "ghost-claude-1",
+            CredentialKind::Claude,
+            &gateway_url,
+            seal_pk,
+        ));
+        let refused = AnthropicAuth::airlock(cfg).await;
+        assert_eq!(
+            refused.err().as_deref(),
+            Some("airlock_route_or_credential_absent")
+        );
     }
 
     #[tokio::test]

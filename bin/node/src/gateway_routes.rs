@@ -230,6 +230,19 @@ pub fn register(
     save(workspace, &routes)
 }
 
+/// Retire a node-local loopback route — the programmatic twin of [`unbind`],
+/// for a service daemon dropping its port on the way out. A route that is
+/// already absent is success: the operator may have unbound it by hand, and a
+/// daemon stopping must not fail on that.
+pub fn unregister(workspace: &Path, name: &gateway::RouteName) -> Result<(), String> {
+    let mut routes = load(workspace)?;
+    let Ok(index) = routes.routes.binary_search_by(|route| route.name.cmp(name)) else {
+        return Ok(());
+    };
+    routes.routes.remove(index);
+    save(workspace, &routes)
+}
+
 fn unbind(args: RouteArgs) -> Result<(), Box<dyn std::error::Error>> {
     let workspace = args.workspace.dir()?;
     let name = args.name()?;
@@ -287,6 +300,32 @@ mod tests {
         unbind(route(dir.path(), Some("api"), None)).unwrap();
         assert!(!dir.path().join(FILE_NAME).exists());
         assert!(bind(bind_args(dir.path(), Some("evil.name"), None, 1)).is_err());
+    }
+
+    /// A daemon's port is a standing instruction to the node's reverse proxy,
+    /// so it must be re-assertable while the daemon lives and gone once it
+    /// stops — otherwise overlay ingress keeps landing on a port any local
+    /// process may bind next.
+    #[test]
+    fn a_daemon_port_is_refreshable_and_retires_completely() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = gateway::RouteName::named("airlock");
+        register(dir.path(), name.clone(), 4100).unwrap();
+        assert_eq!(load(dir.path()).unwrap().port(&name), Some(4100));
+
+        // the heartbeat re-assert is idempotent, and a restarted daemon on a
+        // fresh ephemeral port replaces the entry rather than adding one.
+        register(dir.path(), name.clone(), 4100).unwrap();
+        register(dir.path(), name.clone(), 4200).unwrap();
+        assert_eq!(load(dir.path()).unwrap().routes.len(), 1);
+        assert_eq!(load(dir.path()).unwrap().port(&name), Some(4200));
+
+        // retiring removes exactly it, leaves no husk file, and is safe twice
+        // (the operator may have unbound it by hand first).
+        unregister(dir.path(), &name).unwrap();
+        assert_eq!(load(dir.path()).unwrap().port(&name), None);
+        assert!(!dir.path().join(FILE_NAME).exists());
+        unregister(dir.path(), &name).unwrap();
     }
 
     #[test]
