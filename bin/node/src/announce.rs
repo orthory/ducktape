@@ -53,16 +53,33 @@ pub(crate) struct AnnounceSet {
     pub(crate) resources: BTreeMap<String, u64>,
 }
 
-/// why a set cannot be announced. A closed domain: both arms are conditions the
-/// consent boundary refuses OUTRIGHT rather than silently trimming, because the
-/// alternative is an operator who approved a consent screen listing tags this
-/// node will never announce.
+/// why a set cannot be announced.
+///
+/// A closed domain, and BOTH arms belong to the consent boundary — they are
+/// what `plan_enable` refuses, so that an operator is never asked to approve a
+/// consent screen listing tags this node will never announce.
+///
+/// Neither is reachable from the watcher, by construction rather than by luck,
+/// and that is the property to preserve in review:
+///
+/// - `IllegalTags` — [`announced_set`] only ever emits tags drawn from
+///   `grant.capabilities` (intersected with a hello), and `Services::validate`
+///   refuses to load a grant carrying an illegal tag. So the file cannot hold
+///   one, and the watcher cannot derive one.
+/// - `OverCap` — `plan_enable` bounds the WIDEST set the grants could ever
+///   produce ([`widest`]), not the set they happen to produce against whoever
+///   is signaling at that moment. Every live derivation is a subset of that
+///   bound, so it cannot cross.
+///
+/// If either ever does fire on the watcher path, the fix is upstream at the
+/// boundary that let it into `services.toml` — not a trim here, which would
+/// only hide it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     /// tags the registry's own grammar rejects. The hello boundary's item rule
     /// is LOOSER than `capability::validate_tag` (it admits any printable ascii
     /// plus a space), so a third-party daemon or an operator spec dir can
-    /// signal `"Claude Sonnet"` and reach this point intact.
+    /// signal `"Claude Sonnet"` and reach the consent screen intact.
     IllegalTags(Vec<String>),
     /// more tags than the registry accepts. An announce is all-or-nothing, so
     /// crossing the cap does not cost the excess — it costs the whole set.
@@ -156,6 +173,32 @@ pub(crate) fn announced_set(
     })
 }
 
+/// the WIDEST set `grants` could ever announce: every granted kind signaling
+/// everything it was granted.
+///
+/// This is what the consent boundary must bound, because the live derivation is
+/// always a subset of it. Bounding the live one instead makes the check
+/// order-dependent — enabling `compute` while `agent`'s daemon happens to be
+/// down would pass, and the union would cross the cap later when `agent`
+/// started, at which point no verb is running to refuse it.
+///
+/// Expressed as a synthetic signaling set fed through [`announced_set`] rather
+/// than as a second union, so there is exactly one definition of what this node
+/// announces and the bound cannot drift from the thing it bounds.
+pub(crate) fn widest(grants: &[ServiceGrant]) -> Vec<noded::services::Signaling> {
+    grants
+        .iter()
+        .map(|grant| noded::services::Signaling {
+            kind: grant.kind.clone(),
+            version: String::new(),
+            build: String::new(),
+            capabilities: grant.capabilities.clone(),
+            scopes: Vec::new(),
+            needs: Vec::new(),
+        })
+        .collect()
+}
+
 /// Submit one announce through this node's own `/v1/submit` and return the
 /// height it committed at.
 ///
@@ -201,6 +244,24 @@ fn committed(base: &str, node_key: &[u8]) -> Option<AnnounceSet> {
 const TICK: std::time::Duration =
     std::time::Duration::from_secs(noded::services::HELLO_TTL.as_secs() / 3);
 
+/// how long after this thread starts before it may submit anything.
+///
+/// The signaling catalog lives in THIS process, so a node restart does not age
+/// it out — it starts EMPTY. A daemon that never stopped running re-registers on
+/// its own beat (`HELLO_TTL / 3`), and its beats fail while the node's `/v1` is
+/// down, so its first post-boot hello can land after this thread's first tick.
+/// Acting then would read "nothing is signaling" off a catalog that has simply
+/// not been filled yet and RETRACT a healthy daemon — pulling a live node out of
+/// every placement pool for a tick and costing two consensus writes per node
+/// restart.
+///
+/// One full TTL is the tight bound: every live daemon beats at least three times
+/// inside it, so by the time this expires an empty catalog means the daemon is
+/// really gone. The cost is that a genuinely stale registry is corrected up to
+/// `SETTLE` later at boot, which is fine — nothing places work on a node faster
+/// than the operator can start its daemon.
+const SETTLE: std::time::Duration = noded::services::HELLO_TTL;
+
 /// a failure is reported on the FIRST occurrence and every Nth after it,
 /// carrying the count. The doctrine's rule for a forever-retry loop: an
 /// unconditional `warn!` on a 10 s tick evicts the whole 4096-line ring in
@@ -238,27 +299,32 @@ pub(crate) fn spawn(watch: Watch) -> std::io::Result<()> {
 }
 
 fn run(watch: Watch) {
-    // what the registry holds for this node, as far as this thread knows.
-    let mut last: Option<AnnounceSet> = None;
+    let started = std::time::Instant::now();
     let mut failures: u64 = 0;
     loop {
         std::thread::sleep(TICK);
-        // ONE committed read, retried until the node can answer it, and then
-        // never again. Retried rather than given up on because an unseeded
-        // watcher has no idea what the registry holds, and a guess is worse
-        // than a wait in BOTH directions: guessing "empty" would submit a
-        // pointless announce on every node boot — and on a node not yet
-        // admitted, one per tick forever — while guessing "whatever we
-        // compute" would leave a dead daemon's tags standing after a restart.
-        // A booting node answers within a tick or two; until then this thread
-        // does nothing at all, which is exactly right.
-        if last.is_none() {
-            let Some(seed) = committed(&watch.base, &watch.node_key) else {
-                continue;
-            };
-            last = Some(seed);
+        // the catalog has to have had a chance to fill before its emptiness
+        // means anything. Until then this thread does nothing at all.
+        let settled = started.elapsed() >= SETTLE;
+        if !settled {
+            continue;
         }
-        let want = match desired(&watch) {
+        // RE-READ every tick, never cached. The committed set is the only thing
+        // that says what the network actually believes, and a snapshot taken
+        // once at boot is not the same information: a node whose host was still
+        // catching up when the watcher started would hold an empty snapshot
+        // forever, agree with an empty desired set, and never notice that a
+        // dead daemon's tags were standing on chain the whole time. Comparing
+        // against fresh committed state is what makes this converge rather than
+        // merely track — the old pump's per-tick read was the guarantee, not
+        // just its cost. One loopback query per 10 s is not a cost worth
+        // trading it for.
+        let Some(committed) = committed(&watch.base, &watch.node_key) else {
+            failures += 1;
+            report(failures, "the committed capability registry did not answer");
+            continue;
+        };
+        let want = match desired(&watch, std::time::Instant::now()) {
             Ok(want) => want,
             Err(reason) => {
                 failures += 1;
@@ -266,7 +332,11 @@ fn run(watch: Watch) {
                 continue;
             }
         };
-        if last.as_ref() == Some(&want) {
+        // the registry already says what this node offers — including when the
+        // `enable`/`disable` verb just put it there, which is why that submit
+        // costs no follow-up frame here.
+        if want == committed {
+            failures = 0;
             continue;
         }
         match submit(&watch.base, &want) {
@@ -278,11 +348,11 @@ fn run(watch: Watch) {
                     capabilities = ?want.capabilities,
                     "capabilities announced"
                 );
-                last = Some(want);
             }
-            // `last` is deliberately NOT advanced: the next tick retries, which
-            // is what a node that has not been admitted yet needs. Bounded by
-            // the tick plus the submit's own hold, so ~one attempt per 20 s.
+            // nothing is latched on failure, so the next tick simply re-derives
+            // and retries — which is what a node not yet admitted to its network
+            // needs. Bounded by the tick plus the submit's own hold, so ~one
+            // attempt per 20 s.
             Err(reason) => {
                 failures += 1;
                 report(failures, &reason);
@@ -291,10 +361,14 @@ fn run(watch: Watch) {
     }
 }
 
-/// the announce this node would emit right now. Reads the two live inputs and
+/// the announce this node would emit at `now`. Reads the two live inputs and
 /// delegates the decision; it decides nothing itself.
-fn desired(watch: &Watch) -> Result<AnnounceSet, String> {
-    let signaling = watch.services.live(std::time::Instant::now());
+///
+/// `now` is threaded in rather than read from the clock so the catalog's TTL
+/// expiry — i.e. retraction, the whole reason this thread exists — is reachable
+/// from a test without sleeping.
+fn desired(watch: &Watch, now: std::time::Instant) -> Result<AnnounceSet, String> {
+    let signaling = watch.services.live(now);
     // consent that cannot be read is not consent — but silently retracting a
     // live node's whole announce because someone corrupted a toml is exactly
     // the failure that must not be quiet, so this is an error, not an empty set.
@@ -434,6 +508,159 @@ mod tests {
                 total: MAX_ANNOUNCED_TAGS + 1
             })
         );
+    }
+
+    /// a workspace whose `services.toml` grants each `(kind, tags)` pair — the
+    /// watcher reads consent off disk, so a test grant IS a file.
+    fn granted_workspace(grants: &[(&str, &[&str])]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("scratch workspace");
+        let mut body = String::from("version = 1\n");
+        let mut sorted = grants.to_vec();
+        sorted.sort_by_key(|(kind, _)| *kind);
+        for (kind, capabilities) in &sorted {
+            let tags = capabilities
+                .iter()
+                .map(|tag| format!("    {tag:?},"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            body.push_str(&format!(
+                "\n[[service]]\nkind = {kind:?}\ninstance = {:?}\nnonce = {:?}\n\
+                 granted_unix = 1\ncapabilities = [\n{tags}\n]\nscopes = []\n",
+                "aa".repeat(32),
+                "bb".repeat(16),
+            ));
+        }
+        std::fs::write(dir.path().join(crate::services::FILE_NAME), body).expect("write grants");
+        dir
+    }
+
+    fn watcher(workspace: &tempfile::TempDir, services: noded::services::ServiceCatalog) -> Watch {
+        Watch {
+            base: String::new(),
+            node_key: vec![7u8; 32],
+            workspace: workspace.path().to_path_buf(),
+            services,
+            capacity: caps(4),
+        }
+    }
+
+    /// register a live hello for `kind` at `at`.
+    fn beat(
+        catalog: &noded::services::ServiceCatalog,
+        kind: &str,
+        capabilities: &[&str],
+        at: std::time::Instant,
+    ) {
+        catalog
+            .hello(
+                noded::services::Hello {
+                    kind: kind.into(),
+                    version: "1".into(),
+                    build: noded::services::build_identity_or_unknown().to_string(),
+                    capabilities: tags(capabilities),
+                    scopes: Vec::new(),
+                    needs: Vec::new(),
+                },
+                at,
+            )
+            .expect("a well-formed hello is admitted");
+    }
+
+    #[test]
+    fn a_daemon_that_stops_signaling_retracts_the_announce() {
+        // THE behaviour this whole thread exists for. Driven through the real
+        // catalog with an explicit clock, so the TTL expiry that constitutes
+        // "the daemon stopped" is actually exercised — and without sleeping.
+        let catalog = noded::services::ServiceCatalog::default();
+        let workspace = granted_workspace(&[("compute", &["claude"])]);
+        let watch = watcher(&workspace, catalog.clone());
+        let t0 = std::time::Instant::now();
+
+        beat(&catalog, "compute", &["claude"], t0);
+        assert_eq!(
+            desired(&watch, t0).unwrap().capabilities,
+            tags(&["claude", "compute"]),
+            "a signaling grant announces its kind and its executors"
+        );
+
+        // the daemon dies; its entry ages out one TTL after its last beat.
+        let dead = t0 + noded::services::HELLO_TTL + std::time::Duration::from_secs(1);
+        let want = desired(&watch, dead).unwrap();
+        assert!(
+            want.capabilities.is_empty(),
+            "an absent daemon retracts the tags it was serving"
+        );
+        assert!(
+            want.resources.is_empty(),
+            "and the capacity with them — resources without tags is a module-level reject"
+        );
+        // the grant is untouched on disk: consent survives the daemon.
+        assert!(crate::services::load(workspace.path()).unwrap().grant("compute").is_some());
+    }
+
+    #[test]
+    fn an_absent_daemon_retracts_only_its_own_kind() {
+        let catalog = noded::services::ServiceCatalog::default();
+        let workspace = granted_workspace(&[("agent", &["claude"]), ("compute", &["codex"])]);
+        let watch = watcher(&workspace, catalog.clone());
+        let t0 = std::time::Instant::now();
+
+        // compute beats once and stops; agent keeps beating.
+        beat(&catalog, "compute", &["codex"], t0);
+        let later = t0 + std::time::Duration::from_secs(20);
+        beat(&catalog, "agent", &["claude"], later);
+        assert_eq!(
+            desired(&watch, later).unwrap().capabilities,
+            tags(&["agent", "claude", "codex", "compute"]),
+            "both kinds are live here"
+        );
+
+        // past compute's deadline but inside agent's: only compute drops.
+        let gap = t0 + noded::services::HELLO_TTL + std::time::Duration::from_secs(1);
+        assert_eq!(
+            desired(&watch, gap).unwrap().capabilities,
+            tags(&["agent", "claude"]),
+            "the surviving daemon keeps announcing; only the dead kind is retracted"
+        );
+    }
+
+    #[test]
+    fn the_settle_window_outlasts_a_live_daemons_beat() {
+        // the boot-retraction guard is only correct if a daemon that never
+        // stopped is GUARANTEED to have re-registered before the window closes.
+        // A daemon beats every HELLO_TTL/3, so it beats at least twice inside
+        // SETTLE even if its first post-boot attempt is lost.
+        let beat_period = noded::services::HELLO_TTL / 3;
+        assert!(
+            SETTLE >= beat_period * 2,
+            "SETTLE must outlast at least two daemon beats, else a node restart \
+             retracts a healthy daemon"
+        );
+        assert!(
+            TICK <= SETTLE,
+            "the first tick must not fall outside the settle window it gates"
+        );
+    }
+
+    #[test]
+    fn the_widest_set_is_liveness_independent_and_bounds_every_live_one() {
+        // what `plan_enable` bounds. It must not depend on who happens to be
+        // signaling, and every live derivation must be a subset of it.
+        let grants = [grant("agent", &["claude"]), grant("compute", &["codex"])];
+        let bound = announced_set(&grants, &widest(&grants), &caps(4)).unwrap();
+        assert_eq!(
+            bound.capabilities,
+            tags(&["agent", "claude", "codex", "compute"]),
+            "every granted kind contributes everything it was granted"
+        );
+        // with only one daemon up, the live set is strictly smaller.
+        let live = [signal("agent", &["claude"])];
+        let now = announced_set(&grants, &live, &caps(4)).unwrap();
+        assert!(
+            now.capabilities.iter().all(|tag| bound.capabilities.contains(tag)),
+            "a live derivation is always a subset of the bound"
+        );
+        assert!(now.capabilities.len() < bound.capabilities.len());
     }
 
     #[test]

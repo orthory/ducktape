@@ -721,9 +721,9 @@ pub(crate) enum ServiceCmd {
     Run(RunArgs),
     /// show services signaling to this node and those enabled in config
     List(ReadArgs),
-    /// grant a service standing on this node (mints its instance id)
+    /// grant a service standing on this node and announce it (needs a running node)
     Enable(EnableArgs),
-    /// revoke a service's grant and retire its instance id
+    /// revoke a service's grant, retire its id, retract the announce (needs a running node)
     Disable(KindArgs),
     /// per-service state, instance id, offered tags and requested scopes
     Status(ReadArgs),
@@ -944,13 +944,9 @@ pub(crate) struct EnablePlan {
     /// and a clock read, not a write — so the commit below is purely two
     /// writers in order (announce, then persist) with nothing left to decide.
     pub(crate) grant: ServiceGrant,
-    /// the announce this enable would submit: every granted-and-signaling
-    /// kind's contribution INCLUDING this one. Decided here so that a set the
-    /// registry would refuse is refused before the operator is asked to consent
-    /// to it — the announce is all-or-nothing, so an illegal tag or an over-cap
-    /// total does not cost the excess, it costs this node's whole registry
-    /// entry.
-    pub(crate) announce: crate::announce::AnnounceSet,
+    /// the capacity this node announces beside its tags, from the same resolved
+    /// config the consent screen was rendered from.
+    pub(crate) capacity: std::collections::BTreeMap<String, u64>,
 }
 
 impl EnablePlan {
@@ -1006,13 +1002,20 @@ pub(crate) fn plan_enable(
             )
         })?;
     let grant = mint_grant(kind, node_id, &offered);
-    // the announce this would produce, decided against the CURRENT signaling
-    // set and refused here if the registry would not take it.
+    // REFUSE here if the registry could not take what these grants imply.
+    //
+    // Bounded against the WIDEST set the grants could ever produce — every
+    // granted kind signaling everything it was granted — not against whoever
+    // happens to be signaling right now. Checking the live set would make this
+    // order-dependent: enabling `compute` while `agent`'s daemon was down would
+    // pass, and the union would cross the cap later when `agent` started, with
+    // no verb running to refuse it and no way for the watcher to do anything
+    // but announce a truncated set or nothing at all.
     let mut prospective = load(workspace)?.grants;
     prospective.push(grant.clone());
-    let announce = crate::announce::announced_set(
+    crate::announce::announced_set(
         &prospective,
-        &signaling_now(workspace),
+        &crate::announce::widest(&prospective),
         &service.sandbox_capacity,
     )
     .map_err(|refusal| format!("{kind} cannot be announced: {refusal}"))?;
@@ -1022,7 +1025,7 @@ pub(crate) fn plan_enable(
         node_id,
         offered: Some(offered),
         grant,
-        announce,
+        capacity: service.sandbox_capacity.clone(),
     })
 }
 
@@ -1062,13 +1065,25 @@ pub(crate) fn commit_enable(
     plan: &EnablePlan,
 ) -> Result<u64, String> {
     let mut services = load(workspace)?;
-    let height = crate::announce::submit(base, &plan.announce)
-        .map_err(|error| format!("{} was not enabled: {error}", plan.kind))?;
     let position = services
         .grants
         .binary_search_by(|existing| existing.kind.as_str().cmp(&plan.kind))
         .unwrap_or_else(|position| position);
     services.grants.insert(position, plan.grant.clone());
+    // derived HERE, from the grants as they stand now — not carried down from
+    // the plan. A human may have sat on the consent prompt for a while, and
+    // another `enable` on this node could have landed in the meantime;
+    // announcing a set decided before that pause would retract it. Cannot be
+    // refused at this point: `plan_enable` bounded the widest set these grants
+    // can produce, and this is a subset of it.
+    let announce = crate::announce::announced_set(
+        &services.grants,
+        &signaling_now(workspace),
+        &plan.capacity,
+    )
+    .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))?;
+    let height = crate::announce::submit(base, &announce)
+        .map_err(|error| format!("{} was not enabled: {error}", plan.kind))?;
     save(workspace, &services).map_err(|error| {
         format!(
             "{} is ANNOUNCED at height {height} but its grant was not written, so nothing will \
@@ -1411,6 +1426,22 @@ fn note_skew(kind: &str, last: &mut Option<Skew>, now: Skew) {
     }
 }
 
+/// Keep signaling without a grant, and say why exactly once.
+///
+/// THE single exit for "this daemon cannot be enabled right now". Both halves
+/// of enabling — planning it and committing it — route here, because the rule
+/// is the same for both and a second copy is how one of them comes to exit the
+/// process instead.
+fn decline(kind: &str, hint: &str, reason: &str) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::warn!(
+        target: "ducktape::service",
+        kind = %kind,
+        reason = "enable_not_announced",
+        "{reason}"
+    );
+    write_err(hint)
+}
+
 /// Offer enablement once, at startup, per the posture the operator chose.
 fn offer_enable(
     workspace: &Path,
@@ -1428,13 +1459,23 @@ fn offer_enable(
         "  {} — enable it with: ducktape service enable {kind}\n",
         paint(YELLOW, "not enabled")
     );
-    let plan = match offer {
+    let planned = match offer {
         // a unit file and a pipe have no one to ask; say it once and serve.
         EnableOffer::Never => return write_err(&hint),
         EnableOffer::AskIfTty if !crate::tty::stdin_is_tty() => return write_err(&hint),
         EnableOffer::Always | EnableOffer::AskIfTty => {
-            plan_enable(workspace, kind, service, node_id)?
+            plan_enable(workspace, kind, service, node_id)
         }
+    };
+    // PLANNING can fail too, and it must not be fatal either — this is where
+    // the tag-legality and cap refusals live, so a host whose capability spec
+    // dir carries one registry-illegal tag would otherwise be unable to
+    // `service run` at all. It would exit here, BEFORE the heartbeat thread is
+    // spawned, and signal nothing: the operator loses the daemon, the hello,
+    // and the `service list` row that would have told them why.
+    let plan = match planned {
+        Ok(plan) => plan,
+        Err(error) => return decline(kind, &hint, &error),
     };
     let asked = matches!(offer, EnableOffer::AskIfTty);
     if asked {
@@ -1459,15 +1500,7 @@ fn offer_enable(
             paint(GREEN, ServiceState::Enabled.glyph()),
             plan.grant.display_id()
         )),
-        Err(error) => {
-            tracing::warn!(
-                target: "ducktape::service",
-                kind = %kind,
-                reason = "enable_not_announced",
-                "{error}"
-            );
-            write_err(&hint)
-        }
+        Err(error) => decline(kind, &hint, &error),
     }
 }
 
@@ -1561,7 +1594,11 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
         .http_listen
         .as_deref()
         .map(config::http_base_of)
-        .ok_or("this node serves no http surface, so `disable` cannot retract the announce")?;
+        .ok_or(
+            "this node serves no http surface, so `disable` cannot retract the announce. \
+             Revoking consent is a transaction now, so it needs a reachable node and a \
+             finalizing chain — a grant cannot be revoked while the node is down",
+        )?;
     let mut services = load(&workspace)?;
     let position = services
         .grants
@@ -2085,7 +2122,7 @@ mod tests {
             chain_id: "dukenet#03f6df3d".into(),
             node_id: NODE_A,
             grant: mint_grant("compute", NODE_A, &offered),
-            announce: crate::announce::AnnounceSet::default(),
+            capacity: Default::default(),
             offered: Some(offered),
         };
         let rendered = [
