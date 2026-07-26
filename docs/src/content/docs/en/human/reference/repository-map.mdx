@@ -39,8 +39,8 @@ shows what is built and tested.
 - `crates/system/governance`: validator-set governance over valset.
 - `crates/system/identity`: canonical accounts, member keys, display names, and
   node bindings.
-- `crates/system/duckdns`: optional `<handle>.duck` → AccountId naming, with
-  no node or service directory.
+- `crates/duckdns`: `<handle>.duck` → AccountId naming. A LIBRARY, not a
+  module — the `gateway` module embeds it and owns the on-chain half.
 - `crates/system/wireguard`: validator-set-backed WireGuard tunnel-upgrade
   protocol; `wireguard::effect` is the apply layer.
 - `crates/system/nat-traversal`, `reachability`, `data-plane`, `overlay-net`:
@@ -49,8 +49,8 @@ shows what is built and tested.
 - `crates/system/lifecycle`, `capability`, `dispatch`, and `tagging`: the
   module code registry, executor capabilities, capability-routed dispatch, and
   engagement routing.
-- `crates/system/blobstore`, `gateway`: node-local content-addressed blob
-  store and `.duck` gateway route state.
+- `crates/kernel/blobstore`: node-local content-addressed blob store, never in
+  any root. `crates/modules/system/gateway`: `.duck` gateway route state.
 - `crates/services/compute`: the dispatcher's host-side worker half
   (`compute-service`), off-chain and outside the module tree.
 - `crates/services/provider`: machine-local executor providers behind the

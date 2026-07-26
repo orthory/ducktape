@@ -8,7 +8,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 
 // Consensus rejects these handles — a seed that asks for one aborts the demo.
-// Mirrors RESERVED_ROOT_LABELS in crates/system/duckdns/src/wire.rs (the source
+// Mirrors RESERVED_ROOT_LABELS in crates/duckdns/src/wire.rs (the source
 // of truth); app/src/domain/duckdns-client.test.ts pins all three copies.
 const RESERVED_ROOT_LABELS = ["net", "agents"];
 

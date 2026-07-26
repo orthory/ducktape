@@ -77,11 +77,13 @@ potential future collisions). Bikeshed-level — finalize during execution.
   three ways: contract lib (stays standalone), client muscle (broker-host,
   done), lender serving (a future `crates/services/airlock` autonomous plug —
   the gateway binaries' logic moves there in its own servicization step).
-  Known placement debt, accepted deliberately: the contract lib (and
-  blobstore) still sit under crates/modules/system/, so "modules = onchain
-  only" is not yet literally true — relocate the contract lib together with
-  the airlock plug step, not before, to avoid moving it twice / squatting the
-  plug's name.
+  Placement debt — RESOLVED, no longer accepted. This paragraph used to defer
+  three crates that sat under crates/modules/system/ without being modules.
+  All three have moved: the airlock contract lib → `crates/airlock` (#818,
+  with the plug step as predicted), and `duckdns` → `crates/duckdns` +
+  `blobstore` → `crates/kernel/blobstore` in the follow-up. **`crates/modules/`
+  is now consensus modules only** — every crate under `system/` and `apps/`
+  implements `sdk::Module`, and that is the standing rule, not a snapshot.
 - **bin/node glue** — `cred_resolve.rs`, `cred_cli.rs`, `agent_cli.rs`. Keeping
   the gateway↔capability-host `CredentialKind` mapping in the node is a
   deliberate wall (it keeps capability-host free of consensus-module deps).
