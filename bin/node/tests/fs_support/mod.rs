@@ -54,9 +54,16 @@ impl Harness {
 
     /// a bare `ducktape fs` invocation (no `--node`) — for the resolution-error
     /// and stub-verb cases.
+    ///
+    /// `DUCKTAPE_HOME` points at this harness's own temp dir so the bottom rung
+    /// of the addressing ladder (the lone registered workspace) sees an EMPTY
+    /// registry. Without it the run reads the developer's real
+    /// `~/.ducktape/workspaces` and the outcome depends on whose box it is.
     pub fn cli_bare(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
-        cmd.arg("fs").args(args);
+        cmd.arg("fs")
+            .args(args)
+            .env("DUCKTAPE_HOME", self.dir.path());
         cmd
     }
 }

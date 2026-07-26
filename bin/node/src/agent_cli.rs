@@ -2,21 +2,26 @@
 //!
 //! Two verbs, one credential+targeting story:
 //!
-//! - `agent pty [<provider>] [--node <name>] [--cred <name>] [--cpu <n>] [--mem <gb>]`
+//! - `agent pty [<provider>] [--host-node <name>] [--cred <name>] [--cpu <n>] [--mem <gb>]`
 //!   attaches THIS terminal to a Podman-sandboxed provider running on a host
 //!   node (default: this node). The CLI talks ONLY to its own node's ws surface
 //!   (`/v1/ws`); the node does the cross-node mesh. Raw terminal mode + resize
 //!   forwarding make it feel like ssh.
-//! - `agent sched [<provider>] --cred <name> [--node <name>] [--cpu] [--mem] -- "<prompt>"`
+//! - `agent sched [<provider>] --cred <name> [--host-node <name>] [--cpu] [--mem] -- "<prompt>"`
 //!   submits a durable, node-pinned headless run (a `saga::SagaMsg::Trigger`)
 //!   and prints its run id. The target may be offline now and execute on
 //!   reconnect — that durability is the point.
 //!
 //! `<provider>` is optional when `--cred` names a credential: the registry
 //! record's kind decides what to launch; an explicit provider contradicting the
-//! cred is an error. `--node` resolves a display name → account → node key (or
-//! accepts a raw 64-hex node key), erroring with candidates when an account
-//! operates several nodes.
+//! cred is an error.
+//!
+//! TWO addressing inputs, deliberately two names. `--node`/`-n`/`DUCKTAPE_NODE`
+//! (the shared [`NodeAddr`] group) say which node this CLI DIALS — an http base.
+//! `--host-node` says which PEER runs the work: a display name → account → node
+//! key, or a raw 64-hex node key, erroring with candidates when an account
+//! operates several nodes. They are different types; spelling both `--node`
+//! is what made the flag mean two things.
 //!
 //! Program output stays `println!` (a CLI's stdout is not logging); the pty
 //! passthrough writes raw provider bytes straight to stdout.
@@ -26,23 +31,21 @@ use std::collections::BTreeMap;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
+use crate::cli_args::NodeAddr;
 use crate::config::{self, hex_bytes};
 use crate::cred_cli::{ProviderArg, query_node};
 
 type AgentResult = Result<(), Box<dyn std::error::Error>>;
 
-/// `ducktape agent <verb>`. `-n/--network` selects THIS operator's own node
-/// (the ws + query surface the CLI dials); it is global so it attaches in any
-/// position. The own node is also found from `DUCKTAPE_NODE` or the lone
-/// registered workspace.
+/// `ducktape agent <verb>`. The shared addressing group selects THIS operator's
+/// own node — the ws + query surface the CLI dials, never the host the work runs
+/// on (that is `--host-node`).
 #[derive(Debug, clap::Args)]
 pub(crate) struct AgentArgs {
     #[command(subcommand)]
     cmd: AgentCmd,
-    /// this operator's own node: a registered workspace chain id (else
-    /// `DUCKTAPE_NODE`, else the single registered workspace)
-    #[arg(short = 'n', long = "network", value_name = "CHAIN-ID", global = true)]
-    network: Option<String>,
+    #[command(flatten)]
+    addr: NodeAddr,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -57,10 +60,10 @@ pub(crate) enum AgentCmd {
 pub(crate) struct PtyArgs {
     /// provider to launch (`claude`|`codex`); optional when `--cred` names one
     provider: Option<ProviderArg>,
-    /// host node to run on: a display name or a raw 64-hex node key
-    /// (omitted = this node)
-    #[arg(long, value_name = "NAME")]
-    node: Option<String>,
+    /// host node to RUN on: a display name or a raw 64-hex node key
+    /// (omitted = this node). NOT `--node`, which is the http base this CLI dials.
+    #[arg(long = "host-node", value_name = "NAME")]
+    host_node: Option<String>,
     /// credential name to serve the session (required for a cross-node host)
     #[arg(long, value_name = "NAME")]
     cred: Option<String>,
@@ -79,10 +82,10 @@ pub(crate) struct SchedArgs {
     /// credential name (required: a headless guest run must bring a credential)
     #[arg(long, value_name = "NAME")]
     cred: String,
-    /// node to pin the run to: a display name or a raw 64-hex node key
-    /// (omitted = this node)
-    #[arg(long, value_name = "NAME")]
-    node: Option<String>,
+    /// node to PIN the run to: a display name or a raw 64-hex node key
+    /// (omitted = this node). NOT `--node`, which is the http base this CLI dials.
+    #[arg(long = "host-node", value_name = "NAME")]
+    host_node: Option<String>,
     /// cpu-cores demand
     #[arg(long, value_name = "CORES")]
     cpu: Option<u64>,
@@ -95,10 +98,11 @@ pub(crate) struct SchedArgs {
 }
 
 pub(crate) fn run(args: AgentArgs) -> AgentResult {
-    let AgentArgs { cmd, network } = args;
+    let AgentArgs { cmd, addr } = args;
+    let base = addr.resolve()?;
     match cmd {
-        AgentCmd::Pty(pty) => cmd_pty(pty, network.as_deref()),
-        AgentCmd::Sched(sched) => cmd_sched(sched, network.as_deref()),
+        AgentCmd::Pty(pty) => cmd_pty(pty, &base),
+        AgentCmd::Sched(sched) => cmd_sched(sched, &base),
     }
 }
 
@@ -106,16 +110,15 @@ pub(crate) fn run(args: AgentArgs) -> AgentResult {
 // pty — create the session, then attach this terminal in raw mode
 // ============================================================================
 
-fn cmd_pty(args: PtyArgs, network: Option<&str>) -> AgentResult {
-    let base = own_node_base(network)?;
-    let provider = resolve_provider(&base, args.provider, args.cred.as_deref())?;
-    let host_hex = match args.node.as_deref() {
-        Some(name) => Some(hex_bytes(&resolve_host_node(&base, name)?)),
+fn cmd_pty(args: PtyArgs, base: &str) -> AgentResult {
+    let provider = resolve_provider(base, args.provider, args.cred.as_deref())?;
+    let host_hex = match args.host_node.as_deref() {
+        Some(name) => Some(hex_bytes(&resolve_host_node(base, name)?)),
         None => None,
     };
 
     let created = create_session(
-        &base,
+        base,
         provider.token(),
         host_hex.as_deref(),
         args.cred.as_deref(),
@@ -131,7 +134,7 @@ fn cmd_pty(args: PtyArgs, network: Option<&str>) -> AgentResult {
         .enable_all()
         .build()
         .map_err(|e| format!("attach runtime: {e}"))?;
-    let outcome = runtime.block_on(attach(&base, &created.session_id, &created.topic));
+    let outcome = runtime.block_on(attach(base, &created.session_id, &created.topic));
     // `shutdown_background`, NOT drop: the attach loop's stdin forwarder reads
     // `tokio::io::stdin()`, which parks a BLOCKING thread on `read(0)`. On a real
     // tty that read never returns, and `abort()` cannot interrupt an OS-level
@@ -143,7 +146,7 @@ fn cmd_pty(args: PtyArgs, network: Option<&str>) -> AgentResult {
 
     // Best-effort close (idempotent host-side; the 4 h wall-clock + kill-on-drop
     // are the backstops if it never lands).
-    let _ = close_session(&base, &created.session_id);
+    let _ = close_session(base, &created.session_id);
     outcome
 }
 
@@ -317,16 +320,15 @@ fn window_size(fd: i32) -> (u16, u16) {
 // sched — a node-pinned durable saga trigger
 // ============================================================================
 
-fn cmd_sched(args: SchedArgs, network: Option<&str>) -> AgentResult {
-    let base = own_node_base(network)?;
-    let provider = resolve_provider(&base, args.provider, Some(&args.cred))?;
+fn cmd_sched(args: SchedArgs, base: &str) -> AgentResult {
+    let provider = resolve_provider(base, args.provider, Some(&args.cred))?;
     let tag = provider.token();
 
-    let target = match args.node.as_deref() {
-        Some(name) => resolve_host_node(&base, name)?.to_vec(),
-        None => own_node_key(&base)?,
+    let target = match args.host_node.as_deref() {
+        Some(name) => resolve_host_node(base, name)?.to_vec(),
+        None => own_node_key(base)?,
     };
-    preflight_provider(&base, &target, tag)?;
+    preflight_provider(base, &target, tag)?;
 
     let dispatch_id = fresh_dispatch_id();
     let saga_id = format!("sched\u{1f}{dispatch_id}");
@@ -363,7 +365,7 @@ fn cmd_sched(args: SchedArgs, network: Option<&str>) -> AgentResult {
         pinned_assignee: Some(target),
     };
 
-    submit(&base, "saga", serde_json::to_value(&trigger)?)?;
+    submit(base, "saga", serde_json::to_value(&trigger)?)?;
     println!("{saga_id}");
     Ok(())
 }
@@ -420,43 +422,6 @@ fn fresh_dispatch_id() -> String {
 // shared resolution
 // ============================================================================
 
-/// The operator's own-node http base: an explicit `-n/--network` wins, then
-/// `DUCKTAPE_NODE`, then the single registered workspace.
-fn own_node_base(network: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
-    if let Some(needle) = network.filter(|n| !n.is_empty()) {
-        return http_of_workspace(needle);
-    }
-    if let Ok(url) = std::env::var("DUCKTAPE_NODE")
-        && !url.is_empty()
-    {
-        return Ok(url.trim_end_matches('/').to_string());
-    }
-    let mut workspaces = config::list_workspaces()?;
-    match workspaces.len() {
-        1 => {
-            let (chain_id, _path) = workspaces.swap_remove(0);
-            http_of_workspace(&chain_id)
-        }
-        0 => Err("no workspace selected: pass -n/--network <id> or set DUCKTAPE_NODE".into()),
-        _ => {
-            let list = workspaces
-                .iter()
-                .map(|(chain_id, _)| format!("  {chain_id}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Err(format!("several workspaces registered — pick one with -n:\n{list}").into())
-        }
-    }
-}
-
-fn http_of_workspace(needle: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let (_dir, http) = config::resolve_network(needle)?;
-    http.map(|base| base.trim_end_matches('/').to_string())
-        .ok_or_else(|| {
-            format!("workspace {needle:?} has no http listen — its node.toml sets no http_listen")
-                .into()
-        })
-}
 
 /// This node's own 32-byte mesh key, from `/v1/status`'s `public_key`.
 fn own_node_key(base: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {

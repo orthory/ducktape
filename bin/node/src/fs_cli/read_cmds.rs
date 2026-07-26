@@ -1,7 +1,8 @@
 //! the read verbs: ls / cat / stat / history / diff. thin veneers over the
 //! `NodeApi` transport with stable line-oriented output (tab-separated, so a
-//! script can `cut`/`grep` it). every verb resolves the node address the same
-//! way (`--node` or `DUCKTAPE_NODE`) and streams paged reads to completion.
+//! script can `cut`/`grep` it). every verb resolves the node address through the
+//! one shared [`crate::cli_args::NodeAddr`] ladder and streams paged reads to
+//! completion.
 
 use std::io::Write as _;
 

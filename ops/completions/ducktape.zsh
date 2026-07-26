@@ -25,7 +25,7 @@ _ducktape() {
     local service_verbs=(run list enable disable status help)
     local service_flags=(--config --workspace -n --network --json --yes -y --enable --no-enable)
     local agent_verbs=(pty sched help)
-    local agent_flags=(-n --network --node --cred --cpu --mem)
+    local agent_flags=(-n --network --node --host-node --cred --cpu --mem)
 
     if (( CURRENT == 2 )); then
         compadd -- $families
