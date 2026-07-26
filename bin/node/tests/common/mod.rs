@@ -350,14 +350,15 @@ impl NetworkShapeCluster {
     /// keep node `idx`'s `<kind>` hello alive — a service daemon's ENTIRE
     /// contribution to the capability-announce lane, without the daemon.
     ///
-    /// The daemon PROCESS is deliberately not spawned: `ducktape service run
-    /// compute` resolves its sandbox backend and `probe()`s it BEFORE its
-    /// first hello, so on a host with no `[sandbox]` table in node.toml (no
-    /// generated test config writes one) or without podman + pasta + nft on
-    /// PATH it FATALs before signaling anything. A spawned daemon would die
-    /// before the lane under test is reached and the test would assert
-    /// nothing. What it contributes to `grant ∩ live hello` is exactly this
-    /// POST, refreshed inside [`noded::services::HELLO_TTL`].
+    /// The daemon PROCESS is deliberately not spawned, and that is a SCOPING
+    /// choice, not a limitation of the host: a daemon's entire contribution to
+    /// the announce lane is this POST, so booting a container runtime to prove
+    /// capability announcement buys no extra signal and couples this lane to
+    /// podman's availability and startup cost. What a real daemon would
+    /// additionally prove — that a REAL hello carries the shape this lane
+    /// expects — is a daemon-fixture concern, and it belongs in the dispatch
+    /// e2e (#826), which owns the `[sandbox]` fixture, the portable-podman
+    /// PATH, and the libpod pull-on-404 fix that lane actually needs.
     ///
     /// The FIRST hello is synchronous and asserted — that IS the readiness
     /// event; the refresh then rides a heartbeat thread like the daemon's.

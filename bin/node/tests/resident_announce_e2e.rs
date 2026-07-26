@@ -10,12 +10,12 @@
 //! The offered half is a real `POST /v1/services/hello` against the resident's
 //! own app surface, refreshed on a heartbeat — a service daemon's entire
 //! contribution to THIS lane. The daemon PROCESS is deliberately not spawned:
-//! `ducktape service run compute` resolves and `probe()`s its sandbox backend
-//! before its first hello, so with no `[sandbox]` table in node.toml (no
-//! generated test config writes one) and no podman + pasta + nft on PATH it
-//! FATALs before signaling — a spawned daemon dies before this lane is
-//! reached. The dispatch-EXECUTION leg this file used to carry moved into that
-//! daemon with it and has no runnable home until the sandbox harness gains one.
+//! an announce test that boots a container runtime pays podman's availability
+//! and startup cost for no extra signal. What a real daemon would additionally
+//! prove — that a REAL hello carries the shape this lane expects — belongs in
+//! the dispatch e2e (#826), which owns the `[sandbox]` fixture and the runtime
+//! plumbing. The dispatch-EXECUTION leg this file used to carry moved into the
+//! daemon with #816/#817 and lives there now.
 //!
 //! run alone (cluster e2es flake under parallel load):
 //!   cargo test -p node-bin --test resident_announce_e2e -- --nocapture --test-threads=1
