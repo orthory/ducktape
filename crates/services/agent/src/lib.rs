@@ -517,7 +517,6 @@ pub fn credential_wire(resolved: &ResolvedCredential) -> wire::Credential {
         authority: resolved.authority.clone(),
         via: resolved.via.clone(),
         seal_pk: resolved.seal_pk,
-        account: resolved.account.clone(),
     }
 }
 
@@ -533,7 +532,6 @@ fn airlock_config(credential: wire::Credential) -> AirlockConfig {
         authority: credential.authority,
         via: credential.via,
         seal_pk: credential.seal_pk,
-        account: credential.account,
     })
 }
 
@@ -583,7 +581,6 @@ mod tests {
                 authority: "a".into(),
                 via: "http://v".into(),
                 seal_pk: [7u8; 32],
-                account: vec![1, 2, 3],
             };
             let expected_config = AirlockConfig::self_host(&resolved);
             let built = airlock_config(wire::Credential {
@@ -592,7 +589,6 @@ mod tests {
                 authority: "a".into(),
                 via: "http://v".into(),
                 seal_pk: [7u8; 32],
-                account: vec![1, 2, 3],
             });
             assert_eq!(built, expected_config);
         }

@@ -99,8 +99,12 @@ struct AppState {
     /// The named credential store, keyed by credential name (== session `sub`).
     /// Seeded at build and/or filled by sealed `/credential` uploads.
     creds: Mutex<HashMap<String, Arc<CredEntry>>>,
-    /// Remaining request budget per session `sub` (credential name). Refilled by
-    /// asking for a new /session; the overlay ACL gates who may reach it.
+    /// Remaining request budget per session `sub` (credential NAME), refilled by
+    /// every `/session` open. Deliberately named for what it is: a per-credential
+    /// throttle shared by all of that credential's borrowers, NOT a per-session
+    /// cap and NOT an authorization boundary — reopening a session refills it.
+    /// The boundary is [`AppState::grant_check`], which decides who may open a
+    /// session at all.
     budgets: Mutex<HashMap<String, u32>>,
     /// Per-name sealed-request nonces already served — replay dedupe. Bounded
     /// by the request budget per name; dies with the process like every key.
@@ -142,11 +146,19 @@ pub enum GrantAnswer {
 }
 
 /// The co-hosted-lending grant gate, injected by the node. Given a credential
-/// `name` and the account the session claims to act on behalf of, it answers
-/// whether that account may draw on the credential — the node resolves this
-/// against its own COMMITTED gateway-module record (owner or a granted account).
-/// `None` on gateways that never lend (owner-local, TEE): the claimed account is
-/// then unread. See [`GrantAnswer`] for what each answer costs the borrower.
+/// `name` and the account the session acts on behalf of, it answers whether that
+/// account may draw on the credential — the node resolves this against its own
+/// COMMITTED gateway-module record (owner or a granted account).
+///
+/// The account handed here is ALWAYS the one the node's proxy vouched for in
+/// [`CALLER_ACCOUNT_HEADER`]. There is no other source, and there must not be
+/// one: the record's `owner_account` is a public field of the very record a
+/// borrower must read to learn `seal_pk`, so a gate keyed on anything the
+/// request could carry admits everyone who can read the chain. See
+/// [`session_gate`].
+///
+/// `None` on gateways that never lend (owner-local, TEE): there is no subject to
+/// check. See [`GrantAnswer`] for what each answer costs the borrower.
 pub type GrantCheck =
     Arc<dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = GrantAnswer> + Send>> + Send + Sync>;
 
@@ -156,6 +168,38 @@ pub type GrantCheck =
 /// handler calls it on a name miss. `None` on gateways with no backing store.
 pub type ReloadCredential =
     Arc<dyn Fn(&str) -> Option<(CredentialKind, CredentialPayload)> + Send + Sync>;
+
+/// Whether this gateway serves `POST /credential`.
+///
+/// ONE discriminant, decided at build time by which build path ran, because the
+/// two answers come from genuinely different topologies:
+///
+/// - [`Self::Accepted`] — the ATTESTED build. An enclave has no other way to
+///   receive a credential: there is a real host-vs-enclave boundary and the
+///   upload is the only thing that crosses it. Its listener is the CVM's own,
+///   not something a network member is routed to.
+/// - [`Self::Refused`] — the SELF-HOST lender. Its credentials come from the
+///   operator's own disk store (`ducktape user cred add`), which the lazy
+///   [`ReloadCredential`] picks up without a restart, so nothing legitimate ever
+///   posts here. Its router, by contrast, IS reachable by any admitted network
+///   member through the owner's signed `airlock` gateway route — and sealing is
+///   not authentication, since the seal public key is on chain and served at
+///   `/attestation`. An open upload endpoint there is a way for any member to
+///   overwrite a lender's credential with an attacker-chosen bearer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialUploads {
+    Accepted,
+    Refused,
+}
+
+/// The unforgeable half of a session request.
+///
+/// The node's gateway proxy mints `x-duck-caller-account` from the mesh-verified
+/// WireGuard peer identity (`bin/node/src/gateway_plane.rs`), and the proxy's own
+/// decode REFUSES a caller-supplied `x-duck-*`, so a borrower cannot write it.
+/// Everything else on a [`SessionRequest`] is chosen by whoever composed the
+/// JSON.
+pub const CALLER_ACCOUNT_HEADER: &str = "x-duck-caller-account";
 
 /// Build the gateway router and report the vendor ("tdx"/"snp"/"self-host").
 pub fn build(cfg: GatewayConfig) -> Result<(Router, String)> {
@@ -238,7 +282,18 @@ fn build_with_quoter_gated(
 
     let report_data = attest::make_report_data(&seal_kp.public_bytes(), &sess_pk.to_bytes());
     let quote = quoter(&report_data)?;
-    assemble(cfg, vendor.to_string(), quote, seal_kp, sess_sk, sess_pk, seeds, grant_check, None)
+    assemble(Assembly {
+        cfg,
+        vendor: vendor.to_string(),
+        quote,
+        seal_kp,
+        sess_sk,
+        sess_pk,
+        seeds,
+        grant_check,
+        reload: None,
+        uploads: CredentialUploads::Accepted,
+    })
 }
 
 /// Non-TEE build: no quote, vendor "self-host". The broker pins the seal_pk from
@@ -252,14 +307,22 @@ fn build_self_host(
     let seal_kp = cfg.seal_keypair.take().unwrap_or_else(SealKeypair::generate);
     let sess_sk = SigningKey::generate(&mut OsRng);
     let sess_pk = sess_sk.verifying_key();
-    assemble(cfg, "self-host".to_string(), Vec::new(), seal_kp, sess_sk, sess_pk, seeds, grant_check, reload)
+    assemble(Assembly {
+        cfg,
+        vendor: "self-host".to_string(),
+        quote: Vec::new(),
+        seal_kp,
+        sess_sk,
+        sess_pk,
+        seeds,
+        grant_check,
+        reload,
+        uploads: CredentialUploads::Refused,
+    })
 }
 
-/// Shared assembly: build the named store from the seeds, wire the state and the
-/// router. The two build paths differ only in vendor/quote/keys, all resolved
-/// before this point.
-#[allow(clippy::too_many_arguments)]
-fn assemble(
+/// Everything [`assemble`] needs, already resolved by whichever build path ran.
+struct Assembly {
     cfg: GatewayConfig,
     vendor: String,
     quote: Vec<u8>,
@@ -269,7 +332,25 @@ fn assemble(
     seeds: Vec<(String, CredentialKind, CredentialPayload)>,
     grant_check: Option<GrantCheck>,
     reload: Option<ReloadCredential>,
-) -> Result<(Router, String)> {
+    uploads: CredentialUploads,
+}
+
+/// Shared assembly: build the named store from the seeds, wire the state and the
+/// router. The two build paths differ only in vendor/quote/keys and whether they
+/// serve `/credential`, all resolved before this point.
+fn assemble(assembly: Assembly) -> Result<(Router, String)> {
+    let Assembly {
+        cfg,
+        vendor,
+        quote,
+        seal_kp,
+        sess_sk,
+        sess_pk,
+        seeds,
+        grant_check,
+        reload,
+        uploads,
+    } = assembly;
     let mut creds = HashMap::new();
     for (name, kind, payload) in seeds {
         creds.insert(name, Arc::new(cred_entry(kind, payload)?));
@@ -299,13 +380,18 @@ fn assemble(
 
     let app = Router::new()
         .route("/attestation", get(attestation))
-        .route("/credential", post(credential))
         .route("/session", post(session))
         // Proxy the whole /v1/* surface (Claude Code calls /v1/messages and
         // /v1/messages/count_tokens, not just messages).
-        .route("/v1/{*rest}", any(proxy))
-        .with_state(state);
-    Ok((app, vendor))
+        .route("/v1/{*rest}", any(proxy));
+    // NOT mounted-then-guarded: a route that exists and refuses is one bad
+    // refactor away from a route that exists and accepts. See
+    // [`CredentialUploads`] for why only the attested build has one.
+    let app = match uploads {
+        CredentialUploads::Accepted => app.route("/credential", post(credential)),
+        CredentialUploads::Refused => app,
+    };
+    Ok((app.with_state(state), vendor))
 }
 
 /// Turn a seed/upload payload into a [`CredEntry`]. A `Bearer` is static
@@ -439,19 +525,63 @@ async fn credential(
     Ok(StatusCode::OK)
 }
 
-/// Run the injected grant gate for one session request: the claimed account must
-/// be present and base64-decodable, and the node's lookup must admit it. A
-/// missing or malformed claimed account is a refusal, never a bypass — and a
-/// REFUSAL, not [`GrantAnswer::Undetermined`]: this gateway decided it on the
-/// request alone, without needing its authority.
-async fn grant_answer(check: &GrantCheck, req: &SessionRequest) -> GrantAnswer {
-    let Some(account_b64) = &req.account_b64 else {
-        return GrantAnswer::Refused;
+/// The account the TRANSPORT vouched for, or `None` when nothing did.
+///
+/// This is the whole of the identity input, and a session request contributes
+/// nothing to it: the node's gateway proxy mints [`CALLER_ACCOUNT_HEADER`] from
+/// the mesh-verified WireGuard peer and refuses a caller-supplied copy at its own
+/// decode, so it is the one field on the request that its sender cannot choose.
+fn vouched_caller(headers: &HeaderMap) -> Option<Vec<u8>> {
+    headers
+        .get(CALLER_ACCOUNT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|encoded| hex::decode(encoded).ok())
+}
+
+/// What a `/session` request is answered with. FOUR outcomes: the grant answer
+/// is only reachable once the transport has vouched for a caller, and "nobody
+/// vouched for you" is a refusal an operator acts on differently from a missing
+/// grant. Every one is a stable snake_case token, and none echoes back the value
+/// that would have been accepted.
+enum SessionGate {
+    Open,
+    CallerUnverified,
+    NotGranted,
+    AuthorityUnavailable,
+}
+
+/// Decide whether one session may open. Pure decision: it reads state and the
+/// injected authority, and writes nothing.
+///
+/// Co-hosted lending: when a grant gate is wired, the caller must be one the
+/// node's proxy VOUCHED for, and that account must be the owner or a grantee of
+/// the on-chain record. Both before any handshake work — a session for an
+/// ungranted account never opens.
+///
+/// The subject is the account of the node that made the hop, which is the node
+/// running the sandbox. That is the only subject this flow can express: the
+/// session token the sandbox ends up holding names a credential and nothing
+/// about who is acting, so a lender granting an account is lending to that
+/// account's NODE, for whatever workload it runs.
+///
+/// With no gate wired (owner-local, TEE) this gateway lends to nobody across
+/// accounts, so there is no subject to check.
+async fn session_gate(
+    grant_check: &Option<GrantCheck>,
+    headers: &HeaderMap,
+    req: &SessionRequest,
+) -> SessionGate {
+    let Some(check) = grant_check else {
+        return SessionGate::Open;
     };
-    let Ok(account) = BASE64.decode(account_b64) else {
-        return GrantAnswer::Refused;
+    let Some(account) = vouched_caller(headers) else {
+        return SessionGate::CallerUnverified;
     };
-    check(req.sub.clone(), account).await
+    match check(req.sub.clone(), account).await {
+        GrantAnswer::Granted => SessionGate::Open,
+        GrantAnswer::Refused => SessionGate::NotGranted,
+        GrantAnswer::Undetermined => SessionGate::AuthorityUnavailable,
+    }
 }
 
 /// Consult the lazy store loader for `name` and adopt whatever it hands back.
@@ -479,6 +609,7 @@ fn refresh_credential(st: &AppState, name: &str) {
 
 async fn session(
     State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<SessionRequest>,
 ) -> Result<Json<SessionResponse>, AppErr> {
     // A session names the credential it draws on. The store loader gets first
@@ -491,25 +622,23 @@ async fn session(
     if !known_credential {
         return Err(AppErr(StatusCode::NOT_FOUND, "credential_not_found".into()));
     }
-    // Co-hosted lending: when a grant gate is wired, the session's claimed account
-    // must be the owner or a granted account of the on-chain record. Refuse before
-    // any handshake work — a session for an ungranted account never opens.
-    //
-    // Three answers, three statuses. A 403 sends the borrower's operator to go
-    // get a grant, so an authority we could not REACH must never wear one: that
-    // is a 503 naming the lender's node, which the borrower retries.
-    if let Some(check) = &st.grant_check {
-        match grant_answer(check, &req).await {
-            GrantAnswer::Granted => {}
-            GrantAnswer::Refused => {
-                return Err(AppErr(StatusCode::FORBIDDEN, "credential_not_granted".into()));
-            }
-            GrantAnswer::Undetermined => {
-                return Err(AppErr(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "grant_authority_unavailable".into(),
-                ));
-            }
+    // The one visible dispatch for "may this session open at all". Five answers,
+    // and each names its OWN closed door: a 403 sends the borrower's operator to
+    // go get a grant, so neither an authority we could not REACH nor a caller the
+    // transport never vouched for may wear that one.
+    match session_gate(&st.grant_check, &headers, &req).await {
+        SessionGate::Open => {}
+        SessionGate::CallerUnverified => {
+            return Err(AppErr(StatusCode::FORBIDDEN, "caller_account_unverified".into()));
+        }
+        SessionGate::NotGranted => {
+            return Err(AppErr(StatusCode::FORBIDDEN, "credential_not_granted".into()));
+        }
+        SessionGate::AuthorityUnavailable => {
+            return Err(AppErr(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "grant_authority_unavailable".into(),
+            ));
         }
     }
     // Enclave side of the handshake: derive the shared key from the client's
@@ -527,7 +656,6 @@ async fn session(
         sub: req.sub.clone(),
         iat: now,
         exp: now + st.cfg.session_ttl_secs,
-        max_requests: st.cfg.max_requests,
         eph: req.client_eph_pk_b64.clone(),
         seal: req.body_seal,
     };

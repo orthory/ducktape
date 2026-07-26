@@ -405,6 +405,25 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
         query_credential(&cluster, 1, "owner-claude-1")
     });
 
+    // BEFORE the grant: the real lender refuses this node, and the grant is the
+    // only thing that will change that. Cheap on purpose — this lane needs no
+    // sandbox, so the property stays provable on a host that cannot run one.
+    let record_ungranted = query_credential(&cluster, 1, "owner-claude-1").expect("record");
+    let (status, browser) = cluster.http(1, "GET", "/v1/gateway/browser", None);
+    assert_eq!(status, 200, "browser base failed: {browser}");
+    let via_pre = browser["base"].as_str().unwrap().to_string();
+    let refused_before_grant = rt.block_on(async {
+        AirlockClient::remote("airlock.owner.duck".into(), via_pre)
+            .open_session(&record_ungranted.seal_pk, "owner-claude-1")
+            .await
+    });
+    let refused_before_grant =
+        refused_before_grant.expect_err("an ungranted node must not open a session");
+    assert!(
+        format!("{refused_before_grant}").contains("credential_not_granted"),
+        "and it is the GRANT that is missing, named as such: {refused_before_grant}"
+    );
+
     let compute_account = compute.public_key().as_ref().to_vec();
     cluster.submit(
         0,
@@ -436,8 +455,11 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     // Every hop is remote (compute -> overlay -> owner -> loopback upstream).
     let reply = rt.block_on(async {
         let gw = AirlockClient::remote("airlock.owner.duck".into(), via.clone());
+        // No account is named, and none CAN be: the client has no such call. The
+        // subject is whatever the owner's node stamped on the hop, which for this
+        // request is the compute node's own account — the one just granted.
         let token = gw
-            .open_session_as(&record.seal_pk, "owner-claude-1", &compute_account)
+            .open_session(&record.seal_pk, "owner-claude-1")
             .await
             .expect("granted session opens over the overlay");
         let resp = gw
@@ -458,18 +480,38 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
         "the lent credential's reply must return over the overlay: {reply:?}"
     );
 
-    // NEGATIVE: a fresh, UNGRANTED account is refused at the owner's own gateway,
-    // before any credentialed request — the account is what's gated. Two nodes
-    // suffice; the stranger keypair is bound to no node and granted nothing.
-    let stranger = ed25519::PrivateKey::from_seed(9_999);
-    let stranger_account = stranger.public_key().as_ref().to_vec();
-    let refused = rt.block_on(async {
-        let gw = AirlockClient::remote("airlock.owner.duck".into(), via);
-        gw.open_session_as(&record.seal_pk, "owner-claude-1", &stranger_account)
-            .await
+    // NEGATIVE, and note what it is NOT. There is no longer a test here for
+    // "claim somebody else's account", because there is no longer a way to claim
+    // one: `SessionRequest` carries no account and `Gateway` exposes no call that
+    // takes one, so the credential-theft shape is refused by the type system
+    // rather than at runtime. The account the lender authorizes is the one its
+    // own node stamps on the hop.
+    //
+    // The runtime half — an ungranted node is refused by the real lender — ran
+    // above, before the grant committed, in this same lane and with no sandbox.
+    // What needs a submitter DISTINCT from the executor, and therefore podman,
+    // is the delegated shape:
+    // `sched_pinned_run::a_delegated_run_draws_as_the_executing_node_not_the_submitter`.
+
+    // And the lender serves no credential UPLOAD: its store is written by
+    // `ducktape user cred add` on the owner's own disk. Sealing is not
+    // authentication — `seal_pk` is on chain and served at `/attestation` — so a
+    // route here would let any member replace the lent credential with their own
+    // bearer, over exactly this overlay hop.
+    let upload = rt.block_on(async {
+        let gw = AirlockClient::remote("airlock.owner.duck".into(), via.clone());
+        gw.upload_sealed_credential(
+            &record.seal_pk,
+            "owner-claude-1",
+            airlock::wire::CredentialKind::Claude,
+            &airlock::wire::CredentialPayload::Bearer {
+                access_token: "ATTACKER-OWNS-THIS".into(),
+            },
+        )
+        .await
     });
     assert!(
-        refused.is_err(),
-        "an ungranted account must be refused at session open, not proxied: {refused:?}"
+        upload.is_err(),
+        "the lender must not serve a credential upload to the network: {upload:?}"
     );
 }

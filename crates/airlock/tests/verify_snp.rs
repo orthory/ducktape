@@ -87,6 +87,48 @@ async fn milan_report_is_rejected_under_genoa_roots() {
     assert!(err.is_err());
 }
 
+/// The SNP twin of the TDX debug gate, and the one that was genuinely open: the
+/// `sev` crate's chain/report verify reads neither `policy` nor `vmpl`, so a
+/// debug-allowed guest booting the AUDITED image produced a report that chained
+/// to real AMD silicon, matched the pinned measurement, and handed the host the
+/// guest's register state.
+///
+/// Both fields sit inside the signed region, so mutating the report BYTES would
+/// break the signature and this test would go green on the wrong refusal. The
+/// real AMD-signed fixture is decoded first and mutated after, so only the gate
+/// itself can refuse the mutated cases.
+#[test]
+fn a_debug_or_non_vmpl0_snp_report_is_refused_although_the_honest_fixture_is_not() {
+    use airlock::verify::accept_snp_report;
+    use sev::firmware::guest::AttestationReport;
+    use sev::parser::Decoder;
+
+    let report = AttestationReport::decode(&mut &MILAN_REPORT[..], ()).unwrap();
+    // The honest fixture: real AMD-signed, policy DEBUG clear, VMPL 0.
+    assert!(
+        accept_snp_report(&report, &milan_measurement()).is_ok(),
+        "the real AMD fixture must not be caught by these gates"
+    );
+    assert!(!report.policy.debug_allowed(), "the fixture starts non-debug");
+    assert_eq!(report.vmpl, 0, "the fixture starts at VMPL 0");
+
+    let mut debuggable = report;
+    debuggable.policy.set_debug_allowed(true);
+    let refused = accept_snp_report(&debuggable, &milan_measurement()).unwrap_err();
+    assert!(
+        refused.to_string().contains("DEBUG"),
+        "a debug-allowed guest must be refused for THAT: {refused}"
+    );
+
+    let mut nested = report;
+    nested.vmpl = 1;
+    let refused = accept_snp_report(&nested, &milan_measurement()).unwrap_err();
+    assert!(
+        refused.to_string().contains("VMPL"),
+        "a report from VMPL != 0 describes other code, and must say so: {refused}"
+    );
+}
+
 #[tokio::test]
 async fn tampered_real_report_is_rejected() {
     let mut quote = MILAN_REPORT.to_vec();

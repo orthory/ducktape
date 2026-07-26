@@ -38,6 +38,31 @@ pub enum SessionResponseFault {
     TokenWouldNotOpen,
 }
 
+/// The gateway ANSWERED and refused, carrying its own stable reason token as the
+/// body.
+///
+/// Tagged onto the error the same way [`SessionResponseFault`] is, and for the
+/// same reason: `error_for_status` throws the body away, and a bare 403 cannot
+/// tell "your grant is missing" from "you claimed an account the transport did
+/// not vouch for" — two refusals whose operator actions have nothing in common.
+/// The token is the gateway's own; this type only carries it across the
+/// boundary and never invents one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRefusedBy {
+    pub status: u16,
+    /// the response body verbatim. A snake_case token from this crate's own
+    /// gateway; free prose from anything else in the path (a node's proxy).
+    pub reason: String,
+}
+
+impl std::fmt::Display for SessionRefusedBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the gateway refused the session ({}): {}", self.status, self.reason)
+    }
+}
+
+impl std::error::Error for SessionRefusedBy {}
+
 impl std::fmt::Display for SessionResponseFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -104,48 +129,25 @@ impl Gateway {
     /// Run the session-key handshake against an ALREADY-VERIFIED `seal_pk` and
     /// return the scoped session token. ECDHs the attested key, so the token can
     /// only be opened by this client — a relaying node cannot read it.
+    ///
+    /// There is no "as this account" variant, and there must not be one: on a
+    /// lending gateway the grant subject is the account the node's proxy vouched
+    /// for on the hop, and a caller that could name its own subject is the
+    /// credential-theft defect.
     pub async fn open_session(&self, seal_pk: &[u8; 32], sub: &str) -> Result<String> {
-        let (token, _keys) = self.open_session_with(seal_pk, sub, false, None).await?;
-        Ok(token)
-    }
-
-    /// Open a session that CLAIMS to act on behalf of `account` — the grant
-    /// subject a co-hosted lending gateway checks against its on-chain credential
-    /// record. Refused (`credential_not_granted`) if the account is neither the
-    /// owner nor a grantee.
-    pub async fn open_session_as(
-        &self,
-        seal_pk: &[u8; 32],
-        sub: &str,
-        account: &[u8],
-    ) -> Result<String> {
-        let (token, _keys) = self.open_session_with(seal_pk, sub, false, Some(account)).await?;
+        let (token, _keys) = self.open_session_with(seal_pk, sub, false).await?;
         Ok(token)
     }
 
     /// Sealed-body session: bodies must be AEAD'd under the returned keys
-    /// (`bodyseal`); the enclave refuses plaintext on this token.
+    /// (`bodyseal`); the enclave refuses plaintext on this token. What the
+    /// production broker opens on every self-host path.
     pub async fn open_session_sealed(
         &self,
         seal_pk: &[u8; 32],
         sub: &str,
     ) -> Result<(String, handshake::SessionKeys)> {
-        self.open_session_with(seal_pk, sub, true, None).await
-    }
-
-    /// Sealed-body session that ALSO claims to act on behalf of `account` — the
-    /// grant subject a co-hosted lending gateway checks against its on-chain
-    /// credential record (see [`Self::open_session_as`]), but body-sealed. The
-    /// production broker uses this on the self-host path so the owner's gateway
-    /// learns which account is drawing on the credential; refused
-    /// (`credential_not_granted`) if the account is neither owner nor grantee.
-    pub async fn open_session_sealed_as(
-        &self,
-        seal_pk: &[u8; 32],
-        sub: &str,
-        account: &[u8],
-    ) -> Result<(String, handshake::SessionKeys)> {
-        self.open_session_with(seal_pk, sub, true, Some(account)).await
+        self.open_session_with(seal_pk, sub, true).await
     }
 
     async fn open_session_with(
@@ -153,26 +155,29 @@ impl Gateway {
         seal_pk: &[u8; 32],
         sub: &str,
         body_seal: bool,
-        account: Option<&[u8]>,
     ) -> Result<(String, handshake::SessionKeys)> {
         let (client_eph_pk, keys) = handshake::client_handshake(seal_pk);
         // Everything from `.json()` down runs on an ARRIVED response, so each
         // step tags itself (see [`SessionResponseFault`]) — the caller must not
         // have to guess which one failed from an absent transport error.
-        let resp: SessionResponse = self
+        let response = self
             .route(self.http.post(self.url("/session")))
             .json(&SessionRequest {
                 sub: sub.to_string(),
                 client_eph_pk_b64: BASE64.encode(client_eph_pk),
                 body_seal,
-                account_b64: account.map(|a| BASE64.encode(a)),
             })
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context(SessionResponseFault::Malformed)?;
+            .await?;
+        // Not `error_for_status`: it discards the body, which is where the
+        // gateway's own refusal token lives. See [`SessionRefusedBy`].
+        let status = response.status();
+        if !status.is_success() {
+            let reason = response.text().await.unwrap_or_default();
+            return Err(SessionRefusedBy { status: status.as_u16(), reason }.into());
+        }
+        let resp: SessionResponse =
+            response.json().await.context(SessionResponseFault::Malformed)?;
         let sealed = BASE64
             .decode(&resp.sealed_token_b64)
             .context(SessionResponseFault::Malformed)?;

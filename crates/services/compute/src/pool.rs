@@ -81,17 +81,31 @@ pub fn max_concurrent_runs_from_env() -> usize {
 /// the node that will execute the run. Implemented by the node binary (the only
 /// place the committed-query lane and the overlay gateway are reachable); the
 /// pool holds it behind this seam so credential-less runs and unit tests need no
-/// node. A resolve `Err` (unknown credential, non-account origin, ungranted
-/// account) fails the attempt BEFORE any provider spawns — the paid call never
-/// happens for a refused credential.
+/// node.
+///
+/// ROUTING ONLY. An implementation resolves WHERE the owner's gateway is and
+/// WHAT to pin, and decides nothing about who may draw on it — it cannot: the
+/// grant is settled by the lender, against the account the lender's own node
+/// stamps when this node makes the gateway hop, which no implementation here can
+/// see or predict. A local re-decision could only ever disagree with the lender,
+/// and once did.
+///
+/// So the only `Err` left is a name this node cannot route (unregistered
+/// credential, no browser gateway, owner without a `.duck` handle). It fails the
+/// attempt before any provider spawns; a REFUSED grant fails slightly later, at
+/// `start_broker`, still before the sandbox spawns and still before any paid
+/// call.
 #[async_trait::async_trait]
 pub trait CredentialResolver: Send + Sync {
     async fn resolve(&self, credential: &str, saga_id: &str) -> Result<Resolved, String>;
 }
 
-/// A resolved credential: the self-host airlock config the broker draws on. The
-/// grant subject (the account the run acts on behalf of) rides INSIDE the
-/// config, so the broker's sealed session names it to the owner's gateway.
+/// A resolved credential: the self-host airlock config the broker draws on.
+///
+/// It carries no account, and must not. The sealed session the broker opens
+/// names the credential and nothing about who is acting; identity enters exactly
+/// once, at the gateway hop, where it is stamped by the lender's node rather than
+/// asserted by this one.
 pub struct Resolved {
     pub airlock: AirlockConfig,
 }
@@ -1229,7 +1243,6 @@ format = "text"
             authority: "airlock.owner.duck".into(),
             via: "http://127.0.0.1:0".into(),
             seal_pk: [7u8; 32],
-            account: b"acct".to_vec(),
         })
     }
 

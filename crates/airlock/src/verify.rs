@@ -162,6 +162,14 @@ async fn verify_tdx(
 /// with the status named.
 const TDX_OK_STATUSES: &[&str] = &["UpToDate", "SWHardeningNeeded"];
 
+/// TD ATTRIBUTES bit 0 — the TUD group's DEBUG flag. Intel's own words: *"In TD
+/// debug mode, the CPU state and private memory are accessible by the host
+/// VMM."* A debug TD boots the SAME audited image, so MRTD is unchanged and the
+/// quote chains to real silicon; the only thing that differs is that the
+/// operator can read the credential straight out of guest memory, which is the
+/// single property this whole crate exists to provide.
+const TDX_ATTR_DEBUG: u8 = 0x01;
+
 /// Pure verification against provided collateral at a given time — the
 /// fixture-testable core. Full dcap chain: PCK -> Intel root (pinned inside
 /// dcap-qvl), TCB info, QE identity, quote signature.
@@ -173,6 +181,26 @@ pub fn verify_tdx_at(
 ) -> Result<[u8; REPORT_DATA_LEN]> {
     let verified = dcap_qvl::verify::rustcrypto::verify(quote, collateral, now_secs)
         .map_err(|e| anyhow!("dcap verify: {e:?}"))?;
+    accept_tdx_report(&verified, expected)
+}
+
+/// Everything a chain-VERIFIED TDX quote must still satisfy before a credential
+/// is released to it, and the only source of the REPORTDATA `verify_tdx_at`
+/// returns — so this cannot be skipped without failing to compile.
+///
+/// Split out because the debug gate has no other honest test: flipping the
+/// DEBUG bit in the quote BYTES breaks the quote signature, so a fixture test
+/// doing that would go green on the wrong refusal. Driving this with a genuinely
+/// verified report whose attributes are then mutated tests the gate itself.
+///
+/// The debug check is deliberately OURS even though dcap-qvl 0.5 also refuses a
+/// debug TD by default (`QuoteVerifier::allow_debug` is `false`): that default
+/// is a builder knob on a dependency, and "the credential is unreadable by the
+/// host" is not a property to hold by someone else's default.
+pub fn accept_tdx_report(
+    verified: &dcap_qvl::verify::VerifiedReport,
+    expected: &Measurement,
+) -> Result<[u8; REPORT_DATA_LEN]> {
     if !TDX_OK_STATUSES.contains(&verified.status.as_str()) {
         bail!(
             "TDX TCB status {:?} not accepted (advisories: {:?})",
@@ -181,6 +209,10 @@ pub fn verify_tdx_at(
         );
     }
     let td = verified.report.as_td10().context("quote is not a TDX TD10 report")?;
+    let td_is_debuggable = td.td_attributes[0] & TDX_ATTR_DEBUG != 0;
+    if td_is_debuggable {
+        bail!("TDX TD ATTRIBUTES set DEBUG: the host VMM can read this TD's private memory");
+    }
     if td.mr_td != expected.0 {
         bail!(
             "MRTD mismatch: {} != expected {} (not the audited image)",
@@ -229,6 +261,43 @@ async fn verify_snp(
         .verify()
         .map_err(|e| anyhow!("SEV-SNP chain/report signature: {e}"))?;
 
+    accept_snp_report(&report, expected)
+}
+
+/// Everything a chain-VERIFIED SEV-SNP report must still satisfy before a
+/// credential is released to it, and the only source of the REPORTDATA
+/// `verify_snp` returns — so this cannot be skipped without failing to compile.
+///
+/// Split out for the same reason as [`accept_tdx_report`]: `policy` and `vmpl`
+/// live INSIDE the signed region, so mutating them in the report bytes breaks
+/// the signature and any fixture test doing that would go green on the wrong
+/// refusal. Both checks run AFTER the chain verify, so they are decisions on
+/// authenticated fields rather than on whatever the caller sent.
+///
+/// Unlike TDX, nothing upstream does this for us: the `sev` crate's
+/// `(&chain, &report).verify()` is a certificate-chain and report-signature
+/// check and reads neither field.
+pub fn accept_snp_report(
+    report: &AttestationReport,
+    expected: &Measurement,
+) -> Result<[u8; REPORT_DATA_LEN]> {
+    // A debug-allowed guest boots the SAME audited image — measurement
+    // unchanged, VCEK chain intact — and lets the hypervisor read its register
+    // state. The launch measurement is SNP's whole trust story here (there is
+    // deliberately no TCB-freshness gate, see `verify_snp`), so a policy that
+    // hands the host the guest's state voids it entirely.
+    if report.policy.debug_allowed() {
+        bail!("SEV-SNP guest policy allows DEBUG: the host can read this guest's state");
+    }
+    // A report requested at VMPL > 0 attests a LESS privileged level than the
+    // one holding the seal key, so it says nothing about the code that would
+    // receive the credential.
+    if report.vmpl != 0 {
+        bail!(
+            "SEV-SNP report was requested at VMPL {}, not 0 (it does not describe the enclave)",
+            report.vmpl
+        );
+    }
     if report.measurement != expected.0 {
         bail!(
             "SEV-SNP measurement mismatch: {} != expected {} (not the audited image)",

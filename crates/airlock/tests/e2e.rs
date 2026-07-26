@@ -13,6 +13,8 @@ use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::json;
 use tokio::net::TcpListener;
 
@@ -529,7 +531,6 @@ async fn unknown_credential_name_is_refused_at_session_open() {
             sub: "missing".into(),
             client_eph_pk_b64: "AAAA".into(),
             body_seal: false,
-            account_b64: None,
         })
         .send()
         .await
@@ -574,15 +575,13 @@ async fn codex_credential_proxies_to_the_openai_upstream() {
     assert_eq!(seen, "Bearer tok-codex", "a codex session hits the openai upstream with its bearer");
 }
 
-#[tokio::test]
-async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
-    let upstream = boot_echo_upstream().await;
-    let kp = SealKeypair::generate();
-    let seal_pk = kp.public_bytes();
-    // The injected gate: only the account `granted` may draw on the credential —
-    // the node's committed-record lookup, stubbed to one allowed account here.
-    // `wedged` stands in for a node that did not answer at all.
-    let check: airlock::server::GrantCheck = std::sync::Arc::new(|_name: String, account: Vec<u8>| {
+// -------- the co-hosted lending gate --------
+
+/// The injected gate: only the account `granted` may draw on the credential —
+/// the node's committed-record lookup, stubbed here. `wedged` stands in for a
+/// node that did not answer at all.
+fn stub_grant_check() -> airlock::server::GrantCheck {
+    std::sync::Arc::new(|_name: String, account: Vec<u8>| {
         Box::pin(async move {
             match account.as_slice() {
                 b"granted" => airlock::server::GrantAnswer::Granted,
@@ -593,22 +592,51 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
             as std::pin::Pin<
                 Box<dyn std::future::Future<Output = airlock::server::GrantAnswer> + Send>,
             >
-    });
+    })
+}
+
+/// A grant-gated self-host lender, reached the ONLY way production reaches one:
+/// through the node's gateway proxy, which stamps the account it verified for
+/// the caller. `verified_caller` is what that proxy vouched for — the test
+/// chooses it because a real caller cannot.
+///
+/// `seal_secret` is passed in rather than generated so several differently-
+/// vouched gateways share one seal_pk, exactly as one lender serving several
+/// borrowers does.
+async fn boot_lender_behind_proxy(
+    upstream: &str,
+    seal_secret: [u8; 32],
+    verified_caller: &[u8],
+) -> String {
     let (app, _) = server::build_seeded_gated(
-        self_host_cfg(Some(kp), upstream.clone(), String::new()),
-        vec![("a".into(), CredentialKind::Claude, CredentialPayload::Bearer {
-            access_token: "tok-a".into(),
-        })],
-        Some(check),
+        self_host_cfg(
+            Some(SealKeypair::from_secret_bytes(seal_secret)),
+            upstream.to_string(),
+            String::new(),
+        ),
+        vec![(
+            "a".into(),
+            CredentialKind::Claude,
+            CredentialPayload::Bearer { access_token: "tok-a".into() },
+        )],
+        Some(stub_grant_check()),
     )
     .unwrap();
-    let gateway_url = spawn(app).await;
-    let gw = Gateway::local(gateway_url.clone());
+    spawn(airlock::testkit::behind_gateway_proxy(app, verified_caller)).await
+}
+
+#[tokio::test]
+async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
+    let upstream = boot_echo_upstream().await;
+    let secret = SealKeypair::generate().secret_bytes();
+    let seal_pk = SealKeypair::from_secret_bytes(secret).public_bytes();
 
     // Granted account: the session opens and the round-trip carries the real token.
-    let token = gw.open_session_as(&seal_pk, "a", b"granted").await.expect("granted session opens");
+    let url = boot_lender_behind_proxy(&upstream, secret, b"granted").await;
+    let gw = Gateway::local(url.clone());
+    let token = gw.open_session(&seal_pk, "a").await.expect("granted session opens");
     let seen = reqwest::Client::new()
-        .post(format!("{gateway_url}/v1/messages"))
+        .post(format!("{url}/v1/messages"))
         .bearer_auth(&token)
         .body("{}")
         .send()
@@ -619,23 +647,219 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
         .unwrap();
     assert_eq!(seen, "Bearer tok-a");
 
-    // Ungranted account: refused at session open with 403.
-    let err = gw.open_session_as(&seal_pk, "a", b"stranger").await.unwrap_err();
-    assert!(err.to_string().contains("403"), "an ungranted account must 403: {err}");
-
-    // No claimed account at all: the gate is mandatory once wired — omitting the
-    // account is a refusal, never a bypass.
+    // Ungranted account: refused at session open with 403. The caller really IS
+    // `stranger` here — the proxy said so — so this is the grant refusal and not
+    // an identity one.
+    let url = boot_lender_behind_proxy(&upstream, secret, b"stranger").await;
+    let gw = Gateway::local(url);
     let err = gw.open_session(&seal_pk, "a").await.unwrap_err();
-    assert!(err.to_string().contains("403"), "an accountless session must 403: {err}");
+    assert!(err.to_string().contains("403"), "an ungranted account must 403: {err}");
 
     // The gate could not ASK its authority. That is NOT a refusal: a 403 sends
     // the borrower's operator to add a grant that already exists, so the one
     // answer that carries no information gets its own 503 instead.
-    let err = gw.open_session_as(&seal_pk, "a", b"wedged").await.unwrap_err();
+    let url = boot_lender_behind_proxy(&upstream, secret, b"wedged").await;
+    let gw = Gateway::local(url);
+    let err = gw.open_session(&seal_pk, "a").await.unwrap_err();
     assert!(
         err.to_string().contains("503"),
         "an undetermined grant must 503, never 403: {err}"
     );
+}
+
+/// THE ATTACK, and why it is now a fact about the TYPES rather than a runtime
+/// refusal. A member the network admitted, granted nothing, reads the lender's
+/// PUBLIC credential record — `owner_account` is a plain field of it, and the
+/// borrower has to read that record anyway to learn `seal_pk` — and tries to open
+/// a session as the owner.
+///
+/// It cannot construct the request. `SessionRequest` has no account field and the
+/// client exposes no call that takes one, so this asserts the only thing left to
+/// assert: a hand-built request that tries to smuggle the owner's account in is a
+/// DECODE error, not a session. `deny_unknown_fields` is what makes that true, so
+/// re-adding the field in any form fails here.
+#[tokio::test]
+async fn a_session_request_cannot_name_an_account_at_all() {
+    let upstream = boot_echo_upstream().await;
+    let secret = SealKeypair::generate().secret_bytes();
+    // the proxy vouched for `stranger`, who is granted nothing.
+    let url = boot_lender_behind_proxy(&upstream, secret, b"stranger").await;
+
+    let refusal = reqwest::Client::new()
+        .post(format!("{url}/session"))
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"sub":"a","client_eph_pk_b64":"AAAA","body_seal":false,"account_b64":"{}"}}"#,
+            BASE64.encode(b"granted")
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refusal.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "an account on a session request is an unknown field, not an authorization input"
+    );
+
+    // and the well-formed request from the same caller is refused on the account
+    // the transport vouched for, which is the only one that counts.
+    let gw = Gateway::local(url);
+    let err = gw
+        .open_session(&SealKeypair::from_secret_bytes(secret).public_bytes(), "a")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("403"), "an ungranted caller must 403: {err}");
+}
+
+/// The same gate from the other direction: a caller that reached the listener
+/// WITHOUT the node's proxy has no verified identity at all, so a lending
+/// gateway must refuse it outright rather than fall back to the claim. A
+/// same-box process dialling the loopback port is exactly that caller.
+#[tokio::test]
+async fn a_session_no_proxy_vouched_for_is_refused() {
+    let upstream = boot_echo_upstream().await;
+    let (app, _) = server::build_seeded_gated(
+        self_host_cfg(Some(SealKeypair::generate()), upstream, String::new()),
+        vec![(
+            "a".into(),
+            CredentialKind::Claude,
+            CredentialPayload::Bearer { access_token: "tok-a".into() },
+        )],
+        Some(stub_grant_check()),
+    )
+    .unwrap();
+    // NOT behind the proxy: dialled directly, the way a local process would.
+    let url = spawn(app).await;
+
+    let refusal = reqwest::Client::new()
+        .post(format!("{url}/session"))
+        .json(&SessionRequest {
+            sub: "a".into(),
+            client_eph_pk_b64: "AAAA".into(),
+            body_seal: false,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refusal.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "an unvouched caller must never open a lending session"
+    );
+    assert_eq!(refusal.text().await.unwrap(), "caller_account_unverified");
+}
+
+/// A client that omits or misspells a field gets a DECODE error, never a grant
+/// refusal.
+///
+/// `account_b64` used to carry `serde(default)`, so an omission silently became
+/// `None` and came out the far side as 403 `credential_not_granted` — sending
+/// the borrower's operator to add a grant that already existed, which is the
+/// exact misdiagnosis the three-state grant taxonomy was built to prevent. The
+/// gateway here is one that WOULD admit the caller, so a tolerant decode could
+/// only ever be caught as the wrong refusal.
+#[tokio::test]
+async fn a_malformed_session_request_is_a_decode_error_never_a_grant_refusal() {
+    let upstream = boot_echo_upstream().await;
+    let secret = SealKeypair::generate().secret_bytes();
+    let url = boot_lender_behind_proxy(&upstream, secret, b"granted").await;
+
+    for body in [
+        // a required field omitted
+        r#"{"sub":"a","client_eph_pk_b64":"AAAA"}"#,
+        // and a misspelling, which `deny_unknown_fields` is what catches
+        r#"{"sub":"a","client_eph_pk_b64":"AAAA","body_seal":false,"body_sea1":true}"#,
+    ] {
+        let resp = reqwest::Client::new()
+            .post(format!("{url}/session"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "a wire-shape error must be named as one, not as a missing grant: {body}"
+        );
+    }
+}
+
+/// The self-host lender serves NO credential upload. Its router is reachable by
+/// any admitted member through the owner's signed `airlock` route, and sealing
+/// is not authentication — the seal public key is on chain AND served at
+/// `/attestation` — so an upload endpoint there lets any member replace the
+/// lender's credential with an attacker-chosen bearer.
+///
+/// The route must be ABSENT, not present-and-guarded: this asserts on the status
+/// axum gives an unrouted path, so re-mounting it fails here even if whatever
+/// guard came with it refuses.
+#[tokio::test]
+async fn the_self_host_lender_serves_no_credential_upload() {
+    let kp = SealKeypair::generate();
+    let seal_pk = kp.public_bytes();
+    let (app, _) = server::build_seeded(
+        self_host_cfg(Some(kp), String::new(), String::new()),
+        vec![(
+            "a".into(),
+            CredentialKind::Claude,
+            CredentialPayload::Bearer { access_token: "tok-owner".into() },
+        )],
+    )
+    .unwrap();
+    let url = spawn(app).await;
+
+    // A perfectly well-formed upload, sealed to the gateway's real key.
+    let sealed = airlock::seal::seal(&seal_pk, br#"{"kind":"bearer","access_token":"attacker"}"#);
+    let resp = reqwest::Client::new()
+        .post(format!("{url}/credential"))
+        .json(&airlock::wire::CredentialUpload {
+            name: "a".into(),
+            kind: CredentialKind::Claude,
+            sealed_b64: BASE64.encode(&sealed),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a self-host lender must not route /credential at all"
+    );
+
+    // And the credential it already serves is untouched.
+    let gw = Gateway::local(url.clone());
+    let token = gw.open_session(&seal_pk, "a").await.unwrap();
+    let claims = reqwest::Client::new()
+        .post(format!("{url}/v1/messages"))
+        .bearer_auth(&token)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    // No upstream is configured, so this cannot 200 — what matters is that it
+    // got past the token check with the OWNER's credential still in the store.
+    assert_ne!(claims.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+/// The attested build is the one topology where an upload is the only way in:
+/// there is a real host-vs-enclave boundary, and the CVM's listener is not
+/// something a network member is routed to.
+#[tokio::test]
+async fn the_attested_gateway_still_accepts_a_sealed_upload() {
+    let upstream = boot_upstream().await;
+    let enclave = enclave();
+    let gateway_url = boot_gateway(&upstream, &enclave).await;
+    let gw = Gateway::local(gateway_url);
+    let seal_pk = attested_seal_pk(&gw, &enclave).await;
+    gw.upload_sealed_credential(
+        &seal_pk,
+        "test-sub",
+        CredentialKind::Claude,
+        &CredentialPayload::Bearer { access_token: "enclave-tok".into() },
+    )
+    .await
+    .expect("the enclave path keeps its provisioning endpoint");
 }
 
 #[test]
