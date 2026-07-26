@@ -1,6 +1,6 @@
 ---
 name: sim-lane
-description: Use when any Rust #[test] in this workspace needs a deterministic in-process Ducktape node (no child processes, no fleet) — boot it with simnode::boot from bin/simnode, drive real submit → commit → query round-trips, and step commits deterministically. Covers the embedding harness, SimOpts, and the chat-module wire shapes those tests hit. (The old iced-UI sim lane under app/src-iced was retired with app/ removal.)
+description: Use when any Rust #[test] in this workspace needs a deterministic in-process Ducktape node (no child processes, no fleet) — boot it with simnode::boot from bin/simnode, drive real submit → commit → query round-trips, and step commits deterministically. Covers the embedding harness, SimOpts, and the chat-module wire shapes those tests hit. (The old iced-UI sim lane died with the app/src-iced shell; app/ itself is live and has its own in-crate tests.)
 ---
 
 # Sim lane — deterministic in-process node
@@ -10,9 +10,11 @@ in-process: the full noded `/v1` HTTP surface plus a synchronous control handle,
 no child processes and no timers. Any crate's `#[test]` can drive real
 transaction round-trips (submit → commit → query) against it.
 
-> The UI half of this lane — `app/src-iced/src/shell/sim/` (`SimShell`, the
-> `iced_test::Simulator` harness, the composer/`rich_text` traps) — was
-> **retired with the removal of app/**. Only the embeddable node below survives.
+> The UI half of this lane died with the `app/src-iced` shell it lived in
+> (`SimShell`, the `iced_test::Simulator` harness, the composer/`rich_text`
+> traps). **`app/` itself was rewritten in place, not removed** — the live
+> `ducktape-app` crate has ordinary `#[cfg(test)]` suites (`cargo test -p
+> ducktape-app`) and no simulator lane. Only the embeddable node below survives.
 
 ## Where things live
 

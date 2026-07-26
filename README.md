@@ -36,6 +36,7 @@ The tree groups by function into three layers — module / kernel / networking:
 | `crates/examples/` | Reference modules: `directory` (also bin/node's liveness canary), `greeter` (types-only composition example) |
 | `crates/labs/` | Quarantined experimental modules (`evm`, `multisig`): in-tree and tested but registered by NO genesis set, kept as a standalone crate EXCLUDED from the workspace so its heavy deps (revm, alloy) never tax the shipping build — gated via `make labs-gate` |
 | `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (validator), `noded` (app-facing daemon), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous), `fs` (duckfs CLI), `mcp` (MCP tool server), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool) |
+| `app/` | `ducktape-app`, the native Iced desktop client (Chat + Pages), UI declared in `src/ui/*.ice`; `crates/design` is its design system |
 | `docs/` | Nimbus documentation site (human/agent tracks, English/Korean) |
 
 Each module publishes its wire surface — types-only payload/query/reply shapes
@@ -170,8 +171,7 @@ is `skills/module-dev/SKILL.md`.
 
 ## Run a node
 
-The product ships as headless surfaces — there is no bundled desktop app in
-this tree. Three binaries are runnable:
+Three binaries plus the desktop app are runnable:
 
 - **`node-bin`** (the `ducktape` daemon) — the networked node that serves the
   module HTTP/WebSocket surface. Release build with `make node`; run a
@@ -191,6 +191,10 @@ this tree. Three binaries are runnable:
 
 - **`coordinator`** — the untrusted UDP rendezvous (see the operator path
   above).
+
+- **`ducktape-app`** (`app/`) — the native Iced desktop client for Chat and
+  Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`; it
+  dials `DUCKTAPE_NODE`, else `http://127.0.0.1:8844`. See `app/README.md`.
 
 Install the `ducktape` operator CLI into `~/.cargo/bin`:
 

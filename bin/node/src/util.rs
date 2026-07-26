@@ -9,10 +9,9 @@ use sdk::StateRoot;
 /// `LogRing`, which means it never reached the app's Logs tab: the only surface
 /// most users have. routing it through `tracing` puts it in both.
 ///
-/// the literal "FATAL" text stays in the message on purpose: the desktop shell
-/// greps `daemon.log` for it to classify a dead node
-/// (`app/src-iced/src/backend/workspace_service.rs`), and `bin/node`'s e2e suites assert
-/// on it.
+/// the literal "FATAL" text stays in the message on purpose: it is how a
+/// `daemon.log` reader classifies a dead node, and `bin/node`'s e2e suites
+/// assert on it.
 ///
 /// NOTE: `process::exit` runs no destructors, so the ring's ws subscribers may
 /// not be scheduled before we go. That is fine and deliberate — stderr is

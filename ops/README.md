@@ -1,10 +1,11 @@
 # Operator scripts
 
-Repo-side helpers for running, seeding, and maintaining a ducktape node. There
-is no desktop app in this tree anymore — the native iced shell was removed; the
+Repo-side helpers for running, seeding, and maintaining a ducktape node. The
 runnable surfaces are the node daemon (`node-bin`/`noded`), the deterministic
-`simnode`, and the UDP coordinator. Most scripts here back a `make` target; see
-the repository `Makefile`.
+`simnode`, the UDP coordinator, and the native Iced desktop app (`app/`,
+`cargo run -p ducktape-app`) — the scripts here drive the node side, and
+`demo-seed.sh` seeds a workspace the app can then open. Most scripts back a
+`make` target; see the repository `Makefile`.
 
 ## Demo network
 

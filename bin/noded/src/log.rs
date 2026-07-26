@@ -180,8 +180,8 @@ fn install_panic_hook() {
         tracing::error!(
             target: "ducktape::node",
             thread = std::thread::current().name().unwrap_or("?"),
-            // the "panicked at" text is a marker the desktop shell greps for
-            // (app/src-iced/src/backend/workspace_service.rs) — keep it in the message.
+            // the "panicked at" text is a marker `daemon.log` readers grep for —
+            // keep it in the message.
             "panicked at: {info}"
         );
         default(info);
