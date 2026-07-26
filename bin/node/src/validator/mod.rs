@@ -2,7 +2,6 @@
 //! pre-start mesh lane, resume the epoch engine, then hand ownership to the
 //! consensus pump.
 
-pub(crate) mod announce;
 mod boot;
 pub(crate) mod code_announce;
 mod engine;
@@ -49,7 +48,6 @@ pub(crate) async fn run_validator(
     checkpoint_blocks: u64,
     promoted: bool,
     dev_demo: bool,
-    sandbox_capacity: std::collections::BTreeMap<String, u64>,
     rpc_listener: Option<std::net::TcpListener>,
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
@@ -62,7 +60,6 @@ pub(crate) async fn run_validator(
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     blobs: noded::blobs::BlobHandle,
-    services: noded::services::ServiceCatalog,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
     planes: data_plane::PlaneMonitor,
@@ -364,14 +361,11 @@ pub(crate) async fn run_validator(
         dev_demo,
         checkpoint_blocks,
         sync_lease,
-        workspace: gateway_workspace,
-        sandbox_capacity,
         rpc_ingress,
         http_cmds,
         stream_hub,
         index,
         blobs,
-        services,
         metrics,
         status,
         status_public_key,
@@ -411,12 +405,10 @@ pub(crate) async fn run_promoted(
     advertised_reach: Ingress,
     checkpoint_blocks: u64,
     dev_demo: bool,
-    sandbox_capacity: std::collections::BTreeMap<String, u64>,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     blobs: noded::blobs::BlobHandle,
-    services: noded::services::ServiceCatalog,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
     planes: data_plane::PlaneMonitor,
@@ -433,7 +425,6 @@ pub(crate) async fn run_promoted(
 
     let PromotionBaton {
         context,
-        workspace,
         host,
         mut recovery,
         epoch,
@@ -702,14 +693,11 @@ pub(crate) async fn run_promoted(
         dev_demo,
         checkpoint_blocks,
         sync_lease,
-        workspace,
-        sandbox_capacity,
         rpc_ingress,
         http_cmds: http_ingress,
         stream_hub,
         index,
         blobs,
-        services,
         metrics,
         status,
         status_public_key,
@@ -829,9 +817,6 @@ impl DrainingSlot {
 /// here and the seated engine restarts straight into the validator path.
 pub(crate) struct PromotionBaton {
     pub(crate) context: commonware_runtime::tokio::Context,
-    /// the workspace dir this node was booted from — carried across promotion
-    /// so the seat's capability announce can re-read `services.toml` per tick.
-    pub(crate) workspace: std::path::PathBuf,
     /// the application state the seat resumes from — the replica's own
     /// folded host (warm) or the freshly synced boundary host (cold).
     pub(crate) host: host::Host,

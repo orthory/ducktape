@@ -13,7 +13,6 @@ use futures::{FutureExt as _, StreamExt as _};
 
 use recovery::Manifest;
 
-use super::announce::CapabilityAnnouncer;
 use crate::constants::DRAIN_TICK;
 use crate::reachability_plane::GateOutcomes;
 use crate::rpc::{JoinRequestRecord, RpcJob};
@@ -127,10 +126,6 @@ pub(super) struct ValidatorLoopState<'a> {
     /// sync retention lease (unix secs of the last served state-sync request)
     /// — the drain defers oplog pruning while it is fresh.
     pub(super) sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// the workspace dir whose `services.toml` carries the compute grant —
-    /// re-read by the announce pump, never latched at boot.
-    pub(super) workspace: std::path::PathBuf,
-    pub(super) sandbox_capacity: std::collections::BTreeMap<String, u64>,
     /// the local rpc bridge's parsed-request queue — the caller owns the
     /// listener spawn (a promoted node's listener pump carries over from
     /// its parked life; a fresh boot spawns one), so both entries feed the
@@ -143,7 +138,6 @@ pub(super) struct ValidatorLoopState<'a> {
     /// the volatile service-signaling catalog: the live half of the capability
     /// announce (`grant ∩ hello`). Shared with the http surface's handle, so a
     /// daemon's hello is visible to the announce pump the moment it lands.
-    pub(super) services: noded::services::ServiceCatalog,
     pub(super) metrics: noded::NodeMetrics,
     pub(super) status: noded::StatusCell,
     pub(super) status_public_key: String,
@@ -231,7 +225,6 @@ struct ValidatorRuntime<'a> {
     /// a failed fetch retries next tick (the sender rides in each task).
     fetch_done_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
     fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<[u8; 32]>,
-    announcer: CapabilityAnnouncer,
     next_drain: std::time::SystemTime,
 }
 
@@ -264,14 +257,11 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         dev_demo,
         checkpoint_blocks,
         sync_lease,
-        workspace,
-        sandbox_capacity,
         rpc_ingress,
         http_cmds,
         stream_hub,
         index,
         blobs,
-        services,
         metrics,
         status,
         status_public_key,
@@ -376,19 +366,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let code_signaller =
         super::code_announce::CodeReadinessSignaller::new(signer.public_key().as_ref().to_vec());
     let (fetch_done_tx, fetch_done_rx) = tokio::sync::mpsc::unbounded_channel();
-    // the capability self-announcer: publishes `grant ∩ live hello` into the
-    // capability registry (state-driven, idempotent). Inert while no compute
-    // daemon is signaling — a grant alone announces nothing.
-    let announcer = CapabilityAnnouncer::new(
-        signer.public_key().as_ref().to_vec(),
-        workspace,
-        services,
-        sandbox_capacity,
-        // this tier submits into its OWN orderer and the drain routes every
-        // frame's fate back, so its liveness backstop is charged in blocks,
-        // not seconds — see `Rearm`.
-        super::announce::Rearm::Unordered,
-    );
     // graceful checkpoint on process signals (SIGTERM/SIGINT): the desktop
     // shell SIGTERMs the daemon on quit, so it must take the SAME safe path
     // as an rpc `Shutdown` — a best-effort final manifest + journal barrier
@@ -493,7 +470,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         code_signaller,
         fetch_done_tx,
         fetch_done_rx,
-        announcer,
         next_drain: context.current() + DRAIN_TICK,
     };
     // the startup snapshot: the RECOVERED boundary serves on /v1/status the

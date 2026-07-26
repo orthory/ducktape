@@ -165,32 +165,10 @@ impl ResidentRelay {
         Ok(frame_id)
     }
 
-    /// Resident-owned pumps have no caller hold and never reference a forge
-    /// pack. Keep that contract explicit instead of silently dropping a bulk
-    /// transfer's acknowledgement state.
-    pub(crate) fn submit_unheld<S>(
-        &mut self,
-        signer: &ed25519::PrivateKey,
-        targets: &[ed25519::PublicKey],
-        relay_tx: &mut S,
-        target: String,
-        payload: Vec<u8>,
-    ) -> Result<node::FrameId, String>
-    where
-        S: P2pSender<PublicKey = ed25519::PublicKey>,
-    {
-        let (frame_id, frame, custodian) = self.signed_frame(signer, targets, target, payload)?;
-        if relay::required_blob_digest(&frame).is_some() {
-            return Err("an unheld resident pump cannot submit a forge pack".into());
-        }
-        if !send(relay_tx, &custodian, relay::RelayMsg::Submit { frame }) {
-            return Err("validator unreachable - retry shortly".into());
-        }
-        Ok(frame_id)
-    }
-
     /// Handle validator acknowledgements and final outcomes. An unclaimed
-    /// final reply belongs to a resident-owned pump and is returned to main.
+    /// final reply belongs to nobody now that the resident announce pump is
+    /// gone; it is still returned, and still routed for its release side
+    /// effect.
     pub(crate) fn on_message<S>(
         &mut self,
         peer: ed25519::PublicKey,

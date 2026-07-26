@@ -264,6 +264,22 @@ impl Services {
                     GRANT_NONCE_LEN * 2
                 ));
             }
+            // the consented tags must be announceable, checked HERE as well as
+            // at the consent boundary: that makes "an announce can never carry
+            // an illegal tag" a property of the file rather than of one code
+            // path, so nothing downstream has to filter. Fail-closed on a file
+            // only this CLI writes.
+            if let Some(bad) = grant
+                .capabilities
+                .iter()
+                .find(|tag| capability::validate_tag(tag).is_err())
+            {
+                return Err(format!(
+                    "services: {} grants {bad:?}, which the capability registry refuses (a tag \
+                     is 1..64 bytes of [a-z0-9._-])",
+                    grant.kind
+                ));
+            }
         }
         Ok(())
     }
@@ -924,6 +940,17 @@ pub(crate) struct EnablePlan {
     pub node_id: [u8; 32],
     /// the reviewed hello, when the daemon is currently signaling.
     pub offered: Option<noded::services::Signaling>,
+    /// the grant this enable would mint. Decided here — minting is randomness
+    /// and a clock read, not a write — so the commit below is purely two
+    /// writers in order (announce, then persist) with nothing left to decide.
+    pub(crate) grant: ServiceGrant,
+    /// the announce this enable would submit: every granted-and-signaling
+    /// kind's contribution INCLUDING this one. Decided here so that a set the
+    /// registry would refuse is refused before the operator is asked to consent
+    /// to it — the announce is all-or-nothing, so an illegal tag or an over-cap
+    /// total does not cost the excess, it costs this node's whole registry
+    /// entry.
+    pub(crate) announce: crate::announce::AnnounceSet,
 }
 
 impl EnablePlan {
@@ -978,57 +1005,90 @@ pub(crate) fn plan_enable(
                  start it first: ducktape service run {kind}"
             )
         })?;
+    let grant = mint_grant(kind, node_id, &offered);
+    // the announce this would produce, decided against the CURRENT signaling
+    // set and refused here if the registry would not take it.
+    let mut prospective = load(workspace)?.grants;
+    prospective.push(grant.clone());
+    let announce = crate::announce::announced_set(
+        &prospective,
+        &signaling_now(workspace),
+        &service.sandbox_capacity,
+    )
+    .map_err(|refusal| format!("{kind} cannot be announced: {refusal}"))?;
     Ok(EnablePlan {
         kind: kind.to_string(),
         chain_id: service.chain_id.clone(),
         node_id,
         offered: Some(offered),
+        grant,
+        announce,
     })
 }
 
-/// Mint the grant the plan describes and persist it. THE enable code path.
-pub(crate) fn commit_enable(
-    workspace: &Path,
-    plan: &EnablePlan,
-) -> Result<ServiceGrant, String> {
-    let mut services = load(workspace)?;
+/// Mint one grant from a reviewed hello. Randomness and a clock read — it
+/// writes nothing, which is why it belongs to the plan rather than the commit.
+fn mint_grant(kind: &str, node_id: [u8; 32], offered: &noded::services::Signaling) -> ServiceGrant {
     let mut nonce = [0u8; GRANT_NONCE_LEN];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let instance = mint_instance(&plan.node_id, &plan.kind, &nonce);
-    let grant = ServiceGrant {
-        kind: plan.kind.clone(),
-        instance: config::hex_bytes(&instance),
+    ServiceGrant {
+        kind: kind.to_string(),
+        instance: config::hex_bytes(&mint_instance(&node_id, kind, &nonce)),
         nonce: config::hex_bytes(&nonce),
         granted_unix: now_unix(),
-        capabilities: plan
-            .offered
-            .as_ref()
-            .map(|offer| offer.capabilities.clone())
-            .unwrap_or_default(),
-        scopes: plan
-            .offered
-            .as_ref()
-            .map(|offer| offer.scopes.clone())
-            .unwrap_or_default(),
-    };
+        capabilities: offered.capabilities.clone(),
+        scopes: offered.scopes.clone(),
+    }
+}
+
+/// Commit the plan: ANNOUNCE first, then persist. THE enable code path.
+///
+/// Two writers, in this order, and the order is the whole reason there is no
+/// divergence to manage between the file and the chain:
+///
+/// - the announce is **rejected** → nothing is written, the verb fails carrying
+///   the module's own words, and re-running it is the entire retry story;
+/// - the announce **applies** and the file write then fails → the error names
+///   both facts. The window is an over-announce and it is inert, because
+///   `serve_kind` refuses to serve a kind with no grant; re-running re-announces
+///   (the module stages nothing for a set it already holds) and writes.
+///
+/// The submit carries no key: `/v1/submit` re-frames the op with the NODE's key
+/// inside the node process, which is the identity `capability` keys the registry
+/// on. That is why this whole family stays keyless.
+pub(crate) fn commit_enable(
+    workspace: &Path,
+    base: &str,
+    plan: &EnablePlan,
+) -> Result<u64, String> {
+    let mut services = load(workspace)?;
+    let height = crate::announce::submit(base, &plan.announce)
+        .map_err(|error| format!("{} was not enabled: {error}", plan.kind))?;
     let position = services
         .grants
         .binary_search_by(|existing| existing.kind.as_str().cmp(&plan.kind))
         .unwrap_or_else(|position| position);
-    services.grants.insert(position, grant.clone());
-    save(workspace, &services)?;
+    services.grants.insert(position, plan.grant.clone());
+    save(workspace, &services).map_err(|error| {
+        format!(
+            "{} is ANNOUNCED at height {height} but its grant was not written, so nothing will \
+             serve it: {error}",
+            plan.kind
+        )
+    })?;
     // the grant mint is the audit-relevant event, and `service run` installs a
     // subscriber before it can reach here, so this is recorded in daemon.log
     // and the log ring on the daemon path. The one-shot CLI verb has no
     // subscriber by design — there it is the printed output that informs.
     tracing::info!(
         target: "ducktape::service",
-        kind = %grant.kind,
-        instance = %grant.display_id(),
-        capabilities = grant.capabilities.len(),
+        kind = %plan.grant.kind,
+        instance = %plan.grant.display_id(),
+        capabilities = plan.grant.capabilities.len(),
+        height,
         "service enabled"
     );
-    Ok(grant)
+    Ok(height)
 }
 
 /// How often the daemon re-signals. A third of the TTL, so two consecutive
@@ -1089,7 +1149,7 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         join_or_dash(&hello.capabilities),
     ))?;
 
-    offer_enable(&workspace, &kind, args.offer(), &service, node_key)?;
+    offer_enable(&workspace, &kind, args.offer(), &service, node_key, &base)?;
 
     // the heartbeat must outlive this call: for compute it runs BESIDE the
     // execution loop, so a long run never lets the node's catalog entry lapse
@@ -1358,6 +1418,7 @@ fn offer_enable(
     offer: EnableOffer,
     service: &config::ServiceConfig,
     node_id: [u8; 32],
+    base: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if load(workspace)?.grant(kind).is_some() {
         // already granted: straight to serving, never a prompt.
@@ -1384,13 +1445,30 @@ fn offer_enable(
             return write_err(&hint);
         }
     }
-    let grant = commit_enable(workspace, &plan)?;
-    write_err(&format!(
-        "  {} enabled {}\n",
-        paint(GREEN, ServiceState::Enabled.glyph()),
-        grant.display_id()
-    ))?;
-    Ok(())
+    // A failed announce must NEVER stop the daemon. Enabling is a transaction
+    // now, so it can fail for reasons that have nothing to do with this process
+    // — a node not yet admitted to its network, a chain not finalizing — and a
+    // daemon that exited on one of those would take down the very signal the
+    // operator needs in order to retry. Say it once, keep signaling, serve
+    // nothing (no grant was written): the same resting state as declining the
+    // prompt. Deliberately NOT a retry loop — the operator's next
+    // `service enable` is the retry.
+    match commit_enable(workspace, base, &plan) {
+        Ok(height) => write_err(&format!(
+            "  {} enabled {} · announced at height {height}\n",
+            paint(GREEN, ServiceState::Enabled.glyph()),
+            plan.grant.display_id()
+        )),
+        Err(error) => {
+            tracing::warn!(
+                target: "ducktape::service",
+                kind = %kind,
+                reason = "enable_not_announced",
+                "{error}"
+            );
+            write_err(&hint)
+        }
+    }
 }
 
 /// Keep the signal alive until the process is stopped.
@@ -1458,19 +1536,18 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let grant = commit_enable(&workspace, &plan)?;
+    let height = commit_enable(&workspace, &base, &plan)?;
     // stdout is the id alone, so `$(ducktape service enable compute)` is the
     // instance id and nothing else; the prose goes to stderr.
-    println!("{}", grant.display_id());
+    println!("{}", plan.grant.display_id());
     write_err(&format!(
-        "{} enabled {}\n",
+        "{} enabled {} · announced at height {height}\n",
         paint(GREEN, ServiceState::Enabled.glyph()),
-        grant.display_id()
+        plan.grant.display_id()
     ))?;
     if daemon_for(&plan.kind).is_some() {
         // the daemon, not the node, is what has to be running — and the node
-        // needs no restart at all: it reads the offered set from the live
-        // signaling catalog every announce tick.
+        // needs no restart: the announce above already told the network.
         write_err(&format!("  start it with: ducktape service run {}\n", plan.kind))?;
     }
     Ok(())
@@ -1479,6 +1556,12 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
     let kind = args.kind;
     let workspace = args.workspace.dir()?;
+    let service = config::resolve_service(&args.workspace.config_file()?)?;
+    let base = service
+        .http_listen
+        .as_deref()
+        .map(config::http_base_of)
+        .ok_or("this node serves no http surface, so `disable` cannot retract the announce")?;
     let mut services = load(&workspace)?;
     let position = services
         .grants
@@ -1486,16 +1569,29 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
         .position(|grant| grant.kind == kind)
         .ok_or_else(|| format!("{kind} is not enabled in {}", workspace.display()))?;
     let retired = services.grants.remove(position);
+    // RETRACT first, persist second — the same order `commit_enable` uses and
+    // for the same reason. A refusal here cannot come from this removal (a
+    // disable can only shrink the set); it means the file already held
+    // something the registry refuses, which `Services::validate` now prevents.
+    let announce = crate::announce::announced_set(
+        &services.grants,
+        &signaling_now(&workspace),
+        &service.sandbox_capacity,
+    )
+    .map_err(|refusal| format!("{kind} was not disabled: {refusal}"))?;
+    let height = crate::announce::submit(&base, &announce)
+        .map_err(|error| format!("{kind} was not disabled: {error}"))?;
     save(&workspace, &services)?;
     println!("{}", retired.display_id());
     write_err(&format!(
-        "disabled {kind}; {} is retired (a re-enable mints a fresh id)\n",
+        "disabled {kind}; {} is retired (a re-enable mints a fresh id) · retracted at height \
+         {height}\n",
         retired.display_id()
     ))?;
-    // the node retracts its announce on the next tick (the grant is re-read
-    // there), but a RUNNING daemon keeps executing the work it already holds:
-    // it read its grant once, at its own boot. Stopping it is the operator's
-    // act, so say so rather than implying revocation is instant.
+    // the announce is already retracted above, but a RUNNING daemon keeps
+    // executing the work it already holds: it read its grant once, at its own
+    // boot. Stopping it is the operator's act, so say so rather than implying
+    // revocation is instant.
     if daemon_for(&kind).is_some() {
         write_err(&format!(
             "  stop the daemon too: a running `service run {kind}` keeps \
@@ -1983,11 +2079,14 @@ mod tests {
     #[test]
     fn a_non_terminal_destination_receives_no_escape_sequences() {
         let rows = every_state();
+        let offered = signaling("compute");
         let plan = EnablePlan {
             kind: "compute".into(),
             chain_id: "dukenet#03f6df3d".into(),
             node_id: NODE_A,
-            offered: Some(signaling("compute")),
+            grant: mint_grant("compute", NODE_A, &offered),
+            announce: crate::announce::AnnounceSet::default(),
+            offered: Some(offered),
         };
         let rendered = [
             render_list(&rows),
