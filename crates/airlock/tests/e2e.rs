@@ -452,12 +452,26 @@ fn self_host_cfg(
 
 /// An upstream that echoes back the `Authorization` header the gateway sent, so a
 /// round-trip reveals exactly which credential's token the proxy planted.
+///
+/// This is the ONE fixture that stands in for BOTH vendors, so it must serve
+/// every shape `server::upstream_path` can produce from the caller's
+/// `/v1/messages` — claude passes through, codex has its `/v1` stripped (the
+/// ChatGPT backend serves `/responses` under `/backend-api/codex`, with no
+/// `/v1`). A fixture that knows only one vendor's shape does not fail loudly: it
+/// 404s, the echo comes back EMPTY, and the assertion blames the credential.
+/// That is how this went red and stayed red — add the new shape here when a
+/// third credential kind lands, not after the next bisect.
 async fn boot_echo_upstream() -> String {
     async fn echo(headers: HeaderMap) -> Response {
         let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
         ([("content-type", "text/plain")], got).into_response()
     }
-    spawn(Router::new().route("/v1/messages", post(echo))).await
+    spawn(
+        Router::new()
+            .route("/v1/messages", post(echo)) // claude: pass-through
+            .route("/messages", post(echo)), // codex: `/v1` stripped
+    )
+    .await
 }
 
 /// Open a session for `name` and POST once; return the `Authorization` header the
