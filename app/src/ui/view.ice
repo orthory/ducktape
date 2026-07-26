@@ -6,9 +6,9 @@ component StatusBadge(label:str)
       "paused"
         Badge.Warning label=label
       "open"
-        Badge.Warning label=label
+        Badge.Success label=label
       "closed"
-        Badge.Outline label=label
+        Badge.Destructive label=label
       "merged"
         Badge.Success label=label
       "passed"
@@ -133,14 +133,13 @@ view
             if !empty(active_channel)
               col w=fill gap=12.0
                 row w=fill h=32.0 gap=9.0 align=center
-                  text "#" size=16.0 wrap=none font=display @text-brand
+                  text "#" size=16.0 wrap=none font=display @text-fg
                   text active_channel_name size=16.0 wrap=none font=display @text-fg
                   if active_channel_archived
                     box p=2.0 pl=7.0 pr=7.0 bg=fg/6 border=fg/13 border-w=1.0 r=6.0
                       text "Archived" size=9.0 wrap=none font=code_semibold @text-muted
                   if active_channel_members_only
-                    box p=2.0 pl=7.0 pr=7.0 bg=brand/14 border=brand/26 border-w=1.0 r=6.0
-                      text "Members only" size=9.0 wrap=none font=code_semibold @text-brand
+                    Badge.Outline label="Members only"
                   if active_channel_huddle_count > 0
                     box p=2.0 pl=7.0 pr=7.0 bg=success_bg border=success_line border-w=1.0 r=6.0
                       row gap=5.0 align=center
@@ -177,13 +176,13 @@ view
             if connected && empty(messages)
               EmptyState title="No messages yet" description="Create a channel or start the conversation."
             if connected && !empty(messages) && history_view
-              box w=fill h=32.0 pl=10.0 pr=6.0 bg=brand/12 border=brand/26 border-w=1.0 r=9.0
+              box w=fill h=32.0 pl=10.0 pr=6.0 bg=warning_bg border=warning_line border-w=1.0 r=9.0
                 row w=fill h=fill gap=8.0 align=center
-                  text "Viewing history" w=fill size=12.5 wrap=none @text-brand
+                  text "Viewing history" w=fill size=12.5 wrap=none @text-warning
                   button "Jump to latest" h=24.0 p=5.0 @ghost_action -> choose_channel(active_channel)
-                    active bg=brand/16 text=fg border=brand/30 border-w=1.0 r=7.0
-                    hovered bg=brand/24 text=fg
-                    pressed bg=brand/30 text=fg
+                    active bg=surface text=fg border=warning_line border-w=1.0 r=7.0
+                    hovered bg=warning_bg text=fg
+                    pressed bg=accent text=fg
             if connected && !empty(messages)
               stack w=fill h=fill
                 mouse move=chat_pointer_moved
@@ -781,8 +780,8 @@ view
                               text "▸" w=14.0 size=12.0 align-x=center @text-muted
                               text entry.name w=fill size=13.0 wrap=none font=medium @text-fg
                             active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
-                            hovered bg=brand/10 text=fg
-                            pressed bg=brand/16
+                            hovered bg=row_hover text=fg
+                            pressed bg=accent
                         if entry.kind != "dir"
                           row w=fill gap=2.0 align=center
                             button label="Preview file" w=fill p=6.0 @ghost_action -> fs_open_file(entry.path)
@@ -791,8 +790,8 @@ view
                                 text entry.name w=fill size=13.0 wrap=none @text-fg
                                 text entry.size size=12.0 wrap=none font=code @text-muted
                               active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
-                              hovered bg=brand/10 text=fg
-                              pressed bg=brand/16
+                              hovered bg=row_hover text=fg
+                              pressed bg=accent
                             if entry.path == fs_delete_target
                               button "rm!" label="Confirm delete" disabled=fs_loading w=34.0 h=22.0 p=0.0 @danger_action -> fs_delete_submit
                             if entry.path != fs_delete_target
@@ -816,7 +815,7 @@ view
                           text "No differences." size=12.5 @text-muted
                         for entry in fs_diff
                           row w=fill gap=8.0 align=center
-                            text entry.kind w=64.0 size=12.0 wrap=none font=code @text-brand
+                            text entry.kind w=64.0 size=12.0 wrap=none font=code @text-muted
                             text entry.path w=fill size=12.0 wrap=none font=code @text-fg
                     if empty(fs_diff_from)
                       col w=fill gap=4.0
@@ -824,7 +823,7 @@ view
                           box w=fill p=7.0 bg=surface border=fg/10 border-w=1.0 r=8.0
                             col w=fill gap=2.0
                               row w=fill gap=8.0 align=center
-                                text snapshot.short_id size=12.0 wrap=none font=code @text-brand
+                                text snapshot.short_id size=12.0 wrap=none font=code @text-fg
                                 text snapshot.height size=12.0 wrap=none font=code @text-muted
                                 space w=fill
                                 text snapshot.author size=12.0 wrap=none font=code @text-muted
@@ -872,9 +871,9 @@ view
         row w=fill h=28.0 gap=10.0 align=center
           text "Network members" size=16.0 font=display @text-fg
           space w=fill
-          text members_validators size=12.0 wrap=none font=code @text-brand
+          text members_validators size=12.0 wrap=none font=code @text-fg
           text "validators" size=12.5 wrap=none @text-muted
-          text members_residents size=12.0 wrap=none font=code @text-brand
+          text members_residents size=12.0 wrap=none font=code @text-fg
           text "residents" size=12.5 wrap=none @text-muted
         if empty(members_rows)
           EmptyState title="No members yet" description="Validators and residents appear as they join."
@@ -885,10 +884,9 @@ view
                 box w=fill p=8.0 bg=muted_bg border=fg/8 border-w=1.0 r=9.0
                   row w=fill gap=10.0 align=center
                     text member.label size=12.0 wrap=none font=code @text-fg
-                    Badge label=member.role
+                    Badge.Outline label=member.role
                     if member.is_this_node
-                      box h=18.0 pl=6.0 pr=6.0 align-y=center bg=brand/14 border=brand/30 border-w=1.0 r=9.0
-                        text "this node" size=9.0 wrap=none font=code_semibold @text-brand
+                      Badge.Outline label="this node"
                     space w=fill
                     text member.key size=12.0 wrap=none font=code @text-muted
     agents:
@@ -920,7 +918,7 @@ view
         row w=fill h=28.0 gap=8.0 align=center
           text "Forge" size=16.0 font=display @text-fg
           if !empty(forge_repo)
-            text forge_repo size=12.0 wrap=none font=code @text-brand
+            text forge_repo size=12.0 wrap=none font=code @text-fg
           space w=fill
         if empty(forge_repos)
           EmptyState title="No repos" description="Consensus-backed repos appear here once created."
@@ -933,8 +931,8 @@ view
                     text repo.name w=fill size=13.0 wrap=none font=medium @text-fg
                     text repo.head size=12.0 wrap=none font=code @text-muted
                   active bg=muted_bg text=fg border=fg/8 border-w=1.0 r=9.0
-                  hovered bg=brand/10 text=fg
-                  pressed bg=brand/16
+                  hovered bg=row_hover text=fg
+                  pressed bg=accent
         if !empty(forge_repo) && forge_item_number <= 0
           col w=fill h=fill gap=6.0
             if !empty(forge_branches)
@@ -952,12 +950,12 @@ view
                     button label="Open item" w=fill p=7.0 @ghost_action -> forge_open_item(item.number)
                       row w=fill h=fill gap=8.0 align=center
                         text item.number size=12.0 wrap=none font=code @text-muted
-                        Badge label=item.kind
+                        Badge.Outline label=item.kind
                         text item.title w=fill size=13.0 wrap=none @text-fg
                         StatusBadge label=item.state
                       active bg=muted_bg text=fg border=fg/8 border-w=1.0 r=8.0
-                      hovered bg=brand/10 text=fg
-                      pressed bg=brand/16
+                      hovered bg=row_hover text=fg
+                      pressed bg=accent
         if forge_item_number > 0
           col w=fill h=fill gap=6.0
             row w=fill gap=8.0 align=center
@@ -966,7 +964,7 @@ view
                 hovered bg=fg/10 text=fg
                 pressed bg=fg/14
               text forge_item_title w=fill size=14.0 wrap=none font=display @text-fg
-              Badge label=forge_item_kind
+              Badge.Outline label=forge_item_kind
               StatusBadge label=forge_item_state
             row w=fill gap=8.0 align=center
               if !empty(forge_item_author)
@@ -992,13 +990,13 @@ view
                     col w=fill gap=6.0
                       row w=fill gap=6.0 align=center
                         text "Merge" w=fill size=14.0 font=display @text-fg
-                        text forge_item_approvals size=12.0 wrap=none font=code @text-brand
+                        text forge_item_approvals size=12.0 wrap=none font=code @text-success
                         text "approvals" size=12.5 wrap=none @text-muted
-                        text "·" size=11.0 wrap=none @text-muted
+                        text "·" size=11.0 wrap=none font=code_medium @text-muted
                         text forge_item_change_requests size=12.0 wrap=none font=code @text-muted
                         text "change requests" size=12.5 wrap=none @text-muted
                       if forge_item_state == "merged"
-                        text forge_merge_note(forge_item_merge_oid, forge_item_branches) size=12.0 font=code @text-brand
+                        text forge_merge_note(forge_item_merge_oid, forge_item_branches) size=12.0 font=code @text-success
                       if forge_item_state == "closed"
                         text "Closed without merging." size=12.5 @text-muted
                       if forge_item_state == "open"
@@ -1025,9 +1023,9 @@ view
                             row w=fill gap=7.0 align=center
                               text review.author_name size=14.0 wrap=none font=display @text-fg
                               if review.verdict == "approve"
-                                text verdict_label(review.verdict) size=10.5 wrap=none font=code_medium @text-brand
+                                text verdict_label(review.verdict) size=10.5 wrap=none font=code_medium @text-success
                               if review.verdict != "approve"
-                                text verdict_label(review.verdict) size=10.5 wrap=none font=code_medium @text-muted
+                                text verdict_label(review.verdict) size=10.5 wrap=none font=code_medium @text-danger
                               text review.commit size=12.0 wrap=none font=code @text-muted
                               if review.outdated
                                 text "outdated" size=9.0 wrap=none font=code_semibold @text-muted
@@ -1098,16 +1096,16 @@ view
                   col w=fill gap=4.0
                     row w=fill gap=8.0 align=center
                       text proposal.id size=14.0 wrap=none font=display @text-fg
-                      Badge label=proposal.action
+                      Badge.Outline label=proposal.action
                       StatusBadge label=proposal.status
                       space w=fill
                       text proposal.proposer size=12.0 wrap=none font=code @text-muted
                     row w=fill gap=8.0 align=center
-                      text proposal.approvals size=12.0 wrap=none font=code @text-brand
+                      text proposal.approvals size=12.0 wrap=none font=code @text-success
                       text "for" size=12.5 wrap=none @text-muted
                       text proposal.rejections size=12.0 wrap=none font=code @text-muted
                       text "against" size=12.5 wrap=none @text-muted
-                      text "·" size=11.0 wrap=none @text-muted
+                      text "·" size=11.0 wrap=none font=code_medium @text-muted
                       text proposal.electorate size=12.0 wrap=none font=code @text-muted
                       text "electorate" size=12.5 wrap=none @text-muted
                       space w=fill
@@ -1135,7 +1133,7 @@ view
               for peer in node_peers
                 row w=fill gap=8.0 align=center
                   if peer.live
-                    box w=7.0 h=7.0 bg=success r=3.5
+                    box w=7.0 h=7.0 bg=success_dot r=3.5
                       text ""
                   if !peer.live
                     box w=7.0 h=7.0 bg=fg/30 r=3.5
@@ -1178,7 +1176,7 @@ view
                     row w=fill gap=8.0 align=center
                       text "Account" w=120.0 size=10.0 font=code_semibold @text-muted
                       text account_id size=12.0 wrap=none font=code @text-muted
-                      text "·" size=11.0 wrap=none @text-muted
+                      text "·" size=11.0 wrap=none font=code_medium @text-muted
                       text account_members size=12.0 wrap=none font=code @text-muted
                       text "keys" size=12.5 wrap=none @text-muted
                       text account_nodes size=12.0 wrap=none font=code @text-muted
@@ -1201,7 +1199,13 @@ view
                 text "IDENTITY" size=10.0 font=code_semibold @text-muted
                 row w=fill gap=8.0 align=center
                   text "User key" w=120.0 size=10.0 font=code_semibold @text-muted
-                  text settings_key_state w=fill size=12.0 wrap=none font=code @text-brand
+                  match settings_key_state
+                    "encrypted"
+                      text settings_key_state w=fill size=12.0 wrap=none font=code @text-success
+                    "PLAINTEXT — secure it"
+                      text settings_key_state w=fill size=12.0 wrap=none font=code @text-danger
+                    _
+                      text settings_key_state w=fill size=12.0 wrap=none font=code @text-muted
                 row w=fill gap=8.0 align=center
                   text "Key path" w=120.0 size=10.0 font=code_semibold @text-muted
                   text settings_key_path w=fill size=12.0 wrap=none font=code @text-muted
@@ -1238,12 +1242,12 @@ view
                   for block in explorer_blocks
                     button label="Inspect block" w=fill p=6.0 @ghost_action -> select_explorer_block(block.height)
                       row w=fill h=fill gap=8.0 align=center
-                        text block.height size=12.0 wrap=none font=code @text-brand
+                        text block.height size=12.0 wrap=none font=code @text-fg
                         text block.hash w=fill size=12.0 wrap=none font=code @text-muted
                         text block.op_count size=12.0 wrap=none font=code @text-muted
                       active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
-                      hovered bg=brand/10 text=fg
-                      pressed bg=brand/16
+                      hovered bg=row_hover text=fg
+                      pressed bg=accent
             box w=fill h=fill p=8.0 bg=muted_bg border=fg/10 border-w=1.0 r=10.0
               stack w=fill h=fill
                 if explorer_selected <= 0
@@ -1289,8 +1293,8 @@ view
                                 text hit.text size=13.0 wrap=none @text-fg
                                 text hit.meta size=11.0 wrap=none font=code_medium @text-muted
                               active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-                              hovered bg=brand/12 text=fg
-                              pressed bg=brand/18
+                              hovered bg=row_hover text=fg
+                              pressed bg=accent
                       if !empty(palette_page_hits)
                         box w=fill pl=4.0
                           text "PAGES" size=10.0 font=code_semibold @text-muted
@@ -1301,8 +1305,8 @@ view
                                 text hit.text size=13.0 wrap=none @text-fg
                                 text hit.kind size=12.0 wrap=none font=code @text-muted
                               active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-                              hovered bg=brand/12 text=fg
-                              pressed bg=brand/18
+                              hovered bg=row_hover text=fg
+                              pressed bg=accent
     bell:
       stack w=fill h=fill
         if bell_open

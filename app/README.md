@@ -31,6 +31,7 @@ renderer-owned. Depth comes from surface steps and warm shadows.
 | `muted_bg` | `#f6f5f2` | recessed wells and quiet regions |
 | `sidebar` | `#fbfbf9` | opaque utility bars inside content |
 | `elevated` | `#f3f2ef` | panels one notch above the canvas |
+| `row_hover` | `#f8f7f3` | ordinary row hover |
 | `fg` / `muted` | `#2c2b27` / `#6b6962` | warm ink and its secondary |
 | `primary` | `#26251f` | neutral primary actions and focus |
 | `brand` | `#a05a3c` | mentions, unread state, and action links |
@@ -53,9 +54,9 @@ Shared color, shape, recipes, and components come from the pinned
 crate owns only application font assets and the product type scale; drift
 guards hold the Ice sources to both authorities.
 
-- Faces: **Geist** (UI), **Geist Mono** (data — hashes, seqs, diffs, logs;
-  never a label), **IBM Plex Sans KR** as the per-glyph CJK fallback. The
-  files are embedded from `crates/design/assets/fonts/` at build time.
+- Faces: **Geist** (UI), **Geist Mono** (machine values, metadata, field
+  labels, and badges), **IBM Plex Sans KR** as the per-glyph CJK fallback.
+  The files are embedded from `crates/design/assets/fonts/` at build time.
 - Scale: 22 display · 20 screen title · 16 section · 14 pane header · 13.5
   body · 13 list · 12.5 caption · 12 machine value · 11/10.5 meta · 10 field
   label · 9.5 navigation · 9 badge.

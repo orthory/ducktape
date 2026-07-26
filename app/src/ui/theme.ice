@@ -13,6 +13,7 @@ theme
   sidebar #fbfbf9
   elevated #f3f2ef
   subtle #ecebe6
+  row_hover #f8f7f3
   rail_hover #f0efea
   separator #efeee9
   scrim #28262257

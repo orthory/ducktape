@@ -28,14 +28,14 @@ component TitleBar(status:str, loading:bool, degraded:bool, bell_badge:i64)
         text "Working…" size=12.0 wrap=none @text-muted
       if !loading && !degraded
         row gap=6.0 align=center
-          box w=7.0 h=7.0 bg=success r=3.5
+          box w=7.0 h=7.0 bg=success_dot r=3.5
             text ""
           text status size=12.0 wrap=none @text-muted
 
 component ConnectionBanner(status:str)
-  box w=fill h=30.0 pl=14.0 pr=14.0 bg=danger/12 border=danger/30 border-w=1.0
+  box w=fill h=30.0 pl=14.0 pr=14.0 bg=danger_bg border=danger_line border-w=1.0
     row w=fill h=fill gap=8.0 align=center
-      box w=7.0 h=7.0 bg=danger r=3.5
+      box w=7.0 h=7.0 bg=danger_dot r=3.5
         text ""
       text "Connection degraded" size=13.0 wrap=none font=medium @text-fg
       text status w=fill size=13.0 wrap=none @text-muted

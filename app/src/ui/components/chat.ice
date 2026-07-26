@@ -4,12 +4,12 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
       button label=channel.name w=fill h=34.0 p=7.0 @ghost_action -> choose_channel(channel.id)
         row w=fill h=fill gap=9.0 align=center
           if channel.members_only
-            text "◆" w=16.0 size=12.0 align-x=center @text-brand
+            text "◆" w=16.0 size=12.0 align-x=center @text-fg
           if !channel.members_only
-            text "#" w=16.0 size=13.0 align-x=center font=medium @text-brand
+            text "#" w=16.0 size=13.0 align-x=center font=medium @text-fg
           text channel.name w=fill size=13.0 wrap=none font=medium @text-fg
           if channel.huddle_count > 0
-            text channel.huddle_count size=9.0 font=code_semibold @text-brand
+            text channel.huddle_count size=9.0 font=code_semibold @text-success
         active bg=subtle text=fg border=transparent border-w=1.0 r=9.0
         hovered bg=rail_hover text=fg
         pressed bg=subtle text=fg
@@ -71,7 +71,7 @@ component MessageBody(message:ChatMessage)
               text block.lang size=10.5 wrap=none font=code_medium @text-muted
             text block.text w=fill size=12.0 line-h=1.5 font=code wrap=word @text-fg
       if block.kind == "quote"
-        box w=fill p=9.0 pl=13.0 bg=brand/9 border=brand/20 border-w=1.0 r=8.0
+        box w=fill p=9.0 pl=13.0 bg=muted_bg border=border border-w=1.0 r=8.0
           col w=fill
             if block.rich
               RichLine block=block
@@ -143,7 +143,7 @@ component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled
         box w=fill p=8.0 pl=10.0 pr=10.0 bg=transparent border=transparent border-w=1.0 r=10.0
           MessageContents message=message
       if !message.deleted && selected
-        box w=fill p=8.0 pl=10.0 pr=10.0 bg=brand/10 border=brand/22 border-w=1.0 r=10.0
+        box w=fill p=8.0 pl=10.0 pr=10.0 bg=accent border=border border-w=1.0 r=10.0
           MessageContents message=message
       if !message.deleted && !selected && hovered
         box w=fill p=8.0 pl=10.0 pr=10.0 bg=fg/4 border=fg/7 border-w=1.0 r=10.0
@@ -212,7 +212,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, hovered:bool, di
         box w=fill p=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
           ThreadMessageBody message=message
       if !message.deleted && selected
-        box w=fill p=8.0 bg=brand/10 border=brand/22 border-w=1.0 r=9.0
+        box w=fill p=8.0 bg=accent border=border border-w=1.0 r=9.0
           ThreadMessageBody message=message
       if !message.deleted && !selected && hovered
         box w=fill p=8.0 bg=fg/4 border=fg/7 border-w=1.0 r=9.0

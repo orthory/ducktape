@@ -43,6 +43,19 @@ mod tests {
         app.reply_editor.text().trim().to_string()
     }
 
+    #[test]
+    fn full_view_fits_a_four_mib_stack() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let (app, _) = Ducktape::__boot();
+                let _ = app.__view();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     fn default_ice_color(name: &str) -> iced::Color {
         let source = include_str!("ui/ducktape-ui/default.ice");
         let value = source
@@ -1312,6 +1325,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             "sidebar #fbfbf9",
             "elevated #f3f2ef",
             "subtle #ecebe6",
+            "row_hover #f8f7f3",
             "rail_hover #f0efea",
             "separator #efeee9",
             "scrim #28262257",
@@ -1443,6 +1457,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         }
 
         let view = include_str!("ui/view.ice");
+        let shell = include_str!("ui/components/shell.ice");
         let chat = include_str!("ui/components/chat.ice");
         let pages = include_str!("ui/components/pages.ice");
 
@@ -1451,6 +1466,18 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert_recipe_owns_states("chat.ice", chat, "@danger_action");
         assert_recipe_owns_states("pages.ice", pages, "@danger_action");
         assert!(!view.contains("active bg=brand text=fg"));
+        assert!(!view.contains("hovered bg=brand/10"));
+        assert!(!view.contains("hovered bg=brand/12"));
+        assert!(!view.contains("font=code @text-brand"));
+        assert!(!chat.contains("bg=brand/10 border=brand/22"));
+        assert!(!chat.contains("bg=brand/9 border=brand/20"));
+        assert!(view.contains("Badge.Outline label=\"Members only\""));
+        assert!(view.contains("Badge.Outline label=item.kind"));
+        assert!(shell.contains("bg=success_dot r=3.5"));
+        assert!(shell.contains("bg=danger_bg border=danger_line"));
+        assert!(shell.contains("bg=danger_dot r=3.5"));
+        assert!(view.contains("\"encrypted\"\n                      text settings_key_state w=fill size=12.0 wrap=none font=code @text-success"));
+        assert!(view.contains("\"PLAINTEXT — secure it\"\n                      text settings_key_state w=fill size=12.0 wrap=none font=code @text-danger"));
 
         for target in [
             "rename_channel_submit",
@@ -1513,8 +1540,8 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         for mapping in [
             "\"active\"\n        Badge.Success label=label",
             "\"paused\"\n        Badge.Warning label=label",
-            "\"open\"\n        Badge.Warning label=label",
-            "\"closed\"\n        Badge.Outline label=label",
+            "\"open\"\n        Badge.Success label=label",
+            "\"closed\"\n        Badge.Destructive label=label",
             "\"merged\"\n        Badge.Success label=label",
             "\"passed\"\n        Badge.Success label=label",
             "\"rejected\"\n        Badge.Destructive label=label",
@@ -1558,6 +1585,29 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
                         "{name}: {size} is off the design scale — change design::type_scale, not the view: {line:?}"
                     );
                 }
+                if !line.trim_start().starts_with("text ") {
+                    continue;
+                }
+                for (size, font) in [
+                    ("size=22.0", "font=display"),
+                    ("size=20.0", "font=display"),
+                    ("size=16.0", "font=display"),
+                    ("size=11.0", "font=code_medium"),
+                    ("size=10.5", "font=code_medium"),
+                    ("size=10.0", "font=code_semibold"),
+                    ("size=9.5", "font=display"),
+                    ("size=9.0", "font=code_semibold"),
+                ] {
+                    let has_size = line.split_whitespace().any(|token| token == size);
+                    if has_size {
+                        assert!(line.contains(font), "{name}: {line}");
+                    }
+                }
+                let is_caption = line.split_whitespace().any(|token| token == "size=12.5");
+                assert!(
+                    !is_caption || !line.contains("font="),
+                    "{name}: caption must stay weight 400: {line}"
+                );
             }
         }
 

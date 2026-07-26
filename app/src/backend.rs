@@ -34,7 +34,9 @@ pub use forge::client::{
     ForgeRefresh, ItemRow as ForgeItem, ReviewCommentRow as ForgeReviewComment,
     ReviewRow as ForgeReview,
 };
-pub use inbox::client::{BellDelta, BellItem, apply_bell_items as fold_bell_items};
+pub use inbox::client::{
+    BellDelta, BellItem, apply_bell_items as fold_bell_items,
+};
 pub use pages::client::PagesDelta;
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 const MAX_SIGNED_PAYLOAD_BYTES: usize = 23 * 1024;
@@ -331,6 +333,7 @@ pub struct LiveUpdate {
     /// one committed forge op's invalidation scope (`kind == "forge"`).
     pub forge: ForgeRefresh,
 }
+
 
 /// Custom command the multiline composer's key bindings raise. It carries no
 /// data: the only Custom binding is "send", routed straight to
@@ -671,11 +674,7 @@ pub fn channel_head_seq(channels: Vec<ChatChannel>, channel: String) -> i64 {
 // active-channel scalars re-derived from the (delta-folded) channel list,
 // keeping the current value when the channel is absent from the list.
 
-pub fn channel_display_name(
-    channels: Vec<ChatChannel>,
-    channel: String,
-    current: String,
-) -> String {
+pub fn channel_display_name(channels: Vec<ChatChannel>, channel: String, current: String) -> String {
     channels
         .iter()
         .find(|row| row.id == channel)
@@ -700,7 +699,11 @@ pub fn channel_flag_members_only(
         .map_or(current, |row| row.members_only)
 }
 
-pub fn channel_live_huddle_count(channels: Vec<ChatChannel>, channel: String, current: i64) -> i64 {
+pub fn channel_live_huddle_count(
+    channels: Vec<ChatChannel>,
+    channel: String,
+    current: i64,
+) -> i64 {
     channels
         .iter()
         .find(|row| row.id == channel)
@@ -1087,11 +1090,7 @@ pub async fn files_preview(
         let eof = reply["eof"].as_bool().unwrap_or(true);
         let bytes = base64_decode(b64).unwrap_or_default();
         let (text, binary) = match String::from_utf8(bytes.clone()) {
-            Ok(text)
-                if !text
-                    .chars()
-                    .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') =>
-            {
+            Ok(text) if !text.chars().any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') => {
                 (text, false)
             }
             _ => (format!("{} binary bytes", bytes.len()), true),
@@ -1112,7 +1111,10 @@ pub async fn files_preview(
 }
 
 /// The committed snapshot window, newest first.
-pub async fn files_history(rpc: String, generation: i64) -> Result<FsHistory, HydrationError> {
+pub async fn files_history(
+    rpc: String,
+    generation: i64,
+) -> Result<FsHistory, HydrationError> {
     async {
         let rpc = rpc_client(&rpc)?;
         let reply = rpc.files_get("history", &[("limit", "50")]).await?;
@@ -1202,7 +1204,11 @@ pub async fn files_remove(rpc: String, path: String) -> Result<bool, AppError> {
 }
 
 /// Write a text file (create or replace) as inline content.
-pub async fn files_write_text(rpc: String, path: String, text: String) -> Result<bool, AppError> {
+pub async fn files_write_text(
+    rpc: String,
+    path: String,
+    text: String,
+) -> Result<bool, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
         files_commit_one(
@@ -1227,7 +1233,11 @@ pub async fn files_write_text(rpc: String, path: String, text: String) -> Result
 /// Upload a local file dropped onto the window into the current directory:
 /// small files ride inline; larger ones stage 1 MiB chunks then commit a
 /// chunk list. The dropped path never leaves this device — only bytes do.
-pub async fn files_upload(rpc: String, dir: String, dropped: String) -> Result<bool, AppError> {
+pub async fn files_upload(
+    rpc: String,
+    dir: String,
+    dropped: String,
+) -> Result<bool, AppError> {
     async {
         let source = PathBuf::from(&dropped);
         let name = source
@@ -1400,7 +1410,9 @@ pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, H
         let mut members = Vec::new();
         let mut counts = (0i64, 0i64);
         for (query, role) in [("validators", "validator"), ("residents", "resident")] {
-            let reply: serde_json::Value = rpc.query("valset", &serde_json::json!(query)).await?;
+            let reply: serde_json::Value = rpc
+                .query("valset", &serde_json::json!(query))
+                .await?;
             let keys = reply[query].as_array().cloned().unwrap_or_default();
             match role {
                 "validator" => counts.0 = count_i64(keys.len()),
@@ -1515,9 +1527,7 @@ pub async fn load_governance(
                     approvals: count_i64(approvals),
                     rejections: count_i64(votes.len() - approvals),
                     electorate: count_i64(
-                        view["electorate"]
-                            .as_array()
-                            .map_or(0, |members| members.len()),
+                        view["electorate"].as_array().map_or(0, |members| members.len()),
                     ),
                     action,
                     status,
@@ -1657,9 +1667,7 @@ pub fn node_logs(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeL
     struct State {
         rpc: String,
         cursor: Option<String>,
-        stream: Option<
-            iced::futures::stream::BoxStream<'static, ducktape_rpc::Result<ducktape_rpc::LogLine>>,
-        >,
+        stream: Option<iced::futures::stream::BoxStream<'static, ducktape_rpc::Result<ducktape_rpc::LogLine>>>,
         retry_attempt: u32,
     }
     iced::futures::stream::unfold(
@@ -1687,13 +1695,7 @@ pub fn node_logs(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeL
                         }
                     }
                 }
-                match state
-                    .stream
-                    .as_mut()
-                    .expect("stream initialized")
-                    .next()
-                    .await
-                {
+                match state.stream.as_mut().expect("stream initialized").next().await {
                     Some(Ok(line)) => {
                         state.retry_attempt = 0;
                         state.cursor = Some(line.cursor.clone());
@@ -1823,14 +1825,8 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
                     .unwrap_or_default();
                 AgentRow {
                     id: record["agent_id"].as_str().unwrap_or_default().to_string(),
-                    name: record["display_name"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    capability: record["capability"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
+                    name: record["display_name"].as_str().unwrap_or_default().to_string(),
+                    capability: record["capability"].as_str().unwrap_or_default().to_string(),
                     actions: record["allowed_actions"]
                         .as_array()
                         .map(|actions| {
@@ -1908,10 +1904,7 @@ pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, H
             generation,
             bound: true,
             account_id: short_label(&hex_encode(&id_bytes)),
-            display_name: account["display_name"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+            display_name: account["display_name"].as_str().unwrap_or_default().to_string(),
             bio: account["bio"].as_str().unwrap_or_default().to_string(),
             members: count_i64(account["members"].as_array().map_or(0, |m| m.len())),
             nodes: count_i64(account["nodes"].as_array().map_or(0, |n| n.len())),
@@ -2028,16 +2021,10 @@ pub async fn load_forge_repo(
     async {
         let rpc = rpc_client(&rpc)?;
         let refs: serde_json::Value = rpc
-            .query(
-                "forge",
-                &serde_json::json!({ "list_refs": { "repo": repo } }),
-            )
+            .query("forge", &serde_json::json!({ "list_refs": { "repo": repo } }))
             .await?;
         let items: serde_json::Value = rpc
-            .query(
-                "forge",
-                &serde_json::json!({ "list_items": { "repo": repo } }),
-            )
+            .query("forge", &serde_json::json!({ "list_items": { "repo": repo } }))
             .await?;
         let branches = refs["refs"]
             .as_array()
@@ -2681,10 +2668,7 @@ pub async fn load_bell(rpc: String, generation: i64) -> Result<BellData, Hydrati
             )
             .await?;
         let unread: serde_json::Value = rpc
-            .view(
-                "inbox",
-                &serde_json::json!({ "unread": { "member": member } }),
-            )
+            .view("inbox", &serde_json::json!({ "unread": { "member": member } }))
             .await?;
         let mut items: Vec<BellItem> = listed["items"]
             .as_array()
@@ -2732,7 +2716,10 @@ pub async fn mark_bell_read(
         signed_write(
             &rpc,
             "inbox",
-            inbox::encode_msg(&inbox::InboxMsg::MarkRead { member, up_to_seq }),
+            inbox::encode_msg(&inbox::InboxMsg::MarkRead {
+                member,
+                up_to_seq,
+            }),
             password,
         )
         .await
@@ -3029,7 +3016,11 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
 /// Fold one applied op into a live update. A decode failure (payload or
 /// stamp) degrades to a scoped resync of that module — a CLIENT reloads,
 /// never wedges. `None` = the op is invisible to this UI.
-async fn folded_update(rpc: &str, module: &str, op: ducktape_rpc::StreamOp) -> Option<LiveUpdate> {
+async fn folded_update(
+    rpc: &str,
+    module: &str,
+    op: ducktape_rpc::StreamOp,
+) -> Option<LiveUpdate> {
     let height = i64::try_from(op.height).unwrap_or(i64::MAX);
     let Some(payload) = op
         .payload
@@ -3245,11 +3236,9 @@ pub async fn live_resync_load(
         let load_chat = planes == "chat" || planes == "both";
         let load_pages = planes == "pages" || planes == "both";
         if load_chat {
-            let chat = load_chat_data(
-                &rpc,
-                (!channel_id.is_empty()).then_some(channel_id.as_str()),
-            )
-            .await?;
+            let chat =
+                load_chat_data(&rpc, (!channel_id.is_empty()).then_some(channel_id.as_str()))
+                    .await?;
             refresh.chat_loaded = true;
             refresh.channels = chat.channels;
             refresh.messages = chat.messages;
@@ -3798,12 +3787,12 @@ pub async fn send_reply(
             channel_id: operation_scope.clone(),
         })
         .map_err(|cause: AppError| OptimisticMutationError {
-            message: cause.message,
-            committed: cause.committed,
-            operation_id,
-            scope_id: operation_scope,
-            body: operation_body,
-        })
+        message: cause.message,
+        committed: cause.committed,
+        operation_id,
+        scope_id: operation_scope,
+        body: operation_body,
+    })
 }
 
 pub async fn edit_message(
@@ -4580,8 +4569,8 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
         .iter()
         .find(|info| info.channel.id == active_channel);
     let active_channel_archived = active_wire_channel.is_some_and(|info| info.channel.archived);
-    let active_channel_members_only =
-        active_wire_channel.is_some_and(|info| info.channel.post_policy == PostPolicy::MembersOnly);
+    let active_channel_members_only = active_wire_channel
+        .is_some_and(|info| info.channel.post_policy == PostPolicy::MembersOnly);
     let active_channel_huddle_count =
         active_wire_channel.map_or(0, |info| count_i64(info.channel.huddle.len()));
     let active_channel_head_seq = active_wire_channel.map_or(0, |info| info.head_seq);
@@ -4748,7 +4737,11 @@ async fn load_messages_around(
         .collect())
 }
 
-async fn load_message_at(rpc: &RpcClient, channel_id: &str, seq: u64) -> Result<MsgRow, String> {
+async fn load_message_at(
+    rpc: &RpcClient,
+    channel_id: &str,
+    seq: u64,
+) -> Result<MsgRow, String> {
     let reply: ChatViewReply = rpc
         .view(
             "chat",
@@ -4840,6 +4833,7 @@ pub fn prepend_history(messages: Vec<ChatMessage>, older: Vec<ChatMessage>) -> V
     mark_message_groups(&mut merged);
     merged
 }
+
 
 /// One thread's root plus its complete reply run, walked over the view's reply
 /// cursor to exhaustion.
@@ -5589,10 +5583,7 @@ pub fn next_doc_tab(tabs: Vec<String>, closed: String, active: String) -> String
     if closed != active {
         return active;
     }
-    tabs.into_iter()
-        .rev()
-        .find(|tab| *tab != closed)
-        .unwrap_or_default()
+    tabs.into_iter().rev().find(|tab| *tab != closed).unwrap_or_default()
 }
 
 fn user_key_path() -> Result<PathBuf, String> {
@@ -6124,11 +6115,7 @@ mod tests {
             b"hello duckfs \xf0\x9f\xa6\x86".as_slice(),
         ] {
             let encoded = base64_encode(sample);
-            assert_eq!(
-                base64_decode(&encoded).as_deref(),
-                Some(sample),
-                "{encoded}"
-            );
+            assert_eq!(base64_decode(&encoded).as_deref(), Some(sample), "{encoded}");
         }
         assert_eq!(base64_encode(b"abc"), "YWJj");
         assert_eq!(base64_encode(b"ab"), "YWI=");
@@ -6155,6 +6142,7 @@ mod tests {
         assert!(parse_user_key_status("absent\n").is_none());
         assert!(parse_user_key_status(&format!("plaintext {public_key}\n")).is_none());
     }
+
 
     #[test]
     fn post_commit_hydration_errors_are_not_retryable() {
@@ -7212,16 +7200,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mirror = git2::Repository::init_bare(dir.path()).unwrap();
         let base = mirror_commit(&mirror, None, &[("a.txt", "base\n"), ("b.txt", "keep\n")]);
-        let ours = mirror_commit(
-            &mirror,
-            Some(base),
-            &[("a.txt", "ours\n"), ("b.txt", "keep\n")],
-        );
-        let theirs = mirror_commit(
-            &mirror,
-            Some(base),
-            &[("a.txt", "base\n"), ("b.txt", "theirs\n")],
-        );
+        let ours = mirror_commit(&mirror, Some(base), &[("a.txt", "ours\n"), ("b.txt", "keep\n")]);
+        let theirs =
+            mirror_commit(&mirror, Some(base), &[("a.txt", "base\n"), ("b.txt", "theirs\n")]);
 
         let build = merge_against_mirror(&mirror, ours, theirs, "Merge pull request #1").unwrap();
         let MergeBuild::Clean { merge_oid, pack } = build else {
