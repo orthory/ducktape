@@ -22,10 +22,10 @@ use zeroize::{Zeroize as _, Zeroizing};
 pub use chat::client::{
     ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage, ChatReaction, ChatSpan,
     append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
-    apply_chat_thread, author_name, chat_message, contains_pending_message,
-    mark_message_groups, merge_message_send_result, merge_pending_messages,
-    merge_thread_reply, optimistic_message, paragraph_blocks, parse_message_with_members,
-    rollback_pending_message, short_label, thread_offset_after_reply,
+    apply_chat_thread, author_name, chat_message, contains_pending_message, mark_message_groups,
+    merge_message_send_result, merge_pending_messages, merge_thread_reply, optimistic_message,
+    paragraph_blocks, parse_message_with_members, rollback_pending_message, short_label,
+    thread_offset_after_reply,
 };
 // forge's client view model, same arrangement: the tracker rows, the item
 // pane (reviews + merge-box tallies), and the op-refresh classification.
@@ -1092,7 +1092,11 @@ pub async fn files_preview(
         let eof = reply["eof"].as_bool().unwrap_or(true);
         let bytes = base64_decode(b64).unwrap_or_default();
         let (text, binary) = match String::from_utf8(bytes.clone()) {
-            Ok(text) if !text.chars().any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') => {
+            Ok(text)
+                if !text
+                    .chars()
+                    .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') =>
+            {
                 (text, false)
             }
             _ => (format!("{} binary bytes", bytes.len()), true),
@@ -5725,10 +5729,15 @@ fn live_resync(module: &str, height: i64) -> LiveUpdate {
     update
 }
 
- /// Container style for a per-author avatar: the data-driven tint fill with a
+/// Container style for a per-author avatar: the data-driven tint fill with a
 /// rounded-square radius and a soft drop shadow. `bg=` only takes static colors,
 /// so the dynamic tint rides in through a `container-style` extern.
-pub fn avatar_style(_theme: &iced::Theme, r: f64, g: f64, b: f64) -> iced::widget::container::Style {
+pub fn avatar_style(
+    _theme: &iced::Theme,
+    r: f64,
+    g: f64,
+    b: f64,
+) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(iced::Background::Color(iced::Color::from_rgb(
             r as f32, g as f32, b as f32,
@@ -7103,7 +7112,6 @@ mod tests {
                 target: target.into(),
                 payload,
             },
-            None,
         );
         rpc.submit_frame(frame).await.unwrap();
     }

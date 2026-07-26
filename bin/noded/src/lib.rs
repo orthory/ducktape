@@ -741,7 +741,7 @@ async fn submit_frame(
         // the origin is DELIBERATELY dropped here: the http layer never tells an
         // actor who signed — the actor re-derives that from the bytes (or, on
         // the validator, `submit_frame` does). one authority on authorship.
-        Ok((_origin, msg, _cont)) => msg.payload,
+        Ok((_origin, msg)) => msg.payload,
         Err(err) => return error_response(StatusCode::BAD_REQUEST, &err.to_string()),
     };
     let (reply, rx) = oneshot::channel();

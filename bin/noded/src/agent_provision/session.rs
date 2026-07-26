@@ -228,7 +228,7 @@ async fn run_action(
     // concurrently even though normal MCP clients are serial, so keep frames
     // from overtaking each other at the actor boundary.
     let mut next_seq = state.seq.lock().await;
-    let frame = node::encode_frame(&state.signer, *next_seq, &msg, None);
+    let frame = node::encode_frame(&state.signer, *next_seq, &msg);
     *next_seq += 1;
     match state.node.submit_frame(frame).await {
         Ok(()) => action_response(StatusCode::OK, "ok"),

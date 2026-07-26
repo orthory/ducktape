@@ -1024,16 +1024,7 @@ fn run_sim(
                     // already refused it, and this decode is the second wall.
                     Some(NodeCommand::SubmitFrame { frame, reply }) => {
                         match node::decode_frame(&frame) {
-                            // the sim's single-op lane has no batch path to
-                            // release a continuation on — refuse loudly rather
-                            // than silently strip it off a signed frame.
-                            Ok((_origin, _msg, Some(_cont))) => {
-                                let _ = reply.send(Err(
-                                    "continuation envelopes are not supported on the sim frame lane"
-                                        .to_string(),
-                                ));
-                            }
-                            Ok((origin, msg, None)) => {
+                            Ok((origin, msg)) => {
                                 sim.handle_submit(origin, msg, reply).await;
                             }
                             Err(err) => {
@@ -1252,7 +1243,6 @@ impl Sim {
             self.node.submit_decoded(BlockOp {
                 origin,
                 msg,
-                continuation: None,
                 frame: [0u8; 32],
             });
         }

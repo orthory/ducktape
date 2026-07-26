@@ -273,7 +273,7 @@ impl ResidentRelay {
         self.seq += 1;
         std::fs::write(&self.seq_file, self.seq.to_string())
             .map_err(|e| format!("cannot persist the submit seq: {e}"))?;
-        let frame = node::encode_frame(signer, self.seq, &Msg { target, payload }, None);
+        let frame = node::encode_frame(signer, self.seq, &Msg { target, payload });
         let frame_id = node::frame_id(&frame);
         Ok((frame_id, frame, custodian))
     }
@@ -749,8 +749,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay-submit-seq");
         std::fs::write(&path, "41").unwrap();
-        let relay =
-            ResidentRelay::new(path.clone(), std::sync::Arc::new(blobstore::BlobHandle::default()));
+        let relay = ResidentRelay::new(
+            path.clone(),
+            std::sync::Arc::new(blobstore::BlobHandle::default()),
+        );
         assert_eq!(relay.seq, 41);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "41");
     }

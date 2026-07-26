@@ -64,7 +64,6 @@ fn a_signed_frame_commits_under_its_verified_signer() {
         &signer,
         1,
         &chat_frame_op(create_channel("general", "General")),
-        None,
     );
     let (code, receipt) = sim.submit_frame(&frame);
     assert_eq!(code, 200, "a valid frame commits: {receipt}");
@@ -105,7 +104,6 @@ fn a_tampered_frame_is_refused_with_no_block() {
         &signer,
         1,
         &chat_frame_op(create_channel("general", "General")),
-        None,
     );
     // flip one PAYLOAD byte: the trailing bytes are cont_flag (1) + signature
     // (64), so the payload's last byte sits at len - 66. the signature binds
@@ -140,7 +138,7 @@ fn a_files_commit_over_a_frame_is_authored_by_the_verified_key() {
 
     // a user-signed commit: the signer key authors it.
     let signer = Ed::from_seed(11);
-    let frame = node::encode_frame(&signer, 1, &files_mkdir_commit("/shared/proj", "signed"), None);
+    let frame = node::encode_frame(&signer, 1, &files_mkdir_commit("/shared/proj", "signed"));
     let (code, receipt) = sim.submit_frame(&frame);
     assert_eq!(code, 200, "the files frame commits: {receipt}");
 
@@ -193,7 +191,7 @@ fn a_byte_identical_frame_resubmit_is_stopped_by_the_files_cas_not_a_consensus_s
     let sim = Sim::spawn(storage.path(), &["--auto"]);
 
     let signer = Ed::from_seed(13);
-    let frame = node::encode_frame(&signer, 1, &files_mkdir_commit("/shared/proj", "once"), None);
+    let frame = node::encode_frame(&signer, 1, &files_mkdir_commit("/shared/proj", "once"));
 
     let (code, receipt) = sim.submit_frame(&frame);
     assert_eq!(code, 200, "the first commit lands: {receipt}");

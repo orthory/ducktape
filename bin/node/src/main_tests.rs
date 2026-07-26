@@ -305,8 +305,8 @@ async fn served_directory_frame(
     seq: u64,
     msg: Msg,
 ) -> statesync::FinalizedFrame {
-    let frame = node::encode_frame(signer, seq, &msg, None);
-    let (origin, msg, _cont) = node::decode_frame(&frame).expect("decode frame");
+    let frame = node::encode_frame(signer, seq, &msg);
+    let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
     // a block is a BATCH super-frame: apply the single member via the batch
     // API and serve the batch bytes, so the catch-up replay reproduces this.
     expected
@@ -343,9 +343,8 @@ async fn served_mixed_frame(
             target: "disk".into(),
             payload: vec![value],
         },
-        None,
     );
-    let (origin, msg, _cont) = node::decode_frame(&frame).expect("decode frame");
+    let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
     // a block is a BATCH super-frame: apply the single member through the
     // batch API so the served root-hash matches what recovery reproduces on
     // replay (which decodes the frame as a batch), and serve the batch bytes.
@@ -466,11 +465,11 @@ fn suffix_installer_rejects_mismatched_served_seal() {
                 value: "v".into(),
             }),
         };
-        let frame = node::encode_frame(&signer, 0, &msg, None);
+        let frame = node::encode_frame(&signer, 0, &msg);
 
         let mut expected_host =
             Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
-        let (origin, msg, _cont) = node::decode_frame(&frame).expect("decode frame");
+        let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
         expected_host
             .submit_at(
                 host::BlockContext {
@@ -702,8 +701,8 @@ fn boot_fold_rebuilds_a_batch_block_ops() {
         target: "directory".into(),
         payload: payload.clone(),
     };
-    let frame = node::encode_frame(&signer, 1, &msg, None);
-    let (origin, decoded, _cont) = node::decode_frame(&frame).expect("frame decodes");
+    let frame = node::encode_frame(&signer, 1, &msg);
+    let (origin, decoded) = node::decode_frame(&frame).expect("frame decodes");
     let dispatches = row_dispatches(&payload, &origin);
     let root_hash = test_root(9);
 
@@ -774,7 +773,6 @@ fn boot_fold_skips_nop_and_undecodable_frames() {
             target: crate::constants::NOP_TARGET.into(),
             payload: Vec::new(),
         },
-        None,
     );
     for frame in [nop.as_slice(), b"not a frame".as_slice()] {
         assert!(
@@ -806,7 +804,6 @@ fn boot_fold_rebuilds_rejected_rows_with_empty_trace() {
             target: "directory".into(),
             payload: b"garbage-the-module-rejects".to_vec(),
         },
-        None,
     );
     let batch = node::encode_batch(&[frame]);
     let row = sealed_frame_block_row(

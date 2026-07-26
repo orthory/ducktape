@@ -119,8 +119,7 @@ fn spawn_session_actor(
                     let _ = reply.send(files_reply(&BTreeMap::new(), false, &req));
                 }
                 NodeCommand::SubmitFrame { frame, reply } => {
-                    let (origin, msg, _cont) =
-                        node::decode_frame(&frame).expect("a valid action frame");
+                    let (origin, msg) = node::decode_frame(&frame).expect("a valid action frame");
                     assert_eq!(msg.target, "runs");
                     seen_actions.lock().unwrap().push((
                         origin,
