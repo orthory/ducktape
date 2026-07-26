@@ -129,48 +129,25 @@ impl Gateway {
     /// Run the session-key handshake against an ALREADY-VERIFIED `seal_pk` and
     /// return the scoped session token. ECDHs the attested key, so the token can
     /// only be opened by this client — a relaying node cannot read it.
+    ///
+    /// There is no "as this account" variant, and there must not be one: on a
+    /// lending gateway the grant subject is the account the node's proxy vouched
+    /// for on the hop, and a caller that could name its own subject is the
+    /// credential-theft defect.
     pub async fn open_session(&self, seal_pk: &[u8; 32], sub: &str) -> Result<String> {
-        let (token, _keys) = self.open_session_with(seal_pk, sub, false, None).await?;
-        Ok(token)
-    }
-
-    /// Open a session that CLAIMS to act on behalf of `account` — the grant
-    /// subject a co-hosted lending gateway checks against its on-chain credential
-    /// record. Refused (`credential_not_granted`) if the account is neither the
-    /// owner nor a grantee.
-    pub async fn open_session_as(
-        &self,
-        seal_pk: &[u8; 32],
-        sub: &str,
-        account: &[u8],
-    ) -> Result<String> {
-        let (token, _keys) = self.open_session_with(seal_pk, sub, false, Some(account)).await?;
+        let (token, _keys) = self.open_session_with(seal_pk, sub, false).await?;
         Ok(token)
     }
 
     /// Sealed-body session: bodies must be AEAD'd under the returned keys
-    /// (`bodyseal`); the enclave refuses plaintext on this token.
+    /// (`bodyseal`); the enclave refuses plaintext on this token. What the
+    /// production broker opens on every self-host path.
     pub async fn open_session_sealed(
         &self,
         seal_pk: &[u8; 32],
         sub: &str,
     ) -> Result<(String, handshake::SessionKeys)> {
-        self.open_session_with(seal_pk, sub, true, None).await
-    }
-
-    /// Sealed-body session that ALSO claims to act on behalf of `account` — the
-    /// grant subject a co-hosted lending gateway checks against its on-chain
-    /// credential record (see [`Self::open_session_as`]), but body-sealed. The
-    /// production broker uses this on the self-host path so the owner's gateway
-    /// learns which account is drawing on the credential; refused
-    /// (`credential_not_granted`) if the account is neither owner nor grantee.
-    pub async fn open_session_sealed_as(
-        &self,
-        seal_pk: &[u8; 32],
-        sub: &str,
-        account: &[u8],
-    ) -> Result<(String, handshake::SessionKeys)> {
-        self.open_session_with(seal_pk, sub, true, Some(account)).await
+        self.open_session_with(seal_pk, sub, true).await
     }
 
     async fn open_session_with(
@@ -178,7 +155,6 @@ impl Gateway {
         seal_pk: &[u8; 32],
         sub: &str,
         body_seal: bool,
-        account: Option<&[u8]>,
     ) -> Result<(String, handshake::SessionKeys)> {
         let (client_eph_pk, keys) = handshake::client_handshake(seal_pk);
         // Everything from `.json()` down runs on an ARRIVED response, so each
@@ -190,7 +166,6 @@ impl Gateway {
                 sub: sub.to_string(),
                 client_eph_pk_b64: BASE64.encode(client_eph_pk),
                 body_seal,
-                account_b64: account.map(|a| BASE64.encode(a)),
             })
             .send()
             .await?;

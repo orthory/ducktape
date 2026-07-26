@@ -4,17 +4,24 @@
 //!
 //! A `ducktape agent sched --cred <name>` run carries the credential NAME in its
 //! envelope, never any secret. On the node that executes the run, this resolver
-//! reads three pieces of COMMITTED state and refuses anything that does not line
-//! up:
+//! turns that name into ROUTING METADATA and nothing else: where the owner's
+//! gateway is (`airlock.<handle>.duck`), which vendor it fronts, and the public
+//! seal key to pin.
 //!
-//! 1. the gateway credential record for `<name>` (routing metadata + seal_pk),
-//! 2. the run's saga origin (the submitting node key — cryptographic, stamped by
-//!    the frameless `/v1/submit` lane, never user-supplied envelope bytes),
-//! 3. the account that node key is bound to (the grant subject).
+//! ## it does not decide who is acting
 //!
-//! The grant is checked locally with [`gateway::credential_use_allowed`] — a
-//! fast refusal before any provider spawns. The owner's gateway remains the
-//! final word, since the traffic terminates there.
+//! It used to. It read the run's saga origin, mapped that submitting node to an
+//! account, and shipped that account to the lender as the grant subject — a
+//! claim by the COMPUTE layer about who a run acts for, which the lender had no
+//! way to check. The lender authorizes the account its own node vouched for when
+//! the request made the gateway hop, and that is the node running this sandbox.
+//! So the subject is not this resolver's to supply, and the local grant check
+//! that re-enforced the old meaning is gone with it: the owner's gateway is not
+//! merely "the final word", it is the only word.
+//!
+//! What that means for an operator: a grant names the account of the node that
+//! RUNS the workload. A run submitted by A and executed on B draws as B, so the
+//! lender must have granted B.
 //!
 //! The resolver reads state over the same committed-query lane (`/v1/query`)
 //! the agent provisioner uses, so it sees exactly what consensus committed —
@@ -23,10 +30,9 @@
 
 use provider_host::{AirlockConfig, CredentialKind, ResolvedCredential};
 use compute_service::{CredentialResolver, Resolved};
-use gateway::{CredentialRecord, GatewayQuery, GatewayReply, HandleRegistration, credential_use_allowed};
+use gateway::{CredentialRecord, GatewayQuery, GatewayReply, HandleRegistration};
 use identity::{AccountView, IdentityQuery, IdentityReply};
 use noded::node_link::NodeLink;
-use saga::{SagaOrigin, SagaQuery, SagaReply};
 
 /// The gateway route label the co-hosted airlock gateway registers itself under
 /// (`bin/node/src/boot/surfaces.rs`). A resolved credential's traffic is routed
@@ -71,20 +77,6 @@ impl NodeCredentialResolver {
         }
     }
 
-    async fn saga_origin(&self, saga_id: &str) -> Result<SagaOrigin, String> {
-        let bytes = self
-            .query(
-                "saga",
-                saga::encode_query(&SagaQuery::Get { saga_id: saga_id.to_string() }),
-            )
-            .await?;
-        match saga::decode_reply(&bytes)? {
-            SagaReply::Saga(Some(view)) => Ok(view.origin),
-            SagaReply::Saga(None) => Err("scheduled run has no committed saga record".into()),
-            other => Err(format!("saga returned an unexpected reply: {other:?}")),
-        }
-    }
-
     async fn account_of_node(&self, node_key: &[u8]) -> Result<Option<AccountView>, String> {
         let bytes = self
             .query(
@@ -124,11 +116,7 @@ impl NodeCredentialResolver {
     /// Build the broker's self-host config from a granted record: reach the
     /// owner's gateway at `<airlock>.<owner-handle>.duck` through this node's
     /// browser gateway, pinning the on-chain seal_pk (no TEE quote in self-host).
-    async fn build_airlock(
-        &self,
-        record: &CredentialRecord,
-        on_behalf: Vec<u8>,
-    ) -> Result<AirlockConfig, String> {
+    async fn build_airlock(&self, record: &CredentialRecord) -> Result<AirlockConfig, String> {
         let Some(via) = self.via.clone() else {
             return Err("this node has no browser gateway to route credential traffic".into());
         };
@@ -144,7 +132,6 @@ impl NodeCredentialResolver {
             authority: format!("{AIRLOCK_ROUTE}.{handle}.duck"),
             via,
             seal_pk: record.seal_pk,
-            account: on_behalf,
         };
         Ok(AirlockConfig::self_host(&resolved))
     }
@@ -152,44 +139,31 @@ impl NodeCredentialResolver {
 
 #[async_trait::async_trait]
 impl CredentialResolver for NodeCredentialResolver {
-    async fn resolve(&self, credential: &str, saga_id: &str) -> Result<Resolved, String> {
+    /// `saga_id` is unread: nothing about the run decides this any more. It stays
+    /// on the trait because the seam is the pool's, and a resolver that wanted to
+    /// name the run in a refusal would need it.
+    async fn resolve(&self, credential: &str, _saga_id: &str) -> Result<Resolved, String> {
         let record = self.credential_record(credential).await?;
-        let origin = self.saga_origin(saga_id).await?;
-        // only an EXTERNAL origin (a submitting node key) maps to an account; a
-        // module/system-triggered saga gets no identity lookup at all.
-        let account = match &origin {
-            SagaOrigin::External(node_key) => self.account_of_node(node_key).await?,
-            SagaOrigin::Module(_) | SagaOrigin::System => None,
-        };
-        let (record, on_behalf) = authorize(credential, record, &origin, account)?;
-        let airlock = self.build_airlock(&record, on_behalf).await?;
+        let record = routable(credential, record)?;
+        let airlock = self.build_airlock(&record).await?;
         Ok(Resolved { airlock })
     }
 }
 
-/// The pure grant decision — the whole security gate in one testable place. The
-/// three committed reads are done by the caller; this decides. Returns the
-/// granted record and the account to act on behalf of, or a named refusal.
-fn authorize(
-    credential: &str,
-    record: Option<CredentialRecord>,
-    origin: &SagaOrigin,
-    account: Option<AccountView>,
-) -> Result<(CredentialRecord, Vec<u8>), String> {
-    let Some(record) = record else {
-        return Err(format!("unknown credential: {credential}"));
-    };
-    let SagaOrigin::External(_) = origin else {
-        return Err("scheduled run has no account origin".into());
-    };
-    let Some(account) = account else {
-        return Err("submitting node is not bound to an account".into());
-    };
-    let granted = credential_use_allowed(&record, &account.account_id);
-    if !granted {
-        return Err("credential_not_granted".into());
-    }
-    Ok((record, account.account_id))
+/// All that survives of the old `authorize`: a name this node cannot route is a
+/// refusal worth making here, because the alternative is dialling nothing.
+///
+/// Everything else it used to do was an authorization decision, and this layer
+/// does not make those. It cannot: the only identity in the flow is the one the
+/// lender's node stamps on the hop, which this process neither sees nor can
+/// predict. A local re-check could therefore only ever disagree with the lender —
+/// which is exactly what it did, refusing nothing the lender admits and admitting
+/// runs the lender refuses.
+///
+/// Nor was it buying earliness. The lender's refusal lands in `start_broker`,
+/// before `invoke` spawns the sandbox and before any paid upstream call.
+fn routable(credential: &str, record: Option<CredentialRecord>) -> Result<CredentialRecord, String> {
+    record.ok_or_else(|| format!("unknown credential: {credential}"))
 }
 
 /// The node owns the gateway↔capability-host credential-kind mapping, because
@@ -217,90 +191,33 @@ mod tests {
         }
     }
 
-    fn account(id: &[u8]) -> AccountView {
-        AccountView {
-            account_id: id.to_vec(),
-            display_name: None,
-            avatar: None,
-            bio: None,
-            nonce: 0,
-            member_keys: Vec::new(),
-            nodes: Vec::new(),
-            updated_at: 0,
-        }
+    /// A name this node can route resolves, whoever the grant names. The grant is
+    /// the LENDER's decision and is made against the account its node vouches for
+    /// on the hop; re-deciding it here could only ever disagree, since this
+    /// process cannot see that account.
+    #[test]
+    fn a_known_credential_resolves_without_any_account_decision() {
+        let resolved = routable("owner-claude-1", Some(record(b"owner", &[])))
+            .expect("a registered credential is routable");
+        assert_eq!(resolved.name, "owner-claude-1");
+        assert_eq!(resolved.seal_pk, [3u8; 32]);
     }
 
-    fn external(node_key: &[u8]) -> SagaOrigin {
-        SagaOrigin::External(node_key.to_vec())
+    /// The grant set is not read here — including the case that used to be
+    /// refused locally. A record granting somebody else still ROUTES; the lender
+    /// is what refuses it, and it refuses on the executing node's account, not on
+    /// anything this side could have supplied.
+    #[test]
+    fn a_record_this_node_is_not_granted_still_routes() {
+        let resolved = routable("owner-claude-1", Some(record(b"owner", &[b"someone-else"])))
+            .expect("routing is not authorization");
+        assert_eq!(resolved.owner_account, b"owner");
     }
 
     #[test]
-    fn the_owner_account_resolves_and_acts_for_itself() {
-        let (record, on_behalf) = authorize(
-            "owner-claude-1",
-            Some(record(b"owner", &[])),
-            &external(b"owner-node"),
-            Some(account(b"owner")),
-        )
-        .expect("the owner may always use its own credential");
-        assert_eq!(record.name, "owner-claude-1");
-        assert_eq!(on_behalf, b"owner");
-    }
-
-    #[test]
-    fn a_granted_account_resolves() {
-        let (_record, on_behalf) = authorize(
-            "owner-claude-1",
-            Some(record(b"owner", &[b"guest"])),
-            &external(b"guest-node"),
-            Some(account(b"guest")),
-        )
-        .expect("a granted account may use the credential");
-        assert_eq!(on_behalf, b"guest");
-    }
-
-    #[test]
-    fn an_ungranted_account_is_refused() {
-        let err = authorize(
-            "owner-claude-1",
-            Some(record(b"owner", &[b"someone-else"])),
-            &external(b"stranger-node"),
-            Some(account(b"stranger")),
-        )
-        .unwrap_err();
-        assert_eq!(err, "credential_not_granted");
-    }
-
-    #[test]
-    fn an_unknown_credential_is_refused_first() {
-        let err = authorize("ghost", None, &external(b"node"), Some(account(b"acct"))).unwrap_err();
+    fn an_unknown_credential_is_refused() {
+        let err = routable("ghost", None).unwrap_err();
         assert!(err.contains("unknown credential: ghost"), "got {err:?}");
-    }
-
-    #[test]
-    fn a_non_external_origin_has_no_account() {
-        for origin in [SagaOrigin::Module("runs".into()), SagaOrigin::System] {
-            let err = authorize(
-                "owner-claude-1",
-                Some(record(b"owner", &[])),
-                &origin,
-                Some(account(b"owner")),
-            )
-            .unwrap_err();
-            assert_eq!(err, "scheduled run has no account origin");
-        }
-    }
-
-    #[test]
-    fn an_unbound_submitting_node_is_refused() {
-        let err = authorize(
-            "owner-claude-1",
-            Some(record(b"owner", &[])),
-            &external(b"orphan-node"),
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(err, "submitting node is not bound to an account");
     }
 
     #[test]

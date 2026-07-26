@@ -66,18 +66,24 @@ pub(crate) enum CredCmd {
         /// the credential name
         name: String,
     },
-    /// lend a credential to another account (owner-signed)
+    /// lend a credential to a NODE's account: whoever runs a workload there may
+    /// draw on it (owner-signed)
     Grant {
         /// the credential name
         name: String,
-        /// the grantee: a hex account id or a display name
+        /// the account of the node that will RUN the workload — a hex account id
+        /// or a display name. Not the account that submits the work: a run
+        /// submitted by one account and executed on another node reaches this
+        /// credential as the EXECUTING node, and that is who must be granted.
         account: String,
     },
-    /// rescind a lend (owner-signed)
+    /// rescind a lend (owner-signed). In flight sessions keep working until their
+    /// token expires; this stops new ones opening
     Revoke {
         /// the credential name
         name: String,
-        /// the grantee: a hex account id or a display name
+        /// the account to stop lending to — the same executing-node account
+        /// `grant` named
         account: String,
     },
     /// read a TEE gateway's enclave measurement out of its quote, so it can be
@@ -302,7 +308,7 @@ fn cmd_grant(ctx: &VerbCtx, name: String, account: String, stdin: &mut impl BufR
     let statement = gateway::CredentialGrantStatement {
         chain_id: resolved.service.chain_id.clone(),
         owner_account,
-        name,
+        name: name.clone(),
         account: grantee,
     };
     let preimage = gateway::grant_credential_preimage(&statement)?;
@@ -312,6 +318,10 @@ fn cmd_grant(ctx: &VerbCtx, name: String, account: String, stdin: &mut impl BufR
     };
     let height = submit_gateway(&base, &message)?;
     println!("granted at height {height}");
+    println!(
+        "note: this lends to that account's NODES. Any workload running on one of \
+         them can draw on {name:?} — including work submitted by someone else."
+    );
     Ok(())
 }
 

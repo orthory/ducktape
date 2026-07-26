@@ -5,11 +5,13 @@
 //! Every type here is STRICT: `deny_unknown_fields`, and no `serde(default)`
 //! anywhere. The protocol decodes each frame at its boundary, so a producer
 //! that is out of step gets a named decode error instead of a silently
-//! defaulted field. That matters most on [`SessionRequest::account_b64`]: it
-//! used to default to `None`, so a client typo became a 403
-//! `credential_not_granted` — sending the borrower's operator to add a grant
-//! that already existed, which is the exact misdiagnosis the three-state grant
-//! taxonomy exists to prevent.
+//! defaulted field.
+//!
+//! Nothing here carries an ACCOUNT. A session request names the credential and
+//! the session's ephemeral key, and says nothing about who is acting: identity
+//! enters the flow at exactly one place, the gateway hop, where the node stamps
+//! a mesh-verified caller the request cannot mint. A field for the caller to
+//! declare its own account was the whole of the credential-theft defect.
 
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +82,14 @@ pub enum CredentialPayload {
 /// refuses an unknown name. `client_eph_pk_b64`
 /// is this session's ephemeral X25519 public key: the enclave ECDHs it against
 /// its static seal key to derive the shared session key (see `handshake`).
+///
+/// There is deliberately NO account field. The grant subject is the account the
+/// node's gateway proxy vouched for on the hop
+/// ([`crate::server::CALLER_ACCOUNT_HEADER`]), which is minted from the
+/// mesh-verified peer identity and refused if a caller supplies one. A request
+/// cannot name a subject: the computation layer does not get to say who it acts
+/// for, and the token it ends up holding carries no identity either — only
+/// `sub`, which credential.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRequest {
@@ -88,22 +98,6 @@ pub struct SessionRequest {
     /// Sealed-body session: bodies are AEAD'd broker<->enclave (`bodyseal`)
     /// and the enclave refuses plaintext. Echoed into the token claims.
     pub body_seal: bool,
-    /// The account (base64) the caller claims to act on behalf of — the grant
-    /// subject. Load-bearing only on a co-hosted lending gateway, and even there
-    /// it is a CROSS-CHECK, never the authorization input: it must equal the
-    /// account the node's proxy vouched for in `x-duck-caller-account`, or the
-    /// session is refused (`account_mismatch`). `null` on gateways with no grant
-    /// lookup (the owner-local and TEE paths), where it is simply unread — but
-    /// the field is always PRESENT on the wire, so an omission is a decode error
-    /// rather than a silent `None`.
-    ///
-    /// `deny_unknown_fields` alone does not get that: serde lets an `Option`
-    /// field go missing even with no `#[serde(default)]`, and absent would decode
-    /// to `None` — which on a gated gateway comes out as a 403 about a grant.
-    /// Naming a deserializer suppresses that fallback, so an omission is a
-    /// `missing field` error like every other.
-    #[serde(deserialize_with = "Option::deserialize")]
-    pub account_b64: Option<String>,
 }
 
 /// The token, AEAD-sealed under the handshake session key. Only the client that

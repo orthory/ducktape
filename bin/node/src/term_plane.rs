@@ -507,28 +507,18 @@ async fn serve_create(
         return refused("no_sandbox", "this node hosts no terminal sessions");
     };
     let sandbox_present = sessions.has_sandbox();
-    // the creator is the mesh-authenticated requesting node's account — never a
-    // client-supplied field. When the creator runs on their own node (the lending
-    // case) this is cryptographic.
-    let creator_account = match account_of_node(&control.commands, &peer.0).await {
-        Ok(account) => account,
-        Err(detail) => {
-            tracing::warn!(target: "ducktape::term", reason = "credential_not_granted", "peer session create refused");
-            return refused("credential_not_granted", &detail);
-        }
-    };
+    // The creator's ACCOUNT is deliberately not looked up. It used to be, and it
+    // used to be shipped to the lender as the grant subject — but the lender
+    // authorizes the account ITS node vouched for on the gateway hop, which is
+    // THIS host, the one running the sandbox. A creator account resolved here
+    // could only ever be a second, uncheckable answer to a question the lender
+    // has already answered. `peer.0` still binds the session's input frames to
+    // its creator; that is a node-key gate, not an identity claim.
     let record = match credential_record(&control.commands, cred).await {
         Ok(record) => record,
         Err(detail) => return refused("unknown_credential", &detail),
     };
-    let admit = match admit_create(
-        provider,
-        &creator_account,
-        record.as_ref(),
-        cpu,
-        mem_gb,
-        sandbox_present,
-    ) {
+    let admit = match admit_create(provider, record.as_ref(), cpu, mem_gb, sandbox_present) {
         Ok(admit) => admit,
         Err((reason, detail)) => {
             tracing::warn!(target: "ducktape::term", reason, "peer session create refused");
@@ -549,14 +539,11 @@ async fn serve_create(
         authority,
         via: control.local_gateway_via.clone(),
         seal_pk: admit.seal_pk,
-        // the creator (a mesh peer, or the owner itself) is who draws on the
-        // credential; the owner's gateway checks THIS account against the grant.
-        account: creator_account,
     };
     // the record travels to the agent daemon, which pins it as its broker's
-    // self-host airlock upstream. Nothing secret crosses: a name, an authority
-    // handle, this node's own gateway `via`, a PUBLIC seal key and the account
-    // the owner's gateway checks the grant against.
+    // self-host airlock upstream. Nothing secret crosses, and no identity either:
+    // a name, an authority handle, this node's own gateway `via`, and a PUBLIC
+    // seal key.
     let attach = PeerAttach {
         creator_node: peer.0,
         credential: agent_service::credential_wire(&resolved),
@@ -620,9 +607,14 @@ struct AdmitOk {
     limits: std::collections::BTreeMap<String, u64>,
 }
 
+/// What survives is what this HOST knows about itself and the record: can it
+/// sandbox, does the name exist, does the requested provider contradict the
+/// credential's vendor, what limits apply. The grant check that used to sit here
+/// does not: it decided, against a creator account this node resolved, a question
+/// the lender decides against the account it vouches for — and the two are
+/// different parties the moment the creator is not the host.
 fn admit_create(
     provider: &str,
-    creator_account: &[u8],
     record: Option<&gateway::CredentialRecord>,
     cpu: Option<u64>,
     mem_gb: Option<u64>,
@@ -640,13 +632,6 @@ fn admit_create(
             "no credential by that name is registered".into(),
         ));
     };
-    let is_allowed = gateway::credential_use_allowed(record, creator_account);
-    if !is_allowed {
-        return Err((
-            "credential_not_granted",
-            "creator is neither the owner nor a grantee".into(),
-        ));
-    }
     let contradicts = provider_contradicts_kind(provider, record.kind);
     if contradicts {
         return Err((
@@ -964,35 +949,6 @@ async fn query(
         .map_err(|_| "node actor dropped the query".to_string())?
 }
 
-/// the account bound to the mesh-authenticated requesting node (the creator).
-async fn account_of_node(
-    commands: &fmpsc::Sender<NodeCommand>,
-    node: &[u8; 32],
-) -> Result<Vec<u8>, String> {
-    let reply = query(
-        commands,
-        "identity",
-        identity::encode_query(&identity::IdentityQuery::OfNode {
-            node_key: node.to_vec(),
-        }),
-    )
-    .await?;
-    match identity::decode_reply(&reply)? {
-        identity::IdentityReply::Account(Some(account))
-            if account
-                .nodes
-                .iter()
-                .any(|candidate| candidate.node_key.as_slice() == node) =>
-        {
-            Ok(account.account_id)
-        }
-        identity::IdentityReply::Account(_) => {
-            Err("creator node has no current identity account".into())
-        }
-        _ => Err("unexpected identity reply".into()),
-    }
-}
-
 /// the committed credential record for `name`, or `None` when unregistered.
 async fn credential_record(
     commands: &fmpsc::Sender<NodeCommand>,
@@ -1134,52 +1090,46 @@ mod tests {
         }
     }
 
+    /// What the HOST decides, and the boundary of it. Every case here is a fact
+    /// about this host or about the record; none is a fact about who is asking.
+    ///
+    /// The grant is deliberately absent, including for an account the record does
+    /// NOT name: a record granting somebody else still admits here, because the
+    /// account this host would have checked is not the account the lender checks.
+    /// The lender authorizes the account its own node stamps on the gateway hop —
+    /// this host's — and it refuses at `/session`, before the sandbox spawns.
     #[test]
-    fn admit_gates_on_sandbox_credential_grant_and_kind() {
+    fn admit_gates_on_sandbox_credential_and_kind_but_never_on_who_is_asking() {
         let owner = b"owner-acct".to_vec();
-        let grantee = b"grantee-acct".to_vec();
-        let stranger = b"stranger".to_vec();
-        let claude = rec("c1", &owner, &[&grantee], gateway::CredentialKind::Claude);
+        let claude = rec("c1", &owner, &[b"someone-else"], gateway::CredentialKind::Claude);
 
         // no sandbox → refused before any credential decision.
         assert_eq!(
-            admit_create("claude", &owner, Some(&claude), None, None, false)
-                .unwrap_err()
-                .0,
+            admit_create("claude", Some(&claude), None, None, false).unwrap_err().0,
             "no_sandbox"
         );
         // unknown credential.
         assert_eq!(
-            admit_create("claude", &owner, None, None, None, true)
-                .unwrap_err()
-                .0,
+            admit_create("claude", None, None, None, true).unwrap_err().0,
             "unknown_credential"
         );
-        // owner is allowed; grantee is allowed; stranger is refused.
-        assert!(admit_create("claude", &owner, Some(&claude), None, None, true).is_ok());
-        assert!(admit_create("claude", &grantee, Some(&claude), None, None, true).is_ok());
-        assert_eq!(
-            admit_create("claude", &stranger, Some(&claude), None, None, true)
-                .unwrap_err()
-                .0,
-            "credential_not_granted"
-        );
+        // a record this host is on nobody's grant list for still admits: routing
+        // is not authorization, and the lender has not been asked yet.
+        assert!(admit_create("claude", Some(&claude), None, None, true).is_ok());
         // an explicit provider contradicting the cred's kind is refused.
         assert_eq!(
-            admit_create("codex", &owner, Some(&claude), None, None, true)
-                .unwrap_err()
-                .0,
+            admit_create("codex", Some(&claude), None, None, true).unwrap_err().0,
             "provider_kind_mismatch"
         );
         // an unknown provider tag is not a contradiction (the manager resolves it).
-        assert!(admit_create("echo", &owner, Some(&claude), Some(1), Some(2), true).is_ok());
+        assert!(admit_create("echo", Some(&claude), Some(1), Some(2), true).is_ok());
     }
 
     #[test]
     fn admit_maps_limits_and_kind() {
         let owner = b"owner".to_vec();
         let codex = rec("x", &owner, &[], gateway::CredentialKind::Codex);
-        let ok = admit_create("codex", &owner, Some(&codex), Some(3), Some(8), true).unwrap();
+        let ok = admit_create("codex", Some(&codex), Some(3), Some(8), true).unwrap();
         assert_eq!(ok.limits.get("cores"), Some(&3));
         assert_eq!(ok.limits.get("mem_gb"), Some(&8));
         assert!(matches!(ok.kind, provider_host::CredentialKind::Codex));

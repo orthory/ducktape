@@ -17,12 +17,20 @@
 //!   crosses back: it lands live on the `run-output:<id>` ring AND commits into
 //!   the saga's own result record.
 //!
-//! - `an_ungranted_scheduled_run_is_refused_at_resolve`: node A submits a `sched`
-//!   trigger PINNED to node B, naming B's credential. A's account was never
-//!   granted, so B refuses at resolve — `credential_not_granted` lands in the
-//!   saga's error and the run commits no result. The refusal is the whole point
-//!   of making the credential name a committed, origin-gated resolution rather
-//!   than an envelope secret.
+//! - `a_delegated_run_draws_as_the_executing_node_not_the_submitter`: the
+//!   delegated shape, against the REAL lender (`ducktape service run airlock`,
+//!   the only gateway that carries a grant gate). Node 0 owns the credential and
+//!   SUBMITS; node 1 EXECUTES and dials node 0's airlock over the overlay. Both
+//!   directions on one cluster, so the only thing that differs between them is
+//!   the grant: ungranted node 1 is refused `credential_not_granted` at
+//!   `/session`, then the owner grants node 1's account and the same run shape
+//!   succeeds with the mock upstream's `PONG` committed into the saga.
+//!
+//!   The subject is node 1 — the node that RUNS the workload and makes the
+//!   gateway hop — not node 0, which submitted it. That is the only subject the
+//!   flow can express: the session token the sandbox holds names a credential and
+//!   nothing about who is acting, so identity enters once, where the owner's node
+//!   stamps the mesh-verified caller on the hop.
 //!
 //! ## what a sandboxed run costs this suite in evidence
 //!
@@ -43,7 +51,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{Cluster, SANDBOX_IMAGE, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
+use common::{Cluster, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
 use commonware_cryptography::{Signer as _, ed25519};
 
 use airlock::attest::{self, Measurement};
@@ -330,6 +338,54 @@ fn airlock_route_revision(cluster: &Cluster, reader: usize, account: &[u8]) -> O
     match gateway::decode_reply(&bytes).ok()? {
         GatewayReply::Route(record) => record.as_ref().as_ref().map(|r| r.statement.revision),
         _ => None,
+    }
+}
+
+/// Seed the owner's DISK store the way `ducktape user cred add` writes it, so the
+/// real lender daemon serves it from its first session. The lender is the only
+/// gateway with a grant gate; the in-process testkit gateway above deliberately
+/// has none, which is why a grant can only be proven against this one.
+fn seed_claude_store(storage: &Path, name: &str, refresh: &str) {
+    let dir = storage.join("airlock-creds").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("kind"), "claude\n").unwrap();
+    std::fs::write(
+        dir.join(".credentials.json"),
+        format!(r#"{{"claudeAiOauth":{{"refreshToken":"{refresh}"}}}}"#),
+    )
+    .unwrap();
+}
+
+/// The seal PUBLIC key the lender minted when it opened its store — the on-chain
+/// anchor the executing node pins. Self-host has no quote.
+fn seal_pk_from_store(storage: &Path) -> [u8; 32] {
+    let bytes = std::fs::read(storage.join("airlock-creds").join("seal.key")).expect("seal.key");
+    let secret: [u8; 32] = bytes.as_slice().try_into().expect("32-byte seal secret");
+    airlock::seal::SealKeypair::from_secret_bytes(secret).public_bytes()
+}
+
+/// Owner-signed grant of `CRED_NAME` to `grantee` — which, under this flow, is
+/// the account of the node that will RUN the workload.
+fn signed_grant(owner: &ed25519::PrivateKey, chain: &str, grantee: &[u8]) -> GatewayMsg {
+    let statement = gateway::CredentialGrantStatement {
+        chain_id: chain.into(),
+        owner_account: owner.public_key().as_ref().to_vec(),
+        name: CRED_NAME.into(),
+        account: grantee.to_vec(),
+    };
+    let signature = owner
+        .sign(
+            GATEWAY_CREDENTIAL_NS,
+            &gateway::grant_credential_preimage(&statement).unwrap(),
+        )
+        .as_ref()
+        .to_vec();
+    GatewayMsg::GrantCredential {
+        statement,
+        authorization: MemberAuthorization {
+            signer: owner.public_key().as_ref().to_vec(),
+            signature,
+        },
     }
 }
 
@@ -753,81 +809,163 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
 }
 
 #[test]
-fn an_ungranted_scheduled_run_is_refused_at_resolve() {
-    if skip_unless_sandboxed("an_ungranted_scheduled_run_is_refused_at_resolve").is_some() {
+fn a_delegated_run_draws_as_the_executing_node_not_the_submitter() {
+    if skip_unless_sandboxed("a_delegated_run_draws_as_the_executing_node_not_the_submitter")
+        .is_some()
+    {
         return;
     }
     let _serial = serial();
+    let rt = Runtime::new().unwrap();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
 
-    // node 0 = submitter A (ungranted), node 1 = target B (owns the credential,
-    // stages the provider so resolution reaches the grant gate). No wireguard /
-    // airlock gateway: the refusal fires at the grant check, before any broker.
-    let provider = ScriptProvider::stage(fixtures.path(), false);
-    let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
-    cluster.extra_toml = sandbox_toml(SANDBOX_IMAGE);
-    // the [sandbox] table is only HOW runs are isolated; the pool also
-    // needs the user's compute grant. This run is pinned, not claimed from a
-    // pool, so the grant announces nothing.
-    cluster.compute_grant = Some(vec![]);
-    cluster.env[0] = hide_builtins(fixtures.path(), "node0");
-    cluster.env[1] = [provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
-    cluster.spawn(0);
-    cluster.wait_marker(0, "rpc listening on", CONVERGE);
-    cluster.spawn(1);
-    for i in 0..2 {
-        cluster.wait_marker(i, "converged root_hash=", CONVERGE);
-        cluster.wait_compute_marker(i, "compute daemon serving", CONVERGE);
-    }
+    // Only the mock UPSTREAM lives in this process. The gateway is the real
+    // lender daemon in the node's own process — `build_with_quoter` above wires
+    // NO grant gate, so a grant cannot be proven against it, and that gap is
+    // exactly why the compute side used to carry a grant check of its own.
+    let upstream = rt.block_on(bind_and_serve(
+        Router::new()
+            .route("/oauth/token", post(mock_oauth))
+            .route("/v1/messages", post(mock_messages))
+            .with_state(Arc::new(MockUpstream::default())),
+    ));
 
-    // B owns the credential (bound to seed 42); A is bound to a DIFFERENT account
-    // (seed 43) that is never granted.
+    // node 0 = OWNER: owns the credential, runs the lender, and SUBMITS.
+    // node 1 = EXECUTOR: runs the compute daemon and makes the gateway hop.
+    let provider = ScriptProvider::stage(fixtures.path(), true);
+    let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
+    cluster.wireguard = true;
+    cluster.extra_toml = sandbox_toml(BROKER_IMAGE);
+    cluster.compute_grant = Some(vec![]);
+    let owner_storage = cluster.workspace(0);
+    seed_claude_store(&owner_storage, CRED_NAME, "rt-delegated");
+    cluster.env[0] = [
+        hide_builtins(fixtures.path(), "node0"),
+        vec![
+            ("DUCKTAPE_AIRLOCK_ANTHROPIC_BASE".into(), upstream.clone()),
+            (
+                "DUCKTAPE_AIRLOCK_OAUTH_TOKEN_URL".into(),
+                format!("{upstream}/oauth/token"),
+            ),
+        ],
+    ]
+    .concat();
+    cluster.env[1] = [provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
+
+    for index in 0..2 {
+        cluster.spawn(index);
+    }
+    for index in 0..2 {
+        cluster.wait_marker(index, "rpc listening on", CONVERGE);
+        cluster.wait_marker(index, "converged root_hash=", CONVERGE);
+        cluster.wait_marker(index, "peer handshake COMPLETE", CONVERGE);
+        cluster.wait_marker(index, "gateway plane: overlay stream bound", CONVERGE);
+    }
+    // the EXECUTOR's compute daemon is what runs the workload and dials the
+    // lender; the owner's is incidental to this proof.
+    cluster.wait_compute_marker(1, "compute daemon serving", CONVERGE);
+    // the lender starts only once its node's http surface is up: it opens the
+    // store (minting seal.key) and registers its loopback port as the route.
+    cluster.spawn_service(0, "airlock");
+    cluster.wait_service_marker(0, "airlock", "airlock daemon serving", CONVERGE);
+
     let owner = ed25519::PrivateKey::from_seed(42);
-    let stranger = ed25519::PrivateKey::from_seed(43);
-    let target = Cluster::identity(1);
-    let submitter = Cluster::identity(0);
-    bind_node(&cluster, 1, &owner, &target);
-    bind_node(&cluster, 0, &stranger, &submitter);
+    let executor = ed25519::PrivateKey::from_seed(43);
+    let owner_node = Cluster::identity(0);
+    let executor_node = Cluster::identity(1);
+    bind_node(&cluster, 0, &owner, &owner_node);
+    bind_node(&cluster, 1, &executor, &executor_node);
 
     cluster.submit(
-        1,
+        0,
         "gateway",
-        &gateway::encode_msg(&set_credential(&owner, &cluster.namespace, &target, [7u8; 32])),
+        &gateway::encode_msg(&GatewayMsg::SetHandle {
+            handle: Some("owner".into()),
+        }),
     );
-    poll_until("the credential record to commit", FINALIZE, || {
-        credential_record(&cluster, 0)
+    for reader in 0..2 {
+        poll_until("owner.duck resolution", FINALIZE, || {
+            resolve_handle(&cluster, reader, "owner").filter(|id| id == owner.public_key().as_ref())
+        });
+    }
+
+    cluster.submit(
+        0,
+        "gateway",
+        &gateway::encode_msg(&signed_airlock_route(
+            &owner,
+            &cluster.namespace,
+            &owner_node,
+            1,
+        )),
+    );
+    poll_until("airlock route revision 1", FINALIZE, || {
+        (airlock_route_revision(&cluster, 1, owner.public_key().as_ref()) == Some(1)).then_some(())
     });
 
-    // A submits pinned to B, naming B's credential. A was never granted.
-    let saga_id = "sched\u{1f}sched-e2e-refused";
-    submit_sched(&cluster, 0, saga_id, &target, 1);
+    // the record carries the STORE's seal_pk (self-host has no quote) and an
+    // empty grant set — nobody may draw on it yet.
+    let seal_pk = seal_pk_from_store(&owner_storage);
+    cluster.submit(
+        0,
+        "gateway",
+        &gateway::encode_msg(&set_credential(&owner, &cluster.namespace, &owner_node, seal_pk)),
+    );
+    poll_until("the credential record to commit", FINALIZE, || {
+        credential_record(&cluster, 1)
+    });
 
-    // B refuses at resolve: the saga fails carrying the named refusal, and B's
-    // provider never spawned.
-    let view = wait_terminal(&cluster, 0, saga_id, ROUND_TRIP);
+    // ---- DIRECTION 1: the executor is not granted -------------------------
+    //
+    // The OWNER submits, so the submitter is the credential's owner and would
+    // have passed any check keyed on who asked. The lender never sees the owner:
+    // it sees node 1, which made the hop, and node 1 is on no grant list.
+    let refused_id = "sched\u{1f}sched-delegated-ungranted";
+    submit_sched(&cluster, 0, refused_id, &executor_node, 1);
+    let view = wait_terminal(&cluster, 0, refused_id, ROUND_TRIP);
     assert_eq!(
         view.status,
         SagaStatus::Failed,
-        "an ungranted run must fail, not run\n{}",
+        "an ungranted EXECUTOR must fail even when the OWNER submitted\n{}",
         cluster.all_log_tails(120),
     );
     assert!(
-        view.error.as_deref().unwrap_or_default().contains("credential_not_granted"),
-        "the saga carries the refusal token: {:?}",
+        view.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("credential_not_granted"),
+        "the lender's own refusal token reaches the saga: {:?}",
         view.error,
     );
-    // NOTE what is deliberately NOT asserted here: "the provider never
-    // spawned". The old host-path `exec.log` counter could not have fired even
-    // on a provider that DID spawn — a run executes in a container, and that
-    // path does not exist in its mount namespace — and the obvious replacement
-    // (`view.result.is_none()`) is entailed by `Failed` plus the refusal token
-    // above, so it would read like cover while proving nothing new.
-    //
-    // The property has a home where it CAN fail, against the pool that enforces
-    // it: `compute_service::pool`'s
-    // `a_resolver_refusal_fails_the_run_without_spawning`, which counts real
-    // spawner invocations and asserts zero. What this leg adds is the half a
-    // unit test cannot reach: the refusal is driven by COMMITTED state — B's
-    // credential record, A's account, the run's saga origin — across two real
-    // processes, and lands in consensus as the saga's own error.
+
+    // ---- the grant, and the ONLY thing that changes ------------------------
+    let executor_account = executor.public_key().as_ref().to_vec();
+    cluster.submit(
+        0,
+        "gateway",
+        &gateway::encode_msg(&signed_grant(&owner, &cluster.namespace, &executor_account)),
+    );
+    poll_until("the grant to commit", FINALIZE, || {
+        credential_record(&cluster, 1)
+            .filter(|record| gateway::credential_use_allowed(record, &executor_account))
+            .map(|_| ())
+    });
+
+    // ---- DIRECTION 2: the same run shape, now granted ----------------------
+    let granted_id = "sched\u{1f}sched-delegated-granted";
+    submit_sched(&cluster, 0, granted_id, &executor_node, 1);
+    let view = wait_terminal(&cluster, 0, granted_id, ROUND_TRIP);
+    assert_eq!(
+        view.status,
+        SagaStatus::Done,
+        "granting the EXECUTING node is what makes the delegated run work: {:?}\n{}",
+        view.error,
+        cluster.all_log_tails(120),
+    );
+    let result = view.result.unwrap_or_default();
+    assert!(
+        String::from_utf8_lossy(&result).contains("PONG"),
+        "the lent credential's reply crosses back into the saga result: {}",
+        String::from_utf8_lossy(&result),
+    );
 }

@@ -151,14 +151,14 @@ pub enum GrantAnswer {
 /// COMMITTED gateway-module record (owner or a granted account).
 ///
 /// The account handed here is ALWAYS the one the node's proxy vouched for in
-/// [`CALLER_ACCOUNT_HEADER`], never a self-declared one: the record's
-/// `owner_account` is a public field of the very record a borrower must read to
-/// learn `seal_pk`, so a gate keyed on a claim admits anyone who can read the
-/// chain. See [`session_gate`].
+/// [`CALLER_ACCOUNT_HEADER`]. There is no other source, and there must not be
+/// one: the record's `owner_account` is a public field of the very record a
+/// borrower must read to learn `seal_pk`, so a gate keyed on anything the
+/// request could carry admits everyone who can read the chain. See
+/// [`session_gate`].
 ///
-/// `None` on gateways that never lend (owner-local, TEE): there is no account to
-/// check, and the claim is then unread. See [`GrantAnswer`] for what each answer
-/// costs the borrower.
+/// `None` on gateways that never lend (owner-local, TEE): there is no subject to
+/// check. See [`GrantAnswer`] for what each answer costs the borrower.
 pub type GrantCheck =
     Arc<dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = GrantAnswer> + Send>> + Send + Sync>;
 
@@ -525,54 +525,27 @@ async fn credential(
     Ok(StatusCode::OK)
 }
 
-/// How a session request's claimed account stands against the account the
-/// TRANSPORT vouched for. One discriminant, resolved before the grant gate runs
-/// — because asking the authority about an account nobody vouched for answers
-/// the wrong question.
-enum CallerAccount {
-    /// No [`CALLER_ACCOUNT_HEADER`]: this request did not arrive through the
-    /// node's gateway proxy, so no mesh-verified caller identity exists.
-    Unverified,
-    /// The proxy vouched for a caller, and the session claims a different
-    /// account (or claims none).
-    Disowned,
-    /// The proxy-vouched caller, equal to the account the session claims. The
-    /// bytes are the HEADER's, never the claim's.
-    Verified(Vec<u8>),
-}
-
-/// Resolve the caller from the transport, cross-checked against the claim.
+/// The account the TRANSPORT vouched for, or `None` when nothing did.
 ///
-/// The header is the authorization input and the claim is only a cross-check, so
-/// the returned bytes come from the header. Requiring them to AGREE (rather than
-/// ignoring the claim) is what keeps a client that believes it is borrowing on
-/// behalf of account A from silently drawing as account B.
-fn caller_account(headers: &HeaderMap, req: &SessionRequest) -> CallerAccount {
-    let Some(verified) = headers
+/// This is the whole of the identity input, and a session request contributes
+/// nothing to it: the node's gateway proxy mints [`CALLER_ACCOUNT_HEADER`] from
+/// the mesh-verified WireGuard peer and refuses a caller-supplied copy at its own
+/// decode, so it is the one field on the request that its sender cannot choose.
+fn vouched_caller(headers: &HeaderMap) -> Option<Vec<u8>> {
+    headers
         .get(CALLER_ACCOUNT_HEADER)
         .and_then(|value| value.to_str().ok())
         .and_then(|encoded| hex::decode(encoded).ok())
-    else {
-        return CallerAccount::Unverified;
-    };
-    let claimed = req.account_b64.as_deref().and_then(|b64| BASE64.decode(b64).ok());
-    let claims_its_own_account = claimed.is_some_and(|claimed| claimed == verified);
-    if !claims_its_own_account {
-        return CallerAccount::Disowned;
-    }
-    CallerAccount::Verified(verified)
 }
 
-/// What a `/session` request is answered with. FIVE outcomes, not three: the
-/// grant answer is only reachable once the transport has vouched for a caller,
-/// and "nobody vouched for you" and "that is not your account" are refusals an
-/// operator acts on differently from a missing grant. Every one of them is a
-/// stable snake_case token and NONE of them echoes back the value that would
-/// have been accepted.
+/// What a `/session` request is answered with. FOUR outcomes: the grant answer
+/// is only reachable once the transport has vouched for a caller, and "nobody
+/// vouched for you" is a refusal an operator acts on differently from a missing
+/// grant. Every one is a stable snake_case token, and none echoes back the value
+/// that would have been accepted.
 enum SessionGate {
     Open,
     CallerUnverified,
-    AccountMismatch,
     NotGranted,
     AuthorityUnavailable,
 }
@@ -581,13 +554,18 @@ enum SessionGate {
 /// injected authority, and writes nothing.
 ///
 /// Co-hosted lending: when a grant gate is wired, the caller must be one the
-/// node's proxy VOUCHED for, must be claiming its own account, and must be the
-/// owner or a grantee of the on-chain record. All three before any handshake
-/// work — a session for an ungranted account never opens.
+/// node's proxy VOUCHED for, and that account must be the owner or a grantee of
+/// the on-chain record. Both before any handshake work — a session for an
+/// ungranted account never opens.
+///
+/// The subject is the account of the node that made the hop, which is the node
+/// running the sandbox. That is the only subject this flow can express: the
+/// session token the sandbox ends up holding names a credential and nothing
+/// about who is acting, so a lender granting an account is lending to that
+/// account's NODE, for whatever workload it runs.
 ///
 /// With no gate wired (owner-local, TEE) this gateway lends to nobody across
-/// accounts, so there is no account to check and the claim stays unread, exactly
-/// as [`GrantCheck`] documents.
+/// accounts, so there is no subject to check.
 async fn session_gate(
     grant_check: &Option<GrantCheck>,
     headers: &HeaderMap,
@@ -596,10 +574,8 @@ async fn session_gate(
     let Some(check) = grant_check else {
         return SessionGate::Open;
     };
-    let account = match caller_account(headers, req) {
-        CallerAccount::Unverified => return SessionGate::CallerUnverified,
-        CallerAccount::Disowned => return SessionGate::AccountMismatch,
-        CallerAccount::Verified(account) => account,
+    let Some(account) = vouched_caller(headers) else {
+        return SessionGate::CallerUnverified;
     };
     match check(req.sub.clone(), account).await {
         GrantAnswer::Granted => SessionGate::Open,
@@ -654,9 +630,6 @@ async fn session(
         SessionGate::Open => {}
         SessionGate::CallerUnverified => {
             return Err(AppErr(StatusCode::FORBIDDEN, "caller_account_unverified".into()));
-        }
-        SessionGate::AccountMismatch => {
-            return Err(AppErr(StatusCode::FORBIDDEN, "account_mismatch".into()));
         }
         SessionGate::NotGranted => {
             return Err(AppErr(StatusCode::FORBIDDEN, "credential_not_granted".into()));

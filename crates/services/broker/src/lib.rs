@@ -1234,14 +1234,11 @@ async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, Str
         }
         AirlockTrust::PinnedSealPk(pk) => *pk,
     };
-    // A lending session names the account it draws the grant on behalf of, so the
-    // owner's gateway can check it against the on-chain record and 403 an
-    // ungranted account (`credential_not_granted`). `None` on the env/Attested
-    // path, which runs no grant gate — the account is then simply unsent.
-    let handshake = match &cfg.account {
-        Some(account) => gateway.open_session_sealed_as(&seal_pk, &cfg.sub, account).await,
-        None => gateway.open_session_sealed(&seal_pk, &cfg.sub).await,
-    };
+    // The session names the CREDENTIAL and nothing else. On a lending gateway the
+    // grant subject is the account the owner's node vouched for when this request
+    // made the hop — this side does not get to name one, and the token that comes
+    // back carries no identity either.
+    let handshake = gateway.open_session_sealed(&seal_pk, &cfg.sub).await;
     // A handshake failure is named for WHAT failed, before any credentialed
     // request. Every distinguishable cause has its own reason: the lender's
     // daemon not running, its route or credential absent, its grant gate saying
@@ -1279,11 +1276,6 @@ enum SessionRefusal {
     Absent,
     /// the lender's own grant gate refused this account (403).
     NotGranted,
-    /// the lender's gate saw a caller its node had vouched for, and the session
-    /// claimed a DIFFERENT account. Nothing is wrong with the grant: this run
-    /// was handed an account that is not the one it reaches the lender as, which
-    /// is a resolution bug on THIS side, not a missing grant on the lender's.
-    AccountMismatch,
     /// the lender's gate saw no vouched-for caller at all — this broker reached
     /// a lending gateway without traversing a node's gateway proxy, so nothing
     /// about the caller's identity was ever established. A topology problem, and
@@ -1344,7 +1336,6 @@ impl SessionRefusal {
     /// body falls back to what the STATUS means — never to a guess.
     fn of_gateway_refusal(refusal: &SessionRefusedBy) -> Self {
         match refusal.reason.as_str() {
-            "account_mismatch" => Self::AccountMismatch,
             "caller_account_unverified" => Self::CallerUnverified,
             _unnamed => Self::of_status(refusal.status),
         }
@@ -1379,7 +1370,6 @@ impl SessionRefusal {
             Self::Unreachable => "airlock_gateway_unreachable",
             Self::Absent => "airlock_route_or_credential_absent",
             Self::NotGranted => "credential_not_granted",
-            Self::AccountMismatch => "airlock_account_mismatch",
             Self::CallerUnverified => "airlock_caller_account_unverified",
             Self::AuthorityUnavailable => "airlock_grant_authority_unavailable",
             Self::Refused => "airlock_gateway_refused",
@@ -1422,11 +1412,6 @@ pub struct ResolvedCredential {
     pub authority: String,
     pub via: String,
     pub seal_pk: [u8; 32],
-    /// the ACCOUNT the run acts on behalf of — the credential-grant subject the
-    /// owner's gateway checks the session against (the owner itself, or a granted
-    /// account). Sent as the sealed session's `account_b64`; without it a
-    /// grant-gated gateway refuses every session `credential_not_granted`.
-    pub account: Vec<u8>,
 }
 
 /// How the broker decides to trust a gateway's seal key — the one discriminant
@@ -1450,10 +1435,6 @@ pub struct AirlockConfig {
     gateway: AirlockGateway,
     trust: AirlockTrust,
     sub: String,
-    /// self-host lending: the grant subject the session claims to act on behalf
-    /// of, sent as `account_b64` so the owner's grant-gated gateway can enforce
-    /// the grant. `None` on the env/Attested path (no grant gate).
-    account: Option<Vec<u8>>,
     /// attest=snp: the pinned AMD platform generation (parsed at config time).
     snp_product: Option<SnpProduct>,
     /// attest=snp: an out-of-band VCEK (file READ at config time); KDS otherwise.
@@ -1475,7 +1456,6 @@ impl AirlockConfig {
             },
             trust: AirlockTrust::PinnedSealPk(resolved.seal_pk),
             sub: resolved.name.clone(),
-            account: Some(resolved.account.clone()),
             snp_product: None,
             snp_vcek: None,
             pccs_url: None,
@@ -1535,8 +1515,6 @@ impl AirlockConfig {
             gateway,
             trust: AirlockTrust::Attested { measurement, attest },
             sub: env_nonempty("DUCKTAPE_AIRLOCK_SUB").unwrap_or_else(|| "compute-provider".into()),
-            // the boundary/TEE path runs no grant gate; the account is unsent.
-            account: None,
             snp_product,
             snp_vcek,
             pccs_url: env_nonempty("DUCKTAPE_AIRLOCK_PCCS_URL"),
@@ -2948,7 +2926,6 @@ mod tests {
             gateway: AirlockGateway::Local { url: gateway_url },
             trust: AirlockTrust::Attested { measurement: meas, attest: "snp".into() },
             sub: "test-sub".into(),
-            account: None,
             snp_product: None, // the test roots override supplies the chain
             snp_vcek: None,
             pccs_url: None,
@@ -2995,7 +2972,6 @@ mod tests {
                 attest: "snp".into(),
             },
             sub: "test-sub".into(),
-            account: None,
             snp_product: None,
             snp_vcek: None,
             pccs_url: None,
@@ -3191,7 +3167,6 @@ mod tests {
             authority: "owner.duck".into(),
             via: via.into(),
             seal_pk,
-            account: b"owner-account".to_vec(),
         }
     }
 
@@ -3278,8 +3253,7 @@ mod tests {
             b"grantee".to_vec(),
         )
         .await;
-        let mut rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
-        rc.account = b"grantee".to_vec();
+        let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
         let (auth, messages_url) = AnthropicAuth::airlock(AirlockConfig::self_host(&rc))
             .await
             .expect("a granted account opens the gated session");
@@ -3317,48 +3291,13 @@ mod tests {
             b"stranger".to_vec(),
         )
         .await;
-        let mut rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
-        rc.account = b"stranger".to_vec();
+        let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
         let refused = AnthropicAuth::airlock(AirlockConfig::self_host(&rc)).await;
         // and it is named for what happened. The grant gate's refusal is the
         // headline feature of the lending path; reporting it as a seal_pk
         // mismatch (the pre-fix behavior) sent the operator after the one thing
         // that was provably fine.
         assert_eq!(refused.err().as_deref(), Some("credential_not_granted"));
-    }
-
-    /// THE ATTACK, from the broker's side: a run that names an account its own
-    /// node does not vouch for. On the lender the gate keys on the account the
-    /// node's proxy verified, so naming the GRANTED account while reaching the
-    /// lender as somebody else buys nothing — which is what makes reading
-    /// `owner_account` out of the public credential record useless.
-    ///
-    /// And it is named honestly. The grant here is fine; what is wrong is that
-    /// this side resolved an account it does not speak as, so
-    /// `credential_not_granted` would send the operator to the one thing that
-    /// is not the problem.
-    #[tokio::test]
-    async fn a_session_claiming_an_account_the_caller_is_not_is_refused_by_name() {
-        let upstream = bearer_upstream("tok-grant").await;
-        let (kp, seal_pk) = seal_pair();
-        let gateway_url = boot_grant_gated_gateway(
-            &upstream,
-            kp,
-            vec![(
-                "owner-claude-1".into(),
-                airlock::wire::CredentialKind::Claude,
-                airlock::wire::CredentialPayload::Bearer { access_token: "tok-grant".into() },
-            )],
-            b"grantee".to_vec(),
-            // the lender's node vouched for `stranger` …
-            b"stranger".to_vec(),
-        )
-        .await;
-        let mut rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
-        // … and the run claims the granted account anyway.
-        rc.account = b"grantee".to_vec();
-        let refused = AnthropicAuth::airlock(AirlockConfig::self_host(&rc)).await;
-        assert_eq!(refused.err().as_deref(), Some("airlock_account_mismatch"));
     }
 
     /// The refusal's twin, and the reason it needs its own name: the lender's
@@ -3382,8 +3321,7 @@ mod tests {
             b"wedged".to_vec(),
         )
         .await;
-        let mut rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
-        rc.account = b"wedged".to_vec();
+        let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
         let undetermined = AnthropicAuth::airlock(AirlockConfig::self_host(&rc)).await;
         assert_eq!(
             undetermined.err().as_deref(),
@@ -3405,23 +3343,22 @@ mod tests {
         assert_eq!(R::of_status(503), R::AuthorityUnavailable);
         assert_eq!(R::of_status(418), R::Refused);
 
-        // THREE refusals wear 403, so the status alone is no longer the whole
+        // TWO refusals wear 403, so the status alone is no longer the whole
         // answer: the gateway names its own, and only an unnamed body falls back
-        // to what the status means. Reporting either of the identity refusals as
+        // to what the status means. Reporting "nobody vouched for you" as
         // `credential_not_granted` sends the operator to add a grant that is not
         // the problem.
         let named = |status, reason: &str| {
             R::of_gateway_refusal(&SessionRefusedBy { status, reason: reason.into() })
         };
-        assert_eq!(named(403, "account_mismatch"), R::AccountMismatch);
         assert_eq!(named(403, "caller_account_unverified"), R::CallerUnverified);
         assert_eq!(named(403, "credential_not_granted"), R::NotGranted);
         // a node's proxy in the path answers with prose, not a token.
         assert_eq!(named(502, "loopback upstream refused the connection"), R::Unreachable);
         // and the tag is what the chain actually carries.
-        let mismatched: anyhow::Error =
-            SessionRefusedBy { status: 403, reason: "account_mismatch".into() }.into();
-        assert_eq!(R::of(&mismatched), R::AccountMismatch);
+        let unvouched: anyhow::Error =
+            SessionRefusedBy { status: 403, reason: "caller_account_unverified".into() }.into();
+        assert_eq!(R::of(&unvouched), R::CallerUnverified);
 
         // past the response boundary there is no status to read, so the client
         // tags the step. A body that is not the wire shape means REACHABLE and
@@ -3443,7 +3380,6 @@ mod tests {
             R::Unreachable,
             R::Absent,
             R::NotGranted,
-            R::AccountMismatch,
             R::CallerUnverified,
             R::AuthorityUnavailable,
             R::Refused,

@@ -531,7 +531,6 @@ async fn unknown_credential_name_is_refused_at_session_open() {
             sub: "missing".into(),
             client_eph_pk_b64: "AAAA".into(),
             body_seal: false,
-            account_b64: None,
         })
         .send()
         .await
@@ -635,7 +634,7 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
     // Granted account: the session opens and the round-trip carries the real token.
     let url = boot_lender_behind_proxy(&upstream, secret, b"granted").await;
     let gw = Gateway::local(url.clone());
-    let token = gw.open_session_as(&seal_pk, "a", b"granted").await.expect("granted session opens");
+    let token = gw.open_session(&seal_pk, "a").await.expect("granted session opens");
     let seen = reqwest::Client::new()
         .post(format!("{url}/v1/messages"))
         .bearer_auth(&token)
@@ -653,7 +652,7 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
     // an identity one.
     let url = boot_lender_behind_proxy(&upstream, secret, b"stranger").await;
     let gw = Gateway::local(url);
-    let err = gw.open_session_as(&seal_pk, "a", b"stranger").await.unwrap_err();
+    let err = gw.open_session(&seal_pk, "a").await.unwrap_err();
     assert!(err.to_string().contains("403"), "an ungranted account must 403: {err}");
 
     // The gate could not ASK its authority. That is NOT a refusal: a 403 sends
@@ -661,51 +660,55 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
     // answer that carries no information gets its own 503 instead.
     let url = boot_lender_behind_proxy(&upstream, secret, b"wedged").await;
     let gw = Gateway::local(url);
-    let err = gw.open_session_as(&seal_pk, "a", b"wedged").await.unwrap_err();
+    let err = gw.open_session(&seal_pk, "a").await.unwrap_err();
     assert!(
         err.to_string().contains("503"),
         "an undetermined grant must 503, never 403: {err}"
     );
 }
 
-/// THE ATTACK. A member the network admitted, granted nothing, reads the
-/// lender's PUBLIC credential record — `owner_account` is a plain field of it,
-/// and the borrower has to read that record anyway to learn `seal_pk` — and
-/// opens a session claiming to be the owner.
+/// THE ATTACK, and why it is now a fact about the TYPES rather than a runtime
+/// refusal. A member the network admitted, granted nothing, reads the lender's
+/// PUBLIC credential record — `owner_account` is a plain field of it, and the
+/// borrower has to read that record anyway to learn `seal_pk` — and tries to open
+/// a session as the owner.
 ///
-/// The gate must key on the account the node's proxy VOUCHED for, never on the
-/// one the request claims, or `ducktape user cred grant` and `revoke` are
-/// decorative against any member who can read the chain.
+/// It cannot construct the request. `SessionRequest` has no account field and the
+/// client exposes no call that takes one, so this asserts the only thing left to
+/// assert: a hand-built request that tries to smuggle the owner's account in is a
+/// DECODE error, not a session. `deny_unknown_fields` is what makes that true, so
+/// re-adding the field in any form fails here.
 #[tokio::test]
-async fn a_member_claiming_someone_elses_account_is_refused() {
+async fn a_session_request_cannot_name_an_account_at_all() {
     let upstream = boot_echo_upstream().await;
     let secret = SealKeypair::generate().secret_bytes();
-    let seal_pk = SealKeypair::from_secret_bytes(secret).public_bytes();
-    // The proxy vouched for `stranger`; the request claims `granted`.
+    // the proxy vouched for `stranger`, who is granted nothing.
     let url = boot_lender_behind_proxy(&upstream, secret, b"stranger").await;
-    let gw = Gateway::local(url.clone());
 
-    let err = gw.open_session_as(&seal_pk, "a", b"granted").await.unwrap_err();
-    assert!(
-        err.to_string().contains("403"),
-        "claiming an account the transport did not vouch for must 403: {err}"
-    );
-
-    // And it is refused for the RIGHT reason: a caller told to go get a grant
-    // would go add one that already exists.
     let refusal = reqwest::Client::new()
         .post(format!("{url}/session"))
-        .json(&SessionRequest {
-            sub: "a".into(),
-            client_eph_pk_b64: "AAAA".into(),
-            body_seal: false,
-            account_b64: Some(BASE64.encode(b"granted")),
-        })
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"sub":"a","client_eph_pk_b64":"AAAA","body_seal":false,"account_b64":"{}"}}"#,
+            BASE64.encode(b"granted")
+        ))
         .send()
         .await
         .unwrap();
-    assert_eq!(refusal.status(), reqwest::StatusCode::FORBIDDEN);
-    assert_eq!(refusal.text().await.unwrap(), "account_mismatch");
+    assert_eq!(
+        refusal.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "an account on a session request is an unknown field, not an authorization input"
+    );
+
+    // and the well-formed request from the same caller is refused on the account
+    // the transport vouched for, which is the only one that counts.
+    let gw = Gateway::local(url);
+    let err = gw
+        .open_session(&SealKeypair::from_secret_bytes(secret).public_bytes(), "a")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("403"), "an ungranted caller must 403: {err}");
 }
 
 /// The same gate from the other direction: a caller that reached the listener
@@ -728,25 +731,22 @@ async fn a_session_no_proxy_vouched_for_is_refused() {
     // NOT behind the proxy: dialled directly, the way a local process would.
     let url = spawn(app).await;
 
-    for claimed in [Some(BASE64.encode(b"granted")), None] {
-        let refusal = reqwest::Client::new()
-            .post(format!("{url}/session"))
-            .json(&SessionRequest {
-                sub: "a".into(),
-                client_eph_pk_b64: "AAAA".into(),
-                body_seal: false,
-                account_b64: claimed.clone(),
-            })
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            refusal.status(),
-            reqwest::StatusCode::FORBIDDEN,
-            "an unvouched caller must never open a lending session (claimed {claimed:?})"
-        );
-        assert_eq!(refusal.text().await.unwrap(), "caller_account_unverified");
-    }
+    let refusal = reqwest::Client::new()
+        .post(format!("{url}/session"))
+        .json(&SessionRequest {
+            sub: "a".into(),
+            client_eph_pk_b64: "AAAA".into(),
+            body_seal: false,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refusal.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "an unvouched caller must never open a lending session"
+    );
+    assert_eq!(refusal.text().await.unwrap(), "caller_account_unverified");
 }
 
 /// A client that omits or misspells a field gets a DECODE error, never a grant
@@ -765,10 +765,10 @@ async fn a_malformed_session_request_is_a_decode_error_never_a_grant_refusal() {
     let url = boot_lender_behind_proxy(&upstream, secret, b"granted").await;
 
     for body in [
-        // the field omitted entirely
-        r#"{"sub":"a","client_eph_pk_b64":"AAAA","body_seal":false}"#,
-        // and misspelled, which `deny_unknown_fields` is what catches
-        r#"{"sub":"a","client_eph_pk_b64":"AAAA","body_seal":false,"account_b65":"Z3JhbnRlZA=="}"#,
+        // a required field omitted
+        r#"{"sub":"a","client_eph_pk_b64":"AAAA"}"#,
+        // and a misspelling, which `deny_unknown_fields` is what catches
+        r#"{"sub":"a","client_eph_pk_b64":"AAAA","body_seal":false,"body_sea1":true}"#,
     ] {
         let resp = reqwest::Client::new()
             .post(format!("{url}/session"))

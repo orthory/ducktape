@@ -111,8 +111,6 @@ pub struct Credential {
     pub via: String,
     /// the owner's PUBLIC seal key, pinned as the broker's trust anchor.
     pub seal_pk: [u8; 32],
-    /// the account the run acts on behalf of — checked by the owner's gateway.
-    pub account: Vec<u8>,
 }
 
 /// which vendor a credential is for. Mirrors `provider_host::CredentialKind`.

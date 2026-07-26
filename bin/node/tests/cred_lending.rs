@@ -436,8 +436,11 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     // Every hop is remote (compute -> overlay -> owner -> loopback upstream).
     let reply = rt.block_on(async {
         let gw = AirlockClient::remote("airlock.owner.duck".into(), via.clone());
+        // No account is named, and none CAN be: the client has no such call. The
+        // subject is whatever the owner's node stamped on the hop, which for this
+        // request is the compute node's own account — the one just granted.
         let token = gw
-            .open_session_as(&record.seal_pk, "owner-claude-1", &compute_account)
+            .open_session(&record.seal_pk, "owner-claude-1")
             .await
             .expect("granted session opens over the overlay");
         let resp = gw
@@ -458,45 +461,17 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
         "the lent credential's reply must return over the overlay: {reply:?}"
     );
 
-    // NEGATIVE: a fresh, UNGRANTED account is refused at the owner's own gateway,
-    // before any credentialed request — the account is what's gated. Two nodes
-    // suffice; the stranger keypair is bound to no node and granted nothing.
+    // NEGATIVE, and note what it is NOT. There is no longer a test here for
+    // "claim somebody else's account", because there is no longer a way to claim
+    // one: `SessionRequest` carries no account and `Gateway` exposes no call that
+    // takes one, so the credential-theft shape is refused by the type system
+    // rather than at runtime. The account the lender authorizes is the one its
+    // own node stamps on the hop.
     //
-    // The refusal is `account_mismatch`, not `credential_not_granted`, and that
-    // is the point: the compute node reaches the lender AS ITSELF (its own
-    // WireGuard identity, resolved to its own account by the owner's proxy), so
-    // naming some other account in the request never gets as far as the grant
-    // lookup. There is no way to be refused for a missing grant on an account
-    // you are not.
-    let stranger = ed25519::PrivateKey::from_seed(9_999);
-    let stranger_account = stranger.public_key().as_ref().to_vec();
-    let refused = rt.block_on(async {
-        let gw = AirlockClient::remote("airlock.owner.duck".into(), via.clone());
-        gw.open_session_as(&record.seal_pk, "owner-claude-1", &stranger_account)
-            .await
-    });
-    let refused = refused.expect_err("an ungranted account must be refused at session open");
-    assert!(
-        format!("{refused}").contains("account_mismatch"),
-        "an account the overlay did not vouch for must be named as such: {refused}"
-    );
-
-    // THE ATTACK, over the real overlay. `owner_account` is a PUBLIC field of
-    // the same record the borrower must read to learn `seal_pk`, so any admitted
-    // member holds it for free. Claiming it must buy nothing: the owner's node
-    // stamps the account it verified for the WireGuard peer, and that is what the
-    // gate keys on. Otherwise `ducktape user cred grant` and `revoke` are
-    // decorative against every member who can read the chain.
-    let stolen = rt.block_on(async {
-        let gw = AirlockClient::remote("airlock.owner.duck".into(), via.clone());
-        gw.open_session_as(&record.seal_pk, "owner-claude-1", &record.owner_account)
-            .await
-    });
-    let stolen = stolen.expect_err("a member claiming the OWNER's account must be refused");
-    assert!(
-        format!("{stolen}").contains("account_mismatch"),
-        "claiming the owner's account must not reach the grant lookup at all: {stolen}"
-    );
+    // The runtime half of that — an UNGRANTED executing node is refused, and a
+    // grant to the executing node is what changes it — needs a submitter and a
+    // separate executor to be worth anything, and lives in
+    // `sched_pinned_run::a_delegated_run_draws_as_the_executing_node_not_the_submitter`.
 
     // And the lender serves no credential UPLOAD: its store is written by
     // `ducktape user cred add` on the owner's own disk. Sealing is not
@@ -504,7 +479,7 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     // route here would let any member replace the lent credential with their own
     // bearer, over exactly this overlay hop.
     let upload = rt.block_on(async {
-        let gw = AirlockClient::remote("airlock.owner.duck".into(), via);
+        let gw = AirlockClient::remote("airlock.owner.duck".into(), via.clone());
         gw.upload_sealed_credential(
             &record.seal_pk,
             "owner-claude-1",
