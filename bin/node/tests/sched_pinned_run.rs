@@ -439,13 +439,28 @@ fn wait_terminal(cluster: &Cluster, reader: usize, saga_id: &str, budget: Durati
 /// line carries `marker`. Called AFTER the run committed, so the ring already
 /// holds the line — the read is deterministic (event-driven on the marker, with
 /// `budget` only as a failsafe), never a sleep.
-async fn run_output_has(port: u16, id: &str, marker: &str, budget: Duration) -> bool {
+///
+/// `secret` is the node's own 0600 service-link token: `run-output:` carries
+/// provider stdout, so it is a workspace-gated topic and an un-tokened subscribe
+/// is refused.
+async fn run_output_has(
+    port: u16,
+    id: &str,
+    marker: &str,
+    secret: &str,
+    budget: Duration,
+) -> bool {
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/v1/ws"))
         .await
         .expect("open run-output ws");
     socket
         .send(Message::Text(
-            json!({ "op": "subscribe", "topics": [format!("run-output:{id}")] }).to_string(),
+            json!({
+                "op": "subscribe",
+                "topics": [format!("run-output:{id}")],
+                "token": secret,
+            })
+            .to_string(),
         ))
         .await
         .expect("subscribe run-output");
@@ -710,10 +725,13 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     // the SAME output crossed the live run-output ring — the surface the app
     // tails. read it after commit, so the buffered line is deterministically
     // present.
+    let secret = noded::services::read_link_token(&cluster.workspace(0))
+        .expect("the node minted its service-link token");
     let saw = rt.block_on(run_output_has(
         cluster.http_ports[0],
         dispatch_id,
         "PONG",
+        &secret,
         FINALIZE,
     ));
     assert!(saw, "the mock upstream's reply streamed to the run-output ring");

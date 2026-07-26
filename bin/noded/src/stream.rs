@@ -62,17 +62,37 @@ const SERVICE_COMMAND_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMsg {
+    /// join one or more topics. THIS is where a topic's admission is decided —
+    /// see [`Topic::admission`] — so the handles this frame hands back are
+    /// themselves the capability, and a family a caller was never admitted to
+    /// leaves nothing on the connection to act on.
     Subscribe {
         topics: Vec<String>,
         #[serde(default)]
         resume: BTreeMap<String, String>,
+        /// this node's own 0600 workspace secret ([`crate::services::LINK_TOKEN_FILE`]),
+        /// for the families that carry a member's terminal or a run's output.
+        ///
+        /// The SAME secret [`Self::ServiceAttach`] presents, deliberately: the
+        /// node has exactly one proof that a caller can read its own workspace,
+        /// and a second would be a second thing to leak. Presenting it here
+        /// claims no link and displaces no daemon — it only answers the
+        /// admission question.
+        ///
+        /// Absent on a caller that wants only the public families (committed
+        /// module events, the log ring, the metrics exposition): those admit
+        /// anyone the ws surface admits, because the same bytes already leave
+        /// this node over an unauthenticated HTTP route.
+        #[serde(default)]
+        token: Option<String>,
     },
     Unsubscribe {
         topics: Vec<String>,
     },
     /// keystrokes for an interactive terminal session (see `crate::term`).
-    /// `data` is base64 of the raw bytes to write to the session's pty. An
-    /// unknown/unentitled session id is dropped with a `warn`, never a panic.
+    /// `data` is base64 of the raw bytes to write to the session's pty. A
+    /// session this connection holds no admitted handle on — and an unknown id
+    /// — is dropped with a named reason, never a panic ([`holds_session`]).
     TermInput {
         session: String,
         data: String,
@@ -109,13 +129,18 @@ pub enum ClientMsg {
     /// Trust: the ws surface is unauthenticated by the trusted-local convention
     /// (a local process can already read the node's key off disk), and a
     /// run-output ring is a DISPLAY buffer no consensus decision reads. There is
-    /// deliberately NO entitlement check equivalent to `term_entitled`: a
-    /// terminal session has a node-local id this connection can be checked
-    /// against, while a run id names consensus state a publisher legitimately
-    /// learns from the chain — so subscription is not evidence of authorship and
-    /// gating on it would refuse the daemon its own runs. Spoofing a line into
-    /// another run's DISPLAY ring is the accepted residual risk of the
-    /// trusted-local surface.
+    /// deliberately NO subscription check on this publish, unlike the terminal
+    /// frames' [`holds_session`]: the publisher — the compute daemon — subscribes
+    /// to nothing (`bin/node/src/compute/link.rs`), and a run id names consensus
+    /// state a publisher legitimately learns from the chain, so subscription is
+    /// not evidence of authorship and gating on it would refuse the daemon its
+    /// own runs. Spoofing a line into another run's DISPLAY ring is the accepted
+    /// residual risk of the trusted-local surface.
+    ///
+    /// READING that ring is a different question with a different answer:
+    /// `run-output:<id>` is [`Admission::Workspace`], because provider stdout is
+    /// the same class of bytes a pty carries. Write-open / read-gated is
+    /// deliberate asymmetry, not an oversight.
     ///
     /// What is NOT accepted is an unbounded or malformed one. `id` must be the
     /// 64-hex shape the agent data plane's `valid_event` enforces, because a
@@ -244,6 +269,12 @@ pub enum StreamErrorCode {
     Unavailable,
     BadCursor,
     BadFrame,
+    /// the topic exists and this caller may not hold it — see
+    /// [`Topic::admission`]. Distinct from `UnknownTopic` on purpose: a client
+    /// that mistyped a name and one that omitted the node's secret need
+    /// different fixes, and collapsing them would send an operator hunting a
+    /// typo that is not there.
+    Forbidden,
 }
 
 /// The ws projection of one stored (borsh) op row — the same json row shape
@@ -1053,7 +1084,8 @@ fn handle_client_msg(
         ClientMsg::Subscribe {
             topics: requested,
             resume,
-        } => subscribe_topics(handle, topics, requested, &resume),
+            token,
+        } => subscribe_topics(handle, topics, requested, &resume, token.as_deref()),
         ClientMsg::Unsubscribe { topics: requested } => {
             for topic in requested {
                 topics.remove(&topic);
@@ -1100,23 +1132,28 @@ fn handle_run_output(hub: &StreamHub, id: String, stream: RunStream, line: Strin
     hub.run_output().append(id, stream, line);
 }
 
-/// a ws connection may drive a terminal session only if it has SUBSCRIBED to
-/// that session's `term:<id>` output topic. Subscribing is the connection's
-/// proof it legitimately holds the id: create is HTTP-gated (`origin_guard`),
-/// and this gate stops a trusted-local client that merely knows or guesses an id
-/// from driving another member's session. The app subscribes to the topic
-/// before it ever sends input (see `TerminalView`, and the ws frames are ordered
-/// on one socket), so this never breaks its flow.
-fn term_entitled(topics: &BTreeMap<String, TopicState>, session: &str) -> bool {
-    topics.contains_key(&crate::term::topic(session))
+/// Does this connection hold an ADMITTED handle on `session`'s pty?
+///
+/// The handle IS the capability, and that is no longer circular. Its predecessor
+/// (`term_entitled`) asked `topics.contains_key("term:<id>")` while subscribing
+/// was unconditional, so any connection self-granted pty write access by
+/// subscribing first — the check answered "are you subscribed?" as a proxy for
+/// "are you allowed?", and nothing gated the subscribe. Admission now happens at
+/// the subscribe ([`Topic::admission`]: `term:<session>` is
+/// [`Admission::Workspace`]), so a connection that holds this handle has already
+/// proved it can read this node's own workspace — the same proof
+/// [`take_service_link`] makes the agent daemon give.
+///
+/// The state VARIANT is part of the answer, not just the key: nothing but an
+/// admitted `term:` subscription may drive a pty, whatever else is on the
+/// connection.
+fn holds_session(topics: &BTreeMap<String, TopicState>, session: &str) -> bool {
+    matches!(
+        topics.get(&crate::term::topic(session)),
+        Some(TopicState::Term { .. })
+    )
 }
 
-/// write base64-decoded keystrokes to a session's pty. Refused (no-op + `warn`)
-/// when the connection isn't subscribed to the session (`unentitled_session`),
-/// the terminal plane is absent, the session is unknown, or the base64 is bad —
-/// never a panic. Never logs the bytes; the unentitled refusal logs no id (an
-/// id the caller isn't entitled to is not the node's to echo into the
-/// webview-streamed log ring).
 /// the host node a session's input must be forwarded to, or `None` for a local
 /// session (write to this node's pty). Just the guest-side registry lookup.
 fn forward_target(handle: &NodeHandle, session: &str) -> Option<[u8; 32]> {
@@ -1139,14 +1176,27 @@ async fn forward_input(handle: &NodeHandle, host: [u8; 32], event: crate::Sessio
     }
 }
 
+/// write base64-decoded keystrokes to a session's pty. Refused (no-op + a log
+/// line) when the connection holds no admitted handle on the session
+/// (`unadmitted_session`), the terminal plane is absent, the session is unknown,
+/// or the base64 is bad — never a panic. Never logs the bytes; the refusal logs
+/// no id (an id the caller was not admitted to is not the node's to echo into
+/// the log ring the app streams).
+///
+/// `unadmitted_session` is `debug`, not `warn`, and for the reason
+/// [`refuse_topic`] already gives: it is PER-KEYSTROKE. An unadmitted client
+/// held-down key would otherwise mint one `warn` per repeat into the 4096-line
+/// ring — evicting the very context an operator opened the Logs tab to read,
+/// and doing it through the `logs` topic any ws caller may hold. The other three
+/// reasons here stay `warn`: each is once per frame class, not once per byte.
 async fn handle_term_input(
     handle: &NodeHandle,
     topics: &BTreeMap<String, TopicState>,
     session: &str,
     data_b64: &str,
 ) {
-    if !term_entitled(topics, session) {
-        tracing::warn!(target: "ducktape::term", reason = "unentitled_session", "term input dropped");
+    if !holds_session(topics, session) {
+        tracing::debug!(target: "ducktape::term", reason = "unadmitted_session", "term input dropped");
         return;
     }
     // a remote session lives on a host peer — forward the keystrokes there rather
@@ -1190,7 +1240,7 @@ async fn handle_term_input(
     terminals.input(session, data_b64).await;
 }
 
-/// resize a session's pty. Same entitlement gate + no-op-on-unknown discipline
+/// resize a session's pty. Same admission gate + no-op-on-unknown discipline
 /// as input.
 async fn handle_term_resize(
     handle: &NodeHandle,
@@ -1199,8 +1249,8 @@ async fn handle_term_resize(
     cols: u16,
     rows: u16,
 ) {
-    if !term_entitled(topics, session) {
-        tracing::warn!(target: "ducktape::term", reason = "unentitled_session", "term resize dropped");
+    if !holds_session(topics, session) {
+        tracing::debug!(target: "ducktape::term", reason = "unadmitted_session", "term resize dropped");
         return;
     }
     // a remote session's window change forwards to its host.
@@ -1232,8 +1282,8 @@ async fn handle_term_resize(
 
 /// enqueue a submitted COMMAND onto a session's ordered command lane (the
 /// `CommandSource` seam). Gated exactly like [`handle_term_input`]: the
-/// connection must be subscribed to the session's `term:<id>` output topic
-/// (`term_entitled`, M6). Refused (no-op + `warn`) when unentitled or the
+/// connection must hold an ADMITTED handle on the session's `term:<id>` output
+/// topic ([`holds_session`]). Refused (no-op + `warn`) when it does not, or the
 /// terminal plane is absent; an unknown session id is warned inside
 /// `enqueue_command`. Never logs the command text (it can carry secrets); the
 /// serial consumer assigns the total order and feeds the pty.
@@ -1244,8 +1294,8 @@ fn handle_term_command(
     origin: String,
     text: String,
 ) {
-    if !term_entitled(topics, session) {
-        tracing::warn!(target: "ducktape::term", reason = "unentitled_session", "term command dropped");
+    if !holds_session(topics, session) {
+        tracing::debug!(target: "ducktape::term", reason = "unadmitted_session", "term command dropped");
         return;
     }
     let Some(terminals) = handle.terminals() else {
@@ -1260,8 +1310,13 @@ fn subscribe_topics(
     states: &mut BTreeMap<String, TopicState>,
     requested: Vec<String>,
     resume: &BTreeMap<String, String>,
+    token: Option<&str>,
 ) -> Vec<ServerFrame> {
     let store = handle.stream_index();
+    // ONE constant-time compare per frame, not per topic: the secret is
+    // connection-wide, so this is both the cheapest place to spend it and the
+    // only place the presented bytes are touched at all.
+    let holds_workspace_secret = token.is_some_and(|token| handle.workspace_secret_matches(token));
     let mut frames = Vec::new();
     let mut accepted = BTreeMap::new();
     for topic in requested {
@@ -1274,7 +1329,7 @@ fn subscribe_topics(
             ));
             continue;
         }
-        match prepare_topic(&topic, resume.get(&topic), store.as_ref()) {
+        match prepare_topic(&topic, holds_workspace_secret, resume.get(&topic), store.as_ref()) {
             Ok((state, lagged)) => {
                 accepted.insert(topic.clone(), Some(state.cursor()));
                 states.insert(topic, state);
@@ -1289,91 +1344,339 @@ fn subscribe_topics(
     frames
 }
 
+/// the `files` module's live-change topic, spelled once.
+const FILES_WATCH_TOPIC: &str = "files:watch";
+/// the log-ring tail topic.
+const LOGS_TOPIC: &str = "logs";
+/// the metrics-exposition snapshot topic.
+const METRICS_TOPIC: &str = "metrics";
+const MODULE_PREFIX: &str = "module:";
+const RUN_OUTPUT_PREFIX: &str = "run-output:";
+/// checked before [`TERM_PREFIX`] for readability only — the two diverge at the
+/// fifth byte (`-` vs `:`), so neither is a prefix of the other.
+const TERM_COMMAND_PREFIX: &str = "term-cmd:";
+const TERM_PREFIX: &str = "term:";
+
+/// every topic family this node serves, parsed from the wire name exactly once.
+///
+/// ONE tagged value so admission is ONE `match` with no `_` arm ([`Self::admission`]):
+/// a family added later cannot compile until that match names it, which is what
+/// makes "deny by default" a build error rather than a habit. The prefix ladder
+/// in [`Self::parse`] is not the decision — it is the parse, and a `&str` is not
+/// a closed set; every decision downstream of it branches on this enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Topic<'a> {
+    /// every committed op of one indexed module, decoded.
+    Module(&'a str),
+    /// the same, pinned to `files` and projected as path changes.
+    FilesWatch,
+    /// this node's 4096-line log ring.
+    Logs,
+    /// one run's stdout/stderr tail.
+    RunOutput(&'a str),
+    /// one interactive session's ordered, attributed command log.
+    TermCommand(&'a str),
+    /// one interactive session's raw pty bytes, local or remote-hosted.
+    Term(&'a str),
+    /// the Prometheus exposition, re-sampled per heartbeat.
+    Metrics,
+}
+
+/// what a caller must have proved to hold a topic handle.
+///
+/// Two values and no more: the ws surface has exactly one piece of evidence
+/// about a caller — whether it can read this node's workspace — so a richer
+/// lattice would be names without a mechanism behind them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// nothing. The same bytes already leave this node over an HTTP route with
+    /// no gate on it, so a check here would refuse an honest client and stop
+    /// nobody.
+    Public,
+    /// this node's own 0600 workspace secret ([`crate::services::LINK_TOKEN_FILE`]).
+    Workspace,
+}
+
+impl<'a> Topic<'a> {
+    /// Parse a wire topic name, or `None` for a name no family owns.
+    ///
+    /// `None` is a refusal, not a fallthrough: an unparsed name reaches no
+    /// `TopicState` and so hands the connection nothing.
+    fn parse(name: &'a str) -> Option<Self> {
+        if let Some(module) = name.strip_prefix(MODULE_PREFIX) {
+            return Some(Self::Module(module));
+        }
+        if let Some(id) = name.strip_prefix(RUN_OUTPUT_PREFIX) {
+            return Some(Self::RunOutput(id));
+        }
+        if let Some(session) = name.strip_prefix(TERM_COMMAND_PREFIX) {
+            return Some(Self::TermCommand(session));
+        }
+        if let Some(session) = name.strip_prefix(TERM_PREFIX) {
+            return Some(Self::Term(session));
+        }
+        match name {
+            FILES_WATCH_TOPIC => Some(Self::FilesWatch),
+            LOGS_TOPIC => Some(Self::Logs),
+            METRICS_TOPIC => Some(Self::Metrics),
+            _ => None,
+        }
+    }
+
+    /// What this family costs to hold. The whole authorization decision, in one
+    /// place, with every family named.
+    ///
+    /// The public three are public because gating them would be theater: an
+    /// `Origin`-less caller already reads the identical bytes over
+    /// `POST /v1/query` + `GET /v1/index/{module}/{ops,scan}` (`Module`,
+    /// `FilesWatch`) and `GET /metrics` (`Metrics`), neither of which this
+    /// change touches. `Logs` is public for a different reason and a weaker one,
+    /// named honestly: the ring is the app's Logs tab, the app reaches this node
+    /// by URL with no workspace handle to read a secret from, and the logging
+    /// doctrine already forbids a token, a URI or key material from ever
+    /// entering it. Its admin twin (`GET /v1/admin/logs/tail`) IS gated, so the
+    /// asymmetry is real and survives this change deliberately rather than
+    /// silently.
+    ///
+    /// The gated three all carry provider/member bytes with no unauthenticated
+    /// HTTP twin at all: a pty's raw output, the command log whose `text`
+    /// `crate::term` documents as able to carry secrets, and a run's stdout.
+    fn admission(&self) -> Admission {
+        match self {
+            Self::Module(_) => Admission::Public,
+            Self::FilesWatch => Admission::Public,
+            Self::Logs => Admission::Public,
+            Self::Metrics => Admission::Public,
+            Self::RunOutput(_) => Admission::Workspace,
+            Self::TermCommand(_) => Admission::Workspace,
+            Self::Term(_) => Admission::Workspace,
+        }
+    }
+}
+
+/// Why a subscribe was refused. Typed, mirroring [`crate::services::HelloRefusal`]:
+/// the stable snake_case `reason` and the wire code are derived from the
+/// variant, so a typo cannot silently downgrade a refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopicRefusal {
+    /// no family owns this name.
+    UnknownFamily,
+    /// the family is real but names a module this node does not index. A
+    /// separate variant from [`Self::UnknownFamily`] because the two send an
+    /// operator to different places — a typo in the topic grammar, versus a
+    /// module absent from THIS node's genesis set — and one token covering both
+    /// would be uncountable.
+    UnknownModule,
+    /// the family is workspace-gated and no matching secret was presented.
+    NotAdmitted,
+}
+
+impl TopicRefusal {
+    /// the stable snake_case token — greppable, countable, never prose.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::UnknownFamily => "unknown_topic",
+            Self::UnknownModule => "unknown_module",
+            Self::NotAdmitted => "topic_not_admitted",
+        }
+    }
+
+    fn code(self) -> StreamErrorCode {
+        match self {
+            Self::UnknownFamily | Self::UnknownModule => StreamErrorCode::UnknownTopic,
+            Self::NotAdmitted => StreamErrorCode::Forbidden,
+        }
+    }
+
+    /// the caller-facing sentence. It names what the caller must PRESENT and
+    /// never what this node EXPECTS: echoing the secret into a refusal body is
+    /// a bug this repo has already shipped once.
+    ///
+    /// `&'static str` is that guarantee, structurally — there is no formatting
+    /// site here for a secret to reach.
+    fn detail(self) -> &'static str {
+        match self {
+            Self::UnknownFamily => "unknown stream topic",
+            Self::UnknownModule => "this node indexes no such module",
+            Self::NotAdmitted => {
+                "this topic requires the node's service-link token — read it from \
+                 the workspace and send it as `token` on the subscribe"
+            }
+        }
+    }
+}
+
+/// Refuse one topic: the wire frame back to the caller, and one `debug` line.
+///
+/// `debug`, not `warn`, and for the reason `crate::admin`'s `refuse` already
+/// documents: a refusal is per-request and any local process can drive one in a
+/// loop, so an unconditional `warn!` is a log-ring DoS that evicts the evidence
+/// around whatever you were hunting. The topic NAME never reaches the log — it
+/// carries a session id — while the frame does, because that is the caller's own
+/// input going back to the caller.
+fn refuse_topic(topic: &str, refusal: TopicRefusal) -> ServerFrame {
+    tracing::debug!(
+        target: "ducktape::stream",
+        reason = refusal.reason(),
+        "topic subscribe refused"
+    );
+    ServerFrame::Error {
+        topic: topic.to_string(),
+        code: refusal.code(),
+        detail: refusal.detail().into(),
+    }
+}
+
+/// Decide one requested topic: admit it (with its start cursor) or refuse it.
+///
+/// A decide-fn as far as STATE goes — it inserts no handle, mutates nothing, and
+/// the caller applies the result. It is not effect-free: [`refuse_topic`] emits
+/// one `debug` line, deliberately kept beside the decision so a refusal cannot
+/// be returned without being counted.
+///
+/// `holds_workspace_secret` is the connection's ONE proved fact, compared once
+/// per subscribe frame by [`subscribe_topics`].
 #[allow(clippy::result_large_err)]
 fn prepare_topic(
+    topic: &str,
+    holds_workspace_secret: bool,
+    resume: Option<&String>,
+    store: Option<&Arc<indexer::IndexStore>>,
+) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
+    let Some(family) = Topic::parse(topic) else {
+        return Err(refuse_topic(topic, TopicRefusal::UnknownFamily));
+    };
+    let admitted = match family.admission() {
+        Admission::Public => true,
+        Admission::Workspace => holds_workspace_secret,
+    };
+    if !admitted {
+        return Err(refuse_topic(topic, TopicRefusal::NotAdmitted));
+    }
+    match family {
+        Topic::Module(module) => prepare_module(topic, module, resume, store),
+        Topic::FilesWatch => prepare_files_watch(topic, resume, store),
+        Topic::Logs => prepare_logs(topic, resume),
+        Topic::RunOutput(id) => prepare_run_output(topic, id, resume),
+        Topic::TermCommand(session) => prepare_term_command(topic, session, resume),
+        Topic::Term(session) => prepare_term(topic, session, resume),
+        Topic::Metrics => prepare_metrics(),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn prepare_module(
+    topic: &str,
+    module: &str,
+    resume: Option<&String>,
+    store: Option<&Arc<indexer::IndexStore>>,
+) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
+    let store = store.ok_or_else(|| unavailable(topic, "no index store configured"))?;
+    if !store.module_ids().any(|id| id == module) {
+        return Err(refuse_topic(topic, TopicRefusal::UnknownModule));
+    }
+    let (cursor, lagged) = module_start_cursor(topic, module, resume, store)?;
+    Ok((
+        TopicState::Module {
+            module: module.to_string(),
+            cursor,
+        },
+        lagged,
+    ))
+}
+
+#[allow(clippy::result_large_err)]
+fn prepare_files_watch(
     topic: &str,
     resume: Option<&String>,
     store: Option<&Arc<indexer::IndexStore>>,
 ) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
-    if let Some(module) = topic.strip_prefix("module:") {
-        let store = store.ok_or_else(|| unavailable(topic, "no index store configured"))?;
-        if !store.module_ids().any(|id| id == module) {
-            return Err(unknown_topic(topic));
-        }
-        let (cursor, lagged) = module_start_cursor(topic, module, resume, store)?;
-        return Ok((
-            TopicState::Module {
-                module: module.to_string(),
-                cursor,
-            },
-            lagged,
-        ));
+    let store = store.ok_or_else(|| unavailable(topic, "no index store configured"))?;
+    if !store.module_ids().any(|id| id == "files") {
+        return Err(refuse_topic(topic, TopicRefusal::UnknownModule));
     }
-    if topic == "files:watch" {
-        let store = store.ok_or_else(|| unavailable(topic, "no index store configured"))?;
-        if !store.module_ids().any(|id| id == "files") {
-            return Err(unknown_topic(topic));
-        }
-        let (cursor, lagged) = module_start_cursor(topic, "files", resume, store)?;
-        return Ok((TopicState::FilesWatch { cursor }, lagged));
+    let (cursor, lagged) = module_start_cursor(topic, "files", resume, store)?;
+    Ok((TopicState::FilesWatch { cursor }, lagged))
+}
+
+#[allow(clippy::result_large_err)]
+fn prepare_logs(
+    topic: &str,
+    resume: Option<&String>,
+) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
+    Ok((
+        TopicState::Logs {
+            seq: start_seq(topic, resume)?,
+        },
+        None,
+    ))
+}
+
+#[allow(clippy::result_large_err)]
+fn prepare_run_output(
+    topic: &str,
+    id: &str,
+    resume: Option<&String>,
+) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
+    Ok((
+        TopicState::RunOutput {
+            id: id.to_string(),
+            seq: start_seq(topic, resume)?,
+        },
+        None,
+    ))
+}
+
+/// the ordered command log — like `term:`, any session id subscribes once the
+/// caller is admitted (unknown/evicted → empty catch-up, never an error).
+#[allow(clippy::result_large_err)]
+fn prepare_term_command(
+    topic: &str,
+    session: &str,
+    resume: Option<&String>,
+) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
+    Ok((
+        TopicState::TermCommand {
+            session: session.to_string(),
+            seq: start_seq(topic, resume)?,
+        },
+        None,
+    ))
+}
+
+/// like run-output, any session id subscribes once the caller is admitted
+/// (unknown/evicted → empty catch-up, never an error); the manager gates who may
+/// CREATE one.
+#[allow(clippy::result_large_err)]
+fn prepare_term(
+    topic: &str,
+    session: &str,
+    resume: Option<&String>,
+) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
+    Ok((
+        TopicState::Term {
+            session: session.to_string(),
+            seq: start_seq(topic, resume)?,
+        },
+        None,
+    ))
+}
+
+/// a resume cursor is accepted but meaningless for a snapshot topic: every
+/// (re)subscribe starts from a fresh sample, never a replay.
+#[allow(clippy::result_large_err)]
+fn prepare_metrics() -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
+    Ok((TopicState::Metrics { sampled_ms: 0 }, None))
+}
+
+/// the seq a ring-backed topic starts from: the caller's resume cursor, or the
+/// bottom of the ring.
+#[allow(clippy::result_large_err)]
+fn start_seq(topic: &str, resume: Option<&String>) -> Result<u64, ServerFrame> {
+    match resume {
+        Some(cursor) => parse_seq_cursor(topic, cursor),
+        None => Ok(0),
     }
-    if topic == "logs" {
-        let seq = match resume {
-            Some(cursor) => parse_seq_cursor(topic, cursor)?,
-            None => 0,
-        };
-        return Ok((TopicState::Logs { seq }, None));
-    }
-    if let Some(id) = topic.strip_prefix("run-output:") {
-        let seq = match resume {
-            Some(cursor) => parse_seq_cursor(topic, cursor)?,
-            None => 0,
-        };
-        return Ok((
-            TopicState::RunOutput {
-                id: id.to_string(),
-                seq,
-            },
-            None,
-        ));
-    }
-    if let Some(session) = topic.strip_prefix("term-cmd:") {
-        // the ordered command log — like `term:`, any session id subscribes
-        // (unknown/evicted → empty catch-up, never an error). Checked before
-        // `term:` (non-colliding prefixes, but clearer this way).
-        let seq = match resume {
-            Some(cursor) => parse_seq_cursor(topic, cursor)?,
-            None => 0,
-        };
-        return Ok((
-            TopicState::TermCommand {
-                session: session.to_string(),
-                seq,
-            },
-            None,
-        ));
-    }
-    if let Some(session) = topic.strip_prefix("term:") {
-        // like run-output, any session id subscribes (unknown/evicted → empty
-        // catch-up, never an error); the manager gates who may CREATE one.
-        let seq = match resume {
-            Some(cursor) => parse_seq_cursor(topic, cursor)?,
-            None => 0,
-        };
-        return Ok((
-            TopicState::Term {
-                session: session.to_string(),
-                seq,
-            },
-            None,
-        ));
-    }
-    if topic == "metrics" {
-        // a resume cursor is accepted but meaningless for a snapshot topic:
-        // every (re)subscribe starts from a fresh sample, never a replay.
-        return Ok((TopicState::Metrics { sampled_ms: 0 }, None));
-    }
-    Err(unknown_topic(topic))
 }
 
 #[allow(clippy::result_large_err)]
@@ -1924,14 +2227,6 @@ fn parse_seq_cursor(topic: &str, cursor: &str) -> Result<u64, ServerFrame> {
     })
 }
 
-fn unknown_topic(topic: &str) -> ServerFrame {
-    ServerFrame::Error {
-        topic: topic.to_string(),
-        code: StreamErrorCode::UnknownTopic,
-        detail: "unknown stream topic".into(),
-    }
-}
-
 fn unavailable(topic: impl Into<String>, detail: impl Into<String>) -> ServerFrame {
     ServerFrame::Error {
         topic: topic.into(),
@@ -1960,6 +2255,26 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// a caller that presented no workspace secret (or the wrong one).
+    const NO_SECRET: bool = false;
+    /// a caller whose presented secret matched.
+    const HOLDS_SECRET: bool = true;
+    /// the workspace secret a test node mints.
+    const TEST_SECRET: &str = "d3adb33fd3adb33fd3adb33fd3adb33f";
+
+    /// a handle whose terminal plane holds [`TEST_SECRET`] — a node with a
+    /// workspace, i.e. the only shape that can admit a gated topic at all. The
+    /// actor lane is unused on every subscribe path, so its receiver is dropped
+    /// here rather than parked in each caller.
+    fn handle_with_secret() -> crate::NodeHandle {
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        handle.with_terminals(crate::term::TerminalSessions::new(
+            crate::term::TermRing::default(),
+            crate::term::TermCommandRing::default(),
+            Some(TEST_SECRET.into()),
+        ))
+    }
 
     fn temp_store(modules: &[&str]) -> (tempfile::TempDir, Arc<indexer::IndexStore>) {
         let dir = tempfile::TempDir::new().expect("temp index dir");
@@ -2026,7 +2341,8 @@ mod tests {
     fn fresh_module_subscribe_starts_at_live_tip() {
         let (_dir, store) = temp_store(&["chat"]);
         apply_chat(&store, 1, vec![json!({"one": 1})]);
-        let (state, lagged) = prepare_topic("module:chat", None, Some(&store)).expect("topic");
+        let (state, lagged) =
+            prepare_topic("module:chat", NO_SECRET, None, Some(&store)).expect("topic");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "op/0000000000000001/ffff");
         let mut state = state;
@@ -2045,6 +2361,7 @@ mod tests {
         store.mark_backfilled("chat", 10).expect("mark backfilled");
         let (state, lagged) = prepare_topic(
             "module:chat",
+            NO_SECRET,
             Some(&"op/0000000000000005/0000".to_string()),
             Some(&store),
         )
@@ -2058,7 +2375,7 @@ mod tests {
     #[test]
     fn topic_refusals_are_per_topic() {
         assert!(matches!(
-            prepare_topic("module:chat", None, None),
+            prepare_topic("module:chat", NO_SECRET, None, None),
             Err(ServerFrame::Error {
                 code: StreamErrorCode::Unavailable,
                 ..
@@ -2066,14 +2383,14 @@ mod tests {
         ));
         let (_dir, store) = temp_store(&["chat"]);
         assert!(matches!(
-            prepare_topic("module:nope", None, Some(&store)),
+            prepare_topic("module:nope", NO_SECRET, None, Some(&store)),
             Err(ServerFrame::Error {
                 code: StreamErrorCode::UnknownTopic,
                 ..
             })
         ));
         assert!(matches!(
-            prepare_topic("logs", Some(&"not-a-seq".to_string()), Some(&store)),
+            prepare_topic("logs", NO_SECRET, Some(&"not-a-seq".to_string()), Some(&store)),
             Err(ServerFrame::Error {
                 code: StreamErrorCode::BadCursor,
                 ..
@@ -2174,7 +2491,8 @@ mod tests {
     fn term_topic_subscribes_and_replays_as_event_tagged_chunks() {
         // any session id subscribes (the manager gates who may CREATE one);
         // a fresh subscribe starts at cursor 0 and needs no index store.
-        let (state, lagged) = prepare_topic("term:abc", None, None).expect("term topic subscribes");
+        let (state, lagged) =
+            prepare_topic("term:abc", HOLDS_SECRET, None, None).expect("term topic subscribes");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "0");
 
@@ -2215,7 +2533,8 @@ mod tests {
         // any session id subscribes to its command log (like `term:`); a fresh
         // subscribe starts at cursor 0 and needs no index store.
         let (state, lagged) =
-            prepare_topic("term-cmd:abc", None, None).expect("term-cmd topic subscribes");
+            prepare_topic("term-cmd:abc", HOLDS_SECRET, None, None)
+                .expect("term-cmd topic subscribes");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "0");
         assert!(matches!(state, TopicState::TermCommand { .. }));
@@ -2309,12 +2628,11 @@ mod tests {
     }
 
     #[test]
-    fn term_input_requires_a_subscription_to_the_session_topic() {
+    fn only_an_admitted_session_handle_may_drive_a_pty() {
         let mut topics: BTreeMap<String, TopicState> = BTreeMap::new();
-        // a connection that never subscribed is not entitled to drive a session.
-        assert!(!term_entitled(&topics, "sess1"));
-        // subscribing to a session's OWN output topic entitles input to it — and
-        // only it: holding one session's topic doesn't entitle another's.
+        // a connection that holds no handle drives nothing.
+        assert!(!holds_session(&topics, "sess1"));
+        // an admitted handle on a session drives it — and only it.
         topics.insert(
             crate::term::topic("sess1"),
             TopicState::Term {
@@ -2322,21 +2640,345 @@ mod tests {
                 seq: 0,
             },
         );
-        assert!(term_entitled(&topics, "sess1"));
-        assert!(!term_entitled(&topics, "sess2"));
-        // a non-terminal subscription never entitles terminal input.
-        topics.insert("logs".into(), TopicState::Logs { seq: 0 });
-        assert!(!term_entitled(&topics, "logs"));
+        assert!(holds_session(&topics, "sess1"));
+        assert!(!holds_session(&topics, "sess2"));
+        // a non-terminal handle never drives a pty, whatever its name.
+        topics.insert(LOGS_TOPIC.into(), TopicState::Logs { seq: 0 });
+        assert!(!holds_session(&topics, LOGS_TOPIC));
+        // and neither does the COMMAND-log handle for the same session: it is a
+        // different key, so it can never stand in for the output handle.
+        topics.insert(
+            crate::term::command_topic("sess3"),
+            TopicState::TermCommand {
+                session: "sess3".into(),
+                seq: 0,
+            },
+        );
+        assert!(!holds_session(&topics, "sess3"));
+
+        // the VARIANT is load-bearing, not decoration. Every case above differs
+        // by KEY too, so a revert to the deleted check's key-only
+        // `contains_key` would pass them all; this one cannot be built by
+        // `prepare_topic` and exists precisely to fail that revert. A `term:`
+        // key whose state is not a `Term` is a map this node never wrote — and
+        // "never written" is a claim worth a test rather than a comment.
+        topics.insert(crate::term::topic("sess4"), TopicState::Logs { seq: 0 });
+        assert!(
+            !holds_session(&topics, "sess4"),
+            "a term-keyed handle that is not a Term state must never drive a pty"
+        );
+    }
+
+    /// Every family's admission is DECIDED, and the table is the decision.
+    ///
+    /// A new family cannot reach this list by accident: `Topic::admission` has
+    /// no `_` arm, so adding a variant fails the build until someone writes its
+    /// admission, and adding it here is how that choice gets reviewed.
+    #[test]
+    fn every_topic_family_has_a_decided_admission() {
+        let decided = [
+            (Topic::Module("chat"), Admission::Public),
+            (Topic::FilesWatch, Admission::Public),
+            (Topic::Logs, Admission::Public),
+            (Topic::Metrics, Admission::Public),
+            (Topic::RunOutput("r1"), Admission::Workspace),
+            (Topic::TermCommand("s1"), Admission::Workspace),
+            (Topic::Term("s1"), Admission::Workspace),
+        ];
+        for (family, expected) in decided {
+            assert_eq!(family.admission(), expected, "{family:?}");
+        }
+
+        // the wire names round-trip to the families above ...
+        assert_eq!(Topic::parse("module:chat"), Some(Topic::Module("chat")));
+        assert_eq!(Topic::parse("files:watch"), Some(Topic::FilesWatch));
+        assert_eq!(Topic::parse("logs"), Some(Topic::Logs));
+        assert_eq!(Topic::parse("metrics"), Some(Topic::Metrics));
+        assert_eq!(Topic::parse("run-output:r1"), Some(Topic::RunOutput("r1")));
+        assert_eq!(Topic::parse("term:s1"), Some(Topic::Term("s1")));
+        // `term-cmd:` is its own family and never decodes as a `term:` session
+        // named "cmd:s1" — the two prefixes diverge before the colon.
+        assert_eq!(
+            Topic::parse("term-cmd:s1"),
+            Some(Topic::TermCommand("s1"))
+        );
+
+        // ... and a name no family owns parses to nothing, which is what makes
+        // admission deny-by-default rather than a habit.
+        for unknown in ["", "term", "logs2", "modules:chat", "files:watch2"] {
+            assert_eq!(Topic::parse(unknown), None, "{unknown:?} owns no family");
+            assert!(matches!(
+                prepare_topic(unknown, HOLDS_SECRET, None, None),
+                Err(ServerFrame::Error {
+                    code: StreamErrorCode::UnknownTopic,
+                    ..
+                })
+            ));
+        }
+    }
+
+    /// A workspace-gated family hands back NO handle without the secret.
+    #[test]
+    fn gated_families_refuse_a_caller_with_no_workspace_secret() {
+        for gated in ["term:s1", "term-cmd:s1", "run-output:r1"] {
+            let Err(ServerFrame::Error { code, detail, .. }) =
+                prepare_topic(gated, NO_SECRET, None, None)
+            else {
+                panic!("{gated} must refuse a caller with no workspace secret");
+            };
+            assert_eq!(code, StreamErrorCode::Forbidden);
+            // A TRIPWIRE, not the live check: `detail()` is a `&'static str`
+            // with no access to any secret, so this cannot fail today — it fails
+            // the day someone gives the refusal a formatted body. The real
+            // guarantee is structural and is stated where it is enforced, on
+            // `TopicRefusal::detail`.
+            assert!(
+                !detail.contains(TEST_SECRET),
+                "a refusal must never carry the secret: {detail}"
+            );
+            // and it admits the same caller once the secret matches.
+            assert!(prepare_topic(gated, HOLDS_SECRET, None, None).is_ok());
+        }
+        // the public families need nothing, on the same call.
+        assert!(prepare_topic("logs", NO_SECRET, None, None).is_ok());
+        assert!(prepare_topic("metrics", NO_SECRET, None, None).is_ok());
+    }
+
+    /// A wrong secret is exactly as good as no secret — the compare is the gate,
+    /// not the presence of the field.
+    #[test]
+    fn a_wrong_secret_admits_nothing() {
+        let handle = handle_with_secret();
+        for presented in [None, Some("not-the-secret"), Some("")] {
+            let mut states = BTreeMap::new();
+            subscribe_topics(
+                &handle,
+                &mut states,
+                vec!["term:s1".into()],
+                &BTreeMap::new(),
+                presented,
+            );
+            assert!(states.is_empty(), "presented {presented:?} admitted a pty");
+        }
+        // a node with NO TERMINAL PLANE admits nobody, whatever they present.
+        let (bare, _cmds, _hub) = crate::NodeHandle::channel();
+        let mut states = BTreeMap::new();
+        subscribe_topics(
+            &bare,
+            &mut states,
+            vec!["term:s1".into()],
+            &BTreeMap::new(),
+            Some(TEST_SECRET),
+        );
+        assert!(states.is_empty(), "a node with no plane admits nobody");
+
+        // and NEITHER does a node whose plane minted no secret — the case that
+        // actually ships. `bin/noded/src/main.rs` passes `None`, and
+        // `bin/node/src/boot/surfaces.rs` does too whenever `mint_link_token`
+        // fails. It must reach `link_token_matches` itself rather than
+        // short-circuiting in `workspace_secret_matches` one level up, which is
+        // where the plane-less case above stops: an `is_none_or` slip inside
+        // that function turns "this node minted no secret" into "this node
+        // admits EVERYBODY", and only this case can see it.
+        let (unminted, _cmds, _hub) = crate::NodeHandle::channel();
+        let unminted = unminted.with_terminals(crate::term::TerminalSessions::new(
+            crate::term::TermRing::default(),
+            crate::term::TermCommandRing::default(),
+            None,
+        ));
+        for presented in ["", TEST_SECRET] {
+            assert!(
+                !unminted.workspace_secret_matches(presented),
+                "a plane that minted no secret must match nothing, got {presented:?}"
+            );
+            let mut states = BTreeMap::new();
+            subscribe_topics(
+                &unminted,
+                &mut states,
+                vec!["term:s1".into()],
+                &BTreeMap::new(),
+                Some(presented),
+            );
+            assert!(
+                states.is_empty(),
+                "a plane with no minted secret admitted {presented:?}"
+            );
+        }
+    }
+
+    /// THE hole, end to end: a connection that never presented the node's
+    /// workspace secret cannot write a keystroke into a live pty, and one that
+    /// did can.
+    ///
+    /// The old `term_entitled` asked `topics.contains_key("term:<id>")` while
+    /// the subscribe was unconditional, so this test's first half passed only
+    /// because the attacker had not bothered to subscribe. It subscribes here.
+    ///
+    /// Waits on the daemon's own receive, never on a duration: the assertion is
+    /// that the FIRST input to reach the link is the admitted one, which is
+    /// false the moment the gate leaks.
+    /// a live session plus the ORDERED feed of what actually reached the
+    /// daemon's link.
+    ///
+    /// The link is the observation seam every terminal-frame test below waits
+    /// on: a frame this node dropped never arrives on it, so an assertion about
+    /// what did arrive is an assertion about the gate — with no duration in it.
+    /// One channel for all three command kinds, because ORDER is half the claim.
+    async fn session_on_the_link(
+        mode: crate::term::SessionMode,
+    ) -> (
+        crate::NodeHandle,
+        String,
+        crate::term::AttachGuard,
+        mpsc::Receiver<String>,
+    ) {
+        use agent_service::wire;
+
+        let handle = handle_with_secret();
+        let terminals = handle.terminals().expect("a wired terminal plane").clone();
+        let (link, mut commands) = terminals.attach(TEST_SECRET).expect("the daemon attaches");
+        let (seen_tx, seen) = mpsc::channel::<String>(8);
+        let daemon = terminals.clone();
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                match command {
+                    wire::Command::TermCreate(create) => daemon.on_event(wire::Event::TermCreated {
+                        session: create.session,
+                    }),
+                    wire::Command::TermInput { data_b64, .. } => {
+                        let _ = seen_tx.send(format!("input:{data_b64}")).await;
+                    }
+                    wire::Command::TermResize { cols, rows, .. } => {
+                        let _ = seen_tx.send(format!("resize:{cols}x{rows}")).await;
+                    }
+                    wire::Command::TermClose { .. } => {}
+                }
+            }
+        });
+        let created = terminals
+            .create("claude", mode)
+            .await
+            .expect("the daemon answered the create");
+        (handle, created.session_id, link, seen)
+    }
+
+    /// the two subscription maps a session is driven through: one that
+    /// subscribed WITHOUT the node's secret (the self-grant attempt) and one
+    /// that presented it.
+    fn unadmitted_and_admitted(
+        handle: &crate::NodeHandle,
+        session: &str,
+    ) -> (
+        BTreeMap<String, TopicState>,
+        BTreeMap<String, TopicState>,
+        Vec<ServerFrame>,
+    ) {
+        let mut unadmitted = BTreeMap::new();
+        let refusals = subscribe_topics(
+            handle,
+            &mut unadmitted,
+            vec![crate::term::topic(session)],
+            &BTreeMap::new(),
+            None,
+        );
+        let mut admitted = BTreeMap::new();
+        subscribe_topics(
+            handle,
+            &mut admitted,
+            vec![crate::term::topic(session)],
+            &BTreeMap::new(),
+            Some(TEST_SECRET),
+        );
+        (unadmitted, admitted, refusals)
+    }
+
+    #[tokio::test]
+    async fn a_connection_without_the_workspace_secret_cannot_drive_a_pty() {
+        let (handle, session, _link, mut seen) =
+            session_on_the_link(crate::term::SessionMode::Single).await;
+        let (unadmitted, admitted, refusals) = unadmitted_and_admitted(&handle, &session);
+
+        // the unadmitted connection SUBSCRIBED FIRST — the exact self-grant the
+        // deleted check waved through — and still got nothing to send on.
+        assert!(unadmitted.is_empty(), "subscribing self-granted a handle");
+        assert!(!holds_session(&unadmitted, &session));
+        assert!(refusals.iter().any(|frame| matches!(
+            frame,
+            ServerFrame::Error {
+                code: StreamErrorCode::Forbidden,
+                ..
+            }
+        )));
+        assert!(holds_session(&admitted, &session));
+
+        handle_term_input(&handle, &unadmitted, &session, "dW5hZG1pdHRlZA==").await;
+        handle_term_input(&handle, &admitted, &session, "YWRtaXR0ZWQ=").await;
+
+        assert_eq!(
+            seen.recv().await.as_deref(),
+            Some("input:YWRtaXR0ZWQ="),
+            "the first keystroke to reach the pty must be the ADMITTED one — an \
+             unadmitted write reaching the link at all is the hole"
+        );
+    }
+
+    /// The other two write frames, which `term_input` alone does not cover.
+    ///
+    /// Both were unguarded-by-any-test before: deleting `holds_session` from
+    /// `handle_term_resize` or `handle_term_command` left every unit green,
+    /// because nothing in-tree constructed either frame. `term_command` is the
+    /// sharper of the two — its `text` is documented as able to carry secrets
+    /// and its caller-chosen `origin` is attribution written into a shared
+    /// session's ordered lane.
+    ///
+    /// Shared mode, because the command lane exists only there (raw input is
+    /// refused on it, which is why the test above uses a Single session).
+    /// Ordering is deterministic, not raced: the resize is awaited onto the link
+    /// channel before the command is enqueued, and the command's serial consumer
+    /// writes to that SAME channel, which is FIFO.
+    #[tokio::test]
+    async fn neither_a_resize_nor_a_command_reaches_an_unadmitted_session() {
+        let (handle, session, _link, mut seen) =
+            session_on_the_link(crate::term::SessionMode::Shared).await;
+        let (unadmitted, admitted, _) = unadmitted_and_admitted(&handle, &session);
+
+        handle_term_resize(&handle, &unadmitted, &session, 1, 1).await;
+        handle_term_command(
+            &handle,
+            &unadmitted,
+            &session,
+            "attacker".into(),
+            "unadmitted".into(),
+        );
+        handle_term_resize(&handle, &admitted, &session, 120, 40).await;
+        handle_term_command(&handle, &admitted, &session, "operator".into(), "ls".into());
+
+        assert_eq!(
+            seen.recv().await.as_deref(),
+            Some("resize:120x40"),
+            "the first resize to reach the pty must be the ADMITTED one"
+        );
+        assert_eq!(
+            seen.recv().await.as_deref(),
+            Some(format!("input:{}", STANDARD.encode(b"ls\r")).as_str()),
+            "the first command to reach the pty must be the ADMITTED one"
+        );
     }
 
     #[test]
     fn subscription_cap_refuses_new_topics_but_allows_recursoring() {
-        let (handle, _rx, _hub) = crate::NodeHandle::channel();
+        let handle = handle_with_secret();
         let mut states = BTreeMap::new();
         let requested: Vec<String> = (0..MAX_TOPICS_PER_CONNECTION + 1)
             .map(|i| format!("run-output:r{i}"))
             .collect();
-        let frames = subscribe_topics(&handle, &mut states, requested, &BTreeMap::new());
+        let frames = subscribe_topics(
+            &handle,
+            &mut states,
+            requested,
+            &BTreeMap::new(),
+            Some(TEST_SECRET),
+        );
         assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
         let refused = frames
             .iter()
@@ -2357,6 +2999,7 @@ mod tests {
             &mut states,
             vec!["run-output:r0".into()],
             &BTreeMap::new(),
+            Some(TEST_SECRET),
         );
         assert!(
             again
@@ -2416,7 +3059,8 @@ mod tests {
         // no index store still serves it, and a reconnect's stored cursor is
         // harmless.
         let (state, lagged) =
-            prepare_topic("metrics", Some(&"1752000000000".to_string()), None).expect("topic");
+            prepare_topic("metrics", NO_SECRET, Some(&"1752000000000".to_string()), None)
+                .expect("topic");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "0", "a fresh subscribe never resumes");
     }
@@ -2429,7 +3073,7 @@ mod tests {
         handle
             .status_cell()
             .wire_exposition(|| "ducktape_blocks_total 5\n".to_string());
-        let (mut state, _) = prepare_topic("metrics", None, None).expect("topic");
+        let (mut state, _) = prepare_topic("metrics", NO_SECRET, None, None).expect("topic");
         let result = catch_up_metrics("metrics", &mut state, &handle).await;
         assert!(!result.drop_topic);
         match &result.frames[..] {
@@ -2513,7 +3157,7 @@ mod tests {
         // no exposition source (an embedder that registers no metrics) — the
         // topic drops with the same `unavailable` shape the http 503 carries.
         let (handle, _cmds, _hub) = crate::NodeHandle::channel();
-        let (mut state, _) = prepare_topic("metrics", None, None).expect("topic");
+        let (mut state, _) = prepare_topic("metrics", NO_SECRET, None, None).expect("topic");
         let result = catch_up_metrics("metrics", &mut state, &handle).await;
         assert!(result.drop_topic);
         assert!(matches!(

@@ -682,11 +682,14 @@ impl TerminalSessions {
     /// could otherwise displace the live daemon and receive the create commands
     /// (including lent-credential records) meant for it.
     pub fn attach(&self, token: &str) -> Option<(AttachGuard, mpsc::Receiver<wire::Command>)> {
-        let Some(expected) = self.0.link_token.as_deref() else {
+        // two reasons, not one: "this node minted no secret" is an operator's
+        // node to fix and "you presented the wrong one" is the daemon's, and
+        // collapsing them sends whoever reads the log to the wrong machine.
+        if self.0.link_token.is_none() {
             tracing::warn!(target: "ducktape::service", reason = "no_link_token", "agent service link refused");
             return None;
-        };
-        if !crate::services::token_matches(token, expected) {
+        }
+        if !self.link_token_matches(token) {
             tracing::warn!(target: "ducktape::service", reason = "bad_link_token", "agent service link refused");
             return None;
         }
@@ -698,6 +701,31 @@ impl TerminalSessions {
         *link = Some(tx);
         tracing::info!(target: "ducktape::term", "agent service attached");
         Some((AttachGuard(self.clone()), rx))
+    }
+
+    /// Does `presented` match this node's 0600 workspace link secret?
+    ///
+    /// The node's ONE proof that a caller can read its own workspace, so it
+    /// answers two questions: may you take the interactive plane ([`Self::attach`]),
+    /// and may you hold a workspace-gated ws topic
+    /// (`crate::stream::Admission::Workspace`, reached through
+    /// [`crate::NodeHandle::workspace_secret_matches`]). Holding the secret
+    /// already grants the first, which strictly contains the second, so serving
+    /// both from one file adds no authority — a second secret would only be a
+    /// second thing to leak.
+    ///
+    /// `None` — a node with no workspace to hold one — matches NOTHING, which
+    /// fails closed.
+    ///
+    /// A pure predicate: it logs nothing, because its two callers must not log
+    /// alike. An attach is a once-per-daemon-session event worth a `warn`; a
+    /// subscribe is per-request and locally drivable in a loop, so a `warn`
+    /// there would evict the 4096-line ring. Each caller names its own level.
+    pub(crate) fn link_token_matches(&self, presented: &str) -> bool {
+        self.0
+            .link_token
+            .as_deref()
+            .is_some_and(|expected| crate::services::token_matches(presented, expected))
     }
 
     /// drop the link and end every session it was serving. See [`AttachGuard`].
