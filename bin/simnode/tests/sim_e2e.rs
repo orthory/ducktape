@@ -23,11 +23,10 @@ fn held_submit_commits_only_on_step() {
 
     // parked: nothing committed, and reads serve pre-op state.
     assert_eq!(sim.status()["height"], 0, "held submit must not commit");
-    let channels = sim.query("chat", serde_json::json!("channels"));
     assert_eq!(
-        channels["channels"].as_array().map(Vec::len),
-        Some(0),
-        "held op must be invisible to queries: {channels}"
+        sim.channel("general"),
+        None,
+        "held op must be invisible to queries"
     );
 
     let report = sim.step();
@@ -46,8 +45,10 @@ fn held_submit_commits_only_on_step() {
     );
 
     assert_eq!(sim.status()["height"], 1);
-    let channels = sim.query("chat", serde_json::json!("channels"));
-    assert_eq!(channels["channels"].as_array().map(Vec::len), Some(1));
+    assert!(
+        sim.channel("general").is_some(),
+        "the released op committed and is readable"
+    );
 }
 
 #[test]
@@ -230,9 +231,13 @@ fn peer_block_commits_past_a_parked_queue() {
     assert_eq!(code, 200);
     assert_eq!(receipt["height"], 2);
 
-    // both writers' state committed, in that order.
-    let channels = sim.query("chat", serde_json::json!("channels"));
-    assert_eq!(channels["channels"].as_array().map(Vec::len), Some(2));
+    // both writers' state committed — the peer's and the parked one's, each
+    // named rather than counted.
+    assert!(
+        sim.channel("theirs").is_some(),
+        "the peer's write committed"
+    );
+    assert!(sim.channel("mine").is_some(), "the parked write committed");
 }
 
 // ── The admin namespace ─────────────────────────────────

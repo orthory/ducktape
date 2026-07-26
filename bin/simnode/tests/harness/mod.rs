@@ -139,6 +139,26 @@ impl Sim {
         reply
     }
 
+    /// the canonical chat point read: the channel's committed record, or `None`
+    /// when nothing is committed under that id.
+    ///
+    /// there is no list-all read to count any more, and that is the product's
+    /// position, not a gap: the read-model cutover moved every UI-shaped
+    /// iteration into the index guests (`POST /v1/index/chat/view`) and left
+    /// canonical state answering point reads ALONE. so a "did this commit?"
+    /// assertion has to name the channel it means — which is also the stronger
+    /// claim, since a count of 2 never said WHICH two.
+    pub fn channel(&self, channel_id: &str) -> Option<serde_json::Value> {
+        let reply = self.query(
+            "chat",
+            serde_json::json!({ "channel": { "channel_id": channel_id } }),
+        );
+        match reply["channel"] {
+            serde_json::Value::Null => None,
+            _ => Some(reply["channel"].clone()),
+        }
+    }
+
     /// an inline submit — only sound in auto mode (or for an op the module
     /// rejects at once), where the reply does not wait on a step.
     pub fn submit(

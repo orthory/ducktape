@@ -9,12 +9,18 @@ mod harness;
 
 use harness::Sim;
 
-/// The default 14-native-module sim genesis root-hash, captured from the
-/// pre-C4 composition. C4 moved only the id-LIST source (into `host::topology`);
-/// the native genesis vec is untouched, so this must stay byte-identical — a
-/// change here means a construction change slipped in with the id-list swap.
+/// The default 14-module sim genesis root-hash.
+///
+/// This is the SIM's number and only the sim's: `sim_base` excludes
+/// `capability`, `hello`, `governance` and `lifecycle`, so it is NOT what a node
+/// runs and it is NOT the consensus pin. That one is
+/// `bin/node/src/host_state.rs`'s `GENESIS_ROOT_HASH`, over the production
+/// module set — moving THAT is the flag day that matters. This constant guards
+/// something narrower and still worth guarding: that composing the sim's
+/// genesis is a pure function of the topology selection, so a change in how the
+/// sim builds its host shows up here instead of silently under a scenario.
 const DEFAULT_GENESIS_ROOT_HASH: &str =
-    "0a81571979950afc077681d9645f368eb8eed5a938c217245db7ef65f4e51b0d";
+    "3f4773b5369b4a3dd1654895584c5f0f3b017a07fdc3e9d6980488fcea64bea2";
 
 fn module_ids(status: &serde_json::Value) -> Vec<String> {
     status["modules"]
@@ -37,10 +43,26 @@ fn default_genesis_composes_topology_sim_base() {
         want,
         "sim default genesis composes topology sim_base, in registry order"
     );
+    let root = status["root_hash"].as_str().expect("root_hash is a string");
     assert_eq!(
-        status["root_hash"].as_str().expect("root_hash is a string"),
-        DEFAULT_GENESIS_ROOT_HASH,
-        "default sim genesis root-hash must be byte-identical across the topology swap"
+        root, DEFAULT_GENESIS_ROOT_HASH,
+        "the SIM genesis root hash moved.\n\
+         \n\
+         DID YOU MEAN TO? A module in `sim_base` was added/removed, a guest was \
+         rebuilt, a genesis-seeded record changed — then yes: set \
+         DEFAULT_GENESIS_ROOT_HASH to {root} in the SAME commit as the change \
+         that moved it, and name that change in the commit message.\n\
+         \n\
+         DID YOU NOT? Then the sim's genesis CONSTRUCTION drifted from the \
+         topology selection it is supposed to be a pure function of — look for a \
+         change to how the sim builds its host, not to the module list (the id \
+         list is already pinned by the assertion above).\n\
+         \n\
+         EITHER WAY this is NOT the consensus pin, and updating it proves \
+         nothing about production: `sim_base` is 14 modules and excludes \
+         capability/hello/governance/lifecycle. The number a network forks on is \
+         GENESIS_ROOT_HASH in bin/node/src/host_state.rs — if that moved too, go \
+         read its message instead."
     );
 }
 

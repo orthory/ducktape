@@ -44,16 +44,21 @@ fn embedded_boot_serves_and_commits() {
     .expect("submit");
     assert_eq!(status, 200, "submit: {reply}");
 
+    // the canonical read is a point read (the read-model cutover moved every
+    // list-all into the index guests), so the round-trip names the channel it
+    // just committed.
     let (status, reply) = harness::try_request(
         port,
         "POST",
         "/v1/query",
-        Some(&serde_json::json!({ "target": "chat", "query": "channels" })),
+        Some(&serde_json::json!({
+            "target": "chat", "query": { "channel": { "channel_id": "embed" } }
+        })),
     )
     .expect("query");
-    assert_eq!(status, 200);
-    assert!(
-        reply.to_string().contains("embed"),
+    assert_eq!(status, 200, "query: {reply}");
+    assert_eq!(
+        reply["channel"]["name"], "embed",
         "committed channel visible: {reply}"
     );
 

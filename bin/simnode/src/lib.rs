@@ -426,6 +426,18 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     let fatal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let public_key = node_key.unwrap_or_default();
 
+    // the readiness event: the actor publishes its FIRST status snapshot
+    // (genesis or the resumed height) and signals; the http listener is not
+    // bound until then. `/v1/status` answering 200 is what every client uses as
+    // "this sim is up" — the harness, the CLI, an embedder — so serving before
+    // the actor's boot publish hands them a snapshot claiming version "",
+    // root_hash "", no modules, height 0 and an empty public_key even when
+    // `--node-key` seeded one. On a restart over existing storage that height
+    // is an outright lie about committed state. noded's `booted` signal exists
+    // for exactly this; the sim serves noded's router, so it owes the same
+    // contract.
+    let (booted_tx, booted_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
     // the actor: owns the non-Send host on its own commonware runner thread,
     // answering the node command lane + the /sim control lane. it holds a node
     // clone (for FATAL request_shutdown) and the shared fatal flag.
@@ -454,9 +466,16 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
                 stream_hub,
                 actor_node,
                 actor_fatal,
+                booted_tx,
             )
         })
         .map_err(|err| format!("spawn sim-actor thread: {err}"))?;
+
+    // a dropped sender means the actor thread died inside genesis — report that
+    // instead of binding a listener that would serve the empty default forever.
+    booted_rx
+        .recv()
+        .map_err(|_| "sim actor died during genesis — see the error above".to_string())?;
 
     // the serve loop on a private 2-worker tokio runtime, so an embedder needs
     // no runtime of its own. it binds, reports the REAL bound addr back over a
@@ -766,6 +785,9 @@ fn run_sim(
     stream_hub: StreamHub,
     handle: NodeHandle,
     fatal: Arc<Mutex<Option<String>>>,
+    // fired once, right after the boot snapshot is published — `boot` binds
+    // the listener only then, so `/v1/status` never serves the empty default.
+    booted: std::sync::mpsc::SyncSender<()>,
 ) {
     let duckfs_dir = storage.join("duckfs");
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
@@ -963,6 +985,10 @@ fn run_sim(
             .status_cell()
             .wire_exposition(move || exposition_context.encode());
         sim.publish_status();
+        // the snapshot is live: `boot` may bind the listener now. sending after
+        // the publish is what makes "/v1/status never answers the empty
+        // default" true — the whole point of the signal.
+        let _ = booted.send(());
         loop {
             select! {
                 cmd = control.next() => match cmd {
@@ -1026,10 +1052,6 @@ fn run_sim(
                     None => break,
                 },
             }
-            // one publish per pump turn: any arm may have committed a block
-            // (submit, a control step, a released hold), and the sim is a
-            // test twin — unconditional is simpler than tracking which.
-            sim.publish_status();
         }
     });
 }
@@ -1285,6 +1307,14 @@ impl Sim {
                 "module index fold failed — the sim's views are now STALE"
             );
         }
+        // the status snapshot is part of committing, for the same reason the
+        // fold barrier above is: a commit must imply every read surface already
+        // answers the block. this used to fire once per pump turn instead —
+        // AFTER the arm had already sent its reply — so a caller that read
+        // /v1/status the instant its receipt for height N arrived could still be
+        // told N-1. publishing here makes that unobservable by construction,
+        // rather than by winning a race.
+        self.publish_status();
         Ok((drained, self.node.take_events()))
     }
 
@@ -1754,6 +1784,49 @@ async fn strip_receipt_op_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WHERE the status snapshot is published is load-bearing, and the bug it
+    /// replaced was a race — so this pins the SHAPE, which is deterministic,
+    /// instead of trying to lose the race on purpose.
+    ///
+    /// The contract: a caller who reads `/v1/status` the instant its receipt for
+    /// height N arrives must be told N, never N-1. That holds only while the
+    /// publish happens INSIDE `commit_block` — before the committing arm sends
+    /// its reply. It used to fire once per pump turn, i.e. AFTER the reply had
+    /// already gone out; the symptom was a ~1-in-15 red in
+    /// `governance_scenarios.rs` asserting the tip equals its own receipt, which
+    /// is far too rare to be the guard for this.
+    ///
+    /// So: exactly two call sites, both named. Boot (the snapshot the listener
+    /// waits on) and the commit funnel. A third — especially one back in the
+    /// pump loop — means the ordering regressed.
+    #[test]
+    fn the_status_snapshot_is_published_from_boot_and_the_commit_funnel_alone() {
+        // the production half only — below `#[cfg(test)]` this very test quotes
+        // the call it is looking for, and would count itself.
+        let (source, _) = include_str!("lib.rs")
+            .split_once("#[cfg(test)]")
+            .expect("the test module marks the end of the production source");
+        assert_eq!(
+            source.matches("self.publish_status();").count(),
+            1,
+            "expected exactly ONE `self.publish_status()` — the commit funnel's. \
+             A second (notably one per pump turn) lands AFTER the committing arm \
+             already replied, which is the race this shape exists to make \
+             unobservable."
+        );
+        // and it must be the commit funnel's: the statement immediately
+        // preceding `commit_block`'s return.
+        let (before_return, _) = source
+            .split_once("        Ok((drained, self.node.take_events()))")
+            .expect("commit_block's return is the anchor for this check");
+        assert!(
+            before_return.trim_end().ends_with("self.publish_status();"),
+            "`commit_block` must publish the snapshot as its last act before \
+             returning — that is what makes the publish precede every caller's \
+             reply."
+        );
+    }
 
     /// once a fatal reason is recorded, the embedded control surface fails
     /// closed — every method routes through `call`, so one guard covers all.
