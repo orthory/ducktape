@@ -1,7 +1,7 @@
 app Ducktape
   title "Ducktape"
   theme app_theme
-  bg "#00000000"
+  bg app_background
   fg app_text
   id "dev.ducktape.app"
   font "../../../crates/design/assets/fonts/Geist[wght].ttf"
@@ -15,8 +15,6 @@ app Ducktape
     size 1280 800
     min-size 820 540
     position centered
-    transparent true
-    blur true
     platform macos
       title-hidden true
       titlebar-transparent true
@@ -26,6 +24,8 @@ use "backend.ice"
 use "ducktape-ui/default.ice"
 use "theme.ice"
 use "state.ice"
+use "components/icon.ice"
+use "components/kit.ice"
 use "components/shell.ice"
 use "components/chat.ice"
 use "components/pages.ice"

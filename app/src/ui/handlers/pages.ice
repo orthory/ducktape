@@ -120,7 +120,7 @@ on create_page_submit
 on toggle_page_create
   page_create_open = !page_create_open
   return if !page_create_open
-  task widget focus #workspace-tabs/sidebar/new-page
+  task widget focus #workspace-tabs/content/new-page
 
 on arm_page_delete
   return if loading || mutation_phase != "idle" || empty(active_page)

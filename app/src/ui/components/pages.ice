@@ -155,7 +155,7 @@ component DocumentBlock(block:PageBlock, selected:bool, hovered:bool, disabled:b
           row w=fill align=center
             if !empty(block.prefix)
               text block.prefix size=12.0 wrap=none font=code
-            box w=56.0 h=28.0 bg=glass_regular border=fg/11 border-w=1.0 r=7.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+            box w=56.0 h=28.0 bg=surface border=border border-w=1.0 r=7.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
               row w=fill gap=0.0 align=center
                 button label="Insert block below" disabled=disabled w=28.0 h=28.0 p=0.0 @ghost_action -> open_block_insert(block.key, block.id)
                   box w=fill h=fill align-x=center align-y=center
@@ -171,14 +171,14 @@ component DocumentBlock(block:PageBlock, selected:bool, hovered:bool, disabled:b
                   pressed bg=fg/12 text=fg
 
 component BlockActionsMenu(block_id:str, kind:str, disabled:bool, delete_armed:bool, editable_kinds:[str])
-  box w=172.0 p=5.0 bg=glass_regular border=fg/13 border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+  box w=172.0 p=5.0 bg=surface border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
     col w=fill gap=3.0
       if kind != "Page"
         pick editable_kinds some(kind) hint="Block type" w=fill menu-h=210.0 p=6.0 text-size=13.0 line-h=1.2 -> selected_block_kind_changed _
           active text=fg placeholder=muted handle=muted bg=transparent border=transparent border-w=0.0 r=6.0
           hovered text=fg placeholder=muted handle=fg bg=fg/8 border=fg/10 border-w=1.0 r=6.0
           opened text=fg placeholder=muted handle=fg bg=fg/11 border=ring border-w=1.0 r=6.0
-          menu text=fg selected-text=fg selected-bg=fg/14 bg=glass_regular border=fg/13 border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+          menu text=fg selected-text=fg selected-bg=fg/14 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
       if kind == "Page"
         button "Open page" label="Open subpage" disabled=disabled w=fill h=28.0 p=6.0 @ghost_action -> choose_page(block_id)
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
@@ -227,13 +227,13 @@ component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)
           text prefix size=12.0 wrap=none font=code
         slot
     box w=fill align-x=end align-y=start pr=4.0
-      box p=2.0 bg=glass_regular border=fg/12 border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+      box p=2.0 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
         row gap=1.0 align=center
           pick kinds some(kind) hint="Type" w=82.0 menu-h=210.0 p=4.0 text-size=13.0 line-h=1.2 -> new_block_kind_changed _
             active text=fg placeholder=muted handle=muted bg=transparent border=transparent border-w=0.0 r=6.0
             hovered text=fg placeholder=muted handle=fg bg=fg/8 border=fg/10 border-w=1.0 r=6.0
             opened text=fg placeholder=muted handle=fg bg=fg/11 border=ring border-w=1.0 r=6.0
-            menu text=fg selected-text=fg selected-bg=fg/14 bg=glass_regular border=fg/13 border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+            menu text=fg selected-text=fg selected-bg=fg/14 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
           button "×" label="Cancel block insertion" disabled=disabled w=26.0 h=26.0 p=4.0 @secondary_action -> close_block_insert
             active bg=transparent text=muted r=6.0
             hovered bg=fg/8 text=fg

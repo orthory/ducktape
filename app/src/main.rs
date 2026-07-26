@@ -823,10 +823,12 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(toolbar.contains("if !message.deleted && !message.pending && !hovered"));
         assert!(toolbar.contains("-> open_message_actions_accessibly("));
         assert!(!toolbar.contains("hovered || selected"));
-        assert_eq!(toolbar.matches("w=26.0 h=26.0").count(), 4);
+        assert_eq!(toolbar.matches("w=26.0 h=26.0").count(), 1);
+        assert_eq!(toolbar.matches("w=27.0 h=25.0").count(), 4);
         assert!(components.contains(
-            "text message.author size=14.0 wrap=none font=display @text-fg\n          text message.meta size=11.0 wrap=none font=code_medium @text-muted\n          space w=fill"
+            "text message.author size=13.0 wrap=none font=display @text-fg\n          if message.avatar_kind == \"agent\""
         ));
+        assert!(components.contains("text message.meta size=11.0 wrap=none font=code_medium @text-hint"));
         // Slack-style grouping: the shared avatar + author header only renders
         // for a run's first message; continuations keep the body aligned via a
         // gutter that matches the avatar's width.
@@ -834,8 +836,8 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             "if message.show_author\n      MessageAvatar initials=message.initial kind=message.avatar_kind"
         ));
         assert!(components.contains("if !message.show_author\n      space w=30.0"));
-        assert!(components.contains("\"human\"\n        Avatar initials=initials"));
-        assert!(components.contains("\"agent\"\n        Avatar.Agent initials=initials"));
+        assert!(components.contains("\"human\"\n        PersonAvatar initials=initials plate=30.0 ink=11.0"));
+        assert!(components.contains("\"agent\"\n        AgentAvatar initials=initials plate=30.0 ink=11.0"));
         assert!(!components.contains("avatar_style"));
         // Rich bodies render structured blocks, not one flattened string.
         assert!(components.contains("for block in message.blocks"));
@@ -843,12 +845,12 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(components.contains("flex w=fill wrap=wrap"));
         // The hover toolbar uses the shared glass/popover depth role instead
         // of carrying another inline shadow variant.
-        assert!(toolbar.contains("style=raised_style()"));
+        assert!(toolbar.contains("bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_toast"));
         for label in ["Open thread", "Manage reactions", "More message actions"] {
             assert!(toolbar.contains(&format!("label=\"{label}\"")));
         }
         assert!(components.contains(
-            "button label=\"Open thread\" p=4.0 @ghost_action -> open_thread_for(message.seq)"
+            "button label=\"Open thread\" p=0.0 @ghost_action -> open_thread_for(message.seq)"
         ));
 
         let view = include_str!("ui/view.ice");
@@ -869,7 +871,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(chat.contains("sensor show=chat_resized resize=chat_resized"));
         assert!(chat.contains("float x=0.0 y=message_menu_y"));
         assert!(
-            chat.contains("stack w=fill h=fill\n                mouse move=chat_pointer_moved")
+            chat.contains("stack w=fill h=fill\n                    mouse move=chat_pointer_moved")
         );
         let overlay_content = chat
             .split_once("                  content\n")
@@ -1265,7 +1267,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             "component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)"
         ));
         assert!(view.contains("prefix=block.prefix #block-insert-row"));
-        assert!(view.contains("box w=fill pl=56.0\n                      PageTitleEditor"));
+        assert!(view.contains("box w=fill pl=56.0\n                        PageTitleEditor"));
     }
 
     #[test]
@@ -1286,15 +1288,18 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         for gradient in ["linear(", "radial(", "conic("] {
             assert!(!ui.contains(gradient), "{gradient}");
         }
-        // Functional chrome uses the native window blur behind the three glass
-        // alpha tiers; content surfaces remain opaque paper.
+        // The window is opaque. iced has no backdrop blur, so the chrome paints
+        // the artifact's own non-glass ladder — desk/rail/sidebar/content — and
+        // never a translucent tint that would composite over the desktop.
         let app = include_str!("ui/app.ice");
-        assert!(app.contains("\n    transparent true"));
-        assert!(app.contains("\n    blur true"));
+        assert!(!app.contains("\n    transparent true"));
+        assert!(!app.contains("\n    blur true"));
+        assert!(app.contains("\n  bg app_background"));
         assert!(app.contains("titlebar-transparent true"));
         assert!(app.contains("fullsize-content-view true"));
         assert!(app.contains("font \"../../../crates/design/assets/fonts/Geist[wght].ttf\""));
         assert!(!ui.contains("white/"));
+        assert!(!ui.contains("bg=glass_"));
 
         let defaults = include_str!("ui/ducktape-ui/default.ice");
         for material in [
@@ -1321,7 +1326,15 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(theme.contains("font code_medium family=\"Geist Mono\" weight=medium"));
         assert!(theme.contains("font code_semibold family=\"Geist Mono\" weight=semibold"));
         for app_token in [
-            "glass_rim #ffffffb3",
+            "desk #e3e1d9",
+            "rail #fafaf8",
+            "window_line #d6d4cc",
+            "card_line #ece9e1",
+            "caption #9a988f",
+            "meta #a7a59b",
+            "hint #b3b1a8",
+            "label #bdbbb1",
+            "icon_idle #cbc9bf",
             "sidebar #fbfbf9",
             "elevated #f3f2ef",
             "subtle #ecebe6",
@@ -1336,21 +1349,19 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         let shell = include_str!("ui/components/shell.ice");
         // the shell is titlebar + optional degradation banner over the panes.
         assert!(shell.contains(
-            "component TitleBar(status:str, loading:bool, degraded:bool, bell_badge:i64)"
+            "component TitleBar(network:str, status:str, height:i64, loading:bool, degraded:bool, bell_badge:i64)"
         ));
         assert!(shell.contains("component ConnectionBanner(status:str)"));
         assert!(shell.contains("if degraded\n          ConnectionBanner status=status"));
-        assert!(
-            shell.contains(
-                "box #sidebar w=236.0 h=fill px=8.0 py=9.0 bg=glass_thin border=glass_rim"
-            )
-        );
-
+        assert!(shell.contains("box #root w=74.0 h=fill pt=13.0 pb=10.0 bg=rail"));
         let view = include_str!("ui/view.ice");
-        assert!(view.contains("box w=fill p=6.0 bg=transparent border=fg/11"));
+        assert!(view.contains("box w=236.0 h=fill bg=sidebar clip=true"));
+        assert!(view.contains("box w=230.0 h=fill bg=sidebar clip=true"));
+
+        assert!(view.contains("input \"\" #rpc label=\"RPC endpoint\""));
         assert!(view.contains("if active_thread_seq > 0 && !channel_settings_open"));
         assert!(view.contains("box w=fill p=5.0 bg=transparent border=fg/12"));
-        assert!(view.contains("bg=glass_sheet border=fg/14 border-w=1.0 r=14.0 shadow=shadow_modal shadow-y=24.0 shadow-blur=60.0"));
+        assert!(view.contains("bg=surface border=border border-w=1.0 r=14.0 shadow=shadow_modal shadow-y=24.0 shadow-blur=60.0"));
 
         for authored in [shell, include_str!("ui/components/pages.ice"), view] {
             assert!(!authored.contains("shadow=black/"));
@@ -1364,7 +1375,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(view.contains("p=6.2 text-size=13.0 line-h=1.2"));
         assert!(view.contains("min-h=44.0 max-h=150.0 size=13.5 line-h=1.3 p=6.6 wrap=word"));
         assert!(view.contains("button \"Send\" disabled="));
-        assert!(view.contains("h=30.0 p=7.0 @primary_action -> send_message_submit"));
+        assert!(view.contains("h=29.0 p=7.0 @primary_action -> send_message_submit"));
         assert!(
             view.matches("box w=fill h=fill align-x=center align-y=center")
                 .count()
@@ -1473,11 +1484,11 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(!chat.contains("bg=brand/9 border=brand/20"));
         assert!(view.contains("Badge.Outline label=\"Members only\""));
         assert!(view.contains("Badge.Outline label=item.kind"));
-        assert!(shell.contains("bg=success_dot r=3.5"));
+        assert!(shell.contains("bg=success_dot r=3.0"));
         assert!(shell.contains("bg=danger_bg border=danger_line"));
         assert!(shell.contains("bg=danger_dot r=3.5"));
-        assert!(view.contains("\"encrypted\"\n                      text settings_key_state w=fill size=12.0 wrap=none font=code @text-success"));
-        assert!(view.contains("\"PLAINTEXT — secure it\"\n                      text settings_key_state w=fill size=12.0 wrap=none font=code @text-danger"));
+        assert!(view.contains("KeyValueRow label=\"Key state\" value=settings_key_state last=false"));
+        assert!(view.contains("KeyValueRow label=\"Key path\" value=settings_key_path last=true"));
 
         for target in [
             "rename_channel_submit",
@@ -1489,6 +1500,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         ] {
             let action = view
                 .lines()
+                .chain(include_str!("ui/components/kit.ice").lines())
                 .find(|line| line.trim_start().starts_with("button ") && line.contains(target))
                 .unwrap_or_else(|| panic!("missing action target {target}"));
             assert!(action.contains("@secondary_action"), "{action}");
@@ -1529,10 +1541,8 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         );
 
         for binding in [
-            "StatusBadge label=agent.status",
             "StatusBadge label=item.state",
             "StatusBadge label=forge_item_state",
-            "StatusBadge label=proposal.status",
             "StatusBadge label=op.disposition",
         ] {
             assert!(view.contains(binding), "{binding}");
@@ -1567,6 +1577,8 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             ("shell.ice", include_str!("ui/components/shell.ice")),
             ("chat.ice", include_str!("ui/components/chat.ice")),
             ("pages.ice", include_str!("ui/components/pages.ice")),
+            ("kit.ice", include_str!("ui/components/kit.ice")),
+            ("icon.ice", include_str!("ui/components/icon.ice")),
         ];
         for (name, source) in sources {
             for line in source.lines() {
@@ -1577,9 +1589,10 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
                     else {
                         continue;
                     };
-                    let size: f64 = value.parse().unwrap_or_else(|_| {
-                        panic!("{name}: unparseable size literal {token:?} in {line:?}")
-                    });
+                    let Ok(size) = value.parse::<f64>() else {
+                        // a prop name, not a step — the literal is at the call site
+                        continue;
+                    };
                     assert!(
                         design::type_scale::ALL.contains(&size),
                         "{name}: {size} is off the design scale — change design::type_scale, not the view: {line:?}"
@@ -1722,9 +1735,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(pages.contains("dismiss=close_block_comments backdrop=transparent"));
         assert!(pages.contains("align-x=end align-y=start"));
         assert!(pages.contains("w=300.0 h=380.0"));
-        assert!(pages.contains(
-            "bg=glass_regular border=fg/15 border-w=1.0 r=11.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0"
-        ));
+        assert!(pages.contains("w=300.0 h=380.0 p=8.0 bg=surface border=border border-w=1.0 r=11.0"));
         assert!(pages.contains("#block-comment(scope_key(connected_rpc, selected_block_id))"));
         assert!(!pages.contains("button \"Save\""));
         assert!(!pages.contains("Saving"));
@@ -2596,9 +2607,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
                 "component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)"
             )
         );
-        assert!(components.contains("if unread\n            box w=8.0 h=8.0 bg=brand r=4.0"));
+        assert!(components.contains("if unread\n                box w=7.0 h=7.0 bg=brand r=3.5"));
         assert!(components.contains(
-            "if unread\n            text channel.name w=fill size=13.0 wrap=none font=medium @text-fg"
+            "if unread\n                text channel.name w=fill size=13.0 wrap=none font=medium @text-fg"
         ));
 
         let view = include_str!("ui/view.ice");

@@ -128,9 +128,27 @@ on workspace_connected(next)
   hydration_retry_attempt = 0
   error = ""
   bell_generation = bell_generation + 1
+  explorer_generation = explorer_generation + 1
+  fs_generation = fs_generation + 1
+  members_generation = members_generation + 1
+  gov_generation = gov_generation + 1
+  agents_generation = agents_generation + 1
+  account_generation = account_generation + 1
+  forge_generation = forge_generation + 1
+  settings_generation = settings_generation + 1
+  node_peers_generation = node_peers_generation + 1
   parallel
     run load_doc_tabs(connected_rpc) -> doc_tabs_loaded _
     run load_bell(connected_rpc, bell_generation) -> bell_loaded _ | bell_failed _
+    run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
+    run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
+    run load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
+    run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
+    run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
+    run load_peers(connected_rpc, node_peers_generation) -> peers_loaded _ | peers_failed _
+    run load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
+    run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
+    run load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_failed _
 
 on live_updated(next)
   status = next.status
@@ -718,6 +736,10 @@ on toggle_bell
 
 on close_bell
   bell_open = false
+
+on mark_bell_read_submit
+  return if bell_unread <= 0
+  run mark_bell_read(connected_rpc, password, bell_head(bell_items)) -> bell_marked _ | mutation_failed _
 
 on bell_loaded(next)
   return if next.generation != bell_generation

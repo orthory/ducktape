@@ -2608,31 +2608,151 @@ pub fn keep_forge_reviews(
 pub struct NavItem {
     pub id: String,
     pub title: String,
+    pub icon: String,
+    pub badge: i64,
     pub active: bool,
 }
 
-/// The shell's module navigation, the active pane flagged. Modules join the
-/// shell by joining this list.
-pub fn shell_nav(tab: String) -> Vec<NavItem> {
+/// `3 validators · 2 residents` — the machine subtitle beside the Members title.
+pub fn members_summary(validators: i64, residents: i64) -> String {
+    format!("{validators} validators · {residents} residents")
+}
+
+/// `4 agents · 2 active` — the Agents title's machine subtitle.
+pub fn agents_summary(rows: Vec<AgentRow>) -> String {
+    let active = rows.iter().filter(|row| row.status == "active").count();
+    format!("{} agents · {active} active", rows.len())
+}
+
+/// `12 open · 3 settled` — the Approvals title's machine subtitle.
+pub fn proposals_summary(rows: Vec<ProposalRow>) -> String {
+    let open = rows.iter().filter(|row| row.open).count();
+    format!("{open} open · {} settled", rows.len() - open)
+}
+
+/// One seat per elector, filled for each approval already in — the quorum dots.
+/// Capped so a large electorate does not overflow the card.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct QuorumSeat {
+    pub filled: bool,
+}
+
+pub fn quorum_dots(approvals: i64, electorate: i64) -> Vec<QuorumSeat> {
+    let seats = electorate.clamp(0, 12) as usize;
+    (0..seats)
+        .map(|seat| QuorumSeat {
+            filled: (seat as i64) < approvals,
+        })
+        .collect()
+}
+
+/// How many proposals are still open — the count the rail pins to Approvals.
+pub fn open_proposals(rows: Vec<ProposalRow>) -> i64 {
+    rows.iter().filter(|row| row.open).count() as i64
+}
+
+/// The rail's module navigation, in the artifact's order, the active pane
+/// flagged. Modules join the shell by joining this list. `settings` is not
+/// here: the rail pins it to its own footer beside the account avatar.
+pub fn shell_nav(tab: String, approvals: i64) -> Vec<NavItem> {
     [
-        ("chat", "Chat"),
-        ("pages", "Pages"),
-        ("files", "Files"),
-        ("members", "Members"),
-        ("agents", "Agents"),
-        ("forge", "Forge"),
-        ("governance", "Governance"),
-        ("explorer", "Explorer"),
-        ("node", "Node"),
-        ("settings", "Settings"),
+        ("chat", "Chat", "nav-chat"),
+        ("pages", "Pages", "nav-pages"),
+        ("forge", "Forge", "nav-forge"),
+        ("agents", "Agents", "nav-agents"),
+        ("files", "Files", "nav-files"),
+        ("explorer", "Explorer", "nav-explorer"),
+        ("members", "Members", "nav-members"),
+        ("governance", "Approvals", "shield-check"),
+        ("node", "Node", "node"),
     ]
     .into_iter()
-    .map(|(id, title)| NavItem {
+    .map(|(id, title, icon)| NavItem {
         id: id.into(),
         title: title.into(),
+        icon: icon.into(),
+        badge: if id == "governance" { approvals } else { 0 },
         active: id == tab,
     })
     .collect()
+}
+
+/// The active workspace's name, read once from the CLI's registry. The app and
+/// the CLI name the same workspace, so the titlebar says `demo`, not an IP.
+fn active_workspace_name() -> Option<&'static str> {
+    static NAME: OnceLock<Option<String>> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let path = ducktape_home()?.join("registry.json");
+        let registry: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let active = registry.get("active")?.as_str()?;
+        registry
+            .get("workspaces")?
+            .as_array()?
+            .iter()
+            .find(|workspace| workspace.get("id").and_then(|id| id.as_str()) == Some(active))
+            .and_then(|workspace| workspace.get("name").or_else(|| workspace.get("id")))
+            .and_then(|name| name.as_str())
+            .map(str::to_string)
+    })
+    .as_deref()
+}
+
+/// `$DUCKTAPE_HOME`, else `~/.ducktape` — the same resolution the user key uses.
+fn ducktape_home() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("DUCKTAPE_HOME") {
+        return Some(PathBuf::from(root));
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".ducktape"))
+}
+
+/// The titlebar's chain label: the workspace this app is pointed at, then the
+/// bound account, then the endpoint's host, then the product name.
+pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
+    if let Some(workspace) = active_workspace_name() {
+        return workspace.to_string();
+    }
+    let named = account_name.as_ref().trim();
+    if !named.is_empty() {
+        return named.to_string();
+    }
+    let host = rpc
+        .as_ref()
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    if host.is_empty() {
+        return "Ducktape".into();
+    }
+    host.to_string()
+}
+
+/// The titlebar's machine value: `h 84,912`, grouped the way the artifact
+/// writes heights. A height the node has not reported yet reads `h —`.
+pub fn height_label(height: i64) -> String {
+    if height < 0 {
+        return "h —".into();
+    }
+    let digits = height.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        let boundary = index > 0 && (digits.len() - index) % 3 == 0;
+        if boundary {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    format!("h {grouped}")
+}
+
+/// The first grapheme of a display name, upper-cased, for an avatar plate.
+pub fn initial_of(name: impl AsRef<str>) -> String {
+    name.as_ref()
+        .trim()
+        .chars()
+        .next()
+        .map(|first| first.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into())
 }
 
 /// The local user's inbox member handle (`user:{hex}`), when a key exists.
@@ -5723,6 +5843,34 @@ fn live_resync(module: &str, height: i64) -> LiveUpdate {
     update.load_chat = module == "chat";
     update.load_pages = module == "pages";
     update
+}
+
+/// The artifact's line icon for `name`, as an SVG document the view hands to
+/// iced as an in-memory handle. An unknown name renders an empty document.
+pub fn icon(name: impl AsRef<str>) -> String {
+    design::icons::svg(name.as_ref()).to_string()
+}
+
+/// Tints an icon with one step of the artifact's ink ramp. The asset itself is
+/// drawn on `currentColor`, so the tone — not a second asset — is what makes a
+/// muted rail icon and an accent action icon different.
+pub fn icon_tint(
+    _theme: &iced::Theme,
+    _status: iced::widget::svg::Status,
+    tone: impl AsRef<str>,
+) -> iced::widget::svg::Style {
+    iced::widget::svg::Style {
+        color: Some(rgb(design::ink::tone(tone.as_ref()))),
+    }
+}
+
+/// An artifact hex literal as an opaque iced color.
+fn rgb(hex: u32) -> iced::Color {
+    iced::Color::from_rgb8(
+        ((hex >> 16) & 0xff) as u8,
+        ((hex >> 8) & 0xff) as u8,
+        (hex & 0xff) as u8,
+    )
 }
 
 /// Flat paper card derived from the shared design tokens.

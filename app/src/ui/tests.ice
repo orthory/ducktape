@@ -22,21 +22,25 @@ preset ui_palette_open
     palette_open = true
     palette_draft = ""
 
+preset ui_settings
+  state
+    rpc = ""
+    status = "Offline"
+    connected = false
+    loading = false
+    mutation_phase = "idle"
+    error = ""
+    shell_tab = "settings"
+
 preset ui_component_error
   state
     error = "Connection failed"
 
 test connection_panel_contract
-  preset ui_offline
+  preset ui_settings
   viewport 1120 720
   mount
-    WorkspaceTabs status=status loading=loading degraded=false tab=shell_tab bell_count=0 #workspace-tabs
-      connection:
-        input "" #rpc label="RPC endpoint" <-> rpc hint="Node URL" w=fill @control
-      chat_sidebar:
-        space w=1.0 h=1.0
-      pages_sidebar:
-        space w=1.0 h=1.0
+    WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 approvals=0 account="" #workspace-tabs
       notice:
         space w=1.0 h=1.0
       chat:
@@ -54,7 +58,7 @@ test connection_panel_contract
       governance:
         space w=1.0 h=1.0
       settings:
-        space w=1.0 h=1.0
+        input "" #rpc label="RPC endpoint" <-> rpc hint="Node URL" w=fill @control
       node:
         space w=1.0 h=1.0
       explorer:
@@ -63,10 +67,7 @@ test connection_panel_contract
         space w=1.0 h=1.0
       bell:
         space w=1.0 h=1.0
-  target toggle = #workspace-tabs/sidebar/connection-toggle
-  target endpoint = #workspace-tabs/sidebar/rpc
-  expect missing endpoint
-  click toggle
+  target endpoint = #workspace-tabs/content/rpc
   expect exists endpoint
   expect endpoint.width > 160.0
   click endpoint
@@ -81,13 +82,10 @@ test palette_escape_contract
   preset ui_palette_open
   viewport 1120 720
   mount
-    WorkspaceTabs status=status loading=loading degraded=false tab=shell_tab bell_count=0 #workspace-tabs
-      connection:
-        space w=1.0 h=1.0
-      chat_sidebar:
-        space w=1.0 h=1.0
-      pages_sidebar:
-        space w=1.0 h=1.0
+    WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 approvals=0 account="" #workspace-tabs
+
+
+
       notice:
         space w=1.0 h=1.0
       chat:
@@ -176,13 +174,10 @@ test minimum_window_layout_contract
   preset ui_offline
   viewport 1280 800
   mount
-    WorkspaceTabs status=status loading=loading degraded=false tab=shell_tab bell_count=0 #workspace-tabs
-      connection:
-        space w=1.0 h=1.0
-      chat_sidebar:
-        space w=1.0 h=1.0
-      pages_sidebar:
-        space w=1.0 h=1.0
+    WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 approvals=0 account="" #workspace-tabs
+
+
+
       notice:
         space w=1.0 h=1.0
       chat:
@@ -210,23 +205,16 @@ test minimum_window_layout_contract
       bell:
         space w=1.0 h=1.0
   target titlebar = #workspace-tabs/titlebar/root
-  target rail = #workspace-tabs/rail
-  target sidebar = #workspace-tabs/sidebar
+  target rail = #workspace-tabs/rail/root
   target content = #workspace-tabs/content
   expect titlebar.height ~= 40.0
   expect rail.width ~= 74.0
-  expect sidebar.width ~= 236.0
   expect rail.y ~= titlebar.bottom
-  expect sidebar.x ~= rail.right
-  expect content.x ~= sidebar.right
-  expect content.width > 960.0
-  expect titlebar.background == background.color(color.rgba8(253, 252, 250, 0.619608))
-  expect rail.background == background.color(color.rgba8(253, 252, 250, 0.501961))
-  expect sidebar.background == background.color(color.rgba8(253, 252, 250, 0.501961))
+  expect content.x ~= rail.right + 1.0
+  expect content.width > 1180.0
+  expect rail.background == background.color(color.rgb8(250, 250, 248))
   expect content.background == background.color(color.rgb8(253, 253, 251))
   resize 820 540
   expect rail.width ~= 74.0
-  expect sidebar.width ~= 236.0
-  expect sidebar.x ~= rail.right
-  expect content.x ~= sidebar.right
-  expect content.width > 500.0
+  expect content.x ~= rail.right + 1.0
+  expect content.width > 730.0

@@ -101,7 +101,7 @@ on toggle_channel_create_members_only
 on toggle_channel_create
   channel_create_open = !channel_create_open
   return if !channel_create_open
-  task widget focus #workspace-tabs/sidebar/new-channel
+  task widget focus #workspace-tabs/content/new-channel
 
 on toggle_channel_settings
   return if empty(active_channel)

@@ -46,6 +46,8 @@ extern crate::backend
   HydrationError(generation:i64, message:str)
   box-style card_style()
   box-style raised_style()
+  svg-style icon_tint(tone:str)
+  sync icon(name:str) -> str
   editor-binding composer_keys() -> ComposerCmd
   connect(rpc:str) -> WorkspaceData ! AppError
   stream live_events(rpc:str) -> LiveUpdate
@@ -77,7 +79,7 @@ extern crate::backend
   sync canonical_endpoint(input:str) -> str
   sync connection_degraded(status:str) -> bool
   sync palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  NavItem(id:str, title:str, active:bool)
+  NavItem(id:str, title:str, icon:str, badge:i64, active:bool)
   FsEntry(path:str, name:str, kind:str, size:i64)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
   FsListing(generation:i64, path:str, entries:[FsEntry])
@@ -95,7 +97,16 @@ extern crate::backend
   files_ls(rpc:str, path:str, generation:i64) -> FsListing ! HydrationError
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
-  sync shell_nav(tab:str) -> [NavItem]
+  sync shell_nav(tab:str, approvals:i64) -> [NavItem]
+  sync open_proposals(rows:[ProposalRow]) -> i64
+  sync members_summary(validators:i64, residents:i64) -> str
+  sync agents_summary(rows:[AgentRow]) -> str
+  sync proposals_summary(rows:[ProposalRow]) -> str
+  QuorumSeat(filled:bool)
+  sync quorum_dots(approvals:i64, electorate:i64) -> [QuorumSeat]
+  sync network_label(account_name:str, rpc:str) -> str
+  sync height_label(height:i64) -> str
+  sync initial_of(name:str) -> str
   NodeLogLine(cursor:str, line:str)
   PeerRow(key:str, height:i64, live:bool)
   PeersData(generation:i64, peers:[PeerRow])
