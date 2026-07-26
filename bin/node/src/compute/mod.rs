@@ -67,17 +67,18 @@ pub(crate) struct Compute {
 /// Serve until the process is stopped. Returns only on a fatal misconfiguration
 /// — a node that is merely down is retried forever, because that is an
 /// operational state, not an error.
+///
+/// Through [`crate::services::serve_until_stopped`], which owns the runtime and
+/// arms SIGTERM/SIGINT before a line of this daemon runs: the `podman system
+/// service` started below must never outlive the process that started it.
 pub(crate) fn serve(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
-    // the pool hands Send futures to `SpawnFn`, so a multi-thread runtime is
-    // what it expects; the intake pass itself is !Send (the `Worker` seam is
-    // `?Send`) and rides `block_on` on this thread.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(run(compute))
+    crate::services::serve_until_stopped(std::future::pending(), |stop| run(compute, stop))
 }
 
-async fn run(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    compute: Compute,
+    mut stop: crate::services::Stop,
+) -> Result<(), Box<dyn std::error::Error>> {
     let Compute {
         grant,
         service,
@@ -90,7 +91,16 @@ async fn run(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
     // the node must be ANSWERING before anything is discovered or reaped: a
     // daemon that boots first would otherwise reap against a socket that does
     // not exist yet and then spin on an unreadable projection.
-    await_node(&node).await;
+    //
+    // Raced against the stop, because waiting for a node that never comes is an
+    // ordinary state to be SIGTERMed in — and arming the handlers took the
+    // default disposition away, so an unraced wait here would be a daemon no
+    // signal can end. Nothing has been started yet, so there is nothing to tear
+    // down on this path.
+    tokio::select! {
+        () = await_node(&node) => {}
+        () = &mut stop => return Ok(()),
+    }
 
     // this daemon's OWN podman service, under `<storage>/services/compute`. The
     // node used to start one for everybody; it does not any more, because a
@@ -100,20 +110,26 @@ async fn run(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
     let backend = crate::services::podman_backend(&service, &grant.kind)?;
     let self_exe = std::env::current_exe()
         .map_err(|error| format!("cannot resolve this daemon's own executable: {error}"))?;
-    let _podman = provider_host::PodmanService::start_for(
+    let podman = provider_host::PodmanService::start_for(
         &backend,
         &crate::services::podman_data_dir(&service, &grant.kind),
         &self_exe,
     )
     .await?;
-    reap(&backend, &grant).await;
+    // whatever still carries this instance's label got here through a death
+    // that ran no code — the stop path leaves none — and is destroyed, never
+    // resumed. See [`crate::services::Sweep`].
+    crate::services::sweep_own_containers(&backend, &grant, crate::services::Sweep::CrashOrphans)
+        .await;
 
     let (line_tx, line_rx) = tokio::sync::mpsc::channel(link::OUTPUT_LANE);
     let providers = provider_host::discover(
         &node_key,
         provider_host::AgentDirs::under(&service.storage_dir),
         Some(output_sink(line_tx)),
-        backend,
+        // cloned: `discover` consumes the backend, and the teardown below needs
+        // the same socket to sweep this instance's containers through.
+        backend.clone(),
         &grant.display_id(),
     )?;
     let offered = providers.capabilities();
@@ -159,8 +175,48 @@ async fn run(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
             () = hint.notified() => pump.tick(&node).await,
             // the backstop: a missed hint delays work, never loses it.
             () = tokio::time::sleep(SWEEP) => pump.tick(&node).await,
+            // SIGTERM/SIGINT. An in-flight run's result is lost with the
+            // process exactly as it is on a crash — the saga's lease timeout
+            // re-leases it — so there is nothing to drain first.
+            () = &mut stop => break,
         }
     }
+    stop_sandbox(podman, &backend, &grant).await;
+    Ok(())
+}
+
+/// Tear the sandbox down, containers FIRST.
+///
+/// Order is the whole point. Killing the `podman system service` does not stop
+/// what it created: each container's conmon is its own parent, ignores SIGTERM,
+/// and would keep the workload running under a service that no longer exists.
+/// So this instance's containers are REMOVED here rather than left for the next
+/// start's reaper — over the socket that is still answering right now, which is
+/// the only instrument that reaches them — and only then does the service child
+/// go. Leaving them would mean a stopped daemon still burning CPU and holding a
+/// graph root until something happened to start that kind again, which on a
+/// torn-down workspace is never.
+///
+/// SIGKILL still leaves both behind, and nothing here can change that: the
+/// answer there is the next start of the same kind, where `PodmanService::claim`
+/// reaps the podman service under a root nobody holds any more and the boot
+/// sweep destroys the containers.
+async fn stop_sandbox(
+    podman: Option<provider_host::PodmanService>,
+    backend: &provider_host::SandboxBackend,
+    grant: &ServiceGrant,
+) {
+    crate::services::sweep_own_containers(backend, grant, crate::services::Sweep::Teardown).await;
+    let Some(service) = podman else {
+        // a non-Podman backend started no service (Tart deletes its VM per run).
+        return;
+    };
+    service.shutdown().await;
+    tracing::info!(
+        target: "ducktape::service",
+        instance = %grant.display_id(),
+        "compute daemon stopped"
+    );
 }
 
 /// Block until the node answers a committed query.
@@ -193,42 +249,6 @@ async fn await_node(node: &NodeLink) {
             );
         }
         tokio::time::sleep(READY_RETRY).await;
-    }
-}
-
-/// Adopt this instance's crash orphans.
-///
-/// A daemon that crashed mid-run left containers behind; it returns with the
-/// SAME `compute#hex8` (the id is the grant hash and the grant persists in
-/// `services.toml`) and so can recognise them as its own. That re-adoption
-/// across restart is exactly why the id must survive one.
-///
-/// ONE sweep, and no retired-flat-label arm: this daemon's graph root is private
-/// now, so a pre-daemon `capability-host` container lives in the node's OLD root
-/// and is not enumerable through this socket. Unreachable by construction, not
-/// pending cleanup.
-///
-/// Best-effort: a reap failure is a log line, never a boot failure.
-async fn reap(backend: &provider_host::SandboxBackend, grant: &ServiceGrant) {
-    let provider_host::SandboxBackend::Podman { socket, .. } = backend else {
-        // Tart clones and deletes a VM per run; there is no label to reap.
-        return;
-    };
-    match provider_host::reap_by_label(socket, &provider_host::managed_label(&grant.display_id()))
-        .await
-    {
-        Ok(0) => {}
-        Ok(removed) => tracing::info!(
-            target: "ducktape::service",
-            removed,
-            reason = "own_orphans",
-            "reaped orphaned sandbox containers"
-        ),
-        Err(error) => tracing::warn!(
-            target: "ducktape::service",
-            reason = "reap_failed",
-            "could not sweep sandbox containers: {error}"
-        ),
     }
 }
 

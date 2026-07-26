@@ -18,10 +18,14 @@ tokio = { workspace = true, features = ["process", "io-util", "net"] }
 # can block a run for minutes says so, on the node's stderr and in the app's log
 # ring. This crate had no logging because nothing in it could stall; the pull can.
 tracing = { workspace = true }
-# ONE call: SIGTERM to a predecessor's orphaned podman child, after verifying by
-# /proc/<pid>/exe that it is podman. Already a direct dep of provider-host and
-# bin/node.
+# TWO calls: the `flock` that makes a service root single-owner, and the SIGTERM
+# a successor sends the podman child a dead owner left behind. Already a direct
+# dep of provider-host and bin/node.
 libc = "0.2"
+
+[dev-dependencies]
+# the service-root singleton test claims a real directory twice.
+tempfile = "3"
 
 [features]
 # the test-harness `SandboxBackend::Bare` spawn. a `cfg(test)` gate cannot cross
