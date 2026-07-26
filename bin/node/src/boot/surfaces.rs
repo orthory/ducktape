@@ -194,18 +194,11 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // rebuildable, so the fix is always "delete <storage>/index".
     let index = noded::open_index_store(storage, MODULE_IDS)?;
     // the admin namespace's operator credential: minted fresh each boot and
-    // written 0600 beside node.toml, exactly like the service link token. A mint
-    // failure REFUSES every admin request rather than falling back to the
-    // loopback trust this replaced — the fallback would be the whole bug.
-    let operator_token = noded::admin::mint_operator_token(workspace)
-        .inspect_err(|error| {
-            tracing::error!(
-                target: "ducktape::admin",
-                reason = "operator_token_unwritable",
-                "the admin namespace will refuse every request: {error}"
-            );
-        })
-        .ok();
+    // written 0600 beside node.toml, exactly like the service link token — and
+    // NOT minted at all under `DUCKTAPE_ADMIN=off`, where the routes do not
+    // exist to present it to. The node key goes on below; everything else is
+    // decided here.
+    let admin = noded::AdminConfig::minted(admin_exposure, workspace);
     stream_hub.prime(index.resume_height()?, String::new());
     // the realtime hub's session lane: /v1/call/ws and /v1/presence/ws ask for
     // sessions here. created up front because the app-surface thread starts
@@ -238,10 +231,8 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         // operator's choice (default loopback). shutdown + module-code staging
         // live here, off the unauthenticated public surface.
         .with_admin(noded::AdminConfig {
-            exposure: admin_exposure,
             node_key: Some(node_key.clone()),
-            operator_token,
-            ..Default::default()
+            ..admin
         });
     let http_handle = if gateway_enabled {
         http_handle.with_gateway(gateway_lane)

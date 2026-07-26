@@ -215,8 +215,9 @@ pub struct NodeHandle {
     /// daemon without a mesh — the admin stage route answers 503 there.
     pub(crate) code_stage: Option<crate::module_code::CodeStageLane>,
     /// the owner-gated control namespace's exposure + ownership config (ADR
-    /// A2/A5). the default (`Loopback`, no node key) is the embedded daemon's
-    /// loopback-trust surface; the full node overrides it via [`Self::with_admin`].
+    /// A2/A5). the default (`Loopback`, no node key, NO operator token) FAILS
+    /// CLOSED — it refuses every admin request; a real serve path mints a
+    /// credential and passes it through [`Self::with_admin`].
     pub(crate) admin: crate::admin::AdminConfig,
     /// the node-local interactive terminal-session manager. `None` on a handle
     /// that never wires one (router tests, an embedder that omits it) — the
@@ -322,8 +323,8 @@ impl NodeHandle {
 
     /// configure the owner-gated control namespace (ADR A2/A5). the full node
     /// passes its own consensus key (the `BindNode` subject ownership resolves
-    /// against) and the exposure the operator chose; a daemon that leaves this
-    /// at the default serves the loopback-trust surface.
+    /// against) and the exposure the operator chose; a handle that leaves this
+    /// at the default has no minted credential and so refuses all of admin.
     pub fn with_admin(mut self, admin: crate::admin::AdminConfig) -> Self {
         self.admin = admin;
         self

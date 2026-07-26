@@ -57,7 +57,7 @@ impl InProcDaemon {
         // the admin namespace is operator-gated, and this harness serves on a
         // REAL loopback port — so it mints a real per-instance credential rather
         // than a shared literal any other local process could guess.
-        let operator_token = crate::admin::new_operator_token();
+        let operator_token = crate::services::new_secret();
         let handle = handle.with_admin(crate::AdminConfig {
             operator_token: Some(operator_token.clone()),
             ..Default::default()

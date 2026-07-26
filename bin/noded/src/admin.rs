@@ -14,6 +14,15 @@
 //!   standing between a remote caller and node control — enforced for every
 //!   peer. this is the new capability W2 adds, and the case PoP exists for.
 //!
+//! the EXPOSURE picks the arm, and nothing else does — ownership is not even
+//! looked up under `Loopback`. so a node with a committed owner still takes the
+//! operator credential at the default exposure; the owner PoP becomes the
+//! credential when, and only when, the operator sets `DUCKTAPE_ADMIN=public`.
+//! the two are a LADDER, never an OR: under `Public` with an owner committed,
+//! the operator token is not a fallback and not accepted (a token-only request
+//! is `owner_signature_invalid`, which is how an operator tells "wrong
+//! credential type" from `operator_token_mismatch`'s "wrong secret").
+//!
 //! ## the operator gate — why loopback presence is NOT authority
 //!
 //! loopback used to BE the gate here, on the reasoning `origin_guard` states for
@@ -30,10 +39,16 @@
 //! compare is literally `crate::services::token_matches`. it raises admin from
 //! "can dial loopback" to "can read the node's own workspace".
 //!
-//! CEILING, stated rather than assumed: a first-party daemon launched WITH the
-//! workspace path still clears this bar, because nothing in-process can gate a
-//! `read(2)` by the same uid. bounding that is the launch contract's job (start
-//! a daemon with a base URL, never with `--config`), not this file's.
+//! CEILING, stated rather than assumed — and it is NOT that the service daemons
+//! are now excluded. `ducktape service run <kind>` resolves a workspace and
+//! reads `service-link.token` out of it (`bin/node/src/agent/link.rs`), so a
+//! daemon launched with the workspace path sits in the same directory, at the
+//! same uid, behind the same 0600 mode as `admin.token`: it still clears this
+//! bar, because nothing in-process can gate a `read(2)` by the same uid. what
+//! this gate actually excludes is EVERY OTHER local process on the box — which
+//! is the "can dial loopback" half, and was the whole of the gate before. the
+//! residual is the uid/workspace boundary, and bounding it is the launch
+//! contract's job (start a daemon with a base URL, never with `--config`).
 //!
 //! ## the owner gate (A5, only under `Public`)
 //!
@@ -109,63 +124,20 @@ pub const ADMIN_TOKEN_FILE: &str = "admin.token";
 /// the default identity module id ownership resolves against.
 pub const DEFAULT_IDENTITY_MODULE: &str = "identity";
 
-/// a fresh 32-byte operator credential, hex. for an embedder that holds the
-/// node in-process and so IS the operator (the test harness), with no workspace
-/// to write into.
-pub fn new_operator_token() -> String {
-    use rand::RngCore as _;
-    let mut raw = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut raw);
-    raw.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 /// Mint this node's operator credential and write it 0600 into `dir` (the
 /// workspace beside `node.toml`, or the storage root on the embedded daemon).
 ///
-/// Freshly minted each boot rather than persisted, for the reason
-/// `crate::services::mint_link_token` gives: a node restart must invalidate a
-/// stale holder, and a reader that opens the file per call pays nothing for it.
-///
-/// The 0600 create-new dance mirrors that function byte for byte; it is spelled
-/// out again here only because its writer is private to that module, which is
-/// under concurrent edit. Fold the two together once it settles.
+/// A thin caller of [`crate::services::mint_secret_file`] — ONE writer for the
+/// service link and this, because two byte-identical copies is exactly the
+/// shape where an fsync lands in one and silently not the other.
 pub fn mint_operator_token(dir: &std::path::Path) -> Result<String, String> {
-    let token = new_operator_token();
-    std::fs::create_dir_all(dir)
-        .map_err(|error| format!("admin token dir {}: {error}", dir.display()))?;
-    let path = dir.join(ADMIN_TOKEN_FILE);
-    // create 0600 from the start — a world-readable window, however short, is
-    // the whole thing this credential exists to avoid.
-    write_owner_only(&path, &token)
-        .map_err(|error| format!("admin token {}: {error}", path.display()))?;
-    Ok(token)
-}
-
-#[cfg(unix)]
-fn write_owner_only(path: &std::path::Path, token: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let _ = std::fs::remove_file(path);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?
-        .write_all(token.as_bytes())
-}
-
-#[cfg(not(unix))]
-fn write_owner_only(path: &std::path::Path, token: &str) -> std::io::Result<()> {
-    std::fs::write(path, token)
+    crate::services::mint_secret_file(dir, ADMIN_TOKEN_FILE)
 }
 
 /// Read a node's operator credential — what an operator client presents in
 /// [`ADMIN_TOKEN_HEADER`].
 pub fn read_operator_token(dir: &std::path::Path) -> Result<String, String> {
-    let path = dir.join(ADMIN_TOKEN_FILE);
-    std::fs::read_to_string(&path)
-        .map(|token| token.trim().to_string())
-        .map_err(|error| format!("admin token {}: {error}", path.display()))
+    crate::services::read_secret_file(dir, ADMIN_TOKEN_FILE)
 }
 
 /// how the node exposes its admin (control) namespace.
@@ -227,6 +199,41 @@ impl Default for AdminConfig {
             node_key: None,
             identity_module: DEFAULT_IDENTITY_MODULE.to_string(),
             operator_token: None,
+        }
+    }
+}
+
+impl AdminConfig {
+    /// what every real serve path builds: mint this boot's operator credential
+    /// into `dir` and carry it. The full node adds its own `node_key` on top;
+    /// the embedded daemon and the sim have none (no consensus, no on-chain
+    /// owner), so the credential is their whole gate.
+    ///
+    /// Minting is CONDITIONAL on the namespace existing. Under
+    /// `DUCKTAPE_ADMIN=off` the routes are never registered, so writing a secret
+    /// into the workspace would leave a credential on disk that nothing can ever
+    /// present — a file whose only property is being readable.
+    ///
+    /// A mint failure leaves `operator_token: None`, which REFUSES every admin
+    /// request rather than falling back to the loopback trust this replaced.
+    /// That fallback would be the whole bug.
+    pub fn minted(exposure: AdminExposure, dir: &std::path::Path) -> Self {
+        let operator_token = match exposure.enabled() {
+            false => None,
+            true => mint_operator_token(dir)
+                .inspect_err(|error| {
+                    tracing::error!(
+                        target: "ducktape::admin",
+                        reason = "operator_token_unwritable",
+                        "the admin namespace will refuse every request: {error}"
+                    );
+                })
+                .ok(),
+        };
+        Self {
+            exposure,
+            operator_token,
+            ..Self::default()
         }
     }
 }
@@ -404,7 +411,15 @@ pub enum AdminRefusal {
     OperatorTokenUnavailable,
     /// the request carried no operator credential.
     OperatorTokenMissing,
-    /// the operator credential presented is not this node's.
+    /// the operator credential presented is not this node's — a guess, OR a
+    /// credential cached from before this node restarted.
+    ///
+    /// Those two CANNOT be told apart, and the reason token does not pretend
+    /// to: the node holds only the token it minted this boot, so a stale one and
+    /// a guessed one are byte-identical to it. Remembering previous boots' tokens
+    /// to say "stale" is the same thing as keeping them valid, which is exactly
+    /// what fresh-each-boot exists to prevent. The MESSAGE names both
+    /// possibilities instead of guessing between them.
     OperatorTokenMismatch,
     /// the committed owner could not be read (identity module unreachable).
     OwnerUnresolved,
@@ -460,7 +475,10 @@ impl AdminRefusal {
             AdminRefusal::OperatorTokenMissing => {
                 "admin requires the operator credential from admin.token in the node's workspace"
             }
-            AdminRefusal::OperatorTokenMismatch => "that operator credential is not this node's",
+            AdminRefusal::OperatorTokenMismatch => {
+                "that operator credential is not this node's — re-read admin.token from the \
+                 node's workspace; a restart mints a new one"
+            }
             AdminRefusal::OwnerUnresolved => "cannot resolve node owner",
             AdminRefusal::OwnerSignatureInvalid => "admin request needs a valid owner signature",
             AdminRefusal::OwnerSignatureStale => "admin request timestamp is stale",
@@ -592,21 +610,44 @@ fn admit_owner(
     Ok(())
 }
 
-/// the write half: one refusal body, mirroring `services::hello`'s shape.
+/// the write half: one refusal body, mirroring `services::hello`'s shape. The
+/// `reason` token is the greppable half; the URI never appears.
 ///
-/// `debug`, not `warn`: a refusal is per-request and any local process can drive
-/// one in a loop, so an unconditional `warn!` here would evict the 4096-line ring
-/// — the exact hazard `error_response` already latches for. The `reason` token is
-/// the greppable half; the URI never appears.
+/// The level splits exactly the way `error_response` splits it, for the same
+/// reason. 4xx is `debug`: it is per-request and any local process can drive one
+/// in a loop, so an unconditional `warn!` would evict the 4096-line ring. 5xx is
+/// `warn` but LATCHED — a 503 says this node cannot serve the check AT ALL
+/// (nothing minted a credential, the identity module is unreachable), which is a
+/// standing fault an operator's retry loop mints one line per request for. First
+/// occurrence, then every 50th, carrying `occurrences`: the outage is visible on
+/// line one, and the counter is what says "still broken" rather than "flapped".
 fn refuse(refusal: AdminRefusal) -> Response {
-    tracing::debug!(
-        target: "ducktape::admin",
-        reason = refusal.reason(),
-        status = refusal.status().as_u16(),
-        "admin request refused"
-    );
+    let status = refusal.status();
+    // keyed by the reason token, which comes from a FIXED set of variants — no
+    // caller-supplied string reaches this key, so it cannot be varied to mint
+    // unbounded "first occurrences" the way a per-message key could.
+    static UNSERVABLE: crate::log::Latch = crate::log::Latch::new(50);
+    match status.is_server_error() {
+        true => {
+            if let Some(occurrences) = UNSERVABLE.hit(refusal.reason()) {
+                tracing::warn!(
+                    target: "ducktape::admin",
+                    reason = refusal.reason(),
+                    status = status.as_u16(),
+                    occurrences,
+                    "admin cannot serve its own gate"
+                );
+            }
+        }
+        false => tracing::debug!(
+            target: "ducktape::admin",
+            reason = refusal.reason(),
+            status = status.as_u16(),
+            "admin request refused"
+        ),
+    }
     (
-        refusal.status(),
+        status,
         Json(serde_json::json!({
             "error": refusal.message(),
             "reason": refusal.reason(),
@@ -622,12 +663,17 @@ pub fn admin_router(handle: NodeHandle) -> Router<NodeHandle> {
         .route("/v1/admin/ping", get(ping))
         .route("/v1/admin/shutdown", post(crate::shutdown))
         .route("/v1/admin/logs/tail", get(logs_tail))
-        // upgrade staging: ingest + fan a wasm artifact out to members. kept
-        // exactly as it was on the public surface (no per-route body limit) —
-        // this move only changes the GATE, never the handler.
+        // upgrade staging: ingest + fan a wasm artifact out to members. the body
+        // cap is EXPLICIT (see `MAX_MODULE_ARTIFACT_BYTES`) — without a layer
+        // axum's implicit 2 MiB default applies, and the largest real artifact
+        // is already 1.83 MB of it.
         .route(
             "/v1/admin/module-code/stage",
-            post(crate::module_code::stage_module_code),
+            post(crate::module_code::stage_module_code).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    crate::module_code::MAX_MODULE_ARTIFACT_BYTES,
+                ),
+            ),
         )
         .route(
             "/v1/admin/module-code/{digest}",
