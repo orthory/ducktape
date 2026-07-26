@@ -35,7 +35,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
-use common::{Cluster, poll_until, serial};
+use common::{Cluster, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
 use duckfs_core::{
     Change, Content, FilesMsg, FilesQuery, FilesReply, decode_reply as files_decode_reply,
     encode_msg as files_encode_msg, encode_query as files_encode_query,
@@ -210,27 +210,9 @@ impl PortableProvider {
     }
 }
 
-/// providers spawn only inside a sandbox now, so this e2e needs a working
-/// podman; skip loudly without one, exactly like `remote_session`.
-fn podman_available() -> bool {
-    std::process::Command::new("podman")
-        .arg("version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// the `[sandbox]` table each cluster node boots with — appended LAST to the
-/// generated toml (nothing may follow a toml table header).
-fn sandbox_toml() -> Vec<String> {
-    vec![
-        "[sandbox]".into(),
-        "runtime = \"podman\"".into(),
-        "image = \"docker.io/library/node:22-slim\"".into(),
-        "cores = 0".into(),
-        "mem_gb = 0".into(),
-    ]
-}
+/// the image this suite's stand-in coding agent runs in — the fuller `node`
+/// base rather than the harness default.
+const SANDBOX_IMAGE: &str = "docker.io/library/node:22-slim";
 
 /// hermetic env for a node that must provide NOTHING (see dispatch_e2e).
 fn hermetic_env(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
@@ -364,11 +346,11 @@ fn artifact_stat(cluster: &Cluster, idx: usize) -> Option<u64> {
 
 #[test]
 fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
-    if !podman_available() {
-        eprintln!(
-            "skipping a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace: \
-             no working podman"
-        );
+    if skip_unless_sandboxed(
+        "a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace",
+    )
+    .is_some()
+    {
         return;
     }
     let _serial = serial();
@@ -388,7 +370,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // (nothing may follow a toml table header) — every node boots a podman
     // compute plane; nodes 0/2 stay hermetic (empty spec dir → nothing
     // discovered or announced).
-    cluster.extra_toml.extend(sandbox_toml());
+    cluster.extra_toml.extend(sandbox_toml(SANDBOX_IMAGE));
     // the pool needs the compute grant as well as the [sandbox] table, and
     // the grant is what opts these nodes into the rendezvous pool: the node
     // announces the granted tags INTERSECTED with what it discovers, so the

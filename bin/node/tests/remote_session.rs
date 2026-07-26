@@ -25,12 +25,11 @@
 
 mod common;
 
-use std::process::Command;
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use common::{Cluster, hex, poll_until, serial};
+use common::{Cluster, hex, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
 use commonware_cryptography::{Signer as _, ed25519};
 use futures::{SinkExt as _, StreamExt as _};
 use gateway::{
@@ -48,13 +47,10 @@ const FINALIZE: Duration = Duration::from_secs(60);
 /// bound (container cold-start + the mesh hop); a deadline, not a poll.
 const ECHO: Duration = Duration::from_secs(120);
 
-fn podman_available() -> bool {
-    Command::new("podman")
-        .arg("version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+/// the image the scripted echo provider runs in: this suite's child is driven
+/// through a pty, so it keeps the fuller `node` base rather than the harness
+/// default.
+const SANDBOX_IMAGE: &str = "docker.io/library/node:22-slim";
 
 fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
     identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
@@ -224,8 +220,9 @@ async fn drive_and_observe_echo(
 #[test]
 fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
     let _serial = serial();
-    if !podman_available() {
-        eprintln!("skipping guest_drives_a_scripted_child_on_the_host: no working podman");
+    if skip_unless_sandboxed("guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane")
+        .is_some()
+    {
         return;
     }
     let rt = Runtime::new().unwrap();
@@ -238,15 +235,7 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
     // Podman terminal plane; only the host carries the echo provider.
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
-    // the [sandbox] table LAST in the generated toml (extra_toml appends at
-    // the end; nothing may follow a toml table header).
-    cluster.extra_toml = vec![
-        "[sandbox]".into(),
-        "runtime = \"podman\"".into(),
-        "image = \"docker.io/library/node:22-slim\"".into(),
-        "cores = 0".into(),
-        "mem_gb = 0".into(),
-    ];
+    cluster.extra_toml = sandbox_toml(SANDBOX_IMAGE);
     cluster.env[1] = vec![(
         "DUCKTAPE_CAPABILITY_DIR".into(),
         spec_dir.path().display().to_string(),

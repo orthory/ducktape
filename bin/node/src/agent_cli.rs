@@ -437,9 +437,22 @@ fn submit(base: &str, target: &str, payload: serde_json::Value) -> AgentResult {
     Ok(())
 }
 
-/// A fresh 16-byte run nonce, hex — the dispatch id `run-output:<id>` keys on.
+/// A fresh dispatch id: 32 random bytes as 64 hex chars — what
+/// `run-output:<id>` keys on.
+///
+/// The WIDTH is a wire contract, not a taste call. A run's live output reaches
+/// the node's ring through the ws `run_output` frame, whose admission gate
+/// (`bin/noded/src/stream.rs`) accepts an id of EXACTLY 64 ascii-hex and drops
+/// anything else with `reason = "malformed_run_id"`; the agent data plane's
+/// `valid_event` enforces the same shape before forwarding a line to a peer.
+/// `runs::dispatch_id_for` — the chat-driven lane's id — is a hex sha256 and so
+/// satisfies it by construction. This one used to mint 16 bytes, which meant
+/// EVERY `ducktape agent sched` run had its live output silently dropped at the
+/// node while the committed result landed fine: the ring looked empty for a run
+/// that plainly succeeded. Pinned by
+/// [`tests::a_fresh_dispatch_id_is_a_wire_admissible_run_id`].
 fn fresh_dispatch_id() -> String {
-    let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     hex_bytes(&bytes)
 }
@@ -677,6 +690,21 @@ fn is_term_ended(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sched run's id must be admissible on the wire that carries its LIVE
+    /// output, or the ring stays empty for a run that succeeded. The node's ws
+    /// `run_output` gate takes exactly 64 ascii-hex; so does the agent data
+    /// plane's peer forwarder. See [`fresh_dispatch_id`].
+    #[test]
+    fn a_fresh_dispatch_id_is_a_wire_admissible_run_id() {
+        let id = fresh_dispatch_id();
+        assert_eq!(id.len(), 64, "the ws run_output gate drops any other width");
+        assert!(
+            id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "the gate also requires ascii-hex: {id}"
+        );
+        assert_ne!(id, fresh_dispatch_id(), "a fresh id is fresh");
+    }
 
     #[test]
     fn cred_kind_wins_and_contradiction_is_an_error() {

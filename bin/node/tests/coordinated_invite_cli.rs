@@ -302,18 +302,18 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
     let dir = tempfile::tempdir().expect("tempdir");
     let founder = dir.path().join("founder");
 
-    // reserve a UDP port for the coordinator, then leave it dark for boot.
-    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp port probe");
-    let coord_addr = probe.local_addr().expect("probe addr");
-    drop(probe);
-
-    // distinct listen/http/rpc ports AND a distinct wireguard UDP port: this
-    // test binary runs its tests in parallel, and two spawned nodes on
-    // init's defaults (p2p listen, wireguard 0.0.0.0:51820) collide.
-    let ports = alloc_ports(3);
-    let wg_probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("wg port probe");
-    let wg_port = wg_probe.local_addr().expect("wg probe addr").port();
-    drop(wg_probe);
+    // distinct listen/http/rpc ports, a coordinator UDP port to leave DARK for
+    // boot, and a distinct wireguard UDP port: this test binary runs its tests
+    // in parallel, and two spawned nodes on init's defaults (p2p listen,
+    // wireguard 0.0.0.0:51820) collide.
+    //
+    // All five come from ONE allocator. The coordinator and wireguard ports used
+    // to be hand-rolled `UdpSocket::bind(":0")` probe-drops, which reserved
+    // nothing in the allocator's handed-out set — so the `alloc_ports(3)` three
+    // lines below could hand the very same number straight back out.
+    let ports = alloc_ports(5);
+    let coord_addr = std::net::SocketAddr::from(([127, 0, 0, 1], ports[3]));
+    let wg_port = ports[4];
     let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .arg("node")
         .args([
@@ -431,10 +431,8 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
     // (RFC5737 TEST-NET-3 — guaranteed never to answer). every surface gets
     // an explicit ephemeral-range port: init's working defaults (52200,
     // 8844/8845, 51820) would collide with a real node on this host.
-    let ports = alloc_ports(3);
-    let wg_probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("wg port probe");
-    let wg_port = wg_probe.local_addr().expect("wg probe addr").port();
-    drop(wg_probe);
+    let ports = alloc_ports(4);
+    let wg_port = ports[3];
     let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .arg("node")
         .args([

@@ -1455,6 +1455,79 @@ pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
     nettest::http_text(port, "GET", path)
 }
 
+// ---- sandboxed compute: the `[sandbox]` table and the host gate -------------
+//
+// One home for both halves, because they are one decision. A suite that boots a
+// compute daemon needs a `[sandbox]` table (without one the daemon exits at
+// boot) AND needs to know whether this host can honour it — and the two answers
+// have to agree. They were separately copied into two test binaries, which is
+// how one of them ended up gating on `podman version` while the other gated on
+// the product's own predicate.
+
+/// The default image a sandboxed run executes in: the SMALLEST one that proves
+/// execution end to end, since a script provider's container command is the
+/// executor itself and all it needs of an image is a `/bin/sh` for its shebang.
+///
+/// Size is not cosmetic — each compute daemon keeps its OWN private podman graph
+/// root, so a three-node cluster pulls this three times, into three empty
+/// stores, on every run. busybox is ~4 MB where `node:22-slim` is ~200 MB. A
+/// provider script that needs more than busybox (a `node` runtime, say) passes
+/// its own image to [`sandbox_toml`].
+pub const SANDBOX_IMAGE: &str = "docker.io/library/busybox:stable";
+
+/// the `[sandbox]` table a cluster node boots with, isolating every run into
+/// `image`. Appended LAST to [`Cluster::extra_toml`] — nothing may follow a toml
+/// table header.
+///
+/// It says only HOW a run is isolated. WHETHER this node runs any is
+/// [`Cluster::compute_grant`]; the daemon needs both, and refuses to boot
+/// without the table.
+pub fn sandbox_toml(image: &str) -> Vec<String> {
+    vec![
+        "[sandbox]".into(),
+        "runtime = \"podman\"".into(),
+        format!("image = {image:?}"),
+        "cores = 0".into(),
+        "mem_gb = 0".into(),
+    ]
+}
+
+/// Can this host isolate a run the way the compute daemon demands? `Some(why)`
+/// = no.
+///
+/// Asks the PRODUCT'S OWN predicate rather than `podman version`, and the
+/// difference is not academic: podman on `PATH` is one of four things the Podman
+/// backend requires (`pasta` for the netns, `nft` + `nsenter` for the egress
+/// firewall). A box with a portable podman install has the binary on `PATH` and
+/// its helpers only inside the install prefix — `podman version` says yes, the
+/// daemon exits `FATAL: sandbox: pasta is not executable`, and a suite gated on
+/// the weaker question runs anyway and FAILS instead of skipping. Gating on
+/// `probe()` means a suite skips when, and only when, a real node would refuse
+/// to serve compute.
+///
+/// The image is irrelevant to the answer (`probe` checks tooling, never pulls),
+/// so this takes none.
+pub fn unsandboxable_host() -> Option<String> {
+    provider_host::SandboxBackend::Podman {
+        image: SANDBOX_IMAGE.into(),
+        socket: PathBuf::new(),
+    }
+    .probe()
+    .err()
+}
+
+/// `Some(())` = this test cannot run here and the caller must return; `None` =
+/// run it.
+///
+/// A host that cannot sandbox FAILS by default; skipping is the opt-in
+/// ([`nettest::ALLOW_MISSING_TOOLS_ENV`]), because libtest captures stderr and a
+/// "skipped" line from a passing test reaches nobody. One switch for every
+/// capability gate in the tree — a second, sandbox-only one would just be a
+/// second thing to remember.
+pub fn skip_unless_sandboxed(test: &str) -> Option<()> {
+    nettest::skip_without(test, unsandboxable_host())
+}
+
 #[allow(unused_imports)] // a shared prelude: not every e2e binary polls
 pub use nettest::poll_until;
 

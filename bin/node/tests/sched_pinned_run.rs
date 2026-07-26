@@ -20,9 +20,19 @@
 //! - `an_ungranted_scheduled_run_is_refused_at_resolve`: node A submits a `sched`
 //!   trigger PINNED to node B, naming B's credential. A's account was never
 //!   granted, so B refuses at resolve — `credential_not_granted` lands in the
-//!   saga's error and the provider NEVER spawns (its exec log stays empty). The
-//!   refusal is the whole point of making the credential name a committed,
-//!   origin-gated resolution rather than an envelope secret.
+//!   saga's error and the run commits no result. The refusal is the whole point
+//!   of making the credential name a committed, origin-gated resolution rather
+//!   than an envelope secret.
+//!
+//! ## what a sandboxed run costs this suite in evidence
+//!
+//! Both legs boot each node's `ducktape service run compute` daemon and execute
+//! providers INSIDE a container, so `[sandbox]` is mandatory and a host path is
+//! no longer a shared surface. The granted leg counts executions on the MOCK
+//! UPSTREAM, which is host-side and outside the sandbox; the refusal leg has
+//! only committed state (see its closing assertions). A host that cannot
+//! sandbox FAILS this suite unless `DUCKTAPE_ALLOW_MISSING_TOOLS=1` opts into
+//! skipping — a captured "skipping" line is not a signal anyone sees.
 //!
 //! run alone (cluster e2es flake under parallel load):
 //!   cargo test -p node-bin --test sched_pinned_run -- --nocapture
@@ -33,7 +43,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{Cluster, poll_until, serial};
+use common::{Cluster, SANDBOX_IMAGE, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
 use commonware_cryptography::{Signer as _, ed25519};
 
 use airlock::attest::{self, Measurement};
@@ -205,27 +215,15 @@ async fn seal_credential(gw_base: &str, name: &str) -> [u8; 32] {
 // identity + gateway helpers (mirror airlock_gateway_e2e / gateway_e2e)
 // ===========================================================================
 
-/// providers spawn only inside a sandbox now, so both legs need a working
-/// podman; skip loudly without one, exactly like `remote_session`.
-fn podman_available() -> bool {
-    std::process::Command::new("podman")
-        .arg("version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// the `[sandbox]` table each cluster node boots with — appended LAST to the
-/// generated toml (nothing may follow a toml table header).
-fn sandbox_toml() -> Vec<String> {
-    vec![
-        "[sandbox]".into(),
-        "runtime = \"podman\"".into(),
-        "image = \"docker.io/library/node:22-slim\"".into(),
-        "cores = 0".into(),
-        "mem_gb = 0".into(),
-    ]
-}
+/// The granted leg's image, and the reason it is not the harness default: its
+/// provider script dials the loopback broker with node's global `fetch`, so it
+/// needs a `node` runtime the busybox default does not have.
+///
+/// The refusal leg never executes anything, so it boots on
+/// [`common::SANDBOX_IMAGE`] — each compute daemon fills its OWN empty podman
+/// graph root at boot, and 4 MB beats 200 MB for an image no container ever
+/// runs.
+const BROKER_IMAGE: &str = "docker.io/library/node:22-slim";
 
 fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
     identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
@@ -494,15 +492,16 @@ async fn run_output_has(
 /// One script-backed provider for the `sched-claude` tag. `broker` picks the
 /// isolation: the anthropic-messages broker (the executing node's credential
 /// source rides `ANTHROPIC_BASE_URL` + a `claudeAiOauth` creds file the broker
-/// seeds into `CLAUDE_CONFIG_DIR`) for the run leg, or
-/// none for the refusal leg (which never reaches execution). the refusal leg's
-/// script logs one host-path line per invocation — the never-spawned tripwire;
-/// the run leg's execution count lives on the mock upstream (the host log path
-/// does not exist inside the sandbox).
+/// seeds into `CLAUDE_CONFIG_DIR`) for the run leg, or none for the refusal leg
+/// (which never reaches execution).
+///
+/// The script runs INSIDE the run's container, so its `stdout` is the whole of
+/// its observable behaviour: it can touch no host path (none exists in that
+/// mount namespace) and nothing beyond what the image provides. Execution
+/// counting therefore lives on the mock upstream, which is host-side.
 struct ScriptProvider {
     spec_dir: PathBuf,
     script: PathBuf,
-    exec_log: PathBuf,
 }
 
 impl ScriptProvider {
@@ -510,15 +509,12 @@ impl ScriptProvider {
         let dir = root.join("provider");
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-        let exec_log = dir.join("exec.log");
         let script = dir.join("provider.sh");
 
-        // the broker leg runs INSIDE the podman sandbox (node:22-slim), so it
-        // dials the loopback broker with node's global fetch — the container
-        // has no curl, and a host log path would not exist in its mount
-        // namespace (execution is counted host-side by the mock upstream
-        // instead). the refusal leg never runs, so its body only needs to be
-        // valid; its host log line stays as the never-spawned tripwire.
+        // the broker leg runs INSIDE the podman sandbox ([`BROKER_IMAGE`]), so
+        // it dials the loopback broker with node's global fetch — the container
+        // has no curl. execution is counted host-side by the mock upstream. the
+        // refusal leg never runs, so its body only needs to be valid.
         let body = if broker {
             "#!/bin/sh\n\
              set -e\n\
@@ -540,14 +536,11 @@ impl ScriptProvider {
              '\n"
                 .to_string()
         } else {
-            format!(
-                "#!/bin/sh\n\
-                 set -e\n\
-                 cat > /dev/null\n\
-                 echo ran >> {log}\n\
-                 printf 'unreachable\\n'\n",
-                log = exec_log.display(),
-            )
+            "#!/bin/sh\n\
+             set -e\n\
+             cat > /dev/null\n\
+             printf 'unreachable\\n'\n"
+                .to_string()
         };
         std::fs::write(&script, body).expect("write provider script");
         use std::os::unix::fs::PermissionsExt as _;
@@ -555,8 +548,15 @@ impl ScriptProvider {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod provider script");
 
+        // `config_home_env` is NOT optional decoration for a claude-broker spec:
+        // the broker seeds the per-run bearer as a `claudeAiOauth` credentials
+        // FILE (that shape is what puts Claude Code in subscription mode), and it
+        // has nowhere to write one without a config home. Omitting it is how this
+        // leg died — `claude broker run has no config home to seed credentials`,
+        // raised mid-run, long after the spec loaded. The script reads exactly
+        // this variable back.
         let isolation = if broker {
-            "[isolation]\nbroker = \"anthropic-messages\"\n"
+            "[isolation]\nbroker = \"anthropic-messages\"\nconfig_home_env = \"CLAUDE_CONFIG_DIR\"\n"
         } else {
             ""
         };
@@ -580,11 +580,7 @@ impl ScriptProvider {
             ),
         )
         .expect("write provider spec");
-        Self {
-            spec_dir,
-            script,
-            exec_log,
-        }
+        Self { spec_dir, script }
     }
 
     /// the env that makes a node provide the tag: the operator spec dir plus the
@@ -600,12 +596,6 @@ impl ScriptProvider {
                 self.script.display().to_string(),
             ),
         ]
-    }
-
-    fn executions(&self) -> usize {
-        std::fs::read_to_string(&self.exec_log)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
     }
 }
 
@@ -625,8 +615,7 @@ fn hide_builtins(root: &Path, name: &str) -> Vec<(String, String)> {
 
 #[test]
 fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
-    if !podman_available() {
-        eprintln!("skipping a_granted_scheduled_run_executes_against_the_mock_upstream: no working podman");
+    if skip_unless_sandboxed("a_granted_scheduled_run_executes_against_the_mock_upstream").is_some() {
         return;
     }
     let _serial = serial();
@@ -642,7 +631,7 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     let provider = ScriptProvider::stage(fixtures.path(), true);
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.wireguard = true;
-    cluster.extra_toml = sandbox_toml();
+    cluster.extra_toml = sandbox_toml(BROKER_IMAGE);
     // the [sandbox] table is only HOW runs are isolated; the pool also
     // needs the user's compute grant. This run is pinned, not claimed from a
     // pool, so the grant announces nothing.
@@ -652,6 +641,19 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     cluster.wait_marker(0, "rpc listening on", CONVERGE);
     cluster.wait_marker(0, "converged root_hash=", CONVERGE);
     cluster.wait_marker(0, "gateway plane: overlay stream bound", CONVERGE);
+    // the compute plane is a SEPARATE PROCESS: without this the suite has no eye
+    // on it, and a daemon that died at boot leaves a cluster that looks
+    // perfectly healthy (the node is) until the pinned lease burns every attempt
+    // and reports `lease attempts exhausted` — a diagnosis pointing at
+    // consensus, three minutes from the actual cause. Its own marker names it
+    // immediately.
+    //
+    // What it covers, exactly: `PodmanService` + provider discovery. NOT the
+    // image — nothing is pulled at boot, so an unpullable tag passes this marker
+    // and fails the run ~20s later. A dead libpod socket never prints it and
+    // burns the full budget. Neither is a skip: past `probe()` this suite has
+    // declared the host capable, so an unusable sandbox is a failure.
+    cluster.wait_compute_marker(0, "compute daemon serving", CONVERGE);
 
     // the node owns the credential: bind its key to an account, map its handle,
     // register the gateway port, publish the airlock route, register the record.
@@ -703,7 +705,12 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
 
     // the pinned run: bound to this node, drawing on its OWN credential (the
     // owner is always granted). the origin is this node's key.
-    let dispatch_id = "sched-e2e-run";
+    // 64 ascii-hex, because that is what the product mints
+    // (`agent_cli::fresh_dispatch_id`) and what the node's ws `run_output` gate
+    // admits. A short hand-made id — which this fixture used to carry — is
+    // dropped at the node as `malformed_run_id`, so the ring assertion below
+    // could only ever have failed on a real run.
+    let dispatch_id = "5c4ed0e2be5f0ab8f8dc5d0f4c2b1a9e7d3f60518c2a4b6d8e0f1a3c5e7b9d02";
     let saga_id = format!("sched\u{1f}{dispatch_id}");
     submit_sched(&cluster, 0, &saga_id, &node_key, 3);
 
@@ -747,8 +754,7 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
 
 #[test]
 fn an_ungranted_scheduled_run_is_refused_at_resolve() {
-    if !podman_available() {
-        eprintln!("skipping an_ungranted_scheduled_run_is_refused_at_resolve: no working podman");
+    if skip_unless_sandboxed("an_ungranted_scheduled_run_is_refused_at_resolve").is_some() {
         return;
     }
     let _serial = serial();
@@ -759,7 +765,7 @@ fn an_ungranted_scheduled_run_is_refused_at_resolve() {
     // airlock gateway: the refusal fires at the grant check, before any broker.
     let provider = ScriptProvider::stage(fixtures.path(), false);
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
-    cluster.extra_toml = sandbox_toml();
+    cluster.extra_toml = sandbox_toml(SANDBOX_IMAGE);
     // the [sandbox] table is only HOW runs are isolated; the pool also
     // needs the user's compute grant. This run is pinned, not claimed from a
     // pool, so the grant announces nothing.
@@ -771,6 +777,7 @@ fn an_ungranted_scheduled_run_is_refused_at_resolve() {
     cluster.spawn(1);
     for i in 0..2 {
         cluster.wait_marker(i, "converged root_hash=", CONVERGE);
+        cluster.wait_compute_marker(i, "compute daemon serving", CONVERGE);
     }
 
     // B owns the credential (bound to seed 42); A is bound to a DIFFERENT account
@@ -809,9 +816,18 @@ fn an_ungranted_scheduled_run_is_refused_at_resolve() {
         "the saga carries the refusal token: {:?}",
         view.error,
     );
-    assert_eq!(
-        provider.executions(),
-        0,
-        "a refused credential never launches a provider",
-    );
+    // NOTE what is deliberately NOT asserted here: "the provider never
+    // spawned". The old host-path `exec.log` counter could not have fired even
+    // on a provider that DID spawn — a run executes in a container, and that
+    // path does not exist in its mount namespace — and the obvious replacement
+    // (`view.result.is_none()`) is entailed by `Failed` plus the refusal token
+    // above, so it would read like cover while proving nothing new.
+    //
+    // The property has a home where it CAN fail, against the pool that enforces
+    // it: `compute_service::pool`'s
+    // `a_resolver_refusal_fails_the_run_without_spawning`, which counts real
+    // spawner invocations and asserts zero. What this leg adds is the half a
+    // unit test cannot reach: the refusal is driven by COMMITTED state — B's
+    // credential record, A's account, the run's saga origin — across two real
+    // processes, and lands in consensus as the saga's own error.
 }

@@ -52,6 +52,15 @@ tokio-stream = { version = "0.1", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false }
 
 [dev-dependencies]
+# A SELF dev-dependency, the `data-plane`/`provider-host` pattern: every feature
+# in this crate is off by default, and all three integration binaries open with a
+# `#![cfg(feature = ...)]` — so `cargo test -p airlock` compiled them to
+# `running 0 tests` and printed a green nobody could tell from a real one. The
+# e2e, the SNP verifier proof and the TDX verifier proof were all dead in the
+# per-crate loop, alive only when some OTHER package's dev-deps happened to
+# unify the features in (`bin/node`, `broker-host`). Turning them on here means
+# the focused invocation runs what it claims to.
+airlock = { path = ".", features = ["client", "server", "verify", "testkit"] }
 # The fixture test names dcap-qvl types (QuoteCollateralV3, Quote) directly.
 dcap-qvl = { version = "0.5" }
 axum = "0.8"

@@ -652,16 +652,34 @@ mod tests {
         assert_eq!(claude, vec!["--foo".to_string()]);
     }
 
-    // ---- live podman integration (skips when podman is unavailable) ---------
+    // ---- live podman integration -------------------------------------------
     // These exercise the SAME pty primitive against a REAL `podman run -it`
     // container — the bridge PR1 could only argv-assert off a podman host.
+    //
+    // `#[ignore]`, like every other live test in this module. This crate's
+    // default lane is 85 tests that need nothing, and making the whole
+    // inner-loop `cargo test -p provider-host` require podman for 2 of them is
+    // where the pressure to put the opt-out in a shell profile comes from — an
+    // opt-out in a profile buys nothing and costs churn. An IGNORED test is
+    // disclosed: libtest prints `N ignored` in the summary, which is the exact
+    // property a captured "skipping" line lacked. Run them with
+    // `cargo test -p provider-host -- --ignored`, where the podman gate below
+    // still FAILS loudly on a host that cannot honour it.
+    //
+    // Nothing is lost on a provisioned box: `bin/node/tests/remote_session.rs`
+    // drives this same pty primitive end to end through a real sandbox (guest
+    // directs, host spawns, keystroke forwarded, echo fanned back), in a suite
+    // that does run by default.
 
-    fn podman_available() -> bool {
-        std::process::Command::new("podman")
-            .arg("version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    /// `Some(())` = no podman here, so `test` cannot run and the caller must
+    /// return — which by default it will not: a missing capability FAILS unless
+    /// `DUCKTAPE_ALLOW_MISSING_TOOLS=1` opts into skipping.
+    ///
+    /// These two drive `podman run --network=host` directly rather than the
+    /// sandbox backend, so podman on PATH really is the whole requirement —
+    /// unlike a sandboxed run, which also needs pasta/nft/nsenter.
+    fn skip_without_podman(test: &str) -> Option<()> {
+        nettest::skip_without(test, nettest::missing_tool("podman"))
     }
 
     async fn read_until(session: &InteractiveSession, needle: &[u8], rounds: usize) -> Vec<u8> {
@@ -683,9 +701,9 @@ mod tests {
 
     /// REAL podman: openpty + `podman run -it … cat` bridges bytes both ways.
     #[tokio::test]
+    #[ignore = "live: needs podman (spends nothing) — cargo test -p provider-host -- --ignored"]
     async fn pty_bridges_a_real_podman_container() {
-        if !podman_available() {
-            eprintln!("skipping pty_bridges_a_real_podman_container: no working podman");
+        if skip_without_podman("pty_bridges_a_real_podman_container").is_some() {
             return;
         }
         let mut cmd = tokio::process::Command::new("podman");
@@ -720,8 +738,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "live: needs podman + host codex + ~/.codex/auth.json"]
     async fn codex_tui_renders_in_a_real_container() {
-        if !podman_available() {
-            eprintln!("skipping: no working podman");
+        if skip_without_podman("codex_tui_renders_in_a_real_container").is_some() {
             return;
         }
         let image = std::env::var("DUCKTAPE_SANDBOX_IMAGE")
@@ -770,8 +787,9 @@ mod tests {
     /// build the Podman provider set the live model-turn tests share.
     #[cfg(test)]
     fn live_podman_set() -> Option<crate::ProviderSet> {
-        if !podman_available() {
-            eprintln!("skipping live model turn: no working podman");
+        // NOT `?`: the helper answers Some(()) for "skip", the inverse of this
+        // fn's Option, whose None means "no provider set".
+        if skip_without_podman("the live model turns").is_some() {
             return None;
         }
         let image = std::env::var("DUCKTAPE_SANDBOX_IMAGE")
@@ -1011,9 +1029,9 @@ mod tests {
     /// REAL podman: `-t` gives the CONTAINER process a genuine tty — what a TUI
     /// needs. `test -t 0` is true only over a real pty.
     #[tokio::test]
+    #[ignore = "live: needs podman (spends nothing) — cargo test -p provider-host -- --ignored"]
     async fn podman_dash_t_gives_the_container_a_real_tty() {
-        if !podman_available() {
-            eprintln!("skipping podman tty test: no working podman");
+        if skip_without_podman("podman_dash_t_gives_the_container_a_real_tty").is_some() {
             return;
         }
         let mut cmd = tokio::process::Command::new("podman");

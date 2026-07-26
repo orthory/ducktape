@@ -59,6 +59,10 @@ testkit = ["sandbox-host/testkit"]
 # `sandbox-host/testkit` can only ever be on in a graph where our `testkit` is
 # on too — the lockstep the feature comment above requires.
 provider-host = { path = ".", features = ["testkit"] }
+# the shared capability-skip gate: a host-probe skip must be loud AND become a
+# failure by default, or a box without podman reports two green pty proofs that
+# ran nothing (libtest captures the "skipping" line too).
+nettest = { path = "../../testing/nettest" }
 # `testkit` exposes RunBroker::start_for_test — the idle-control test drives a
 # real run against a broker whose upstream is a dead port.
 broker-host = { workspace = true, features = ["testkit"] }

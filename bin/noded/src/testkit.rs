@@ -48,7 +48,21 @@ impl InProcDaemon {
         build_host: impl FnOnce() -> Host + Send + 'static,
         status_modules: Vec<String>,
     ) -> Self {
-        let port = nettest::free_port();
+        // Bind FIRST, and hand the bound socket to the server thread.
+        //
+        // The harness used to reserve a port with `nettest::free_port()`, drop
+        // the probe, and bind minutes of genesis later — the classic gap. Worse,
+        // the bind then lived on the server thread where its `.expect` panicked
+        // into nothing, so the readiness loop below could not tell "my listener
+        // died" from "not up yet" and would happily settle for a STRANGER's 200
+        // on that port. Binding here closes both: there is no gap to lose the
+        // port in, a failure to bind panics in the caller's own thread, and the
+        // port we report is by construction the one WE hold.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind harness listener");
+        let port = listener.local_addr().expect("harness listen addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("harness listener is nonblocking for tokio");
         let (handle, cmd_rx, _events) = NodeHandle::channel();
         let status = handle.status_cell();
         // the testkit has no mesh and no registry: an empty exposition
@@ -65,10 +79,13 @@ impl InProcDaemon {
 
         // the readiness event, same contract as `bin/noded`'s daemon: genesis
         // runs on the actor thread and publishes the boot snapshot, and only
-        // THEN does the listener bind. Serving first would let `await_ready`
-        // (and any harness probing `/v1/status` for "up") take a 200 carrying
-        // `NodeStatus::default()` — version "", no modules, height 0 — as the
-        // node's real state, while genesis is still running behind it.
+        // THEN does anything SERVE. The listener is bound above (that is a
+        // socket, not a service — an unaccepted connect just sits in the
+        // backlog), but `crate::serve` is not spawned until this channel has
+        // fired. Serving first would let `await_ready` — and any harness probing
+        // `/v1/status` for "up" — take a 200 carrying `NodeStatus::default()`
+        // (version "", no modules, height 0) as the node's real state while
+        // genesis is still running behind it.
         let (booted_tx, booted_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let actor = std::thread::Builder::new()
             .name("inproc-actor".into())
@@ -85,9 +102,8 @@ impl InProcDaemon {
                     .build()
                     .expect("server runtime");
                 rt.block_on(async move {
-                    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                        .await
-                        .expect("bind harness listener");
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .expect("adopt the pre-bound harness listener");
                     let _ = crate::serve(listener, handle).await;
                 });
             })
@@ -113,9 +129,32 @@ impl InProcDaemon {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// Block until the server thread's runtime is actually accepting.
+    ///
+    /// Liveness FIRST, then the probe — the same order `bin/simnode`'s harness
+    /// needed, and for the same reason. Binding in [`Self::start`] means a
+    /// stranger cannot answer *while we hold the socket*, but that is not
+    /// unconditional: if the server thread dies (its runtime fails to build, or
+    /// `serve` panics) the listener drops with it, the port frees, and this loop
+    /// would keep polling it for the remaining 30s — long enough for another
+    /// harness to bind it and answer 200, which this would report as our node
+    /// being ready. Asking `JoinHandle::is_finished()` first makes a dead server
+    /// a named failure instead.
+    ///
+    /// What remains a genuine wait is the runtime spinning up: a connect lands
+    /// in the backlog immediately, but no response comes back until `serve` is
+    /// polling.
     fn await_ready(&self) {
         let deadline = Instant::now() + Duration::from_secs(30);
+        let server = self.server.as_ref().expect("the server thread is running");
         loop {
+            assert!(
+                !server.is_finished(),
+                "the in-proc server thread exited before answering /v1/status on \
+                 port {}; its listener is gone, so anything answering that port \
+                 now belongs to someone else",
+                self.port
+            );
             if nettest::http_status(self.port, "GET", "/v1/status") == Some(200) {
                 return;
             }
