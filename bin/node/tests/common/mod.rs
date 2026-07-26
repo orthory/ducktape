@@ -1517,10 +1517,13 @@ pub fn unsandboxable_host() -> Option<String> {
 }
 
 /// `Some(())` = this test cannot run here and the caller must return; `None` =
-/// run it. Loud, and a FAILURE rather than a skip under
-/// [`nettest::REQUIRE_TOOLS_ENV`] — the one switch every capability gate in the
-/// tree answers to (a second, sandbox-only switch would just be a second thing
-/// to remember to set).
+/// run it.
+///
+/// A host that cannot sandbox FAILS by default; skipping is the opt-in
+/// ([`nettest::ALLOW_MISSING_TOOLS_ENV`]), because libtest captures stderr and a
+/// "skipped" line from a passing test reaches nobody. One switch for every
+/// capability gate in the tree — a second, sandbox-only one would just be a
+/// second thing to remember.
 pub fn skip_unless_sandboxed(test: &str) -> Option<()> {
     nettest::skip_without(test, unsandboxable_host())
 }

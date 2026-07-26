@@ -30,8 +30,9 @@
 //! providers INSIDE a container, so `[sandbox]` is mandatory and a host path is
 //! no longer a shared surface. The granted leg counts executions on the MOCK
 //! UPSTREAM, which is host-side and outside the sandbox; the refusal leg has
-//! only committed state (see its closing assertions). A skip here is loud and
-//! `DUCKTAPE_REQUIRE_TOOLS=1` turns it into a failure.
+//! only committed state (see its closing assertions). A host that cannot
+//! sandbox FAILS this suite unless `DUCKTAPE_ALLOW_MISSING_TOOLS=1` opts into
+//! skipping — a captured "skipping" line is not a signal anyone sees.
 //!
 //! run alone (cluster e2es flake under parallel load):
 //!   cargo test -p node-bin --test sched_pinned_run -- --nocapture
@@ -645,8 +646,13 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     // perfectly healthy (the node is) until the pinned lease burns every attempt
     // and reports `lease attempts exhausted` — a diagnosis pointing at
     // consensus, three minutes from the actual cause. Its own marker names it
-    // immediately. It also covers the image pull: the daemon fills its private
-    // podman graph root before it says this.
+    // immediately.
+    //
+    // What it covers, exactly: `PodmanService` + provider discovery. NOT the
+    // image — nothing is pulled at boot, so an unpullable tag passes this marker
+    // and fails the run ~20s later. A dead libpod socket never prints it and
+    // burns the full budget. Neither is a skip: past `probe()` this suite has
+    // declared the host capable, so an unusable sandbox is a failure.
     cluster.wait_compute_marker(0, "compute daemon serving", CONVERGE);
 
     // the node owns the credential: bind its key to an account, map its handle,
@@ -810,16 +816,18 @@ fn an_ungranted_scheduled_run_is_refused_at_resolve() {
         "the saga carries the refusal token: {:?}",
         view.error,
     );
-    // `Failed` IS the never-executed claim, and it is the only honest one left.
-    // A run executes inside a container now, so the script's old host-path
-    // `exec.log` counter could not have fired even on a provider that DID
-    // spawn — that path does not exist in the run's mount namespace, so a
-    // spawned script would have appended inside the container and the host
-    // assertion would have read 0 either way. A vacuous guard on the safety
-    // property is worse than none, because it reads like cover.
-    assert!(
-        view.result.is_none(),
-        "a refused run commits no result bytes: {:?}",
-        view.result,
-    );
+    // NOTE what is deliberately NOT asserted here: "the provider never
+    // spawned". The old host-path `exec.log` counter could not have fired even
+    // on a provider that DID spawn — a run executes in a container, and that
+    // path does not exist in its mount namespace — and the obvious replacement
+    // (`view.result.is_none()`) is entailed by `Failed` plus the refusal token
+    // above, so it would read like cover while proving nothing new.
+    //
+    // The property has a home where it CAN fail, against the pool that enforces
+    // it: `compute_service::pool`'s
+    // `a_resolver_refusal_fails_the_run_without_spawning`, which counts real
+    // spawner invocations and asserts zero. What this leg adds is the half a
+    // unit test cannot reach: the refusal is driven by COMMITTED state — B's
+    // credential record, A's account, the run's saga origin — across two real
+    // processes, and lands in consensus as the saga's own error.
 }

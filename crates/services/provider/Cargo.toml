@@ -60,8 +60,8 @@ testkit = ["sandbox-host/testkit"]
 # on too — the lockstep the feature comment above requires.
 provider-host = { path = ".", features = ["testkit"] }
 # the shared capability-skip gate: a host-probe skip must be loud AND become a
-# failure under `DUCKTAPE_REQUIRE_TOOLS=1`, or a box without podman reports two
-# green pty proofs that ran nothing.
+# failure by default, or a box without podman reports two green pty proofs that
+# ran nothing (libtest captures the "skipping" line too).
 nettest = { path = "../../testing/nettest" }
 # `testkit` exposes RunBroker::start_for_test — the idle-control test drives a
 # real run against a broker whose upstream is a dead port.

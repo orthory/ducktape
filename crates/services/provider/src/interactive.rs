@@ -657,7 +657,8 @@ mod tests {
     // container — the bridge PR1 could only argv-assert off a podman host.
 
     /// `Some(())` = no podman here, so `test` cannot run and the caller must
-    /// return. Loud, and a FAILURE under `DUCKTAPE_REQUIRE_TOOLS=1`.
+    /// return — which by default it will not: a missing capability FAILS unless
+    /// `DUCKTAPE_ALLOW_MISSING_TOOLS=1` opts into skipping.
     ///
     /// These two drive `podman run --network=host` directly rather than the
     /// sandbox backend, so podman on PATH really is the whole requirement —

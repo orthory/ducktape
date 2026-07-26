@@ -1380,9 +1380,9 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
 /// The whole forge-over-http protocol suite is five tests behind this, and a
 /// bare early-return made every one of them report green on a host without git
 /// — five protocol proofs covering nothing, indistinguishable in CI output from
-/// five that ran. [`nettest::skip_without`] makes the skip loud and turns it
-/// into a FAILURE under `DUCKTAPE_REQUIRE_TOOLS=1`, which is what a host that is
-/// supposed to have git should set.
+/// five that ran. Printing "skipping" does not fix that: libtest captures
+/// stderr too, so the line never reaches the log. [`nettest::skip_without`]
+/// FAILS instead, unless `DUCKTAPE_ALLOW_MISSING_TOOLS=1` asks for the skip.
 fn skip_without_git(test: &str) -> Option<()> {
     nettest::skip_without(test, nettest::missing_tool("git"))
 }

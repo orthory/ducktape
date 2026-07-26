@@ -198,7 +198,7 @@ pub fn alloc_ports(n: usize) -> Vec<u16> {
         // the udp half may legitimately be taken by an unrelated process while
         // tcp is free — that is a port this allocator must not hand out, not an
         // error. mark it used so a later call does not re-probe it either.
-        let Ok(datagram) = UdpSocket::bind(("127.0.0.1", port)) else {
+        let Some(datagram) = claim_udp(port) else {
             handed.insert(port);
             continue;
         };
@@ -214,42 +214,75 @@ pub fn alloc_ports(n: usize) -> Vec<u16> {
     keep.iter().map(|(port, _, _)| *port).collect()
 }
 
-/// Set to `1` on a host that is SUPPOSED to have the tooling every suite here
-/// probes for, and a skip becomes a failure.
+/// The udp half of `port`, held for as long as the caller keeps it — `None`
+/// when someone else has it.
 ///
-/// A skip is the honest answer for a laptop without podman (or git, or a
-/// sandbox's `pasta`), but `ok. 5 passed ... finished in 0.00s` is
-/// indistinguishable from a real green run in CI output — which is how five
-/// forge-over-http tests, a whole compute plane, and a claim lane each spent
-/// weeks proving nothing. So the decision is the operator's, through ONE switch
-/// rather than one per capability: unset, an under-provisioned host skips
-/// loudly; set, it fails.
-pub const REQUIRE_TOOLS_ENV: &str = "DUCKTAPE_REQUIRE_TOOLS";
+/// Split out of [`alloc_ports`] because it is the only branch a test can reach
+/// deterministically: `alloc_ports` binds `:0`, so no test can steer it at a
+/// port it has arranged to be udp-busy, and one that merely checks the returned
+/// ports happen to be udp-free passes against a tcp-only probe on any host with
+/// no udp listener (measured: 0 of 8000 on a quiet box). See
+/// [`tests::a_udp_busy_port_is_unclaimable_even_where_tcp_is_free`].
+fn claim_udp(port: u16) -> Option<UdpSocket> {
+    UdpSocket::bind(("127.0.0.1", port)).ok()
+}
+
+/// Set to `1` to let a test SKIP when the host lacks what it needs. Unset — the
+/// default — a missing capability is a FAILURE.
+///
+/// The default is inverted on purpose, and that inversion is the whole point of
+/// this helper. The obvious design is "skip quietly, and let a careful operator
+/// opt IN to strictness". It does not work: libtest's default capture takes
+/// **stderr as well as stdout**, so a skip printed from a PASSING test is
+/// swallowed and the run reads
+///
+/// ```text
+/// test git_push_over_http_lands_in_forge_head ... ok
+/// test result: ok. 1 passed; 0 failed; ...
+/// ```
+///
+/// — byte-identical to a real green. A "loud skip" is loud only under
+/// `--nocapture`, which is not how anyone runs a suite. That is how five
+/// forge-over-http tests, a whole compute plane and a claim lane each spent
+/// weeks proving nothing.
+///
+/// So the two candidate failure modes are "CI is noisy on an under-provisioned
+/// box" and "CI lies". Only the first is recoverable by reading the output. A
+/// box that genuinely cannot run these sets the variable and gets its skips —
+/// as a deliberate act, not as the silent default.
+pub const ALLOW_MISSING_TOOLS_ENV: &str = "DUCKTAPE_ALLOW_MISSING_TOOLS";
 
 /// `Some(())` = `test` cannot run on this host and the caller must return;
 /// `None` = run it. `why` is `Some(reason)` exactly when the capability is
 /// missing — the shape every probe already returns.
 ///
-/// Panics instead of skipping under [`REQUIRE_TOOLS_ENV`].
+/// PANICS on a missing capability unless [`ALLOW_MISSING_TOOLS_ENV`] opts out.
 pub fn skip_without(test: &str, why: Option<String>) -> Option<()> {
-    let host_declared_capable =
-        std::env::var_os(REQUIRE_TOOLS_ENV).is_some_and(|require| require == "1");
-    decide_skip(test, host_declared_capable, why)
+    let skipping_allowed =
+        std::env::var_os(ALLOW_MISSING_TOOLS_ENV).is_some_and(|allow| allow == "1");
+    decide_skip(test, skipping_allowed, why)
 }
 
 /// The decision [`skip_without`] makes, with the environment read out of it —
-/// so the escalation can be tested without `set_var`, which is process-global
-/// and would leak into every other test running on a sibling libtest thread.
-fn decide_skip(test: &str, host_declared_capable: bool, why: Option<String>) -> Option<()> {
+/// so both arms can be tested without `set_var`, which is process-global and
+/// leaks into every other test running on a sibling libtest thread.
+fn decide_skip(test: &str, skipping_allowed: bool, why: Option<String>) -> Option<()> {
     let why = why?;
     assert!(
-        !host_declared_capable,
-        "{REQUIRE_TOOLS_ENV}=1 but this host cannot run {test}: {why}"
+        skipping_allowed,
+        "{test} cannot run on this host: {why}\n\
+         Install what is missing, or set {ALLOW_MISSING_TOOLS_ENV}=1 to skip \
+         instead — and then do not read this suite's green as coverage."
     );
-    // stderr, not the harness's own channel: libtest swallows a passing test's
-    // stdout, so a skip has to be visible beside the `passed` that covered
-    // nothing.
-    eprintln!("SKIP {test}: {why} (set {REQUIRE_TOOLS_ENV}=1 to make this a failure)");
+    // fd 2 DIRECTLY, not `eprintln!`: the macro routes through
+    // `std::io::_eprint`, which honours libtest's thread-local output capture
+    // and would swallow this line on a passing test — the exact defect this
+    // helper exists to kill. `Stderr::write_fmt` does not consult it. (The panic
+    // arm needs no such care: libtest always prints a failure.)
+    let _ = writeln!(
+        std::io::stderr(),
+        "SKIP {test}: {why} ({ALLOW_MISSING_TOOLS_ENV}=1 is set)"
+    );
     Some(())
 }
 
@@ -328,13 +361,34 @@ mod tests {
 
     /// A reserved port must be free on BOTH protocols: harnesses hand these
     /// numbers to `--wireguard-listen` (udp) as readily as to `--listen` (tcp),
-    /// and a tcp-only probe reserves the wrong half of the number space.
+    /// so a tcp-only probe reserves the wrong half of the number space.
+    ///
+    /// The squatter is what makes this a test. Asserting that
+    /// [`alloc_ports`]'s output happens to be udp-free would pass against a
+    /// tcp-only probe on any host with no udp listener, and `alloc_ports` binds
+    /// `:0` — there is no way to steer it at a port arranged to be busy. So the
+    /// branch is exercised where it is reachable: hold the udp half, leave the
+    /// tcp half free (the exact state a tcp-only probe misreads), and require
+    /// [`claim_udp`] to refuse it.
     #[test]
-    fn alloc_ports_are_free_on_udp_too() {
-        for port in alloc_ports(4) {
-            UdpSocket::bind(("127.0.0.1", port))
-                .unwrap_or_else(|e| panic!("alloc_ports handed out udp-busy port {port}: {e}"));
-        }
+    fn a_udp_busy_port_is_unclaimable_even_where_tcp_is_free() {
+        let squatter = UdpSocket::bind("127.0.0.1:0").expect("udp squatter");
+        let port = squatter.local_addr().expect("squatter addr").port();
+        // the misreading a tcp-only probe would make: this succeeds.
+        let tcp = TcpListener::bind(("127.0.0.1", port)).expect("the tcp half IS free");
+
+        assert!(
+            claim_udp(port).is_none(),
+            "port {port} is udp-busy and must not be claimable"
+        );
+
+        drop(squatter);
+        drop(tcp);
+        assert!(
+            claim_udp(port).is_some(),
+            "port {port} is free again once the squatter lets go — otherwise \
+             the check above proved nothing about udp"
+        );
     }
 
     /// No port is EVER handed out twice in one process, however many calls —
@@ -355,16 +409,17 @@ mod tests {
         assert_eq!(decide_skip("a_test", true, None), None);
     }
 
+    /// THE default: a missing capability FAILS, because a skip that libtest
+    /// captures is indistinguishable from a pass.
     #[test]
-    fn a_missing_capability_skips_an_undeclared_host() {
-        assert_eq!(decide_skip("a_test", false, Some("no widget".into())), Some(()));
+    #[should_panic(expected = "a_test cannot run on this host: no widget")]
+    fn a_missing_capability_fails_by_default() {
+        decide_skip("a_test", false, Some("no widget".into()));
     }
 
-    /// the whole point: a declared-capable host turns the skip into a failure.
     #[test]
-    #[should_panic(expected = "cannot run a_test: no widget")]
-    fn a_missing_capability_fails_a_declared_host() {
-        decide_skip("a_test", true, Some("no widget".into()));
+    fn a_missing_capability_skips_only_when_the_operator_asked() {
+        assert_eq!(decide_skip("a_test", true, Some("no widget".into())), Some(()));
     }
 
     #[test]
