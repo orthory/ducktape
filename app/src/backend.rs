@@ -2736,7 +2736,7 @@ pub fn height_label(height: i64) -> String {
     let digits = height.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
-        let boundary = index > 0 && (digits.len() - index) % 3 == 0;
+        let boundary = index > 0 && (digits.len() - index).is_multiple_of(3);
         if boundary {
             grouped.push(',');
         }
