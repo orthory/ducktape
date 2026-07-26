@@ -20,8 +20,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use commonware_cryptography::Signer as _;
-
 use crate::config;
 
 pub const FILE_NAME: &str = "services.toml";
@@ -57,8 +55,8 @@ fn daemon_for(kind: &str) -> Option<Daemon> {
 /// containers along — exactly the coupling separate processes exist to remove.
 /// The honest cost is two image stores: an image both services use is pulled
 /// into each.
-pub(crate) fn podman_data_dir(resolved: &config::Resolved, kind: &str) -> PathBuf {
-    resolved.storage_dir.join("services").join(kind)
+pub(crate) fn podman_data_dir(service: &config::ServiceConfig, kind: &str) -> PathBuf {
+    service.storage_dir.join("services").join(kind)
 }
 
 /// this service's OWN sandbox backend, with its socket named.
@@ -71,10 +69,10 @@ pub(crate) fn podman_data_dir(resolved: &config::Resolved, kind: &str) -> PathBu
 /// Non-Podman backends (Tart) are returned unchanged — a Tart run clones and
 /// deletes a VM per run, so there is no service, no socket and no shared root.
 pub(crate) fn podman_backend(
-    resolved: &config::Resolved,
+    service: &config::ServiceConfig,
     kind: &str,
 ) -> Result<provider_host::SandboxBackend, String> {
-    let backend = resolved.sandbox.clone().ok_or(
+    let backend = service.sandbox.clone().ok_or(
         "no [sandbox] table in node.toml: this host has no configured way to isolate a run",
     )?;
     let provider_host::SandboxBackend::Podman { image, .. } = backend else {
@@ -83,9 +81,32 @@ pub(crate) fn podman_backend(
     Ok(provider_host::SandboxBackend::Podman {
         image,
         socket: provider_host::PodmanService::socket_path(
-            &podman_data_dir(resolved, kind),
+            &podman_data_dir(service, kind),
             kind,
         ),
+    })
+}
+
+/// Ask the NODE who it is.
+///
+/// A daemon needs its node's public identity (it names provider dirs, forge
+/// commit authorship and the service instance id), and the obvious place to
+/// read it — `identity.key` — is the node's PRIVATE key. So it is asked of the
+/// node instead: the process that holds the key is the one that answers for it,
+/// and the daemon reaches `/v1/status` over the same localhost surface it
+/// already signals on.
+///
+/// Loud on failure, matching the first-hello contract: a daemon that cannot
+/// learn which node it serves must not sit in a retry loop pretending to be
+/// configured.
+fn node_identity(base: &str) -> Result<[u8; 32], String> {
+    let status = crate::node_http::get_json(base, "/v1/status")
+        .map_err(|error| format!("could not read this node's identity: {error}"))?;
+    let published = status["public_key"].as_str().unwrap_or_default();
+    let raw = config::unhex(published).unwrap_or_default();
+    <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| {
+        "this node has not published a mesh identity yet — start it, then start the daemon"
+            .to_string()
     })
 }
 
@@ -647,7 +668,9 @@ impl WorkspaceArgs {
     /// grant.
     fn dir(&self) -> Result<PathBuf, String> {
         if let Some(file) = &self.config {
-            return Ok(config::resolve(file)?.workspace);
+            // the keyless read: every `service` verb — `run` included — answers
+            // "which workspace?" without ever opening the node's identity.
+            return Ok(config::resolve_service(file)?.workspace);
         }
         if let Some(dir) = &self.workspace {
             return Ok(dir.clone());
@@ -832,7 +855,16 @@ impl EnablePlan {
 }
 
 /// Decide what enabling `kind` would mean. Writes nothing.
-pub(crate) fn plan_enable(workspace: &Path, kind: &str) -> Result<EnablePlan, String> {
+///
+/// `node_id` is supplied by the caller ([`node_identity`]) rather than read out
+/// of `identity.key`: minting an instance id needs the node's PUBLIC key, and
+/// resolving it from the key file would put the node's private key in every
+/// process that offers a consent screen.
+pub(crate) fn plan_enable(
+    workspace: &Path,
+    kind: &str,
+    node_id: [u8; 32],
+) -> Result<EnablePlan, String> {
     if !kind_is_well_formed(kind) {
         return Err(format!(
             "{kind:?} is not a service kind (1..32 chars of [a-z0-9-])"
@@ -846,9 +878,7 @@ pub(crate) fn plan_enable(workspace: &Path, kind: &str) -> Result<EnablePlan, St
             existing.display_id()
         ));
     }
-    // the node's own key scopes the id, so the mint reads the workspace
-    // identity exactly the way every other node-scoped verb does.
-    let resolved = config::resolve(&workspace.join("node.toml"))?;
+    let service = config::resolve_service(&workspace.join("node.toml"))?;
     // the grant is minted FROM a reviewed hello, so there must BE one. A
     // grant invented for an absent daemon would record no offered tags and no
     // requested scopes — the consent screen would show nothing and the
@@ -864,9 +894,8 @@ pub(crate) fn plan_enable(workspace: &Path, kind: &str) -> Result<EnablePlan, St
         })?;
     Ok(EnablePlan {
         kind: kind.to_string(),
-        chain_id: resolved.chain_id,
-        node_id: <[u8; 32]>::try_from(resolved.signer.public_key().as_ref())
-            .map_err(|_| "node identity key is not 32 bytes".to_string())?,
+        chain_id: service.chain_id,
+        node_id,
         offered: Some(offered),
     })
 }
@@ -936,16 +965,22 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("{kind:?} is not a service kind (1..32 chars of [a-z0-9-])").into());
     }
     let workspace = args.workspace.dir()?;
-    let resolved = config::resolve(&args.workspace.config_file()?)?;
+    // THE daemon config path (`config::ServiceConfig`): everything below is
+    // derived without ever opening the node's `identity.key`, so this process
+    // cannot sign as the node — which is why `/v1/submit` re-signing is a
+    // boundary rather than a formality.
+    let service = config::resolve_service(&args.workspace.config_file()?)?;
     // the base comes from the SAME resolved config as everything else, rather
     // than a second read of a node.toml the workspace may not contain.
-    let base = resolved
+    let base = service
         .http_listen
         .as_deref()
         .map(config::http_base_of)
         .ok_or("this node serves no http surface, so a service daemon has nothing to signal to")?;
+    // which node this daemon serves — asked of the node, not read off its key.
+    let node_key = node_identity(&base)?;
 
-    let hello = discover_hello(&kind, &resolved)?;
+    let hello = discover_hello(&kind, &service, &node_key)?;
     // the FIRST hello must land: a daemon that cannot signal has nothing to
     // offer and must not sit in a retry loop pretending otherwise. A build
     // mismatch or a down node is a loud exit, not a silent spin.
@@ -954,11 +989,11 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         "{} {} · signaling to {} · offering {}\n",
         paint(GREEN, "●"),
         paint(BOLD, &kind),
-        resolved.chain_id,
+        service.chain_id,
         join_or_dash(&hello.capabilities),
     ))?;
 
-    offer_enable(&workspace, &kind, args.offer())?;
+    offer_enable(&workspace, &kind, args.offer(), node_key)?;
 
     // the heartbeat must outlive this call: for compute it runs BESIDE the
     // execution loop, so a long run never lets the node's catalog entry lapse
@@ -968,7 +1003,7 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .name("service-hello".into())
         .spawn(move || heartbeat(&beat_base, &hello))?;
 
-    match serve_kind(&kind, &workspace, resolved, &base)? {
+    match serve_kind(&kind, &workspace, service, &base, node_key)? {
         // nothing to execute (an ungranted kind, or a kind with no first-party
         // daemon): the signal IS the whole job, so park on it.
         Served::SignalOnly => loop {
@@ -991,8 +1026,9 @@ enum Served {
 fn serve_kind(
     kind: &str,
     workspace: &Path,
-    resolved: config::Resolved,
+    service: config::ServiceConfig,
     base: &str,
+    node_key: [u8; 32],
 ) -> Result<Served, Box<dyn std::error::Error>> {
     let Some(daemon) = daemon_for(kind) else {
         // every other kind is recorded, listed and signaled — and executes
@@ -1013,13 +1049,15 @@ fn serve_kind(
     match daemon {
         Daemon::Compute => crate::compute::serve(crate::compute::Compute {
             grant,
-            resolved,
+            service,
             http_base,
+            node_key,
         })?,
         Daemon::Agent => crate::agent::serve(crate::agent::Agent {
             grant,
-            resolved,
+            service,
             http_base,
+            node_key,
             workspace: workspace.to_path_buf(),
         })?,
     }
@@ -1060,9 +1098,10 @@ fn scopes_for(kind: &str) -> Vec<String> {
 /// the whole point of signaling before enabling.
 fn discover_hello(
     kind: &str,
-    resolved: &config::Resolved,
+    service: &config::ServiceConfig,
+    node_key: &[u8; 32],
 ) -> Result<noded::services::Hello, String> {
-    let backend = podman_backend(resolved, kind)?;
+    let backend = podman_backend(service, kind)?;
     // the same precondition the node's own boot enforces — a daemon must not
     // advertise tags it has no runnable sandbox for.
     backend.probe().map_err(|error| format!("sandbox: {error}"))?;
@@ -1072,8 +1111,8 @@ fn discover_hello(
     // one. The serving set is rediscovered under `<kind>#hex8` once a grant
     // exists.
     let providers = provider_host::discover(
-        resolved.signer.public_key().as_ref(),
-        provider_host::AgentDirs::under(&resolved.storage_dir),
+        node_key,
+        provider_host::AgentDirs::under(&service.storage_dir),
         None,
         backend,
         kind,
@@ -1104,6 +1143,7 @@ fn offer_enable(
     workspace: &Path,
     kind: &str,
     offer: EnableOffer,
+    node_id: [u8; 32],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if load(workspace)?.grant(kind).is_some() {
         // already granted: straight to serving, never a prompt.
@@ -1117,7 +1157,7 @@ fn offer_enable(
         // a unit file and a pipe have no one to ask; say it once and serve.
         EnableOffer::Never => return write_err(&hint),
         EnableOffer::AskIfTty if !crate::tty::stdin_is_tty() => return write_err(&hint),
-        EnableOffer::Always | EnableOffer::AskIfTty => plan_enable(workspace, kind)?,
+        EnableOffer::Always | EnableOffer::AskIfTty => plan_enable(workspace, kind, node_id)?,
     };
     let asked = matches!(offer, EnableOffer::AskIfTty);
     if asked {
@@ -1173,7 +1213,11 @@ fn heartbeat(base: &str, hello: &noded::services::Hello) -> ! {
 
 fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
     let workspace = args.workspace.dir()?;
-    let plan = plan_enable(&workspace, &args.kind)?;
+    // the consent screen names the node, so it asks the node — the same keyless
+    // route `service run` takes. `enable` already requires a live hello, so a
+    // reachable node is a precondition either way.
+    let node_id = node_identity(&config::http_base_in(&workspace)?)?;
+    let plan = plan_enable(&workspace, &args.kind, node_id)?;
 
     write_err(&render_enable_summary(&plan))?;
     let question = format!("Enable {} on this node?", plan.kind);
@@ -1262,6 +1306,73 @@ mod tests {
             capabilities: vec!["agent.codex".into()],
             scopes: vec![],
             needs: vec![],
+        }
+    }
+
+    /// every `.rs` on the daemon path: this file, plus both daemon modules.
+    fn daemon_path_sources() -> Vec<(String, String)> {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = vec![("services.rs".to_string(), src.join("services.rs"))];
+        for module in ["compute", "agent"] {
+            for entry in std::fs::read_dir(src.join(module)).expect("read daemon module dir") {
+                let path = entry.expect("dir entry").path();
+                let is_rust = path.extension().is_some_and(|ext| ext == "rs");
+                if !is_rust {
+                    continue;
+                }
+                files.push((format!("{module}/{}", path.file_name().unwrap().to_string_lossy()), path));
+            }
+        }
+        files
+            .into_iter()
+            .map(|(name, path)| {
+                let source = std::fs::read_to_string(&path).expect("read daemon source");
+                // the test module is not the daemon path — and this very lint
+                // lives in one, spelling out the tokens it forbids.
+                let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+                // strip line comments: this is a lint on CODE, and the doc
+                // comments deliberately NAME the thing they forbid.
+                let code = production
+                    .lines()
+                    .map(|line| line.split("//").next().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (name, code)
+            })
+            .collect()
+    }
+
+    /// A source-parsing lint, because the shape is load-bearing and a comment
+    /// would not hold it.
+    ///
+    /// `config::resolve` yields a [`config::Resolved`], whose `signer` field IS
+    /// the node's ed25519 PRIVATE key — so every `ducktape service run <kind>`
+    /// used to load, into the daemon's address space, the very key that makes
+    /// `/v1/submit` worth calling. A daemon holding it needs no node surface at
+    /// all: it can sign frames itself, which caps every authorization boundary
+    /// anyone draws on `/v1` later.
+    ///
+    /// The fix is `config::ServiceConfig` — a type with no field a secret can
+    /// live in, resolved by a function that never opens `identity.key`. This
+    /// test is what keeps it that way: name the node-side resolver, the key
+    /// loader or the signer field anywhere on the daemon path and the build
+    /// goes red.
+    #[test]
+    fn the_daemon_path_cannot_name_the_node_key() {
+        const BANNED: &[&str] = &[
+            "config::Resolved",
+            "config::resolve(",
+            "load_identity",
+            ".signer",
+        ];
+        for (name, code) in daemon_path_sources() {
+            for needle in BANNED {
+                assert!(
+                    !code.contains(needle),
+                    "{name} names `{needle}`: the daemon path must not be able to reach \
+                     the node's private key — resolve through `config::ServiceConfig`"
+                );
+            }
         }
     }
 

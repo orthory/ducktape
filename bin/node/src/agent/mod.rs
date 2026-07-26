@@ -44,18 +44,23 @@
 
 use std::sync::Arc;
 
-use commonware_cryptography::Signer as _;
-
 use crate::config;
 use crate::services::ServiceGrant;
 
 mod link;
 
 /// Everything the daemon needs, resolved before any of it runs.
+///
+/// `service` is [`config::ServiceConfig`], NOT `config::Resolved`: the latter
+/// carries the node's ed25519 private key, and the module doc above claims this
+/// daemon owns no keypair — a claim the TYPE now makes true. `node_key` is the
+/// node's PUBLIC identity, learned from the node over `/v1/status`; it names
+/// this host's execution id and signs nothing.
 pub(crate) struct Agent {
     pub(crate) grant: ServiceGrant,
-    pub(crate) resolved: config::Resolved,
+    pub(crate) service: config::ServiceConfig,
     pub(crate) http_base: String,
+    pub(crate) node_key: [u8; 32],
     /// where `node.toml` and the node's 0600 service-link token live.
     pub(crate) workspace: std::path::PathBuf,
 }
@@ -75,12 +80,13 @@ pub(crate) fn serve(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
 async fn run(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
     let Agent {
         grant,
-        resolved,
+        service,
         http_base,
+        node_key,
         workspace,
     } = agent;
-    let node_key = resolved.signer.public_key().as_ref().to_vec();
-    let backend = crate::services::podman_backend(&resolved, &grant.kind)?;
+    let node_key = node_key.to_vec();
+    let backend = crate::services::podman_backend(&service, &grant.kind)?;
 
     // this daemon's OWN podman service — its socket, storage root and egress
     // hook, under `<storage>/services/agent`. Fail-closed: a start failure ends
@@ -91,7 +97,7 @@ async fn run(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("cannot resolve this daemon's own executable: {error}"))?;
     let _podman = provider_host::PodmanService::start_for(
         &backend,
-        &crate::services::podman_data_dir(&resolved, &grant.kind),
+        &crate::services::podman_data_dir(&service, &grant.kind),
         &self_exe,
     )
     .await?;
@@ -99,7 +105,7 @@ async fn run(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
 
     let providers = agent_service::discover(
         &node_key,
-        provider_host::AgentDirs::under(&resolved.storage_dir),
+        provider_host::AgentDirs::under(&service.storage_dir),
         backend,
         &grant.display_id(),
     )?;
@@ -109,7 +115,7 @@ async fn run(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
     let sessions = Arc::new(agent_service::Sessions::new(
         providers,
         provider_host::execution_node_id(&node_key),
-        resolved.storage_dir.join("term-sessions"),
+        service.storage_dir.join("term-sessions"),
         events,
     ));
 
