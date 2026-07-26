@@ -499,18 +499,17 @@ async fn session(
     // get a grant, so an authority we could not REACH must never wear one: that
     // is a 503 naming the lender's node, which the borrower retries.
     if let Some(check) = &st.grant_check {
-        let denial = match grant_answer(check, &req).await {
-            GrantAnswer::Granted => None,
+        match grant_answer(check, &req).await {
+            GrantAnswer::Granted => {}
             GrantAnswer::Refused => {
-                Some(AppErr(StatusCode::FORBIDDEN, "credential_not_granted".into()))
+                return Err(AppErr(StatusCode::FORBIDDEN, "credential_not_granted".into()));
             }
-            GrantAnswer::Undetermined => Some(AppErr(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "grant_authority_unavailable".into(),
-            )),
-        };
-        if let Some(denial) = denial {
-            return Err(denial);
+            GrantAnswer::Undetermined => {
+                return Err(AppErr(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "grant_authority_unavailable".into(),
+                ));
+            }
         }
     }
     // Enclave side of the handshake: derive the shared key from the client's

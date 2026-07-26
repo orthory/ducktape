@@ -92,18 +92,46 @@ pub(crate) struct Airlock {
 /// Serve until the process is stopped.
 pub(crate) fn serve(airlock: Airlock) -> Result<(), Box<dyn std::error::Error>> {
     let Airlock { grant, service, http_base, workspace } = airlock;
+    serve_until(
+        grant.display_id(),
+        service.storage_dir,
+        http_base,
+        workspace,
+        std::future::pending(),
+    )
+}
+
+/// Build the runtime, ARM the stop signals inside it, and serve until either a
+/// signal or `also_stop` resolves. [`serve`] is this with the config unpacked
+/// and `also_stop` never resolving, so a test driving this holds the real
+/// arming-before-publication ordering instead of a replica of it — and a replica
+/// is what the previous guard was: hoisting the arming out of `block_on`, the
+/// production-only panic it exists to prevent, left that test green.
+fn serve_until(
+    instance: String,
+    storage: PathBuf,
+    http_base: String,
+    workspace: PathBuf,
+    also_stop: impl std::future::Future<Output = ()>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async move {
-        // ARMED before `run` publishes anything (and inside the runtime, which
-        // installing a signal handler requires). See [`arm_stop_requested`].
-        let stop = arm_stop_requested();
-        run(grant.display_id(), service.storage_dir, http_base, workspace, stop).await
+        // ARMED before `run` publishes anything, and inside the runtime, which
+        // installing a signal handler REQUIRES. See [`arm_stop_requested`].
+        let signalled = arm_stop_requested();
+        let stop = async move {
+            tokio::select! {
+                () = signalled => {}
+                () = also_stop => {}
+            }
+        };
+        run(instance, storage, http_base, workspace, stop).await
     })
 }
 
-/// Serve until `stop` resolves. Split from [`serve`] so the route's whole
-/// lifetime — register, beat, abort-then-JOIN, retire — is drivable by a test
-/// without a signal and without a resolved node config.
+/// Serve until `stop` resolves. Split from [`serve_until`] so the route's
+/// lifetime — published before the listener is served, retired once the daemon
+/// stops — is drivable without a resolved node config.
 async fn run(
     instance: String,
     storage: PathBuf,
@@ -117,6 +145,10 @@ async fn run(
     // publish even though no credential exists yet.
     let store = airlock_service::Store::open(&storage)?;
     let credentials = store.len();
+
+    // A daemon start is the natural cadence to reap temps a killed writer left
+    // in this workspace; no hot path pays for it.
+    crate::gateway_routes::sweep_stale_temporaries(&workspace);
 
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
@@ -171,6 +203,11 @@ async fn run(
     // JOIN before retiring, not just abort: cancellation only lands at the
     // task's next await, so a re-register already in flight has to finish
     // first — otherwise it restores the entry right after we removed it.
+    //
+    // UNTESTED, deliberately: observing it needs the beat to be mid-write when
+    // the stop lands, and HEARTBEAT is tens of seconds. The only way to see it
+    // is to inject a tiny interval, which is a test waiting on time — worse than
+    // no test. Deleting this line does not fail anything; keep it anyway.
     let _ = refresh.await;
     retire_route(&workspace, &route, port);
     served
@@ -225,18 +262,26 @@ fn beat_is_worth_a_line(beats: u64) -> bool {
 /// proxies to can never disagree with the port this process serves on for
 /// longer than one beat. Scoped to OUR port: a second daemon that took the route
 /// keeps it, and this one goes quiet instead of flapping the entry every beat.
+/// One counter PER CAUSE, each reset by the other: `attempts` has to mean
+/// "consecutive beats of THIS failure", or a run that alternates between a
+/// foreign owner and an unwritable workspace logs a total describing neither.
 async fn refresh_route(workspace: PathBuf, route: gateway::RouteName, port: u16) -> ! {
-    let mut beats_not_holding: u64 = 0;
+    let mut foreign_beats: u64 = 0;
+    let mut failed_beats: u64 = 0;
     loop {
         tokio::time::sleep(crate::services::HEARTBEAT).await;
         match crate::gateway_routes::reassert(&workspace, &route, port) {
-            Ok(RouteOwner::Vacant | RouteOwner::Ours) => beats_not_holding = 0,
+            Ok(RouteOwner::Vacant | RouteOwner::Ours) => {
+                foreign_beats = 0;
+                failed_beats = 0;
+            }
             Ok(RouteOwner::Foreign) => {
-                beats_not_holding += 1;
-                if beat_is_worth_a_line(beats_not_holding) {
+                failed_beats = 0;
+                foreign_beats += 1;
+                if beat_is_worth_a_line(foreign_beats) {
                     tracing::warn!(
                         target: "ducktape::gateway",
-                        attempts = beats_not_holding,
+                        attempts = foreign_beats,
                         reason = "route_owned_by_another_daemon",
                         "another airlock daemon owns this workspace's gateway route; \
                          this one serves nothing the node will reach"
@@ -244,11 +289,12 @@ async fn refresh_route(workspace: PathBuf, route: gateway::RouteName, port: u16)
                 }
             }
             Err(error) => {
-                beats_not_holding += 1;
-                if beat_is_worth_a_line(beats_not_holding) {
+                foreign_beats = 0;
+                failed_beats += 1;
+                if beat_is_worth_a_line(failed_beats) {
                     tracing::warn!(
                         target: "ducktape::gateway",
-                        attempts = beats_not_holding,
+                        attempts = failed_beats,
                         reason = "route_refresh_failed",
                         "airlock gateway route not re-registered: {error}"
                     );
@@ -456,23 +502,19 @@ mod tests {
         assert_eq!(lending_without_a_grant(&storage, &workspace), None);
     }
 
-    /// Arming installs a real signal handler, which PANICS outside a reactor
-    /// rather than erroring — so "inside the runtime, before the route is
-    /// published" is a constraint a refactor could silently break into a
-    /// production-only crash. This is the call site [`serve`] uses.
-    #[test]
-    fn stop_signals_arm_inside_the_daemon_runtime() {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-        runtime.block_on(async {
-            let _armed = arm_stop_requested();
-        });
-    }
-
     /// The registered port is a standing instruction to the node's reverse
     /// proxy, so its lifetime must be exactly the daemon's: published before the
-    /// listener serves, gone once the daemon stops. This drives the REAL run
-    /// loop — the select!, the beat task's abort-then-JOIN, and the retire —
-    /// with an injected stop in place of SIGTERM.
+    /// listener serves, gone once the daemon stops.
+    ///
+    /// It drives [`serve_until`], which is [`serve`] minus only the config
+    /// unpacking — so it holds the arming ordering too. Arming installs a real
+    /// signal handler, which PANICS outside a reactor rather than erroring; a
+    /// refactor hoisting it out of `block_on` is a production-only crash with no
+    /// compile-time complaint, and a hand-rolled replica of the call site (the
+    /// guard this replaces) stayed green through exactly that mutation.
+    ///
+    /// What it does NOT cover: the beat task's abort-then-join. See the comment
+    /// on that line for why it has no honest test seam.
     #[test]
     fn the_route_lives_exactly_as_long_as_the_daemon() {
         let dir = tempfile::tempdir().unwrap();
@@ -480,10 +522,10 @@ mod tests {
         let storage = dir.path().join("storage");
         let route = gateway::RouteName::named(AIRLOCK_ROUTE);
 
-        // The stop future's FIRST poll happens inside the select!, i.e. after
-        // the route is registered and the router is being served. That is the
-        // daemon's own "serving" event, so this observation waits on the system
-        // rather than on a clock.
+        // The stop future's FIRST poll happens inside `run`'s select!, i.e.
+        // after the route is registered and the router is being served. That is
+        // the daemon's own "serving" event, so this observation waits on the
+        // system rather than on a clock.
         let observed = Arc::new(std::sync::Mutex::new(None));
         let seen = observed.clone();
         let peek = (workspace.clone(), route.clone());
@@ -491,17 +533,15 @@ mod tests {
             *seen.lock().unwrap() = crate::gateway_routes::load(&peek.0).unwrap().port(&peek.1);
         };
 
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-        runtime
-            .block_on(run(
-                "airlock#test".into(),
-                storage,
-                // never dialed: no session is opened in this test.
-                "http://127.0.0.1:1".into(),
-                workspace.clone(),
-                stop,
-            ))
-            .expect("a stopped daemon exits cleanly");
+        serve_until(
+            "airlock#test".into(),
+            storage,
+            // never dialed: no session is opened in this test.
+            "http://127.0.0.1:1".into(),
+            workspace.clone(),
+            stop,
+        )
+        .expect("a stopped daemon exits cleanly");
 
         let served_on = observed
             .lock()

@@ -71,6 +71,38 @@ impl LocalRoutes {
             .ok()
             .map(|index| self.routes[index].port)
     }
+
+    /// Insert or replace `name -> port`, keeping the sorted-unique invariant
+    /// [`Self::validate`] enforces.
+    fn upsert(&mut self, name: gateway::RouteName, port: u16) {
+        match self.routes.binary_search_by(|route| route.name.cmp(&name)) {
+            Ok(index) => self.routes[index].port = port,
+            Err(index) => self.routes.insert(index, LocalRoute { name, port }),
+        }
+    }
+
+    /// Drop `name` if it is present; absent is not an error.
+    fn drop_route(&mut self, name: &gateway::RouteName) {
+        let Ok(index) = self.routes.binary_search_by(|route| route.name.cmp(name)) else {
+            return;
+        };
+        self.routes.remove(index);
+    }
+
+    /// Who holds `name` in THIS snapshot, from the point of view of the daemon
+    /// serving `port`. Takes a loaded snapshot rather than a workspace on
+    /// purpose: an ownership check that re-reads the file before acting on its
+    /// own answer is decoration (see [`retire`]).
+    fn owner(&self, name: &gateway::RouteName, port: u16) -> RouteOwner {
+        let Some(registered) = self.port(name) else {
+            return RouteOwner::Vacant;
+        };
+        let is_ours = registered == port;
+        if is_ours {
+            return RouteOwner::Ours;
+        }
+        RouteOwner::Foreign
+    }
 }
 
 pub fn load(workspace: &Path) -> Result<LocalRoutes, String> {
@@ -92,18 +124,24 @@ pub fn load(workspace: &Path) -> Result<LocalRoutes, String> {
     Ok(routes)
 }
 
+fn temporary_path(workspace: &Path) -> PathBuf {
+    workspace.join(format!(".{FILE_NAME}.{}.tmp", std::process::id()))
+}
+
 fn save(workspace: &Path, routes: &LocalRoutes) -> Result<(), String> {
     routes.validate()?;
     std::fs::create_dir_all(workspace).map_err(|error| format!("create {workspace:?}: {error}"))?;
     let path = workspace.join(FILE_NAME);
-    // Per-process temp name. This file is now read-modify-written on a service
-    // daemon's 10 s heartbeat, so a FIXED name lets that beat and an operator's
+    // Per-process temp name. This file is read-modify-written on a service
+    // daemon's heartbeat, so a FIXED name lets that beat and an operator's
     // `gateway bind` interleave until one rename publishes the other's bytes.
+    // The leftovers a crash leaves behind are reaped by
+    // [`sweep_stale_temporaries`], which is what the fixed name gave for free.
     //
     // ponytail: the read-modify-write itself is still last-writer-wins across
     // processes — a lost update, not a torn file. Take a lock only if a second
     // route-writing daemon ever appears.
-    let temporary = workspace.join(format!(".{FILE_NAME}.{}.tmp", std::process::id()));
+    let temporary = temporary_path(workspace);
     if routes.routes.is_empty() {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -201,18 +239,9 @@ pub(super) fn run(cmd: GatewayCmd) -> Result<(), Box<dyn std::error::Error>> {
 fn bind(args: BindArgs) -> Result<(), Box<dyn std::error::Error>> {
     let workspace = args.route.workspace.dir()?;
     let name = args.route.name()?;
-    let port = args.port.get();
-    let mut routes = load(&workspace)?;
-    match routes
-        .routes
-        .binary_search_by(|route| route.name.cmp(&name))
-    {
-        Ok(index) => routes.routes[index].port = port,
-        Err(index) => routes
-            .routes
-            .insert(index, LocalRoute { name: name.clone(), port }),
-    }
-    save(&workspace, &routes)?;
+    // the verb IS `register` plus a printed key — its own copy of the
+    // load/upsert/save was a duplicate waiting to diverge from the daemon path.
+    register(&workspace, name.clone(), args.port.get())?;
     println!("{}", name.local_key());
     Ok(())
 }
@@ -230,11 +259,36 @@ pub fn register(
     }
     name.validate()?;
     let mut routes = load(workspace)?;
-    match routes.routes.binary_search_by(|route| route.name.cmp(&name)) {
-        Ok(index) => routes.routes[index].port = port,
-        Err(index) => routes.routes.insert(index, LocalRoute { name, port }),
-    }
+    routes.upsert(name, port);
     save(workspace, &routes)
+}
+
+/// Reap `save`'s leftovers: a writer killed between its `write` and its `rename`
+/// leaves its temp behind, and a per-process temp name means nothing overwrites
+/// it (the old fixed name self-healed on the next write — that is the one thing
+/// it was good for). One `read_dir` where a daemon starts restores that, at a
+/// cadence no hot path pays for.
+///
+/// ponytail: a temp belonging to a LIVE writer mid-`save` is removed too, whose
+/// rename then fails loudly and whose caller retries — a failed command, never a
+/// corrupt file. Checking liveness would need `/proc`, which is not portable to
+/// the macOS boxes this runs on.
+pub fn sweep_stale_temporaries(workspace: &Path) {
+    let Ok(entries) = std::fs::read_dir(workspace) else {
+        return;
+    };
+    let ours = temporary_path(workspace);
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let is_a_temp = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&format!(".{FILE_NAME}.")) && name.ends_with(".tmp"));
+        if !is_a_temp || path == ours {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// Who holds a route right now, from the point of view of the daemon serving
@@ -256,17 +310,6 @@ pub enum RouteOwner {
     Foreign,
 }
 
-fn owner_of(workspace: &Path, name: &gateway::RouteName, port: u16) -> Result<RouteOwner, String> {
-    let Some(registered) = load(workspace)?.port(name) else {
-        return Ok(RouteOwner::Vacant);
-    };
-    let is_ours = registered == port;
-    if is_ours {
-        return Ok(RouteOwner::Ours);
-    }
-    Ok(RouteOwner::Foreign)
-}
-
 /// Re-assert `name -> port` on a daemon's heartbeat, so the port the node
 /// proxies to cannot disagree with the port this process serves on for longer
 /// than one beat. Returns what the file said BEFORE: only `Vacant` writes — an
@@ -280,9 +323,14 @@ pub fn reassert(
     name: &gateway::RouteName,
     port: u16,
 ) -> Result<RouteOwner, String> {
-    let owner = owner_of(workspace, name, port)?;
+    // ONE load, and the write comes out of that same snapshot — see [`retire`].
+    let mut routes = load(workspace)?;
+    let owner = routes.owner(name, port);
     match owner {
-        RouteOwner::Vacant => register(workspace, name.clone(), port)?,
+        RouteOwner::Vacant => {
+            routes.upsert(name.clone(), port);
+            save(workspace, &routes)?;
+        }
         RouteOwner::Ours => {}
         RouteOwner::Foreign => {}
     }
@@ -294,26 +342,33 @@ pub fn reassert(
 /// as it was BEFORE the removal: only `Ours` is removed. A route that is already
 /// absent is success (the operator may have unbound it by hand), and a `Foreign`
 /// one is LEFT ALONE — deleting it would 404 a live daemon's ingress.
+///
+/// The ownership check and the removal act on ONE loaded snapshot. Re-reading
+/// the file to perform the delete would make the check decoration: a second
+/// daemon registering between the two reads meant we deleted ITS live entry by
+/// name, which is exactly the failure [`RouteOwner`] exists to close.
+///
+/// ponytail: this narrows the window to the load->save any writer of this file
+/// already has, and does NOT eliminate it — two writers can still lose one
+/// update, because a plain read-modify-write cannot be made atomic without a
+/// lock. Take an advisory lock here if a second route-writing daemon ever
+/// appears; today the only concurrent writer is an operator typing
+/// `ducktape gateway bind`.
 pub fn retire(
     workspace: &Path,
     name: &gateway::RouteName,
     port: u16,
 ) -> Result<RouteOwner, String> {
-    let owner = owner_of(workspace, name, port)?;
+    let mut routes = load(workspace)?;
+    let owner = routes.owner(name, port);
     match owner {
         RouteOwner::Vacant | RouteOwner::Foreign => {}
-        RouteOwner::Ours => remove(workspace, name)?,
+        RouteOwner::Ours => {
+            routes.drop_route(name);
+            save(workspace, &routes)?;
+        }
     }
     Ok(owner)
-}
-
-fn remove(workspace: &Path, name: &gateway::RouteName) -> Result<(), String> {
-    let mut routes = load(workspace)?;
-    let Ok(index) = routes.routes.binary_search_by(|route| route.name.cmp(name)) else {
-        return Ok(());
-    };
-    routes.routes.remove(index);
-    save(workspace, &routes)
 }
 
 fn unbind(args: RouteArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -427,6 +482,80 @@ mod tests {
         // a hand `gateway unbind` is corrected on the next beat.
         assert_eq!(reassert(dir.path(), &name, 4200).unwrap(), RouteOwner::Vacant);
         assert_eq!(load(dir.path()).unwrap().port(&name), Some(4200));
+    }
+
+    /// The ownership check must act on the SAME bytes it read. `retire` used to
+    /// re-load and delete by NAME, so a second daemon registering between the
+    /// two reads had its live entry deleted anyway — the check narrowed the
+    /// failure to a microsecond instead of closing it. This pins the property at
+    /// the only layer that can hold it: given a snapshot, ownership and the edit
+    /// it authorizes come from that one snapshot.
+    #[test]
+    fn ownership_and_the_edit_it_authorizes_read_one_snapshot() {
+        let name = gateway::RouteName::named("airlock");
+        let mut routes = LocalRoutes::default();
+        routes.upsert(name.clone(), 4100);
+
+        assert_eq!(routes.owner(&name, 4100), RouteOwner::Ours);
+        assert_eq!(routes.owner(&name, 4200), RouteOwner::Foreign);
+        assert_eq!(routes.owner(&gateway::RouteName::apex(), 4100), RouteOwner::Vacant);
+
+        // the survivor's entry is what a foreign retire must not touch, and the
+        // snapshot is the only thing that can say whose it is.
+        routes.upsert(name.clone(), 4200);
+        assert_eq!(routes.owner(&name, 4100), RouteOwner::Foreign);
+        routes.drop_route(&name);
+        assert_eq!(routes.owner(&name, 4200), RouteOwner::Vacant);
+        routes.validate().expect("upsert/drop keep the sorted-unique invariant");
+    }
+
+    /// The TOCTOU is invisible to a value test — reading the file twice is only
+    /// wrong under a concurrent writer, and there is no seam to inject one. The
+    /// SHAPE is what holds it, so the shape is what gets guarded.
+    #[test]
+    fn a_port_scoped_write_loads_the_route_file_exactly_once() {
+        let source = include_str!("gateway_routes.rs");
+        for signature in ["pub fn reassert(", "pub fn retire("] {
+            let body = source
+                .split_once(signature)
+                .expect("the function exists")
+                .1
+                .split_once("\n}\n")
+                .expect("the function ends")
+                .0;
+            assert_eq!(
+                body.matches("load(workspace)").count(),
+                1,
+                "{signature} must read the file ONCE — a second read is the TOCTOU \
+                 RouteOwner exists to close: the entry it deletes may no longer be the \
+                 one it checked"
+            );
+        }
+    }
+
+    /// A writer killed between its `write` and its `rename` leaves a temp that
+    /// nothing overwrites, because the name carries its pid. The fixed name
+    /// self-healed; this restores that without giving back the clobber it cost.
+    #[test]
+    fn a_killed_writers_temp_is_reaped_and_the_route_file_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        register(dir.path(), gateway::RouteName::named("airlock"), 4100).unwrap();
+        let orphan = dir.path().join(format!(".{FILE_NAME}.999999.tmp"));
+        std::fs::write(&orphan, b"a dead writer's leftovers").unwrap();
+        // our own in-flight temp must survive a sweep we ourselves run.
+        let ours = temporary_path(dir.path());
+        std::fs::write(&ours, b"in flight").unwrap();
+
+        sweep_stale_temporaries(dir.path());
+
+        assert!(!orphan.exists(), "another process's leftover temp is reaped");
+        assert!(ours.exists(), "our own in-flight temp is not");
+        assert_eq!(
+            load(dir.path()).unwrap().port(&gateway::RouteName::named("airlock")),
+            Some(4100),
+            "the sweep must never touch the route file itself"
+        );
+        std::fs::remove_file(&ours).unwrap();
     }
 
     #[test]
