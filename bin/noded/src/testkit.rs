@@ -48,7 +48,21 @@ impl InProcDaemon {
         build_host: impl FnOnce() -> Host + Send + 'static,
         status_modules: Vec<String>,
     ) -> Self {
-        let port = nettest::free_port();
+        // Bind FIRST, and hand the bound socket to the server thread.
+        //
+        // The harness used to reserve a port with `nettest::free_port()`, drop
+        // the probe, and bind minutes of genesis later — the classic gap. Worse,
+        // the bind then lived on the server thread where its `.expect` panicked
+        // into nothing, so the readiness loop below could not tell "my listener
+        // died" from "not up yet" and would happily settle for a STRANGER's 200
+        // on that port. Binding here closes both: there is no gap to lose the
+        // port in, a failure to bind panics in the caller's own thread, and the
+        // port we report is by construction the one WE hold.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind harness listener");
+        let port = listener.local_addr().expect("harness listen addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("harness listener is nonblocking for tokio");
         let (handle, cmd_rx, _events) = NodeHandle::channel();
         let status = handle.status_cell();
         // the testkit has no mesh and no registry: an empty exposition
@@ -85,9 +99,8 @@ impl InProcDaemon {
                     .build()
                     .expect("server runtime");
                 rt.block_on(async move {
-                    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                        .await
-                        .expect("bind harness listener");
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .expect("adopt the pre-bound harness listener");
                     let _ = crate::serve(listener, handle).await;
                 });
             })
@@ -113,6 +126,13 @@ impl InProcDaemon {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// Block until the server thread's runtime is actually accepting.
+    ///
+    /// The LISTENER is already bound before this runs (see [`Self::start`]), so
+    /// this can no longer adopt a stranger: any answer on this port comes from
+    /// the socket this harness owns. What it still waits for is the runtime
+    /// spinning up behind it — a connect lands in the backlog immediately, but
+    /// the response does not come back until `serve` is polling.
     fn await_ready(&self) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {

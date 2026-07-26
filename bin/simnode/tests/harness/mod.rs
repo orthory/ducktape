@@ -50,14 +50,24 @@ impl Sim {
         sim
     }
 
+    /// Block until this sim answers `/v1/status`.
+    ///
+    /// Liveness FIRST, and the order is the whole point: a child that lost its
+    /// listen port exits, and something else is then answering on that number.
+    /// Probing first would read the WINNER's 200 as this child's readiness, and
+    /// the test would drive a stranger's sim for its entire run — visible only
+    /// as an unrelated flake. Asking "is my child alive?" before "did someone
+    /// answer?" turns that into a named startup failure. (The same reorder
+    /// landed in `bin/noded/tests/daemon_e2e.rs`; this harness was the copy left
+    /// behind.)
     fn await_status(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if let Ok((200, _)) = try_request(self.port, "GET", "/v1/status", None) {
-                return;
-            }
             if let Some(status) = self.child.try_wait().expect("poll sim") {
                 panic!("sim exited during startup ({status}) — see stderr above");
+            }
+            if let Ok((200, _)) = try_request(self.port, "GET", "/v1/status", None) {
+                return;
             }
             assert!(
                 Instant::now() < deadline,

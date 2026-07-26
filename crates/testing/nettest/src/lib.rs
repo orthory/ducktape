@@ -16,7 +16,7 @@
 //! copies are what this crate exists to kill.
 
 use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -161,22 +161,31 @@ static HANDED_OUT: std::sync::Mutex<std::collections::BTreeSet<u16>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// `n` free localhost ports, distinct from each other AND from every port this
-/// process handed out earlier.
+/// process handed out earlier, and free on BOTH tcp and udp.
 ///
-/// Two guards, for two different collisions. Holding all `n` listeners at once
+/// Two guards, for two different collisions. Holding all `n` probes at once
 /// stops one call from returning the same port twice. [`HANDED_OUT`] stops it
 /// across calls — the case that actually bites, because the window is as long
 /// as the caller takes to bind, not as long as this function runs.
 ///
-/// A port that loses the [`HANDED_OUT`] check is dropped IMMEDIATELY rather
-/// than held aside during the retry: its owner may be about to bind it for
-/// real, and squatting on it while we look for another would break the very
-/// daemon we are trying not to collide with.
+/// Both protocols, because a caller cannot be asked to pick the right allocator
+/// and the number space is shared regardless of which one it binds: a harness
+/// that reserved a port here and then handed it to `--wireguard-listen` (udp)
+/// would otherwise be holding a reservation on the wrong protocol, and the
+/// harnesses that noticed rolled their OWN `UdpSocket::bind(":0")` probe-drop —
+/// which reserves nothing at all in [`HANDED_OUT`], so this function could hand
+/// the very same number out again seven lines later. One allocator, one number
+/// space, no call-site decision.
+///
+/// A port that loses either check is dropped IMMEDIATELY rather than held aside
+/// during the retry: its owner may be about to bind it for real, and squatting
+/// on it while we look for another would break the very daemon we are trying
+/// not to collide with.
 pub fn alloc_ports(n: usize) -> Vec<u16> {
     // one allocation at a time: two threads probing concurrently would each
     // check `HANDED_OUT` before the other inserted, and hand out the same port.
     let mut handed = HANDED_OUT.lock().unwrap_or_else(|e| e.into_inner());
-    let mut keep: Vec<TcpListener> = Vec::with_capacity(n);
+    let mut keep: Vec<(u16, TcpListener, UdpSocket)> = Vec::with_capacity(n);
     // the ephemeral range is tens of thousands wide and cycles, so a repeat is
     // rare and a second probe effectively always advances; the cap turns an
     // exhausted range into a named failure instead of a hang.
@@ -186,8 +195,15 @@ pub fn alloc_ports(n: usize) -> Vec<u16> {
         }
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind port-0 probe");
         let port = listener.local_addr().expect("probe addr").port();
+        // the udp half may legitimately be taken by an unrelated process while
+        // tcp is free — that is a port this allocator must not hand out, not an
+        // error. mark it used so a later call does not re-probe it either.
+        let Ok(datagram) = UdpSocket::bind(("127.0.0.1", port)) else {
+            handed.insert(port);
+            continue;
+        };
         if handed.insert(port) {
-            keep.push(listener);
+            keep.push((port, listener, datagram));
         }
     }
     assert_eq!(
@@ -195,9 +211,56 @@ pub fn alloc_ports(n: usize) -> Vec<u16> {
         n,
         "could not find {n} localhost ports this process has not already used"
     );
-    keep.iter()
-        .map(|l| l.local_addr().expect("probe addr").port())
-        .collect()
+    keep.iter().map(|(port, _, _)| *port).collect()
+}
+
+/// Set to `1` on a host that is SUPPOSED to have the tooling every suite here
+/// probes for, and a skip becomes a failure.
+///
+/// A skip is the honest answer for a laptop without podman (or git, or a
+/// sandbox's `pasta`), but `ok. 5 passed ... finished in 0.00s` is
+/// indistinguishable from a real green run in CI output — which is how five
+/// forge-over-http tests, a whole compute plane, and a claim lane each spent
+/// weeks proving nothing. So the decision is the operator's, through ONE switch
+/// rather than one per capability: unset, an under-provisioned host skips
+/// loudly; set, it fails.
+pub const REQUIRE_TOOLS_ENV: &str = "DUCKTAPE_REQUIRE_TOOLS";
+
+/// `Some(())` = `test` cannot run on this host and the caller must return;
+/// `None` = run it. `why` is `Some(reason)` exactly when the capability is
+/// missing — the shape every probe already returns.
+///
+/// Panics instead of skipping under [`REQUIRE_TOOLS_ENV`].
+pub fn skip_without(test: &str, why: Option<String>) -> Option<()> {
+    let host_declared_capable =
+        std::env::var_os(REQUIRE_TOOLS_ENV).is_some_and(|require| require == "1");
+    decide_skip(test, host_declared_capable, why)
+}
+
+/// The decision [`skip_without`] makes, with the environment read out of it —
+/// so the escalation can be tested without `set_var`, which is process-global
+/// and would leak into every other test running on a sibling libtest thread.
+fn decide_skip(test: &str, host_declared_capable: bool, why: Option<String>) -> Option<()> {
+    let why = why?;
+    assert!(
+        !host_declared_capable,
+        "{REQUIRE_TOOLS_ENV}=1 but this host cannot run {test}: {why}"
+    );
+    // stderr, not the harness's own channel: libtest swallows a passing test's
+    // stdout, so a skip has to be visible beside the `passed` that covered
+    // nothing.
+    eprintln!("SKIP {test}: {why} (set {REQUIRE_TOOLS_ENV}=1 to make this a failure)");
+    Some(())
+}
+
+/// `Some(reason)` when `bin` is not runnable here — the probe shape
+/// [`skip_without`] takes, for a capability that is just "a tool on PATH".
+pub fn missing_tool(bin: &str) -> Option<String> {
+    let runs = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    (!runs).then(|| format!("{bin} is not runnable on PATH"))
 }
 
 /// poll `probe` every 300ms until it returns `Some`, or panic with `what` past
@@ -261,5 +324,52 @@ mod tests {
         deduped.sort_unstable();
         deduped.dedup();
         assert_eq!(deduped.len(), ports.len(), "alloc_ports handed back a duplicate");
+    }
+
+    /// A reserved port must be free on BOTH protocols: harnesses hand these
+    /// numbers to `--wireguard-listen` (udp) as readily as to `--listen` (tcp),
+    /// and a tcp-only probe reserves the wrong half of the number space.
+    #[test]
+    fn alloc_ports_are_free_on_udp_too() {
+        for port in alloc_ports(4) {
+            UdpSocket::bind(("127.0.0.1", port))
+                .unwrap_or_else(|e| panic!("alloc_ports handed out udp-busy port {port}: {e}"));
+        }
+    }
+
+    /// No port is EVER handed out twice in one process, however many calls —
+    /// the cross-call collision that made one harness drive another's daemon.
+    #[test]
+    fn alloc_ports_never_repeats_across_calls() {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..16 {
+            for port in alloc_ports(2) {
+                assert!(seen.insert(port), "alloc_ports re-handed port {port}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_present_capability_runs_the_test() {
+        assert_eq!(decide_skip("a_test", false, None), None);
+        assert_eq!(decide_skip("a_test", true, None), None);
+    }
+
+    #[test]
+    fn a_missing_capability_skips_an_undeclared_host() {
+        assert_eq!(decide_skip("a_test", false, Some("no widget".into())), Some(()));
+    }
+
+    /// the whole point: a declared-capable host turns the skip into a failure.
+    #[test]
+    #[should_panic(expected = "cannot run a_test: no widget")]
+    fn a_missing_capability_fails_a_declared_host() {
+        decide_skip("a_test", true, Some("no widget".into()));
+    }
+
+    #[test]
+    fn missing_tool_finds_a_real_one_and_names_a_fake_one() {
+        assert_eq!(missing_tool("cargo"), None);
+        assert!(missing_tool("ducktape-no-such-tool").is_some());
     }
 }
