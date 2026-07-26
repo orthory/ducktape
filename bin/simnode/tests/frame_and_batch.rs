@@ -298,23 +298,15 @@ fn a_rejected_batch_member_is_isolated_and_the_rest_commit() {
     assert_eq!(reply["height"], 1, "the batch is a single block: {reply}");
     assert_eq!(sim.status()["height"], 1);
 
-    // member 2 left NO trace: exactly alpha + beta committed (alpha once).
-    let channels = sim.query("chat", serde_json::json!("channels"));
-    let ids: Vec<&str> = channels["channels"]
-        .as_array()
-        .expect("channels array")
-        .iter()
-        .map(|c| c["id"].as_str().expect("channel id"))
-        .collect();
+    // member 2 left NO trace. the point read says this more sharply than the
+    // old count did: alpha's committed record still carries member 1's name, so
+    // the rejected duplicate neither added a channel NOR overwrote one.
+    let alpha = sim.channel("alpha").expect("member 1's alpha committed");
     assert_eq!(
-        ids.len(),
-        2,
-        "member 2's duplicate left no trace: {channels}"
+        alpha["name"], "Alpha",
+        "member 2's 'Alpha again' left no trace on alpha: {alpha}"
     );
-    assert!(
-        ids.contains(&"alpha") && ids.contains(&"beta"),
-        "{channels}"
-    );
+    assert!(sim.channel("beta").is_some(), "member 3's beta committed");
 }
 
 /// DETERMINISM: the same N ops as ONE batch block vs as N single blocks reach an
@@ -621,17 +613,17 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
             "kv value for {k:?} converges"
         );
     }
-    assert_eq!(
-        sim_a.query(
-            "pages",
-            serde_json::json!({ "list_pages": { "after": null, "limit": 0 } }),
-        )["page_list"]["pages"],
-        sim_b.query(
-            "pages",
-            serde_json::json!({ "list_pages": { "after": null, "limit": 0 } }),
-        )["page_list"]["pages"],
-        "the page list converges"
-    );
+    // pages answers point reads only since the read-model cutover (ListPages
+    // moved to the index guest), so convergence is asserted per page the script
+    // created — which names them instead of trusting a list's ordering.
+    for page_id in ["p1", "p2"] {
+        let query = serde_json::json!({ "get_page": { "page_id": page_id, "after": null, "limit": 0 } });
+        assert_eq!(
+            sim_a.query("pages", query.clone()),
+            sim_b.query("pages", query),
+            "page {page_id} converges"
+        );
+    }
 
     // the timestamp-stamping modules converge once the block-dependent stamp is
     // stripped: the SAME entities exist in both runs, only their created_at differs.
@@ -647,15 +639,9 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
         tasks_a, tasks_b,
         "the same tasks exist in both runs (only the stamped time differs)"
     );
-    let inbox_query =
-        serde_json::json!({ "list": { "member": "eddy", "from_seq": 0, "limit": 100 } });
-    let inbox_a = strip(
-        &sim_a.query("inbox", inbox_query.clone())["items"],
-        &["created_at"],
-    );
-    let inbox_b = strip(&sim_b.query("inbox", inbox_query)["items"], &["created_at"]);
-    assert_eq!(
-        inbox_a, inbox_b,
-        "the same inbox items exist in both runs (only the stamped time differs)"
-    );
+    // inbox is deliberately absent from this logical sweep: the read-model
+    // cutover made it WRITE-ONLY in canonical state (its member feeds and
+    // unread counters live in the index guest), so there is no canonical value
+    // to converge. its contribution to this test is the root assertion above —
+    // that it stamps consensus_time — which is the property this file owns.
 }

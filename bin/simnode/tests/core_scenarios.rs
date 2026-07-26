@@ -195,65 +195,23 @@ fn a_hook_event_cannot_be_spoofed_from_outside_chat() {
     );
 }
 
-// ── inbox: the seq discipline ───────────────────────────
-
-#[test]
-fn inbox_seqs_never_rewind_and_maintenance_is_idempotent() {
-    let storage = tempfile::tempdir().expect("storage dir");
-    let sim = Sim::spawn(storage.path(), &["--auto"]);
-    let deliver = |body: &str| serde_json::json!({ "deliver": { "member": "eddy", "kind": "note", "body": body } });
-    let list = serde_json::json!({ "list": { "member": "eddy", "from_seq": 0, "limit": 10 } });
-    let unread = serde_json::json!({ "unread": { "member": "eddy" } });
-
-    sim.submit_ok("inbox", deliver("one"), Some("courier"));
-    sim.submit_ok("inbox", deliver("two"), Some("courier"));
-    let items = sim.query("inbox", list.clone());
-    let seqs: Vec<u64> = items["items"]
-        .as_array()
-        .expect("items array")
-        .iter()
-        .map(|n| n["seq"].as_u64().expect("seq"))
-        .collect();
-    assert_eq!(seqs, vec![1, 2], "items: {items}");
-    assert_eq!(sim.query("inbox", unread.clone())["unread_count"], 2);
-
-    // mark-read is a watermark, and over-marking is a deterministic no-op —
-    // never an error (an unknown member too).
-    sim.submit_ok(
-        "inbox",
-        serde_json::json!({ "mark_read": { "member": "eddy", "up_to_seq": 1 } }),
-        Some("eddy"),
-    );
-    assert_eq!(sim.query("inbox", unread.clone())["unread_count"], 1);
-    sim.submit_ok(
-        "inbox",
-        serde_json::json!({ "mark_read": { "member": "eddy", "up_to_seq": 999 } }),
-        Some("eddy"),
-    );
-    assert_eq!(sim.query("inbox", unread.clone())["unread_count"], 0);
-    sim.submit_ok(
-        "inbox",
-        serde_json::json!({ "mark_read": { "member": "nobody", "up_to_seq": 7 } }),
-        Some("eddy"),
-    );
-
-    // clearing deletes the items but NEVER rewinds next_seq: the next
-    // delivery continues the sequence, so a consumer's watermark stays valid.
-    sim.submit_ok(
-        "inbox",
-        serde_json::json!({ "clear": { "member": "eddy", "up_to_seq": 2 } }),
-        Some("eddy"),
-    );
-    assert_eq!(
-        sim.query("inbox", list.clone())["items"]
-            .as_array()
-            .map(Vec::len),
-        Some(0)
-    );
-    sim.submit_ok("inbox", deliver("three"), Some("courier"));
-    let items = sim.query("inbox", list);
-    assert_eq!(items["items"][0]["seq"], 3, "seq rewound: {items}");
-}
+// ── inbox: no scenario, and that is the current contract ─
+//
+// `inbox_seqs_never_rewind_and_maintenance_is_idempotent` lived here until the
+// read-model cutover made inbox WRITE-ONLY in canonical state: its member feeds
+// and unread counters moved into the index guest, so `/v1/query` answers
+// `QueryUnsupported` and the scenario had no surface left to read. It is gone
+// rather than re-pointed at the index tier, because folding through a derived
+// view would have tested the GUEST's mirroring, not the module's seq discipline.
+//
+// Nothing is uncovered. `crates/modules/apps/inbox/tests/inbox_module.rs` owns
+// every property it asserted and reads canonical state directly, so it can also
+// see `next_seq` — which this scenario could only ever infer:
+// `deliver_assigns_per_member_sequence` (per-member seqs) and
+// `mark_read_and_clear_are_idempotent_and_noop_tolerant` (watermark acks,
+// over-ack and unknown-member no-ops, and clear NOT rewinding next_seq).
+// `crates/kernel/host/tests/wasm_inbox_parity.rs` carries the same to the wasm
+// tenant. inbox writes still ride the sim e2e in `frame_and_batch.rs`.
 
 // ── identity → duckdns: origin-derived account authority ─
 

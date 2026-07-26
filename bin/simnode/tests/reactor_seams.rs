@@ -543,13 +543,17 @@ fn a_restart_on_the_same_storage_resumes_height_and_state() {
         "committed module state survived the restart (root-hash byte-identical)"
     );
 
-    // the persisted channels are served from the reloaded qmdb.
-    let channels = sim.query("chat", json!("channels"));
-    assert_eq!(
-        channels["channels"].as_array().map(Vec::len),
-        Some(2),
-        "the qmdb-backed channels reloaded from disk: {channels}"
-    );
+    // the persisted channels are served from the reloaded qmdb — both of them,
+    // by name, so a half-reload cannot pass as a count.
+    for (id, name) in [("room", "Room"), ("den", "Den")] {
+        let channel = sim
+            .channel(id)
+            .unwrap_or_else(|| panic!("{id} reloaded from the qmdb-backed store"));
+        assert_eq!(
+            channel["name"], name,
+            "{id} reloaded with its record intact"
+        );
+    }
 
     // a NEW commit continues the chain at watermark+1 with a changed root-hash.
     let receipt = sim.submit_ok("chat", create_channel("hall", "Hall"), Some("owner"));
