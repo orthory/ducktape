@@ -15,23 +15,32 @@ Promoted from a PoC into real workspace crates. Design:
   handshake core (`attest`, `seal`, `handshake`, `token`, `wire`, `aead`), plus
   the async client (`client::Gateway`) behind the `client` feature. Off-consensus;
   uses RustCrypto primitives directly like `reachability`.
-- **`airlock-gateway`** (`bin/`) — the credential side (the TEE). Runs
-  canonically inside an Intel TDX / AMD SEV-SNP confidential VM. Holds a sealed
-  refresh token in enclave memory, attests, proxies `/v1/*`, issues scoped
-  session tokens.
-- **`airlock-broker`** (`bin/`) — the Computation Provider's local api-snatch.
-  Verifies the gateway quote, handshakes once, and exposes a loopback
+- **`airlock-service`** (`crates/services/airlock`) — the LENDER half without a
+  TEE: the disk-backed credential store a node co-hosts (`user cred add` writes
+  it) plus the gateway router that serves it. Run as
+  `ducktape service run airlock`, a standalone daemon beside the node. Its trust
+  anchor is the seal PUBLIC key on consensus, which the borrower pins — no quote.
+- **`airlock-gateway`** (`bin/`) — the ENCLAVE lender, and nothing else. Runs
+  inside an Intel TDX / AMD SEV-SNP confidential VM. Holds a sealed refresh token
+  in enclave memory, attests, proxies `/v1/*`, issues scoped session tokens. It
+  stays a separate, minimal binary because the measurement covers every byte in
+  it: folding `ducktape` in would churn the pinned measurement on every unrelated
+  release.
+- **`broker-host`** (`crates/services/broker`) — the Computation Provider's local
+  api-snatch. Verifies the gateway quote, handshakes once, and exposes a loopback
   `ANTHROPIC_BASE_URL` for an unmodified sandbox (the real `claude` CLI). The
   sandbox holds only an opaque per-run bearer.
-- **`airlock-cli`** (`bin/`) — client roles: `seal` (Credential Provider),
-  `inspect` (pin the measurement), `run` (self-test).
+- **`ducktape user cred`** (`bin/node`) — the operator verbs. `add`/`list`/
+  `grant`/`revoke`/`remove` manage a self-hosted credential and its on-chain
+  record; `inspect` (pin an enclave's measurement) and `seal` (verify the quote,
+  then seal + upload the credential) are the enclave half.
 
 ## Two topologies
 
-| topology | when | broker/cli flags |
-|----------|------|------------------|
+| topology | when | broker/cred flags |
+|----------|------|-------------------|
 | **Local** | Credential Provider == Computation Provider | `--gateway-host <url>` / `--host <url>` |
-| **Remote** | Credential Provider != Computation Provider | `--remote <handle>.duck --via <browser-gw>` |
+| **Remote** | Credential Provider != Computation Provider | `--remote <handle>.duck` (the `via` is this node's own browser gateway) |
 
 Remote adds an `x-duck-authority` header; the local node's browser-gateway routes
 it to the remote node's published `LoopbackHttp` route over the overlay.
@@ -48,53 +57,57 @@ upstream); run it where inline 2-node WireGuard works:
 cargo test -p node-bin --test airlock_gateway_e2e -- --nocapture
 ```
 
-For a real cross-machine deployment:
+For a real cross-machine deployment there are two lender shapes. Both publish
+the same `airlock.<handle>.duck` route; they differ only in where trust comes
+from.
 
-**Credential node** (runs the enclave gateway; `<handle>` is its duckdns name).
-The node **embeds** the gateway: set `DUCKTAPE_AIRLOCK_SERVE` and it runs the
-gateway in-process, registers its loopback port as the `airlock` route, and seeds
-the credential — no separate serve / bind / seal steps. The credential provider IS
-the node process, so the credential is seeded directly (not sealed-uploaded).
+**A. Self-hosted lender (no TEE)** — the everyday path. `ducktape user cred add`
+captures the vendor login into the node's store, registers the record on chain
+(pinning the store's seal PUBLIC key), and publishes the `airlock` route. The
+lender daemon then serves it:
 
 ```sh
-# in the node's environment (systemd unit / launchd / shell). The node must run
-# INSIDE a TDX/SNP confidential VM — there is no mock, a box that cannot attest
-# cannot serve credentials:
-export DUCKTAPE_AIRLOCK_SERVE=1
-export DUCKTAPE_AIRLOCK_SERVE_ATTEST=auto           # or tdx|snp; REQUIRED, no default
-export DUCKTAPE_AIRLOCK_SERVE_ANTHROPIC_BASE=https://api.anthropic.com
-export DUCKTAPE_AIRLOCK_SERVE_CREDENTIALS=~/.claude/.credentials.json
-export DUCKTAPE_AIRLOCK_SERVE_CRED_KIND=bearer     # static access token, no rotation
-ducktape-node --config node.toml                  # gateway comes up + route registers at boot
-# clients pin the audited image's measurement on THEIR side (--measurement /
-# DUCKTAPE_AIRLOCK_MEASUREMENT + --snp-product); the serving node takes none.
-# then the ONE manual, signed ownership act — publish the LoopbackHttp route
-# (allow_authorization:true; max_response_bytes 0 = unbounded live stream, the
-# right choice for claude SSE). Build the RouteStatement exactly as
-# signed_airlock_route() in the test, then:
-#   ducktape-node user-sign-gateway-route --key <user.key> --statement <json>
-#   → submit to the node RPC (cmd:submit, target:"gateway"). Also SetHandle <handle>.
+ducktape user cred add claude -n <chain-id>       # login + register + publish route
+ducktape service run airlock --config node.toml   # the lender daemon (systemd unit target)
+ducktape user cred grant <name> <account>         # lend it to another member
 ```
 
-The manual route (for a gateway NOT run by the node) still works and is what
-the standalone binaries are for:
+The daemon binds LOOPBACK and registers its port; the node reverse-proxies
+overlay ingress to it, so the signed `RouteStatement` policy is a real
+enforcement layer in front of it. A borrower pins `seal_pk` from the committed
+credential record — no quote is involved, and the daemon spawns no container, so
+a laptop with no container runtime lends perfectly well.
+`bin/node/tests/cred_lending.rs` is the executable recipe (two real WireGuard
+nodes, the daemon, a mock upstream).
+
+**B. Enclave lender (TEE)** — when the borrower must not trust the operator at
+all. The gateway runs inside a confidential VM and the credential is sealed to a
+key that only exists in there:
 
 ```sh
 MEAS=<48-byte audited-image hex>            # pinned from the audited CVM image
 airlock-gateway serve --attest snp --listen 127.0.0.1:9100 \
     --anthropic-base https://api.anthropic.com     # must run IN a TDX/SNP guest
-# seal the credential (static bearer = no rotation; see "Credential" above)
-airlock-cli seal --attest snp --snp-product milan --measurement $MEAS \
+# read the measurement out of the quote for bootstrap pinning (TOFU; in prod pin
+# from the audited build):
+ducktape user cred inspect --attest snp --snp-product milan --host http://127.0.0.1:9100
+# seal the credential (static bearer = no rotation; see "Credential" below)
+ducktape user cred seal --attest snp --snp-product milan --measurement $MEAS \
     --host http://127.0.0.1:9100 \
     --credentials ~/.claude/.credentials.json --cred-kind bearer
 # register the loopback port node-locally
 ducktape gateway bind --workspace <node-workspace> --label airlock --port 9100
 # publish the signed LoopbackHttp route (allow_authorization:true, max_response_bytes ≤ 4 MiB
-# — the buffered proxy enforces this cap literally; 0/"unbounded" awaits SSE-over-overlay);
+# — the buffered proxy enforces this cap literally; 0/"unbounded" for live SSE);
 # construct the RouteStatement exactly as signed_airlock_route() does in the test,
 # then: user sign-gateway-route --key <user.key> --statement <json>  → submit to the
 # node RPC (cmd:submit, target:"gateway"). Also SetHandle <handle> on duckdns.
 ```
+
+`cred inspect`/`cred seal` reach a REMOTE enclave with `--remote <handle>.duck`
+instead of `--host`; the `via` is read from this node's own browser gateway, so
+the operator never pastes it. Attestation stays strictly bilateral either way —
+the node is asked for nothing but that base.
 
 **Compute node** (runs the sandbox): point the broker at the remote gateway — no
 credential is held locally:
@@ -148,7 +161,8 @@ the token.
 
 ## Credential the gateway holds
 
-`airlock-cli seal` uploads one of two sealed credentials (`CredentialPayload`):
+`ducktape user cred seal` uploads one of two sealed credentials
+(`CredentialPayload`):
 
 - **`Refresh`** — an OAuth refresh token; the gateway exchanges it for an access
   token and **rotates** on each refresh (subscription path).
@@ -209,7 +223,7 @@ since-deleted mock attest standing in for the quote — the custody path is
 unchanged; a TEE-silicon rerun is the standing hardware TODO):
 
 1. `airlock-gateway serve --anthropic-base https://api.anthropic.com` (loopback).
-2. `airlock-cli seal --credentials ~/.claude/.credentials.json --cred-kind bearer`
+2. `ducktape user cred seal --credentials ~/.claude/.credentials.json --cred-kind bearer`
    — seals the current subscription access token (no rotation).
 3. A `claude` CLI inside a **podman** sandbox holding only the opaque run bearer,
    driven through `capability-host` in airlock mode

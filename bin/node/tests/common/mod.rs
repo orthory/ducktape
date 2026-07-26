@@ -116,6 +116,13 @@ pub struct Cluster {
     /// does. Declared beside `nodes` so drop order reaps them before the
     /// tempdir goes.
     daemons: Vec<Option<NodeProc>>,
+    /// the kinds [`Cluster::spawn_service`] granted per node, so a rewrite of
+    /// `services.toml` (every `spawn`) keeps them.
+    service_kinds: Vec<Vec<String>>,
+    /// each node's EXPLICITLY started service daemons
+    /// ([`Cluster::spawn_service`]), one per kind. Same drop-order reasoning as
+    /// `daemons`.
+    services: Vec<Vec<ServiceProc>>,
     dir: tempfile::TempDir,
 }
 
@@ -136,8 +143,14 @@ impl Drop for Cluster {
     /// The reap is identity-verified by executable inside `provider_host`, never a
     /// `pkill -f` pattern match (which has killed an agent's own shell here).
     fn drop(&mut self) {
+        // BOTH daemon sets, and both before the sweep: the implicit compute
+        // daemon `spawn` starts, and whatever `spawn_service` started by hand.
+        // A survivor of either kind could re-create a service after the sweep.
         for daemon in &mut self.daemons {
             *daemon = None; // NodeProc::drop kills + waits
+        }
+        for procs in &mut self.services {
+            procs.clear(); // same: kill + wait
         }
         for idx in 0..self.peer_ids.len() {
             provider_host::reap_service_at(
@@ -147,9 +160,17 @@ impl Drop for Cluster {
     }
 }
 
-/// the service kind whose podman root this harness reaps — the only daemon it
-/// spawns. An `agent` daemon would need its own entry here.
+/// the service kind whose podman root this harness reaps. It is the only kind
+/// that HAS one: `airlock`, the other kind [`Cluster::spawn_service`] starts,
+/// spawns no container runtime at all — that is the whole point of the lender
+/// being a keyless plug. An `agent` daemon would need its own entry here.
 const COMPUTE_SERVICE_KIND: &str = "compute";
+
+/// One `ducktape service run <kind>` daemon attached to a node.
+struct ServiceProc {
+    kind: String,
+    proc: NodeProc,
+}
 
 /// a two-person network-shape ceremony: real `init`/`invite`/`join` verbs,
 /// key files, network.toml descriptors, and node.toml configs.
@@ -621,6 +642,8 @@ impl Cluster {
             extra_toml: Vec::new(),
             compute_grant: None,
             daemons: peer_ids.iter().map(|_| None).collect(),
+            service_kinds: peer_ids.iter().map(|_| Vec::new()).collect(),
+            services: peer_ids.iter().map(|_| Vec::new()).collect(),
             env: peer_ids.iter().map(|_| Vec::new()).collect(),
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
@@ -681,34 +704,54 @@ impl Cluster {
         path
     }
 
-    /// Write (or remove) the workspace `services.toml` the node reads at boot.
+    /// Write (or remove) the workspace `services.toml` the node reads at boot:
+    /// one `[[service]]` per granted kind, unique and kind-SORTED — the file's
+    /// own validation rule, which an append would break the moment a second
+    /// kind sorted before the first.
     ///
     /// Regenerated alongside node.toml on every spawn, so a respawn after
-    /// `wipe_storage` still finds its grant. The dev shape's `storage_dir` IS
+    /// `wipe_storage` still finds its grants. The dev shape's `storage_dir` IS
     /// its workspace, so the file lands beside the node's state.
     fn write_service_grants(&self, idx: usize) {
         let workspace = self.workspace(idx);
         std::fs::create_dir_all(&workspace).expect("create workspace dir");
         let path = workspace.join("services.toml");
-        let Some(tags) = &self.compute_grant else {
+        // the compute grant announces tags; every explicitly spawned kind
+        // announces none (airlock, the lender, discovers no capability at all).
+        let mut granted: Vec<(&str, &[String])> = Vec::new();
+        if let Some(tags) = &self.compute_grant {
+            granted.push(("compute", tags));
+        }
+        granted.extend(
+            self.service_kinds[idx]
+                .iter()
+                .map(|kind| (kind.as_str(), &[] as &[String])),
+        );
+        if granted.is_empty() {
             let _ = std::fs::remove_file(&path);
             return;
-        };
-        let announced = tags
-            .iter()
-            .map(|tag| format!("{tag:?}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        // any well-formed id/nonce pair does: the node asks WHETHER a compute
-        // grant exists and WHAT it announces, never re-deriving the id.
-        let grant = format!(
-            "version = 1\n\n[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
-             nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = [{announced}]\n\
-             scopes = []\n",
-            "11".repeat(32),
-            "22".repeat(16),
-        );
-        std::fs::write(&path, grant).expect("write services.toml");
+        }
+        granted.sort_by_key(|(kind, _)| *kind);
+        let mut file = "version = 1\n".to_string();
+        for (kind, tags) in granted {
+            let announced = tags
+                .iter()
+                .map(|tag| format!("{tag:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // any well-formed id/nonce pair does: the node asks WHETHER a grant
+            // of that kind exists and WHAT it announces, never re-deriving the
+            // id. The bytes are kind-derived only so two grants never collide.
+            let byte = format!("{:02x}", kind.as_bytes()[0]);
+            file.push_str(&format!(
+                "\n[[service]]\nkind = \"{kind}\"\ninstance = \"{}\"\n\
+                 nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = [{announced}]\n\
+                 scopes = []\n",
+                byte.repeat(32),
+                byte.repeat(16),
+            ));
+        }
+        std::fs::write(&path, file).expect("write services.toml");
     }
 
     /// spawn the node at `idx` as a validator/mesh member, stdout+stderr to a
@@ -774,13 +817,83 @@ impl Cluster {
         self.daemons[idx] = Some(NodeProc { id, child, log });
     }
 
+    /// Grant node `idx` a service of `kind` and run its daemon beside the node
+    /// — the harness twin of `service enable <kind>` + `service run <kind>`.
+    ///
+    /// Called EXPLICITLY rather than folded into [`Self::spawn`] (where the
+    /// compute daemon rides along) because a daemon's FIRST hello must LAND:
+    /// the node's http surface has to be listening before the daemon starts,
+    /// and only the test knows when it has waited for that.
+    pub fn spawn_service(&mut self, idx: usize, kind: &str) {
+        let id = self.peer_ids[idx];
+        // `config_file`, not `config_path`: the latter REWRITES node.toml and
+        // services.toml, which would drop the grant appended just below.
+        let cfg = self.config_file(idx);
+        self.service_kinds[idx].push(kind.to_string());
+        self.write_service_grants(idx);
+        let log = self.dir.path().join(format!("{kind}{id}.log"));
+        let out = std::fs::File::create(&log).expect("create service log");
+        let err = out.try_clone().expect("clone service log handle");
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("service")
+            .arg("run")
+            .arg(kind)
+            .arg("--config")
+            .arg(&cfg)
+            // the grant is already on disk, so the daemon must never try to
+            // mint one — there is no tty here.
+            .arg("--no-enable")
+            .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .expect("spawn service daemon");
+        self.services[idx].push(ServiceProc {
+            kind: kind.to_string(),
+            proc: NodeProc { id, child, log },
+        });
+    }
+
+    /// poll the log of node `idx`'s `kind` service daemon until a line contains
+    /// `marker`. Fails fast if the daemon exits without printing it — the twin
+    /// of [`Self::wait_marker`], for the process on the other side of the link.
+    pub fn wait_service_marker(
+        &mut self,
+        idx: usize,
+        kind: &str,
+        marker: &str,
+        timeout: Duration,
+    ) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let service = self.services[idx]
+                .iter_mut()
+                .find(|service| service.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind} daemon runs beside node idx {idx}"));
+            let text = std::fs::read_to_string(&service.proc.log).unwrap_or_default();
+            if let Some(rest) = find_marker(&text, marker) {
+                return rest;
+            }
+            let exited = service.proc.child.try_wait().expect("poll service").is_some();
+            if exited || Instant::now() >= deadline {
+                let verb = if exited { "exited" } else { "timed out" };
+                panic!(
+                    "{kind} daemon beside node idx {idx} {verb} without printing {marker:?};\n{}\n{text}",
+                    self.all_log_tails(60),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
     /// kill the node at `idx` (crash-fault injection) and reap it.
     ///
-    /// Its compute daemon goes too: the daemon is that node's plane, and
-    /// leaving one attached to a dead node would keep retrying against a
-    /// port the next spawn reuses.
+    /// Its service daemons go too: a daemon is that node's plane, and leaving
+    /// one attached to a dead node would keep retrying against a port the next
+    /// spawn reuses.
     pub fn kill(&mut self, idx: usize) {
-        self.daemons[idx] = None; // NodeProc::drop kills + waits
+        self.services[idx].clear(); // NodeProc::drop kills + waits
+        self.daemons[idx] = None;
         self.nodes[idx] = None;
     }
 

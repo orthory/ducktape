@@ -4,8 +4,8 @@
 //!
 //! The default build is pure — no IO, no async — and is what `airlock-gateway`
 //! builds on. The optional `client` feature adds the async HTTP client side of
-//! the handshake (`client::Gateway`), shared by `airlock-broker` and
-//! `airlock-cli`. See
+//! the handshake (`client::Gateway`), shared by `broker-host` and
+//! `ducktape user cred`. See
 //! `docs/superpowers/specs/2026-07-18-execution-auth-separation-design.md`.
 
 mod aead;

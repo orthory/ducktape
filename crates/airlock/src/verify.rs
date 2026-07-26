@@ -101,7 +101,7 @@ pub enum TrustRoots {
 
 /// Structurally parse a quote WITHOUT verifying any signature, returning the
 /// embedded measurement (hex) and REPORTDATA. TOFU inspection only — the
-/// `airlock-cli inspect` flow that pins a measurement for later verified use.
+/// `ducktape user cred inspect` flow that pins a measurement for later verified use.
 /// Never a trust decision.
 pub fn peek_measurement(
     mode: AttestMode,

@@ -1,6 +1,7 @@
-//! The async HTTP client side of the gateway protocol, shared by `airlock-cli`
-//! (the CLI roles) and `airlock-broker` (the Computation Provider's local
-//! api-snatch). Topology-agnostic: a `Gateway` is either LOCAL (same-machine
+//! The async HTTP client side of the gateway protocol, shared by
+//! `ducktape user cred inspect|seal` (the credential-provider verbs) and
+//! `broker-host` (the Computation Provider's local api-snatch).
+//! Topology-agnostic: a `Gateway` is either LOCAL (same-machine
 //! loopback) or REMOTE (a duckdns handle routed by the local node's
 //! browser-gateway, carried in `x-duck-authority`).
 //!

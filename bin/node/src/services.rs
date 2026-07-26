@@ -25,9 +25,9 @@ use crate::config;
 pub const FILE_NAME: &str = "services.toml";
 const FORMAT_VERSION: u8 = 1;
 
-/// the two first-party service kinds. Defined in `noded` because both the
-/// node's own surfaces (the ws service link) and this CLI must name them.
-pub use noded::services::{AGENT_KIND, COMPUTE_KIND};
+/// the first-party service kinds. Defined in `noded` because both the node's
+/// own surfaces (the ws service link) and this CLI must name them.
+pub use noded::services::{AGENT_KIND, AIRLOCK_KIND, COMPUTE_KIND};
 
 /// which first-party daemon a kind names — the ONE discriminant `run` branches
 /// on. `None` = a kind this binary hosts no execution plane for: it signals,
@@ -35,12 +35,14 @@ pub use noded::services::{AGENT_KIND, COMPUTE_KIND};
 enum Daemon {
     Compute,
     Agent,
+    Airlock,
 }
 
 fn daemon_for(kind: &str) -> Option<Daemon> {
     match kind {
         COMPUTE_KIND => Some(Daemon::Compute),
         AGENT_KIND => Some(Daemon::Agent),
+        AIRLOCK_KIND => Some(Daemon::Airlock),
         _ => None,
     }
 }
@@ -1152,6 +1154,14 @@ fn serve_kind(
             node_key,
             workspace: workspace.to_path_buf(),
         })?,
+        // no `node_key`: the lender signs nothing and submits no op. Its only
+        // use of the node is a committed READ over `/v1`.
+        Daemon::Airlock => crate::airlock::serve(crate::airlock::Airlock {
+            grant,
+            service,
+            http_base,
+            workspace: workspace.to_path_buf(),
+        })?,
     }
     Ok(Served::Stopped)
 }
@@ -1180,8 +1190,65 @@ fn scopes_for(kind: &str) -> Vec<String> {
         // saga results and lease heartbeats to /v1/submit), and resolves the
         // same lent-credential records for the runs it executes.
         Some(Daemon::Compute) => vec!["saga.runs".into(), "credential.lent".into()],
+        // the minimal-scope service, and deliberately so: it READS this node's
+        // committed gateway credential records to decide a grant, and it
+        // registers its loopback port under the account's `airlock` route. It
+        // submits nothing, executes nothing, and touches no blob — so it asks
+        // for no submit scope and no blob scope.
+        Some(Daemon::Airlock) => vec!["gateway.credentials".into(), "gateway.routes".into()],
         None => Vec::new(),
     }
+}
+
+/// The capability tags a kind's daemon can actually run on this host.
+///
+/// A kind that SPAWNS must have a working sandbox and is refused loudly without
+/// one — advertising a tag it cannot isolate a run for is worse than not
+/// starting. A kind that spawns nothing must NOT be held to that: airlock lends
+/// credentials and never opens a container, and a lending node is routinely a
+/// laptop with no container runtime installed at all. Demanding a `[sandbox]`
+/// table from it refused the exact machine shape the service is for.
+///
+/// A kind with no first-party daemon offers nothing for the same reason: this
+/// binary executes nothing for it, so tags discovered here would be a catalog
+/// entry no one can act on.
+fn offered_capabilities(
+    kind: &str,
+    service: &config::ServiceConfig,
+    node_key: &[u8; 32],
+) -> Result<Vec<String>, String> {
+    match daemon_for(kind) {
+        Some(Daemon::Compute) | Some(Daemon::Agent) => {
+            discover_executors(kind, service, node_key)
+        }
+        Some(Daemon::Airlock) | None => Ok(Vec::new()),
+    }
+}
+
+/// Real discovery for a spawning kind: probe the sandbox, then read what
+/// executor CLIs this host actually carries.
+///
+/// Discovery for the HELLO only — this set spawns nothing (and dials no
+/// socket), so it is named for the kind rather than an instance id: there may
+/// be no grant yet, since the hello is what the user reviews before minting
+/// one. The serving set is rediscovered under `<kind>#hex8` once a grant exists.
+fn discover_executors(
+    kind: &str,
+    service: &config::ServiceConfig,
+    node_key: &[u8; 32],
+) -> Result<Vec<String>, String> {
+    let backend = podman_backend(service, kind)?;
+    // the same precondition the node's own boot enforces — a daemon must not
+    // advertise tags it has no runnable sandbox for.
+    backend.probe().map_err(|error| format!("sandbox: {error}"))?;
+    let providers = provider_host::discover(
+        node_key,
+        provider_host::AgentDirs::under(&service.storage_dir),
+        None,
+        backend,
+        kind,
+    )?;
+    Ok(providers.capabilities())
 }
 
 /// Build this host's hello: what it IS, and what it can actually run.
@@ -1193,33 +1260,20 @@ fn discover_hello(
     service: &config::ServiceConfig,
     node_key: &[u8; 32],
 ) -> Result<noded::services::Hello, String> {
-    let backend = podman_backend(service, kind)?;
-    // the same precondition the node's own boot enforces — a daemon must not
-    // advertise tags it has no runnable sandbox for.
-    backend.probe().map_err(|error| format!("sandbox: {error}"))?;
-    // discovery for the HELLO only — this set spawns nothing (and dials no
-    // socket), so it is named for the kind rather than an instance id: there may
-    // be no grant yet, since the hello is what the user reviews before minting
-    // one. The serving set is rediscovered under `<kind>#hex8` once a grant
-    // exists.
-    let providers = provider_host::discover(
-        node_key,
-        provider_host::AgentDirs::under(&service.storage_dir),
-        None,
-        backend,
-        kind,
-    )?;
     Ok(noded::services::Hello {
         kind: kind.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         // metadata, so an unidentifiable build says so instead of refusing to
         // start. A tarball or vendored build signals and serves like any other.
         build: noded::services::build_identity_or_unknown().to_string(),
-        capabilities: providers.capabilities(),
+        // the probe+discovery moved into `offered_capabilities`, because a kind
+        // that spawns NOTHING must not demand a container runtime to say hello.
+        capabilities: offered_capabilities(kind, service, node_key)?,
         scopes: scopes_for(kind),
-        // agent declares no needs: an interactive pty session is self-contained,
-        // so it is useful on a network with no compute capacity anywhere. The
-        // two are siblings, not layers.
+        // no first-party daemon declares a need. An interactive pty session is
+        // self-contained, and so is lending a credential: both are useful on a
+        // network with no compute capacity anywhere. They are siblings, not
+        // layers.
         needs: Vec::new(),
     })
 }
@@ -1411,11 +1465,11 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
         paint(GREEN, ServiceState::Enabled.glyph()),
         grant.display_id()
     ))?;
-    if plan.kind == COMPUTE_KIND {
+    if daemon_for(&plan.kind).is_some() {
         // the daemon, not the node, is what has to be running — and the node
         // needs no restart at all: it reads the offered set from the live
         // signaling catalog every announce tick.
-        write_err("  start it with: ducktape service run compute\n")?;
+        write_err(&format!("  start it with: ducktape service run {}\n", plan.kind))?;
     }
     Ok(())
 }
@@ -1440,11 +1494,11 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
     // there), but a RUNNING daemon keeps executing the work it already holds:
     // it read its grant once, at its own boot. Stopping it is the operator's
     // act, so say so rather than implying revocation is instant.
-    if kind == COMPUTE_KIND {
-        write_err(
-            "  stop the daemon too: a running `service run compute` keeps \
-             executing work it already holds\n",
-        )?;
+    if daemon_for(&kind).is_some() {
+        write_err(&format!(
+            "  stop the daemon too: a running `service run {kind}` keeps \
+             serving what it already holds\n"
+        ))?;
     }
     Ok(())
 }

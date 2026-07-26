@@ -435,34 +435,41 @@ async fn grant_allows(check: &GrantCheck, req: &SessionRequest) -> bool {
     check(req.sub.clone(), account).await
 }
 
-/// Consult the lazy store loader for `name`, inserting it into the live store on
-/// a hit. Returns whether the credential is now present. A no-op (returns false)
-/// when no loader is wired or the store has no such credential.
-fn try_load_credential(st: &AppState, name: &str) -> bool {
+/// Consult the lazy store loader for `name` and adopt whatever it hands back.
+///
+/// The loader is the one that decides there is anything to do: it answers
+/// `Some` for a credential the live store has never held AND for one whose
+/// backing artifact has changed since it was last read. So this runs on every
+/// session rather than only on a store miss — otherwise a re-login that rotated
+/// a credential in place would be served as the dead token until restart.
+///
+/// A no-op when no loader is wired (an enclave has no backing store) or the
+/// loader has nothing new.
+fn refresh_credential(st: &AppState, name: &str) {
     let Some(reload) = &st.reload else {
-        return false;
+        return;
     };
     let Some((kind, payload)) = reload(name) else {
-        return false;
+        return;
     };
     let Ok(entry) = cred_entry(kind, payload) else {
-        return false;
+        return;
     };
     st.creds.lock().unwrap().insert(name.to_string(), Arc::new(entry));
-    true
 }
 
 async fn session(
     State(st): State<Arc<AppState>>,
     Json(req): Json<SessionRequest>,
 ) -> Result<Json<SessionResponse>, AppErr> {
-    // A session names the credential it draws on. A name the store already holds
-    // opens directly; a miss falls to the lazy loader (a credential `cred add`
-    // wrote after boot) before refusing — so a fresh credential is served without
-    // a node restart. A miss with no loader (or an absent name) is a race or a
-    // stale record and 404s.
+    // A session names the credential it draws on. The store loader gets first
+    // refusal on every session, so both restart-free cases are covered: a
+    // credential `cred add` wrote after boot, and one a re-login rotated in
+    // place. A name that is still absent afterwards is a race or a stale record
+    // and 404s.
+    refresh_credential(&st, &req.sub);
     let known_credential = st.creds.lock().unwrap().contains_key(&req.sub);
-    if !known_credential && !try_load_credential(&st, &req.sub) {
+    if !known_credential {
         return Err(AppErr(StatusCode::NOT_FOUND, "credential_not_found".into()));
     }
     // Co-hosted lending: when a grant gate is wired, the session's claimed account

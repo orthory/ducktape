@@ -9,7 +9,12 @@
 //! secret. `grant`/`revoke` lend/rescind by account; `list` reads committed
 //! records; `remove` tombstones one.
 //!
-//! Every verb runs CO-HOSTED with the node whose credential it manages: it reads
+//! `inspect`/`seal` are the ENCLAVE half of the same family and live in
+//! [`crate::cred_seal`]: they talk to a TEE airlock gateway
+//! (`bin/airlock-gateway`) whose quote they verify themselves. They are the only
+//! two verbs here that neither sign an on-chain statement nor touch the store.
+//!
+//! Every other verb runs CO-HOSTED with the node whose credential it manages: it reads
 //! the node's own workspace (chain id, consensus key, storage) to build the
 //! owner-signed statement, then submits it over the node's frameless
 //! `/v1/submit` (which stamps the node as the op origin — the record's
@@ -24,7 +29,7 @@ use commonware_cryptography::Signer as _;
 use crate::config;
 use crate::userkey_cli::{load_user_signer, redeem_node};
 
-type CredResult = Result<(), Box<dyn std::error::Error>>;
+pub(crate) type CredResult = Result<(), Box<dyn std::error::Error>>;
 
 /// `ducktape user cred <verb>` — the credential subfamily. `--node`/`-n` are the
 /// same node-resolution pair `redeem-invite` carries, made `global` so they
@@ -77,6 +82,24 @@ pub(crate) enum CredCmd {
         name: String,
         /// the grantee: a hex account id or a display name
         account: String,
+    },
+    /// read a TEE gateway's enclave measurement out of its quote, so it can be
+    /// pinned as `seal --measurement`
+    Inspect {
+        #[command(flatten)]
+        gateway: crate::cred_seal::GatewayArgs,
+        #[command(flatten)]
+        attest: crate::cred_seal::AttestArgs,
+    },
+    /// verify a TEE gateway's quote, then seal a credential under the attested
+    /// key and upload it
+    Seal {
+        #[command(flatten)]
+        gateway: crate::cred_seal::GatewayArgs,
+        #[command(flatten)]
+        attest: crate::cred_seal::AttestArgs,
+        #[command(flatten)]
+        seal: crate::cred_seal::SealArgs,
     },
 }
 
@@ -170,6 +193,15 @@ pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
         CredCmd::Remove { name } => cmd_remove(&ctx, name, stdin),
         CredCmd::Grant { name, account } => cmd_grant(&ctx, name, account, stdin),
         CredCmd::Revoke { name, account } => cmd_revoke(&ctx, name, account, stdin),
+        // the enclave verbs resolve the node base LAZILY: only `--remote` needs
+        // it (to read this node's browser-gateway base), so a purely local
+        // `--host` inspect must not demand a workspace it never reads.
+        CredCmd::Inspect { gateway, attest } => {
+            crate::cred_seal::cmd_inspect(gateway, attest, || ctx.http_base())
+        }
+        CredCmd::Seal { gateway, attest, seal } => {
+            crate::cred_seal::cmd_seal(gateway, attest, seal, || ctx.http_base())
+        }
     }
 }
 
@@ -370,7 +402,7 @@ fn cmd_add(
     gateway::validate_credential_name(&name)?;
 
     // capture the login artifact into the on-disk store, keyed by name.
-    let store = crate::airlock_serve::cred_store_root(&resolved.service.storage_dir);
+    let store = airlock_service::cred_store_root(&resolved.service.storage_dir);
     let dir = store.join(&name);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     // `DUCKTAPE_CRED_REUSE_ARTIFACT=<path>` imports an ALREADY-authenticated
@@ -407,7 +439,7 @@ fn cmd_add(
 
     // the seal PUBLIC key the node co-hosts under (minted on first add, then
     // stable) is what the record pins for the compute broker.
-    let seal = crate::airlock_serve::load_or_create_seal_keypair(&store)?;
+    let seal = airlock_service::load_or_create_seal_keypair(&store)?;
     let record = gateway::CredentialRecord {
         name: name.clone(),
         owner_account: account.account_id.clone(),
@@ -435,21 +467,20 @@ fn cmd_add(
     Ok(())
 }
 
-/// The `airlock` gateway route label the co-hosted gateway registers itself
-/// under; the compute broker resolves `<AIRLOCK_ROUTE>.<handle>.duck` to it.
-/// Mirrors `crate::cred_resolve::AIRLOCK_ROUTE`.
-const AIRLOCK_ROUTE: &str = "airlock";
-
 /// Publish the account's `airlock` gateway route if it is not already published
-/// — the one signed statement that makes this node's co-hosted gateway reachable
+/// — the one signed statement that makes this account's lender daemon reachable
 /// over the overlay. Idempotent: a route already present is left untouched.
+///
+/// The label is [`crate::airlock::AIRLOCK_ROUTE`], the same constant the daemon
+/// registers its loopback port under: one definition, so the publisher and the
+/// registrar cannot drift apart.
 fn ensure_airlock_route(
     base: &str,
     user: &commonware_cryptography::ed25519::PrivateKey,
     resolved: &config::Resolved,
     account_id: &[u8],
 ) -> CredResult {
-    let name = gateway::RouteName::named(AIRLOCK_ROUTE);
+    let name = gateway::RouteName::named(crate::airlock::AIRLOCK_ROUTE);
     let existing = query_gateway(
         base,
         &gateway::GatewayQuery::Get { account_id: account_id.to_vec(), name: name.clone() },

@@ -57,10 +57,14 @@ tasks = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
 gateway = { workspace = true }
-# a credential-provider node embeds an airlock gateway in-process (server) and
-# seeds its credential; the compute-side broker path also uses the client. See
-# src/airlock_serve.rs.
-airlock = { path = "../../crates/modules/system/airlock", features = ["client", "server"] }
+# the airlock contract: `server` supplies the GrantCheck type the lender daemon
+# injects (src/airlock.rs), `client` + `verify` the enclave-facing credential
+# verbs (`user cred inspect|seal`, src/cred_seal.rs) — those fetch a quote and
+# verify it against roots they resolve themselves, so the node is uninvolved.
+airlock = { path = "../../crates/airlock", features = ["client", "server", "verify"] }
+# the lender's disk-backed credential store: opened by the `service run airlock`
+# daemon, and written by `user cred add`.
+airlock-service = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
@@ -95,6 +99,10 @@ futures = "0.3"
 bytes = "1"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# the airlock client/verify surface is anyhow-typed and reports measurements as
+# hex; both already ride in on the airlock dependency above.
+anyhow = "1"
+hex = "0.4"
 # compact, url-safe text encoding for the invite blob (replaces hex-of-toml).
 base64 = "0.22"
 # the http/ws app surface, shared with the embedded daemon: NodeCommand lane,
@@ -171,10 +179,10 @@ tokio = { version = "1", features = ["test-util", "macros"] }
 tempfile = "3"
 # the streaming e2e feeds an SSE upstream through a channel-backed Body.
 tokio-stream = "0.1"
-# airlock is also a runtime dependency (see [dependencies] — src/airlock_serve.rs);
-# tests additionally need the real verifier + the minted-chain testkit. axum
-# serves the in-process mock upstream airlock_gateway_e2e swaps into.
-airlock = { path = "../../crates/modules/system/airlock", features = ["client", "server", "verify", "testkit"] }
+# airlock is also a runtime dependency (see [dependencies]); tests additionally
+# need the minted-chain testkit. axum serves the in-process mock upstream
+# airlock_gateway_e2e swaps into.
+airlock = { path = "../../crates/airlock", features = ["client", "server", "verify", "testkit"] }
 axum = "0.8"
 data-plane = { workspace = true, features = ["sim"] }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on

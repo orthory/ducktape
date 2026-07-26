@@ -15,7 +15,7 @@ path = "src/lib.rs"
 
 [features]
 # The async HTTP client side of the handshake (Gateway + fetch_quote +
-# open_session + credential upload), shared by airlock-broker and airlock-cli.
+# open_session + credential upload), shared by broker-host and `ducktape user cred`.
 client = ["dep:reqwest"]
 # The gateway HTTP service (airlock::server), used by airlock-gateway and the
 # in-process e2e test. Off by default so the pure core stays IO/async-free.

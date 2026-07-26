@@ -1,14 +1,23 @@
-//! `airlock-gateway` — the credential side of the airlock. A thin CLI wrapper
-//! over [`airlock::server`]. Runs (canonically) inside an Intel TDX / AMD
-//! SEV-SNP confidential VM: holds a sealed OAuth refresh token in enclave
-//! memory, proxies the Claude messages API, and issues scoped session tokens.
-//! The operator cannot read the credential.
+//! `airlock-gateway` — the TEE enclave binary, and nothing else. A thin CLI
+//! wrapper over [`airlock::server`]. Runs inside an Intel TDX / AMD SEV-SNP
+//! confidential VM: holds a sealed OAuth refresh token in enclave memory,
+//! proxies the vendor messages API, and issues scoped session tokens. The
+//! operator cannot read the credential.
 //!
-//! Subcommands:
-//!   serve          the gateway itself
-//!   mock-upstream  a fake OAuth + messages server, for the hermetic test/demo
-
-mod mock_upstream;
+//! ## why this stays a separate, minimal binary
+//!
+//! Attestation measurement covers the WHOLE binary, so every byte in here is a
+//! byte a lender re-pins on each rebuild. `ducktape` is deliberately NOT folded
+//! in: that would churn the pinned measurement on every unrelated node release
+//! and ship borrower/node code into the lender's trust boundary. Small enclave
+//! binary = cheap trust. The non-TEE lender path is the airlock service daemon
+//! (`ducktape service run airlock`), which never runs from here.
+//!
+//! There is exactly one subcommand and one attest family, for the same reason.
+//! A `self-host` mode here would mint a fresh ephemeral seal key on every boot
+//! (an enclave persists no keypair), which no lender could ever pin — broken by
+//! construction, and a second path against the service daemon's real one. A
+//! mock upstream likewise has no business inside a measured image.
 
 use anyhow::{Context, Result};
 
@@ -32,25 +41,13 @@ fn arg_or(name: &str, default: &str) -> String {
     arg(name).unwrap_or_else(|| default.to_string())
 }
 
-/// `--attest tdx|snp|auto` runs the configfs-tsm path; `self-host` serves no
-/// quote (the broker pins the seal_pk from consensus). Standalone mints a fresh
-/// seal key either way — the node embed is what injects the on-chain keypair.
-fn attest_mode() -> Result<AttestMode> {
-    let spec = arg("--attest").context("--attest is required (tdx|snp|auto|self-host)")?;
-    Ok(match spec.as_str() {
-        "self-host" => AttestMode::SelfHost,
-        _ => AttestMode::Tsm(spec),
-    })
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("serve") => serve().await,
-        Some("mock-upstream") => mock_upstream::run(&arg_or("--listen", "127.0.0.1:9101")).await,
         other => {
             eprintln!(
-                "usage: airlock-gateway <serve|mock-upstream> [flags]  (got {:?})",
+                "usage: airlock-gateway serve --attest tdx|snp|auto [flags]  (got {:?})",
                 other.unwrap_or("")
             );
             std::process::exit(2);
@@ -60,11 +57,17 @@ async fn main() -> Result<()> {
 
 async fn serve() -> Result<()> {
     let cfg = GatewayConfig {
-        attest: attest_mode()?,
+        // the configfs-tsm path is the only one: this binary must run inside a
+        // confidential VM, so a host that cannot attest fails loudly here
+        // rather than serving an unattested credential.
+        attest: AttestMode::Tsm(arg("--attest").context("--attest is required (tdx|snp|auto)")?),
         seal_keypair: None,
-        anthropic_base: arg_or("--anthropic-base", "http://127.0.0.1:9101"),
-        openai_base: arg_or("--openai-base", "http://127.0.0.1:9101"),
-        oauth_token_url: arg_or("--oauth-token-url", "http://127.0.0.1:9101/oauth/token"),
+        anthropic_base: arg_or("--anthropic-base", "https://api.anthropic.com"),
+        openai_base: arg_or("--openai-base", "https://chatgpt.com/backend-api/codex"),
+        oauth_token_url: arg_or(
+            "--oauth-token-url",
+            "https://console.anthropic.com/v1/oauth/token",
+        ),
         oauth_client_id: arg_or("--oauth-client-id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
         session_ttl_secs: arg("--session-ttl-secs")
             .map(|s| s.parse::<u64>())

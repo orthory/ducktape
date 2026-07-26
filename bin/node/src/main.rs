@@ -51,7 +51,7 @@ use commonware_runtime::{Metrics as _, Runner, Supervisor};
 
 mod agent_cli;
 mod agent_plane;
-mod airlock_serve;
+mod airlock;
 mod blob_fetch;
 mod boot;
 mod cli;
@@ -60,6 +60,7 @@ mod code_plane;
 mod config;
 mod constants;
 mod cred_cli;
+mod cred_seal;
 mod node_http;
 mod tty;
 mod agent;
@@ -384,7 +385,7 @@ fn run_node(
         label: &label,
         storage: &storage,
         // the config dir where gateway-routes.json lives (= storage in the dev
-        // shape); an embedded airlock gateway registers its port here.
+        // shape); a service daemon registers its loopback port there.
         workspace: &workspace,
         rpc_listen,
         http_listen,
@@ -398,11 +399,6 @@ fn run_node(
         // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice (ADR A2/A4).
         node_key: signer.public_key().as_ref().to_vec(),
         admin_exposure: noded::AdminExposure::from_env(),
-        // the resolved node.toml sandbox backend: the interactive terminal plane
-        // uses the SAME backend + identity as this node's real agent runs, so a
-        // Direct node has no terminal plane and Podman reaping stays consistent.
-        // cloned — the validator/resident arms below consume the original.
-        sandbox: sandbox.clone(),
     })?;
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
