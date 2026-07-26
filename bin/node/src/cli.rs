@@ -10,9 +10,10 @@ use commonware_cryptography::{Signer as _, ed25519};
 
 use crate::cli_args::{
     AdmitArgs, InitArgs, InviteArgs, JoinCmd, JoinQuery, KeyArgs, MemberCmd, OpCmd, PubkeyArgs,
-    ResidentCmd, SelectorArgs, StatusArgs,
+    ResidentCmd, Selector, SelectorArgs, StatusArgs, WorkCmd, WorkTargetArgs,
 };
 use crate::config;
+use crate::work_admission::{self, AdmitTarget, WorkAdmission};
 use config::{hex_bytes, unhex};
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
@@ -32,7 +33,108 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::Peers(args) => cmd_node_peers(args),
         OpCmd::Resident(cmd) => dispatch_resident(cmd),
         OpCmd::Member(cmd) => dispatch_member(cmd),
+        OpCmd::Work(cmd) => dispatch_work(cmd),
     }
+}
+
+fn dispatch_work(cmd: WorkCmd) -> CommandResult {
+    match cmd {
+        WorkCmd::List(args) => cmd_work_list(args),
+        WorkCmd::Admit(args) => cmd_work_admit(args),
+        WorkCmd::Revoke(args) => cmd_work_revoke(args),
+    }
+}
+
+/// the workspace directory a `node work` verb reads and writes. The policy sits
+/// beside `node.toml`, and both the node and the compute daemon read it there.
+fn work_workspace(selector: &Selector) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cfg_path = selector.config_path()?;
+    Ok(cfg_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf())
+}
+
+/// `anyone` is the literal, everything else is an account (hex id or display
+/// name — the same resolution `user cred grant` takes). A hex id resolves
+/// offline; a display name needs the node to answer.
+fn resolve_work_target(
+    workspace: &std::path::Path,
+    input: &str,
+) -> Result<AdmitTarget, Box<dyn std::error::Error>> {
+    if input == work_admission::ANYONE {
+        return Ok(AdmitTarget::Anyone);
+    }
+    let base = config::http_base_in(workspace)?;
+    Ok(AdmitTarget::Account(crate::cred_cli::resolve_account(
+        &base, input,
+    )?))
+}
+
+fn cmd_work_list(args: SelectorArgs) -> CommandResult {
+    let workspace = work_workspace(&args.selector)?;
+    match work_admission::load(&workspace)? {
+        WorkAdmission::Owner => {
+            println!("owner only — this node runs its owner's work and its own submissions")
+        }
+        WorkAdmission::Anyone => {
+            println!("anyone — every network member may run a workload on this node")
+        }
+        WorkAdmission::Accounts(accounts) => {
+            println!("owner, plus {} admitted account(s):", accounts.len());
+            for account in &accounts {
+                println!("  {}", hex_bytes(account));
+            }
+        }
+    }
+    println!(
+        "policy: {}",
+        work_admission::policy_path(&workspace).display()
+    );
+    Ok(())
+}
+
+fn cmd_work_admit(args: WorkTargetArgs) -> CommandResult {
+    let workspace = work_workspace(&args.selector)?;
+    let target = resolve_work_target(&workspace, &args.target)?;
+    let policy = work_admission::load(&workspace)?.with(target.clone());
+    work_admission::save(&workspace, &policy)?;
+    match target {
+        AdmitTarget::Anyone => {
+            // the `service enable` consent-screen precedent: the widening that
+            // re-opens the hole says so on the way in, on stderr so stdout stays
+            // scriptable.
+            eprintln!(
+                "consent: every network member may now run a workload on this node, and any \
+                 workload here may draw on every credential this node has been granted. \
+                 Narrow it with `ducktape node work revoke anyone`."
+            );
+            println!("admitted: anyone");
+        }
+        AdmitTarget::Account(account) => println!("admitted: {}", hex_bytes(&account)),
+    }
+    Ok(())
+}
+
+fn cmd_work_revoke(args: WorkTargetArgs) -> CommandResult {
+    let workspace = work_workspace(&args.selector)?;
+    let target = resolve_work_target(&workspace, &args.target)?;
+    let current = work_admission::load(&workspace)?;
+    // revoking ONE account while the policy admits everyone would write a file
+    // that changes nothing and print success: refuse instead of fail-quiet.
+    let narrowing_one_from_anyone =
+        current == WorkAdmission::Anyone && !matches!(target, AdmitTarget::Anyone);
+    if narrowing_one_from_anyone {
+        return Err("this node admits anyone, so revoking one account changes nothing — \
+                    run `ducktape node work revoke anyone` first"
+            .into());
+    }
+    work_admission::save(&workspace, &current.without(target.clone()))?;
+    match target {
+        AdmitTarget::Anyone => println!("revoked: anyone"),
+        AdmitTarget::Account(account) => println!("revoked: {}", hex_bytes(&account)),
+    }
+    Ok(())
 }
 
 fn dispatch_resident(cmd: ResidentCmd) -> CommandResult {

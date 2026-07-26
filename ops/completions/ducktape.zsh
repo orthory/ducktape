@@ -8,9 +8,10 @@
 _ducktape() {
     local families=(node user gateway fs service agent mcp help --help -h version --version -V)
 
-    local node_verbs=(run key init invite admit join list status peers resident member help)
+    local node_verbs=(run key init invite admit join list status peers resident member work help)
     local node_resident=(accept remove)
     local node_member=(promote remove leave status)
+    local node_work=(list admit revoke)
     local node_join=(requests state)
     local node_flags=(--config -n --network --sync-only --json --out --dir --name --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --wireguard-effect --role --ttl-days)
 
@@ -37,6 +38,7 @@ _ducktape() {
             case ${words[3]} in
                 resident) compadd -- $node_resident $node_flags ;;
                 member)   compadd -- $node_member $node_flags ;;
+                work)     compadd -- $node_work $node_flags ;;
                 join)     compadd -- $node_join $node_flags ;;
                 run|key|init|invite|admit|list|status|peers) compadd -- $node_flags ;;
                 *)        compadd -- $node_verbs ;;

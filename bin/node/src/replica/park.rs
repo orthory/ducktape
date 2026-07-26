@@ -308,6 +308,7 @@ pub(super) async fn park(
             session_manager,
             gateway_commands.clone(),
             local_gateway_via,
+            workspace.clone(),
             session_requests,
         );
         Some(tracked)

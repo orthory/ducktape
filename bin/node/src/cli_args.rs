@@ -44,6 +44,37 @@ pub enum OpCmd {
     /// consensus-quorum membership
     #[command(subcommand)]
     Member(MemberCmd),
+    /// whose work this node will execute
+    #[command(subcommand)]
+    Work(WorkCmd),
+}
+
+/// `ducktape node work` — this node's own answer to "whose workload do I run?".
+///
+/// A credential GRANT and a work ADMISSION are two consents in OPPOSITE
+/// directions, and conflating them is the first thing to get wrong:
+/// `user cred grant` is the lender telling the network *which node may draw on
+/// my credential*; `node work admit` is a host telling the network *whose work
+/// I will run at all*. A cross-node run needs both, on different boxes.
+#[derive(Debug, clap::Subcommand)]
+pub enum WorkCmd {
+    /// print this node's admission policy
+    List(SelectorArgs),
+    /// run an account's work on this node (or `anyone`)
+    Admit(WorkTargetArgs),
+    /// stop running an account's work on this node (or `anyone`)
+    Revoke(WorkTargetArgs),
+}
+
+/// one account, or the literal `anyone`.
+#[derive(Debug, clap::Args)]
+pub struct WorkTargetArgs {
+    /// a hex account id, a display name, or the literal `anyone`. `anyone`
+    /// admits every network member — and lets a stranger's workload draw on
+    /// every credential this node has been granted.
+    pub target: String,
+    #[command(flatten)]
+    pub selector: Selector,
 }
 
 #[derive(Debug, clap::Subcommand)]

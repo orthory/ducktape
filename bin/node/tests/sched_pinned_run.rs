@@ -362,6 +362,20 @@ fn seed_claude_store(storage: &Path, name: &str, refresh: &str) {
 
 /// The seal PUBLIC key the lender minted when it opened its store — the on-chain
 /// anchor the executing node pins. Self-host has no quote.
+/// Give a node's workspace a work-admission policy admitting `account`.
+///
+/// Written as the FILE, not through the writer: an integration test should pin
+/// the on-disk contract the operator (and `ducktape node work admit`) produces,
+/// not a second copy of the producer. The daemon re-reads it on every decision,
+/// so this lands with no restart — which is itself part of what the test proves.
+fn admit_work_from(workspace: &Path, account: &[u8]) {
+    std::fs::write(
+        workspace.join("work-admit.toml"),
+        format!("admit = [\"{}\"]\n", common::hex(account)),
+    )
+    .expect("write work-admit.toml");
+}
+
 fn seal_pk_from_store(storage: &Path) -> [u8; 32] {
     let bytes = std::fs::read(storage.join("airlock-creds").join("seal.key")).expect("seal.key");
     let secret: [u8; 32] = bytes.as_slice().try_into().expect("32-byte seal secret");
@@ -918,6 +932,38 @@ fn a_delegated_run_draws_as_the_executing_node_not_the_submitter() {
     poll_until("the credential record to commit", FINALIZE, || {
         credential_record(&cluster, 1)
     });
+
+    // ---- DIRECTION 0: the executor does not run this submitter's work ------
+    //
+    // TWO consents in opposite directions, and this is the first: before the
+    // lender is ever dialled, node 1 decides whether it runs node 0's work at
+    // all. Its default is owner-only and these are two accounts, so the run is
+    // refused HERE — no container, no gateway hop, no session. Without this
+    // step the credential lane below is not even reachable.
+    let unadmitted_id = "sched\u{1f}sched-delegated-unadmitted";
+    submit_sched(&cluster, 0, unadmitted_id, &executor_node, 1);
+    let view = wait_terminal(&cluster, 0, unadmitted_id, ROUND_TRIP);
+    assert_eq!(
+        view.status,
+        SagaStatus::Failed,
+        "a node that does not admit the submitter's account runs nothing for it\n{}",
+        cluster.all_log_tails(120),
+    );
+    assert!(
+        view.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("work_not_admitted"),
+        "the EXECUTOR's own admission refuses first, and says so: {:?}",
+        view.error,
+    );
+
+    // ---- the admission, on the EXECUTOR, for the SUBMITTER's account -------
+    //
+    // The opposite direction from the grant below: this is node 1 saying whose
+    // work it will run, not node 0 saying who may draw on its credential. No
+    // restart — the policy is re-read on every decision.
+    admit_work_from(&cluster.workspace(1), owner.public_key().as_ref());
 
     // ---- DIRECTION 1: the executor is not granted -------------------------
     //

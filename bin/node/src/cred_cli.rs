@@ -782,7 +782,7 @@ fn query_owner_account_view(
 
 /// Resolve a grant target: a hex account id used directly, else a display name
 /// matched against the account set (ambiguity and absence are loud errors).
-fn resolve_account(base: &str, input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+pub(crate) fn resolve_account(base: &str, input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     if let Ok(bytes) = config::unhex(input) {
         return Ok(bytes);
     }

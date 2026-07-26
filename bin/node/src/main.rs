@@ -100,6 +100,7 @@ mod util;
 mod validator;
 mod voice;
 mod voice_plane;
+mod work_admission;
 use crate::util::fatal;
 use config::Resolved;
 #[cfg(test)]
