@@ -933,18 +933,23 @@ view
           space w=1.0 h=1.0
         col w=fill h=fill p=18.0 gap=11.0
           if empty(forge_repos)
-            EmptyState title="No repos" description="Consensus-backed repos appear here once created."
+            EmptyPlate message="No repos — a consensus-backed repo appears here once it is created."
           if !empty(forge_repos) && empty(forge_repo)
             scroll dir=vertical w=fill h=fill
-              col w=fill gap=2.0
+              grid min-cell=380.0 gap=13.0
                 for repo in forge_repos
-                  button label="Open repo" w=fill p=8.0 @ghost_action -> forge_open_repo(repo.name)
-                    row w=fill h=fill gap=8.0 align=center
-                      text repo.name w=fill size=13.0 wrap=none font=medium @text-fg
-                      text repo.head size=12.0 wrap=none font=code @text-muted
-                    active bg=muted_bg text=fg border=fg/8 border-w=1.0 r=9.0
-                    hovered bg=row_hover text=fg
-                    pressed bg=accent
+                  button label="Open repo" description=repo.name w=fill p=0.0 @icon_action -> forge_open_repo(repo.name)
+                    box w=fill pl=17.0 pr=17.0 pt=15.0 pb=15.0
+                      col w=fill gap=7.0
+                        row w=fill gap=8.0 align=center
+                          Icon name="branch" tone="mono" px=14.0
+                          text repo.name w=fill size=14.0 wrap=none font=display @text-primary
+                        row w=fill gap=14.0 align=center
+                          text repo.head w=fill size=10.5 wrap=none font=code_medium @text-input
+                          text "open" size=10.5 wrap=none font=code_medium @text-label
+                    active bg=surface text=fg border=card_line border-w=1.0 r=13.0
+                    hovered bg=row_hover text=fg border=control_line
+                    pressed bg=elevated text=fg
           if !empty(forge_repo) && forge_item_number <= 0
             col w=fill h=fill gap=6.0
               if !empty(forge_branches)
