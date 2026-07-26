@@ -544,7 +544,16 @@ pub async fn list(
     let signaling = handle.services().live(Instant::now());
     (
         axum::http::StatusCode::OK,
-        axum::Json(serde_json::json!({ "signaling": signaling })),
+        // the NODE's own stamp, beside the daemons it is describing. `service
+        // status` renders "(this node: …)" from this field and must not read
+        // its own [`build_identity_or_unknown`]: that constant belongs to
+        // whichever binary the operator happened to type, which is routinely
+        // not the one running the node — it named a build the node was not
+        // running and called an in-step daemon skewed.
+        axum::Json(serde_json::json!({
+            "signaling": signaling,
+            "build": build_identity_or_unknown(),
+        })),
     )
         .into_response()
 }
@@ -803,9 +812,13 @@ mod build_is_metadata_not_a_gate {
              interactive plane"
         );
 
-        // this file DEFINES the stamp and `hello` RENDERS it, so its rule is an
-        // allowlist. It reads only the shipping half, which is also what keeps
-        // the literals below from matching themselves.
+        // this file DEFINES the stamp and RENDERS it twice — in `hello`'s OK
+        // body and in the `/v1/services` catalog document — so its rule is an
+        // allowlist. Both renders are the same act: handing this node's own
+        // stamp to a caller that would otherwise substitute its own (the CLI's
+        // `service status` did exactly that, and named the wrong build). It
+        // reads only the shipping half, which is also what keeps the literals
+        // below from matching themselves.
         assert_eq!(
             lines_naming_the_stamp(&shipping_half(file!())),
             [
@@ -813,6 +826,7 @@ mod build_is_metadata_not_a_gate {
                 r#"option_env!("DUCKTAPE_BUILD").filter(|id| !id.is_empty())"#,
                 "pub fn build_identity_or_unknown() -> &'static str {",
                 "build_identity().unwrap_or(UNKNOWN_BUILD)",
+                r#""build": build_identity_or_unknown(),"#,
                 r#""build": build_identity_or_unknown(),"#,
             ],
             "the stamp is DEFINED and RENDERED here and read nowhere else — a new \

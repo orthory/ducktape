@@ -68,16 +68,18 @@ pub(crate) struct Agent {
 /// Serve until the process is stopped. Returns only on a fatal
 /// misconfiguration — a node that is merely down is retried forever, because
 /// that is an operational state, not an error.
+///
+/// Through [`crate::services::serve_until_stopped`], which owns the runtime and
+/// arms SIGTERM/SIGINT before a line of this daemon runs: the `podman system
+/// service` started below must never outlive the process that started it.
 pub(crate) fn serve(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
-    // each session's pump and reaper is its own task, and a pty read must not
-    // wait behind a container teardown on another session's thread.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(run(agent))
+    crate::services::serve_until_stopped(std::future::pending(), |stop| run(agent, stop))
 }
 
-async fn run(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    agent: Agent,
+    stop: crate::services::Stop,
+) -> Result<(), Box<dyn std::error::Error>> {
     let Agent {
         grant,
         service,
@@ -95,18 +97,24 @@ async fn run(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
     // the service child.
     let self_exe = std::env::current_exe()
         .map_err(|error| format!("cannot resolve this daemon's own executable: {error}"))?;
-    let _podman = provider_host::PodmanService::start_for(
+    let podman = provider_host::PodmanService::start_for(
         &backend,
         &crate::services::podman_data_dir(&service, &grant.kind),
         &self_exe,
     )
     .await?;
-    reap(&backend, &grant).await;
+    // whatever still carries this instance's label got here through a death
+    // that ran no code — the stop path leaves none — and is destroyed, never
+    // resumed. See [`crate::services::Sweep`].
+    crate::services::sweep_own_containers(&backend, &grant, crate::services::Sweep::CrashOrphans)
+        .await;
 
     let providers = agent_service::discover(
         &node_key,
         provider_host::AgentDirs::under(&service.storage_dir),
-        backend,
+        // cloned: `discover` consumes the backend, and the teardown below needs
+        // the same socket to sweep this instance's containers through.
+        backend.clone(),
         &grant.display_id(),
     )?;
     let offered = providers.capabilities().len();
@@ -127,46 +135,52 @@ async fn run(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
         "agent daemon serving"
     );
 
-    // the link never returns: a dropped socket is ordinary (the node restarts,
-    // the operator upgrades) and is redialed forever.
-    link::attach(ws_url(&http_base), workspace, sessions, event_rx).await;
+    // the link never returns on its own: a dropped socket is ordinary (the node
+    // restarts, the operator upgrades) and is redialed forever. A stop is what
+    // ends this daemon — an attached session dies with the process either way,
+    // and its container is taken down by the teardown below rather than left
+    // running under a service that is about to go.
+    tokio::select! {
+        () = link::attach(ws_url(&http_base), workspace, sessions, event_rx) => {}
+        () = stop => {}
+    }
+    stop_sandbox(podman, &backend, &grant).await;
     Ok(())
 }
 
-/// Adopt this instance's crash orphans.
+/// Tear the sandbox down, containers FIRST.
 ///
-/// A daemon that crashed mid-session left containers behind; it returns with the
-/// SAME `agent#hex8` (the id is the grant hash and the grant persists in
-/// `services.toml`) and so can recognise them as its own. That re-adoption
-/// across a restart is exactly why the id must survive one.
+/// Order is the whole point. Killing the `podman system service` does not stop
+/// what it created: each session container's conmon is its own parent, ignores
+/// SIGTERM, and would keep the session alive under a service that no longer
+/// exists. So this instance's containers are REMOVED here rather than left for
+/// the next start's reaper — over the socket that is still answering right now,
+/// which is the only instrument that reaches them — and only then does the
+/// service child go. Leaving them would mean a stopped daemon still holding a
+/// pty's container and a graph root until something happened to start that kind
+/// again, which on a torn-down workspace is never.
 ///
-/// ONE sweep, and no retired-label arm: this daemon's own graph root is private,
-/// so a pre-carve `node-term` container lives in the node's OLD root and is not
-/// enumerable through this socket at all. It is unreachable by construction, not
-/// pending cleanup.
-///
-/// Best-effort: a reap failure is a log line, never a boot failure.
-async fn reap(backend: &provider_host::SandboxBackend, grant: &ServiceGrant) {
-    let provider_host::SandboxBackend::Podman { socket, .. } = backend else {
-        // Tart clones and deletes a VM per session; there is no label to reap.
+/// SIGKILL still leaves both behind, and nothing here can change that: the
+/// answer there is the next start of the same kind, where `PodmanService::claim`
+/// reaps the podman service under a root nobody holds any more and the boot
+/// sweep destroys the containers.
+async fn stop_sandbox(
+    podman: Option<provider_host::PodmanService>,
+    backend: &provider_host::SandboxBackend,
+    grant: &ServiceGrant,
+) {
+    crate::services::sweep_own_containers(backend, grant, crate::services::Sweep::Teardown).await;
+    let Some(service) = podman else {
+        // a non-Podman backend started no service (Tart deletes its VM per
+        // session).
         return;
     };
-    match provider_host::reap_by_label(socket, &provider_host::managed_label(&grant.display_id()))
-        .await
-    {
-        Ok(0) => {}
-        Ok(removed) => tracing::info!(
-            target: "ducktape::service",
-            removed,
-            reason = "own_orphans",
-            "reaped orphaned session containers"
-        ),
-        Err(error) => tracing::warn!(
-            target: "ducktape::service",
-            reason = "reap_failed",
-            "could not sweep session containers: {error}"
-        ),
-    }
+    service.shutdown().await;
+    tracing::info!(
+        target: "ducktape::service",
+        instance = %grant.display_id(),
+        "agent daemon stopped"
+    );
 }
 
 /// `http(s)://host:port` → `ws(s)://host:port/v1/ws`.
