@@ -87,7 +87,6 @@ mod reachability_plane_tests;
 mod relay;
 mod relay_runtime;
 mod replica;
-mod resident_announce;
 mod resource_limits;
 mod rpc;
 mod services;

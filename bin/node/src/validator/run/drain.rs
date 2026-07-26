@@ -64,6 +64,7 @@ impl ValidatorRuntime<'_> {
             pending_relays,
             pending_gates,
             gating,
+            announcer,
             validator_relay,
             last_published,
             blocks_since_checkpoint,
@@ -276,16 +277,46 @@ impl ValidatorRuntime<'_> {
                     false,
                 );
             }
+            // this node's OWN capability announce — the resident tier's twin of
+            // this route is the relay Reply in `replica::park`. An internal
+            // submit enters no hold map, so without this its consensus fate
+            // falls straight through the `continue` below, and a REJECTED
+            // announce leaves the decision core latched on a pair the registry
+            // never took: the offered set has not changed, so every later tick
+            // matches the latch and stays quiet, and the node announces nothing
+            // again EVER.
+            if let Some(applied) =
+                announcer.on_outcome(&d.id, d.disposition == node::Disposition::Applied)
+            {
+                match applied {
+                    true => tracing::info!(
+                        target: "ducktape::modules",
+                        node = %label,
+                        height = d.height,
+                        capabilities = ?announcer.offered(),
+                        "capabilities announced"
+                    ),
+                    false => tracing::warn!(
+                        target: "ducktape::modules",
+                        node = %label,
+                        height = d.height,
+                        reason = "capability_announce_rejected",
+                        detail = %d.reason.as_deref().unwrap_or("deterministic_no_op"),
+                        "capability announce did not apply; retrying"
+                    ),
+                }
+            }
             // BEFORE the pending_submits lookup, deliberately. An op rejected in
             // consensus produced no record ANYWHERE: the submitter's own log says
             // SUCCESS (the submit was accepted) while the state machine says NO.
             //
-            // and the internal submits — oracle results, capability announces,
-            // upgrade readiness, code-ready signals — are fire-and-forget and never
-            // enter `pending_submits` at all, so the `continue` below swallows their
+            // and the internal submits — oracle results, upgrade readiness,
+            // code-ready signals — are fire-and-forget and never enter
+            // `pending_submits` at all, so the `continue` below swallows their
             // rejection whole. That is exactly how an announcer that latches on
             // submit-Ok wedges FOREVER: silently out of every rendezvous pool, the
-            // upgrade stuck at R<n, and nothing anywhere saying why.
+            // upgrade stuck at R<n, and nothing anywhere saying why. The capability
+            // announce is routed above; the rest still are not.
             let module = d.op.as_ref().map_or("system", |op| op.target.as_str());
             // the idle-chain NOP filler is rejected BY DESIGN — it targets a module
             // that deliberately does not exist. warning on it would fire every block
@@ -1159,23 +1190,30 @@ impl ValidatorRuntime<'_> {
             announcer,
             ..
         } = self;
+        let now = std::time::Instant::now();
         if orchestrator
                 .current_members()
                 .contains(&signer.public_key())
-            && let Some(msg) = announcer.maybe_announce(node.host()).await
+            && let Some(msg) = announcer.maybe_announce(node.host(), now).await
         {
             let seq = *next_seq;
             *next_seq += 1;
             match node.submit(signer, seq, msg).await {
-                Ok(_) => tracing::info!(
-                    target: "ducktape::modules",
-                    node = %label,
-                    capabilities = ?announcer.offered(),
-                    "capabilities announced"
-                ),
+                // SUBMITTED, not announced: the registry has agreed to nothing
+                // yet. Latch the frame so the drain can route its consensus
+                // fate back here, and say so at debug — the info line belongs
+                // on the APPLIED outcome, where it is true.
+                Ok(id) => {
+                    announcer.sent(id, now);
+                    tracing::debug!(
+                        target: "ducktape::modules",
+                        node = %label,
+                        "capability announce submitted"
+                    );
+                }
                 Err(e) => {
                     // un-latch so a transient submit failure retries.
-                    announcer.announced = None;
+                    announcer.submit_failed();
                     tracing::debug!(
                         target: "ducktape::modules",
                         node = %label,

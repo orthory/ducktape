@@ -26,7 +26,7 @@ use crate::host_state::{SyncSubstrates, restore_host, sync_all_modules};
 use crate::relay;
 use crate::relay_runtime;
 use crate::replica;
-use crate::resident_announce;
+use crate::validator::announce::CapabilityAnnouncer;
 use crate::rpc::{JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
 use crate::sync::catchup::{PostRebootCatchupError, catch_up_post_reboot_frames};
 use crate::sync::serve::{
@@ -665,9 +665,11 @@ pub(super) async fn park(
     });
     // ---- the RESIDENT-tier pumps -----------------------------------
     //
-    // the state-driven twin of the validator loop's announce pump, adapted to a
-    // node that installs boundaries instead of executing blocks (see
-    // resident_announce.rs). There is no resident dispatch pump any more: the
+    // the SAME announce pump the validator loop drives, adapted to a node that
+    // installs boundaries instead of executing blocks: it decides from committed
+    // state, latches the submitted frame, and un-latches on a non-applied fate —
+    // one copy, so a wedge fixed on one tier cannot survive on the other. There
+    // is no resident dispatch pump any more: the
     // compute daemon serves this node's assigned work and its announcements
     // over /v1, on both tiers alike.
     //
@@ -678,7 +680,7 @@ pub(super) async fn park(
     // which serves a resident's committed queries and relays its submits
     // exactly as it does for any other local client. What is left here is the
     // announce, and its offered half now comes from the daemon's live hello.
-    let mut resident_announcer = resident_announce::ResidentAnnouncer::new(
+    let mut resident_announcer = CapabilityAnnouncer::new(
         me_bytes.clone(),
         grant_workspace,
         services,
@@ -945,12 +947,12 @@ pub(super) async fn park(
                         // resident-owned capability announce pump.
                         let applied =
                             matches!(outcome, relay::RelayOutcome::Applied { .. });
-                        if let Some(ok) = resident_announcer.on_reply(&frame_id, applied) {
+                        if let Some(ok) = resident_announcer.on_outcome(&frame_id, applied) {
                             if ok {
                                 tracing::info!(
                                     target: "ducktape::modules",
                                     node = %label,
-                                    capabilities = ?resident_announcer.capabilities(),
+                                    capabilities = ?resident_announcer.offered(),
                                     "resident: announced capabilities"
                                 );
                             } else {
@@ -2089,12 +2091,12 @@ pub(super) async fn park(
                                 tracing::info!(
                                     target: "ducktape::modules",
                                     node = %label,
-                                    capabilities = ?resident_announcer.capabilities(),
+                                    capabilities = ?resident_announcer.offered(),
                                     "resident: capability announce relayed"
                                 );
                             }
                             Err(e) => {
-                                resident_announcer.send_failed();
+                                resident_announcer.submit_failed();
                                 tracing::warn!(
                                     target: "ducktape::modules",
                                     node = %label,
