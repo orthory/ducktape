@@ -73,11 +73,14 @@ component CrumbBar(path:str, dirs:i64, files:i64)
           text dirs size=11.0 wrap=none font=code @text-hint
           text "dirs" size=11.0 wrap=none font=code @text-hint
         space w=fill
-        // duckfs write authority, stated in full rather than per-path: the
-        // module's own home tree, the shared tree, and nothing else
-        // (crates/duckfs/core/src/paths.rs check_authority). A path prefix test
-        // is not expressible here, and one honest rule beats a guessed branch.
-        text "writes · /home/<module-id> by that module · /shared by any member" size=10.5 wrap=none @text-meta
+        // duckfs write authority, stated in full rather than per-path, in the
+        // terms check_authority actually uses (crates/duckfs/core/src/paths.rs).
+        // The owner segment is an ACTOR string — a module id for a module, and
+        // `ext:<key>` for the person writing from this app — so a member does
+        // own a home tree. Both roots reject a write on their own. A path
+        // prefix test is not expressible here, and one honest rule beats a
+        // guessed branch.
+        text "writes · /home/<owner>/** by that owner · /shared/** by any member · roots not writable" size=10.5 wrap=none @text-meta
     box w=fill h=1.0 bg=separator
       space w=1.0 h=1.0
 
@@ -119,25 +122,36 @@ component ObjectRow(entry:FsEntry, selected:bool)
     box w=fill h=1.0 bg=muted_bg
       space w=1.0 h=1.0
 
-// The row's contents. A directory has neither a size worth printing nor a
-// content address, so both machine columns read as an em dash rather than as
-// `0 B` and an empty cell.
+// The row's contents. A directory's SIZE reads as an em dash because
+// `EntryInfo.size` is a CHILD COUNT for a directory, not bytes (duckfs
+// tree.rs) — `3 B` would be a lie. Its OBJECT is a real value and is shown: a
+// directory's id is its TreeObj digest.
+//
+// EVERY CELL IS CLIPPED. iced has no text-overflow:ellipsis, so a `wrap=none`
+// run wider than its column paints straight over its neighbours — a full
+// blake3 hex is ~420px of glyphs pinned at a 92px right edge, which walked
+// across SIZE and the file name on every row. The clip box is the column; the
+// text fills it.
 component ObjectRowFace(entry:FsEntry)
-  row #root w=fill gap=12.0 align=center px=20.0 py=11.0
-    row w=fill gap=9.0 align=center
+  row #root w=fill gap=12.0 align=center px=20.0 py=11.0 clip=true
+    row w=fill gap=9.0 align=center clip=true
       if entry.kind == "dir"
         Icon name="folder" tone="warning" px=16.0
       if entry.kind != "dir"
         Icon name="file" tone="label" px=16.0
       text entry.name w=fill size=12.5 wrap=none font=code_medium @text-accent_fg
-    if entry.kind == "dir"
-      text "—" w=72.0 align-x=right size=11.0 wrap=none font=code @text-input
-    if entry.kind != "dir"
-      text size_label(entry.size) w=72.0 align-x=right size=11.0 wrap=none font=code @text-input
-    if empty(entry.object)
-      text "—" w=92.0 align-x=right size=11.0 wrap=none font=code @text-hint
-    if !empty(entry.object)
-      text entry.object w=92.0 align-x=right size=11.0 wrap=none font=code @text-hint
+    box w=72.0 clip=true
+      col w=fill
+        if entry.kind == "dir"
+          text "—" w=fill align-x=right size=11.0 wrap=none font=code @text-input
+        if entry.kind != "dir"
+          text size_label(entry.size) w=fill align-x=right size=11.0 wrap=none font=code @text-input
+    box w=92.0 clip=true
+      col w=fill
+        if empty(entry.object)
+          text "—" w=fill align-x=right size=11.0 wrap=none font=code @text-hint
+        if !empty(entry.object)
+          text entry.object w=fill align-x=right size=11.0 wrap=none font=code @text-hint
 
 // The 306px object panel: identity, then the machine values behind it. The
 // artifact's kind chip is an uppercased file extension; Ice cannot split a
@@ -166,6 +180,8 @@ component ObjectPanel(entry:FsEntry)
             box w=fill pt=4.0
               text entry.path w=fill size=10.5 font=code @text-hint
             col w=fill gap=7.0 pt=14.0
+              // a directory has a tree digest too, so this arm is only the
+              // defensive default for a reply that omitted the field
               if empty(entry.object)
                 ObjectFact label="object id" value="—"
               if !empty(entry.object)
@@ -176,9 +192,11 @@ component ObjectPanel(entry:FsEntry)
                 ObjectFact label="size" value=size_label(entry.size)
 
 // One machine value, in the artifact's own r8 pill rather than the app's
-// `KeyValueRow` — the pills are separate outlines, not a divided card.
+// `KeyValueRow` — the pills are separate outlines, not a divided card. Clipped
+// for the same reason the table cells are: a 64-hex object id is wider than
+// this 306px panel and would otherwise paint outside the pill's own border.
 component ObjectFact(label:str, value:str)
-  box #root w=fill px=12.0 py=9.0 border=card_line border-w=1.0 r=8.0
+  box #root w=fill px=12.0 py=9.0 border=card_line border-w=1.0 r=8.0 clip=true
     row w=fill gap=10.0 align=center
       text label size=11.0 wrap=none font=code @text-meta
       space w=fill
@@ -188,14 +206,17 @@ component ObjectFact(label:str, value:str)
 // because where a hit opens is the screen's decision, so `view.ice` wraps this
 // in the button that navigates.
 component ExplorerCard(hit:ExplorerHit)
-  box #root w=fill px=15.0 py=13.0 bg=surface border=separator border-w=1.0 r=11.0
+  box #root w=fill px=15.0 py=13.0 bg=surface border=separator border-w=1.0 r=11.0 clip=true
     row w=fill gap=12.0 align=start
       ExplorerKindPlate kind=hit.kind code=hit.code
       col w=fill gap=3.0
         row w=fill gap=8.0 align=center
           text hit.title w=fill size=13.0 wrap=none font=display @text-primary
           ExplorerKindBadge kind=hit.kind
-        text hit.snippet w=fill size=12.0 wrap=none line-h=1.5 @text-input
+        // the snippet is raw message/page body of any length — it wraps, the
+        // same way chat's own search hits do. The title and meta stay single
+        // runs and are held inside the card by the clip.
+        text hit.snippet w=fill size=12.0 wrap=word line-h=1.5 @text-input
         text hit.meta w=fill size=10.5 wrap=none font=code @text-label
 
 // The 28px mono plate. Kind reads before the text does: one ink and one wash
