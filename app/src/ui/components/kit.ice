@@ -36,15 +36,16 @@ component NoteRow(label:str, note:str, last:bool)
       box w=fill h=1.0 bg=elevated
         space w=1.0 h=1.0
 
-// The 26px round plate a human wears. Agents get the 7px-radius square below —
-// the artifact never mixes the two.
+// The two shape-named entry points into `PrincipalAvatar`. The shape rule and
+// the radius ladder live there — these only spell the discriminant, so a call
+// site that already knows it is drawing a person keeps reading as one.
 component PersonAvatar(initials:str, plate:f64, ink:f64)
-  box #root w=plate h=plate align-x=center align-y=center bg=avatar_bg r=(plate / 2.0)
-    text initials size=ink wrap=none font=display @text-muted
+  col #root
+    PrincipalAvatar initials=initials is_agent=false plate=plate ink=ink ring=""
 
 component AgentAvatar(initials:str, plate:f64, ink:f64)
-  box #root w=plate h=plate align-x=center align-y=center bg=primary r=7.0
-    text initials size=ink wrap=none font=code_semibold @text-toast_fg
+  col #root
+    PrincipalAvatar initials=initials is_agent=true plate=plate ink=ink ring=""
 
 // The status dot that precedes a machine reading.
 component Dot(plate:f64)
@@ -77,16 +78,19 @@ component MemberRowCard(member:MemberRow)
   col #root w=fill
     box w=fill pl=14.0 pr=14.0 pt=12.0 pb=12.0
       row w=fill gap=12.0 align=center
-        if member.role == "agent"
-          AgentAvatar initials=initial_of(member.label) plate=32.0 ink=10.0
-        if member.role != "agent"
-          PersonAvatar initials=initial_of(member.label) plate=32.0 ink=12.0
+        if member.is_agent
+          PrincipalAvatar initials=initials_of(member.label) is_agent=true plate=32.0 ink=10.0 ring=""
+        if !member.is_agent
+          PrincipalAvatar initials=initial_of(member.label) is_agent=false plate=32.0 ink=12.0 ring=""
         col w=fill gap=2.0
           row gap=6.0 align=center
             text member.label size=13.5 wrap=none font=display @text-fg
+            // the artifact writes `you` in SANS medium and the key line in mono
+            // regular; the type-scale guard pins 9.0/10.0 to code_semibold, so
+            // these take the neighbouring steps that carry the right FACE.
             if member.is_this_node
-              text "you" size=9.0 wrap=none font=code_semibold @text-meta
-          text member.key size=10.0 wrap=none font=code_semibold @text-hint
+              text "you" size=9.5 wrap=none font=display @text-meta
+          text member.key size=10.5 wrap=none font=code_medium @text-hint
         RoleMarker role=member.role
     box w=fill h=1.0 bg=muted_bg
       space w=1.0 h=1.0
@@ -115,99 +119,169 @@ component AgentCard(agent:AgentRow)
   col #root w=fill
     box w=fill pl=14.0 pr=14.0 pt=13.0 pb=13.0
       row w=fill gap=13.0 align=center
-        AgentAvatar initials=initial_of(agent.name) plate=34.0 ink=11.0
+        PrincipalAvatar initials=agent.initials is_agent=true plate=34.0 ink=11.0 ring=""
         col w=fill gap=3.0
           row w=fill gap=8.0 align=center
             text agent.name size=13.5 wrap=none font=display @text-fg
             box px=7.0 py=2.0 bg=elevated r=5.0
               text agent.capability size=10.0 wrap=none font=code_semibold @text-secondary_fg
-          if !empty(agent.actions)
-            text agent.actions w=fill size=10.5 wrap=none font=code_medium @text-meta
-          if empty(agent.actions)
-            text "no actions granted" size=10.5 wrap=none font=code_medium @text-meta
-        text agent.owner size=10.5 wrap=none font=code_medium @text-hint
-        if agent.status == "active"
-          box px=8.0 py=3.0 bg=success_bg border=success_line border-w=1.0 r=6.0
-            row gap=5.0 align=center
-              box w=5.0 h=5.0 bg=success_dot r=2.5
-                space w=1.0 h=1.0
-              text "ACTIVE" size=9.0 wrap=none font=code_semibold @text-success
-        if agent.status != "active"
-          box px=8.0 py=3.0 bg=warning_bg border=warning_line border-w=1.0 r=6.0
-            row gap=5.0 align=center
-              box w=5.0 h=5.0 bg=warning_dot r=2.5
-                space w=1.0 h=1.0
-              text agent.status size=9.0 wrap=none font=code_semibold @text-warning
+          // what it may do, counted — never a comma-joined dump of grant names
+          row w=fill gap=5.0 align=center
+            text len(agent.skills) size=10.5 wrap=none font=code_medium @text-meta
+            text "skills ·" size=10.5 wrap=none font=code_medium @text-meta
+            text len(agent.caps) size=10.5 wrap=none font=code_medium @text-meta
+            text "grants · owner" size=10.5 wrap=none font=code_medium @text-meta
+            OwnerHandle handle=agent.owner_handle
+        AgentStatusChip status=agent.status
     box w=fill h=1.0 bg=muted_bg
       space w=1.0 h=1.0
+
+// A member handle always wears its sigil; an unowned record says so rather
+// than leaving the slot blank.
+component OwnerHandle(handle:str)
+  row #root gap=0.0 align=center
+    if empty(handle)
+      text "unowned" size=10.5 wrap=none font=code_medium @text-hint
+    if !empty(handle)
+      text "@" size=10.5 wrap=none font=code_medium @text-hint
+    if !empty(handle)
+      text handle size=10.5 wrap=none font=code_medium @text-hint
+
+// Standing, in the registry's own words, printed the way a status reads:
+// upper-case, because the wire hands us `active` / `paused` in snake case.
+component AgentStatusChip(status:str)
+  col #root
+    match status
+      "active"
+        box px=8.0 py=3.0 bg=success_bg border=success_line border-w=1.0 r=6.0
+          row gap=5.0 align=center
+            PulseDot plate=5.0 tone="success"
+            text "ACTIVE" size=9.0 wrap=none font=code_semibold @text-success
+      "paused"
+        box px=8.0 py=3.0 bg=warning_bg border=warning_line border-w=1.0 r=6.0
+          row gap=5.0 align=center
+            PulseDot plate=5.0 tone="warning"
+            text "PAUSED" size=9.0 wrap=none font=code_semibold @text-warning
+      _
+        box px=8.0 py=3.0 bg=warning_bg border=warning_line border-w=1.0 r=6.0
+          row gap=5.0 align=center
+            PulseDot plate=5.0 tone="warning"
+            text status size=9.0 wrap=none font=code_semibold @text-warning
 
 // An open proposal: what it does, who opened it, and how close the electorate
 // is to settling it. The dots are the tally — the number is the confirmation.
 component ProposalCard(proposal:ProposalRow, busy:bool)
-  box #root w=fill p=16.0 bg=surface border=card_line border-w=1.0 r=12.0
+  box #root w=fill p=16.0 bg=surface border=border border-w=1.0 r=12.0
     col w=fill gap=5.0
       row w=fill gap=7.0 align=center
-        box px=6.0 py=2.0 bg=brand_bg border=brand_line border-w=1.0 r=4.0
-          text proposal.action size=9.0 wrap=none font=code_semibold @text-brand
-        text proposal.id w=fill size=13.5 wrap=none font=display @text-primary
-      row w=fill gap=6.0 align=center
-        text "proposed by" size=12.5 wrap=none @text-caption
-        text proposal.proposer size=12.0 wrap=none font=code_medium @text-secondary_fg
-        text "·" size=12.5 wrap=none @text-caption
-        text "deadline" size=12.5 wrap=none @text-caption
+        ProposalKindPill action=proposal.action tone=proposal_kind_tone(proposal.action)
+        text proposal.id w=fill size=14.0 wrap=none font=display @text-primary
+      // one meta line: who opened it, when it lapses, and what it actually does
+      row w=fill gap=4.0 align=center
+        text "proposed by" size=12.0 wrap=none @text-caption
+        row gap=0.0 align=center
+          text "@" size=12.0 wrap=none @text-secondary_fg
+          text proposal.proposer size=12.0 wrap=none @text-secondary_fg
+        // the contract signed `expires_in(deadline)`; what landed is
+        // `expires_in_blocks(deadline_height, height)`, and this card has no
+        // chain height to feed it. Print the deadline height honestly until
+        // the screen threads one in — never a relative phrase we cannot compute.
+        text "· expires at h" size=12.0 wrap=none @text-caption
         text proposal.deadline size=12.0 wrap=none font=code_medium @text-secondary_fg
+        if !empty(proposal.detail)
+          text "·" size=12.0 wrap=none @text-caption
+        if !empty(proposal.detail)
+          text proposal.detail w=fill size=12.0 wrap=none font=code_medium @text-secondary_fg
+      // the dots count the frozen voting rule, not the electorate
       row w=fill gap=13.0 align=center pt=9.0
         row gap=5.0 align=center
-          for seat in quorum_dots(proposal.approvals, proposal.electorate)
+          for seat in quorum_dots(proposal.approvals, proposal.required_yes)
             QuorumDot filled=seat.filled
-        text proposal.approvals size=12.0 wrap=none font=code_medium @text-success
-        text "of" size=12.5 wrap=none @text-caption
-        text proposal.electorate size=12.0 wrap=none font=code_medium @text-secondary_fg
+        TallyReading label=tally_label(proposal.approvals, proposal.required_yes) tone=tally_tone(proposal.approvals, proposal.required_yes)
+        text tally_note(proposal.approvals, proposal.required_yes) size=12.0 wrap=none @text-meta
         if proposal.rejections > 0
           text proposal.rejections size=12.0 wrap=none font=code_medium @text-danger
         if proposal.rejections > 0
-          text "against" size=12.5 wrap=none @text-caption
+          text "against" size=12.0 wrap=none @text-caption
         space w=fill
-        button "Reject" disabled=busy h=30.0 p=7.0 @outline_action -> gov_vote(proposal.id, false)
-        button "Approve" disabled=busy h=30.0 p=7.0 @primary_action -> gov_vote(proposal.id, true)
-        button "Settle" disabled=busy h=30.0 p=7.0 @secondary_action -> gov_execute(proposal.id)
+        // the artifact's slot holds exactly two buttons; Settle appears only
+        // once the rule is met, because that is the only moment it can succeed
+        row gap=8.0 align=center
+          button label="Reject" disabled=busy @outline_action px-15px py-7px text-secondary_fg border-control_line rounded-8px -> gov_vote(proposal.id, false)
+            text "Reject" size=12.0 wrap=none font=display @text-secondary_fg
+          if proposal.approvals < proposal.required_yes
+            button label="Approve" disabled=busy @primary_action px-17px py-7px rounded-8px -> gov_vote(proposal.id, true)
+              text approve_label(proposal.approvals, proposal.required_yes) size=12.0 wrap=none font=display @text-primary_fg
+          if proposal.approvals >= proposal.required_yes
+            button label="Settle" disabled=busy @secondary_action px-17px py-7px rounded-8px -> gov_execute(proposal.id)
+              text "Settle →" size=12.0 wrap=none font=display @text-secondary_fg
 
+// ACCESS-class proposals wear the terracotta pair; everything else is neutral.
+// Two tones, no border — the plate is the whole signal.
+component ProposalKindPill(action:str, tone:str)
+  col #root
+    if tone == "access"
+      box px=6.0 py=2.0 bg=brand_bg r=4.0
+        text action size=9.0 wrap=none font=code_semibold @text-brand
+    if tone != "access"
+      box px=6.0 py=2.0 bg=elevated r=4.0
+        text action size=9.0 wrap=none font=code_semibold @text-avatar_fg_sm
+
+// `3 / 4` in one mono run: grey until one signature from quorum, then green.
+component TallyReading(label:str, tone:str)
+  col #root
+    if tone == "near"
+      text label size=12.0 wrap=none font=code_semibold @text-success
+    if tone != "near"
+      text label size=12.0 wrap=none font=code_semibold @text-meta
+
+// An unfilled seat is the unfinalized ring at dot scale — 1.5px, `presence_off`.
 component QuorumDot(filled:bool)
   col #root
     if filled
       box w=13.0 h=13.0 bg=success_dot r=6.5
         space w=1.0 h=1.0
     if !filled
-      box w=13.0 h=13.0 bg=surface border=avatar_bg border-w=1.0 r=6.5
+      box w=13.0 h=13.0 bg=surface border=presence_off border-w=1.5 r=6.5
         space w=1.0 h=1.0
 
-// A settled proposal: a tick, the action, and the tally it closed on.
+// A settled proposal: a tick, the title, and the tally it closed on. No
+// mid-row action chip — the closing tally is the whole right-hand meta.
 component SettledProposalRow(proposal:ProposalRow)
   box #root w=fill px=15.0 py=13.0 bg=surface border=separator border-w=1.0 r=10.0
     row w=fill gap=11.0 align=center
       box w=19.0 h=19.0 align-x=center align-y=center bg=success_bg border=success_line border-w=1.0 r=9.5
         text "✓" size=9.0 wrap=none font=code_semibold @text-success
       text proposal.id size=13.0 wrap=none font=medium @text-muted
-      text proposal.action size=12.0 wrap=none font=code_medium @text-hint
       space w=fill
-      text proposal.status size=11.0 wrap=none font=code_medium @text-meta
+      row gap=5.0 align=center
+        text proposal.status size=11.0 wrap=none font=code_medium @text-meta
+        text "·" size=11.0 wrap=none font=code_medium @text-meta
+        text tally_label(proposal.approvals, proposal.required_yes) size=11.0 wrap=none font=code_medium @text-meta
 
 
 // One alert: a severity dot, the title with its severity marker, the body, and
 // when it landed. Unread rows sit on a warmer plate than read ones.
 component BellRow(item:BellItem)
-  box #root w=fill pl=9.0 pr=9.0 pt=9.0 pb=10.0 r=9.0
-    row w=fill gap=9.0 align=start
-      if item.read
-        box w=7.0 h=7.0 bg=avatar_bg r=3.5
-          space w=1.0 h=1.0
-      if !item.read
-        box w=7.0 h=7.0 bg=info_dot r=3.5
-          space w=1.0 h=1.0
-      col w=fill gap=3.0
-        row w=fill gap=7.0 align=center
-          text item.kind w=fill size=12.0 wrap=none @text-primary
-          box px=4.0 py=1.0 bg=info_bg border=info_line border-w=1.0 r=4.0
-            text item.source size=9.0 wrap=none font=code_semibold @text-info
-        text item.body w=fill size=12.0 line-h=1.45 @text-input
-      text item.height size=9.5 wrap=none font=display @text-label
+  col #root w=fill
+    if item.read
+      box w=fill pl=9.0 pr=9.0 pt=9.0 pb=10.0 r=9.0 bg=transparent
+        BellBody item=item
+    if !item.read
+      box w=fill pl=9.0 pr=9.0 pt=9.0 pb=10.0 r=9.0 bg=unread_wash
+        BellBody item=item
+
+component BellBody(item:BellItem)
+  row #root w=fill gap=9.0 align=start
+    if item.read
+      box w=7.0 h=7.0 bg=avatar_bg r=3.5
+        space w=1.0 h=1.0
+    if !item.read
+      PulseDot plate=7.0 tone="info"
+    col w=fill gap=3.0
+      row w=fill gap=7.0 align=center
+        text item.kind w=fill size=12.0 wrap=none @text-primary
+        box px=4.0 py=1.0 bg=info_bg border=info_line border-w=1.0 r=4.0
+          text item.source size=9.0 wrap=none font=code_semibold @text-info
+      text item.body w=fill size=12.0 line-h=1.45 @text-input
+    text item.height size=10.5 wrap=none font=code_medium @text-label
