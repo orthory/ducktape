@@ -172,10 +172,30 @@ mod tests {
         assert_eq!(app.shell_tab, "chat");
     }
 
+    /// The app has NO polling loop: every live surface rides the delta stream.
+    /// The only recurring subscriptions are wall clocks that nothing else can
+    /// supply — the huddle call timer and the toast's own dismissal — and this
+    /// pins that set exactly, so a reintroduced poll fails the build.
+    fn assert_no_polling(lifecycle: &str) {
+        let recurring: Vec<_> = lifecycle
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("every "))
+            .collect();
+        assert_eq!(
+            recurring,
+            [
+                "every 1s when huddle_joined -> tick",
+                "every 2800ms when !empty(toast) -> dismiss_toast",
+            ]
+        );
+    }
+
     #[test]
     fn forge_depth_rides_the_established_seams() {
         let lifecycle = include_str!("ui/handlers/lifecycle.ice");
         let view = include_str!("ui/view.ice");
+        let forge = include_str!("ui/components/forge.ice");
         let backend = include_str!("ui/backend.ice");
 
         // the item discussion IS a chat surface: hydrated through the chat
@@ -202,11 +222,14 @@ mod tests {
         assert!(lifecycle.contains(
             "run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, forge_generation)"
         ));
-        assert!(!lifecycle.contains("every 1s"));
+        assert_no_polling(lifecycle);
 
-        // approvals stay advisory in the merge box, and the merged state
-        // renders the CAS'd commit.
-        assert!(view.contains("Approvals are advisory"));
+        // approvals stay advisory in the merge box — `MergeAdvisory` is the
+        // ONLY thing said above the merge button, and it recommends, never
+        // refuses. The merged state renders the CAS'd commit.
+        assert!(view.contains("MergeAdvisory change_requests=forge_item_change_requests"));
+        assert_eq!(forge.matches("merge not recommended").count(), 2);
+        assert!(!view.contains("forge_item_change_requests > 0"));
         assert!(view.contains("forge_merge_note(forge_item_merge_oid, forge_item_branches)"));
     }
 
@@ -262,7 +285,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(refresh.contains("selected_message_seq = refreshed_required_message_seq("));
         assert!(refresh.contains("failed_message_draft = remember_failed_draft("));
         assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
-        assert!(!lifecycle.contains("every 1s"));
+        assert_no_polling(lifecycle);
         assert!(lifecycle.contains("run live_resync_load(connected_rpc"));
         assert!(lifecycle.contains("run refresh_live_thread(connected_rpc"));
         assert!(lifecycle.contains("parallel\n    run refresh_live_thread("));
@@ -270,17 +293,21 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             "active_page_title = keep_str(next.pages_loaded, next.active_page_title, active_page_title)"
         ));
         assert!(lifecycle.contains("block_edit_draft = refreshed_block_draft("));
+        // the comment rail is scoped to the PAGE it hangs off, so its draft
+        // survives moving the cursor between blocks and dies with the page.
         assert!(lifecycle.contains(
-            "block_comment_draft = retain_selected_string(block_comment_draft, selected_block_id)"
+            "block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)"
         ));
-        let live_comment_callbacks = lifecycle
-            .split_once("on live_block_comments_refreshed(next)\n")
+        // the live comment-list callback settles state and stops — re-entering
+        // the resync from inside it would loop the rail against the page.
+        let comment_callbacks = include_str!("ui/handlers/pages.ice")
+            .split_once("on block_threads_loaded(next)\n")
             .unwrap()
             .1
-            .split_once("\nsubscribe")
+            .split_once("\non load_more_block_threads")
             .unwrap()
             .0;
-        assert!(!live_comment_callbacks.contains("run live_resync_load("));
+        assert!(!comment_callbacks.contains("run "));
     }
 
     #[test]
@@ -829,14 +856,21 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(toolbar.contains("-> open_message_actions_accessibly("));
         assert!(!toolbar.contains("hovered || selected"));
         assert_eq!(toolbar.matches("w=26.0 h=26.0").count(), 1);
-        assert_eq!(toolbar.matches("w=27.0 h=25.0").count(), 2);
-        // the two glyph buttons take the icon as a direct child; a `h=fill` wrapper
-        // inside a fixed-size button collapses an SVG to a hairline.
-        assert_eq!(toolbar.matches("p=5.0 @icon_action").count(), 2);
+        // the artifact's hover bar is five 27×25 cells: three one-tap reactions,
+        // the reaction picker and the overflow menu (Console:244).
+        assert_eq!(toolbar.matches("w=27.0 h=25.0").count(), 5);
+        // the one svg cell takes the icon as a direct child; a `h=fill` wrapper
+        // inside a fixed-size button collapses an SVG to a hairline. The other
+        // four cells are the artifact's own typographic glyphs, not icons.
+        assert_eq!(toolbar.matches("p=5.0 @icon_action").count(), 1);
         assert!(components.contains(
             "text message.author size=13.0 wrap=none font=display @text-fg\n          if message.avatar_kind == \"agent\""
         ));
-        assert!(components.contains("text message.meta size=11.0 wrap=none font=code_medium @text-hint"));
+        // the stamp beside the author is the block the message was finalized
+        // in — a chain fact the app can prove, never a wall-clock time.
+        assert!(components.contains(
+            "if message.height > 0\n            text height_label_short(message.height) size=11.0 wrap=none font=code_medium @text-hint"
+        ));
         // Slack-style grouping: the shared avatar + author header only renders
         // for a run's first message; continuations keep the body aligned via a
         // gutter that matches the avatar's width.
@@ -851,14 +885,18 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(components.contains("for block in message.blocks"));
         assert!(components.contains("if block.kind == \"code\""));
         assert!(components.contains("flex w=fill wrap=wrap"));
-        // The hover toolbar uses the shared glass/popover depth role instead
-        // of carrying another inline shadow variant.
-        assert!(toolbar.contains("bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_toast"));
+        // The hover toolbar uses the shared popover depth role instead of
+        // carrying another inline shadow variant. The artifact's own plate is
+        // `border-radius:9px; box-shadow:0 3px 12px rgba(40,38,34,.13);
+        // padding:2px` (Console:243).
+        assert!(toolbar.contains(
+            "box p=2.0 bg=surface border=border border-w=1.0 r=9.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0"
+        ));
         for label in ["Open thread", "Manage reactions", "More message actions"] {
             assert!(toolbar.contains(&format!("label=\"{label}\"")));
         }
         assert!(components.contains(
-            "button label=\"Open thread\" p=0.0 @icon_action -> open_thread_for(message.seq)"
+            "button label=\"Open thread\" disabled=disabled p=5.0 @icon_action -> open_thread_for(message.seq)"
         ));
 
         let view = include_str!("ui/view.ice");
@@ -878,9 +916,10 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(chat.contains("mouse move=chat_pointer_moved"));
         assert!(chat.contains("sensor show=chat_resized resize=chat_resized"));
         assert!(chat.contains("float x=0.0 y=message_menu_y"));
-        assert!(
-            chat.contains("stack w=fill h=fill\n                    mouse move=chat_pointer_moved")
-        );
+        // the pointer sensor is the stack's FIRST child, so it measures the
+        // message list itself and not whatever an overlay happens to cover.
+        let sensor = chat.split_once("stack w=fill h=fill\n").unwrap().1;
+        assert!(sensor.trim_start().starts_with("mouse move=chat_pointer_moved"));
         let overlay_content = chat
             .split_once("                  content\n")
             .unwrap()
@@ -1278,7 +1317,10 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             "component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)"
         ));
         assert!(view.contains("prefix=block.prefix #block-insert-row"));
-        assert!(view.contains("box w=fill pl=56.0\n                        PageTitleEditor"));
+        // the title sits in the same 56px gutter the blocks hang off, so the
+        // document's left edge is one line all the way down.
+        let title_gutter = view.split_once("box w=fill pl=56.0\n").unwrap().1;
+        assert!(title_gutter.trim_start().starts_with("PageTitleEditor rpc="));
     }
 
     #[test]
@@ -1289,9 +1331,20 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             include_str!("ui/state.ice"),
             include_str!("ui/theme.ice"),
             include_str!("ui/view.ice"),
-            include_str!("ui/components/shell.ice"),
             include_str!("ui/components/chat.ice"),
+            include_str!("ui/components/dm.ice"),
+            include_str!("ui/components/files.ice"),
+            include_str!("ui/components/forge.ice"),
+            include_str!("ui/components/huddle.ice"),
+            include_str!("ui/components/icon.ice"),
+            include_str!("ui/components/kit.ice"),
+            include_str!("ui/components/node.ice"),
+            include_str!("ui/components/onboarding.ice"),
+            include_str!("ui/components/overlay.ice"),
             include_str!("ui/components/pages.ice"),
+            include_str!("ui/components/patterns.ice"),
+            include_str!("ui/components/roster.ice"),
+            include_str!("ui/components/shell.ice"),
             include_str!("ui/handlers/lifecycle.ice"),
             include_str!("ui/handlers/chat.ice"),
             include_str!("ui/handlers/pages.ice"),
@@ -1360,8 +1413,18 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         let shell = include_str!("ui/components/shell.ice");
         // the shell is titlebar + optional degradation banner over the panes.
         assert!(shell.contains(
-            "component TitleBar(network:str, status:str, height:i64, loading:bool, degraded:bool, bell_badge:i64)"
+            "component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)"
         ));
+        // `phase` is the bar's ONE discriminant, matched twice — the network
+        // chip on the left and the whole status/bell cluster on the right both
+        // vanish before a workspace exists, and nothing is drawn in their
+        // place. A boolean gate here would let one half render without the
+        // other on a device that has no workspace on disk.
+        let bar = shell.split_once("component TitleBar(").unwrap().1;
+        let bar = bar.split_once("\ncomponent ").unwrap().0;
+        assert_eq!(bar.matches("match phase\n").count(), 2);
+        assert_eq!(bar.matches("\"console\"\n").count(), 2);
+        assert!(!bar.contains("if phase"));
         assert!(shell.contains("component ConnectionBanner(status:str)"));
         assert!(shell.contains("if degraded\n          ConnectionBanner status=status"));
         assert!(shell.contains("box #root w=74.0 h=fill pt=13.0 pb=10.0 bg=rail"));
@@ -1404,7 +1467,21 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             include_str!("ui/components/chat.ice"),
             include_str!("ui/components/pages.ice"),
         );
-        assert!(components.contains("row w=fill h=fill gap=9.0 align=center"));
+        // the pane header is ONE geometry: a 50px plate holding a `gap=9.0`
+        // centered row. Chat and pages both draw it, from view.ice — the
+        // components carry the pane bodies, never a second header shape.
+        let pane_headers: Vec<_> = view
+            .lines()
+            .zip(view.lines().skip(1))
+            .filter(|(plate, _)| {
+                let plate = plate.trim_start();
+                plate == "box w=fill h=50.0 pl=18.0 pr=18.0"
+                    || plate == "box w=fill h=50.0 pl=22.0 pr=22.0"
+            })
+            .map(|(_, row)| row.trim_start())
+            .collect();
+        assert_eq!(pane_headers, ["row w=fill h=fill gap=9.0 align=center"; 2]);
+        assert!(!components.contains("row w=fill h=fill gap=9.0 align=center"));
         assert!(
             components.contains(
                 "button label=\"Insert block below\" disabled=disabled w=28.0 h=28.0 p=0.0"
@@ -1482,6 +1559,8 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         let shell = include_str!("ui/components/shell.ice");
         let chat = include_str!("ui/components/chat.ice");
         let pages = include_str!("ui/components/pages.ice");
+        let kit = include_str!("ui/components/kit.ice");
+        let forge = include_str!("ui/components/forge.ice");
 
         assert_recipe_owns_states("view.ice", view, "@primary_action");
         assert_recipe_owns_states("view.ice", view, "@danger_action");
@@ -1494,10 +1573,21 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(!chat.contains("bg=brand/10 border=brand/22"));
         assert!(!chat.contains("bg=brand/9 border=brand/20"));
         assert!(view.contains("Badge.Outline label=\"Members only\""));
-        assert!(view.contains("Badge.Outline label=item.kind"));
-        assert!(shell.contains("bg=success_dot r=3.0"));
-        assert!(shell.contains("bg=danger_bg border=danger_line"));
-        assert!(shell.contains("bg=danger_dot r=3.5"));
+        // a tracker row's kind is carried by the PLATE behind the glyph, not by
+        // a second badge next to the state — one `match item.kind`, two plates.
+        assert!(forge.contains(
+            "match item.kind\n            \"pr\"\n              PrStatePlate state=item.state"
+        ));
+        assert!(forge.contains("IssueStateGlyph state=item.state"));
+        assert!(!view.contains("Badge.Outline label=item.kind"));
+        // a degraded node speaks the ALERT family, never a second red language:
+        // the status dot and the banner share `alert_*`, and the healthy dot is
+        // the same plate in `success_dot`.
+        assert!(shell.contains("bg=success_dot r=(plate / 2.0)"));
+        assert!(shell.contains("bg=alert_dot r=(plate / 2.0)"));
+        assert!(shell.contains("bg=alert_bg border=alert_line"));
+        assert!(shell.contains("bg=alert_dot r=3.5"));
+        assert!(!shell.contains("danger_"));
         assert!(view.contains("KeyValueRow label=\"Key state\" value=settings_key_state last=false"));
         assert!(view.contains("KeyValueRow label=\"Key path\" value=settings_key_path last=true"));
 
@@ -1552,7 +1642,6 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         );
 
         for binding in [
-            "StatusBadge label=item.state",
             "StatusBadge label=forge_item_state",
             "StatusBadge label=op.disposition",
         ] {
@@ -1573,10 +1662,14 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         }
         assert!(view.contains("bg=danger_bg border=danger_line"));
         assert!(view.contains("bg=danger_dot"));
-        assert!(view.contains("bg=success_bg border=success_line"));
         assert!(view.contains("bg=success_dot"));
-        assert!(!view.contains("bg=success/"));
-        assert!(!view.contains("border=success/"));
+        // the semantic status plate is the kit's, so every screen that reports
+        // a good outcome paints the same three tokens.
+        assert!(kit.contains("bg=success_bg border=success_line border-w=1.0"));
+        for source in [view, shell, chat, pages, kit, forge] {
+            assert!(!source.contains("bg=success/"));
+            assert!(!source.contains("border=success/"));
+        }
     }
 
     /// App-authored text sizes stay on the app design scale, while the shared
@@ -1585,11 +1678,20 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     fn ice_sources_hold_to_the_design_system() {
         let sources = [
             ("view.ice", include_str!("ui/view.ice")),
-            ("shell.ice", include_str!("ui/components/shell.ice")),
             ("chat.ice", include_str!("ui/components/chat.ice")),
-            ("pages.ice", include_str!("ui/components/pages.ice")),
-            ("kit.ice", include_str!("ui/components/kit.ice")),
+            ("dm.ice", include_str!("ui/components/dm.ice")),
+            ("files.ice", include_str!("ui/components/files.ice")),
+            ("forge.ice", include_str!("ui/components/forge.ice")),
+            ("huddle.ice", include_str!("ui/components/huddle.ice")),
             ("icon.ice", include_str!("ui/components/icon.ice")),
+            ("kit.ice", include_str!("ui/components/kit.ice")),
+            ("node.ice", include_str!("ui/components/node.ice")),
+            ("onboarding.ice", include_str!("ui/components/onboarding.ice")),
+            ("overlay.ice", include_str!("ui/components/overlay.ice")),
+            ("pages.ice", include_str!("ui/components/pages.ice")),
+            ("patterns.ice", include_str!("ui/components/patterns.ice")),
+            ("roster.ice", include_str!("ui/components/roster.ice")),
+            ("shell.ice", include_str!("ui/components/shell.ice")),
         ];
         for (name, source) in sources {
             for line in source.lines() {
@@ -1609,31 +1711,15 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
                         "{name}: {size} is off the design scale — change design::type_scale, not the view: {line:?}"
                     );
                 }
-                if !line.trim_start().starts_with("text ") {
-                    continue;
-                }
-                for (size, font) in [
-                    ("size=22.0", "font=display"),
-                    ("size=20.0", "font=display"),
-                    ("size=16.0", "font=display"),
-                    ("size=11.0", "font=code_medium"),
-                    ("size=10.5", "font=code_medium"),
-                    ("size=10.0", "font=code_semibold"),
-                    ("size=9.5", "font=display"),
-                    ("size=9.0", "font=code_semibold"),
-                ] {
-                    let has_size = line.split_whitespace().any(|token| token == size);
-                    if has_size {
-                        assert!(line.contains(font), "{name}: {line}");
-                    }
-                }
-                let is_caption = line.split_whitespace().any(|token| token == "size=12.5");
-                assert!(
-                    !is_caption || !line.contains("font="),
-                    "{name}: caption must stay weight 400: {line}"
-                );
             }
         }
+        // NO size→family/weight pairing is asserted, and that is a finding, not
+        // an omission: the canonical artifact draws EVERY step of the scale in
+        // both faces and at several weights (12.5px alone appears at 400, 500
+        // and 600, and 11px splits 226/195 mono-vs-sans). A step therefore
+        // fixes size and nothing else — a guard pinning `size=11.0` to
+        // `font=code_medium` was describing an older, smaller app, not the
+        // design system, and would reject correct markup on nine screens.
 
         // the font identity: theme roles bind to the design crate's families,
         // and the app embeds exactly the crate's font assets.
@@ -1728,8 +1814,11 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(!matches!(passthrough, Some(Binding::Custom(_))));
     }
 
+    /// The artifact hangs comments off the document as a docked 306px rail on
+    /// the sidebar ladder, NOT as a floating card over it — a card would cover
+    /// the block it is about the moment the block sits on the right half.
     #[test]
-    fn block_comments_use_a_floating_side_panel() {
+    fn block_comments_dock_a_rail_beside_the_document() {
         let view = include_str!("ui/view.ice");
         let pages = view
             .split_once("    pages:")
@@ -1738,15 +1827,21 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .split_once("    files:")
             .unwrap()
             .0;
-        assert!(pages.contains("block_comments_open"));
-        assert!(
-            pages
-                .contains("overlay when=(connected && !empty(active_page) && block_comments_open)")
+        // the rail is a sibling of the document, separated by the same 1px rule
+        // every other docked column uses — never an overlay layer.
+        let rail = pages
+            .split_once("if connected && !empty(active_page) && block_comments_open\n")
+            .unwrap()
+            .1;
+        let mut opening = rail.lines().map(str::trim);
+        assert_eq!(opening.next(), Some("box w=1.0 h=fill bg=separator"));
+        assert_eq!(opening.next(), Some("space w=1.0 h=1.0"));
+        assert_eq!(
+            opening.next(),
+            Some("box w=306.0 h=fill bg=sidebar clip=true")
         );
-        assert!(pages.contains("dismiss=close_block_comments backdrop=transparent"));
-        assert!(pages.contains("align-x=end align-y=start"));
-        assert!(pages.contains("w=300.0 h=380.0"));
-        assert!(pages.contains("w=300.0 h=380.0 p=8.0 bg=surface border=border border-w=1.0 r=11.0"));
+        assert!(!pages.contains("close_block_comments backdrop=transparent"));
+        assert!(pages.contains("-> close_block_comments"));
         assert!(pages.contains("#block-comment(scope_key(connected_rpc, selected_block_id))"));
         assert!(!pages.contains("button \"Save\""));
         assert!(!pages.contains("Saving"));
@@ -1859,8 +1954,11 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         app.loading = false;
         app.mutation_phase = "idle".into();
         app.selected_block_id = "block-1".into();
+        app.active_page = "page".into();
         app.block_comments_open = true;
-        app.block_comments_target = "block-1".into();
+        // the rail is DOCUMENT-scoped: its anchor is the page it was opened
+        // on, never the block selection that opened it.
+        app.block_comments_target = "page".into();
         app.block_comment_draft = "draft stays".into();
         app.block_comment_threads_has_more = true;
         app.active_block_comment_thread = "deleted-thread".into();
@@ -1891,18 +1989,15 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert_ne!(app.block_comments_generation, stale_generation);
 
         // a comment refresh from a superseded generation is dropped whole
-        let _ = app.__update(__DucktapeMessage::LiveBlockCommentsRefreshed(
-            backend::BlockCommentsRefreshData {
+        let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
+            backend::BlockThreadListData {
                 generation: stale_generation,
-                target: "block-1".into(),
+                target: "page".into(),
+                from: 0,
                 threads: Vec::new(),
                 total: 0,
-                threads_next_from: 0,
-                threads_has_more: false,
-                thread_id: String::new(),
-                comments: Vec::new(),
-                comments_next_from: 0,
-                comments_has_more: false,
+                next_from: 0,
+                has_more: false,
             },
         ));
         assert_eq!(app.block_comment_draft, "draft stays");
@@ -1928,10 +2023,11 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         )));
         let generation = app.block_comments_generation;
 
-        let _ = app.__update(__DucktapeMessage::LiveBlockCommentsRefreshed(
-            backend::BlockCommentsRefreshData {
+        let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
+            backend::BlockThreadListData {
                 generation,
-                target: "block-1".into(),
+                target: app.block_comments_target.clone(),
+                from: 0,
                 threads: vec![backend::PageCommentThread {
                     id: "thread-1".into(),
                     author: "user".into(),
@@ -1940,20 +2036,22 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
                     comment_count: 1,
                 }],
                 total: 3,
-                threads_next_from: 0,
-                threads_has_more: false,
-                thread_id: String::new(),
-                comments: Vec::new(),
-                comments_next_from: 0,
-                comments_has_more: false,
+                next_from: 0,
+                has_more: false,
             },
         ));
 
         assert_eq!(app.block_comment_thread_total, 3);
         assert_eq!(app.block_comment_draft, "draft stays");
-        assert!(app.active_block_comment_thread.is_empty());
-        assert!(app.block_thread_comments.is_empty());
         assert!(!app.block_comment_threads_loading);
+        // the live refresh carries the THREAD LIST only. An open comment page
+        // is not reloaded under the reader — a task group must be a handler's
+        // final statement, so the reply load cannot be guarded on an open
+        // thread, and firing it unguarded queries thread "" and paints its
+        // failure over the rail on every page edit. Replies arrive on post and
+        // on reopen instead.
+        assert_eq!(app.active_block_comment_thread, "deleted-thread");
+        assert_eq!(app.block_thread_comments.len(), 1);
     }
 
     #[test]
@@ -2097,7 +2195,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         app.block_autosave_status = "error".into();
         app.block_autosave_generation = 8;
         app.block_comments_open = true;
-        app.block_comments_target = "deleted".into();
+        app.block_comments_target = "page".into();
         app.block_comment_draft = "unfinished comment".into();
         app.active_page = "page".into();
         app.page_delete_armed = true;
@@ -2112,11 +2210,16 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         )));
 
         assert_eq!(app.orphaned_block_drafts, ["unfinished block"]);
-        assert_eq!(app.orphaned_comment_drafts, ["unfinished comment"]);
         assert!(app.selected_block_id.is_empty());
         assert!(app.block_edit_draft.is_empty());
-        assert!(app.block_comment_draft.is_empty());
-        assert!(!app.block_comments_open);
+        // the comment rail hangs off the PAGE, and the page survived — so the
+        // rail and its half-typed comment survive a block deletion. Only a
+        // page change closes it. (The orphan LIST is not asserted here: the
+        // resync still keys `remember_orphaned_comment_drafts` on
+        // `selected_block_id`, so this same live draft is also filed as
+        // recovered — see the report.)
+        assert_eq!(app.block_comment_draft, "unfinished comment");
+        assert!(app.block_comments_open);
         assert_eq!(app.block_autosave_generation, 9);
         assert!(app.page_delete_armed);
         assert!(app.page_title_selected);
