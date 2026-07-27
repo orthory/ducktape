@@ -23,7 +23,9 @@ use airlock::client::Gateway;
 use airlock::seal::SealKeypair;
 use airlock::server::{self, AttestMode, GatewayConfig};
 use airlock::testkit::SnpTestEnclave;
-use airlock::wire::{AttestationResponse, CredentialKind, CredentialPayload, SessionRequest};
+use airlock::wire::{
+    AttestationResponse, CredentialKind, CredentialPayload, SessionRequest, WorkRef,
+};
 
 /// 48-byte measurement (all 0x11) shared by the gateway and the verifying client.
 fn measurement() -> Measurement {
@@ -130,7 +132,10 @@ async fn full_custody_path_swaps_session_token_for_the_credential() {
     .unwrap();
 
     // Computation Provider: handshake for a scoped token, then a proxied call.
-    let token = gw.open_session(&seal_pk, "test-sub").await.unwrap();
+    let token = gw
+        .open_session(&seal_pk, "test-sub", &WorkRef::Direct)
+        .await
+        .unwrap();
     let resp = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages"))
         .bearer_auth(&token)
@@ -170,7 +175,7 @@ async fn a_forged_gateway_cannot_mint_a_token_the_client_opens() {
     let gw = Gateway::local(gateway_url);
 
     let wrong_seal_pk = [0x42u8; 32]; // not the gateway's attested key
-    let err = gw.open_session(&wrong_seal_pk, "test-sub").await;
+    let err = gw.open_session(&wrong_seal_pk, "test-sub", &WorkRef::Direct).await;
     assert!(err.is_err(), "a token derived against the wrong seal_pk must not open");
 }
 
@@ -221,7 +226,10 @@ async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
     .await
     .unwrap();
 
-    let (token, keys) = gw.open_session_sealed(&seal_pk, "test-sub").await.unwrap();
+    let (token, keys) = gw
+        .open_session_sealed(&seal_pk, "test-sub", &WorkRef::Direct)
+        .await
+        .unwrap();
     let sealed_body = bodyseal::seal_request(&keys, br#"{"secret":"prompt"}"#);
     assert!(
         !sealed_body.windows(6).any(|w| w == b"prompt"),
@@ -279,7 +287,10 @@ async fn a_sealed_session_refuses_a_plaintext_body() {
     )
     .await
     .unwrap();
-    let (token, _keys) = gw.open_session_sealed(&seal_pk, "test-sub").await.unwrap();
+    let (token, _keys) = gw
+        .open_session_sealed(&seal_pk, "test-sub", &WorkRef::Direct)
+        .await
+        .unwrap();
 
     // A plaintext body on a sealed session = what a bearer thief can produce.
     let resp = reqwest::Client::new()
@@ -354,7 +365,10 @@ async fn build_seeded_uses_the_initial_credential_without_upload() {
 
     // NO upload_sealed_credential — the credential was seeded at build.
     let seal_pk = attested_seal_pk(&gw, &enclave).await;
-    let token = gw.open_session(&seal_pk, "sub").await.unwrap();
+    let token = gw
+        .open_session(&seal_pk, "sub", &WorkRef::Direct)
+        .await
+        .unwrap();
     let resp = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages"))
         .bearer_auth(&token)
@@ -412,7 +426,10 @@ async fn static_bearer_credential_is_used_without_any_oauth_refresh() {
     .await
     .unwrap();
 
-    let token = gw.open_session(&seal_pk, "test-sub").await.unwrap();
+    let token = gw
+        .open_session(&seal_pk, "test-sub", &WorkRef::Direct)
+        .await
+        .unwrap();
     let resp = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages"))
         .bearer_auth(&token)
@@ -479,7 +496,10 @@ async fn boot_echo_upstream() -> String {
 /// Open a session for `name` and POST once; return the `Authorization` header the
 /// upstream saw (the echo upstream reflects it in the body).
 async fn round_trip_via(gw: &Gateway, gateway_url: &str, seal_pk: &[u8; 32], name: &str) -> String {
-    let token = gw.open_session(seal_pk, name).await.unwrap();
+    let token = gw
+        .open_session(seal_pk, name, &WorkRef::Direct)
+        .await
+        .unwrap();
     reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages"))
         .bearer_auth(&token)
@@ -531,6 +551,7 @@ async fn unknown_credential_name_is_refused_at_session_open() {
             sub: "missing".into(),
             client_eph_pk_b64: "AAAA".into(),
             body_seal: false,
+            work: WorkRef::Direct,
         })
         .send()
         .await
@@ -577,13 +598,28 @@ async fn codex_credential_proxies_to_the_openai_upstream() {
 
 // -------- the co-hosted lending gate --------
 
+/// The saga id the stub gate below treats as work the caller may delegate on.
+/// Nothing in THIS crate can resolve a saga — that decision belongs to the node
+/// (`bin/node/src/airlock.rs`), which reads it out of committed state. What the
+/// stub stands for here is only that the pointer ARRIVES.
+const DELEGABLE: &str = "sched\u{1f}delegable";
+
 /// The injected gate: only the account `granted` may draw on the credential —
 /// the node's committed-record lookup, stubbed here. `wedged` stands in for a
-/// node that did not answer at all.
+/// node that did not answer at all. A caller presenting [`DELEGABLE`] is
+/// admitted whoever it is, standing in for a real lender resolving that saga and
+/// finding a granted submitter.
 fn stub_grant_check() -> airlock::server::GrantCheck {
-    std::sync::Arc::new(|_name: String, account: Vec<u8>| {
+    std::sync::Arc::new(|question: airlock::server::GrantQuestion| {
         Box::pin(async move {
-            match account.as_slice() {
+            let delegated = question.work
+                == (WorkRef::Saga {
+                    saga_id: DELEGABLE.into(),
+                });
+            if delegated {
+                return airlock::server::GrantAnswer::Granted;
+            }
+            match question.caller.as_slice() {
                 b"granted" => airlock::server::GrantAnswer::Granted,
                 b"wedged" => airlock::server::GrantAnswer::Undetermined,
                 _other => airlock::server::GrantAnswer::Refused,
@@ -593,6 +629,38 @@ fn stub_grant_check() -> airlock::server::GrantCheck {
                 Box<dyn std::future::Future<Output = airlock::server::GrantAnswer> + Send>,
             >
     })
+}
+
+/// The wire half of delegation, and the ONLY half this crate owns: the pointer
+/// a session presents reaches the injected authority intact, and it is what the
+/// authority answered on — the same caller, the same credential, refused on one
+/// pointer and admitted on the other.
+///
+/// Which pointers a real lender admits is decided in `bin/node/src/airlock.rs`
+/// against committed state, and is tested there and on two live nodes.
+#[tokio::test]
+async fn the_work_pointer_a_session_presents_reaches_the_grant_gate() {
+    let upstream = boot_echo_upstream().await;
+    let secret = SealKeypair::generate().secret_bytes();
+    let seal_pk = SealKeypair::from_secret_bytes(secret).public_bytes();
+    // one ungranted caller, one lender, two sessions.
+    let url = boot_lender_behind_proxy(&upstream, secret, b"stranger").await;
+    let gw = Gateway::local(url);
+
+    let direct = gw.open_session(&seal_pk, "a", &WorkRef::Direct).await;
+    assert!(
+        direct.unwrap_err().to_string().contains("403"),
+        "an ungranted caller with nothing to point at is refused"
+    );
+    gw.open_session(
+        &seal_pk,
+        "a",
+        &WorkRef::Saga {
+            saga_id: DELEGABLE.into(),
+        },
+    )
+    .await
+    .expect("the same caller opens when its pointer is one the authority admits");
 }
 
 /// A grant-gated self-host lender, reached the ONLY way production reaches one:
@@ -634,7 +702,8 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
     // Granted account: the session opens and the round-trip carries the real token.
     let url = boot_lender_behind_proxy(&upstream, secret, b"granted").await;
     let gw = Gateway::local(url.clone());
-    let token = gw.open_session(&seal_pk, "a").await.expect("granted session opens");
+    let token =
+        gw.open_session(&seal_pk, "a", &WorkRef::Direct).await.expect("granted session opens");
     let seen = reqwest::Client::new()
         .post(format!("{url}/v1/messages"))
         .bearer_auth(&token)
@@ -652,7 +721,7 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
     // an identity one.
     let url = boot_lender_behind_proxy(&upstream, secret, b"stranger").await;
     let gw = Gateway::local(url);
-    let err = gw.open_session(&seal_pk, "a").await.unwrap_err();
+    let err = gw.open_session(&seal_pk, "a", &WorkRef::Direct).await.unwrap_err();
     assert!(err.to_string().contains("403"), "an ungranted account must 403: {err}");
 
     // The gate could not ASK its authority. That is NOT a refusal: a 403 sends
@@ -660,7 +729,10 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
     // answer that carries no information gets its own 503 instead.
     let url = boot_lender_behind_proxy(&upstream, secret, b"wedged").await;
     let gw = Gateway::local(url);
-    let err = gw.open_session(&seal_pk, "a").await.unwrap_err();
+    let err = gw
+        .open_session(&seal_pk, "a", &WorkRef::Direct)
+        .await
+        .unwrap_err();
     assert!(
         err.to_string().contains("503"),
         "an undetermined grant must 503, never 403: {err}"
@@ -705,7 +777,11 @@ async fn a_session_request_cannot_name_an_account_at_all() {
     // the transport vouched for, which is the only one that counts.
     let gw = Gateway::local(url);
     let err = gw
-        .open_session(&SealKeypair::from_secret_bytes(secret).public_bytes(), "a")
+        .open_session(
+            &SealKeypair::from_secret_bytes(secret).public_bytes(),
+            "a",
+            &WorkRef::Direct,
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("403"), "an ungranted caller must 403: {err}");
@@ -737,6 +813,7 @@ async fn a_session_no_proxy_vouched_for_is_refused() {
             sub: "a".into(),
             client_eph_pk_b64: "AAAA".into(),
             body_seal: false,
+            work: WorkRef::Direct,
         })
         .send()
         .await
@@ -829,7 +906,10 @@ async fn the_self_host_lender_serves_no_credential_upload() {
 
     // And the credential it already serves is untouched.
     let gw = Gateway::local(url.clone());
-    let token = gw.open_session(&seal_pk, "a").await.unwrap();
+    let token = gw
+        .open_session(&seal_pk, "a", &WorkRef::Direct)
+        .await
+        .unwrap();
     let claims = reqwest::Client::new()
         .post(format!("{url}/v1/messages"))
         .bearer_auth(&token)

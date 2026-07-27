@@ -33,7 +33,7 @@ use identity::{AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAut
 use airlock::attest::{self, Measurement};
 use airlock::client::Gateway as AirlockClient;
 use airlock::server::{self, AttestMode, GatewayConfig};
-use airlock::wire::{CredentialKind, CredentialPayload};
+use airlock::wire::{CredentialKind, CredentialPayload, WorkRef};
 
 use axum::extract::State;
 use axum::routing::post;
@@ -392,7 +392,7 @@ fn airlock_over_gateway_two_wireguard_nodes() {
 
         // 2) session-key handshake OVER the overlay → scoped token.
         let token = gw
-            .open_session(&seal_pk, "compute-node")
+            .open_session(&seal_pk, "compute-node", &WorkRef::Direct)
             .await
             .expect("handshake over overlay");
 
@@ -524,7 +524,7 @@ fn airlock_single_node_self_serves_its_own_route() {
         // SEALED session: the request/response bodies cross the overlay as
         // ciphertext (streaming + body AEAD combined, over the real wire).
         let (token, keys) = gw
-            .open_session_sealed(&seal_pk, "self")
+            .open_session_sealed(&seal_pk, "self", &WorkRef::Direct)
             .await
             .expect("sealed handshake through the gateway");
         let plaintext =

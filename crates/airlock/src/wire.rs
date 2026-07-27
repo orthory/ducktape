@@ -12,6 +12,10 @@
 //! enters the flow at exactly one place, the gateway hop, where the node stamps
 //! a mesh-verified caller the request cannot mint. A field for the caller to
 //! declare its own account was the whole of the credential-theft defect.
+//!
+//! [`WorkRef`] is not a reopening of that. It is a POINTER — an id the lender
+//! resolves in its OWN committed state — and every fact it yields is read from
+//! consensus, never from the request. See its own docs.
 
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +94,9 @@ pub enum CredentialPayload {
 /// cannot name a subject: the computation layer does not get to say who it acts
 /// for, and the token it ends up holding carries no identity either — only
 /// `sub`, which credential.
+///
+/// `work` is a POINTER, and the distinction from an account field is the whole
+/// design — see [`WorkRef`].
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRequest {
@@ -98,6 +105,38 @@ pub struct SessionRequest {
     /// Sealed-body session: bodies are AEAD'd broker<->enclave (`bodyseal`)
     /// and the enclave refuses plaintext. Echoed into the token claims.
     pub body_seal: bool,
+    /// WHICH WORK this session draws for. Required and tagged, never an
+    /// `Option`: this wire has no `serde(default)` anywhere by design, so every
+    /// producer states which arm it means and a producer out of step gets a
+    /// named decode error.
+    pub work: WorkRef,
+}
+
+/// The work a session draws for — a POINTER the lender resolves, never a claim
+/// the caller makes.
+///
+/// ## why this is not the account field that was deleted
+///
+/// `POST /v1/submit` on a real node DISCARDS the caller's claimed submitter id
+/// and re-signs the op with the node's own signer
+/// (`bin/node/src/validator/run/ingress.rs`). So a saga's committed
+/// `SagaOrigin::External(bytes)` is **the submitting node's key, proven by a
+/// verified signature** — derived, never asserted. That single fact is what
+/// makes delegation safe: the executor sends an id and nothing else, and the
+/// lender reads WHO submitted, WHO holds the lease, and WHETHER that submitter
+/// is granted out of its own committed state. Nothing on this request is
+/// trusted beyond "which record to look up".
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkRef {
+    /// No delegation: authorize the vouched-for caller's own grant, exactly as
+    /// an ungated gateway always has. What an interactive session presents —
+    /// the terminal plane has no committed record of who asked, so it has no
+    /// pointer to offer and no delegation to claim.
+    Direct,
+    /// A committed saga on the lender's own chain. The lender resolves it from
+    /// its own state; see the type docs.
+    Saga { saga_id: String },
 }
 
 /// The token, AEAD-sealed under the handshake session key. Only the client that

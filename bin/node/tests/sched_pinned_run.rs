@@ -17,20 +17,29 @@
 //!   crosses back: it lands live on the `run-output:<id>` ring AND commits into
 //!   the saga's own result record.
 //!
-//! - `a_delegated_run_draws_as_the_executing_node_not_the_submitter`: the
-//!   delegated shape, against the REAL lender (`ducktape service run airlock`,
-//!   the only gateway that carries a grant gate). Node 0 owns the credential and
-//!   SUBMITS; node 1 EXECUTES and dials node 0's airlock over the overlay. Both
-//!   directions on one cluster, so the only thing that differs between them is
-//!   the grant: ungranted node 1 is refused `credential_not_granted` at
-//!   `/session`, then the owner grants node 1's account and the same run shape
-//!   succeeds with the mock upstream's `PONG` committed into the saga.
+//! - `a_delegated_run_draws_on_the_submitters_grant`: the delegated shape,
+//!   against the REAL lender (`ducktape service run airlock`, the only gateway
+//!   that carries a grant gate). Node 0 owns the credential and SUBMITS; node 1
+//!   EXECUTES and dials node 0's airlock over the overlay. FOUR directions on
+//!   ONE cluster, so exactly one thing differs between any two of them:
 //!
-//!   The subject is node 1 — the node that RUNS the workload and makes the
-//!   gateway hop — not node 0, which submitted it. That is the only subject the
-//!   flow can express: the session token the sandbox holds names a credential and
-//!   nothing about who is acting, so identity enters once, where the owner's node
-//!   stamps the mesh-verified caller on the hop.
+//!   | # | shape | state | outcome |
+//!   |---|---|---|---|
+//!   | 0 | 0 submits, pinned to 1 | 1 admits nobody | `work_not_admitted` |
+//!   | 1 | 1 submits, pinned to itself | nobody granted | `credential_not_granted` |
+//!   | 2 | 0 submits, pinned to 1 | 1 admitted, **still ungranted** | `Done` + `PONG` |
+//!   | 2b | direction 2's pointer, replayed once its saga is terminal | unchanged | **refused** |
+//!   | 3 | 1 submits, pinned to itself | 1 granted | `Done` + `PONG` |
+//!
+//!   Direction 2 is the whole campaign: A submits, B executes, and the draw is
+//!   on A's grant. B supplies only a POINTER — the run's committed saga id — and
+//!   the lender resolves out of its own state that A submitted it and that B
+//!   holds its lease. Direction 3 is the non-regression: an executor granted in
+//!   its own right still draws in its own right.
+//!
+//!   Directions 0 and 1 are two consents in OPPOSITE directions and both must
+//!   hold: node 1 decides whose work it runs, node 0 decides whose account may
+//!   draw on its credential. Neither substitutes for the other.
 //!
 //! ## what a sandboxed run costs this suite in evidence
 //!
@@ -827,10 +836,8 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
 }
 
 #[test]
-fn a_delegated_run_draws_as_the_executing_node_not_the_submitter() {
-    if skip_unless_sandboxed("a_delegated_run_draws_as_the_executing_node_not_the_submitter")
-        .is_some()
-    {
+fn a_delegated_run_draws_on_the_submitters_grant() {
+    if skip_unless_sandboxed("a_delegated_run_draws_on_the_submitters_grant").is_some() {
         return;
     }
     let _serial = serial();
@@ -940,6 +947,12 @@ fn a_delegated_run_draws_as_the_executing_node_not_the_submitter() {
     // all. Its default is owner-only and these are two accounts, so the run is
     // refused HERE — no container, no gateway hop, no session. Without this
     // step the credential lane below is not even reachable.
+    //
+    // They COMPOSE, and this direction is where that is visible: the CREDENTIAL
+    // consent is already satisfied for this exact run shape — the owner submits
+    // it and the saga module leases it to node 1, which is precisely what
+    // direction 2 delegates on — and it makes no difference. One consent
+    // satisfied is not the other consent granted.
     let unadmitted_id = "sched\u{1f}sched-delegated-unadmitted";
     submit_sched(&cluster, 0, unadmitted_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 0, unadmitted_id, ROUND_TRIP);
@@ -965,18 +978,20 @@ fn a_delegated_run_draws_as_the_executing_node_not_the_submitter() {
     // restart — the policy is re-read on every decision.
     admit_work_from(&cluster.workspace(1), owner.public_key().as_ref());
 
-    // ---- DIRECTION 1: the executor is not granted -------------------------
+    // ---- DIRECTION 1: nobody is granted ------------------------------------
     //
-    // The OWNER submits, so the submitter is the credential's owner and would
-    // have passed any check keyed on who asked. The lender never sees the owner:
-    // it sees node 1, which made the hop, and node 1 is on no grant list.
+    // Node 1 submits this one and pins it to ITSELF, so there is no delegation
+    // to be had: the committed origin, the assignee and the account the lender's
+    // node stamps on the hop are all node 1, and node 1 is on no grant list. It
+    // also takes the admission's `ThisNode` path, which isolates the CREDENTIAL
+    // gate from the work gate direction 0 just proved.
     let refused_id = "sched\u{1f}sched-delegated-ungranted";
-    submit_sched(&cluster, 0, refused_id, &executor_node, 1);
-    let view = wait_terminal(&cluster, 0, refused_id, ROUND_TRIP);
+    submit_sched(&cluster, 1, refused_id, &executor_node, 1);
+    let view = wait_terminal(&cluster, 1, refused_id, ROUND_TRIP);
     assert_eq!(
         view.status,
         SagaStatus::Failed,
-        "an ungranted EXECUTOR must fail even when the OWNER submitted\n{}",
+        "an executor granted nothing, drawing for nobody but itself, must fail\n{}",
         cluster.all_log_tails(120),
     );
     assert!(
@@ -988,7 +1003,75 @@ fn a_delegated_run_draws_as_the_executing_node_not_the_submitter() {
         view.error,
     );
 
-    // ---- the grant, and the ONLY thing that changes ------------------------
+    // ---- DIRECTION 2: DELEGATION, and the grant list is untouched -----------
+    //
+    // THE POINT OF THE CAMPAIGN. Node 1 is still granted nothing — direction 1
+    // just proved it, and no grant op is submitted until below. What changes is
+    // WHO SUBMITS: the owner does, so the run's committed origin is the owner's
+    // node key (proven by the signature `/v1/submit` re-stamped on the op), and
+    // the saga module leased the attempt to node 1.
+    //
+    // Node 1's broker sends the saga id and nothing else. The lender reads both
+    // facts out of its own committed state — the owner submitted it, node 1
+    // holds its lease — and authorizes the draw on the OWNER's grant. A run
+    // submitted by A and executed on B, drawing as A: the thing that has never
+    // worked before this PR.
+    let delegated_id = "sched\u{1f}sched-delegated-pointer";
+    submit_sched(&cluster, 0, delegated_id, &executor_node, 1);
+    let view = wait_terminal(&cluster, 0, delegated_id, ROUND_TRIP);
+    assert_eq!(
+        view.status,
+        SagaStatus::Done,
+        "an ungranted executor draws on the SUBMITTER's grant for work it holds: {:?}\n{}",
+        view.error,
+        cluster.all_log_tails(120),
+    );
+    assert!(
+        String::from_utf8_lossy(&view.result.unwrap_or_default()).contains("PONG"),
+        "and the lent credential's reply crosses back into the saga result",
+    );
+    assert!(
+        !gateway::credential_use_allowed(
+            &credential_record(&cluster, 1).expect("the record is still committed"),
+            executor.public_key().as_ref(),
+        ),
+        "and it did so with the executor on NO grant list — otherwise this \
+         direction proves nothing the next one does not",
+    );
+
+    // ---- DIRECTION 2b: and the pointer DIES with the run -------------------
+    //
+    // The same saga id, the same executor, the same lender, one moment later —
+    // replayed by hand through node 1's browser gateway, exactly the path its own
+    // broker took to reach the lender above. The saga module clears neither
+    // `assignee` nor `pinned_assignee` on any terminal path, so without a
+    // liveness condition this one completed run is a permanent, unmetered
+    // licence: node 1 re-POSTs this body forever and mints a fresh token each
+    // time (the session budget is keyed on the CREDENTIAL and refilled on every
+    // open, so it caps nothing). The owner would have nothing to revoke — node 1
+    // holds no grant, so `user cred revoke` has no subject.
+    let (status, browser) = cluster.http(1, "GET", "/v1/gateway/browser", None);
+    assert_eq!(status, 200, "browser base failed: {browser}");
+    let via = browser["base"].as_str().unwrap().to_string();
+    let seal_pk = credential_record(&cluster, 1).expect("the record").seal_pk;
+    let replayed = rt.block_on(async {
+        AirlockClient::remote("airlock.owner.duck".into(), via)
+            .open_session(
+                &seal_pk,
+                CRED_NAME,
+                &airlock::wire::WorkRef::Saga {
+                    saga_id: delegated_id.into(),
+                },
+            )
+            .await
+    });
+    let replayed = replayed.expect_err("a finished run is not a standing licence");
+    assert!(
+        format!("{replayed}").contains("credential_not_granted"),
+        "the pointer that drew for a live run must stop drawing once it ends: {replayed}"
+    );
+
+    // ---- the grant, and the ONLY thing that changes -------------------------
     let executor_account = executor.public_key().as_ref().to_vec();
     cluster.submit(
         0,
@@ -1001,14 +1084,19 @@ fn a_delegated_run_draws_as_the_executing_node_not_the_submitter() {
             .map(|_| ())
     });
 
-    // ---- DIRECTION 2: the same run shape, now granted ----------------------
+    // ---- DIRECTION 3: direction 1's exact shape, now granted ----------------
+    //
+    // The non-regression half: an executor granted in its OWN right still draws
+    // in its own right, with no pointer doing any work — origin, assignee and
+    // caller are all node 1 again. The grant is the only thing that changed
+    // since direction 1.
     let granted_id = "sched\u{1f}sched-delegated-granted";
-    submit_sched(&cluster, 0, granted_id, &executor_node, 1);
-    let view = wait_terminal(&cluster, 0, granted_id, ROUND_TRIP);
+    submit_sched(&cluster, 1, granted_id, &executor_node, 1);
+    let view = wait_terminal(&cluster, 1, granted_id, ROUND_TRIP);
     assert_eq!(
         view.status,
         SagaStatus::Done,
-        "granting the EXECUTING node is what makes the delegated run work: {:?}\n{}",
+        "granting the EXECUTING node still makes its own run work: {:?}\n{}",
         view.error,
         cluster.all_log_tails(120),
     );

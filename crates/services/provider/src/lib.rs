@@ -163,7 +163,7 @@ pub(crate) use broker_host as broker;
 // seal_pk). `CredentialKind` is capability-host's OWN mirror of the gateway
 // module's enum — the node maps between them so this crate stays independent of
 // the gateway module crate.
-pub use broker::{AirlockConfig, AirlockTrust, CredentialKind, ResolvedCredential};
+pub use broker::{AirlockConfig, AirlockTrust, CredentialKind, ResolvedCredential, WorkRef};
 // interactive (pty) sessions are unix-only: they use libc pty primitives, which
 // are a cfg(unix) dependency. all real node targets (Linux, macOS) are unix.
 #[cfg(unix)]

@@ -79,11 +79,16 @@ pub(crate) struct PtyArgs {
 pub(crate) struct SchedArgs {
     /// provider to launch (`claude`|`codex`); optional — the `--cred` kind decides
     provider: Option<ProviderArg>,
-    /// credential name (required: a headless guest run must bring a credential)
+    /// credential name (required: a headless guest run must bring a credential).
+    /// With `--host-node`, THIS RUN LETS THAT NODE SPEND YOUR SUBSCRIPTION: the
+    /// lender admits the executing node on YOUR grant, for this credential and
+    /// this run only, until the run reaches a terminal status.
     #[arg(long, value_name = "NAME")]
     cred: String,
     /// node to PIN the run to: a display name or a raw 64-hex node key
     /// (omitted = this node). NOT `--node`, which is the http base this CLI dials.
+    /// The pin is what scopes the `--cred` draw — it is the only node that may
+    /// present this run as its reason for opening a session.
     #[arg(long = "host-node", value_name = "NAME")]
     host_node: Option<String>,
     /// cpu-cores demand
