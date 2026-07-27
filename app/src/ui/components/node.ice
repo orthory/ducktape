@@ -1,17 +1,22 @@
 // `This node` — the screen the artifact gives no rail seat, so these mount
 // under Settings as the Overview / Permissions / Activity tabs.
 //
-// The whole surface is organised around the split the artifact's copy asserts
-// three separate times: the node TIER is what this machine runs, and ADMIN is
-// what quorum granted it. One is local, the other is a chain fact, and the app
-// has never said so anywhere.
+// The artifact's copy asserts two authority axes — a node tier this machine
+// picks, and an ADMIN grant quorum hands out on top of it. This product has
+// ONE. `members_is_admin` (backend.rs) is literally
+// `is_this_node && role == "validator"`, the same predicate as
+// `member_tier(..) == "validator"`, and the tier is not a device setting: it is
+// the valset row the chain wrote. So the artifact's ADMIN/MAINTAINER/VIEWER
+// vocabulary is NOT adopted — every surface here names the real standing
+// (validator / resident / guest) and never implies a local switch.
 //
 // Deliberately NOT here: Restart / Stop / Start (the app attaches to a node it
 // does not supervise — rpc-client carries no lifecycle verb), the build string
-// (only {height, public_key} is decoded off /v1/status), the admin-holder
-// summary card (no admin-holder query exists), and the validator
-// accept/decline pair (the artifact binds handlers for it but authored no
-// geometry, so building it would be invention).
+// (only {height, public_key} is decoded off /v1/status), the RUN AS tier picker
+// (no chain action moves this node between standings from here, and the only
+// one it could submit is refused by the module — see the resident card), and
+// the validator accept/decline pair (the artifact binds handlers for it but
+// authored no geometry, so building it would be invention).
 
 // ---------------------------------------------------------------- YOUR ACCESS
 
@@ -19,6 +24,18 @@
 // artifact paints the admin and guest cards with a vertical gradient; iced has
 // no gradient primitive, so each takes the gradient's TOP stop as a flat plate
 // — the same substitution UnfinalizedFrame makes for the dashed border.
+//
+// `admin` is on the contract's signature and stays there, but nothing here
+// branches on it: it is `is_this_node && role == "validator"`, which is the
+// `"validator"` arm itself. A badge that split on it could only ever render one
+// of its two faces.
+//
+// The `_` arm is NOT a guest card. Anything that is not one of the three
+// standings means we do not know this node's, so the card says so rather than
+// telling a validator's operator they are a read-only guest. NOTE: today
+// `member_tier` folds "no row for this node" into `"guest"`, so an unanswered
+// roster still lands on the guest card; it must answer `""` for an unmatched
+// roster for this arm to catch the case it exists for.
 component NodeAccessCard(tier:str, admin:bool)
   col #root w=fill gap=9.0
     GroupLabel label="YOUR ACCESS"
@@ -29,12 +46,8 @@ component NodeAccessCard(tier:str, admin:bool)
             col w=fill gap=3.0
               row w=fill gap=7.0 align=center
                 text "This node" size=14.0 wrap=none font=display @text-primary
-                if admin
-                  box px=7.0 py=2.0 bg=primary r=5.0
-                    text "ADMIN · VALIDATOR" size=9.0 wrap=none font=code_semibold @text-primary_fg
-                if !admin
-                  box px=7.0 py=2.0 bg=primary r=5.0
-                    text "VALIDATOR" size=9.0 wrap=none font=code_semibold @text-primary_fg
+                box px=7.0 py=2.0 bg=primary r=5.0
+                  text "VALIDATOR · QUORUM SEAT" size=9.0 wrap=none font=code_semibold @text-primary_fg
               text "signs quorum · finalizes rounds · stores all history" size=10.5 wrap=none font=code_medium @text-caption
             col w=fill gap=9.0
               row w=fill gap=9.0
@@ -46,7 +59,7 @@ component NodeAccessCard(tier:str, admin:bool)
             col w=fill gap=13.0
               box w=fill h=1.0 bg=success_line
                 space w=1.0 h=1.0
-              text "Admin authority is transferred and revoked by quorum only." w=fill size=12.0 line-h=1.5 @text-caption
+              text "A quorum seat is granted and revoked by quorum only — this device cannot change it." w=fill size=12.0 line-h=1.5 @text-caption
       "resident"
         box w=fill pl=18.0 pr=18.0 pt=16.0 pb=16.0 bg=surface border=card_line border-w=1.0 r=13.0
           col w=fill gap=14.0
@@ -61,29 +74,30 @@ component NodeAccessCard(tier:str, admin:bool)
                 CapabilityCheck label="Read & verify finality" on=true
                 CapabilityCheck label="Send · react · thread" on=true
               row w=fill gap=9.0
-                CapabilityCheck label="Propose modules & members" on=true
+                // NOT held, and the artifact's tick here is wrong for this
+                // product: governance's `frozen_electorate` resolves the
+                // submitter against `valset::members`, which is validators
+                // only, so a resident's proposal is refused by the module.
+                CapabilityCheck label="Propose modules & members" on=false
                 CapabilityCheck label="Sign quorum · finalize" on=false
             col w=fill gap=13.0
               box w=fill h=1.0 bg=separator
                 space w=1.0 h=1.0
               col w=fill gap=9.0
-                text "ADMIN ONLY · QUORUM-GATED" size=9.0 wrap=none font=code_semibold @text-warning
+                text "VALIDATORS ONLY · QUORUM-GATED" size=9.0 wrap=none font=code_semibold @text-warning
                 row w=fill wrap wrap-gap=7.0 gap=7.0
+                  GatedChip label="Propose modules & members"
                   GatedChip label="Invite members"
                   GatedChip label="Change roles"
                   GatedChip label="Network settings"
-                // the CTA does not grant anything — it opens the proposal that
-                // asks the electorate to grant it, and the note below says so
-                row w=fill pt=4.0
-                  button label="Request validator role" p=0.0 @primary_action -> node_request_tier("add_validator")
-                    box pl=14.0 pr=14.0 pt=8.0 pb=8.0
-                      row gap=7.0 align=center
-                        text "Request validator role" size=12.0 wrap=none font=display @text-primary_fg
-                        text "→" size=12.0 wrap=none @text-caption
-                    active bg=primary text=primary_fg border=transparent border-w=1.0 r=8.0
-                    hovered bg=ink_hover text=primary_fg
-                    pressed bg=ink_hover text=primary_fg
-      _
+                // The artifact's `Request validator role` CTA is NOT built. It
+                // could only ever fail: the proposal it would open is refused
+                // for any submitter without a validator seat, which is every
+                // operator who can see this card. There is no message path from
+                // here to a validator either, so the rule is stated instead of
+                // a button that returns a rejection.
+                GateNote reason="Only a validator may open a membership proposal." next="Ask a validator to propose this node for the validator set — this device cannot open it."
+      "guest"
         box w=fill pl=18.0 pr=18.0 pt=16.0 pb=16.0 bg=warning_bg_lit border=warning_line border-w=1.0 r=13.0
           col w=fill gap=14.0
             col w=fill gap=3.0
@@ -110,6 +124,14 @@ component NodeAccessCard(tier:str, admin:bool)
                   GatedChip label="Sign quorum"
                   GatedChip label="Invite"
                 text "Contributing needs a resident invite · quorum grants resident and validator standing." w=fill size=12.0 line-h=1.5 @text-caption
+      _
+        box w=fill pl=18.0 pr=18.0 pt=16.0 pb=16.0 bg=surface border=card_line border-w=1.0 r=13.0
+          col w=fill gap=9.0
+            row w=fill gap=7.0 align=center
+              text "This node" size=14.0 wrap=none font=display @text-primary
+              box px=7.0 py=2.0 bg=elevated r=5.0
+                text "STANDING UNKNOWN" size=9.0 wrap=none font=code_semibold @text-meta
+            text "The valset roster has not answered, so this node's standing is not known yet. Nothing is claimed until it does." w=fill size=12.0 line-h=1.5 @text-caption
 
 // A capability the tier either holds or does not. The plate carries the whole
 // state — a tick on the success plate, an en-dash on the idle one — and the
@@ -134,72 +156,21 @@ component GatedChip(label:str)
       Icon name="lock" tone="idle" px=11.0
       text label size=12.0 wrap=none @text-meta
 
-// ---------------------------------------------------------------------- RUN AS
-
-// The tier picker. Reading the tier is local; CHANGING it is not — every
-// inactive card opens a governance proposal rather than flipping a switch, and
-// the note under the row says exactly that. `Light` carries the artifact's own
-// lock glyph because no chain action demotes a resident to a light node: there
-// is GovAction::{AddValidator, AddResident, RemoveValidator} and nothing else.
-component NodeRunAsPicker(tier:str)
-  col #root w=fill gap=9.0
-    row gap=9.0 align=center
-      GroupLabel label="RUN AS"
-      text "node tier · separate from admin authority" size=12.5 @text-label
-    row w=fill gap=10.0 align=start
-      RunAsCard label="Validator" badge="QUORUM" detail="joins rounds · signs quorum" action="add_validator" locked=false active=(tier == "validator")
-      RunAsCard label="Full" badge="FULL SYNC" detail="stores history · may propose" action="add_resident" locked=false active=(tier == "resident")
-      RunAsCard label="Light" badge="READ-ONLY" detail="verifies headers · read only" action="" locked=true active=(tier == "guest")
-    row w=fill gap=7.0 align=center
-      box w=5.0 h=5.0 bg=label r=2.5
-        space w=1.0 h=1.0
-      text "Changing this node's tier opens a proposal — quorum settles it, this device does not." w=fill size=12.5 @text-caption
-
-component RunAsCard(label:str, badge:str, detail:str, action:str, locked:bool, active:bool)
-  col #root w=fill
-    if active
-      box w=fill pl=15.0 pr=15.0 pt=13.0 pb=13.0 bg=primary border=primary border-w=1.5 r=12.0
-        col w=fill gap=7.0
-          row w=fill gap=7.0 align=center
-            text label size=14.0 wrap=none font=display @text-primary_fg
-            space w=fill
-            box px=6.0 py=2.0 bg=panel_tile r=4.0
-              text badge size=9.0 wrap=none font=code_semibold @text-toast_fg
-          text detail w=fill size=12.0 @text-ink_soft
-    if !active
-      col w=fill
-        if locked
-          box w=fill pl=15.0 pr=15.0 pt=13.0 pb=13.0 bg=surface border=border border-w=1.5 r=12.0
-            col w=fill gap=7.0
-              row w=fill gap=7.0 align=center
-                text label size=14.0 wrap=none font=display @text-accent_fg
-                Icon name="lock" tone="label" px=11.0
-                space w=fill
-                box px=6.0 py=2.0 bg=elevated r=4.0
-                  text badge size=9.0 wrap=none font=code_semibold @text-input
-              text detail w=fill size=12.0 @text-meta
-        if !locked
-          button label=label w=fill p=0.0 @outline_action -> node_request_tier(action)
-            col w=fill pl=15.0 pr=15.0 pt=13.0 pb=13.0 gap=7.0
-              row w=fill gap=7.0 align=center
-                text label size=14.0 wrap=none font=display @text-accent_fg
-                space w=fill
-                box px=6.0 py=2.0 bg=elevated r=4.0
-                  text badge size=9.0 wrap=none font=code_semibold @text-input
-              text detail w=fill size=12.0 @text-meta
-            active bg=surface text=accent_fg border=border border-w=1.5 r=12.0
-            hovered bg=card_wash_hover text=accent_fg border=control_line_hover border-w=1.5 r=12.0
-            pressed bg=elevated text=accent_fg border=control_line_hover border-w=1.5 r=12.0
-
 // ----------------------------------------------------------------- PERMISSIONS
 
 // The capability x tier table. The rows are static product truth; the only
 // live thing is which column is tinted, which is why the whole thing takes one
-// prop. 92px columns, exactly as authored.
+// prop. 92px columns, exactly as authored. When `tier` is not one of the three
+// standings — an unanswered roster — no column tints, which is the honest
+// reading.
+//
+// `Propose modules & members` is FULL-off against the artifact: the governance
+// module resolves a proposal's submitter against the validator set, so the
+// resident column would be printing a claim the chain refuses.
 component PermissionMatrix(tier:str)
   col #root w=fill gap=13.0
     box w=fill max-w=640.0
-      text "Ducktape has two authority axes — the node tier this device runs, and admin governance, which quorum grants. The table is the default for each tier; the tier this node runs is highlighted." size=12.5 line-h=1.55 @text-muted
+      text "Standing is one axis, not two: the row the validator set holds for this node is the whole of its authority, and quorum — not this device — writes it. The table is what each standing may do; this node's standing is highlighted." size=12.5 line-h=1.55 @text-muted
     box w=fill max-w=640.0 bg=surface border=card_line border-w=1.0 r=12.0 clip=true
       col w=fill
         box w=fill bg=card_wash
@@ -211,7 +182,7 @@ component PermissionMatrix(tier:str)
             MatrixHead label="Light" active=(tier == "guest")
         MatrixRow label="Read & verify finality" v=true f=true l=true tier=tier
         MatrixRow label="Send · react · thread" v=true f=true l=false tier=tier
-        MatrixRow label="Propose modules & members" v=true f=true l=false tier=tier
+        MatrixRow label="Propose modules & members" v=true f=false l=false tier=tier
         MatrixRow label="Sign quorum · finalize" v=true f=false l=false tier=tier
 
 component MatrixHead(label:str, active:bool)
@@ -253,16 +224,18 @@ component MatrixTick(on:bool)
 // -------------------------------------------------------------------- ACTIVITY
 
 // The log console is the one dark plate in the console: paper everywhere else,
-// terminal here. `source` names where the stream comes from — the app reads the
-// ring over the node's ws `logs` topic, so it prints the endpoint, NOT the
-// `~/.ducktape/…/node.log` path the artifact writes, which the app never opens.
-// The caller fills the slot with its own filtered `for` over the ring.
+// terminal here. `source` names where the stream comes from; the caller fills
+// the slot with its own filtered `for` over the ring.
+//
+// The artifact hangs a green liveness dot beside the NODE LOG title. It is not
+// built: `node_logs` retries the ws `logs` topic forever and surfaces no
+// failure, so the dot had no signal behind it and could not go dark — a green
+// light over a dead stream is worse than none.
 component NodeLogConsole(source:str)
   box #root w=fill h=fill bg=primary r=12.0 clip=true
     col w=fill h=fill pl=17.0 pr=17.0 pt=15.0 pb=15.0 gap=11.0
       row w=fill gap=8.0 align=center
         text "NODE LOG" size=9.0 wrap=none font=code_semibold @text-toast_fg
-        PulseDot plate=6.0 tone="success"
         space w=fill
         text source size=10.5 wrap=none font=code_medium @text-input
       scroll dir=vertical w=fill h=fill bar=hidden
@@ -292,14 +265,3 @@ component LogLevel(level:str)
         text "ERROR" size=12.0 wrap=none font=code @text-danger_soft
       _
         text level size=12.0 wrap=none font=code @text-input
-
-// ------------------------------------------------------------------- THE ROUTE
-
-// The one handler this file owns. Both the Request-validator CTA and the RUN AS
-// picker land here: they are the same act — open the membership proposal that
-// would move THIS node to that tier. `gov_voting` is already the governance
-// busy latch, and `gov_acted` / `gov_act_failed` already clear it and reload.
-on node_request_tier(action)
-  return if !connected || !empty(gov_voting) || empty(settings_node_key)
-  gov_voting = action
-  run governance_propose(connected_rpc, password, action, settings_node_key) -> gov_acted _ | gov_act_failed _
