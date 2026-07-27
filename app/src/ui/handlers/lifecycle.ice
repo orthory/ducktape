@@ -1,3 +1,16 @@
+// Two lists this file loads that state.ice has no field for. A handler file may
+// declare app state, and the loaders that fill these live here.
+state
+  // The DIRECT section of the chat sidebar: every principal you can open a
+  // two-party channel with.
+  dm_peers:[DmPeer] = []
+  // The duckfs path list behind the 206px tree, which is a different question
+  // from `fs_entries` (one directory) and comes from a different call. It is
+  // the find route's FIRST page — 256 paths (duckfs wire.rs MAX_PAGE) — so a
+  // workspace larger than that shows a tree that stops, until the tree itself
+  // learns to page on its `next` cursor.
+  files_tree:[FsEntry] = []
+
 on mount
   loading = true
   run connect(rpc) -> workspace_connected _ | failed _
@@ -137,8 +150,13 @@ on workspace_connected(next)
   forge_generation = forge_generation + 1
   settings_generation = settings_generation + 1
   node_peers_generation = node_peers_generation + 1
+  node_facts_generation = node_facts_generation + 1
+  dm_peers_generation = dm_peers_generation + 1
   parallel
     run load_doc_tabs(connected_rpc) -> doc_tabs_loaded _
+    run load_bool_pref(connected_rpc, "receipts") -> receipts_pref_loaded _
+    run load_dm_peers(connected_rpc, dm_peers_generation) -> dm_peers_loaded _ | dm_peers_failed _
+    run load_node_facts(connected_rpc, node_facts_generation) -> node_facts_loaded _ | node_facts_failed _
     run load_bell(connected_rpc, bell_generation) -> bell_loaded _ | bell_failed _
     run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
     run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
@@ -304,11 +322,14 @@ on select_shell_tab(next)
   forge_generation = forge_generation + 1
   settings_generation = settings_generation + 1
   node_peers_generation = node_peers_generation + 1
+  node_facts_generation = node_facts_generation + 1
   explorer_loading = shell_tab == "explorer"
   fs_loading = shell_tab == "files"
   parallel
+    run load_node_facts(connected_rpc, node_facts_generation) -> node_facts_loaded _ | node_facts_failed _
     run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
     run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
+    run files_find(connected_rpc, "", fs_generation) -> fs_tree_loaded _ | fs_failed _
     run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
     run load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
     run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
@@ -462,6 +483,25 @@ on forge_refreshed(next)
   forge_item_approvals = keep_i64(next.item_loaded, next.item.approvals, forge_item_approvals)
   forge_item_change_requests = keep_i64(next.item_loaded, next.item.change_requests, forge_item_change_requests)
 
+// The breadcrumb home. Nothing else clears `forge_repo`, so without this the
+// repo grid is unreachable for the rest of the session once a repo is opened.
+on forge_close_repo
+  forge_repo = ""
+  forge_branches = []
+  forge_items = []
+  forge_repo_menu = false
+  forge_item_number = 0
+  forge_item_diff = ""
+  forge_item_channel = ""
+  forge_discussion = []
+  forge_discussion_members = []
+  forge_discussion_pending = ""
+  forge_merge_conflicts = []
+
+on forge_toggle_repo_menu
+  forge_repo_menu = !forge_repo_menu
+  overlay_in = forge_repo_menu
+
 on forge_close_item
   forge_item_number = 0
   forge_item_diff = ""
@@ -505,6 +545,10 @@ on account_rename_failed(cause)
 on agents_loaded(next)
   return if next.generation != agents_generation
   agents_rows = next.agents
+  // `pulse` is the console's only breathing dot and it repeats forever, so a
+  // live agent is the one fact that starts it. Nothing else animates.
+  return if !any_agent_active(next.agents)
+  pulse = 1.0
 
 on agents_failed(cause)
   return if cause.generation != agents_generation
@@ -522,6 +566,29 @@ on peers_loaded(next)
 on peers_failed(cause)
   return if cause.generation != node_peers_generation
 
+// The consensus facts /v1/status already publishes and the console dropped:
+// app-hash, view, quorum, reachable validators, finality and the gc watermark.
+//
+// `view`, `quorum` and `reachable_validators` are NOT stored: the contract made
+// them `Option<i64>` so a resident is not shown misleading zeroes, but Ice can
+// only WRAP an optional (`some(T)`), never read one — so an `i64?` cannot reach
+// an `i64` state field or a text node. Until NodeFacts carries the trio as
+// plain i64 beside a `consensus_known: bool`, `node_view`/`node_quorum`/
+// `node_reachable` stay at their defaults and nothing may print them.
+on node_facts_loaded(next)
+  return if next.generation != node_facts_generation
+  node_root_hash = next.root_hash
+  node_last_finalized = next.last_finalized_at
+  node_checkpoint = next.checkpoint_height
+
+on node_facts_failed(cause)
+  return if cause.generation != node_facts_generation
+
+// Overview | Permissions | Activity, inside Settings now that the Node rail
+// seat is gone. The log stream below subscribes on this tab.
+on select_node_tab(tab)
+  node_tab = tab
+
 on settings_loaded(next)
   return if next.generation != settings_generation
   settings_endpoint = next.endpoint
@@ -537,6 +604,41 @@ on settings_failed(cause)
 on settings_clear_tabs
   doc_tabs = []
   run clear_doc_tabs(connected_rpc) -> doc_tabs_saved _
+
+// PREFERENCES — device-local, one endpoint at a time.
+on receipts_pref_loaded(enabled)
+  pref_receipts = enabled
+
+on toggle_receipts_pref
+  pref_receipts = !pref_receipts
+  run save_bool_pref(connected_rpc, "receipts", pref_receipts) -> receipts_pref_saved _
+
+on receipts_pref_saved(saved)
+  return if saved
+  error = "This device could not save the preference."
+
+// DANGER ZONE — forget this workspace on THIS DEVICE and go back to onboarding.
+on forget_workspace_submit
+  return if !connected
+  run forget_workspace(connected_rpc) -> workspace_forgotten _ | mutation_failed _
+
+on workspace_forgotten(_result)
+  connected = false
+  status = "Not connected"
+  error = ""
+  phase = "welcome"
+
+// The app's one clipboard action: every Copy button routes here so the toast
+// copy lives at the call site and the write itself stays native.
+on copy_to_clipboard(text, label)
+  toast = label
+  toast_tone = "info"
+  overlay_in = true
+  task clipboard write text
+
+on dismiss_toast
+  toast = ""
+  overlay_in = false
 
 on governance_loaded(next)
   return if next.generation != gov_generation
@@ -555,6 +657,13 @@ on gov_execute(proposal_id)
   gov_voting = proposal_id
   run governance_execute(connected_rpc, password, gov_voting) -> gov_acted _ | gov_act_failed _
 
+// The quorum-gated membership actions the roster detail panel offers. They
+// share `gov_voting` with vote/execute: one governance write is in flight.
+on gov_propose(action, target_key)
+  return if !connected || !empty(gov_voting)
+  gov_voting = target_key
+  run governance_propose(connected_rpc, password, action, target_key) -> gov_acted _ | gov_act_failed _
+
 on gov_acted(_result)
   gov_voting = ""
   gov_generation = gov_generation + 1
@@ -572,6 +681,43 @@ on members_loaded(next)
 
 on members_failed(cause)
   return if cause.generation != members_generation
+
+// The DIRECT peer directory. Loaded with the workspace, because the sidebar
+// section that reads it is on screen from the first frame.
+on dm_peers_loaded(next)
+  return if next.generation != dm_peers_generation
+  dm_peers = next.peers
+
+on dm_peers_failed(cause)
+  return if cause.generation != dm_peers_generation
+
+// ROSTER — one screen, one filter, one detail panel. An empty key closes it.
+on open_member(key)
+  members_selected = key
+
+on pick_members_filter(filter)
+  members_filter = filter
+
+// The invite modal is pure view state — minting is a separate, explicit act.
+on open_invite_modal
+  invite_modal_open = true
+  overlay_in = true
+
+on close_invite_modal
+  invite_modal_open = false
+  overlay_in = false
+
+// Pause or resume an agent. The payload is what the row reads NOW, so a live
+// agent pauses and a paused one resumes. Only its owner may ask: the view
+// offers this on `is_mine` rows, and the node refuses anyone else.
+on agent_set_status(agent_id, live)
+  return if !connected
+  run set_agent_status(connected_rpc, password, agent_id, live) -> agent_status_set _ | mutation_failed _
+
+on agent_status_set(_result)
+  agents_generation = agents_generation + 1
+  error = ""
+  run load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
 
 on fs_open_dir(path)
   return if fs_loading || !connected
@@ -616,6 +762,11 @@ on fs_previewed(next)
 on fs_history_loaded(next)
   return if next.generation != fs_generation
   fs_history = next.snapshots
+
+// The whole path list behind the tree sidebar — a prefix walk, not a listing.
+on fs_tree_loaded(next)
+  return if next.generation != fs_generation
+  files_tree = next.entries
 
 on fs_failed(cause)
   return if cause.generation != fs_generation
@@ -669,6 +820,7 @@ on fs_wrote(_result)
   fs_loading = true
   parallel
     run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
+    run files_find(connected_rpc, "", fs_generation) -> fs_tree_loaded _ | fs_failed _
     run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
 
 on fs_write_failed(cause)
@@ -718,6 +870,7 @@ on select_explorer_block(height)
 on toggle_palette
   return if !connected
   palette_open = !palette_open
+  overlay_in = palette_open
   palette_draft = ""
   palette_chat_hits = []
   palette_page_hits = []
@@ -728,14 +881,18 @@ on toggle_palette
 
 on close_palette
   palette_open = false
+  overlay_in = false
 
+// Opening the bell only opens it. Marking read is the Mark-all-read button's
+// job — doing it here cleared the badge and every unread row before the list
+// painted, and left that button with nothing to do.
 on toggle_bell
   bell_open = !bell_open
-  return if !bell_open || bell_unread <= 0
-  run mark_bell_read(connected_rpc, password, bell_head(bell_items)) -> bell_marked _ | mutation_failed _
+  overlay_in = bell_open
 
 on close_bell
   bell_open = false
+  overlay_in = false
 
 on mark_bell_read_submit
   return if bell_unread <= 0
@@ -757,6 +914,7 @@ on global_key_pressed(event)
   return if palette_key == "none"
   return if palette_key == "open" && !connected
   palette_open = palette_key == "open"
+  overlay_in = palette_open
   palette_key = ""
   palette_draft = ""
   palette_chat_hits = []
@@ -789,11 +947,25 @@ on palette_search_failed(cause)
   return if cause.generation != palette_generation
   palette_searching = false
 
+// The huddle's elapsed clock is a LOCAL session fact: one tick per second for
+// as long as SHE is in the huddle, never a chain value. `huddle_joined_at` is
+// stamped from `huddle_now` when she joins, so mm:ss is their difference.
+on tick
+  huddle_now = huddle_now + 1
+
+// The app has exactly ONE subscribe block. Component handler files may not
+// declare another, so every new subscription lands here.
+//
+// The node log stream follows the node body into Settings — the rail seat it
+// used to key on is gone, and a predicate that can never be true again would
+// have taken the log console dark without a word.
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
   keyboard press when (connected || palette_open) -> global_key_pressed _
   window file-dropped -> fs_file_dropped _
-  run node_logs(connected_rpc) when (connected && shell_tab == "node") -> node_log_line _
+  run node_logs(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "activity") -> node_log_line _
+  every 1s when huddle_joined -> tick
+  every 2800ms when !empty(toast) -> dismiss_toast
 
 on mutation_failed(cause)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, cause.committed)
