@@ -1308,7 +1308,10 @@ view
                   box w=fill p=15.0 bg=surface border=card_line border-w=1.0 r=11.0
                     row w=fill gap=13.0 align=center
                       PersonAvatar initials=initial_of(account_name) plate=40.0 ink=14.0
-                      col w=fill gap=3.0
+                      // clip: the key line is four `wrap=none` runs over a 64-hex
+                      // key, so it cannot shrink — without this it paints over the
+                      // rename controls in the next column.
+                      col w=fill gap=3.0 clip=true
                         row w=fill gap=7.0 align=center
                           if !empty(account_name)
                             text account_name size=13.5 wrap=none font=display @text-fg
