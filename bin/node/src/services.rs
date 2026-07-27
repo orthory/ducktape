@@ -1265,13 +1265,22 @@ pub(crate) const HEARTBEAT: std::time::Duration =
 /// granted standing keeps signaling and executes nothing — enable is the
 /// consent boundary, and a daemon can never grant itself one.
 fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // a foreground daemon logs; it is not a one-shot verb printing a value.
-    noded::log::init(None, None);
     let kind = args.kind.clone();
     if !kind_is_well_formed(&kind) {
         return Err(format!("{kind:?} is not a service kind (1..32 chars of [a-z0-9-])").into());
     }
     let workspace = args.workspace.dir()?;
+    // a foreground daemon logs; it is not a one-shot verb printing a value —
+    // and it TEES, exactly as `node run` tees `daemon.log`. Without this the
+    // airlock lender's record of who spent the operator's subscription lived in
+    // whatever terminal happened to launch it, which is not a record. Per KIND,
+    // because compute/agent/airlock can share a workspace.
+    //
+    // ORDER IS LOAD-BEARING and it is the two lines above: `kind` reaches a
+    // path join, so the `[a-z0-9-]{1,32}` check has to have refused a traversal
+    // first. Everything before this point can only return an `Err` main prints;
+    // there is no event to lose.
+    noded::log::init(None, Some(workspace.join(format!("{kind}.log"))));
     // THE daemon config path (`config::ServiceConfig`): everything below is
     // derived without ever opening the node's `identity.key`, so this process
     // cannot sign as the node — which is why `/v1/submit` re-signing is a
