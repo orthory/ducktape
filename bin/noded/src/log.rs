@@ -97,6 +97,11 @@ pub fn set_filter(directives: &str) -> Result<(), String> {
 /// makes the node its OWN tee: the desktop spawner that used to pipe stderr
 /// into daemon.log is gone, so without this a hand-run `ducktape node run`
 /// leaves no durable record at all — the log "looks off by default".
+///
+/// A `service run <kind>` daemon tees the same way, to `<workspace>/<kind>.log`,
+/// and for the same reason: nothing supervises it either, and the airlock
+/// lender's `info` record of who drew on the operator's credential is only a
+/// record if it outlives the terminal that launched the daemon.
 pub fn init(ring: Option<crate::LogRing>, log_file: Option<std::path::PathBuf>) {
     let (boot, bad_env) = boot_filter();
     let (filter_layer, handle) = reload::Layer::new(boot);
@@ -151,7 +156,9 @@ pub fn init(ring: Option<crate::LogRing>, log_file: Option<std::path::PathBuf>) 
         tracing::warn!(
             target: "ducktape::node",
             error = %err,
-            "daemon.log unavailable — logging to stderr and the ring only"
+            // named by `error` above: `node run` tees daemon.log, a
+            // `service run <kind>` daemon tees <kind>.log.
+            "log file unavailable — logging to stderr and the ring only"
         );
     }
 

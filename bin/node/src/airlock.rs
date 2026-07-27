@@ -345,8 +345,11 @@ fn committed_grant_check(node: NodeLink) -> airlock::server::GrantCheck {
 /// 2. **delegation** — [`delegated_answer`], for a session that presented a
 ///    pointer to committed work.
 ///
-/// The reason is named at debug (this is per-session) and never carries an
-/// account, a saga id, or a token.
+/// Both answers are recorded, and they are recorded differently on purpose. A
+/// refusal names only a [`refuse`] token, at `debug`: it is reachable by anyone
+/// who can reach the route, so everything about it is a stranger's input. An
+/// admission is the owner's audit record and goes to [`admit`] at `info`,
+/// because the person who needs it is the one who was not watching.
 async fn grant_answer(reader: &dyn CommittedReader, question: &GrantQuestion) -> GrantAnswer {
     let record = match committed_credential_record(reader, &question.credential).await {
         Ok(Some(record)) => record,
@@ -366,7 +369,7 @@ async fn grant_answer(reader: &dyn CommittedReader, question: &GrantQuestion) ->
     };
     let caller_is_granted = credential_use_allowed(&record, &question.caller);
     if caller_is_granted {
-        return GrantAnswer::Granted;
+        return admit(question, Draw::Direct);
     }
     match &question.work {
         // Nothing to delegate against. An interactive session takes this arm by
@@ -478,10 +481,85 @@ async fn delegated_answer(
     }
     // FOUR.
     match submitter_is_granted(reader, record, &saga.origin).await {
-        Half::Yes => GrantAnswer::Granted,
+        Half::Yes => admit(question, Draw::Delegated(saga_id)),
         Half::No => refuse("delegated_submitter_not_granted"),
         Half::Unreadable => GrantAnswer::Undetermined,
     }
+}
+
+/// WHAT the admitted session drew against — the "for what work" half of the
+/// owner's record, and the only field that separates a caller spending its own
+/// entitlement from one spending somebody else's.
+///
+/// A discriminant rather than an `Option<&str>`, because the two are not the
+/// same fact wearing different clothes: [`grant_answer`] settles the caller's
+/// own grant BEFORE it looks at the pointer, so a session that carried a saga
+/// pointer and was admitted on its own grant is [`Self::Direct`] — the pointer
+/// bought nothing there, and recording it would tell the owner a run paid for a
+/// draw that the caller's standing grant paid for.
+enum Draw<'a> {
+    /// the caller is the credential's owner or one of its grantees.
+    Direct,
+    /// the caller holds no grant at all: this lender's OWN committed state says
+    /// the work is pinned to it and was submitted by an account that is granted.
+    Delegated(&'a str),
+}
+
+/// One discriminant, one `match`, and the saga id goes through `{:?}` rather
+/// than `{}`.
+///
+/// That is not a style choice: a product saga id is `sched\x1f<name>`, and
+/// `Debug` for a string is what ESCAPES that control byte instead of writing it
+/// into the owner's terminal and the app's log ring. Same treatment the compute
+/// intake gives its own `attempt = ?key`. No space in either rendering, so the
+/// value cannot be misread as the start of another field.
+impl std::fmt::Display for Draw<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Draw::Direct => f.write_str("direct"),
+            Draw::Delegated(saga_id) => write!(f, "delegated({saga_id:?})"),
+        }
+    }
+}
+
+/// How much of an account id the record names. The same 4-byte prefix every
+/// other identity in this codebase's logs carries (`peer = %hex_bytes(&key[..4])`
+/// on the join plane): enough for an owner to tell their handful of borrowers
+/// apart and to correlate two lines, while the log itself stays a poor place to
+/// harvest identities from. The full id is on chain for whoever needs it.
+const CALLER_PREFIX_BYTES: usize = 4;
+
+/// **The owner's record of a draw on their own subscription**: who, which
+/// credential, when, and for what work.
+///
+/// The one `info` on this path, and it has to be one: `debug` is off at the
+/// default filter, so a record nobody turned on is a record that does not exist
+/// — and the owner is exactly the person who was not watching. The cadence
+/// earns it. This fires once per session OPEN, not per request: a borrower's
+/// broker opens one session per run and re-mints only when the 3600 s token
+/// lapses, which is the `{session}` granularity the doctrine reserves `info`
+/// for. The per-request line is the borrower's broker's (`ducktape::broker`, at
+/// `debug`), and it belongs there — this is the lender's side, and a lender
+/// counting a borrower's requests would be a different feature.
+///
+/// The credential NAME is here and DELIBERATELY still absent from [`refuse`]:
+/// a refusal is reachable by any admitted member with a `sub` of their own
+/// choosing, so naming it there writes a stranger's string into the owner's log.
+/// By this line the name has been matched against a record consensus committed,
+/// so it is one the owner registered themselves.
+///
+/// Never the token, the credential's value, or the caller's whole account —
+/// see [`CALLER_PREFIX_BYTES`].
+fn admit(question: &GrantQuestion, draw: Draw<'_>) -> GrantAnswer {
+    let caller = &question.caller[..question.caller.len().min(CALLER_PREFIX_BYTES)];
+    tracing::info!(
+        target: "ducktape::gateway",
+        credential = %question.credential,
+        caller = %noded::hex_bytes(caller),
+        work = %draw,
+        "airlock session opened"
+    );
+    GrantAnswer::Granted
 }
 
 /// One refusal, one stable snake_case token. Never an account, a saga id, a
@@ -751,6 +829,56 @@ mod tests {
         }
     }
 
+    /// Everything ONE gate call logged, on a subscriber scoped to that call.
+    ///
+    /// Scoped, not the process-wide `set_global_default` the broker's capture
+    /// installs: these tests share a binary with every other `bin/node` unit
+    /// test, and a global subscriber is a race the first installer wins.
+    ///
+    /// `max` is load-bearing rather than decoration. The draw record is asserted
+    /// at INFO — what the DEFAULT filter admits — because a record only
+    /// reachable once somebody sets `RUST_LOG` is a record the owner never sees,
+    /// and the owner not watching is the whole premise. Refusals are asserted at
+    /// TRACE, so "it does not name the credential" cannot pass by hiding under a
+    /// level.
+    async fn logged(
+        max: tracing::Level,
+        state: &dyn CommittedReader,
+        question: &GrantQuestion,
+    ) -> (GrantAnswer, String) {
+        use tracing::instrument::WithSubscriber as _;
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Sink {
+            type Writer = Self;
+            fn make_writer(&self) -> Self {
+                self.clone()
+            }
+        }
+
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(max)
+            .with_writer(sink.clone())
+            .finish();
+        let answer = grant_answer(state, question)
+            .with_subscriber(subscriber)
+            .await;
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).expect("utf8 log output");
+        (answer, text)
+    }
+
     /// THE DELEGATED ADMISSION: the executor holds the lease AND the submitter is
     /// granted — here implicitly, because the submitter owns the credential. The
     /// executor is on no grant list at all.
@@ -761,6 +889,85 @@ mod tests {
             grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
             GrantAnswer::Granted
         );
+    }
+
+    /// **The owner's half of the record**, and the half that did not exist: a
+    /// delegated draw is precisely the case where somebody holding NO grant
+    /// spends the owner's subscription, and the lender used to log nothing at
+    /// all for it. One line, three questions.
+    #[tokio::test]
+    async fn an_admitted_draw_is_recorded_for_the_owner() {
+        let state = Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
+        let (answer, log) = logged(
+            tracing::Level::INFO,
+            &state,
+            &question(EXEC_ACCOUNT, pointer()),
+        )
+        .await;
+        assert_eq!(answer, GrantAnswer::Granted);
+        // WHO — the account the transport vouched for, by its prefix.
+        let caller = noded::hex_bytes(&EXEC_ACCOUNT[..CALLER_PREFIX_BYTES]);
+        assert!(log.contains(&format!("caller={caller}")), "{log}");
+        // WHICH credential — the owner's own name for it, matched against the
+        // record consensus committed.
+        assert!(log.contains(&format!("credential={CRED}")), "{log}");
+        // FOR WHAT WORK — the pointer this lender resolved, with the saga id's
+        // `\x1f` escaped rather than written into the owner's terminal.
+        assert!(log.contains(&format!("work=delegated({SAGA:?})")), "{log}");
+        // WHEN is the subscriber's timestamp; nothing here supplies it.
+        //
+        // …and never the whole account: a log is a poor place to harvest
+        // identities from, and the full id is on chain for whoever needs it.
+        assert!(!log.contains(&noded::hex_bytes(EXEC_ACCOUNT)), "{log}");
+    }
+
+    /// The same record for a draw on the caller's OWN grant — and it says
+    /// `Direct` even though this session carried a pointer, because the pointer
+    /// bought nothing: `a_granted_caller_costs_no_saga_read` settles the grant
+    /// before the pointer is ever looked at. Recording the saga here would tell
+    /// the owner a run paid for a draw their standing grant paid for.
+    #[tokio::test]
+    async fn a_draw_on_the_callers_own_grant_is_recorded_as_direct() {
+        let mut state = Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
+        state.grants = vec![EXEC_ACCOUNT.to_vec()];
+        let (answer, log) = logged(
+            tracing::Level::INFO,
+            &state,
+            &question(EXEC_ACCOUNT, pointer()),
+        )
+        .await;
+        assert_eq!(answer, GrantAnswer::Granted);
+        assert!(log.contains("work=direct"), "{log}");
+        assert!(!log.contains("delegated"), "{log}");
+    }
+
+    /// The refusal side is unchanged, and it has to STAY unchanged now that the
+    /// admitted side names things. A refusal is reachable by any admitted member
+    /// with a `sub` of their own choosing, so a later "make the two lines
+    /// symmetric" refactor would hand a stranger a pen and the owner's log.
+    #[tokio::test]
+    async fn a_refusal_still_names_neither_the_credential_nor_the_caller() {
+        let state = Committed::new(
+            SagaOrigin::External(STRANGER_NODE.to_vec()),
+            Some(EXEC_NODE),
+        );
+        let (answer, log) = logged(
+            tracing::Level::TRACE,
+            &state,
+            &question(EXEC_ACCOUNT, pointer()),
+        )
+        .await;
+        assert_eq!(answer, GrantAnswer::Refused);
+        assert!(
+            log.contains(r#"reason="delegated_submitter_not_granted""#),
+            "{log}"
+        );
+        assert!(!log.contains(CRED), "{log}");
+        assert!(
+            !log.contains(&noded::hex_bytes(&EXEC_ACCOUNT[..CALLER_PREFIX_BYTES])),
+            "{log}"
+        );
+        assert!(!log.contains(SAGA), "{log}");
     }
 
     /// The EXECUTOR condition. The origin is the owner, so a gate that checked
