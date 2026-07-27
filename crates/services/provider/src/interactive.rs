@@ -24,7 +24,7 @@
 //! bounded by the broker's own request/byte caps, not by output silence.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 
 use tokio::io::unix::AsyncFd;
@@ -36,8 +36,8 @@ use tokio::net::unix::OwnedWriteHalf;
 use crate::broker::RunBroker;
 use crate::sandbox::{self, SandboxBackend};
 use crate::{
-    BrokerKind, CliProvider, LiveChild, RunAuth, RunContext, TartGuard, broker_provider_overrides,
-    canonical_mount_path, configure_process_group, podman_api,
+    BrokerKind, CliProvider, LiveChild, RunAuth, RunContext, RunHome, TartGuard,
+    broker_provider_overrides, canonical_mount_path, configure_process_group, podman_api,
 };
 
 /// how a live interactive session carries the terminal. A Tart guest (ssh) or
@@ -72,9 +72,12 @@ pub struct InteractiveSession {
     /// so the ssh child dies before this guard's Drop stops/deletes the VM.
     _tart: Option<TartGuard>,
     /// held for the session's lifetime: dropping the broker tears its endpoint
-    /// down, and the config home must outlive the child that reads it.
+    /// down, and dropping the config home REMOVES it — declared last, so the
+    /// child that reads it is already gone by then. a session's transcripts and
+    /// credentials file do not outlive the session in a workdir a later run
+    /// (another account's, since #843) will mount.
     _broker: Option<RunBroker>,
-    _config_home: Option<PathBuf>,
+    _config_home: Option<RunHome>,
 }
 
 impl InteractiveSession {
@@ -85,7 +88,7 @@ impl InteractiveSession {
         mut command: tokio::process::Command,
         tart: Option<TartGuard>,
         broker: Option<RunBroker>,
-        config_home: Option<PathBuf>,
+        config_home: Option<RunHome>,
     ) -> Result<Self, String> {
         let (master, slave) = open_pty()?;
         set_nonblocking(&master)?;
@@ -129,7 +132,7 @@ impl InteractiveSession {
         client: podman_api::Podman,
         id: String,
         broker: Option<RunBroker>,
-        config_home: Option<PathBuf>,
+        config_home: Option<RunHome>,
     ) -> Self {
         let (writer, reader) = attach.into_split();
         Self {
@@ -341,14 +344,14 @@ impl CliProvider {
         };
         let workdir = self.ensure_writable_workdir(ctx)?;
         let workdir = canonical_mount_path(&workdir, "sandbox workdir")?;
-        let config_home = self.prepare_config_home(&workdir, ctx)?;
+        let home = self.prepare_config_home(&workdir)?;
         // the per-run credential source: a peer-attached session carries a
         // consensus-resolved self-host gateway on `ctx.airlock`, so the broker
         // resolves the upstream to it instead of the boundary env; a local
         // session leaves it `None` and the env/host-credential path is unchanged.
         let broker = self.start_broker(ctx.airlock.as_ref()).await?;
         let auth = RunAuth {
-            config_home: config_home.as_deref(),
+            config_home: home.as_ref().map(RunHome::config),
             broker: broker.as_ref().map(|b| &b.endpoint),
         };
         let args = interactive_argv(base, &auth, &workdir, self.spec.isolation.broker);
@@ -366,11 +369,7 @@ impl CliProvider {
                     format!("{}: attach interactive container: {e}", self.spec.tag)
                 })?;
                 Ok(InteractiveSession::from_attach(
-                    attach,
-                    client,
-                    id,
-                    broker,
-                    config_home,
+                    attach, client, id, broker, home,
                 ))
             }
             SandboxBackend::Tart { .. } => {
@@ -386,7 +385,7 @@ impl CliProvider {
                 let mut command = tokio::process::Command::new("sshpass");
                 command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script, true));
                 command.current_dir(&workdir);
-                InteractiveSession::spawn_on_pty(command, Some(guard), broker, config_home)
+                InteractiveSession::spawn_on_pty(command, Some(guard), broker, home)
             }
             #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => {
