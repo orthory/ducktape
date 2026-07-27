@@ -68,6 +68,12 @@ pub struct ChatMessage {
     pub show_author: bool,
     pub initial: String,
     pub avatar_kind: String,
+    /// authored by the viewing device's own user key — the own-message bubble.
+    pub mine: bool,
+    /// the block this message settled in; 0 while pending.
+    pub height: i64,
+    /// consensus wall-clock (unix seconds) of that block; 0 while pending.
+    pub time: i64,
     pub reactions: Vec<ChatReaction>,
 }
 
@@ -89,6 +95,9 @@ impl Default for ChatMessage {
             show_author: true,
             initial: String::new(),
             avatar_kind: String::new(),
+            mine: false,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         }
     }
@@ -611,6 +620,11 @@ pub fn optimistic_message(
         show_author: true,
         initial: "Y".into(),
         avatar_kind: "human".into(),
+        // an optimistic row is this device's own post by construction; it has
+        // no block yet, so height/time stay unset until the canonical row lands.
+        mine: true,
+        height: 0,
+        time: 0,
         reactions: Vec::new(),
     });
     messages
@@ -716,6 +730,7 @@ pub fn thread_offset_after_reply(offset: i64, has_more: bool, committed: bool) -
 
 pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
     let edited = row.rev > 0;
+    let mine = authored_by_user(&row.author, current_user);
     let meta = if edited {
         format!("#{} · edited", row.seq)
     } else {
@@ -746,6 +761,9 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
         show_author: true,
         initial: avatar_initial(&row.author),
         avatar_kind: avatar_kind(&row.author).into(),
+        mine,
+        height: number_i64(row.height),
+        time: number_i64(row.time),
         reactions: row
             .reactions
             .into_iter()
@@ -769,6 +787,12 @@ fn reacted_by_user(reactors: &[String], current_user: Option<&[u8]>) -> bool {
         let handle = format!("user:{}", hex_encode(key));
         reactors.contains(&handle)
     })
+}
+
+/// True when the message's rendered author IS the local user — the same
+/// `user:{hex}` comparison the reaction check makes, against the same key.
+fn authored_by_user(author: &str, current_user: Option<&[u8]>) -> bool {
+    current_user.is_some_and(|key| author == format!("user:{}", hex_encode(key)))
 }
 
 /// Slack-style grouping: a message shows its avatar + author header only when it

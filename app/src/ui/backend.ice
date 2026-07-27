@@ -5,12 +5,13 @@ extern crate::backend
   ChannelRead(channel:str, seq:i64)
   ChatSpan(text:str, bold:bool, italic:bool, highlight:bool, link:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
-  ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, reactions:[ChatReaction])
-  ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
+  ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, mine:bool, height:i64, time:i64, reactions:[ChatReaction])
+  HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64)
+  ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
   SendReceipt(operation_id:str, channel_id:str)
   ChatDelta(kind:str, channel_id:str, seq:i64, root_seq:i64, message:ChatMessage, channel:ChatChannel, name:str, archived:bool, emoji:str, added:bool, reactor:str, by_me:bool, member:ChatMember)
   PagesDelta(kind:str, comments:bool)
-  LiveRefresh(generation:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], pages_loaded:bool, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
+  LiveRefresh(generation:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages_loaded:bool, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
   ThreadLoadData(generation:i64, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   ThreadPageData(generation:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   LiveThreadData(generation:i64, channel_id:str, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
@@ -29,7 +30,7 @@ extern crate::backend
   PageSearchHit(page_id:str, block_id:str, kind:str, text:str)
   PageSearchData(generation:i64, hits:[PageSearchHit])
   AutosaveResult(generation:i64, written:bool)
-  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
+  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
   BellItem(seq:i64, kind:str, body:str, source:str, height:i64, read:bool)
   BellDelta(kind:str, item:BellItem, up_to_seq:i64)
   BellData(generation:i64, unread:i64, items:[BellItem])
@@ -77,10 +78,18 @@ extern crate::backend
   sync restore_draft(current:str, pending:str, keep_pending:bool) -> str
   sync remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
+  sync onboarding_phase() -> str
+  sync network_slug(name:str) -> str
+  WorkspaceInit(chain_id:str, workspace:str, rpc:str)
+  create_network(name:str) -> WorkspaceInit ! AppError
+  join_network(blob:str) -> WorkspaceInit ! AppError
+  mint_invite(workspace:str, role:str, ttl_days:i64) -> str ! AppError
+  ProvisionStep(index:i64, label:str, state:str)
+  stream provision_progress(workspace:str, rpc:str) -> ProvisionStep
   sync connection_degraded(status:str) -> bool
   sync palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  NavItem(id:str, title:str, icon:str, badge:i64, active:bool)
-  FsEntry(path:str, name:str, kind:str, size:i64)
+  NavItem(id:str, title:str, icon:str, badge:i64, active:bool, live:bool)
+  FsEntry(path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
   FsListing(generation:i64, path:str, entries:[FsEntry])
   FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool)
@@ -97,17 +106,36 @@ extern crate::backend
   files_ls(rpc:str, path:str, generation:i64) -> FsListing ! HydrationError
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
-  sync shell_nav(tab:str, approvals:i64) -> [NavItem]
+  files_find(rpc:str, prefix:str, generation:i64) -> FsListing ! HydrationError
+  sync size_label(bytes:i64) -> str
+  sync shell_nav(tab:str, approvals:i64, agent_live:bool) -> [NavItem]
   sync open_proposals(rows:[ProposalRow]) -> i64
   sync members_summary(validators:i64, residents:i64) -> str
   sync agents_summary(rows:[AgentRow]) -> str
   sync proposals_summary(rows:[ProposalRow]) -> str
   QuorumSeat(filled:bool)
-  sync quorum_dots(approvals:i64, electorate:i64) -> [QuorumSeat]
+  sync quorum_dots(approvals:i64, required:i64) -> [QuorumSeat]
+  sync tally_label(approvals:i64, required:i64) -> str
+  sync tally_tone(approvals:i64, required:i64) -> str
+  sync tally_note(approvals:i64, required:i64) -> str
+  sync approve_label(approvals:i64, required:i64) -> str
+  sync proposal_kind_tone(action:str) -> str
+  sync settled_proposals(rows:[ProposalRow]) -> [ProposalRow]
+  sync pending_label(rows:[ProposalRow]) -> str
+  sync expires_in(deadline:i64) -> str
+  sync relative_time(unix_seconds:i64) -> str
+  sync clock_time(unix_seconds:i64) -> str
+  sync day_label(unix_seconds:i64) -> str
+  sync mmss(seconds:i64) -> str
   sync network_label(account_name:str, rpc:str) -> str
   sync height_label(height:i64) -> str
   sync initial_of(name:str) -> str
+  sync initials_of(name:str) -> str
   NodeLogLine(cursor:str, line:str)
+  LogParts(time:str, level:str, message:str)
+  sync split_log_line(line:str) -> LogParts
+  NodeFacts(generation:i64, root_hash:str, view:i64, quorum:i64, reachable_validators:i64, last_finalized_at:i64, checkpoint_height:i64, peers_live:i64, peers_total:i64)
+  load_node_facts(rpc:str, generation:i64) -> NodeFacts ! HydrationError
   PeerRow(key:str, height:i64, live:bool)
   PeersData(generation:i64, peers:[PeerRow])
   sync push_log_line(lines:[NodeLogLine], line:NodeLogLine) -> [NodeLogLine]
@@ -117,9 +145,15 @@ extern crate::backend
   AccountData(generation:i64, bound:bool, account_id:str, display_name:str, bio:str, members:i64, nodes:i64)
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
   set_account_name(rpc:str, password:str, display_name:str) -> bool ! AppError
-  SettingsFacts(generation:i64, endpoint:str, node_key:str, height:i64, key_path:str, key_state:str, open_tabs:i64)
+  SettingsFacts(generation:i64, endpoint:str, node_key:str, height:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
+  sync settings_data_dir(facts:SettingsFacts) -> str
+  load_bool_pref(rpc:str, key:str) -> bool
+  save_bool_pref(rpc:str, key:str, on:bool) -> bool
+  forget_workspace(rpc:str) -> bool ! AppError
+  Copied(label:str)
+  task copy_text(text:str, label:str) -> Copied
   ForgeRepo(name:str, head:str)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
   ForgeData(generation:i64, repos:[ForgeRepo])
@@ -139,25 +173,45 @@ extern crate::backend
   forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:str, module:str, scope:ForgeRefresh, generation:i64) -> ForgeLiveData ! HydrationError
   sync forge_live_hit(kind:str, module:str) -> bool
   sync forge_stats(files:i64, additions:i64, deletions:i64) -> str
+  DiffLine(kind:str, old_no:str, new_no:str, sign:str, text:str)
+  sync diff_lines(diff:str) -> [DiffLine]
+  sync filter_forge_items(items:[ForgeItem], kind:str) -> [ForgeItem]
+  sync forge_open_count(items:[ForgeItem], kind:str) -> i64
+  sync forge_gate(tier:str) -> str
   sync forge_merge_note(merge_oid:str, branches:str) -> str
   sync verdict_label(verdict:str) -> str
   sync verdict_pick_label(current:str, key:str, label:str) -> str
-  AgentRow(id:str, name:str, capability:str, status:str, actions:str, owner:str)
+  AgentSkill(name:str, always:bool)
+  AgentCap(label:str, arg:str)
+  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_key:str, owner_handle:str, created_at:i64, is_mine:bool, tools:i64, secrets:i64, subagent_budget:i64, allowed_actions:[str], skills:[AgentSkill], caps:[AgentCap])
+  RunRow(run_id:str, agent_id:str, outcome:str, running:bool, created_at:i64, summary:str)
+  AgentRunsData(generation:i64, runs:[RunRow])
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
-  ProposalRow(id:str, action:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, electorate:i64, open:bool)
+  sync any_agent_active(rows:[AgentRow]) -> bool
+  load_agent_runs(rpc:str, agent_id:str, generation:i64) -> AgentRunsData ! HydrationError
+  set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError
+  ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, required_yes:i64, electorate:i64, open:bool)
   GovernanceData(generation:i64, proposals:[ProposalRow])
   load_governance(rpc:str, generation:i64) -> GovernanceData ! HydrationError
   governance_vote(rpc:str, password:str, proposal_id:str, approve:bool) -> bool ! AppError
   governance_execute(rpc:str, password:str, proposal_id:str) -> bool ! AppError
-  MemberRow(key:str, label:str, role:str, is_this_node:bool)
+  governance_propose(rpc:str, password:str, action:str, target_key:str) -> bool ! AppError
+  MemberRow(key:str, label:str, role:str, is_this_node:bool, is_agent:bool, model:str, live:bool)
   MembersData(generation:i64, validators:i64, residents:i64, members:[MemberRow])
   load_members(rpc:str, generation:i64) -> MembersData ! HydrationError
+  sync members_is_admin(rows:[MemberRow]) -> bool
+  sync member_tier(rows:[MemberRow]) -> str
+  sync filter_members(rows:[MemberRow], filter:str) -> [MemberRow]
   ExplorerBlock(height:i64, hash:str, commit:str, op_count:i64)
   ExplorerOp(height:i64, proposer:str, target:str, disposition:str, op_hash:str, payload:str, trace:str)
   ExplorerData(generation:i64, blocks:[ExplorerBlock], ops:[ExplorerOp])
   sync explorer_ops_at(ops:[ExplorerOp], height:i64) -> [ExplorerOp]
   load_explorer(rpc:str, generation:i64) -> ExplorerData ! HydrationError
+  ExplorerHit(kind:str, code:str, title:str, snippet:str, meta:str, target:str)
+  KindCount(kind:str, label:str, count:i64)
+  ExplorerResults(generation:i64, hits:[ExplorerHit], kinds:[KindCount])
+  search_workspace(rpc:str, text:str, generation:i64) -> ExplorerResults ! HydrationError
   sync slash_kind_matches(draft:str, kinds:[str]) -> [str]
   sync doc_tabs_with(tabs:[str], page_id:str) -> [str]
   sync doc_tabs_without(tabs:[str], page_id:str) -> [str]
@@ -230,6 +284,15 @@ extern crate::backend
   remove_channel_member(rpc:str, password:str, channel_id:str, member_key:str) -> bool ! AppError
   join_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
   leave_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
+  sync huddle_self(roster:[HuddleParticipant]) -> bool
+  stream huddle_tick() -> i64
+  DmPeer(key:str, name:str, initials:str, is_agent:bool)
+  DmPeersData(generation:i64, peers:[DmPeer])
+  load_dm_peers(rpc:str, generation:i64) -> DmPeersData ! HydrationError
+  sync dm_channel_id(a:str, b:str) -> str
+  sync is_dm_channel(id:str, members:[ChatMember]) -> bool
+  open_dm(rpc:str, password:str, peer_key:str) -> ChatData ! AppError
+  sync post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str
   send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
   load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> ThreadLoadData ! HydrationError
   load_thread_page(rpc:str, channel_id:str, root_seq:i64, from:i64, generation:i64) -> ThreadPageData ! HydrationError
@@ -242,6 +305,7 @@ extern crate::backend
   search_chat(rpc:str, channel_id:str, text:str, generation:i64) -> ChatSearchData ! HydrationError
   load_page(rpc:str, page_id:str, selected_block_id:str) -> PagesData ! AppError
   load_block_threads(rpc:str, target:str, from:i64, generation:i64) -> BlockThreadListData ! HydrationError
+  load_page_threads(rpc:str, page_id:str, generation:i64) -> BlockThreadListData ! HydrationError
   load_block_comment_page(rpc:str, target:str, thread_id:str, from:i64, generation:i64) -> BlockCommentData ! HydrationError
   refresh_block_comments(rpc:str, target:str, thread_id:str, generation:i64) -> BlockCommentsRefreshData ! HydrationError
   post_block_comment(rpc:str, password:str, target:str, thread_id:str, text:str, generation:i64) -> BlockCommentData ! AppError

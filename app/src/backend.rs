@@ -24,9 +24,13 @@ pub use chat::client::{
     append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
     apply_chat_thread, author_name, chat_message, contains_pending_message, mark_message_groups,
     merge_message_send_result, merge_pending_messages, merge_thread_reply, optimistic_message,
-    paragraph_blocks, parse_message_with_members, rollback_pending_message, short_label,
+    parse_message_with_members, rollback_pending_message, short_label,
     thread_offset_after_reply,
 };
+// the composer's block splitter is not called by the shipping binary — only by
+// the app's own test helpers, which build message rows the way a send does.
+#[cfg(test)]
+pub use chat::client::paragraph_blocks;
 // forge's client view model, same arrangement: the tracker rows, the item
 // pane (reviews + merge-box tallies), and the op-refresh classification.
 pub use forge::client::{
@@ -43,6 +47,16 @@ const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
 const MAX_FRAME_HEX_BYTES: usize = 3 * 1024 * 1024;
 const ENCRYPTED_KEY_PREFIX: &str = "ducktape-user-key-v1:";
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// `node init` mints a key and writes a workspace; `node join` fetches an
+/// invite's fronts. Both are slower than an rpc round-trip and both are
+/// interactive-blocking, so they get their own ceiling.
+const CLI_TIMEOUT: Duration = Duration::from_secs(120);
+/// How many one-second polls the provisioning screen waits before it says the
+/// node is not running and names the command that starts it.
+const PROVISION_PATIENCE: u32 = 8;
+/// The voting window a membership proposal opens with, in consensus seconds —
+/// the same value the CLI's membership ceremony uses.
+const GOVERNANCE_VOTING_PERIOD: u64 = 1_000_000;
 const CHAT_TIMELINE_ROOT_LIMIT: usize = 128;
 /// The chat view clamps one message page to 256 rows (default 50, max 256), so
 /// the timeline walk steps in 256-row pages.
@@ -66,6 +80,8 @@ pub struct ChatData {
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
     pub active_channel_huddle_count: i64,
+    /// the huddle's roster, not just its length — the faces and the tiles.
+    pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
     pub selected_message_seq: i64,
     pub selected_message_rev: i64,
@@ -271,6 +287,7 @@ pub struct WorkspaceData {
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
     pub active_channel_huddle_count: i64,
+    pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
     pub pages: Vec<PageItem>,
     pub blocks: Vec<PageBlock>,
@@ -998,6 +1015,8 @@ pub struct FsEntry {
     pub name: String,
     pub kind: String,
     pub size: i64,
+    /// the entry's content address — already on the ls/find wire.
+    pub object: String,
 }
 
 /// One committed duckfs snapshot.
@@ -1041,30 +1060,10 @@ pub async fn files_ls(
     async {
         let rpc = rpc_client(&rpc)?;
         let reply = rpc.files_get("ls", &[("path", path.as_str())]).await?;
-        let entries = reply["entries"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|entry| {
-                let entry_path = entry["path"].as_str().unwrap_or_default().to_string();
-                let name = entry_path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(entry_path.as_str())
-                    .to_string();
-                FsEntry {
-                    name,
-                    kind: entry["kind"].as_str().unwrap_or_default().to_string(),
-                    size: entry["size"].as_i64().unwrap_or(0),
-                    path: entry_path,
-                }
-            })
-            .collect();
         Ok(FsListing {
             generation,
+            entries: fs_entries(&reply),
             path,
-            entries,
         })
     }
     .await
@@ -1072,6 +1071,67 @@ pub async fn files_ls(
         generation,
         message,
     })
+}
+
+/// Every path under one prefix, in full-path order — the duckfs tree sidebar
+/// and Explorer's FILE results read the same wire.
+pub async fn files_find(
+    rpc: String,
+    prefix: String,
+    generation: i64,
+) -> Result<FsListing, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply = rpc.files_get("find", &[("prefix", prefix.as_str())]).await?;
+        Ok(FsListing {
+            generation,
+            entries: fs_entries(&reply),
+            path: prefix,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The `entries` array of an ls/find reply as rows (both serve `EntryInfo`).
+fn fs_entries(reply: &serde_json::Value) -> Vec<FsEntry> {
+    reply["entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| {
+            let entry_path = entry["path"].as_str().unwrap_or_default().to_string();
+            let name = entry_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(entry_path.as_str())
+                .to_string();
+            FsEntry {
+                name,
+                kind: entry["kind"].as_str().unwrap_or_default().to_string(),
+                size: entry["size"].as_i64().unwrap_or(0),
+                object: entry["object"].as_str().unwrap_or_default().to_string(),
+                path: entry_path,
+            }
+        })
+        .collect()
+}
+
+/// `412 KB` — a byte count in the unit a person reads.
+pub fn size_label(bytes: i64) -> String {
+    const KB: i64 = 1_024;
+    const MB: i64 = 1_024 * KB;
+    const GB: i64 = 1_024 * MB;
+    match bytes {
+        size if size < KB => format!("{size} B"),
+        size if size < MB => format!("{} KB", size / KB),
+        size if size < GB => format!("{:.1} MB", size as f64 / MB as f64),
+        size => format!("{:.1} GB", size as f64 / GB as f64),
+    }
 }
 
 /// Read a file's head bytes for the preview pane (64 KiB window).
@@ -1387,14 +1447,19 @@ pub fn fs_parent(path: String) -> String {
     }
 }
 
-/// One member of the network: a validator (quorum seat) or resident
-/// (mesh + statesync standing).
+/// One member of the network: a validator (quorum seat), a resident
+/// (mesh + statesync standing), or a registered agent.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct MemberRow {
     pub key: String,
     pub label: String,
     pub role: String,
     pub is_this_node: bool,
+    pub is_agent: bool,
+    /// an agent's capability tag; empty for a human member.
+    pub model: String,
+    /// the mesh reports this key as a live peer (this node is live by definition).
+    pub live: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -1405,15 +1470,17 @@ pub struct MembersData {
     pub members: Vec<MemberRow>,
 }
 
-/// Load the valset directory: validators then residents, this node marked.
+/// Load the roster: validators, then residents, then the registered agents —
+/// one list, this node marked, liveness folded in from the mesh sample.
 pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, HydrationError> {
     async {
-        let rpc = rpc_client(&rpc)?;
-        let node_key = rpc.status().await?.public_key;
+        let client = rpc_client(&rpc)?;
+        let node_key = client.status().await?.public_key;
+        let live_keys = live_peer_keys(&client).await;
         let mut members = Vec::new();
         let mut counts = (0i64, 0i64);
         for (query, role) in [("validators", "validator"), ("residents", "resident")] {
-            let reply: serde_json::Value = rpc
+            let reply: serde_json::Value = client
                 .query("valset", &serde_json::json!(query))
                 .await?;
             let keys = reply[query].as_array().cloned().unwrap_or_default();
@@ -1422,23 +1489,32 @@ pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, H
                 _ => counts.1 = count_i64(keys.len()),
             }
             for key in keys {
-                let bytes: Vec<u8> = key
-                    .as_array()
-                    .map(|bytes| {
-                        bytes
-                            .iter()
-                            .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let hex = hex_encode(&bytes);
+                let hex = hex_encode(&json_bytes(&key));
+                let is_this_node = hex == node_key;
                 members.push(MemberRow {
                     label: short_label(&hex),
-                    is_this_node: hex == node_key,
+                    live: is_this_node || live_keys.contains(&hex),
+                    is_this_node,
+                    is_agent: false,
+                    model: String::new(),
                     role: role.into(),
                     key: hex,
                 });
             }
+        }
+        // registered agents are members of the workspace too — the roster shows
+        // people AND machines, keyed on the agent id (agents hold no node key).
+        let agents = load_agents(rpc, generation).await.map(|data| data.agents);
+        for agent in agents.unwrap_or_default() {
+            members.push(MemberRow {
+                key: agent.id,
+                label: agent.name,
+                role: "agent".into(),
+                is_this_node: false,
+                is_agent: true,
+                model: agent.capability,
+                live: agent.status == "active",
+            });
         }
         Ok(MembersData {
             generation,
@@ -1454,16 +1530,63 @@ pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, H
     })
 }
 
+/// The peer sample's live keys, full hex — the join key for member liveness.
+/// A node that cannot answer `/v1/peers` simply reports nobody live.
+async fn live_peer_keys(rpc: &RpcClient) -> BTreeSet<String> {
+    let Ok(reply) = rpc.peers().await else {
+        return BTreeSet::new();
+    };
+    reply["peers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|peer| peer["live"].as_bool().unwrap_or(false))
+        .filter_map(|peer| peer["key"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// This node holds a quorum seat — the ONE authority predicate behind the
+/// approvals gate, the members Invite button and the forge write gate.
+pub fn members_is_admin(rows: Vec<MemberRow>) -> bool {
+    rows.iter()
+        .any(|row| row.is_this_node && row.role == "validator")
+}
+
+/// This node's standing: `validator` | `resident` | `guest`.
+pub fn member_tier(rows: Vec<MemberRow>) -> String {
+    rows.iter()
+        .find(|row| row.is_this_node)
+        .map_or_else(|| "guest".into(), |row| row.role.clone())
+}
+
+/// The All / Humans / Agents / Validators strip.
+pub fn filter_members(rows: Vec<MemberRow>, filter: String) -> Vec<MemberRow> {
+    rows.into_iter()
+        .filter(|row| match filter.as_str() {
+            "humans" => !row.is_agent,
+            "agents" => row.is_agent,
+            "validators" => row.role == "validator",
+            _ => true,
+        })
+        .collect()
+}
+
 /// One governance proposal, rendered.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ProposalRow {
     pub id: String,
     pub action: String,
+    /// what the action actually does — the `GovAction` payload, rendered.
+    pub detail: String,
     pub proposer: String,
     pub status: String,
     pub deadline: i64,
     pub approvals: i64,
     pub rejections: i64,
+    /// the frozen voting rule's bar: `Threshold{required_yes}` /
+    /// `ParticipatingMajority{quorum}`. This, not the electorate, is the target.
+    pub required_yes: i64,
     pub electorate: i64,
     pub open: bool,
 }
@@ -1495,40 +1618,17 @@ pub async fn load_governance(
                     .iter()
                     .filter(|vote| vote[1].as_bool().unwrap_or(false))
                     .count();
-                let status = view["status"]
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| {
-                        view["status"]
-                            .as_object()
-                            .and_then(|tagged| tagged.keys().next().cloned())
-                            .unwrap_or_default()
-                    });
-                let action = view["action"]
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| {
-                        view["action"]
-                            .as_object()
-                            .and_then(|tagged| tagged.keys().next().cloned())
-                            .unwrap_or_default()
-                    });
-                let proposer_bytes: Vec<u8> = view["proposer"]
-                    .as_array()
-                    .map(|bytes| {
-                        bytes
-                            .iter()
-                            .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let status = tagged_name(&view["status"]);
+                let action = tagged_name(&view["action"]);
                 ProposalRow {
                     id: view["proposal_id"].as_str().unwrap_or_default().to_string(),
                     open: status == "open",
-                    proposer: short_label(&hex_encode(&proposer_bytes)),
+                    detail: gov_action_detail(&view["action"]),
+                    proposer: short_label(&hex_encode(&json_bytes(&view["proposer"]))),
                     deadline: view["deadline"].as_i64().unwrap_or(0),
                     approvals: count_i64(approvals),
                     rejections: count_i64(votes.len() - approvals),
+                    required_yes: voting_bar(&view["voting_rule"]),
                     electorate: count_i64(
                         view["electorate"].as_array().map_or(0, |members| members.len()),
                     ),
@@ -1553,6 +1653,84 @@ pub async fn load_governance(
         generation,
         message,
     })
+}
+
+/// The `GovAction` payload as one readable clause — what the op DOES, which
+/// the bare variant tag never says.
+fn gov_action_detail(action: &serde_json::Value) -> String {
+    let Some(tagged) = action.as_object() else {
+        return String::new();
+    };
+    let Some((variant, payload)) = tagged.iter().next() else {
+        return String::new();
+    };
+    let key = payload.get("key").map(json_bytes).unwrap_or_default();
+    if !key.is_empty() {
+        return format!("key {}", short_label(&hex_encode(&key)));
+    }
+    if let Some(text) = payload.get("text").and_then(|text| text.as_str()) {
+        return text.to_string();
+    }
+    match variant.as_str() {
+        "update_module" => format!(
+            "{} → h {}",
+            payload["name"].as_str().unwrap_or_default(),
+            payload["activation_height"].as_i64().unwrap_or(0)
+        ),
+        "set_share_mode" => match payload["enabled"].as_bool().unwrap_or(false) {
+            true => "account shares".into(),
+            false => "one ballot per validator".into(),
+        },
+        _ => String::new(),
+    }
+}
+
+/// The frozen rule's bar: how many YES this proposal needs to pass.
+fn voting_bar(rule: &serde_json::Value) -> i64 {
+    let Some(tagged) = rule.as_object() else {
+        return 0;
+    };
+    let Some((_, payload)) = tagged.iter().next() else {
+        return 0;
+    };
+    payload["required_yes"]
+        .as_i64()
+        .or_else(|| payload["quorum"].as_i64())
+        .unwrap_or(0)
+}
+
+/// Open a membership proposal. The app could vote and settle but never OPEN
+/// one; `action` is `add_validator` | `add_resident` | `remove_validator`.
+pub async fn governance_propose(
+    rpc: String,
+    password: String,
+    action: String,
+    target_key: String,
+) -> Result<bool, AppError> {
+    async {
+        let key = public_key(&target_key, "member public key")?;
+        let action = match action.as_str() {
+            "add_validator" => governance::GovAction::AddValidator { key },
+            "add_resident" => governance::GovAction::AddResident { key },
+            "remove_validator" => governance::GovAction::RemoveValidator { key },
+            other => return Err(format!("unknown membership action `{other}`")),
+        };
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "governance",
+            governance::encode_msg(&governance::GovMsg::Propose {
+                proposal_id: fresh_id("proposal"),
+                action,
+                voting_period: GOVERNANCE_VOTING_PERIOD,
+            }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
 }
 
 /// Cast (or change) this node's ballot.
@@ -1611,7 +1789,14 @@ pub struct SettingsFacts {
     pub height: i64,
     pub key_path: String,
     pub key_state: String,
+    /// this workspace's directory on this device — the NETWORK card's Data dir.
+    pub data_dir: String,
     pub open_tabs: i64,
+}
+
+/// The NETWORK card's Data dir row.
+pub fn settings_data_dir(facts: SettingsFacts) -> String {
+    facts.data_dir
 }
 
 /// Load the settings facts: node identity from /v1/status, the local user
@@ -1635,6 +1820,10 @@ pub async fn load_settings_facts(
             }
         };
         let tabs = load_doc_tabs(rpc.clone()).await;
+        let data_dir = workspace_at(&rpc)
+            .map(|(_, dir)| dir.display().to_string())
+            .or_else(|| ducktape_home().map(|home| home.display().to_string()))
+            .unwrap_or_default();
         Ok(SettingsFacts {
             generation,
             endpoint: rpc,
@@ -1642,6 +1831,7 @@ pub async fn load_settings_facts(
             height: i64::try_from(status.height).unwrap_or(i64::MAX),
             key_path,
             key_state,
+            data_dir,
             open_tabs: count_i64(tabs.len()),
         })
     }
@@ -1745,6 +1935,100 @@ pub fn filter_log_lines(lines: Vec<NodeLogLine>, filter: String) -> Vec<NodeLogL
         .collect()
 }
 
+/// One tracing line, split for the dark log console's three columns.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct LogParts {
+    pub time: String,
+    pub level: String,
+    pub message: String,
+}
+
+/// Split `2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted` into its
+/// three columns. A line that does not carry a level is all message.
+pub fn split_log_line(line: String) -> LogParts {
+    const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+    let mut fields = line.split_whitespace();
+    let Some(first) = fields.next() else {
+        return LogParts {
+            time: String::new(),
+            level: String::new(),
+            message: line,
+        };
+    };
+    let timestamped = first.contains(':') && first.chars().next().is_some_and(|c| c.is_ascii_digit());
+    let (time, level_field) = match timestamped {
+        true => (first.to_string(), fields.next().unwrap_or_default()),
+        false => (String::new(), first),
+    };
+    if !LEVELS.contains(&level_field) {
+        return LogParts {
+            time,
+            level: String::new(),
+            message: line,
+        };
+    }
+    let cut = line
+        .find(level_field)
+        .map_or(line.len(), |at| at + level_field.len());
+    LogParts {
+        time,
+        level: level_field.to_string(),
+        message: line[cut..].trim_start().to_string(),
+    }
+}
+
+/// The node's consensus/storage facts — everything `/v1/status` publishes that
+/// the two-field `Status` type drops, plus the mesh sample's live/total.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct NodeFacts {
+    pub generation: i64,
+    pub root_hash: String,
+    pub view: i64,
+    pub quorum: i64,
+    pub reachable_validators: i64,
+    pub last_finalized_at: i64,
+    pub checkpoint_height: i64,
+    pub peers_live: i64,
+    pub peers_total: i64,
+}
+
+/// Load the node facts from the raw status document plus the peer sample.
+/// Sections the node omits for its role stay zero — the status projection
+/// leaves them out rather than filling them with misleading numbers.
+pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let status = client.status_json().await?;
+        let operations = &status["operations"];
+        let consensus = &operations["consensus"];
+        let peers = client.peers().await.unwrap_or_default();
+        let peers = peers["peers"].as_array().cloned().unwrap_or_default();
+        Ok(NodeFacts {
+            generation,
+            root_hash: status["root_hash"].as_str().unwrap_or_default().to_string(),
+            view: consensus["view"].as_i64().unwrap_or(0),
+            quorum: consensus["quorum"].as_i64().unwrap_or(0),
+            reachable_validators: consensus["reachable_validators"].as_i64().unwrap_or(0),
+            last_finalized_at: operations["last_finalized_at"].as_i64().unwrap_or(0),
+            checkpoint_height: operations["storage"]["checkpoint_height"]
+                .as_i64()
+                .unwrap_or(0),
+            peers_live: count_i64(
+                peers
+                    .iter()
+                    .filter(|peer| peer["live"].as_bool().unwrap_or(false))
+                    .count(),
+            ),
+            peers_total: count_i64(peers.len()),
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
 /// One peer row.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PeerRow {
@@ -1784,15 +2068,43 @@ pub async fn load_peers(rpc: String, generation: i64) -> Result<PeersData, Hydra
     })
 }
 
-/// One registered agent, rendered.
+/// One curated skill of an agent: the ref's name and whether it loads as
+/// persona (`LoadMode::Always`) or on demand.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentSkill {
+    pub name: String,
+    pub always: bool,
+}
+
+/// One granted capability, in the `CapRequest` vocabulary: the request name
+/// and the resource it names (empty for the argument-less grants).
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentCap {
+    pub label: String,
+    pub arg: String,
+}
+
+/// One registered agent, rendered. Everything here already rides
+/// `AgentRecord` — the registry reply carries the whole record.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AgentRow {
     pub id: String,
     pub name: String,
+    pub initials: String,
     pub capability: String,
     pub status: String,
-    pub actions: String,
-    pub owner: String,
+    /// the decoded `SagaOrigin::External` key hex, empty for module/system owners.
+    pub owner_key: String,
+    /// that key resolved against the member roster, else the origin's variant tag.
+    pub owner_handle: String,
+    pub created_at: i64,
+    pub is_mine: bool,
+    pub tools: i64,
+    pub secrets: i64,
+    pub subagent_budget: i64,
+    pub allowed_actions: Vec<String>,
+    pub skills: Vec<AgentSkill>,
+    pub caps: Vec<AgentCap>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -1801,47 +2113,102 @@ pub struct AgentsData {
     pub agents: Vec<AgentRow>,
 }
 
-/// Load the agent roster from the canonical registry.
+/// The owner origin, decoded: `("<key hex>", "<handle>")`. An external origin
+/// carries raw key bytes; a module/system origin has no key at all and reads
+/// as its own name.
+fn agent_owner(owner: &serde_json::Value) -> (String, String) {
+    let Some(tagged) = owner.as_object() else {
+        let name = owner.as_str().unwrap_or_default().to_string();
+        return (String::new(), name);
+    };
+    let Some((variant, payload)) = tagged.iter().next() else {
+        return (String::new(), String::new());
+    };
+    if variant != "external" {
+        let name = payload.as_str().unwrap_or(variant.as_str()).to_string();
+        return (String::new(), name);
+    }
+    let key = hex_encode(&json_bytes(payload));
+    let handle = short_label(&key);
+    (key, handle)
+}
+
+/// `ResourceCaps` flattened into the `CapRequest` names the console chips.
+fn agent_caps(caps: &serde_json::Value) -> Vec<AgentCap> {
+    let mut chips = Vec::new();
+    for (field, label) in [
+        ("forge_read", "ForgeRead"),
+        ("forge_push", "ForgePush"),
+        ("duckfs_read", "DuckfsRead"),
+        ("duckfs_write", "DuckfsWrite"),
+        ("tools", "Tool"),
+        ("secrets", "Secret"),
+        ("pages_write", "PagesWrite"),
+    ] {
+        for value in caps[field].as_array().cloned().unwrap_or_default() {
+            chips.push(AgentCap {
+                label: label.into(),
+                arg: value.as_str().unwrap_or_default().to_string(),
+            });
+        }
+    }
+    if caps["subagent_budget"].as_i64().unwrap_or(0) > 0 {
+        chips.push(AgentCap {
+            label: "SpawnSubagent".into(),
+            arg: String::new(),
+        });
+    }
+    chips
+}
+
+/// Load the agent roster from the canonical registry, each row marked with
+/// whether THIS device's user key is its owner.
 pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, HydrationError> {
     async {
-        let rpc = rpc_client(&rpc)?;
-        let reply: serde_json::Value = rpc.query("agent", &serde_json::json!("agents")).await?;
+        let client = rpc_client(&rpc)?;
+        let local = local_user_key().await.map(|key| hex_encode(&key));
+        let reply: serde_json::Value = client.query("agent", &serde_json::json!("agents")).await?;
         let agents = reply["agents"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
             .map(|record| {
-                let status = record["status"]
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| {
-                        record["status"]
-                            .as_object()
-                            .and_then(|tagged| tagged.keys().next().cloned())
-                            .unwrap_or_default()
-                    });
-                let owner = record["owner"]
-                    .as_object()
-                    .and_then(|tagged| tagged.keys().next().cloned())
-                    .or_else(|| record["owner"].as_str().map(str::to_string))
-                    .unwrap_or_default();
+                let status = tagged_name(&record["status"]);
+                let (owner_key, owner_handle) = agent_owner(&record["owner"]);
+                let name = record["display_name"].as_str().unwrap_or_default().to_string();
+                let caps = &record["caps"];
                 AgentRow {
                     id: record["agent_id"].as_str().unwrap_or_default().to_string(),
-                    name: record["display_name"].as_str().unwrap_or_default().to_string(),
+                    initials: initials_of(&name),
                     capability: record["capability"].as_str().unwrap_or_default().to_string(),
-                    actions: record["allowed_actions"]
+                    created_at: record["created_at"].as_i64().unwrap_or(0),
+                    is_mine: local.as_deref().is_some_and(|key| key == owner_key),
+                    tools: count_i64(caps["tools"].as_array().map_or(0, Vec::len)),
+                    secrets: count_i64(caps["secrets"].as_array().map_or(0, Vec::len)),
+                    subagent_budget: caps["subagent_budget"].as_i64().unwrap_or(0),
+                    allowed_actions: record["allowed_actions"]
                         .as_array()
-                        .map(|actions| {
-                            actions
-                                .iter()
-                                .filter_map(|action| action.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|action| action.as_str().map(str::to_string))
+                        .collect(),
+                    skills: record["skills"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|skill| AgentSkill {
+                            name: skill["name"].as_str().unwrap_or_default().to_string(),
+                            always: skill["load"].as_str() == Some("always"),
                         })
-                        .unwrap_or_default(),
+                        .collect(),
+                    caps: agent_caps(caps),
+                    name,
                     status,
-                    owner,
+                    owner_key,
+                    owner_handle,
                 }
             })
             .collect();
@@ -1852,6 +2219,128 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
         generation,
         message,
     })
+}
+
+/// Whether any agent is engaging work right now — the rail's Forge pulse dot.
+pub fn any_agent_active(rows: Vec<AgentRow>) -> bool {
+    rows.iter().any(|row| row.status == "active")
+}
+
+/// One run of one agent: the RECENT RUNS card, the agent live chip and the
+/// Explorer RUN hit all read this row.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct RunRow {
+    pub run_id: String,
+    pub agent_id: String,
+    pub outcome: String,
+    pub running: bool,
+    pub created_at: i64,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentRunsData {
+    pub generation: i64,
+    pub runs: Vec<RunRow>,
+}
+
+/// What a settled run produced, in one line: the forge PR it moved, else the
+/// output ref it wrote, else how it ended.
+fn run_summary(record: &serde_json::Value, outcome: &str) -> String {
+    if let Some(number) = record["pr_number"].as_u64() {
+        return format!("pr #{number}");
+    }
+    match record["output_ref"].as_str() {
+        Some(output) if !output.is_empty() => output.to_string(),
+        _ => outcome.to_string(),
+    }
+}
+
+/// This agent's runs: the pending (RUNNING) entries first, then the delivered
+/// ring newest-first. Two queries because the runs module keeps in-flight
+/// correlation and settled history in two separate projections.
+pub async fn load_agent_runs(
+    rpc: String,
+    agent_id: String,
+    generation: i64,
+) -> Result<AgentRunsData, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let pending: serde_json::Value = client
+            .query("runs", &serde_json::json!("pending_runs"))
+            .await?;
+        let recent: serde_json::Value = client
+            .query("runs", &serde_json::json!("recent_runs"))
+            .await?;
+        let wanted = |record: &serde_json::Value| {
+            agent_id.is_empty() || record["agent_id"].as_str() == Some(agent_id.as_str())
+        };
+        let mut runs: Vec<RunRow> = pending["pending_runs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(wanted)
+            .map(|record| RunRow {
+                run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
+                agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
+                outcome: "running".into(),
+                running: true,
+                created_at: record["created_at"].as_i64().unwrap_or(0),
+                summary: record["channel_id"].as_str().unwrap_or_default().to_string(),
+            })
+            .collect();
+        runs.extend(
+            recent["recent_runs"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(wanted)
+                .map(|record| {
+                    let outcome = tagged_name(&record["outcome"]);
+                    RunRow {
+                        run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
+                        agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
+                        running: false,
+                        created_at: record["created_at"].as_i64().unwrap_or(0),
+                        summary: run_summary(&record, &outcome),
+                        outcome,
+                    }
+                }),
+        );
+        Ok(AgentRunsData { generation, runs })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Pause or resume one agent — owner-gated at the module, not quorum-gated.
+pub async fn set_agent_status(
+    rpc: String,
+    password: String,
+    agent_id: String,
+    paused: bool,
+) -> Result<bool, AppError> {
+    async {
+        let agent_id = required_id(agent_id, "agent")?;
+        let rpc = rpc_client(&rpc)?;
+        // `AgentMsg` is snake_case-tagged serde over `sdk::wire` (plain JSON);
+        // the app does not depend on the agent crate, so the two owner-gated
+        // verbs are written as their wire form.
+        let verb = match paused {
+            true => "pause_agent",
+            false => "resume_agent",
+        };
+        let payload = serde_json::json!({ verb: { "agent_id": agent_id } });
+        signed_write(&rpc, "agent", encode_wire(&payload), password).await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
 }
 
 /// The local account picture: whether THIS NODE is bound, and the account's
@@ -2548,6 +3037,113 @@ pub async fn forge_live_refresh(
 }
 
 /// The PR stats line: `3 files · +12 −4`.
+/// One rendered line of a unified patch. `kind` is `file` | `hunk` | `add` |
+/// `del` | `ctx` — the gutters, the sign column and the row tint all key on it.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct DiffLine {
+    pub kind: String,
+    pub old_no: String,
+    pub new_no: String,
+    pub sign: String,
+    pub text: String,
+}
+
+/// Split a unified patch into painted rows, tracking both line counters
+/// across hunk headers.
+pub fn diff_lines(diff: String) -> Vec<DiffLine> {
+    let mut rows = Vec::new();
+    let mut old_no = 0i64;
+    let mut new_no = 0i64;
+    for line in diff.lines() {
+        let is_file_header = line.starts_with("diff ")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+            || line.starts_with("index ")
+            || line.starts_with("new file")
+            || line.starts_with("deleted file");
+        if is_file_header {
+            rows.push(diff_row("file", String::new(), String::new(), "", line));
+            continue;
+        }
+        if let Some((old_start, new_start)) = hunk_starts(line) {
+            old_no = old_start;
+            new_no = new_start;
+            rows.push(diff_row("hunk", String::new(), String::new(), "", line));
+            continue;
+        }
+        match line.chars().next() {
+            Some('+') => {
+                rows.push(diff_row("add", String::new(), new_no.to_string(), "+", &line[1..]));
+                new_no += 1;
+            }
+            Some('-') => {
+                rows.push(diff_row("del", old_no.to_string(), String::new(), "-", &line[1..]));
+                old_no += 1;
+            }
+            _ => {
+                let text = line.strip_prefix(' ').unwrap_or(line);
+                rows.push(diff_row("ctx", old_no.to_string(), new_no.to_string(), "", text));
+                old_no += 1;
+                new_no += 1;
+            }
+        }
+    }
+    rows
+}
+
+fn diff_row(kind: &str, old_no: String, new_no: String, sign: &str, text: &str) -> DiffLine {
+    DiffLine {
+        kind: kind.into(),
+        old_no,
+        new_no,
+        sign: sign.into(),
+        text: text.to_string(),
+    }
+}
+
+/// `@@ -138,9 +138,12 @@ …` → the two start line numbers.
+fn hunk_starts(line: &str) -> Option<(i64, i64)> {
+    let body = line.strip_prefix("@@ ")?;
+    let (ranges, _) = body.split_once(" @@")?;
+    let (old, new) = ranges.split_once(' ')?;
+    let start = |range: &str| -> Option<i64> {
+        let digits = range.trim_start_matches(['-', '+']);
+        digits.split(',').next()?.parse().ok()
+    };
+    Some((start(old)?, start(new)?))
+}
+
+/// The tracker's Pull requests / Issues split.
+pub fn filter_forge_items(items: Vec<ForgeItem>, kind: String) -> Vec<ForgeItem> {
+    items.into_iter().filter(|item| item.kind == kind).collect()
+}
+
+/// The tab count chips — open work only: a PR counts until it merges, an
+/// issue until it closes.
+pub fn forge_open_count(items: Vec<ForgeItem>, kind: String) -> i64 {
+    count_i64(
+        items
+            .iter()
+            .filter(|item| item.kind == kind)
+            .filter(|item| match kind.as_str() {
+                "pr" => item.state != "merged",
+                _ => item.state == "open",
+            })
+            .count(),
+    )
+}
+
+/// Why forge's write actions are unavailable to this node, as a stable reason
+/// token — empty when they ARE available. The product's tiers are validator /
+/// resident / guest; the artifact's viewer/maintainer/admin do not exist here.
+pub fn forge_gate(tier: String) -> String {
+    match tier.as_str() {
+        "validator" => String::new(),
+        "resident" => "resident_cannot_merge".into(),
+        _ => "guest_read_only".into(),
+    }
+}
+
 pub fn forge_stats(files: i64, additions: i64, deletions: i64) -> String {
     format!("{files} files · +{additions} −{deletions}")
 }
@@ -2606,7 +3202,7 @@ pub fn keep_forge_reviews(
     if loaded { next } else { current }
 }
 
-/// One shell navigation entry.
+/// One shell navigation entry. `live` is the capsule's pulse dot.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NavItem {
     pub id: String,
@@ -2614,6 +3210,7 @@ pub struct NavItem {
     pub icon: String,
     pub badge: i64,
     pub active: bool,
+    pub live: bool,
 }
 
 /// `3 validators · 2 residents` — the machine subtitle beside the Members title.
@@ -2633,15 +3230,25 @@ pub fn proposals_summary(rows: Vec<ProposalRow>) -> String {
     format!("{open} open · {} settled", rows.len() - open)
 }
 
-/// One seat per elector, filled for each approval already in — the quorum dots.
-/// Capped so a large electorate does not overflow the card.
+/// `N pending` — the header count, open proposals only.
+pub fn pending_label(rows: Vec<ProposalRow>) -> String {
+    format!("{} pending", rows.iter().filter(|row| row.open).count())
+}
+
+/// The settled half of the register — the RECENTLY FINALIZED column.
+pub fn settled_proposals(rows: Vec<ProposalRow>) -> Vec<ProposalRow> {
+    rows.into_iter().filter(|row| !row.open).collect()
+}
+
+/// One seat per REQUIRED signature, filled for each approval already in —
+/// the quorum dots. Capped so a large threshold does not overflow the card.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct QuorumSeat {
     pub filled: bool,
 }
 
-pub fn quorum_dots(approvals: i64, electorate: i64) -> Vec<QuorumSeat> {
-    let seats = electorate.clamp(0, 12) as usize;
+pub fn quorum_dots(approvals: i64, required: i64) -> Vec<QuorumSeat> {
+    let seats = required.clamp(0, 12) as usize;
     (0..seats)
         .map(|seat| QuorumSeat {
             filled: (seat as i64) < approvals,
@@ -2649,15 +3256,58 @@ pub fn quorum_dots(approvals: i64, electorate: i64) -> Vec<QuorumSeat> {
         .collect()
 }
 
+/// `3 / 4` — the tally, one mono run.
+pub fn tally_label(approvals: i64, required: i64) -> String {
+    format!("{approvals} / {required}")
+}
+
+/// `near` one vote from quorum (or past it), else `far` — success vs meta ink.
+pub fn tally_tone(approvals: i64, required: i64) -> String {
+    match approvals >= required.saturating_sub(1) {
+        true => "near".into(),
+        false => "far".into(),
+    }
+}
+
+/// `3 approvals · 1 more for quorum`, or `quorum met`.
+pub fn tally_note(approvals: i64, required: i64) -> String {
+    let remaining = required.saturating_sub(approvals);
+    if remaining <= 0 {
+        return "quorum met".into();
+    }
+    format!("{approvals} approvals · {remaining} more for quorum")
+}
+
+/// The approve button leans forward at the last vote: `Approve →`.
+pub fn approve_label(approvals: i64, required: i64) -> String {
+    match approvals + 1 >= required {
+        true => "Approve →".into(),
+        false => "Approve".into(),
+    }
+}
+
+/// The kind pill's two tones: an access-class action reads `access`.
+pub fn proposal_kind_tone(action: String) -> String {
+    let access = matches!(
+        action.as_str(),
+        "add_validator" | "add_resident" | "remove_validator" | "remove_resident" | "grant_client"
+    );
+    match access {
+        true => "access".into(),
+        false => "neutral".into(),
+    }
+}
+
 /// How many proposals are still open — the count the rail pins to Approvals.
 pub fn open_proposals(rows: Vec<ProposalRow>) -> i64 {
     rows.iter().filter(|row| row.open).count() as i64
 }
 
-/// The rail's module navigation, in the artifact's order, the active pane
-/// flagged. Modules join the shell by joining this list. `settings` is not
-/// here: the rail pins it to its own footer beside the account avatar.
-pub fn shell_nav(tab: String, approvals: i64) -> Vec<NavItem> {
+/// The rail's module navigation: EIGHT seats, in the artifact's order, the
+/// active pane flagged. Modules join the shell by joining this list. `settings`
+/// is not here (the rail pins it to its own footer beside the account avatar),
+/// and neither is `node` — the node surface lives under Settings.
+pub fn shell_nav(tab: String, approvals: i64, agent_live: bool) -> Vec<NavItem> {
     [
         ("chat", "Chat", "nav-chat"),
         ("pages", "Pages", "nav-pages"),
@@ -2667,7 +3317,6 @@ pub fn shell_nav(tab: String, approvals: i64) -> Vec<NavItem> {
         ("explorer", "Explorer", "nav-explorer"),
         ("members", "Members", "nav-members"),
         ("governance", "Approvals", "shield-check"),
-        ("node", "Node", "node"),
     ]
     .into_iter()
     .map(|(id, title, icon)| NavItem {
@@ -2676,6 +3325,7 @@ pub fn shell_nav(tab: String, approvals: i64) -> Vec<NavItem> {
         icon: icon.into(),
         badge: if id == "governance" { approvals } else { 0 },
         active: id == tab,
+        live: id == "forge" && agent_live,
     })
     .collect()
 }
@@ -2706,6 +3356,408 @@ fn ducktape_home() -> Option<PathBuf> {
         return Some(PathBuf::from(root));
     }
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".ducktape"))
+}
+
+/// The CLI's workspace registry: `<ducktape home>/workspaces`. `node init` and
+/// `node join` materialize one directory per network in here, so the directory
+/// listing IS the registry — there is no index file to keep in sync.
+fn workspaces_root() -> Option<PathBuf> {
+    ducktape_home().map(|home| home.join("workspaces"))
+}
+
+/// Every registered workspace as `(chain id, directory)`: a directory holding
+/// a `node.toml` is a workspace, whatever else it contains.
+fn registered_workspaces() -> Vec<(String, PathBuf)> {
+    let Some(root) = workspaces_root() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut workspaces: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|dir| dir.join("node.toml").is_file())
+        .filter_map(|dir| {
+            let name = dir.file_name()?.to_str()?.to_string();
+            Some((name, dir))
+        })
+        .collect();
+    workspaces.sort();
+    workspaces
+}
+
+/// One value out of a workspace's `node.toml` (`key = "value"`). The file is
+/// written key-per-line by `write_node_toml`, so this reads it without a toml
+/// parser the app would otherwise not need.
+fn node_toml_value(dir: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("node.toml")).ok()?;
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(name, _)| name.trim() == key)
+        .map(|(_, value)| {
+            value
+                .split('#')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .trim_matches(['"', '\''])
+                .to_string()
+        })
+}
+
+/// This workspace's app endpoint, from its `http_listen`.
+fn workspace_endpoint(dir: &Path) -> Option<String> {
+    node_toml_value(dir, "http_listen").map(|listen| format!("http://{listen}"))
+}
+
+/// The registered workspace this app is pointed at, matched on the endpoint it
+/// is actually connected to.
+fn workspace_at(rpc: &str) -> Option<(String, PathBuf)> {
+    let endpoint = canonical_endpoint(rpc.to_string());
+    registered_workspaces()
+        .into_iter()
+        .find(|(_, dir)| workspace_endpoint(dir).as_deref() == Some(endpoint.as_str()))
+}
+
+/// Workspaces this device has been told to forget — device-local, never wire
+/// state. The directories stay on disk; the console simply stops offering them.
+fn forgotten_workspaces() -> Vec<String> {
+    read_prefs()["forgotten_workspaces"]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Which shell to mount: `console` once this device holds a workspace it has
+/// not forgotten, else `welcome`.
+pub fn onboarding_phase() -> String {
+    let forgotten = forgotten_workspaces();
+    let has_workspace = registered_workspaces()
+        .into_iter()
+        .any(|(chain_id, _)| !forgotten.contains(&chain_id));
+    match has_workspace {
+        true => "console".into(),
+        false => "welcome".into(),
+    }
+}
+
+/// What `node init` / `node join` hand back: the network's id, where it
+/// materialized, and the endpoint this app should connect to.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct WorkspaceInit {
+    pub chain_id: String,
+    pub workspace: String,
+    pub rpc: String,
+}
+
+/// A workspace name as its directory slug: lowercase, anything outside
+/// `[a-z0-9-]` folded to `-`, trimmed.
+pub fn network_slug(name: String) -> String {
+    let folded: String = name
+        .to_lowercase()
+        .chars()
+        .map(|character| match character.is_ascii_alphanumeric() {
+            true => character,
+            false => '-',
+        })
+        .collect();
+    folded.trim_matches('-').to_string()
+}
+
+/// Found a network on this device: `ducktape node init --name <name>` mints
+/// the chain id, the identity and the workspace directory.
+pub async fn create_network(name: String) -> Result<WorkspaceInit, AppError> {
+    async {
+        let name = bounded_text(name, "network name", 128)?;
+        let chain_id = ducktape_cli(&["node", "init", "--name", &name]).await?;
+        workspace_init(&chain_id)
+    }
+    .await
+    .map_err(app_error)
+}
+
+/// Materialize this device's workspace from an invite blob:
+/// `ducktape node join <blob>`.
+pub async fn join_network(blob: String) -> Result<WorkspaceInit, AppError> {
+    async {
+        let blob = bounded_text(blob, "invite", 64 * 1024)?;
+        // `join` reports progress on stderr, so the workspace it materialized
+        // is identified by diffing the registry around the call.
+        let before: BTreeSet<String> = registered_workspaces()
+            .into_iter()
+            .map(|(chain_id, _)| chain_id)
+            .collect();
+        ducktape_cli(&["node", "join", &blob]).await?;
+        let chain_id = registered_workspaces()
+            .into_iter()
+            .map(|(chain_id, _)| chain_id)
+            .find(|chain_id| !before.contains(chain_id))
+            .ok_or_else(|| "the invite did not materialize a workspace".to_string())?;
+        workspace_init(&chain_id)
+    }
+    .await
+    .map_err(app_error)
+}
+
+/// Mint a single-use bearer invite for a workspace: `ducktape node invite`
+/// prints the `🦆…` blob on stdout. This WRITES (it folds this member's dial
+/// hint into the descriptor), so it is not a read-only probe.
+pub async fn mint_invite(workspace: String, role: String, ttl_days: i64) -> Result<String, AppError> {
+    async {
+        let role = match role.as_str() {
+            "client" => "client",
+            "resident" => "resident",
+            other => return Err(format!("unknown invite role `{other}`")),
+        };
+        let ttl = ttl_days.clamp(1, 365).to_string();
+        ducktape_cli(&[
+            "node",
+            "invite",
+            "-n",
+            &workspace,
+            "--role",
+            role,
+            "--ttl-days",
+            &ttl,
+        ])
+        .await
+    }
+    .await
+    .map_err(app_error)
+}
+
+/// The workspace facts of a freshly registered chain id.
+fn workspace_init(chain_id: &str) -> Result<WorkspaceInit, String> {
+    let (chain_id, dir) = registered_workspaces()
+        .into_iter()
+        .find(|(id, _)| id == chain_id)
+        .ok_or_else(|| format!("{chain_id} is not in the workspace registry"))?;
+    let rpc = workspace_endpoint(&dir)
+        .ok_or_else(|| "the new workspace has no node.toml http_listen".to_string())?;
+    Ok(WorkspaceInit {
+        chain_id,
+        workspace: dir.display().to_string(),
+        rpc,
+    })
+}
+
+/// Run one `ducktape` verb and return its stdout's last non-empty line — the
+/// CLI's machine value (diagnostics ride stderr).
+async fn ducktape_cli(args: &[&str]) -> Result<String, String> {
+    let mut command = tokio::process::Command::new(ducktape_binary());
+    command.args(args).kill_on_drop(true);
+    let output = tokio::time::timeout(CLI_TIMEOUT, command.output())
+        .await
+        .map_err(|_| format!("ducktape {} timed out", args.join(" ")))?
+        .map_err(|error| {
+            format!("could not start the ducktape CLI ({error}); build node-bin or set DUCKTAPE_BIN")
+        })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ducktape {} refused: {}",
+            args.join(" "),
+            bounded_detail(&detail)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .ok_or_else(|| format!("ducktape {} returned nothing", args.join(" ")))
+}
+
+/// One provisioning step. `state` is `done` | `running` | `pending` | `blocked`.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ProvisionStep {
+    pub index: i64,
+    pub label: String,
+    pub state: String,
+}
+
+/// The five provisioning steps. Steps 1-3 are facts of the materialized
+/// workspace; steps 4-5 are a REAL `/v1/status` poll, because the app attaches
+/// to a node it does not supervise — when nothing answers, the step goes
+/// `blocked` and its label says which command starts it.
+pub fn provision_progress(
+    workspace: String,
+    rpc: String,
+) -> iced::futures::stream::BoxStream<'static, ProvisionStep> {
+    struct State {
+        dir: Option<PathBuf>,
+        chain_id: String,
+        rpc: String,
+        step: usize,
+        attempts: u32,
+    }
+    let found = registered_workspaces()
+        .into_iter()
+        .find(|(chain_id, dir)| *chain_id == workspace || dir.display().to_string() == workspace);
+    let (chain_id, dir) = match found {
+        Some((chain_id, dir)) => (chain_id, Some(dir)),
+        None => (workspace, None),
+    };
+    Box::pin(iced::futures::stream::unfold(
+        State {
+            dir,
+            chain_id,
+            rpc,
+            step: 0,
+            attempts: 0,
+        },
+        |mut state| async move {
+            // the workspace's own facts, then the node's own answer.
+            match state.step {
+                0 => {
+                    state.step = 1;
+                    let home = ducktape_home()
+                        .map(|home| home.display().to_string())
+                        .unwrap_or_else(|| "~/.ducktape".into());
+                    Some((registered_step(1, &format!("Workspace registered · {home}"), state.dir.is_some()), state))
+                }
+                1 => {
+                    state.step = 2;
+                    let key = state
+                        .dir
+                        .as_deref()
+                        .and_then(workspace_identity)
+                        .unwrap_or_default();
+                    let known = !key.is_empty();
+                    Some((registered_step(2, &format!("Admin keypair · {key}"), known), state))
+                }
+                2 => {
+                    state.step = 3;
+                    let ready = state
+                        .dir
+                        .as_ref()
+                        .is_some_and(|dir| dir.join("network.toml").is_file());
+                    Some((registered_step(3, "Workspace ready · 초대 링크 발급 가능", ready), state))
+                }
+                3 => {
+                    // the app attaches to a node it does not supervise: the
+                    // only honest readiness signal is the node answering.
+                    let up = match rpc_client(&state.rpc) {
+                        Ok(client) => client.status().await.is_ok(),
+                        Err(_) => false,
+                    };
+                    if up {
+                        state.step = 4;
+                        return Some((registered_step(4, "Local node starting", true), state));
+                    }
+                    state.attempts += 1;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let stalled = state.attempts >= PROVISION_PATIENCE;
+                    let step = match stalled {
+                        false => ProvisionStep {
+                            index: 4,
+                            label: "Local node starting".into(),
+                            state: "running".into(),
+                        },
+                        true => ProvisionStep {
+                            index: 4,
+                            label: format!("Start the node · ducktape node run -n {}", state.chain_id),
+                            state: "blocked".into(),
+                        },
+                    };
+                    Some((step, state))
+                }
+                4 => {
+                    let listen = state
+                        .dir
+                        .as_deref()
+                        .and_then(|dir| node_toml_value(dir, "http_listen"))
+                        .unwrap_or_else(|| state.rpc.clone());
+                    state.step = 5;
+                    Some((
+                        ProvisionStep {
+                            index: 5,
+                            label: format!("Node API listening · {listen}"),
+                            state: "done".into(),
+                        },
+                        state,
+                    ))
+                }
+                // every step has reported; the console takes over.
+                _ => None,
+            }
+        },
+    ))
+}
+
+/// A step whose fact is either established or missing.
+fn registered_step(index: i64, label: &str, established: bool) -> ProvisionStep {
+    ProvisionStep {
+        index,
+        label: label.to_string(),
+        state: match established {
+            true => "done".into(),
+            false => "blocked".into(),
+        },
+    }
+}
+
+/// The workspace's own node identity, short — `network.toml` seats it as the
+/// founding validator, so a fresh network's admin key is readable there.
+fn workspace_identity(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("network.toml")).ok()?;
+    let line = text.lines().find(|line| line.trim_start().starts_with("validators"))?;
+    let key = line.split('"').nth(1)?;
+    Some(short_label(key))
+}
+
+/// Forget this workspace on THIS DEVICE: it stops being offered by the shell
+/// and its view prefs are dropped. The directory, the identity and the chain
+/// are untouched — this is not a leave-the-network op.
+pub async fn forget_workspace(rpc: String) -> Result<bool, AppError> {
+    let Some((chain_id, _)) = workspace_at(&rpc) else {
+        return Err(app_error(
+            "this endpoint is not one of this device's registered workspaces".into(),
+        ));
+    };
+    let mut prefs = read_prefs();
+    let mut forgotten = forgotten_workspaces();
+    if !forgotten.contains(&chain_id) {
+        forgotten.push(chain_id);
+    }
+    prefs["forgotten_workspaces"] = serde_json::json!(forgotten);
+    if let Some(tabs) = prefs["doc_tabs"].as_object_mut() {
+        tabs.remove(&canonical_endpoint(rpc));
+    }
+    Ok(write_prefs(&prefs))
+}
+
+/// One device-local boolean preference (the only key that ships is `receipts`).
+pub async fn load_bool_pref(rpc: String, key: String) -> bool {
+    read_prefs()["prefs"][&canonical_endpoint(rpc)][&key]
+        .as_bool()
+        .unwrap_or(false)
+}
+
+/// Persist one device-local boolean preference.
+pub async fn save_bool_pref(rpc: String, key: String, on: bool) -> bool {
+    let mut prefs = read_prefs();
+    prefs["prefs"][canonical_endpoint(rpc)][key] = serde_json::json!(on);
+    write_prefs(&prefs)
+}
+
+/// Published when the clipboard task lands, so a toast can confirm WHAT was
+/// copied.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct Copied {
+    pub label: String,
+}
+
+/// The app's ONE clipboard seam: put `text` on the system clipboard, then
+/// report the label the toast names.
+pub fn copy_text(text: String, label: String) -> iced::Task<Copied> {
+    iced::clipboard::write::<Copied>(text).chain(iced::Task::done(Copied { label }))
 }
 
 /// The titlebar's chain label: the workspace this app is pointed at, then the
@@ -2746,6 +3798,147 @@ pub fn height_label(height: i64) -> String {
         grouped.push(digit);
     }
     format!("h {grouped}")
+}
+
+/// TWO uppercase letters for a 28px+ avatar plate: the initials of the first
+/// two words, else the first two alphanumerics of one word.
+pub fn initials_of(name: impl AsRef<str>) -> String {
+    let name = name.as_ref();
+    let words: Vec<&str> = name.split_whitespace().take(2).collect();
+    if words.len() == 2 {
+        let letters: String = words
+            .iter()
+            .filter_map(|word| word.chars().find(char::is_ascii_alphanumeric))
+            .collect();
+        if letters.chars().count() == 2 {
+            return letters.to_uppercase();
+        }
+    }
+    let letters: String = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(2)
+        .collect();
+    match letters.is_empty() {
+        true => "?".into(),
+        false => letters.to_uppercase(),
+    }
+}
+
+/// `2h ago` / `40m ago` / `just now` — one renderer for every relative stamp.
+pub fn relative_time(unix_seconds: i64) -> String {
+    if unix_seconds <= 0 {
+        return String::new();
+    }
+    let elapsed = now_seconds().saturating_sub(unix_seconds);
+    if elapsed < 60 {
+        return "just now".into();
+    }
+    let (value, unit) = duration_parts(elapsed);
+    format!("{value}{unit} ago")
+}
+
+/// `expires in 23h` / `expires in 2d`; a passed deadline reads `expired`.
+pub fn expires_in(deadline: i64) -> String {
+    let remaining = deadline.saturating_sub(now_seconds());
+    if remaining <= 0 {
+        return "expired".into();
+    }
+    let (value, unit) = duration_parts(remaining);
+    format!("expires in {value}{unit}")
+}
+
+/// A span in seconds as its largest whole unit: `(45, "m")`, `(23, "h")`.
+fn duration_parts(seconds: i64) -> (i64, &'static str) {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    match seconds {
+        span if span < HOUR => (span / MINUTE, "m"),
+        span if span < DAY => (span / HOUR, "h"),
+        span => (span / DAY, "d"),
+    }
+}
+
+/// Wall-clock `14:32` (UTC) for a message stamp.
+pub fn clock_time(unix_seconds: i64) -> String {
+    if unix_seconds <= 0 {
+        return String::new();
+    }
+    let day_seconds = unix_seconds.rem_euclid(86_400);
+    format!("{:02}:{:02}", day_seconds / 3_600, (day_seconds % 3_600) / 60)
+}
+
+/// `Today` / `Yesterday` / `2026-07-27` — the message list's date divider.
+pub fn day_label(unix_seconds: i64) -> String {
+    if unix_seconds <= 0 {
+        return String::new();
+    }
+    let day = unix_seconds.div_euclid(86_400);
+    let today = now_seconds().div_euclid(86_400);
+    match today - day {
+        0 => "Today".into(),
+        1 => "Yesterday".into(),
+        _ => civil_date(day),
+    }
+}
+
+/// `YYYY-MM-DD` from a count of days since the epoch (civil-from-days).
+fn civil_date(days: i64) -> String {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = shifted_month + if shifted_month < 10 { 3 } else { -9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Elapsed `mm:ss` for the huddle pills and panel.
+pub fn mmss(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// The wall clock, unix seconds.
+fn now_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// A serde-tagged enum's variant name, whether it rode as a bare string
+/// (unit variant) or as a single-key object (payload variant).
+fn tagged_name(value: &serde_json::Value) -> String {
+    value.as_str().map(str::to_string).unwrap_or_else(|| {
+        value
+            .as_object()
+            .and_then(|tagged| tagged.keys().next().cloned())
+            .unwrap_or_default()
+    })
+}
+
+/// A serde `Vec<u8>` as it arrives over JSON: an array of numbers.
+fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
+    value
+        .as_array()
+        .map(|bytes| {
+            bytes
+                .iter()
+                .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A module payload in its wire form — `sdk::wire` is serde_json bytes.
+fn encode_wire(payload: &serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(payload).unwrap_or_default()
 }
 
 /// The first grapheme of a display name, upper-cased, for an avatar plate.
@@ -3310,6 +4503,7 @@ pub struct LiveRefresh {
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
     pub active_channel_huddle_count: i64,
+    pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
     pub pages_loaded: bool,
     pub pages: Vec<PageItem>,
@@ -3348,6 +4542,7 @@ pub async fn live_resync_load(
             active_channel_archived: false,
             active_channel_members_only: false,
             active_channel_huddle_count: 0,
+            huddle_roster: Vec::new(),
             channel_members: Vec::new(),
             pages_loaded: false,
             pages: Vec::new(),
@@ -3370,6 +4565,7 @@ pub async fn live_resync_load(
             refresh.active_channel_archived = chat.active_channel_archived;
             refresh.active_channel_members_only = chat.active_channel_members_only;
             refresh.active_channel_huddle_count = chat.active_channel_huddle_count;
+            refresh.huddle_roster = chat.huddle_roster;
             refresh.channel_members = chat.channel_members;
         }
         if load_pages {
@@ -3527,6 +4723,157 @@ pub async fn create_channel(
     .await
 }
 
+/// One peer of the DM directory. There is no `status`: presence has no source
+/// anywhere in the product, and a dot that always reads "offline" is a lie.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct DmPeer {
+    pub key: String,
+    pub name: String,
+    pub initials: String,
+    pub is_agent: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct DmPeersData {
+    pub generation: i64,
+    pub peers: Vec<DmPeer>,
+}
+
+/// The people and machines this device can open a DM with: identity accounts
+/// for the humans, the agent registry for the machines.
+pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let me = local_user_key().await.map(|key| hex_encode(&key));
+        let reply: serde_json::Value = client
+            .query(
+                "identity",
+                &serde_json::json!({ "all": { "from": 0, "limit": 256 } }),
+            )
+            .await?;
+        let mut peers: Vec<DmPeer> = Vec::new();
+        for account in reply["accounts"].as_array().cloned().unwrap_or_default() {
+            let key = hex_encode(&json_bytes(&account["account_id"]));
+            if me.as_deref() == Some(key.as_str()) {
+                continue;
+            }
+            let name = match account["display_name"].as_str() {
+                Some(name) if !name.is_empty() => name.to_string(),
+                _ => short_label(&key),
+            };
+            peers.push(DmPeer {
+                initials: initials_of(&name),
+                is_agent: false,
+                key,
+                name,
+            });
+        }
+        let agents = load_agents(rpc, generation).await.map(|data| data.agents);
+        for agent in agents.unwrap_or_default() {
+            peers.push(DmPeer {
+                initials: agent.initials,
+                name: agent.name,
+                key: agent.id,
+                is_agent: true,
+            });
+        }
+        Ok(DmPeersData { generation, peers })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The two-party channel id of a pair of member keys: sorted, so both sides
+/// derive the same id, and carrying both keys, so it cannot be forged by a
+/// channel the pair is not in.
+pub fn dm_channel_id(a: String, b: String) -> String {
+    let (low, high) = match a <= b {
+        true => (a, b),
+        false => (b, a),
+    };
+    format!("dm:{low}:{high}")
+}
+
+/// True only when this channel IS the derived DM of its exactly-two members —
+/// a user-created channel cannot fake the id.
+pub fn is_dm_channel(id: String, members: Vec<ChatMember>) -> bool {
+    let [first, second] = members.as_slice() else {
+        return false;
+    };
+    id == dm_channel_id(first.key.clone(), second.key.clone())
+}
+
+/// Open the DM with one peer: resolve the deterministic channel when it
+/// exists, else create it members-only and seat both keys, then load it.
+pub async fn open_dm(
+    rpc: String,
+    password: String,
+    peer_key: String,
+) -> Result<ChatData, AppError> {
+    async {
+        let peer = public_key(&peer_key, "peer public key")?;
+        let me = local_user_key()
+            .await
+            .ok_or_else(|| "this device has no user key — a DM needs one".to_string())?;
+        let channel_id = dm_channel_id(hex_encode(&me), hex_encode(&peer));
+        let client = rpc_client(&rpc)?;
+        let existing = load_chat_data(&client, Some(&channel_id)).await?;
+        if existing.active_channel == channel_id {
+            return Ok(existing);
+        }
+        signed_write(
+            &client,
+            "chat",
+            chat::encode_msg(&ChatMsg::CreateChannel {
+                channel_id: channel_id.clone(),
+                name: short_label(&hex_encode(&peer)),
+                post_policy: PostPolicy::MembersOnly,
+            }),
+            password.clone(),
+        )
+        .await?;
+        for member in [me, peer] {
+            signed_write(
+                &client,
+                "chat",
+                chat::encode_msg(&ChatMsg::SetMembership {
+                    channel_id: channel_id.clone(),
+                    user: member,
+                    member: true,
+                }),
+                password.clone(),
+            )
+            .await
+            .map_err(committed_error)?;
+        }
+        load_chat_data(&client, Some(&channel_id))
+            .await
+            .map_err(committed_error)
+    }
+    .await
+}
+
+/// Why the viewer may not post here, as a stable reason token — empty when
+/// she may. A members-only channel she is not seated in refuses her post.
+pub fn post_gate(
+    archived: bool,
+    members_only: bool,
+    members: Vec<ChatMember>,
+    me: String,
+) -> String {
+    if archived {
+        return "channel_archived".into();
+    }
+    let seated = members.iter().any(|member| member.key == me);
+    if members_only && !seated {
+        return "members_only".into();
+    }
+    String::new()
+}
+
 pub async fn rename_channel(
     rpc: String,
     password: String,
@@ -3648,6 +4995,56 @@ pub async fn remove_channel_member(
         Ok(true)
     }
     .await
+}
+
+/// One participant of a channel's live huddle — the roster is consensus state
+/// (`HuddleMember{user, node, joined_at}`), not a count.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct HuddleParticipant {
+    pub key: String,
+    pub label: String,
+    pub initials: String,
+    pub is_agent: bool,
+    pub is_you: bool,
+    pub joined_at: i64,
+}
+
+/// Render the on-chain huddle roster, marking the row this device holds — the
+/// same `user:{hex}` handle `signed_write` authors with.
+fn huddle_roster(
+    members: &[chat::index::HuddleEntry],
+    me: Option<&[u8]>,
+) -> Vec<HuddleParticipant> {
+    let mine = me.map(|key| format!("user:{}", hex_encode(key)));
+    members
+        .iter()
+        .map(|member| {
+            let label = author_name(&member.user);
+            HuddleParticipant {
+                initials: initials_of(&label),
+                is_agent: !member.user.starts_with("user:"),
+                is_you: mine.as_deref() == Some(member.user.as_str()),
+                joined_at: number_i64(member.joined_at),
+                key: member_id(&member.user).to_string(),
+                label,
+            }
+        })
+        .collect()
+}
+
+/// Am *I* in this huddle — the discriminant that splits the `Huddle` start
+/// button from the LIVE pill with its ✕ Leave.
+pub fn huddle_self(roster: Vec<HuddleParticipant>) -> bool {
+    roster.iter().any(|participant| participant.is_you)
+}
+
+/// A 1 Hz wall-clock tick (unix seconds) — the app's only time subscription,
+/// driving the huddle's elapsed clock.
+pub fn huddle_tick() -> iced::futures::stream::BoxStream<'static, i64> {
+    Box::pin(iced::futures::stream::unfold((), |()| async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        Some((now_seconds(), ()))
+    }))
 }
 
 pub async fn join_huddle(
@@ -4106,6 +5503,49 @@ pub async fn load_block_threads(
         let from = u32::try_from(from).map_err(|_| "invalid comment offset".to_string())?;
         let rpc = rpc_client(&rpc)?;
         query_block_threads(&rpc, &target, from, generation).await
+    }
+    .await;
+    result.map_err(|message| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Every comment thread on a PAGE, not on one block: the same
+/// `ThreadsForTargets` query, asked for the page and all of its blocks at once.
+/// `target` comes back as the page id — the rail is document-scoped.
+pub async fn load_page_threads(
+    rpc: String,
+    page_id: String,
+    generation: i64,
+) -> Result<BlockThreadListData, HydrationError> {
+    let result = async {
+        let page_id = required_id(page_id, "page")?;
+        let rpc = rpc_client(&rpc)?;
+        let blocks = load_page_blocks(&rpc, &page_id).await?;
+        let mut targets = vec![page_id.clone()];
+        targets.extend(blocks.into_iter().map(|block| block.id));
+        let reply: PagesViewReply = rpc
+            .view("pages", &PagesViewQuery::ThreadsForTargets { targets })
+            .await?;
+        let PagesViewReply::Threads(groups) = reply else {
+            return Err("node returned an invalid comment thread page".to_string());
+        };
+        let threads: Vec<PageCommentThread> = groups
+            .into_iter()
+            .flat_map(|group| group.threads)
+            .map(page_comment_thread)
+            .collect();
+        let total = count_i64(threads.len());
+        Ok(BlockThreadListData {
+            generation,
+            target: page_id,
+            from: 0,
+            threads,
+            total,
+            next_from: 0,
+            has_more: false,
+        })
     }
     .await;
     result.map_err(|message| HydrationError {
@@ -4599,6 +6039,160 @@ pub async fn search_pages(
     })
 }
 
+/// One workspace-search result row, whatever plane it came from.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ExplorerHit {
+    /// `message` | `page` | `code` | `file` | `run`.
+    pub kind: String,
+    /// the 2-letter mono plate: `ms` / `pg` / `fg` / `fl` / `ag`.
+    pub code: String,
+    pub title: String,
+    pub snippet: String,
+    pub meta: String,
+    /// where the row navigates: the channel id, page id, `repo#number`, path
+    /// or run id of the hit.
+    pub target: String,
+}
+
+/// One filter chip. Only kinds with a real loader are emitted — a chip that
+/// always reads zero is a fake surface.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct KindCount {
+    pub kind: String,
+    pub label: String,
+    pub count: i64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ExplorerResults {
+    pub generation: i64,
+    pub hits: Vec<ExplorerHit>,
+    pub kinds: Vec<KindCount>,
+}
+
+/// Search the whole workspace: chat, pages, the forge trackers, duckfs paths
+/// and agent runs. Tasks are not searched — that module has no app loader.
+pub async fn search_workspace(
+    rpc: String,
+    text: String,
+    generation: i64,
+) -> Result<ExplorerResults, HydrationError> {
+    let needle = text.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(ExplorerResults {
+            generation,
+            hits: Vec::new(),
+            kinds: Vec::new(),
+        });
+    }
+    let mut hits = Vec::new();
+    if let Ok(chat) = search_chat(rpc.clone(), String::new(), text.clone(), generation).await {
+        hits.extend(chat.hits.into_iter().map(|hit| ExplorerHit {
+            kind: "message".into(),
+            code: "ms".into(),
+            title: author_name(&hit.author),
+            snippet: hit.text,
+            meta: format!("{} · {}", hit.channel_id, hit.meta),
+            target: hit.channel_id,
+        }));
+    }
+    if let Ok(pages) = search_pages(rpc.clone(), String::new(), text.clone(), generation).await {
+        hits.extend(pages.hits.into_iter().map(|hit| ExplorerHit {
+            kind: "page".into(),
+            code: "pg".into(),
+            title: hit.text.clone(),
+            snippet: hit.text,
+            meta: format!("pages · {}", hit.kind),
+            target: hit.page_id,
+        }));
+    }
+    hits.extend(search_forge_items(&rpc, &needle, generation).await);
+    if let Ok(files) = files_find(rpc.clone(), String::new(), generation).await {
+        hits.extend(
+            files
+                .entries
+                .into_iter()
+                .filter(|entry| entry.kind == "file")
+                .filter(|entry| entry.path.to_lowercase().contains(&needle))
+                .take(50)
+                .map(|entry| ExplorerHit {
+                    kind: "file".into(),
+                    code: "fl".into(),
+                    title: entry.name,
+                    snippet: size_label(entry.size),
+                    meta: format!("files · {}", entry.path),
+                    target: entry.path,
+                }),
+        );
+    }
+    if let Ok(runs) = load_agent_runs(rpc, String::new(), generation).await {
+        hits.extend(
+            runs.runs
+                .into_iter()
+                .filter(|run| {
+                    run.run_id.to_lowercase().contains(&needle)
+                        || run.agent_id.to_lowercase().contains(&needle)
+                        || run.summary.to_lowercase().contains(&needle)
+                })
+                .map(|run| ExplorerHit {
+                    kind: "run".into(),
+                    code: "ag".into(),
+                    title: format!("{} · {}", run.run_id, run.agent_id),
+                    snippet: run.summary,
+                    meta: format!("agent · {}", relative_time(run.created_at)),
+                    target: run.run_id,
+                }),
+        );
+    }
+    let kinds = [
+        ("message", "Messages"),
+        ("page", "Pages"),
+        ("code", "Code"),
+        ("file", "Files"),
+        ("run", "Runs"),
+    ]
+    .into_iter()
+    .map(|(kind, label)| KindCount {
+        count: count_i64(hits.iter().filter(|hit| hit.kind == kind).count()),
+        kind: kind.into(),
+        label: label.into(),
+    })
+    .collect();
+    Ok(ExplorerResults {
+        generation,
+        hits,
+        kinds,
+    })
+}
+
+/// The forge half of the workspace search: every repo's tracker, filtered on
+/// the title client-side (the module has no text query).
+async fn search_forge_items(rpc: &str, needle: &str, generation: i64) -> Vec<ExplorerHit> {
+    let Ok(forge) = load_forge(rpc.to_string(), generation).await else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for repo in forge.repos {
+        let Ok(data) = load_forge_repo(rpc.to_string(), repo.name.clone(), generation).await else {
+            continue;
+        };
+        hits.extend(
+            data.items
+                .into_iter()
+                .filter(|item| item.title.to_lowercase().contains(needle))
+                .map(|item| ExplorerHit {
+                    kind: "code".into(),
+                    code: "fg".into(),
+                    title: format!("#{} {}", item.number, item.title),
+                    snippet: format!("{} · {}", item.kind, item.state),
+                    meta: format!("{} · {}", item.author_name, repo.name),
+                    target: format!("{}#{}", repo.name, item.number),
+                }),
+        );
+    }
+    hits
+}
+
 async fn load_workspace(
     rpc: &RpcClient,
     channel_id: Option<&str>,
@@ -4620,6 +6214,7 @@ async fn load_workspace(
         active_channel_archived: chat.active_channel_archived,
         active_channel_members_only: chat.active_channel_members_only,
         active_channel_huddle_count: chat.active_channel_huddle_count,
+        huddle_roster: chat.huddle_roster,
         channel_members: chat.channel_members,
         pages: pages.pages,
         blocks: pages.blocks,
@@ -4696,6 +6291,10 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
         .is_some_and(|info| info.channel.post_policy == PostPolicy::MembersOnly);
     let active_channel_huddle_count =
         active_wire_channel.map_or(0, |info| count_i64(info.channel.huddle.len()));
+    let me = local_user_key().await;
+    let huddle_roster = active_wire_channel.map_or_else(Vec::new, |info| {
+        huddle_roster(&info.channel.huddle, me.as_deref())
+    });
     let active_channel_head_seq = active_wire_channel.map_or(0, |info| info.head_seq);
     let channel_members = if active_channel.is_empty() {
         Vec::new()
@@ -4715,6 +6314,7 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
         active_channel_archived,
         active_channel_members_only,
         active_channel_huddle_count,
+        huddle_roster,
         channel_members,
         selected_message_seq: 0,
         selected_message_rev: 0,
@@ -6191,6 +7791,267 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_rail_seats_exactly_the_eight_module_screens() {
+        let nav = shell_nav("chat".into(), 3, true);
+        let ids: Vec<&str> = nav.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "chat",
+                "pages",
+                "forge",
+                "agents",
+                "files",
+                "explorer",
+                "members",
+                "governance"
+            ]
+        );
+        let forge = nav.iter().find(|item| item.id == "forge").unwrap();
+        assert!(forge.live, "an engaged agent pulses the forge seat");
+        assert!(!nav.iter().any(|item| item.id == "node"));
+        assert_eq!(
+            nav.iter().find(|item| item.id == "governance").unwrap().badge,
+            3
+        );
+    }
+
+    #[test]
+    fn quorum_dots_count_the_frozen_rule_not_the_electorate() {
+        // three of the four REQUIRED signatures are in, inside a six-node pool.
+        let dots = quorum_dots(3, 4);
+        assert_eq!(dots.len(), 4);
+        assert_eq!(dots.iter().filter(|seat| seat.filled).count(), 3);
+        assert_eq!(tally_label(3, 4), "3 / 4");
+        assert_eq!(tally_tone(3, 4), "near");
+        assert_eq!(tally_tone(1, 4), "far");
+        assert_eq!(tally_note(3, 4), "3 approvals · 1 more for quorum");
+        assert_eq!(tally_note(4, 4), "quorum met");
+        assert_eq!(approve_label(3, 4), "Approve →");
+        assert_eq!(approve_label(1, 4), "Approve");
+    }
+
+    #[test]
+    fn a_diff_paints_gutters_signs_and_kinds() {
+        let rows = diff_lines(
+            "diff --git a/round.rs b/round.rs\n@@ -138,3 +138,4 @@ impl RoundState {\n ctx\n-gone\n+added\n"
+                .into(),
+        );
+        let kinds: Vec<&str> = rows.iter().map(|row| row.kind.as_str()).collect();
+        assert_eq!(kinds, ["file", "hunk", "ctx", "del", "add"]);
+        let context = &rows[2];
+        assert_eq!((context.old_no.as_str(), context.new_no.as_str()), ("138", "138"));
+        assert_eq!(rows[3].sign, "-");
+        assert_eq!(rows[3].old_no, "139");
+        assert_eq!(rows[4].sign, "+");
+        assert_eq!(rows[4].new_no, "139");
+        assert_eq!(rows[4].text, "added");
+    }
+
+    #[test]
+    fn a_log_line_splits_into_time_level_and_message() {
+        let parts = split_log_line(
+            "2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident".into(),
+        );
+        assert_eq!(parts.time, "2026-07-27T09:12:44.918Z");
+        assert_eq!(parts.level, "INFO");
+        assert_eq!(parts.message, "ducktape::join: admitted resident");
+
+        let prose = split_log_line("no level here".into());
+        assert_eq!(prose.level, "");
+        assert_eq!(prose.message, "no level here");
+    }
+
+    #[test]
+    fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        assert_eq!(
+            dm_channel_id(a.clone(), b.clone()),
+            dm_channel_id(b.clone(), a.clone()),
+            "both sides derive the same channel"
+        );
+        let members = vec![
+            ChatMember {
+                key: a.clone(),
+                label: "a".into(),
+            },
+            ChatMember {
+                key: b.clone(),
+                label: "b".into(),
+            },
+        ];
+        assert!(is_dm_channel(dm_channel_id(a.clone(), b), members.clone()));
+        assert!(!is_dm_channel("channel-7".into(), members));
+        assert!(!is_dm_channel(
+            dm_channel_id(a.clone(), a),
+            Vec::new()
+        ));
+    }
+
+    #[test]
+    fn the_post_gate_names_why_a_viewer_cannot_post() {
+        let members = vec![ChatMember {
+            key: "beef".into(),
+            label: "b".into(),
+        }];
+        assert_eq!(post_gate(false, false, Vec::new(), "cafe".into()), "");
+        assert_eq!(
+            post_gate(true, false, members.clone(), "beef".into()),
+            "channel_archived"
+        );
+        assert_eq!(
+            post_gate(false, true, members.clone(), "cafe".into()),
+            "members_only"
+        );
+        assert_eq!(post_gate(false, true, members, "beef".into()), "");
+    }
+
+    #[test]
+    fn the_forge_gate_speaks_the_products_own_tiers() {
+        assert_eq!(forge_gate("validator".into()), "");
+        assert_eq!(forge_gate("resident".into()), "resident_cannot_merge");
+        assert_eq!(forge_gate("guest".into()), "guest_read_only");
+    }
+
+    #[test]
+    fn the_roster_answers_admin_tier_and_filters() {
+        let rows = vec![
+            MemberRow {
+                key: "aa".into(),
+                label: "aa".into(),
+                role: "validator".into(),
+                is_this_node: true,
+                is_agent: false,
+                model: String::new(),
+                live: true,
+            },
+            MemberRow {
+                key: "bb".into(),
+                label: "bb".into(),
+                role: "resident".into(),
+                is_this_node: false,
+                is_agent: false,
+                model: String::new(),
+                live: false,
+            },
+            MemberRow {
+                key: "triage".into(),
+                label: "triage".into(),
+                role: "agent".into(),
+                is_this_node: false,
+                is_agent: true,
+                model: "codex".into(),
+                live: true,
+            },
+        ];
+        assert!(members_is_admin(rows.clone()));
+        assert_eq!(member_tier(rows.clone()), "validator");
+        assert_eq!(member_tier(Vec::new()), "guest");
+        assert_eq!(filter_members(rows.clone(), "agents".into()).len(), 1);
+        assert_eq!(filter_members(rows.clone(), "humans".into()).len(), 2);
+        assert_eq!(filter_members(rows.clone(), "validators".into()).len(), 1);
+        assert_eq!(filter_members(rows, "all".into()).len(), 3);
+    }
+
+    #[test]
+    fn the_tracker_splits_into_open_prs_and_open_issues() {
+        let item = |number: i64, kind: &str, state: &str| ForgeItem {
+            number,
+            kind: kind.into(),
+            state: state.into(),
+            title: format!("item {number}"),
+            author: "user:aa".into(),
+            author_name: "aa".into(),
+        };
+        let items = vec![
+            item(1, "pr", "open"),
+            item(2, "pr", "merged"),
+            item(3, "issue", "open"),
+            item(4, "issue", "closed"),
+        ];
+        assert_eq!(filter_forge_items(items.clone(), "pr".into()).len(), 2);
+        assert_eq!(forge_open_count(items.clone(), "pr".into()), 1);
+        assert_eq!(forge_open_count(items, "issue".into()), 1);
+    }
+
+    #[test]
+    fn machine_values_read_as_a_person_reads_them() {
+        assert_eq!(size_label(421_888), "412 KB");
+        assert_eq!(size_label(900), "900 B");
+        assert_eq!(size_label(3 * 1024 * 1024), "3.0 MB");
+        assert_eq!(mmss(0), "00:00");
+        assert_eq!(mmss(4 * 60 + 7), "04:07");
+        assert_eq!(initials_of("Kestrel Song"), "KS");
+        assert_eq!(initials_of("triage"), "TR");
+        assert_eq!(initials_of(""), "?");
+        assert_eq!(network_slug("Acme Research!".into()), "acme-research");
+        assert_eq!(clock_time(1_774_000_000), "09:46");
+        // an absent stamp prints nothing; a real one prints its civil date.
+        assert_eq!(day_label(0), "");
+        assert_eq!(day_label(86_400), "1970-01-02");
+    }
+
+    #[test]
+    fn relative_stamps_read_from_the_wall_clock() {
+        let now = now_seconds();
+        assert_eq!(relative_time(now - 30), "just now");
+        assert_eq!(relative_time(now - 40 * 60), "40m ago");
+        assert_eq!(relative_time(now - 2 * 60 * 60), "2h ago");
+        assert_eq!(relative_time(0), "");
+        assert_eq!(expires_in(now + 23 * 60 * 60), "expires in 23h");
+        assert_eq!(expires_in(now + 2 * 24 * 60 * 60), "expires in 2d");
+        assert_eq!(expires_in(now - 1), "expired");
+        assert_eq!(day_label(now), "Today");
+        assert_eq!(day_label(now - 24 * 60 * 60), "Yesterday");
+    }
+
+    #[test]
+    fn a_proposal_renders_its_payload_and_its_frozen_bar() {
+        let view = serde_json::json!({
+            "action": { "add_validator": { "key": [0x8c, 0x4f, 0xa2, 0x11] } },
+            "voting_rule": { "threshold": { "required_yes": 4 } }
+        });
+        assert_eq!(gov_action_detail(&view["action"]), "key 8c4fa211");
+        assert_eq!(voting_bar(&view["voting_rule"]), 4);
+        let majority = serde_json::json!({ "participating_majority": { "quorum": 3 } });
+        assert_eq!(voting_bar(&majority), 3);
+        assert_eq!(tagged_name(&view["action"]), "add_validator");
+        assert_eq!(proposal_kind_tone("add_validator".into()), "access");
+        assert_eq!(proposal_kind_tone("signal".into()), "neutral");
+        assert_eq!(
+            gov_action_detail(&serde_json::json!({ "signal": { "text": "ship it" } })),
+            "ship it"
+        );
+    }
+
+    #[test]
+    fn the_huddle_roster_marks_the_row_this_device_holds() {
+        let me = [0xaau8; 32];
+        let mine = format!("user:{}", hex_encode(&me));
+        let roster = huddle_roster(
+            &[
+                chat::index::HuddleEntry {
+                    user: mine,
+                    node: String::new(),
+                    joined_at: 10,
+                },
+                chat::index::HuddleEntry {
+                    user: "agent:runs/triage".into(),
+                    node: String::new(),
+                    joined_at: 20,
+                },
+            ],
+            Some(&me),
+        );
+        assert_eq!(roster.len(), 2);
+        assert!(roster[0].is_you && !roster[0].is_agent);
+        assert!(!roster[1].is_you && roster[1].is_agent);
+        assert!(huddle_self(roster.clone()));
+        assert!(!huddle_self(vec![roster[1].clone()]));
+    }
+
+    #[test]
     fn container_depth_uses_only_shared_design_roles() {
         let tokens = ducktape_ui::ui::theme::LIGHT;
         let theme = iced::Theme::Light;
@@ -6333,6 +8194,9 @@ mod tests {
             show_author: true,
             initial: "Y".into(),
             avatar_kind: "human".into(),
+            mine: true,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         };
         let after_second = merge_message_send_result(
@@ -6400,6 +8264,9 @@ mod tests {
             show_author: false,
             initial: "A".into(),
             avatar_kind: "human".into(),
+            mine: false,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         };
         let mut messages = vec![
@@ -6434,6 +8301,9 @@ mod tests {
             show_author: false,
             initial: "A".into(),
             avatar_kind: "human".into(),
+            mine: false,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         };
         // oldest loaded root is seq 3 -> older history exists.
@@ -7214,6 +9084,9 @@ mod tests {
             show_author: true,
             initial: "U".into(),
             avatar_kind: "human".into(),
+            mine: false,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         };
 
