@@ -6,6 +6,14 @@
   byte-identical to `c47d77917` (`git diff --stat 754feb0f3 c47d77917` → empty).
 - **Status:** designed, then **built** on `feat/work-admission`. This file is the
   design of record; §5 is what actually shipped.
+- **Superseded in two places, 2026-07-27 (`dev` @ `02ad78b5e`).** §4 sequenced
+  delegation as a later PR; **PR #843 shipped it** (`c99a9a9c5` + `fad75d469`,
+  merged at `417cbae5c`), and §4 now records what was built rather than what was
+  proposed. §7.1 named `PostPolicy::MembersOnly` as the shared-pty fix; **PR
+  #835 rejected that route** (`d38bd5c65`) and gated on `Channel.owner`
+  instead. Neither correction changes this document's own subject: work
+  admission and credential authorization remain two consents in opposite
+  directions, and #843 touched only the second.
 - **Predecessors:** `2026-07-26-assumption-audit.md` (A15/A16 → PR #833),
   `2026-07-26-wave2-integration-qa.md` (the runbook this changes, amended in the
   same PR).
@@ -48,11 +56,13 @@ place, the gateway hop, where the node's proxy stamps `x-duck-caller-account`
 from the mesh-verified peer and refuses a caller-supplied copy. Every
 caller-asserted account was deleted from the compute layer.
 
-The consequence is stated in the lender's own gate
-(`crates/airlock/src/server.rs:565-573`):
-
-> *a lender granting an account is lending to that account's NODE, for whatever
-> workload it runs.*
+The consequence, as the lender's own gate stated it at the time: *a lender
+granting an account is lending to that account's NODE, for whatever workload it
+runs.* **#843 rewrote that comment** — `session_gate`
+(`crates/airlock/src/server.rs`) now also admits a session "on the grant held by
+whoever the committed work says submitted it", which is §4. The sentence above
+still describes the standing-grant half exactly, and that half is what this
+document is about.
 
 So the credential boundary is now exactly as strong as the answer to a question
 nothing in the tree asks: **whose work will this node run?** A credential's
@@ -494,60 +504,76 @@ consent-screen precedent, not a new pattern.
 
 ---
 
-## 4. Delegation — after, not with
+## 4. Delegation — shipped separately, in PR #843
 
-### 4.1 What it is, and that it is confirmed possible
+### 4.1 What it is
 
-Today the lender authorizes the **executing** node's account, so a run submitted
-by A and executed on B draws as B. Delegation would let it draw as A, with B
-supplying only a **pointer**, never a claim:
+A run submitted by A and executed on B draws on **A's** grant, with B supplying
+only a **pointer**, never a claim. Before #843 the lender authorized the
+executing node's account and nothing else, so such a run drew as B or not at all.
 
-1. `SessionRequest` gains a required work reference. The wire is
-   `deny_unknown_fields` with no `serde(default)` anywhere by design
-   (`crates/airlock/src/wire.rs:5-9`), so it must be a **required tagged field**,
-   not an `Option` — e.g. `work: WorkRef` with arms `Direct` and
-   `Saga { saga_id }`. Every producer then says which, explicitly.
-2. `GrantCheck` widens from `Fn(String, Vec<u8>)`
-   (`crates/airlock/src/server.rs:162-163`) to carry `(sub, vouched_account,
-   work)`.
-3. The lender's `grant_answer` (`bin/node/src/airlock.rs:375`) verifies from its
-   **own committed state**: `SagaQuery::Get { saga_id }` gives `origin` and
-   `assignee`; require `account_of(assignee) == vouched_caller` (so only the
-   node actually holding the lease may present the pointer), then authorize on
-   `account_of(origin)`.
-4. Plumbing is already threaded: `CredentialResolver::resolve` still takes
-   `saga_id` (`bin/node/src/compute/cred.rs:145`, currently `_saga_id`), and
-   `resolve_credential_into` passes it (`crates/services/compute/src/pool.rs:116`).
+### 4.2 What was built, and where it differs from the sketch
 
-Nothing in that is a layering violation: B asserts no identity, it hands over an
-id, and the lender reads the answer out of consensus.
+`SessionRequest` gained a required tagged `work: WorkRef` with arms `Direct` and
+`Saga { saga_id }` (`crates/airlock/src/wire.rs`); `GrantCheck` widened to carry
+it (`crates/airlock/src/server.rs`); `CredentialResolver::resolve`'s `saga_id`
+went from `_saga_id` to the pointer it passes through
+(`bin/node/src/compute/cred.rs`), and the interactive lane states `Direct`
+explicitly (`crates/services/agent/src/lib.rs`) because a pty has no committed
+record of who asked for it. All as sketched.
 
-### 4.2 Why it ships second
+**Two conditions the sketch did not have, both added by `fad75d469`, and each
+one closes a hole the sketch's two-condition version had:**
+
+| # | condition | why the sketch was not enough |
+|---|---|---|
+| 1 | the saga's `status` is `Pending` | no terminal path clears a saga's assignee, so one `Done` run was a permanent, network-wide, unmetered draw the owner could not revoke — the executor holds no grant, so `user cred revoke` has no subject, and the session budget is keyed on the credential and refilled on every open |
+| 2 | the committed spec NAMES the session's credential | one lease on A's saga otherwise opened a session for any credential any lender serves that A is granted on, including a third party's who never saw the saga |
+
+**One condition the sketch got subtly wrong.** It said
+`account_of(assignee) == vouched_caller`. The gate reads **`pinned_assignee`**,
+not `assignee`: the pin is immutable (`Reassign` errors on a pinned saga,
+`Crank`'s re-lease returns the same pin), whereas the LEASE moves — for an
+unpinned saga a permissionless `Crank` re-leases through `pick_assignee`, whose
+height an attacker in the capability pool can time. Keying on the lease would
+carry the submitter's credential to whoever won the roll. An unpinned saga
+therefore delegates to nobody, which costs nothing real: every
+credential-naming product path pins.
+
+Both free conditions are decided before either identity read, so a caller
+pointing at finished or unrelated work costs the lender's command lane two
+queries rather than four. The full gate is `delegated_answer`
+(`bin/node/src/airlock.rs`); its refusal tokens are
+`delegated_work_finished`, `delegated_work_names_another_credential`,
+`delegated_caller_not_the_executor`, `delegated_submitter_not_granted`,
+`work_pointer_oversized`, and — **not a refusal** — `delegated_work_unseen`,
+which is `Undetermined`/503 for a saga this lender has not committed yet. The
+borrower's broker re-asks that one arm and no other
+(`open_session_retrying`, `crates/services/broker/src/lib.rs`).
+
+### 4.3 Why it shipped second, and what that turned out to be worth
+
+The sequencing argument held up:
 
 - **Admission closes the hole on both lanes; delegation closes it on one.**
-  Keyed on `origin`, delegation would refuse a stranger's *saga* draw — but the
-  pty lane has no committed record of who asked, so its subject stays "the
-  vouched caller", and a stranger's pty on my node still spends my grant.
-  Shipping delegation first would leave P1 wide open while looking like a fix.
-- **Delegation restores nothing that admission takes away.** A's run on B where
-  B is granted still works after admission (A must also be admitted on B —
-  one verb). A's run on B drawing on **A's** grant has *never* worked, so
-  sequencing regresses nothing.
-- **Review surface.** Together they touch the airlock wire, the broker, the
-  compute pool, the term plane, node config, and the CLI, in one security PR.
-  Separately they are two reviewable changes with two live-QA passes on the
-  lending pair.
-- Delegation also makes the admission *safer* afterwards: once the grant subject
-  is the work's origin, admitting a friend for compute no longer implies letting
-  them spend the host's subscription. That is an argument for doing it soon —
-  not for doing it in the same diff.
+  Keyed on `origin`, delegation refuses a stranger's *saga* draw — but the pty
+  lane has no committed record of who asked, so its subject stays "the vouched
+  caller", and a stranger's pty on my node still spends my grant. Shipping
+  delegation first would have left P1 wide open while looking like a fix.
+- **Delegation restored nothing that admission took away.** A's run on B where B
+  is granted still works after admission (A must also be admitted on B). A's run
+  on B drawing on **A's** grant had never worked.
+- **Review surface.** #843's review found four blockers (`fad75d469`'s F1–F4),
+  two of which were credential-lending holes. In one combined security PR with
+  the admission they would have been reviewed alongside it.
 
-**The asymmetry to decide when that PR is written, not now:** after delegation
-the two lanes have different grant subjects — the saga's committed origin vs the
-vouched caller. One rule ("the subject is whatever the lender can verify:
-committed state where it exists, its own transport otherwise"), two evaluations.
-The alternative — giving the pty lane a committed record so both lanes read the
-same way — is a much larger change and should be argued on its own.
+**The asymmetry, as decided.** The two lanes have different grant subjects — the
+saga's committed origin vs the vouched caller — under one rule: *the subject is
+whatever the lender can verify, committed state where it exists and its own
+transport otherwise*. Two evaluations, one rule, and `grant_answer` checks the
+caller's own grant first so delegation is purely additive. Giving the pty lane a
+committed record so both lanes read the same way remains unbuilt and would still
+have to be argued on its own.
 
 ---
 
@@ -655,25 +681,36 @@ logged at boot, it is not an account, and without it the operator is told
 
 ### 5.5 Proven on a real two-node cluster
 
-`sched_pinned_run::a_delegated_run_draws_as_the_executing_node_not_the_submitter`
-is #833's own delegated test: two real validators, two accounts, a real compute
-daemon on node 1, a real `service run airlock` lender on node 0, containers, and
-a mock upstream. It went **red** on this branch — and correctly: node 1 now
-refuses node 0's work before the credential lane is reached, so the lender's
-refusal token never arrived.
+The test was #833's own delegated test: two real validators, two accounts, a
+real compute daemon on node 1, a real `service run airlock` lender on node 0,
+containers, and a mock upstream. It went **red** on this branch — and correctly:
+node 1 now refuses node 0's work before the credential lane is reached, so the
+lender's refusal token never arrived.
 
-Rather than weaken it, it grew a third direction, and the result is the best
+Rather than weaken it, it grew a **direction 0**, and the result is the best
 evidence in this PR — two independent gates, in order, on live nodes:
 
 | direction | state | outcome |
 |---|---|---|
 | **0 (new)** | neither admitted nor granted | `Failed` — **`work_not_admitted`**. No container, no gateway hop, no session. |
 | **1** | `work-admit.toml` written on node 1 — **no restart** | `Failed` — `credential_not_granted`, the LENDER's own token, now reachable |
-| **2** | plus the owner's grant | `Done`, the mock upstream's `PONG` committed into the saga result |
+| **2** | plus a grant | `Done`, the mock upstream's `PONG` committed into the saga result |
 
 Direction 0 → 1 changes one file on the executor and nothing else, which is what
 makes "two consents in opposite directions" a demonstrated fact rather than a
 claim — and the absence of a restart is what proves the per-decision read.
+
+> **The test's name and its direction 1/2 semantics changed under #843**, and
+> this section is kept because direction 0 is still this PR's evidence. It is
+> now `sched_pinned_run::a_delegated_run_draws_on_the_submitters_grant` and runs
+> five legs: direction 0 unchanged, direction 1 narrowed to a run node 1 submits
+> and pins to ITSELF (so no delegation is available), a new direction 2 where
+> node 0 submits and node 1 executes **ungranted** and succeeds, a 2b that
+> replays 2's pointer after the saga is terminal and must be refused, and a
+> direction 3 that is old-2's non-regression. **Direction 0 is the only one of
+> them this PR owns.** The name
+> `a_delegated_run_draws_as_the_executing_node_not_the_submitter` no longer
+> exists in the tree.
 
 The sibling test, `a_granted_scheduled_run_executes_against_the_mock_upstream`
 (a run pinned to the submitter's OWN node), passes untouched: it takes the
@@ -737,14 +774,33 @@ every cross-box step.
 
 ## 7. What this does not close — say it, do not imply coverage
 
-1. **P10, the chat-driven Shared pty — dispatched as its own PR.**
-   `PostPolicy::Open` lets any member post
-   commands into a live session, including one running on a lent credential
-   (`bin/noded/src/term_consensus.rs:37-51`, which says so itself). Its fix is
-   the channel's post policy — participants roster, `MembersOnly` — a different
-   mechanism entirely, so `term_consensus.rs` is deliberately **untouched**
-   here. Arguably sharper than the hole this document closes,
-   because the session is already authenticated and already paying.
+1. **P10, the chat-driven Shared pty — dispatched as its own PR, and CLOSED by
+   PR #835.** `PostPolicy::Open` let any member post commands into a live
+   session, including one running on a lent credential, and
+   `term_consensus.rs` documented it as an accepted risk. It is deliberately
+   **untouched by this PR**, which is why it is listed here.
+
+   **The fix was NOT the post policy, and this section originally named the
+   wrong mechanism.** `PostPolicy::MembersOnly` plus a participants roster does
+   not hold: chat's `SetMembership` drops its `author`, so any member can add
+   themselves to any channel's roster and post straight through a members-only
+   policy, and `JoinHuddle` is self-service under an open policy too. `owner` is
+   chat's only author-gated principal, so a multi-driver participant set is not
+   expressible without author-gating `SetMembership` — a `crates/modules/`
+   change and a genesis flag day.
+
+   #835 gated where the effect happens instead: `project_message`
+   (`bin/noded/src/term_consensus.rs`, the only file it touched) drives the pty
+   only when the message's cryptographically verified author equals the
+   channel's `Channel.owner`, and refuses everything else with
+   `command_not_channel_owner` at `debug` — it can fire per post. `Channel.owner`
+   needed nothing new: chat mints it from the SIGNED author at `CreateChannel`,
+   and `ensure_channel` is submitted by the node that owns the pty, so the owner
+   IS that host on both binaries. The projector refuses to START without an
+   owner (`channel_unreadable` / `channel_unowned`) — fail closed. Zero module
+   change, no genesis movement, no second secret. The node-local ws
+   `TermCommand` lane is untouched: trusted-local, the same surface as
+   `/v1/submit`.
 2. **D3 is the ceiling.** `POST /v1/submit` re-signs as this node (so its origin
    always takes the `ThisNode` fast path), `/v1/submit/frame` applies no local
    standing check, and the JSON-lines RPC listener has no gate at all. This
@@ -781,7 +837,11 @@ every cross-box step.
 2. **`ducktape node work {list,admit,revoke}` ships** alongside the file.
    `node.toml` is not the home (§2.2); `work-admit.toml` is, and hand-editing it
    works — the CLI is the consent point and the validating writer.
-3. **Delegation ships next, not with** (§4).
-4. **P10 goes to its own PR**, dispatched separately (§7.1).
+3. **Delegation ships next, not with** (§4). **Done — PR #843**, and §4 records
+   what was built. The sequencing paid for itself: #843's review found four
+   blockers, two of them credential-lending holes that a combined PR would have
+   reviewed alongside this one.
+4. **P10 goes to its own PR**, dispatched separately (§7.1). **Done — PR #835**,
+   and not by the mechanism this document named; §7.1 says which.
 5. **Non-loopback `http_listen` keeps its warn** (§7.2), and the interaction is
    recorded rather than half-fixed.
