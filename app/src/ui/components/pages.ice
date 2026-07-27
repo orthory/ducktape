@@ -1,3 +1,22 @@
+// Pages — the document column and the comments rail.
+//
+// Painted from "Ducktape Console - Liquid Glass.dc.html":885-965, which is the
+// ONLY handoff file that carries a Pages screen (the designer's non-glass
+// variant has no `isPages`). Nothing in this surface is glass: every plate the
+// artifact draws here is already an opaque hex.
+//
+// THREE VALUES THE APP CANNOT SPELL EXACTLY, recorded once here instead of at
+// each call site:
+//   * quote text is 15px and code text is 11.5px in the artifact; neither is on
+//     `design::type_scale::ALL`, so they take the neighbouring steps 14.0/12.0.
+//   * the code plate is #201f1a; the nearest token is `primary` #26251f. Its
+//     ink #c8c6bc IS a token value (`chevron_idle`) under another name.
+//   * the callout tile is #ece1d2; `brand_bg` #f9f1ea is the artifact's own
+//     accent wash and the tile's ink `brand` #a05a3c is exact.
+// A `text` line at 12.5 may carry no `font=` (the design-system guard pins the
+// caption step to weight 400), so the sidebar rows are 400 where the artifact
+// is 500.
+
 component PageTitleEditor(rpc:str, password:str, page_id:str, title:str, disabled:bool)
   state
     editing = false
@@ -37,30 +56,36 @@ component PageTitleEditor(rpc:str, password:str, page_id:str, title:str, disable
     if !empty(local_error)
       text local_error size=12.5 @text-muted
 
+// SIDEBAR ROW — `margin:1px 0;padding:7px 12px;border-radius:7px;gap:8px`, no
+// fixed height, the doc line icon rather than a ▤ glyph, and the SAME #f0efea
+// hover plate in both states (Liquid Glass:893-895).
+//
+// `page.prefix` is two spaces per depth (backend.rs:5439). The artifact indents
+// the row itself by `11 + depth * 15`px, which needs a depth NUMBER — until
+// `PageItem` carries one the prefix stays as the only hierarchy signal, moved
+// ahead of the icon so it indents the whole row instead of the title alone.
 component PageButton(page:PageItem, selected:bool)
   col w=fill
     if selected
-      button label=page.title w=fill h=34.0 p=7.0 @ghost_action -> choose_page(page.id)
-        row w=fill h=fill gap=9.0 align=center
-          text "▤" w=18.0 size=13.0 align-x=center @text-fg
-          text page.prefix size=12.0 wrap=none font=code @text-muted
-          text page.title w=fill size=13.0 wrap=none font=medium @text-fg
-          if page.child_count > 0
-            text page.child_count size=12.0 font=code @text-muted
-        active bg=subtle text=fg border=transparent border-w=1.0 r=8.0
+      button label=page.title w=fill @ghost_action px-12px py-7px -> choose_page(page.id)
+        row w=fill gap=8.0 align=center
+          if !empty(page.prefix)
+            text page.prefix size=12.0 wrap=none font=code @text-label
+          Icon name="doc" tone="label" px=14.0
+          text page.title w=fill size=12.5 wrap=none @text-fg
+        active bg=subtle text=fg border=transparent border-w=1.0 r=7.0
         hovered bg=rail_hover text=fg
         pressed bg=subtle text=fg
     if !selected
-      button label=page.title w=fill h=34.0 p=7.0 @ghost_action -> choose_page(page.id)
-        row w=fill h=fill gap=9.0 align=center
-          text "▤" w=18.0 size=13.0 align-x=center @text-muted
-          text page.prefix size=12.0 wrap=none font=code @text-muted
-          text page.title w=fill size=13.0 wrap=none @text-muted
-          if page.child_count > 0
-            text page.child_count size=12.0 font=code @text-muted
-        active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
-        hovered bg=fg/6 text=fg border=fg/8
-        pressed bg=fg/10 text=fg border=fg/12
+      button label=page.title w=fill @ghost_action px-12px py-7px -> choose_page(page.id)
+        row w=fill gap=8.0 align=center
+          if !empty(page.prefix)
+            text page.prefix size=12.0 wrap=none font=code @text-label
+          Icon name="doc" tone="label" px=14.0
+          text page.title w=fill size=12.5 wrap=none @text-muted
+        active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
+        hovered bg=rail_hover text=fg
+        pressed bg=subtle text=fg
 
 component PageSearchResult(hit:PageSearchHit)
   button label=hit.text w=fill p=7.0 @ghost_action -> open_page_search_hit(hit.page_id, hit.block_id)
@@ -73,74 +98,186 @@ component PageSearchResult(hit:PageSearchHit)
     hovered bg=fg/6 text=fg border=fg/8
     pressed bg=fg/10 text=fg border=fg/12
 
+// COMMENT CARDS — `border:1px solid #ece9e1;background:#fff;border-radius:11px;
+// padding:11px 12px` with a 22px principal plate, the author at 600 12px and
+// the body at 12px/1.55 (Liquid Glass:944-953).
+//
+// TWO PARTS OF THE ARTIFACT CARD ARE NOT DRAWN, because nothing on the wire
+// carries them and a plausible one would be a lie:
+//   * the AGENT badge and the square plate — `PageComment`/`PageCommentThread`
+//     carry a flattened author STRING, and `page_author_name` throws the
+//     `AuthorRef::Agent` variant away (backend.rs:5213). Every plate is drawn
+//     as a person until the discriminant survives the boundary.
+//   * the relative timestamp and the anchor quote — the row carries neither a
+//     time nor `ThreadRow.anchor`. The right-hand slot shows the ordinal the
+//     record does have (`#3`, `#3 · edited`) instead of an invented age.
 component PageCommentThreadButton(thread:PageCommentThread)
-  button label=thread.author description=thread.meta w=fill p=6.0 @ghost_action -> open_block_comment_thread(thread.id)
-    row w=fill gap=7.0 align=center
-      text thread.author w=fill size=13.0 wrap=none font=medium @text-fg
-      text thread.meta size=11.0 wrap=none font=code_medium @text-muted
-      text "›" size=13.0 @text-muted
-    active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
-    hovered bg=fg/6 text=fg border=fg/8
-    pressed bg=fg/10 text=fg border=fg/12
+  button label=thread.author description=thread.meta w=fill @ghost_action px-12px py-11px -> open_block_comment_thread(thread.id)
+    col w=fill gap=7.0
+      row w=fill gap=8.0 align=center
+        PrincipalAvatar initials=initials_of(thread.author) is_agent=false plate=22.0 ink=9.0 ring=""
+        text thread.author w=fill size=12.0 wrap=none font=display @text-primary
+        text "›" size=13.0 wrap=none @text-label
+      text thread.meta w=fill size=12.0 line-h=1.55 wrap=word @text-panel_tile
+    active bg=surface text=fg border=card_line border-w=1.0 r=11.0
+    hovered bg=card_wash_hover text=fg border=control_line
+    pressed bg=card_wash text=fg border=control_line
 
 component PageCommentCard(comment:PageComment)
-  box w=fill p=7.0 bg=transparent border=transparent border-w=1.0 r=7.0
-    col w=fill gap=3.0
-      row w=fill gap=7.0 align=center
-        text comment.author w=fill size=13.0 wrap=none font=medium @text-fg
-        text comment.meta size=11.0 wrap=none font=code_medium @text-muted
-      text comment.text w=fill size=13.5 wrap=word @text-fg
+  box w=fill pl=12.0 pr=12.0 pt=11.0 pb=11.0 bg=surface border=card_line border-w=1.0 r=11.0
+    col w=fill gap=7.0
+      row w=fill gap=8.0 align=center
+        PrincipalAvatar initials=initials_of(comment.author) is_agent=false plate=22.0 ink=9.0 ring=""
+        text comment.author w=fill size=12.0 wrap=none font=display @text-primary
+        text comment.meta size=10.5 wrap=none font=code_medium @text-label
+      text comment.text w=fill size=12.0 line-h=1.55 wrap=word @text-panel_tile
 
+// The rail's docked composer (Liquid Glass:959 — a bordered field with a 27px
+// ink ↑ send key) is NOT a component: `input` binds `<->` to state, a component
+// only owns local state, and the draft has to be the app's `block_comment_draft`
+// for `post_block_comment_submit` to read and clear it. It stays in view.ice.
+
+// THE BLOCK GUTTER, for the row being EDITED. The read view draws its markers
+// inline (see BlockContents) exactly as the artifact does — only the editor
+// keeps a gutter, so the caret does not jump when a block is selected.
 component BlockLine(block:PageBlock)
-  row w=fill gap=7.0 align=start
+  row w=fill gap=0.0 align=start
     match block.kind
       "Page"
-        text "▤" w=16.0 size=13.0 align-x=center @text-muted
+        box pr=11.0
+          Icon name="doc" tone="label" px=14.0
       "Bullet"
-        text "•" w=16.0 size=13.0 align-x=center @text-muted
+        box pt=9.0 pr=11.0
+          BulletDot
       "Number"
-        text "1." w=16.0 size=12.0 align-x=center @text-muted
+        box pr=11.0
+          text "1." size=12.0 wrap=none font=code @text-label
       "Todo"
-        if block.checked
-          text "✓" w=16.0 size=12.0 align-x=center font=medium @text-fg
-        if !block.checked
-          text "○" w=16.0 size=13.0 align-x=center @text-muted
+        box pt=3.0 pr=11.0
+          TodoCheckbox block=block
       "Toggle"
-        text "›" w=16.0 size=14.0 align-x=center @text-muted
-      "Quote"
-        text "│" w=16.0 size=14.0 align-x=center @text-muted
-      "Code"
-        text "{}" w=16.0 size=12.0 align-x=center font=code @text-muted
-      "Callout"
-        text "!" w=16.0 size=12.0 align-x=center font=medium @text-muted
+        box pr=11.0
+          Icon name="chevron-right" tone="label" px=14.0
       _
         space w=0.0
     slot
 
+// THE BLOCK RHYTHM. The artifact gives every kind its own top margin — h2 20,
+// paragraph 8, bullet 6, todo 7, callout 14, quote 16, code 14 — so a heading
+// opens a section (Liquid Glass:913-926). A flat gap does not.
 component BlockContents(block:PageBlock)
-  BlockLine block=block
-    col w=fill gap=2.0
-      match block.kind
-        "Page"
-          row w=fill gap=6.0 align=center
+  col w=fill
+    match block.kind
+      "Page"
+        box w=fill pt=8.0
+          row w=fill gap=8.0 align=center
+            Icon name="doc" tone="label" px=14.0
             if empty(block.text)
-              text "Untitled" w=fill size=13.0 wrap=word font=medium @text-muted
+              text "Untitled" w=fill size=13.5 wrap=word font=medium @text-muted
             if !empty(block.text)
-              text block.text w=fill size=13.0 wrap=word font=medium @text-fg
-            text "›" size=13.0 @text-muted
-        "Heading 1"
-          text block.text w=fill size=20.0 wrap=word font=display @text-fg
-        "Heading 2"
-          text block.text w=fill size=16.0 wrap=word font=display @text-fg
-        "Heading 3"
-          text block.text w=fill size=14.0 wrap=word font=display @text-fg
-        "Code"
-          box w=fill p=7.0 bg=fg/7 border=fg/9 border-w=1.0 r=7.0
-            text block.text w=fill size=12.0 wrap=word font=code @text-fg
-        "Divider"
-          Separator
-        _
-          text block.text w=fill size=13.5 wrap=word @text-fg
+              text block.text w=fill size=13.5 wrap=word font=medium @text-fg
+            text "›" size=13.0 wrap=none @text-label
+      "Heading 1"
+        box w=fill pt=20.0
+          text block.text w=fill size=20.0 line-h=1.25 wrap=word font=display @text-primary
+      "Heading 2"
+        box w=fill pt=20.0
+          text block.text w=fill size=16.0 line-h=1.3 wrap=word font=display @text-primary
+      "Heading 3"
+        box w=fill pt=16.0
+          text block.text w=fill size=14.0 line-h=1.35 wrap=word font=display @text-primary
+      "Bullet"
+        BulletBlock body=block.text
+      "Number"
+        box w=fill pt=6.0
+          row w=fill gap=11.0 align=start
+            text "1." size=12.0 wrap=none font=code @text-label
+            text block.text w=fill size=14.0 line-h=1.65 wrap=word @text-accent_fg
+      "Todo"
+        TodoBlock block=block
+      "Toggle"
+        box w=fill pt=8.0
+          row w=fill gap=11.0 align=start
+            Icon name="chevron-right" tone="label" px=14.0
+            text block.text w=fill size=14.0 line-h=1.7 wrap=word @text-accent_fg
+      "Quote"
+        QuoteBlock body=block.text
+      "Callout"
+        CalloutBlock body=block.text
+      "Code"
+        CodeBlock body=block.text
+      "Divider"
+        Separator
+      _
+        box w=fill pt=8.0
+          text block.text w=fill size=14.0 line-h=1.7 wrap=word @text-accent_fg
+
+// A 5px dot on the gutter ink, not a • glyph in a 16px cell.
+component BulletDot()
+  box #root w=5.0 h=5.0 bg=gutter_ink r=2.5
+    space w=1.0 h=1.0
+
+component BulletBlock(body:str)
+  box #root w=fill pt=6.0
+    row w=fill gap=0.0 align=start
+      box pt=9.0 pr=11.0
+        BulletDot
+      text body w=fill size=14.0 line-h=1.65 wrap=word @text-accent_fg
+
+// ONE CLICK FINALIZES THE TICK. 17px, r5, ink when done and a 1.5px hairline
+// when open — the artifact's own control, not a menu round-trip.
+component TodoCheckbox(block:PageBlock)
+  col #root
+    if block.checked
+      button label="Mark not done" w=17.0 h=17.0 p=0.0 @icon_action -> set_todo_checked(block.id, false)
+        box w=fill h=fill align-x=center align-y=center
+          text "✓" size=9.0 wrap=none font=code_semibold @text-primary_fg
+        active bg=primary text=primary_fg border=primary border-w=1.5 r=5.0
+        hovered bg=ink_hover text=primary_fg border=ink_hover
+        pressed bg=primary text=primary_fg border=primary
+    if !block.checked
+      button label="Mark done" w=17.0 h=17.0 p=0.0 @icon_action -> set_todo_checked(block.id, true)
+        space w=1.0 h=1.0
+        active bg=surface border=control_line_hover border-w=1.5 r=5.0
+        hovered bg=surface border=primary
+        pressed bg=subtle border=primary
+
+// A done todo fades to `meta` and strikes through; an open one keeps body ink.
+component TodoBlock(block:PageBlock)
+  box #root w=fill pt=7.0
+    row w=fill gap=0.0 align=start
+      box pt=3.0 pr=11.0
+        TodoCheckbox block=block
+      if block.checked
+        rich-text w=fill size=14.0 line-h=1.65 wrap=word color=meta
+          span block.text strike
+      if !block.checked
+        text block.text w=fill size=14.0 line-h=1.65 wrap=word @text-accent_fg
+
+// The rule IS the marker — the artifact draws no gutter glyph on a quote.
+component QuoteBlock(body:str)
+  box #root w=fill pt=16.0
+    row w=fill gap=0.0 align=start
+      box w=2.0 h=fill bg=control_line
+        space w=1.0 h=1.0
+      box w=fill pl=14.0
+        text body w=fill size=14.0 line-h=1.6 wrap=word font=italic @text-muted
+
+component CalloutBlock(body:str)
+  box #root w=fill pt=14.0
+    box w=fill pl=15.0 pr=15.0 pt=13.0 pb=13.0 bg=card_wash border=separator border-w=1.0 r=11.0
+      row w=fill gap=11.0 align=start
+        box w=20.0 h=20.0 align-x=center align-y=center bg=brand_bg r=6.0
+          text "i" size=10.0 wrap=none font=code_semibold @text-brand
+        text body w=fill size=13.0 line-h=1.6 wrap=word @text-panel_tile
+
+// Code is a dark card and it never reflows: the artifact keeps `white-space:pre`
+// and lets the plate scroll. `wrap=none` + a clip is that rule without nesting a
+// scroll area inside a clickable block.
+component CodeBlock(body:str)
+  box #root w=fill pt=14.0
+    box w=fill pl=15.0 pr=15.0 pt=13.0 pb=13.0 bg=primary r=10.0 clip=true
+      text body w=fill size=12.0 line-h=1.6 wrap=none font=code @text-chevron_idle
 
 component DocumentBlock(block:PageBlock, selected:bool, hovered:bool, disabled:bool)
   mouse enter=block_entered(block.id) exit=block_exited(block.id)
@@ -198,11 +335,6 @@ component BlockActionsMenu(block_id:str, kind:str, disabled:bool, delete_armed:b
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
         button "→" label="Indent block" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> move_block_submit("indent")
-          active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-          hovered bg=fg/8 text=fg border=fg/9
-          pressed bg=fg/12 text=fg border=fg/13
-      if kind == "Todo"
-        button "Toggle done" label="Toggle checked" disabled=disabled w=fill h=28.0 p=6.0 @ghost_action -> toggle_block_checked
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
