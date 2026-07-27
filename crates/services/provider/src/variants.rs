@@ -4,9 +4,8 @@
 //! a variant is pure sugar over the documented "finer tag with its own spec"
 //! pattern: each entry registers an ADDITIONAL spec under the composed tag
 //! `{parent_tag}_{suffix}`, inheriting `bin`/`env`/`prompt`/`output`/
-//! `timeout_secs`/`workspace`/`session`/`rw_dirs`/`isolation`/`context` (and `description`) from the parent,
-//! with the variant's own FULL argv (and, optionally, its own `[session]`
-//! resume replacement — see [`RawVariant::resume_args`]). there is no
+//! `timeout_secs`/`workspace`/`rw_dirs`/`isolation`/`context` (and `description`) from the parent,
+//! with the variant's own FULL argv. there is no
 //! merging, no placeholder, no substitution — the
 //! "argv is literal" invariant holds per tag, exactly as if the operator had
 //! written one file per tag. this is deliberately NOT the removed
@@ -26,7 +25,6 @@
 use capability::validate_tag;
 use serde::Deserialize;
 
-use crate::session::{self, ResumeArgv, SessionSpec};
 use crate::spec::CapabilitySpec;
 
 /// the on-disk shape of one `[[variants]]` entry — a dumb serde mirror,
@@ -41,14 +39,6 @@ pub(crate) struct RawVariant {
     /// the variant's FULL argv — required and verbatim, never derived from
     /// the parent's args.
     pub(crate) args: Vec<String>,
-    /// optional FULL replacement for the inherited `[session]` resume argv.
-    /// needed where resuming is a SUBCOMMAND (replacement-style resume): the
-    /// inherited argv could not carry this variant's model/effort flags, so
-    /// a variant that pins them cold must be able to pin them on the resume
-    /// path too. append-style families never need this — the appended flags
-    /// ride each variant's own args.
-    #[serde(default)]
-    pub(crate) resume_args: Option<Vec<String>>,
 }
 
 /// expand a parsed base spec's variants into their own [`CapabilitySpec`]s
@@ -87,27 +77,6 @@ pub(crate) fn expand(
                 variant.suffix
             ));
         }
-        // [session] inherits like every other parent field, except a variant
-        // may swap in its own replacement resume argv (see RawVariant) —
-        // validated with the same slot rule as the parent's.
-        let session = match (&variant.resume_args, &base.session) {
-            (None, session) => session.clone(),
-            (Some(resume_args), Some(parent)) => {
-                session::validate_slot(resume_args, origin)
-                    .map_err(|e| format!("{e} (variant {tag:?})"))?;
-                Some(SessionSpec {
-                    capture: parent.capture.clone(),
-                    resume: ResumeArgv::Replace(resume_args.clone()),
-                })
-            }
-            (Some(_), None) => {
-                return Err(format!(
-                    "{origin}: variant {:?} declares resume_args but the \
-                     parent spec has no [session]",
-                    variant.suffix
-                ));
-            }
-        };
         specs.push(CapabilitySpec {
             tag,
             description: base.description.clone(),
@@ -117,7 +86,6 @@ pub(crate) fn expand(
             timeout_secs: base.timeout_secs,
             output: base.output,
             workspace: base.workspace,
-            session,
             // HOW the executor authenticates — its broker, its config home, its
             // auth/state dirs — is a property of the CLI, not of the model or the
             // effort a variant pins. so both auth sections inherit whole, and the
@@ -278,7 +246,7 @@ args = ["run", "--model", "m1", "--effort", "high"]
     }
 
     #[test]
-    fn variants_inherit_workspace_and_session_and_may_replace_the_resume_argv() {
+    fn variants_inherit_workspace_and_auth_and_context_sections() {
         let toml = family_toml(
             r#"
 [workspace]
@@ -293,26 +261,17 @@ config_home_env = "PROV_HOME"
 [context]
 path = "config-home:AGENTS.md"
 
-[session]
-capture = "jsonl-events"
-resume_args = ["resume", "{session_id}", "--default"]
-
 [[variants]]
 suffix = "m1_low"
 args = ["run", "--model", "m1"]
-
-[[variants]]
-suffix = "m1_high"
-args = ["run", "--model", "m1", "--hard"]
-resume_args = ["resume", "{session_id}", "--model", "m1", "--hard"]
 "#,
         );
         let specs = CapabilitySpec::parse_all(&toml, "t").unwrap();
         let get = |tag: &str| specs.iter().find(|s| s.tag == tag).unwrap();
 
-        // plain variant: workspace, session, and BOTH auth sections inherited —
-        // how the CLI authenticates is a property of the CLI, not of the
-        // model/effort the variant pins.
+        // workspace and BOTH auth sections inherited — how the CLI
+        // authenticates is a property of the CLI, not of the model/effort the
+        // variant pins.
         let v = get("prov_m1_low");
         assert_eq!(v.workspace, crate::WorkspaceMode::Persistent);
         assert_eq!(v.rw_dirs, vec!["~/.prov"], "sandbox rw_dirs inherited");
@@ -322,7 +281,6 @@ resume_args = ["resume", "{session_id}", "--model", "m1", "--hard"]
             "the [isolation] block is inherited whole"
         );
         assert_eq!(v.isolation.config_home_env.as_deref(), Some("PROV_HOME"));
-        assert_eq!(v.session, get("prov").session, "session inherited");
         // WHERE the soul is delivered is a property of the CLI, not of the model
         // or effort a variant pins — so it inherits like auth does.
         assert_eq!(
@@ -334,47 +292,6 @@ resume_args = ["resume", "{session_id}", "--model", "m1", "--hard"]
             v.context,
             Some(crate::ContextLocation::ConfigHome("AGENTS.md".into()))
         );
-
-        // resume_args variant: capture inherited, resume argv its own.
-        let v = get("prov_m1_high");
-        let session = v.session.as_ref().unwrap();
-        assert_eq!(session.capture, crate::SessionCapture::JsonlEvents);
-        assert_eq!(
-            session.resume,
-            crate::ResumeArgv::Replace(vec![
-                "resume".into(),
-                "{session_id}".into(),
-                "--model".into(),
-                "m1".into(),
-                "--hard".into(),
-            ])
-        );
-    }
-
-    #[test]
-    fn variant_resume_args_need_a_parent_session_and_the_slot() {
-        // a resume override with nothing to override is operator confusion.
-        let orphan = family_toml(
-            "[[variants]]\nsuffix = \"m_low\"\nargs = [\"a\"]\nresume_args = [\"{session_id}\"]\n",
-        );
-        let err = CapabilitySpec::parse_all(&orphan, "t").unwrap_err();
-        assert!(err.contains("no [session]"), "got {err:?}");
-
-        // the slot rule binds variant overrides like the parent's argv.
-        let slotless = family_toml(
-            r#"
-[session]
-capture = "jsonl-events"
-resume_args = ["resume", "{session_id}"]
-
-[[variants]]
-suffix = "m_low"
-args = ["a"]
-resume_args = ["resume", "stale-id"]
-"#,
-        );
-        let err = CapabilitySpec::parse_all(&slotless, "t").unwrap_err();
-        assert!(err.contains("{session_id}"), "got {err:?}");
     }
 
     #[test]
@@ -394,24 +311,6 @@ resume_args = ["resume", "stale-id"]
                 spec.tag
             );
         }
-    }
-
-    /// how many args the codex spec's `[tools]` section splices in. read off the
-    /// LOADED spec rather than hardcoded, so adding a tool flag moves the resume
-    /// assertion with it instead of breaking it.
-    fn spec_tool_arg_count() -> usize {
-        let base = builtin_specs()
-            .iter()
-            .find(|s| s.tag == "codex")
-            .expect("the codex base spec")
-            .args
-            .clone();
-        // everything between the `exec` subcommand and the first non-tool flag
-        // (`--json`) is the spliced tool block.
-        base.iter()
-            .position(|a| a == "--json")
-            .expect("codex's base argv carries --json")
-            - 1
     }
 
     #[test]
@@ -510,8 +409,7 @@ resume_args = ["resume", "stale-id"]
         );
 
         // the agentic posture rides every embedded spec: persistent per-agent
-        // workspaces, a [session] continuity block, and the slower agentic
-        // timeout budget.
+        // workspaces and the slower agentic timeout budget.
         for spec in &specs {
             assert_eq!(
                 spec.workspace,
@@ -519,7 +417,6 @@ resume_args = ["resume", "stale-id"]
                 "{}: embedded specs opt into persistent workspaces",
                 spec.tag
             );
-            assert!(spec.session.is_some(), "{}: [session] is set", spec.tag);
             assert_eq!(spec.timeout_secs, 600, "{}: agentic timeout", spec.tag);
             // every shipped executor delivers the assembled soul NATIVELY (a file
             // its CLI auto-loads), never by inflating the stdin prompt. WHICH file
@@ -569,39 +466,6 @@ resume_args = ["resume", "stale-id"]
                 spec.tag
             );
         }
-
-        // the resume shape per family: subcommand-style resume replaces the
-        // argv and each variant re-pins its model (an inherited replacement
-        // could not); flag-style resume appends to the variant's own args, so
-        // inheritance already keeps the pins.
-        match &get("codex_gpt-5.5_xhigh").session.as_ref().unwrap().resume {
-            crate::ResumeArgv::Replace(args) => {
-                // the [tools] args splice in after args[0] here too, so the
-                // subcommand shape is exec → tool flags → resume <id>. asserted
-                // by SEARCH, not by a fixed index: pinning `resume` to a literal
-                // offset makes every future tool flag look like a regression
-                // (it did — adding codex's approval-mode flag shifted it).
-                assert_eq!(args[0], "exec");
-                let resume_at = args
-                    .windows(2)
-                    .position(|w| w == ["resume", "{session_id}"])
-                    .expect("the subcommand resume shape carries `resume <id>`");
-                let tool_args_end = 1 + spec_tool_arg_count();
-                assert_eq!(
-                    resume_at, tool_args_end,
-                    "`resume <id>` must sit immediately after the spliced tool args: {args:?}"
-                );
-                assert!(
-                    args.windows(2).any(|w| w == ["-m", "gpt-5.5"]),
-                    "a resumed variant keeps its model pin: {args:?}"
-                );
-            }
-            other => panic!("codex variants resume by replacement, got {other:?}"),
-        }
-        assert_eq!(
-            get("claude_opus_max").session.as_ref().unwrap().resume,
-            crate::ResumeArgv::Append(vec!["--resume".into(), "{session_id}".into()]),
-        );
 
         // the full matrix is present: 19 codex + 16 claude variants + 2 bases.
         // codex efforts are per-model — the 5.6 family reaches `max`, 5.5 caps

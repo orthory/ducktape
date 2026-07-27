@@ -76,10 +76,6 @@ struct RunEnvelope<'a> {
     /// canonical Ducktape attribution trailer. This travels beside the id so
     /// the host never has to reconstruct public Git identity from a run key.
     agent_display_name: &'a str,
-    /// `<channel_id>#<seq>` — seq is the anchor's thread root when the
-    /// anchor is a thread reply (every run in one thread shares a key), else
-    /// the anchor itself. null for job runs: there is no channel.
-    thread_key: Option<String>,
     instructions: &'a str,
     contract: &'a str,
     conversation: String,
@@ -297,7 +293,6 @@ pub(crate) fn library_skills(names: &[String]) -> Result<Vec<SkillRef>, String> 
 fn envelope(
     agent: &AgentRecord,
     run_id: &str,
-    thread_key: Option<String>,
     conversation: String,
     portable: PortableInputs,
 ) -> String {
@@ -306,7 +301,6 @@ fn envelope(
         agent_id: &agent.agent_id,
         run_id,
         agent_display_name: &agent.display_name,
-        thread_key,
         instructions: DEFAULT_PROMPT,
         contract: STRICT_OUTPUT_INSTRUCTION,
         conversation,
@@ -329,17 +323,12 @@ pub(crate) fn render_payload(
     module_id: &str,
     agent: &AgentRecord,
     run_id: &str,
-    channel_id: &str,
-    anchor_seq: u64,
-    thread_root: Option<u64>,
     transcript: &[MessageView],
     portable: PortableInputs,
 ) -> String {
-    let thread_key = format!("{channel_id}#{}", thread_root.unwrap_or(anchor_seq));
     envelope(
         agent,
         run_id,
-        Some(thread_key),
         render_conversation(module_id, &agent.agent_id, transcript),
         portable,
     )
@@ -357,7 +346,6 @@ pub(crate) fn render_job_payload(
     envelope(
         agent,
         run_id,
-        None,
         format!(
             "Job {job_id} — chat replies are not delivered for job runs; respond with actions only.\n\nJob spec:\n{spec}"
         ),
@@ -380,7 +368,6 @@ pub(crate) fn render_page_comment_payload(
     envelope(
         agent,
         run_id,
-        Some(format!("pages:{thread_id}")),
         format!(
             "Pages comment thread {thread_id}, comment {ordinal}. Reply to this comment thread.\n\n{author}: {text}"
         ),
@@ -551,16 +538,13 @@ mod tests {
     }
 
     #[test]
-    fn a_chat_envelope_carries_the_anchor_thread_key_and_no_prompt_pin() {
+    fn a_chat_envelope_carries_the_agent_identity_and_no_prompt_pin() {
         let agent = bot();
         let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
         let payload = render_payload(
             "runs",
             &agent,
             &run_id("general", 1),
-            "general",
-            1,
-            None,
             &transcript,
             plain(),
         );
@@ -569,10 +553,6 @@ mod tests {
         assert_eq!(v["ducktape_run"], RUN_ENVELOPE_VERSION);
         assert_eq!(v["agent_id"], "bot");
         assert_eq!(v["agent_display_name"], "BOT");
-        assert_eq!(
-            v["thread_key"], "general#1",
-            "a non-thread anchor keys itself"
-        );
         assert_eq!(v["instructions"], DEFAULT_PROMPT);
         assert_eq!(v["contract"], STRICT_OUTPUT_INSTRUCTION);
         let conversation = v["conversation"].as_str().unwrap();
@@ -596,8 +576,8 @@ mod tests {
         // just the values.
         assert!(payload.starts_with(r#"{"ducktape_run":1,"agent_id":"bot","run_id":"#));
         assert!(
-            payload.contains(r#","agent_display_name":"BOT","thread_key":"#),
-            "the thread key now follows the display name directly: {payload}"
+            payload.contains(r#","agent_display_name":"BOT","instructions":"#),
+            "the instructions now follow the display name directly: {payload}"
         );
     }
 
@@ -616,9 +596,6 @@ mod tests {
             "runs",
             &agent,
             &run_id("general", 1),
-            "general",
-            1,
-            None,
             &[],
             PortableInputs {
                 workspace: duckfs_workspace(&agent, None),
@@ -656,9 +633,6 @@ mod tests {
                 "runs",
                 &agent,
                 &run_id("general", 1),
-                "general",
-                1,
-                None,
                 &[],
                 PortableInputs {
                     workspace: duckfs_workspace(&agent, None),
@@ -781,9 +755,6 @@ mod tests {
             "runs",
             &agent,
             &chat,
-            "general",
-            1,
-            None,
             &[],
             plain(),
         ));
@@ -825,9 +796,6 @@ mod tests {
             "runs",
             &agent,
             &run_id("general", 1),
-            "general",
-            1,
-            None,
             &[],
             portable(None, resolve_skills(&agent, &[], &None)),
         );
@@ -848,29 +816,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_threaded_anchor_keys_by_its_thread_root() {
-        let agent = bot();
-        let transcript = vec![message(3, AuthorRef::User(vec![1; 32]), "in thread")];
-        let payload = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 3),
-            "general",
-            3,
-            Some(1),
-            &transcript,
-            plain(),
-        );
-        assert_eq!(
-            parse(&payload)["thread_key"],
-            "general#1",
-            "every run in one thread shares a continuity key"
-        );
-    }
 
     #[test]
-    fn a_job_envelope_has_no_thread_key_and_preserves_the_job_framing() {
+    fn a_job_envelope_preserves_the_job_framing() {
         let agent = bot();
         let payload = render_job_payload(
             &agent,
@@ -880,7 +828,6 @@ mod tests {
             plain(),
         );
         let v = parse(&payload);
-        assert!(v["thread_key"].is_null(), "job runs have no channel");
         assert_eq!(v["agent_id"], "bot");
         assert_eq!(
             v["conversation"],
@@ -906,9 +853,6 @@ mod tests {
             "runs",
             &agent,
             &run_id("general", 2),
-            "general",
-            2,
-            None,
             &transcript,
             plain(),
         );
@@ -916,9 +860,6 @@ mod tests {
             "runs",
             &agent,
             &run_id("general", 2),
-            "general",
-            2,
-            None,
             &transcript,
             plain(),
         );
@@ -938,9 +879,6 @@ mod tests {
             "runs",
             &agent,
             &run_id("general", 2),
-            "general",
-            2,
-            None,
             &transcript,
             skilled(),
         );
@@ -948,9 +886,6 @@ mod tests {
             "runs",
             &agent,
             &run_id("general", 2),
-            "general",
-            2,
-            None,
             &transcript,
             skilled(),
         );
@@ -987,9 +922,6 @@ mod tests {
             "runs",
             &agent,
             &run_id("general", 3),
-            "general",
-            3,
-            None,
             &transcript,
             plain(),
         );
@@ -1018,9 +950,6 @@ mod tests {
             "runs",
             &agent,
             &run_id("general", 1),
-            "general",
-            1,
-            None,
             &transcript,
             portable(Some(&"aa".repeat(32)), skills),
         );
@@ -1031,8 +960,8 @@ mod tests {
             "the marker leads with a stable field order: {payload}"
         );
         assert!(
-            payload.contains(r#","agent_display_name":"BOT","thread_key":"#),
-            "the thread key follows the display name directly: {payload}"
+            payload.contains(r#","agent_display_name":"BOT","instructions":"#),
+            "the instructions follow the display name directly: {payload}"
         );
         let v = parse(&payload);
         assert_eq!(v["ducktape_run"], 1);
@@ -1075,9 +1004,6 @@ mod tests {
             "runs",
             &agent,
             &run_id("general", 1),
-            "general",
-            1,
-            None,
             &[],
             plain(),
         );
@@ -1111,9 +1037,6 @@ mod tests {
             "runs",
             &agent,
             &run_id("general", 1),
-            "general",
-            1,
-            None,
             &transcript,
             portable(None, vec![skill("release")]),
         );
@@ -1162,18 +1085,11 @@ mod tests {
             "runs",
             &agent,
             &run_id("forge:app:7", 1),
-            "forge:app:7",
-            1,
-            None,
             &transcript,
             inputs,
         );
         let v = parse(&payload);
         assert_eq!(v["ducktape_run"], 1);
-        assert_eq!(
-            v["thread_key"], "forge:app:7#1",
-            "thread continuity keys are unchanged — replies land in the item discussion"
-        );
         // context rides IMMEDIATELY after conversation — field order is the bytes.
         assert!(
             payload.contains(r#"Reply as the agent.","context":"Forge item context:"#),
@@ -1233,9 +1149,6 @@ mod tests {
             "runs",
             &agent,
             &run_id("forge:app:9", 1),
-            "forge:app:9",
-            1,
-            None,
             &transcript,
             inputs(),
         );
@@ -1243,9 +1156,6 @@ mod tests {
             "runs",
             &agent,
             &run_id("forge:app:9", 1),
-            "forge:app:9",
-            1,
-            None,
             &transcript,
             inputs(),
         );

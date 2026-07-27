@@ -44,10 +44,9 @@
 //! argv, and a working directory the spec's `[workspace]` policy picks — an
 //! empty scratch dir by default, or a stable per-agent workspace under the
 //! host's agent-workspaces root when the spec opts in (see [`workspace`]).
-//! either way the child never sees the node's data directory itself. the
-//! spec's `[session]` policy adds host-local thread continuity on top (see
-//! [`session`]): capture the CLI's own session id, resume it for the next
-//! run of the same thread.
+//! either way the child never sees the node's data directory itself. every
+//! run starts cold — a run's whole continuity is its prompt envelope, which
+//! is what lets any assignee execute it.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -184,14 +183,12 @@ pub use sandbox_host::podman_api::{
     PodmanService, egress_nftables, reap_by_label, reap_service_at, run_egress_hook,
 };
 pub(crate) use sandbox_host::sandbox;
-mod session;
 mod spec;
 mod variants;
 mod workspace;
 #[cfg(unix)]
 pub use interactive::InteractiveSession;
 pub use sandbox_host::{SandboxBackend, TART_MIN_CORES};
-pub use session::{ResumeArgv, SessionCapture, SessionSpec};
 pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
 pub use workspace::WorkspaceMode;
 
@@ -258,15 +255,12 @@ impl PartialEq for RunCancellation {
 impl Eq for RunCancellation {}
 
 /// per-run, host-local context riding beside the prompt: which agent is
-/// running and which conversation thread the run continues. populated by the
-/// worker from the run envelope; a run with no agent identity uses
-/// [`RunContext::default`]. NEVER consensus
-/// data — providers only use it to pick a workspace dir and a session slot
-/// on this machine.
+/// running. populated by the worker from the run envelope; a run with no agent
+/// identity uses [`RunContext::default`]. NEVER consensus data — providers only
+/// use it to pick a workspace dir on this machine.
 #[derive(Debug, Clone, Default)]
 pub struct RunContext {
     pub agent_id: Option<String>,
-    pub thread_key: Option<String>,
     /// the live-output registry key (the dispatch_id half of the saga id) —
     /// set by the oracle pool before provider.run so the output sink can key
     /// a per-run ring the app subscribes as run-output:<dispatch_id>.
@@ -298,9 +292,6 @@ pub struct RunContext {
     /// knows how to enforce become container limit flags, the rest are inert
     /// (scheduling already matched them). Default empty.
     pub limits: BTreeMap<String, u64>,
-    /// true for portable v1 runs: native CLI sessions are host-local
-    /// optimizations and must not be resumed or captured for portable state.
-    pub portable: bool,
     /// the run's assembled context document — the agent's curated skills, built
     /// into ONE markdown doc by the provisioner (the "soul"). ONE assembly, TWO
     /// doors, and the SPEC picks which: a spec declaring `[context]` gets it
@@ -479,25 +470,22 @@ impl ProviderSet {
     }
 }
 
-/// the host-wired roots for per-agent state (see [`workspace`] and
-/// [`session`]): where persistent agent workspaces and session files live.
-/// binaries derive both from their data dir ([`AgentDirs::under`]);
-/// `DUCKTAPE_AGENT_WORKSPACES` / `DUCKTAPE_AGENT_SESSIONS` override either
-/// (the `DUCKTAPE_PROVIDER_TIMEOUT_SECS` precedent). an absent root simply
-/// disables the feature it serves — embedders that never wire one keep the
-/// v1 scratch-and-cold behavior.
+/// the host-wired root for per-agent state (see [`workspace`]): where
+/// persistent agent workspaces live. binaries derive it from their data dir
+/// ([`AgentDirs::under`]); `DUCKTAPE_AGENT_WORKSPACES` overrides it (the
+/// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` precedent). an absent root simply disables
+/// the feature it serves — embedders that never wire one keep the scratch-dir
+/// behavior.
 #[derive(Debug, Clone, Default)]
 pub struct AgentDirs {
     pub workspaces_root: Option<PathBuf>,
-    pub sessions_root: Option<PathBuf>,
 }
 
 impl AgentDirs {
-    /// the binaries' convention: both roots under one data dir.
+    /// the binaries' convention: the root under one data dir.
     pub fn under(data_dir: &Path) -> Self {
         Self {
             workspaces_root: Some(data_dir.join("agent-workspaces")),
-            sessions_root: Some(data_dir.join("agent-sessions")),
         }
     }
 
@@ -507,7 +495,6 @@ impl AgentDirs {
         let over = |key: &str, wired: Option<PathBuf>| env(key).map(PathBuf::from).or(wired);
         Self {
             workspaces_root: over("DUCKTAPE_AGENT_WORKSPACES", self.workspaces_root),
-            sessions_root: over("DUCKTAPE_AGENT_SESSIONS", self.sessions_root),
         }
     }
 }
@@ -1670,31 +1657,6 @@ impl CliProvider {
             Err(e) => Err(format!("provider workdir {}: {e}", preferred.display())),
         }
     }
-
-    /// the session slot for this run — `Some` only when the spec opts into
-    /// `[session]`, the run carries both continuity coordinates, and the
-    /// host wired a sessions root. anything less runs cold, by design.
-    fn session_store<'a>(
-        &'a self,
-        ctx: &'a RunContext,
-    ) -> Result<Option<(&'a SessionSpec, session::SessionStore<'a>)>, String> {
-        if ctx.portable {
-            return Ok(None);
-        }
-        let Some(session) = &self.spec.session else {
-            return Ok(None);
-        };
-        let (Some(root), Some(agent_id), Some(thread_key)) =
-            (&self.dirs.sessions_root, &ctx.agent_id, &ctx.thread_key)
-        else {
-            return Ok(None);
-        };
-        workspace::safe_path_component(agent_id)?;
-        Ok(Some((
-            session,
-            session::SessionStore::new(root, agent_id, thread_key),
-        )))
-    }
 }
 
 /// this run's subdirectory under [`RUN_RUNTIME_DIR`]. distinct runs can share a
@@ -2837,13 +2799,10 @@ fn run_tart_cleanup_bounded(action: &str, vm: &str) -> Result<(), String> {
     .map(|_| ())
 }
 
-/// one finished invocation: the parsed answer plus the raw stdout the
-/// session capture reads (the session id is a sibling of the answer in the
-/// CLI's output, not part of it).
+/// one finished invocation: the parsed answer and its token usage.
 struct Invocation {
     text: String,
     usage: Option<TokenUsage>,
-    stdout: String,
 }
 
 /// append one raw chunk to `pending` and forward every newline-completed
@@ -3263,11 +3222,7 @@ impl CliProvider {
             // telemetry envelope. Never infer usage from answer content.
             OutputFormat::Text => (parse_text_output(&stdout)?, None),
         };
-        Ok(Invocation {
-            text,
-            usage,
-            stdout,
-        })
+        Ok(Invocation { text, usage })
     }
 
     async fn run_output(&self, prompt: &str, ctx: &RunContext) -> Result<ProviderOutput, String> {
@@ -3303,60 +3258,8 @@ impl CliProvider {
         // unchanged. A present config takes precedence over env.
         let broker = self.start_broker(ctx.airlock.as_ref()).await?;
 
-        let Some((session, store)) = self.session_store(ctx)? else {
-            // no session plumbing for this run: one cold invocation.
-            let run = self
-                .invoke(
-                    prompt,
-                    &self.spec.args,
-                    &workdir,
-                    ctx,
-                    config_home,
-                    broker.as_ref(),
-                )
-                .await?;
-            return Ok(ProviderOutput {
-                text: run.text,
-                usage: run.usage,
-            });
-        };
-
-        if let Some(session_id) = store.load() {
-            let argv = session::resume_argv(&self.spec.args, &session.resume, &session_id);
-            match self
-                .invoke(prompt, &argv, &workdir, ctx, config_home, broker.as_ref())
-                .await
-            {
-                Ok(run) => {
-                    // re-capture on success: a CLI that rotates ids on
-                    // resume stays resumable next time.
-                    store.store_captured(&session.capture, &run.stdout);
-                    return Ok(ProviderOutput {
-                        text: run.text,
-                        usage: run.usage,
-                    });
-                }
-                Err(e) => {
-                    if ctx
-                        .cancellation
-                        .as_ref()
-                        .is_some_and(RunCancellation::is_cancelled)
-                    {
-                        return Err(e);
-                    }
-                    // a stale/expired session must degrade to a cold start,
-                    // never break the agent: forget it and retry ONCE below.
-                    // (if the failure was not the session's fault, the cold
-                    // retry fails the same way and that error is reported.)
-                    eprintln!(
-                        "[capability-host] {}: resumed session {session_id} failed ({e}); \
-                         retrying cold",
-                        self.spec.tag
-                    );
-                    store.forget();
-                }
-            }
-        }
+        // ONE cold invocation, always: a run's whole continuity is its prompt
+        // envelope, which is what lets any assignee execute it.
         let run = self
             .invoke(
                 prompt,
@@ -3367,7 +3270,6 @@ impl CliProvider {
                 broker.as_ref(),
             )
             .await?;
-        store.store_captured(&session.capture, &run.stdout);
         Ok(ProviderOutput {
             text: run.text,
             usage: run.usage,
@@ -3574,9 +3476,9 @@ fn excerpt(s: &str) -> String {
 /// what discovery finds is exactly what the node announces.
 ///
 /// per-agent roots: node binaries pass `AgentDirs::under(<data dir>)`;
-/// embedders with no data dir pass `AgentDirs::default()` (workspaces and
-/// sessions stay off beyond env overrides). `DUCKTAPE_AGENT_WORKSPACES` /
-/// `DUCKTAPE_AGENT_SESSIONS` override the wired roots. `output_sink`
+/// embedders with no data dir pass `AgentDirs::default()` (workspaces stay
+/// off beyond the env override). `DUCKTAPE_AGENT_WORKSPACES` overrides the
+/// wired root. `output_sink`
 /// installs a live tail on every discovered CLI provider.
 /// `node_identity` is the verified local signer/origin bytes, kept for the run
 /// labels. `managed_owner` names the SERVICE INSTANCE that owns every container
@@ -5570,12 +5472,11 @@ format = "text"
         );
     }
 
-    // ---- workspaces and sessions ----------------------------------------------
+    // ---- workspaces -----------------------------------------------------------
 
-    fn agent_ctx(agent: &str, thread: &str) -> RunContext {
+    fn agent_ctx(agent: &str) -> RunContext {
         RunContext {
             agent_id: Some(agent.into()),
-            thread_key: Some(thread.into()),
             ..RunContext::default()
         }
     }
@@ -5614,12 +5515,11 @@ mode = "persistent"
         let p = sh_provider(persistent_spec("wd"), bin, "workspace-cwd-scratch").with_agent_dirs(
             AgentDirs {
                 workspaces_root: Some(root.clone()),
-                sessions_root: None,
             },
         );
 
         // an agent-carrying run lands in <root>/<agent_id>, created on demand.
-        let cwd = p.run("q", &agent_ctx("bot", "t#1")).await.unwrap();
+        let cwd = p.run("q", &agent_ctx("bot")).await.unwrap();
         let expected = root.join("bot");
         assert!(expected.is_dir(), "the workspace dir is created on demand");
         assert_eq!(
@@ -5630,7 +5530,7 @@ mode = "persistent"
 
         // a second agent gets its own dir; a context-less run stays
         // in the scratch dir even though the spec says persistent.
-        let other = p.run("q", &agent_ctx("other", "t#1")).await.unwrap();
+        let other = p.run("q", &agent_ctx("other")).await.unwrap();
         assert_eq!(
             PathBuf::from(other),
             root.join("other").canonicalize().unwrap()
@@ -5664,7 +5564,6 @@ printf '%s\n' "$PATH"
         );
         let ctx = RunContext {
             agent_id: Some("bot".into()),
-            thread_key: Some("general#7".into()),
             run_key: None,
             cancellation: None,
             executing_node: None,
@@ -5675,7 +5574,6 @@ printf '%s\n' "$PATH"
             )]),
             path_entries: vec![path_entry.clone()],
             limits: BTreeMap::new(),
-            portable: true,
             context_doc: None,
             airlock: None,
         };
@@ -5717,7 +5615,6 @@ printf '%s\n' "$PATH"
         let p = sh_provider(mock_spec("wd", "wd", "text"), bin, "w1-hard-fail-scratch");
         let ctx = RunContext {
             workdir_override: Some(uncreatable.clone()),
-            portable: true,
             ..RunContext::default()
         };
         let err = p.run("q", &ctx).await.unwrap_err();
@@ -5739,214 +5636,14 @@ printf '%s\n' "$PATH"
         let p = sh_provider(persistent_spec("wd"), bin, "workspace-defense-scratch")
             .with_agent_dirs(AgentDirs {
                 workspaces_root: Some(root),
-                sessions_root: None,
             });
         for bad in ["../escape", "a/b", ".."] {
-            let err = p.run("q", &agent_ctx(bad, "t#1")).await.unwrap_err();
+            let err = p.run("q", &agent_ctx(bad)).await.unwrap_err();
             assert!(
                 err.contains("path") || err.contains("component"),
                 "agent id {bad:?} must fail the run by name, got {err:?}"
             );
         }
-    }
-
-    /// a session-enabled mock spec: jsonl output, append-style resume. args
-    /// stay empty for sh_provider, so the resume argv is
-    /// `[script, "--resume", <id>]` and the script branches on `$1`.
-    fn session_spec(tag: &str) -> CapabilitySpec {
-        CapabilitySpec::parse(
-            &format!(
-                r#"
-spec = 1
-[capability]
-tag = "{tag}"
-[detect]
-bin = "{tag}"
-[invoke]
-args = []
-prompt = "stdin"
-[output]
-format = "jsonl-events"
-[session]
-capture = "jsonl-events"
-resume_args_append = ["--resume", "{{session_id}}"]
-"#
-            ),
-            "test",
-        )
-        .unwrap()
-    }
-
-    /// the one session file under `<root>/<agent>` — asserts exactly one slot.
-    fn sole_session_id(root: &Path, agent: &str) -> Option<String> {
-        let dir = root.join(agent);
-        if !dir.is_dir() {
-            return None;
-        }
-        let mut files: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .collect();
-        assert!(files.len() <= 1, "one thread key = one session slot");
-        let file = files.pop()?;
-        Some(std::fs::read_to_string(file).unwrap().trim().to_string())
-    }
-
-    #[tokio::test]
-    async fn sessions_capture_then_resume_with_the_stored_id() {
-        let dir = scratch("session-flow");
-        let bin = fake_cli(
-            &dir,
-            "sess",
-            r#"cat > /dev/null
-if [ "$1" = "--resume" ]; then
-  printf '{"type":"item.completed","item":{"type":"agent_message","text":"resumed:%s"}}\n' "$2"
-else
-  printf '{"type":"thread.started","thread_id":"sid-1"}\n'
-  printf '{"type":"item.completed","item":{"type":"agent_message","text":"cold"}}\n'
-fi"#,
-        );
-        let sessions = scratch("session-flow-store");
-        let p =
-            sh_provider(session_spec("sess"), bin, "session-flow-wd").with_agent_dirs(AgentDirs {
-                workspaces_root: None,
-                sessions_root: Some(sessions.clone()),
-            });
-
-        // cold first run: answers cold, captures and stores the id.
-        let ctx = agent_ctx("bot", "general#7");
-        assert_eq!(p.run("q", &ctx).await.unwrap(), "cold");
-        assert_eq!(sole_session_id(&sessions, "bot").as_deref(), Some("sid-1"));
-
-        // second run of the SAME thread resumes with the substituted id.
-        assert_eq!(p.run("q", &ctx).await.unwrap(), "resumed:sid-1");
-
-        // a different thread key starts cold — its own slot.
-        assert_eq!(
-            p.run("q", &agent_ctx("bot", "general#8")).await.unwrap(),
-            "cold"
-        );
-
-        // a context-less run has no session identity: cold, no store
-        // beyond the two thread slots.
-        assert_eq!(p.run("q", &RunContext::default()).await.unwrap(), "cold");
-    }
-
-    #[tokio::test]
-    async fn portable_runs_do_not_resume_or_capture_native_sessions() {
-        let dir = scratch("portable-session-flow");
-        let bin = fake_cli(
-            &dir,
-            "sess",
-            r#"cat > /dev/null
-if [ "$1" = "--resume" ]; then
-  printf '{"type":"item.completed","item":{"type":"agent_message","text":"resumed:%s"}}\n' "$2"
-else
-  printf '{"type":"thread.started","thread_id":"sid-1"}\n'
-  printf '{"type":"item.completed","item":{"type":"agent_message","text":"cold"}}\n'
-fi"#,
-        );
-        let sessions = scratch("portable-session-store");
-        let p = sh_provider(session_spec("sess"), bin, "portable-session-wd").with_agent_dirs(
-            AgentDirs {
-                workspaces_root: None,
-                sessions_root: Some(sessions.clone()),
-            },
-        );
-
-        let normal = agent_ctx("bot", "general#7");
-        assert_eq!(p.run("q", &normal).await.unwrap(), "cold");
-        assert_eq!(sole_session_id(&sessions, "bot").as_deref(), Some("sid-1"));
-
-        let portable = RunContext {
-            portable: true,
-            ..normal.clone()
-        };
-        assert_eq!(
-            p.run("q", &portable).await.unwrap(),
-            "cold",
-            "portable v1 runs start from duckfs state, not host-local CLI sessions"
-        );
-        assert_eq!(
-            sole_session_id(&sessions, "bot").as_deref(),
-            Some("sid-1"),
-            "portable runs do not recapture/overwrite the host-local session slot"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_stale_session_degrades_to_one_cold_retry_and_reprimes() {
-        let dir = scratch("session-stale");
-        // resume attempts leave a marker in the cwd and FAIL; cold runs
-        // succeed and mint a fresh id — the expired-session shape.
-        let bin = fake_cli(
-            &dir,
-            "sess",
-            r#"cat > /dev/null
-if [ "$1" = "--resume" ]; then
-  echo "$2" >> resume-attempts
-  echo "session expired" >&2
-  exit 3
-fi
-printf '{"type":"thread.started","thread_id":"sid-fresh"}\n'
-printf '{"type":"item.completed","item":{"type":"agent_message","text":"cold-answer"}}\n'"#,
-        );
-        let sessions = scratch("session-stale-store");
-        let wd = scratch("session-stale-wd");
-        let p =
-            sh_provider(session_spec("sess"), bin, "session-stale-wd").with_agent_dirs(AgentDirs {
-                workspaces_root: None,
-                sessions_root: Some(sessions.clone()),
-            });
-
-        // seed a stale id directly — the state a dead executor session leaves.
-        let ctx = agent_ctx("bot", "general#7");
-        std::fs::create_dir_all(sessions.join("bot")).unwrap();
-        session::SessionStore::new(&sessions, "bot", "general#7").store_captured(
-            &SessionCapture::JsonlEvents,
-            "{\"session_id\":\"sid-stale\"}",
-        );
-        assert_eq!(
-            sole_session_id(&sessions, "bot").as_deref(),
-            Some("sid-stale")
-        );
-
-        // the run still answers (cold retry), and the slot re-primes with
-        // the fresh id the retry captured.
-        assert_eq!(p.run("q", &ctx).await.unwrap(), "cold-answer");
-        let attempts = std::fs::read_to_string(wd.join("resume-attempts")).unwrap();
-        assert_eq!(
-            attempts, "sid-stale\n",
-            "exactly ONE resume attempt, with the stale id"
-        );
-        assert_eq!(
-            sole_session_id(&sessions, "bot").as_deref(),
-            Some("sid-fresh")
-        );
-    }
-
-    #[tokio::test]
-    async fn a_run_without_a_captured_id_stores_nothing() {
-        let dir = scratch("session-nocapture");
-        let bin = fake_cli(
-            &dir,
-            "sess",
-            r#"cat > /dev/null
-printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\n'"#,
-        );
-        let sessions = scratch("session-nocapture-store");
-        let p = sh_provider(session_spec("sess"), bin, "session-nocapture-wd").with_agent_dirs(
-            AgentDirs {
-                workspaces_root: None,
-                sessions_root: Some(sessions.clone()),
-            },
-        );
-        assert_eq!(p.run("q", &agent_ctx("bot", "k")).await.unwrap(), "fine");
-        assert_eq!(
-            sole_session_id(&sessions, "bot"),
-            None,
-            "no id in the output = no store, and the answer is unaffected"
-        );
     }
 
     #[test]
@@ -5955,10 +5652,6 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
         assert_eq!(
             wired.workspaces_root.as_deref(),
             Some(Path::new("/data/agent-workspaces"))
-        );
-        assert_eq!(
-            wired.sessions_root.as_deref(),
-            Some(Path::new("/data/agent-sessions"))
         );
 
         // injected env, no process-state mutation (the discover_with rule).
@@ -5970,21 +5663,16 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
             Some(Path::new("/elsewhere/ws")),
             "the env override wins"
         );
-        assert_eq!(
-            resolved.sessions_root.as_deref(),
-            Some(Path::new("/data/agent-sessions")),
-            "an unset override leaves the wired root"
-        );
     }
 
     // ---- D7 isolation floor (portable env) --------------------------------------
 
-    /// portable and non-portable runs use the SAME additive env overlay: no
-    /// `env_clear`, no HOME override. get_envs (the explicitly-set overlay) is
-    /// exactly ctx.env for both — so a headless CLI's BYO-auth (ambient
-    /// ANTHROPIC_API_KEY, ~/.claude, &c) survives into a portable child.
+    /// a run's env overlay is ADDITIVE: no `env_clear`, no HOME override.
+    /// get_envs (the explicitly-set overlay) is exactly ctx.env — so a headless
+    /// CLI's BYO-auth (ambient ANTHROPIC_API_KEY, ~/.claude, &c) survives into
+    /// the child.
     #[test]
-    fn portable_and_nonportable_use_the_same_additive_env_overlay() {
+    fn the_run_env_overlay_is_additive_except_reserved_control_capabilities() {
         let spec = mock_spec("iso", "iso-cli", "text");
         let p = CliProvider::from_spec(spec, PathBuf::from("/bin/true"), SandboxBackend::Bare);
         let workdir = scratch("iso-portable-wd");
@@ -5998,10 +5686,9 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
         expected.insert(PROVIDER_CONTROL_URL_ENV.into(), None);
         expected.insert(PROVIDER_CONTROL_TOKEN_ENV.into(), None);
 
-        for portable in [true, false] {
+        for workdir_override in [Some(workdir.clone()), None] {
             let ctx = RunContext {
-                portable,
-                workdir_override: Some(workdir.clone()),
+                workdir_override,
                 env: env.clone(),
                 ..Default::default()
             };
@@ -6020,35 +5707,35 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
                 .collect();
             assert_eq!(
                 envs, expected,
-                "portable={portable}: env is additive except reserved control capabilities"
+                "env is additive except reserved control capabilities"
             );
         }
     }
 
-    /// a portable run INHERITS the ambient `$HOME` — same as a non-portable run
-    /// — so the headless claude/codex CLI finds its BYO credentials. This test
-    /// covers the direct backend; Podman and Tart cross the D7 filesystem
-    /// boundary only through their explicit auth and workspace mounts.
+    /// a run INHERITS the ambient `$HOME` — with or without a provisioned
+    /// workspace mount — so the headless claude/codex CLI finds its BYO
+    /// credentials. This test covers the direct backend; Podman and Tart cross
+    /// the D7 filesystem boundary only through their explicit auth and
+    /// workspace mounts.
     #[tokio::test]
-    async fn portable_runs_inherit_the_ambient_home_for_byo_auth() {
+    async fn runs_inherit_the_ambient_home_for_byo_auth() {
         let dir = scratch("portable-home");
         let bin = fake_cli(&dir, "home", "cat > /dev/null\nprintf '%s' \"$HOME\"");
         let p = mock_provider("home", "text", bin, "portable-home-wd");
 
         let real_home = std::env::var("HOME").expect("the test env has HOME set");
         let inherited = p.run("x", &RunContext::default()).await.unwrap();
-        assert_eq!(inherited, real_home, "a non-portable run inherits HOME");
+        assert_eq!(inherited, real_home, "a scratch-dir run inherits HOME");
 
         let mount = scratch("portable-home-mount");
         let ctx = RunContext {
-            portable: true,
             workdir_override: Some(mount.clone()),
             ..Default::default()
         };
-        let portable_home = p.run("x", &ctx).await.unwrap();
+        let mounted_home = p.run("x", &ctx).await.unwrap();
         assert_eq!(
-            portable_home, real_home,
-            "a portable run ALSO inherits the ambient HOME so BYO-auth works"
+            mounted_home, real_home,
+            "a mounted-workspace run ALSO inherits the ambient HOME so BYO-auth works"
         );
     }
 

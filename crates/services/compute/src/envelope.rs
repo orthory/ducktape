@@ -54,7 +54,6 @@ struct WireEnvelope {
     /// states it (defaulting to `agent_id` at compose time when a registry has
     /// no distinct name), so an omitting envelope fails the decode.
     agent_display_name: String,
-    thread_key: Option<String>,
     instructions: String,
     contract: String,
     conversation: String,
@@ -158,13 +157,11 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
     debug_assert_eq!(envelope.ducktape_run, version);
 
     let agent_display_name = envelope.agent_display_name;
-    let mut ctx = RunContext {
+    let ctx = RunContext {
         agent_id: Some(envelope.agent_id),
-        thread_key: envelope.thread_key,
         ..RunContext::default()
     };
     let workspace = accept_portable_envelope(
-        &mut ctx,
         envelope.run_id,
         envelope.workspace,
         envelope.skills,
@@ -214,7 +211,6 @@ pub fn compose_headless(run_id: &str, prompt: &str, credential: Option<&str>) ->
         "agent_id": "sched",
         "agent_display_name": "sched",
         "run_id": run_id,
-        "thread_key": null,
         "instructions": prompt,
         "contract": "",
         "conversation": "",
@@ -236,8 +232,7 @@ pub fn compose_headless(run_id: &str, prompt: &str, credential: Option<&str>) ->
 /// ACCEPT a portable envelope and surface its pinned plan, without
 /// ACTIVATING portable execution HERE.
 ///
-/// this worker validates the portable shape and marks the run portable so no
-/// host-local native session is resumed for it. it deliberately does NOT set
+/// this worker validates the portable shape. it deliberately does NOT set
 /// the child's working directory or inject workspace env: the envelope carries
 /// SOURCE coordinates only (no `mount_path`, D7), and turning the plan into a
 /// real mount is the pool's job via the injected provisioner (a
@@ -246,7 +241,6 @@ pub fn compose_headless(run_id: &str, prompt: &str, credential: Option<&str>) ->
 /// portable ACTIVATION — a per-run writable mount and its bindings — happens
 /// in the pool through its required execution-time provisioner.
 fn accept_portable_envelope(
-    ctx: &mut RunContext,
     consensus_run_id: String,
     workspace: Option<WireWorkspace>,
     skills: Option<Vec<WireSkill>>,
@@ -277,10 +271,8 @@ fn accept_portable_envelope(
         return Err("v1 run envelope skill entries must carry a name and source_prefix".into());
     }
 
-    // mark portable (no host-local session resume) but set NO
-    // workdir_override/env here (W1/M2) — the plan is data the pool decides
-    // whether to act on.
-    ctx.portable = true;
+    // set NO workdir_override/env here (W1/M2) — the plan is data the pool
+    // decides whether to act on.
     Ok(PortablePlan {
         source,
         // consensus decided this (the agent's duckfs_read caps); the host only
@@ -329,7 +321,6 @@ mod tests {
             "agent_id": "bot",
             "run_id": CONSENSUS_RUN_ID,
             "agent_display_name": "BOT",
-            "thread_key": "general#7",
             "instructions": "GENERIC",
             "contract": "CONTRACT",
             "conversation": "CONVERSATION",
@@ -355,7 +346,6 @@ mod tests {
             "agent_id": "bot",
             "run_id": "chat\u{1f}forge:app:7\u{1f}2\u{1f}bot",
             "agent_display_name": "BOT",
-            "thread_key": "forge:app:7#2",
             "instructions": "GENERIC",
             "contract": "CONTRACT",
             "conversation": "CONVERSATION",
@@ -442,7 +432,6 @@ mod tests {
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert_eq!(workspace.agent_display_name, "BOT");
-        assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
     }
 
     #[test]
@@ -486,20 +475,10 @@ mod tests {
     }
 
     #[test]
-    fn job_envelopes_carry_no_thread_key() {
-        let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
-        v["thread_key"] = serde_json::Value::Null;
-        let Prepared { ctx, .. } = prepare(&v.to_string()).unwrap();
-        assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
-        assert_eq!(ctx.thread_key, None);
-    }
-
-    #[test]
-    fn envelopes_are_accepted_and_marked_portable_without_activating_a_mount() {
-        // the worker ACCEPTS the envelope and marks the run portable, but it
-        // does NOT activate a workspace mount: no consensus-supplied cwd
-        // override, no workspace env. the pool activates the plan iff a
-        // provisioner is wired (ADR ROL/M2 + W1).
+    fn envelopes_are_accepted_without_activating_a_mount() {
+        // the worker ACCEPTS the envelope, but it does NOT activate a workspace
+        // mount: no consensus-supplied cwd override, no workspace env. the pool
+        // activates the plan iff a provisioner is wired (ADR ROL/M2 + W1).
         let Prepared {
             input,
             ctx,
@@ -508,11 +487,6 @@ mod tests {
         } = prepare(&envelope_json()).unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
-        assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
-        assert!(
-            ctx.portable,
-            "runs are portable and cannot resume host-local sessions"
-        );
         assert!(
             ctx.workdir_override.is_none(),
             "portable activation is HELD: no consensus-supplied cwd is forced"
@@ -630,18 +604,13 @@ mod tests {
         // requested Pr sink decodes with DEFAULT-EMPTY title/body (the
         // composer omits them; delivery derives them later — contract §1/§3).
         let Prepared {
-            input,
-            ctx,
-            workspace,
-            ..
+            input, workspace, ..
         } = prepare(&forge_envelope_json()).unwrap();
         assert_eq!(
             input,
             "GENERIC\n\nForge item context — you are working this item as a session.\n\
              repo: app\nitem: issue #7 (open)\n\nCONTRACT\n\nCONVERSATION"
         );
-        assert!(ctx.portable, "a forge run is portable");
-        assert_eq!(ctx.thread_key.as_deref(), Some("forge:app:7#2"));
         assert_eq!(workspace.agent_display_name, "BOT");
         assert_eq!(
             workspace.source,

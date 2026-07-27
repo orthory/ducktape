@@ -11,15 +11,9 @@
 # Agentic posture: no --max-turns cap and `--permission-mode acceptEdits`
 # (verified present in claude 2.1.202), so the CLI may run tool-use loops and
 # edit files — confined to its cwd, which [workspace] pins to the agent's
-# persistent dir under the host's agent-workspaces root. [session] adds
-# thread continuity: the session id rides the --output-format json result
-# object (`session_id`), and later runs of the same thread append
-# `--resume <id>` to the SAME argv — the append style keeps each variant's
-# --model/--effort pins on the resume path for free. The `{session_id}` slot
-# is the one host-side substitution in the format, filled with an id the CLI
-# itself minted — host-local plumbing, NOT the removed consensus model
-# routing. Sessions are assignee-local: another node picking up the thread
-# just starts cold.
+# persistent dir under the host's agent-workspaces root. Every run starts
+# cold: a run's whole continuity is the prompt envelope (full transcript),
+# which is what makes a run portable across assignees.
 
 spec = 1
 
@@ -57,13 +51,6 @@ format = "json-result"
 # Persistent per-agent cwd (<data>/agent-workspaces/<agent_id>); omit this
 # section for the empty-scratch-dir fence.
 mode = "persistent"
-
-[session]
-# The result object carries the session id; resuming is a flag, so the
-# resume argv is the spec's own args plus --resume <id> — inherited by every
-# variant with its model/effort pins intact.
-capture = "json-result-field:session_id"
-resume_args_append = ["--resume", "{session_id}"]
 
 [interactive]
 # The pty-backed TUI argv, for interactive sessions (a member drives the claude
@@ -128,9 +115,7 @@ path = "workspace-parent:CLAUDE.md"
 [tools]
 # Wires the Ducktape MCP server into every argv this file produces — the base
 # tag and every [[variants]] tag — spliced in at load time IMMEDIATELY AFTER
-# args[0] (the `-p` print-mode selector). The resume path inherits it for
-# free: resume_args_append glues --resume onto these same (already injected)
-# args.
+# args[0] (the `-p` print-mode selector).
 #
 # --allowedTools is NOT optional here: in -p print mode an unapproved MCP tool
 # call is a DENIAL (there is no human to approve it), so a server that is
@@ -149,9 +134,7 @@ args = [
 ]
 
 # ---- curated model/effort matrix -------------------------------------------
-# Base args plus an explicit --model and --effort per variant. The inherited
-# [session] append style adds --resume <id> after each variant's own args on
-# the resume path.
+# Base args plus an explicit --model and --effort per variant.
 
 [[variants]]
 suffix = "fable_low"

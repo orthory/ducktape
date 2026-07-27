@@ -16,18 +16,9 @@
 # Agentic posture: `--sandbox workspace-write` lets the CLI edit files in its
 # working directory — which [workspace] pins to the agent's own persistent
 # dir under the host's agent-workspaces root, so edits accumulate per agent
-# and never touch the node's data dir. [session] adds thread continuity: the
-# session id is captured from the JSONL stream (`thread.started`.`thread_id`)
-# and later runs of the same thread resume it. The `{session_id}` slot in
-# resume argv is the ONE host-side substitution in the format, filled with an
-# id the CLI itself minted — host-local plumbing, NOT the removed consensus
-# model routing. Sessions are assignee-local: another node picking up the
-# thread just starts cold.
-#
-# Resume flag surface (verified against codex-cli 0.144.1): `codex exec
-# resume` takes --json / --skip-git-repo-check / -m / -c, but NOT --sandbox —
-# the sandbox rides the config override `-c sandbox_mode="workspace-write"`
-# instead, so nothing is dropped on the resume path.
+# and never touch the node's data dir. Every run starts cold: a run's whole
+# continuity is the prompt envelope (full transcript), which is what makes a
+# run portable across assignees.
 #
 # Format reference: docs/records/specs/capability-spec.md
 
@@ -73,24 +64,6 @@ format = "jsonl-events"
 # Persistent per-agent cwd (<data>/agent-workspaces/<agent_id>); omit this
 # section for the empty-scratch-dir fence.
 mode = "persistent"
-
-[session]
-# `codex exec --json` announces the session as
-# {"type":"thread.started","thread_id":"<uuid>"}; resuming is a SUBCOMMAND,
-# so the resume argv is a full replacement (variants pin their -m/-c flags in
-# their own resume_args below — an inherited argv could not carry a
-# per-variant flag).
-capture = "jsonl-events"
-resume_args = [
-    "exec",
-    "resume",
-    "{session_id}",
-    "--json",
-    "--skip-git-repo-check",
-    "-c",
-    'sandbox_mode="workspace-write"',
-    "-",
-]
 
 [interactive]
 # The pty-backed TUI argv, for interactive sessions (a member drives the codex
@@ -151,7 +124,7 @@ path = "config-home:AGENTS.md"
 
 [tools]
 # Wires the Ducktape MCP server into every argv this file produces — the base
-# tag, every [[variants]] tag, and the resume argv — spliced in at load time
+# tag and every [[variants]] tag — spliced in at load time
 # IMMEDIATELY AFTER args[0] (the `exec` subcommand). Not appended: codex's
 # trailing bare "-" (prompt from stdin) must stay LAST.
 #
@@ -198,101 +171,80 @@ args = [
 # Each variant pins the model with -m and the reasoning effort with -c. The
 # -c value deliberately carries embedded double quotes ('...="low"'): codex
 # parses the value as TOML, and argv goes straight to exec — no shell ever
-# sees it. The trailing "-" (prompt from stdin) stays LAST. Each variant's
-# resume_args repeats its pins so a resumed thread keeps the exact model and
-# effort the tag promises.
+# sees it. The trailing "-" (prompt from stdin) stays LAST.
 
 [[variants]]
 suffix = "gpt-5.6-sol_low"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="low"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="low"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-sol_medium"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="medium"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="medium"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-sol_high"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-sol_xhigh"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="xhigh"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="xhigh"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-sol_max"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="max"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="max"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-terra_low"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="low"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="low"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-terra_medium"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="medium"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="medium"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-terra_high"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="high"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="high"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-terra_xhigh"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="xhigh"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="xhigh"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-terra_max"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="max"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="max"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-luna_low"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-luna", "-c", 'model_reasoning_effort="low"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-luna", "-c", 'model_reasoning_effort="low"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-luna_medium"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-luna", "-c", 'model_reasoning_effort="medium"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-luna", "-c", 'model_reasoning_effort="medium"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-luna_high"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-luna", "-c", 'model_reasoning_effort="high"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-luna", "-c", 'model_reasoning_effort="high"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-luna_xhigh"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-luna", "-c", 'model_reasoning_effort="xhigh"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-luna", "-c", 'model_reasoning_effort="xhigh"', "-"]
 
 [[variants]]
 suffix = "gpt-5.6-luna_max"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.6-luna", "-c", 'model_reasoning_effort="max"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.6-luna", "-c", 'model_reasoning_effort="max"', "-"]
 
 [[variants]]
 suffix = "gpt-5.5_low"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.5", "-c", 'model_reasoning_effort="low"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.5", "-c", 'model_reasoning_effort="low"', "-"]
 
 [[variants]]
 suffix = "gpt-5.5_medium"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.5", "-c", 'model_reasoning_effort="medium"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.5", "-c", 'model_reasoning_effort="medium"', "-"]
 
 [[variants]]
 suffix = "gpt-5.5_high"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.5", "-c", 'model_reasoning_effort="high"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.5", "-c", 'model_reasoning_effort="high"', "-"]
 
 [[variants]]
 suffix = "gpt-5.5_xhigh"
 args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-m", "gpt-5.5", "-c", 'model_reasoning_effort="xhigh"', "-"]
-resume_args = ["exec", "resume", "{session_id}", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-m", "gpt-5.5", "-c", 'model_reasoning_effort="xhigh"', "-"]

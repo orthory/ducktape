@@ -832,7 +832,7 @@ $DUCKTAPE_HOME/workspaces/<CHAIN-ID>/
     services/compute/podman/{storage,run,hooks,owner.pid,podman.pid}
     services/agent/podman/{storage,run,hooks,owner.pid,podman.pid}
     airlock-creds/{<name>/,seal.key}
-    agent-workspaces/  agent-sessions/  term-sessions/  forge-repo/
+    agent-workspaces/  term-sessions/  forge-repo/
   agent-runs/<16-hex salt>/     # SIBLING of storage, not inside it
 ```
 

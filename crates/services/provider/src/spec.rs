@@ -79,7 +79,6 @@ use std::path::Path;
 use capability::validate_tag;
 use serde::Deserialize;
 
-use crate::session::{self, ResumeArgv, SessionSpec};
 use crate::variants::{self, RawVariant};
 use crate::workspace::{self, WorkspaceMode};
 
@@ -121,9 +120,6 @@ pub struct CapabilitySpec {
     /// the child's working-directory policy — scratch unless the spec's
     /// `[workspace]` opts into per-agent persistence (see [`crate::workspace`]).
     pub workspace: WorkspaceMode,
-    /// optional `[session]` thread-continuity plumbing — host-local capture
-    /// and resume of the executor's own session id (see [`crate::session`]).
-    pub session: Option<SessionSpec>,
     /// optional `[sandbox] rw_dirs` — the executor's own auth/state dirs
     /// (e.g. `~/.claude`, `~/.codex`) that must cross into a Podman sandbox
     /// read-write so the BYO CLI can authenticate. HOME-RELATIVE ONLY
@@ -260,9 +256,6 @@ struct RawSpec {
     /// optional `[workspace]` — validated in [`crate::workspace`].
     #[serde(default)]
     workspace: Option<workspace::RawWorkspace>,
-    /// optional `[session]` — validated in [`crate::session`].
-    #[serde(default)]
-    session: Option<session::RawSession>,
     /// optional `[sandbox]` — the Podman-backend auth/state mounts.
     #[serde(default)]
     sandbox: Option<RawSandbox>,
@@ -487,11 +480,6 @@ struct RawInteractive {
 /// selector (`exec`, `-p`), so right after it is the one position that is
 /// simultaneously legal for every executor and stable across variants. an argv
 /// with fewer than 1 arg has no such position and is left alone.
-///
-/// `ResumeArgv::Append` is deliberately NOT touched: its list is a SUFFIX
-/// glued onto `spec.args` at resume time, not an argv — splicing there would
-/// land tool flags between a flag and its value, and it needs no injection
-/// anyway because the args it is appended to were injected right here.
 fn inject_tool_args(spec: &mut CapabilitySpec, tools: &[String]) {
     let splice = |argv: &mut Vec<String>| {
         if !argv.is_empty() {
@@ -502,13 +490,6 @@ fn inject_tool_args(spec: &mut CapabilitySpec, tools: &[String]) {
         return;
     }
     splice(&mut spec.args);
-    if let Some(SessionSpec {
-        resume: ResumeArgv::Replace(argv),
-        ..
-    }) = &mut spec.session
-    {
-        splice(argv);
-    }
 }
 
 impl CapabilitySpec {
@@ -606,10 +587,6 @@ impl CapabilitySpec {
             .map(|w| workspace::parse_workspace(&w, origin))
             .transpose()?
             .unwrap_or_default();
-        let session = raw
-            .session
-            .map(|s| session::parse_session(&s, origin))
-            .transpose()?;
         let rw_dirs = raw
             .sandbox
             .map(|s| validate_rw_dirs(&s, origin))
@@ -642,7 +619,6 @@ impl CapabilitySpec {
                 timeout_secs: raw.invoke.timeout_secs,
                 output,
                 workspace,
-                session,
                 rw_dirs,
                 isolation,
                 context,
@@ -842,37 +818,21 @@ format = "text"
     }
 
     #[test]
-    fn workspace_and_session_sections_parse_and_default_off() {
-        // absent sections keep the v1 posture: scratch dir, no sessions.
+    fn workspace_section_parses_and_defaults_off() {
+        // an absent section keeps the scratch-dir posture.
         let plain = CapabilitySpec::parse(&spec_toml("ok"), "t").unwrap();
         assert_eq!(plain.workspace, crate::WorkspaceMode::Scratch);
-        assert_eq!(plain.session, None);
 
         let full = format!(
-            r#"{}
-[workspace]
-mode = "persistent"
-[session]
-capture = "json-result-field:session_id"
-resume_args_append = ["--resume", "{{session_id}}"]
-"#,
+            "{}\n[workspace]\nmode = \"persistent\"\n",
             spec_toml("ok")
         );
         let spec = CapabilitySpec::parse(&full, "t").unwrap();
         assert_eq!(spec.workspace, crate::WorkspaceMode::Persistent);
-        let session = spec.session.expect("session parsed");
-        assert_eq!(
-            session.capture,
-            crate::SessionCapture::JsonResultField("session_id".into())
-        );
-        assert_eq!(
-            session.resume,
-            crate::ResumeArgv::Append(vec!["--resume".into(), "{session_id}".into()])
-        );
     }
 
     #[test]
-    fn workspace_and_session_sections_fail_loud_on_unknown_or_bad_fields() {
+    fn workspace_sections_fail_loud_on_unknown_or_bad_fields() {
         let base = spec_toml("ok");
         for (extra, expect) in [
             // an unknown workspace mode and a typo'd field are both loud.
@@ -882,24 +842,17 @@ resume_args_append = ["--resume", "{{session_id}}"]
                 "[workspace]\nmode = \"persistent\"\nroot = \"/x\"\n",
                 "not a valid spec",
             ),
-            // session: unknown capture, unknown field, no/both resume styles,
-            // and a slot-less resume argv.
+            // the RETIRED [session] resume lane: a stale operator spec that
+            // still declares it fails loud at load rather than parsing into a
+            // block nothing would ever read. (`~/.ducktape/capabilities` is
+            // operator-writable, so this is the door a leftover file comes in.)
             (
-                "[session]\ncapture = \"csv\"\nresume_args = [\"{session_id}\"]\n",
-                "not a known mode",
-            ),
-            (
-                "[session]\ncapture = \"jsonl-events\"\nresume = [\"x\"]\n",
+                "[session]\ncapture = \"jsonl-events\"\nresume_args = [\"{session_id}\"]\n",
                 "not a valid spec",
             ),
-            ("[session]\ncapture = \"jsonl-events\"\n", "exactly one"),
             (
-                "[session]\ncapture = \"jsonl-events\"\nresume_args = [\"{session_id}\"]\nresume_args_append = [\"x\"]\n",
-                "exactly one",
-            ),
-            (
-                "[session]\ncapture = \"jsonl-events\"\nresume_args = [\"resume\"]\n",
-                "{session_id}",
+                "[[variants]]\nsuffix = \"m_low\"\nargs = [\"a\"]\nresume_args = [\"{session_id}\"]\n",
+                "not a valid spec",
             ),
         ] {
             let toml = format!("{base}\n{extra}");
@@ -1135,16 +1088,12 @@ resume_args_append = ["--resume", "{{session_id}}"]
     }
 
     /// a family file whose every argv ends in a trailing "-" (the stdin
-    /// marker shape that makes appending tool args impossible), with both a
-    /// replacement-resume variant and the inherited one. `tools` is spliced
-    /// in verbatim by the caller so the same fixture serves the with- and
-    /// without-[tools] cases.
+    /// marker shape that makes appending tool args impossible). `tools` is
+    /// spliced in verbatim by the caller so the same fixture serves the with-
+    /// and without-[tools] cases.
     fn family_with_tools(tools: &str) -> String {
         format!(
             r#"{base}
-[session]
-capture = "jsonl-events"
-resume_args = ["run", "resume", "{{session_id}}", "-"]
 {tools}
 [[variants]]
 suffix = "m_low"
@@ -1153,7 +1102,6 @@ args = ["run", "--model", "m", "-"]
 [[variants]]
 suffix = "m_high"
 args = ["run", "--model", "m", "--hard", "-"]
-resume_args = ["run", "resume", "{{session_id}}", "--model", "m", "-"]
 "#,
             base = spec_toml("ok").replace(r#"args = ["run"]"#, r#"args = ["run", "-"]"#),
         )
@@ -1194,65 +1142,12 @@ resume_args = ["run", "resume", "{{session_id}}", "--model", "m", "-"]
     }
 
     #[test]
-    fn tool_args_reach_the_resume_argv_in_both_resume_styles() {
-        let specs = CapabilitySpec::parse_all(&family_with_tools(TOOLS_SECTION), "t").unwrap();
-        let get = |tag: &str| specs.iter().find(|s| s.tag == tag).unwrap();
-
-        // REPLACEMENT style: the resume argv is a whole argv of its own, so
-        // the tools splice into it directly, after ITS args[0].
-        let resumed = |tag: &str| {
-            let spec = get(tag);
-            crate::session::resume_argv(&spec.args, &spec.session.as_ref().unwrap().resume, "sid-1")
-        };
-        assert_eq!(
-            resumed("ok"),
-            ["run", "--mcp", "srv", "resume", "sid-1", "-"],
-            "the inherited replacement resume argv carries the tools"
-        );
-        assert_eq!(
-            resumed("ok_m_high"),
-            [
-                "run", "--mcp", "srv", "resume", "sid-1", "--model", "m", "-"
-            ],
-            "a variant's OWN replacement resume argv carries them too"
-        );
-
-        // APPEND style: the append list is a SUFFIX, not an argv — it is never
-        // spliced (that would land tools between a flag and its value). it
-        // rides the base args, which were injected, so the composed resume
-        // argv carries the tools anyway.
-        let append = format!(
-            "{}\n[session]\ncapture = \"jsonl-events\"\nresume_args_append = [\"--resume\", \"{{session_id}}\"]\n{TOOLS_SECTION}",
-            spec_toml("ok")
-        );
-        let spec = CapabilitySpec::parse(&append, "t").unwrap();
-        assert_eq!(
-            crate::session::resume_argv(
-                &spec.args,
-                &spec.session.as_ref().unwrap().resume,
-                "sid-1"
-            ),
-            ["run", "--mcp", "srv", "--resume", "sid-1"],
-        );
-    }
-
-    #[test]
     fn a_spec_without_tools_is_untouched() {
         // the regression guard for every spec that predates [tools]: no
         // section, no insertion — argv byte-identical to the file.
         let specs = CapabilitySpec::parse_all(&family_with_tools(""), "t").unwrap();
         assert_eq!(specs[0].args, ["run", "-"], "base argv verbatim");
         assert_eq!(specs[1].args, ["run", "--model", "m", "-"]);
-        assert_eq!(
-            specs[0].session.as_ref().unwrap().resume,
-            crate::ResumeArgv::Replace(vec![
-                "run".into(),
-                "resume".into(),
-                "{session_id}".into(),
-                "-".into(),
-            ]),
-            "resume argv verbatim"
-        );
 
         // an empty [tools].args is inert too — and a [tools] with no args at
         // all is a loud parse error, not a silent no-op.
