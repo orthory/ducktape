@@ -17,232 +17,224 @@ component PageTitleEditor(rpc:str, password:str, page_id:str, title:str, disable
     local_error = ""
   on save_failed(cause)
     local_error = cause.message
-  col width=fill spacing=2.0
+  col w=fill gap=2.0
     if !editing && !empty(title)
-      button label=title disabled=disabled width=fill padding=4.0 -> begin(title)
-        text title width=fill size=34.0 wrapping=none font=display @text-fg
+      button label=title disabled=disabled w=fill p=4.0 @ghost_action -> begin(title)
+        text title w=fill size=22.0 wrap=none font=display @text-fg
         active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
         hovered bg=fg/4 text=fg border=fg/6
         pressed bg=fg/7 text=fg border=fg/9
     if !editing && empty(title)
-      button label="Untitled" disabled=disabled width=fill padding=4.0 -> begin(title)
-        text "Untitled" width=fill size=34.0 wrapping=none font=display @text-muted
+      button label="Untitled" disabled=disabled w=fill p=4.0 @ghost_action -> begin(title)
+        text "Untitled" w=fill size=22.0 wrap=none font=display @text-muted
         active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
         hovered bg=fg/4 text=fg border=fg/6
         pressed bg=fg/7 text=fg border=fg/9
     if editing
-      input "" #title-input label="Page title" <-> draft change=changed(_, rpc, password, page_id) hint="Untitled" disabled=disabled width=fill padding=4.0 text-size=34.0 line-height=1.15
+      input "" #title-input label="Page title" <-> draft change=changed(_, rpc, password, page_id) hint="Untitled" disabled=disabled w=fill p=4.0 text-size=22.0 line-h=1.15 @control
         active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
-        focused bg=fg/5 border=fg/9 border-w=1.0
         disabled value=muted
     if !empty(local_error)
-      text local_error size=12.0 @text-muted
+      text local_error size=12.5 @text-muted
 
 component PageButton(page:PageItem, selected:bool)
-  col width=fill
+  col w=fill
     if selected
-      button label=page.title width=fill height=34.0 padding=7.0 -> choose_page(page.id)
-        row width=fill height=fill spacing=9.0 align=center
-          text "▤" width=18.0 size=13.0 align-x=center @text-fg
-          text page.prefix size=12.0 wrapping=none @text-muted
-          text page.title width=fill size=13.0 wrapping=none font=medium @text-fg
+      button label=page.title w=fill h=34.0 p=7.0 @ghost_action -> choose_page(page.id)
+        row w=fill h=fill gap=9.0 align=center
+          text "▤" w=18.0 size=13.0 align-x=center @text-fg
+          text page.prefix size=12.0 wrap=none font=code @text-muted
+          text page.title w=fill size=13.0 wrap=none font=medium @text-fg
           if page.child_count > 0
-            text page.child_count size=12.0 @text-muted
-        active bg=fg/8 text=fg border=fg/11 border-w=1.0 r=8.0
-        hovered bg=fg/11 text=fg border=fg/14
-        pressed bg=fg/14 text=fg border=fg/16
+            text page.child_count size=12.0 font=code @text-muted
+        active bg=subtle text=fg border=transparent border-w=1.0 r=8.0
+        hovered bg=rail_hover text=fg
+        pressed bg=subtle text=fg
     if !selected
-      button label=page.title width=fill height=34.0 padding=7.0 -> choose_page(page.id)
-        row width=fill height=fill spacing=9.0 align=center
-          text "▤" width=18.0 size=13.0 align-x=center @text-muted
-          text page.prefix size=12.0 wrapping=none @text-muted
-          text page.title width=fill size=13.0 wrapping=none @text-muted
+      button label=page.title w=fill h=34.0 p=7.0 @ghost_action -> choose_page(page.id)
+        row w=fill h=fill gap=9.0 align=center
+          text "▤" w=18.0 size=13.0 align-x=center @text-muted
+          text page.prefix size=12.0 wrap=none font=code @text-muted
+          text page.title w=fill size=13.0 wrap=none @text-muted
           if page.child_count > 0
-            text page.child_count size=12.0 @text-muted
+            text page.child_count size=12.0 font=code @text-muted
         active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
         hovered bg=fg/6 text=fg border=fg/8
         pressed bg=fg/10 text=fg border=fg/12
 
 component PageSearchResult(hit:PageSearchHit)
-  button label=hit.text width=fill padding=7.0 -> open_page_search_hit(hit.page_id, hit.block_id)
-    col width=fill spacing=2.0
-      row width=fill spacing=7.0 align=center
-        text hit.kind width=fill size=12.0 font=medium @text-muted
-        text hit.block_id size=12.0 wrapping=none @text-muted
-      text hit.text width=fill size=13.0 wrapping=word @text-fg
+  button label=hit.text w=fill p=7.0 @ghost_action -> open_page_search_hit(hit.page_id, hit.block_id)
+    col w=fill gap=2.0
+      row w=fill gap=7.0 align=center
+        text hit.kind w=fill size=10.5 font=code_medium @text-muted
+        text hit.block_id size=12.0 wrap=none font=code @text-muted
+      text hit.text w=fill size=13.5 wrap=word @text-fg
     active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
     hovered bg=fg/6 text=fg border=fg/8
     pressed bg=fg/10 text=fg border=fg/12
 
 component PageCommentThreadButton(thread:PageCommentThread)
-  button label=thread.author description=thread.meta width=fill padding=6.0 -> open_block_comment_thread(thread.id)
-    row width=fill spacing=7.0 align=center
-      text thread.author width=fill size=13.0 wrapping=none font=medium @text-fg
-      text thread.meta size=12.0 wrapping=none @text-muted
+  button label=thread.author description=thread.meta w=fill p=6.0 @ghost_action -> open_block_comment_thread(thread.id)
+    row w=fill gap=7.0 align=center
+      text thread.author w=fill size=13.0 wrap=none font=medium @text-fg
+      text thread.meta size=11.0 wrap=none font=code_medium @text-muted
       text "›" size=13.0 @text-muted
     active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
     hovered bg=fg/6 text=fg border=fg/8
     pressed bg=fg/10 text=fg border=fg/12
 
 component PageCommentCard(comment:PageComment)
-  container width=fill padding=7.0 bg=transparent border=transparent border-w=1.0 r=7.0
-    col width=fill spacing=3.0
-      row width=fill spacing=7.0 align=center
-        text comment.author width=fill size=13.0 wrapping=none font=medium @text-fg
-        text comment.meta size=12.0 wrapping=none @text-muted
-      text comment.text width=fill size=13.0 wrapping=word @text-fg
+  box w=fill p=7.0 bg=transparent border=transparent border-w=1.0 r=7.0
+    col w=fill gap=3.0
+      row w=fill gap=7.0 align=center
+        text comment.author w=fill size=13.0 wrap=none font=medium @text-fg
+        text comment.meta size=11.0 wrap=none font=code_medium @text-muted
+      text comment.text w=fill size=13.5 wrap=word @text-fg
 
 component BlockLine(block:PageBlock)
-  row width=fill spacing=7.0 align=start
+  row w=fill gap=7.0 align=start
     match block.kind
       "Page"
-        text "▤" width=16.0 size=13.0 align-x=center @text-muted
+        text "▤" w=16.0 size=13.0 align-x=center @text-muted
       "Bullet"
-        text "•" width=16.0 size=13.0 align-x=center @text-muted
+        text "•" w=16.0 size=13.0 align-x=center @text-muted
       "Number"
-        text "1." width=16.0 size=12.0 align-x=center @text-muted
+        text "1." w=16.0 size=12.0 align-x=center @text-muted
       "Todo"
         if block.checked
-          text "✓" width=16.0 size=12.0 align-x=center font=medium @text-fg
+          text "✓" w=16.0 size=12.0 align-x=center font=medium @text-fg
         if !block.checked
-          text "○" width=16.0 size=13.0 align-x=center @text-muted
+          text "○" w=16.0 size=13.0 align-x=center @text-muted
       "Toggle"
-        text "›" width=16.0 size=14.0 align-x=center @text-muted
+        text "›" w=16.0 size=14.0 align-x=center @text-muted
       "Quote"
-        text "│" width=16.0 size=14.0 align-x=center @text-muted
+        text "│" w=16.0 size=14.0 align-x=center @text-muted
       "Code"
-        text "{}" width=16.0 size=12.0 align-x=center font=mono @text-muted
+        text "{}" w=16.0 size=12.0 align-x=center font=code @text-muted
       "Callout"
-        text "!" width=16.0 size=12.0 align-x=center font=medium @text-muted
+        text "!" w=16.0 size=12.0 align-x=center font=medium @text-muted
       _
-        space width=0.0
+        space w=0.0
     slot
 
 component BlockContents(block:PageBlock)
   BlockLine block=block
-    col width=fill spacing=2.0
+    col w=fill gap=2.0
       match block.kind
         "Page"
-          row width=fill spacing=6.0 align=center
+          row w=fill gap=6.0 align=center
             if empty(block.text)
-              text "Untitled" width=fill size=14.0 wrapping=word font=medium @text-muted
+              text "Untitled" w=fill size=13.0 wrap=word font=medium @text-muted
             if !empty(block.text)
-              text block.text width=fill size=14.0 wrapping=word font=medium @text-fg
-            text "›" size=14.0 @text-muted
+              text block.text w=fill size=13.0 wrap=word font=medium @text-fg
+            text "›" size=13.0 @text-muted
         "Heading 1"
-          text block.text width=fill size=20.0 wrapping=word font=display @text-fg
+          text block.text w=fill size=20.0 wrap=word font=display @text-fg
         "Heading 2"
-          text block.text width=fill size=17.0 wrapping=word font=medium @text-fg
+          text block.text w=fill size=16.0 wrap=word font=display @text-fg
         "Heading 3"
-          text block.text width=fill size=15.0 wrapping=word font=medium @text-fg
+          text block.text w=fill size=14.0 wrap=word font=display @text-fg
         "Code"
-          container width=fill padding=7.0 bg=fg/7 border=fg/9 border-w=1.0 r=7.0
-            text block.text width=fill size=12.0 wrapping=word font=mono @text-fg
+          box w=fill p=7.0 bg=fg/7 border=fg/9 border-w=1.0 r=7.0
+            text block.text w=fill size=12.0 wrap=word font=code @text-fg
         "Divider"
-          container width=fill height=1.0 bg=separator
-            text ""
+          Separator
         _
-          text block.text width=fill size=14.0 wrapping=word @text-fg
+          text block.text w=fill size=13.5 wrap=word @text-fg
 
 component DocumentBlock(block:PageBlock, selected:bool, hovered:bool, disabled:bool)
   mouse enter=block_entered(block.id) exit=block_exited(block.id)
-    stack width=fill
-      container width=fill padding-left=56.0
-        row width=fill align=start
+    stack w=fill
+      box w=fill pl=56.0
+        row w=fill align=start
           if !empty(block.prefix)
-            text block.prefix size=14.0 wrapping=none font=mono
+            text block.prefix size=12.0 wrap=none font=code
           slot
       if !block.pending && (hovered || selected)
-        container width=fill align-x=start align-y=start
-          row width=fill align=center
+        box w=fill align-x=start align-y=start
+          row w=fill align=center
             if !empty(block.prefix)
-              text block.prefix size=14.0 wrapping=none font=mono
-            container width=56.0 height=28.0 bg=popover border=fg/11 border-w=1.0 r=7.0 shadow=black/12 shadow-y=1.0 shadow-blur=5.0
-              row width=fill spacing=0.0 align=center
-                button label="Insert block below" disabled=disabled width=28.0 height=28.0 padding=0.0 -> open_block_insert(block.key, block.id)
-                  container width=fill height=fill align-x=center align-y=center
+              text block.prefix size=12.0 wrap=none font=code
+            box w=56.0 h=28.0 bg=surface border=border border-w=1.0 r=7.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+              row w=fill gap=0.0 align=center
+                button label="Insert block below" disabled=disabled w=28.0 h=28.0 p=0.0 @icon_action -> open_block_insert(block.key, block.id)
+                  box w=fill h=fill align-x=center align-y=center
                     text "+" size=14.0 font=medium
                   active bg=transparent text=muted r=5.0
                   hovered bg=fg/8 text=fg
                   pressed bg=fg/12 text=fg
-                button label="Block actions" disabled=disabled width=28.0 height=28.0 padding=0.0 -> select_block(block.key, block.id, block.kind, block.text, block.checked, true)
-                  container width=fill height=fill align-x=center align-y=center
+                button label="Block actions" disabled=disabled w=28.0 h=28.0 p=0.0 @icon_action -> select_block(block.key, block.id, block.kind, block.text, block.checked, true)
+                  box w=fill h=fill align-x=center align-y=center
                     text "⋮⋮" size=13.0 font=medium
                   active bg=transparent text=muted r=5.0
                   hovered bg=fg/8 text=fg
                   pressed bg=fg/12 text=fg
 
 component BlockActionsMenu(block_id:str, kind:str, disabled:bool, delete_armed:bool, editable_kinds:[str])
-  container width=172.0 padding=5.0 bg=popover border=fg/13 border-w=1.0 r=10.0 shadow=black/24 shadow-y=4.0 shadow-blur=14.0
-    col width=fill spacing=3.0
+  box w=172.0 p=5.0 bg=surface border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+    col w=fill gap=3.0
       if kind != "Page"
-        pick editable_kinds some(kind) placeholder="Block type" width=fill menu-height=210.0 padding=6.0 text-size=12.0 line-height=1.2 -> selected_block_kind_changed _
+        pick editable_kinds some(kind) hint="Block type" w=fill menu-h=210.0 p=6.0 text-size=13.0 line-h=1.2 -> selected_block_kind_changed _
           active text=fg placeholder=muted handle=muted bg=transparent border=transparent border-w=0.0 r=6.0
           hovered text=fg placeholder=muted handle=fg bg=fg/8 border=fg/10 border-w=1.0 r=6.0
-          opened text=fg placeholder=muted handle=fg bg=fg/11 border=fg/13 border-w=1.0 r=6.0
-          menu text=fg selected-text=fg selected-bg=fg/14 bg=popover border=fg/13 border-w=1.0 r=8.0 shadow=black/18 shadow-y=3.0 shadow-blur=11.0
+          opened text=fg placeholder=muted handle=fg bg=fg/11 border=ring border-w=1.0 r=6.0
+          menu text=fg selected-text=fg selected-bg=fg/14 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
       if kind == "Page"
-        button "Open page" label="Open subpage" disabled=disabled width=fill height=28.0 padding=6.0 -> choose_page(block_id)
+        button "Open page" label="Open subpage" disabled=disabled w=fill h=28.0 p=6.0 @ghost_action -> choose_page(block_id)
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
-      row width=fill spacing=2.0 align=center
-        button "↑" label="Move block up" disabled=disabled width=fill height=27.0 padding=4.0 -> move_block_submit("up")
+      row w=fill gap=2.0 align=center
+        button "↑" label="Move block up" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> move_block_submit("up")
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
-        button "↓" label="Move block down" disabled=disabled width=fill height=27.0 padding=4.0 -> move_block_submit("down")
+        button "↓" label="Move block down" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> move_block_submit("down")
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
-        button "←" label="Outdent block" disabled=disabled width=fill height=27.0 padding=4.0 -> move_block_submit("outdent")
+        button "←" label="Outdent block" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> move_block_submit("outdent")
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
-        button "→" label="Indent block" disabled=disabled width=fill height=27.0 padding=4.0 -> move_block_submit("indent")
+        button "→" label="Indent block" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> move_block_submit("indent")
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
       if kind == "Todo"
-        button "Toggle done" label="Toggle checked" disabled=disabled width=fill height=28.0 padding=6.0 -> toggle_block_checked
+        button "Toggle done" label="Toggle checked" disabled=disabled w=fill h=28.0 p=6.0 @ghost_action -> toggle_block_checked
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
-      button "Comments" label="Comments" disabled=disabled width=fill height=28.0 padding=6.0 -> open_block_comments
+      button "Comments" label="Comments" disabled=disabled w=fill h=28.0 p=6.0 @ghost_action -> open_block_comments
         active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
         hovered bg=fg/8 text=fg border=fg/9
         pressed bg=fg/12 text=fg border=fg/13
       if !delete_armed
-        button "Delete" label="Delete block" disabled=disabled width=fill height=28.0 padding=6.0 -> arm_block_delete
-          active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-          hovered bg=fg/8 text=fg border=fg/9
-          pressed bg=fg/12 text=fg border=fg/13
+        button "Delete" label="Delete block" disabled=disabled w=fill h=28.0 p=6.0 @danger_action -> arm_block_delete
       if delete_armed
-        button "Confirm delete" label="Confirm block deletion" disabled=disabled width=fill height=28.0 padding=6.0 -> remove_block_submit
-          active bg=fg/10 text=fg border=fg/12 border-w=1.0 r=6.0
-          hovered bg=fg/14 text=fg border=fg/15
-          pressed bg=fg/18 text=fg border=fg/17
-      button "Close" label="Close block actions" disabled=disabled width=fill height=28.0 padding=6.0 -> close_block_actions
+        button "Confirm delete" label="Confirm block deletion" disabled=disabled w=fill h=28.0 p=6.0 @danger_action -> remove_block_submit
+      button "Close" label="Close block actions" disabled=disabled w=fill h=28.0 p=6.0 @secondary_action -> close_block_actions
         active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
         hovered bg=fg/8 text=fg border=fg/9
         pressed bg=fg/12 text=fg border=fg/13
 
 component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)
-  stack width=fill
-    container width=fill padding-left=56.0 padding-right=118.0
-      row width=fill
+  stack w=fill
+    box w=fill pl=56.0 pr=118.0
+      row w=fill
         if !empty(prefix)
-          text prefix size=14.0 wrapping=none font=mono
+          text prefix size=12.0 wrap=none font=code
         slot
-    container width=fill align-x=end align-y=start padding-right=4.0
-      container padding=2.0 bg=popover border=fg/12 border-w=1.0 r=8.0 shadow=black/14 shadow-y=2.0 shadow-blur=7.0
-        row spacing=1.0 align=center
-          pick kinds some(kind) placeholder="Type" width=82.0 menu-height=210.0 padding=4.0 text-size=12.0 line-height=1.2 -> new_block_kind_changed _
+    box w=fill align-x=end align-y=start pr=4.0
+      box p=2.0 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+        row gap=1.0 align=center
+          pick kinds some(kind) hint="Type" w=82.0 menu-h=210.0 p=4.0 text-size=13.0 line-h=1.2 -> new_block_kind_changed _
             active text=fg placeholder=muted handle=muted bg=transparent border=transparent border-w=0.0 r=6.0
             hovered text=fg placeholder=muted handle=fg bg=fg/8 border=fg/10 border-w=1.0 r=6.0
-            opened text=fg placeholder=muted handle=fg bg=fg/11 border=fg/13 border-w=1.0 r=6.0
-            menu text=fg selected-text=fg selected-bg=fg/14 bg=popover border=fg/13 border-w=1.0 r=8.0 shadow=black/18 shadow-y=3.0 shadow-blur=11.0
-          button "×" label="Cancel block insertion" disabled=disabled width=26.0 height=26.0 padding=4.0 -> close_block_insert
+            opened text=fg placeholder=muted handle=fg bg=fg/11 border=ring border-w=1.0 r=6.0
+            menu text=fg selected-text=fg selected-bg=fg/14 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+          button "×" label="Cancel block insertion" disabled=disabled w=26.0 h=26.0 p=4.0 @secondary_action -> close_block_insert
             active bg=transparent text=muted r=6.0
             hovered bg=fg/8 text=fg
             pressed bg=fg/12 text=fg

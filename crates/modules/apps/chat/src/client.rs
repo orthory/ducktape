@@ -51,7 +51,7 @@ pub struct ChatMember {
     pub label: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatMessage {
     pub id: String,
     pub seq: i64,
@@ -67,9 +67,7 @@ pub struct ChatMessage {
     pub thread_seq: i64,
     pub show_author: bool,
     pub initial: String,
-    pub avatar_r: f64,
-    pub avatar_g: f64,
-    pub avatar_b: f64,
+    pub avatar_kind: String,
     pub reactions: Vec<ChatReaction>,
 }
 
@@ -90,36 +88,9 @@ impl Default for ChatMessage {
             thread_seq: 0,
             show_author: true,
             initial: String::new(),
-            avatar_r: 0.0,
-            avatar_g: 0.0,
-            avatar_b: 0.0,
+            avatar_kind: String::new(),
             reactions: Vec::new(),
         }
-    }
-}
-
-// `f64` avatar tint keeps `Hash` off the derive; hash the bit pattern instead
-// so aggregates over messages can still derive `Hash` for view memoization.
-impl std::hash::Hash for ChatMessage {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-        self.seq.hash(state);
-        self.author.hash(state);
-        self.meta.hash(state);
-        self.body.hash(state);
-        self.blocks.hash(state);
-        self.pending.hash(state);
-        self.rev.hash(state);
-        self.edited.hash(state);
-        self.deleted.hash(state);
-        self.reply_count.hash(state);
-        self.thread_seq.hash(state);
-        self.show_author.hash(state);
-        self.initial.hash(state);
-        self.avatar_r.to_bits().hash(state);
-        self.avatar_g.to_bits().hash(state);
-        self.avatar_b.to_bits().hash(state);
-        self.reactions.hash(state);
     }
 }
 
@@ -623,7 +594,6 @@ pub fn optimistic_message(
     body: String,
     message_id: String,
 ) -> Vec<ChatMessage> {
-    let (avatar_r, avatar_g, avatar_b) = avatar_rgb_for("You");
     let blocks = paragraph_blocks(&body);
     messages.push(ChatMessage {
         id: message_id,
@@ -640,9 +610,7 @@ pub fn optimistic_message(
         thread_seq: 0,
         show_author: true,
         initial: "Y".into(),
-        avatar_r,
-        avatar_g,
-        avatar_b,
+        avatar_kind: "human".into(),
         reactions: Vec::new(),
     });
     messages
@@ -753,7 +721,6 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
     } else {
         format!("#{}", row.seq)
     };
-    let (avatar_r, avatar_g, avatar_b) = avatar_rgb(&row.author);
     let blocks = if row.deleted {
         vec![deleted_block()]
     } else {
@@ -778,9 +745,7 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
         thread_seq: number_i64(row.thread.unwrap_or(0)),
         show_author: true,
         initial: avatar_initial(&row.author),
-        avatar_r,
-        avatar_g,
-        avatar_b,
+        avatar_kind: avatar_kind(&row.author).into(),
         reactions: row
             .reactions
             .into_iter()
@@ -969,8 +934,7 @@ pub fn author_name(author: &str) -> String {
 }
 
 /// The stable identity an avatar is derived from: the shortened id for a user,
-/// the agent/module name otherwise. Both the initial glyph and the tint hash
-/// off this so a given author always looks the same.
+/// the agent/module name otherwise.
 fn avatar_source(author: &str) -> String {
     match author.split_once(':') {
         Some(("user", id)) => short_label(id),
@@ -987,42 +951,18 @@ fn avatar_initial(author: &str) -> String {
     initial_of(&avatar_source(author))
 }
 
+fn avatar_kind(author: &str) -> &'static str {
+    match author.split_once(':') {
+        Some(("user", _)) => "human",
+        Some(_) | None => "agent",
+    }
+}
+
 fn initial_of(source: &str) -> String {
     source
         .chars()
         .find(char::is_ascii_alphanumeric)
         .map_or_else(|| "•".into(), |c| c.to_ascii_uppercase().to_string())
-}
-
-/// Curated avatar tints — saturated mid-tones that keep near-white initials
-/// legible, indexed by a stable hash of the author identity.
-const AVATAR_PALETTE: [(u8, u8, u8); 8] = [
-    (0x60, 0x62, 0xe8), // indigo
-    (0x8a, 0x5c, 0xf0), // violet
-    (0xc7, 0x4a, 0xae), // fuchsia
-    (0xdc, 0x4f, 0x66), // rose
-    (0xc2, 0x6a, 0x24), // amber
-    (0x1a, 0x9d, 0x6e), // emerald
-    (0x0e, 0x8f, 0x96), // teal
-    (0x2f, 0x7a, 0xe0), // blue
-];
-
-/// The avatar tint for an author as linear 0..1 RGB.
-pub fn avatar_rgb(author: &str) -> (f64, f64, f64) {
-    avatar_rgb_for(&avatar_source(author))
-}
-
-/// The avatar tint for a bare identity string (used for optimistic/local authors).
-pub fn avatar_rgb_for(source: &str) -> (f64, f64, f64) {
-    let hash = source
-        .bytes()
-        .fold(0u32, |acc, byte| acc.wrapping_mul(31).wrapping_add(u32::from(byte)));
-    let (r, g, b) = AVATAR_PALETTE[(hash as usize) % AVATAR_PALETTE.len()];
-    (
-        f64::from(r) / 255.0,
-        f64::from(g) / 255.0,
-        f64::from(b) / 255.0,
-    )
 }
 
 pub fn short_label(id: &str) -> String {
@@ -1425,5 +1365,13 @@ mod tests {
         assert!(reacted_by_user(&reactors, Some(&[0xab; 32])));
         assert!(!reacted_by_user(&reactors, Some(&[0xcd; 32])));
         assert!(!reacted_by_user(&reactors, None));
+    }
+
+    #[test]
+    fn avatars_distinguish_humans_from_software_authors() {
+        assert_eq!(avatar_kind("user:deadbeef"), "human");
+        for author in ["agent:chat/reviewer", "module:forge", "system"] {
+            assert_eq!(avatar_kind(author), "agent");
+        }
     }
 }

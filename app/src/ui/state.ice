@@ -1,6 +1,6 @@
 state
   app_theme = "app"
-  app_background = "#fcfcfc"
+  app_background = "#fdfdfb"
   app_text = "#2c2b27"
   rpc = ""
   connected_rpc = ""

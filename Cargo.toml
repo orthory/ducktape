@@ -114,7 +114,7 @@ members = [
     "crates/duckfs/disk",
     "crates/duckfs/client",
     "crates/rpc-client",
-    # the desktop app's design system — fonts, type scale, depth styles
+    # desktop-only font assets and the product typography contract
     "crates/design",
     # apps — product feature modules
     "crates/modules/apps/forge",
@@ -337,6 +337,13 @@ block = { path = "patches/block" }
 # cranelift is 10-30x slower — enough that a fleet of e2e daemons booting
 # concurrently blows readiness deadlines — so the code generator itself is
 # always built optimized. build-time only; artifacts and semantics unchanged.
+# The desktop app's view is one generated function big enough that LLVM's DWARF
+# emitter segfaults on it (rustc 1.96, `-C debuginfo=2`). Dropping debug info for
+# this crate alone keeps the rest of the workspace debuggable — and takes the
+# dev binary from ~516 MB to a fraction of that.
+[profile.dev.package.ducktape-app]
+debug = 0
+
 [profile.dev.package.cranelift-codegen]
 opt-level = 3
 
