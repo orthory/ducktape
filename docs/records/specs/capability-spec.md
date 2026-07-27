@@ -287,8 +287,12 @@ neither of which can recover the credential, and both of which die with the run.
 `config_home_env` is what makes this real rather than decorative: the child's
 `CODEX_HOME` is a **fresh, empty** directory under the run's reserved
 `.ducktape-run/` tree, so the CLI *cannot* fall back to reading the operator's
-`auth.json`. That reserved directory is deleted before DuckFS or Forge scans the
-workspace, so the provider's runtime state can never enter a snapshot or commit.
+`auth.json`. Empty is guaranteed by the NAME: the slot under `.ducktape-run/` is
+drawn fresh per run, so no later run can name — and therefore inherit — an
+earlier one's config home, and the directory is removed when the run that owns it
+ends rather than left in a workdir the next run mounts. That reserved directory is
+also deleted before DuckFS or Forge scans the workspace, so the provider's runtime
+state can never enter a snapshot or commit.
 
 The broker is deliberately not a generic proxy: it binds an ephemeral loopback
 port, requires the per-run bearer, accepts only Responses POSTs, enforces

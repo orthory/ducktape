@@ -56,8 +56,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rand::RngCore as _;
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// the hard ceiling on one child's lifetime, as a multiple of its idle
@@ -102,6 +102,9 @@ const TART_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// commit bracket removes this directory before duckfs/forge scan the tree, so a
 /// provider's own runtime files can never become an agent artifact — which is
 /// exactly why the config home is allowed to sit inside the workdir at all.
+/// each run owns ONE slot under here, named per run and removed when that run
+/// ends ([`RunHome`]) — a workdir outlives its runs and is mounted rw into the
+/// next one's sandbox, so what a run leaves here, the next run's child reads.
 pub const RUN_RUNTIME_DIR: &str = ".ducktape-run";
 
 /// the env var the provisioner exports to point a run at its read-only W6 skills
@@ -1095,19 +1098,22 @@ impl CliProvider {
     /// the directory is EMPTY, and that is the auth-load-bearing part: pointed
     /// at an empty `CODEX_HOME`, codex cannot read the operator's `auth.json`
     /// and must use the model provider the broker argv names.
-    fn prepare_config_home(
-        &self,
-        workdir: &Path,
-        ctx: &RunContext,
-    ) -> Result<Option<PathBuf>, String> {
+    ///
+    /// EMPTY is guaranteed by the NAME, not by cleaning: [`runtime_slot`] is
+    /// drawn fresh per run, so the directory did not exist a moment ago and
+    /// nothing another run wrote can be inside it. it is removed when the
+    /// returned [`RunHome`] drops, so this run's state is not left in a workdir
+    /// the next account's run mounts.
+    fn prepare_config_home(&self, workdir: &Path) -> Result<Option<RunHome>, String> {
         if self.spec.isolation.config_home_env.is_none() {
             return Ok(None);
         }
-        let dir = workdir
-            .join(RUN_RUNTIME_DIR)
-            .join(runtime_slot(ctx, workdir))
-            .join("provider-config");
-        create_private_dir(&dir)?;
+        let slot = workdir.join(RUN_RUNTIME_DIR).join(runtime_slot());
+        let config = slot.join("provider-config");
+        create_private_dir(&config)?;
+        // built BEFORE the seed writes below, so a failed seed takes the
+        // half-materialized home down with it on the `?`.
+        let home = RunHome { slot, config };
         // The two Claude Code state files this FRESH config home must carry.
         // Written only for the Anthropic broker (codex ignores both).
         //
@@ -1135,7 +1141,7 @@ impl CliProvider {
                 ("settings.json", r#"{"skipWebFetchPreflight":true}"#),
                 (".claude.json", r#"{"hasCompletedOnboarding":true}"#),
             ] {
-                let path = dir.join(name);
+                let path = home.config().join(name);
                 std::fs::write(&path, contents).map_err(|e| {
                     format!(
                         "{}: write claude {name} {}: {e}",
@@ -1145,7 +1151,7 @@ impl CliProvider {
                 })?;
             }
         }
-        Ok(Some(dir))
+        Ok(Some(home))
     }
 
     /// start this run's credential broker — `None` unless the spec declares one.
@@ -1620,21 +1626,65 @@ impl CliProvider {
 
 /// this run's subdirectory under [`RUN_RUNTIME_DIR`]. distinct runs can share a
 /// workdir (a persistent per-agent workspace serves every run of that agent, and
-/// the scratch dir is shared per tag), so the slot keeps two concurrent runs from
-/// stepping on each other's config home. deterministic, never random.
-fn runtime_slot(ctx: &RunContext, workdir: &Path) -> String {
-    let mut digest = Sha256::new();
-    digest.update(ctx.run_key.as_deref().unwrap_or("unkeyed").as_bytes());
-    digest.update([0]);
-    digest.update(ctx.agent_id.as_deref().unwrap_or("agent").as_bytes());
-    digest.update([0]);
-    digest.update(workdir.as_os_str().to_string_lossy().as_bytes());
-    digest
-        .finalize()
-        .iter()
-        .take(12)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+/// the scratch dir is shared per tag), so the slot keeps two runs from stepping
+/// on each other's config home.
+///
+/// DRAWN FRESH PER RUN, never derived from the run's coordinates. a name derived
+/// from (run key, agent, workdir) is a name a LATER run can produce again — and a
+/// config home it can therefore inherit, credentials and transcripts included.
+/// two runs sharing a workdir are no longer two runs of the same operator: a run
+/// submitted by one account executes on another account's node, so an inherited
+/// config home is one account's credential material handed to another's child.
+/// randomness is what makes that unrepresentable; the cases that would collide
+/// under a derived name are exactly the real ones (an unkeyed rerun, a retry of
+/// the same dispatch, two concurrent runs of one agent).
+fn runtime_slot() -> String {
+    let mut slot = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut slot);
+    slot.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// this run's private slot under [`RUN_RUNTIME_DIR`] and the config home inside
+/// it, REMOVED when the run that owns it ends — every exit path (success, error,
+/// timeout, panic), because a Drop runs on all of them.
+///
+/// the executor writes its whole session state in there: the seeded
+/// `.credentials.json`, the conversation transcripts, whatever else it caches.
+/// that belongs to this run alone, and the workdir it sits inside is mounted rw
+/// into the sandbox and shared with later runs — of other accounts. so it is not
+/// left behind for the next child to read.
+///
+/// the fresh name ([`runtime_slot`]) and this guard cover each other's hole: the
+/// name means a leftover can never be INHERITED (nothing can name it again), the
+/// guard means there is no leftover to READ through the shared workdir mount. a
+/// SIGKILLed host is the one case that leaves the directory standing, unnamed by
+/// anything and swept with the workdir.
+struct RunHome {
+    /// `<workdir>/<RUN_RUNTIME_DIR>/<slot>` — this run's, removed on drop.
+    slot: PathBuf,
+    /// the config home inside the slot: what the child is pointed at.
+    config: PathBuf,
+}
+
+impl RunHome {
+    fn config(&self) -> &Path {
+        &self.config
+    }
+}
+
+impl Drop for RunHome {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.slot) {
+            // the path is deliberately absent: it names a directory that held
+            // credential material. the run's own workdir is the diagnosis.
+            tracing::warn!(
+                target: "ducktape::provider",
+                reason = "config_home_not_removed",
+                %error,
+                "the run's config home outlived its run"
+            );
+        }
+    }
 }
 
 /// create a directory only this user can read. the provider's config home holds
@@ -1675,8 +1725,8 @@ fn canonical_mount_path(path: &Path, purpose: &str) -> Result<PathBuf, String> {
 /// timeout, panic). only built for a doc OUTSIDE the workdir (`workspace-parent:`):
 /// it sits beside the checkout, where nothing else would ever clean it up, and a
 /// stale soul left there would silently join the NEXT run whose checkout lands in
-/// the same parent. a `config-home:` doc is inside the reserved run-runtime dir
-/// the provisioner already deletes, so it needs no guard.
+/// the same parent. a `config-home:` doc needs no guard of its own: it is inside
+/// the run's [`RunHome`], which removes the whole directory when the run ends.
 struct ContextGuard(PathBuf);
 
 impl Drop for ContextGuard {
@@ -3148,13 +3198,15 @@ impl CliProvider {
         };
         // the run's auth materials, prepared once and shared by every invocation
         // below (a resume and its cold retry are the SAME run — one config home,
-        // one broker). `broker` is held here so the endpoint outlives the child
-        // and is torn down when this call returns, however it returns.
-        let config_home = self.prepare_config_home(&workdir, ctx)?;
+        // one broker). `home` and `broker` are held here so the endpoint and the
+        // config home outlive the child and are torn down when this call returns,
+        // however it returns.
+        let home = self.prepare_config_home(&workdir)?;
+        let config_home = home.as_ref().map(RunHome::config);
         // the assembled soul, delivered by whichever door the SPEC names: a file
         // the CLI auto-loads, or the stdin prompt. the guard (held for the whole
         // call) removes a doc that lives outside the workdir, on every exit path.
-        let _context = self.deliver_context(&workdir, config_home.as_deref(), ctx)?;
+        let _context = self.deliver_context(&workdir, config_home, ctx)?;
         let prompt_buf = self.prompt_with_context(prompt, ctx);
         let prompt = prompt_buf.as_str();
         // the per-run credential source rides `ctx.airlock` (unifies the
@@ -3171,7 +3223,7 @@ impl CliProvider {
                     &self.spec.args,
                     &workdir,
                     ctx,
-                    config_home.as_deref(),
+                    config_home,
                     broker.as_ref(),
                 )
                 .await?;
@@ -3184,14 +3236,7 @@ impl CliProvider {
         if let Some(session_id) = store.load() {
             let argv = session::resume_argv(&self.spec.args, &session.resume, &session_id);
             match self
-                .invoke(
-                    prompt,
-                    &argv,
-                    &workdir,
-                    ctx,
-                    config_home.as_deref(),
-                    broker.as_ref(),
-                )
+                .invoke(prompt, &argv, &workdir, ctx, config_home, broker.as_ref())
                 .await
             {
                 Ok(run) => {
@@ -3230,7 +3275,7 @@ impl CliProvider {
                 &self.spec.args,
                 &workdir,
                 ctx,
-                config_home.as_deref(),
+                config_home,
                 broker.as_ref(),
             )
             .await?;
@@ -4063,8 +4108,10 @@ format = "text"
         // the soul reached the CLI's own config home, and the stdin half is the
         // bare prompt — a native context door must not ALSO inflate the prompt.
         assert_eq!(out, "# soul\nbe kind\n---\nPROMPT");
-        // no guard for this door: the doc is under the run-runtime dir the
-        // provisioner's commit bracket removes.
+        // no ContextGuard for this door: the doc lands INSIDE the config home,
+        // so the run's own [`RunHome`] takes it away with the rest of that
+        // directory — and the reserved dir it hung under is one the
+        // provisioner's commit bracket removes anyway.
         assert!(workdir.join(RUN_RUNTIME_DIR).is_dir());
     }
 
@@ -4345,10 +4392,11 @@ broker = "anthropic-messages"
             SandboxBackend::Bare,
         );
         let workdir = scratch("claude_config_home_seed");
-        let dir = provider
-            .prepare_config_home(&workdir, &RunContext::default())
+        let home = provider
+            .prepare_config_home(&workdir)
             .expect("config home materializes")
             .expect("a claude spec names a config home");
+        let dir = home.config();
 
         let read = |name: &str| -> serde_json::Value {
             serde_json::from_str(
@@ -4381,17 +4429,103 @@ broker = "anthropic-messages"
             SandboxBackend::Bare,
         );
         let workdir = scratch("codex_config_home_seed");
-        let dir = provider
-            .prepare_config_home(&workdir, &RunContext::default())
+        let home = provider
+            .prepare_config_home(&workdir)
             .expect("config home materializes")
             .expect("a codex spec names a config home");
-        let entries: Vec<_> = std::fs::read_dir(&dir)
+        let dir = home.config();
+        let entries: Vec<_> = std::fs::read_dir(dir)
             .expect("read config home")
             .map(|e| e.expect("entry").file_name())
             .collect();
         assert!(
             entries.is_empty(),
             "codex config home must be empty, got {entries:?}"
+        );
+    }
+
+    /// EMPTY is a claim about the NAME. The slot was once
+    /// `sha256(run_key, agent_id, workdir)` — every coordinate that a rerun, a
+    /// retry of the same dispatch, and two concurrent runs of one agent all
+    /// share — so a second run walked into the first one's directory and read
+    /// its credentials file and transcripts. Since a run submitted by one
+    /// account executes on another account's node, that is one operator's
+    /// material handed to another's child.
+    ///
+    /// both homes are held ALIVE here: uniqueness must come from the name, not
+    /// from one guard having cleaned up before the other looked.
+    #[test]
+    fn two_runs_sharing_every_coordinate_get_different_config_homes() {
+        let provider = CliProvider::from_spec(
+            broker_spec("cx"),
+            PathBuf::from("/usr/bin/cx"),
+            SandboxBackend::Bare,
+        );
+        let workdir = scratch("config_home_collision");
+        let first = provider
+            .prepare_config_home(&workdir)
+            .expect("config home materializes")
+            .expect("a codex spec names a config home");
+        let second = provider
+            .prepare_config_home(&workdir)
+            .expect("config home materializes")
+            .expect("a codex spec names a config home");
+        assert_ne!(
+            first.config(),
+            second.config(),
+            "a second run must not be able to NAME the first run's config home"
+        );
+        for home in [&first, &second] {
+            let entries: Vec<_> = std::fs::read_dir(home.config())
+                .expect("read config home")
+                .map(|e| e.expect("entry").file_name())
+                .collect();
+            assert!(entries.is_empty(), "got {entries:?}");
+        }
+    }
+
+    /// the two-runs-in-one-workspace proof, end to end: a fake CLI reports
+    /// whether its config home already held state, then writes some (standing in
+    /// for the `.credentials.json` and transcripts a real executor leaves). Both
+    /// runs share a workspace and every context coordinate, and the second must
+    /// be as clean as the first — and neither may leave its state in the workdir,
+    /// which is mounted rw into the sandbox of whatever run comes next.
+    #[tokio::test]
+    async fn a_rerun_in_one_workspace_neither_inherits_nor_leaves_a_config_home() {
+        let root = scratch("config-home-rerun");
+        let script = fake_cli(
+            &root,
+            "state.sh",
+            "if [ -e \"$TEST_HOME/state\" ]; then echo INHERITED; else echo FRESH; fi\n\
+             echo pretend-credential > \"$TEST_HOME/state\"\n\
+             cat >/dev/null",
+        );
+        let provider = sh_provider(
+            spec_with("rerun", "[isolation]\nconfig_home_env = \"TEST_HOME\"\n"),
+            script,
+            "config-home-rerun-scratch",
+        );
+        let workspace = root.join("workspace");
+        let ctx = RunContext {
+            workdir_override: Some(workspace.clone()),
+            ..RunContext::default()
+        };
+
+        let first = provider.run("PROMPT", &ctx).await.expect("first run");
+        let second = provider.run("PROMPT", &ctx).await.expect("second run");
+        assert_eq!(first, "FRESH");
+        assert_eq!(
+            second, "FRESH",
+            "the second run walked into the first run's config home"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(workspace.join(RUN_RUNTIME_DIR))
+            .expect("read the run-runtime dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a finished run left its config home in a shared workdir: {leftovers:?}"
         );
     }
 
