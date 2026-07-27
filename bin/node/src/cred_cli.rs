@@ -66,15 +66,17 @@ pub(crate) enum CredCmd {
         /// the credential name
         name: String,
     },
-    /// lend a credential to a NODE's account: whoever runs a workload there may
-    /// draw on it (owner-signed)
+    /// lend a credential to an account: its nodes may draw on it, and so may a
+    /// node it delegates a run to (owner-signed)
     Grant {
         /// the credential name
         name: String,
-        /// the account of the node that will RUN the workload — a hex account id
-        /// or a display name. Not the account that submits the work: a run
-        /// submitted by one account and executed on another node reaches this
-        /// credential as the EXECUTING node, and that is who must be granted.
+        /// a hex account id or a display name. It is granted TWO ways, and both
+        /// are deliberate: any workload on a node bound to this account may draw
+        /// on the credential, AND a run this account SUBMITS may draw on it while
+        /// it executes on the node the account pinned it to (`agent sched
+        /// --host-node`, which names this credential in the committed work). The
+        /// second ends when that run ends. Nobody else's work, on either path.
         account: String,
     },
     /// rescind a lend (owner-signed). In flight sessions keep working until their

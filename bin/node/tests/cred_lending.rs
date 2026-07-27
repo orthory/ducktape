@@ -18,11 +18,12 @@
 //!
 //! And DELEGATION, which is why the ungranted refusal above is not the whole
 //! story: the same ungranted node opens a session when it presents a pointer to
-//! committed work the OWNER submitted and the saga module leased to it. Both
-//! halves of that rule get their own negative here — a pointer to a saga this
-//! caller does not hold the lease on, and a pointer the lender cannot resolve at
-//! all — because this lane needs no sandbox and can therefore drive shapes no
-//! product path will construct. The live end-to-end delegated RUN is
+//! committed work the OWNER submitted, PINNED to it, NAMING this credential, and
+//! still running. Each of those four gets its own negative here — the wrong
+//! executor, another credential, a saga the lender cannot resolve, and (the
+//! sharpest) the very pointer that just worked, replayed once its saga is
+//! terminal. This lane needs no sandbox, so it can drive shapes no product path
+//! constructs. The live end-to-end delegated RUN is
 //! `sched_pinned_run::a_delegated_run_draws_on_the_submitters_grant`.
 //!
 //! Like `airlock_gateway_e2e`, this proves the node-to-node overlay hop with a
@@ -238,20 +239,37 @@ fn query_credential(cluster: &Cluster, reader: usize, name: &str) -> Option<Cred
     }
 }
 
-/// Trigger a bare saga from node `idx` — whose KEY stamps the committed origin,
-/// because `/v1/submit` re-signs with the node's own signer — pinned to
-/// `target`, which the saga module leases at trigger time.
+/// Trigger a saga from node `idx` — whose KEY stamps the committed origin,
+/// because `/v1/submit` re-signs with the node's own signer — PINNED to `target`
+/// and naming `credential`, exactly the shape `agent sched --cred --host-node`
+/// composes (through the same two producers, so the gate and the composer cannot
+/// drift apart here).
 ///
-/// Nothing executes it: this cluster runs no compute daemon. The saga exists
-/// only to be POINTED AT, so its spec is opaque bytes and its lease window is
-/// wide enough that no crank can re-lease it out from under the assertions.
-fn trigger_pinned_saga(cluster: &Cluster, idx: usize, saga_id: &str, target: &[u8]) {
+/// Nothing executes it: this cluster runs no compute daemon. The saga exists only
+/// to be POINTED AT, so its lease window is wide enough that no crank can
+/// re-lease it out from under the assertions.
+fn trigger_pinned_saga(
+    cluster: &Cluster,
+    idx: usize,
+    saga_id: &str,
+    target: &[u8],
+    credential: &str,
+) {
+    let spec = dispatch::encode_work_spec(&dispatch::WorkSpec {
+        kind: dispatch::WORK_SPEC_KIND.into(),
+        dispatch_id: saga_id.rsplit('\u{1f}').next().unwrap().into(),
+        capability: "never-claimed".into(),
+        payload: compute_service::envelope::compose_headless(saga_id, "PING", Some(credential))
+            .into_bytes(),
+        demands: Default::default(),
+        admission: dispatch::AdmissionPolicy::Queue,
+    });
     cluster.submit(
         idx,
         "saga",
         &saga::encode_msg(&SagaMsg::Trigger {
             saga_id: saga_id.into(),
-            spec: b"opaque: nothing in this cluster executes it".to_vec(),
+            spec,
             reply_to: None,
             reply_payload: Vec::new(),
             deadline: None,
@@ -262,6 +280,36 @@ fn trigger_pinned_saga(cluster: &Cluster, idx: usize, saga_id: &str, target: &[u
             pinned_assignee: Some(target.to_vec()),
         }),
     );
+}
+
+/// Cancel a saga from the node that triggered it — the saga module admits a
+/// cancel only from the recorded origin, so this is node 0 retiring its own work.
+/// The cheapest way to reach a TERMINAL saga on a cluster that executes nothing.
+fn cancel_saga(cluster: &Cluster, idx: usize, saga_id: &str) {
+    cluster.submit(
+        idx,
+        "saga",
+        &saga::encode_msg(&SagaMsg::Cancel {
+            saga_id: saga_id.into(),
+        }),
+    );
+}
+
+/// Open a session against the owner's real lender through node 1's browser
+/// gateway — the only path production uses, and the one that makes the lender
+/// stamp node 1 as the vouched-for caller.
+fn open_session_as_node_1(
+    rt: &Runtime,
+    via: &str,
+    seal_pk: &[u8; 32],
+    credential: &str,
+    work: WorkRef,
+) -> Result<String, anyhow::Error> {
+    rt.block_on(async {
+        AirlockClient::remote("airlock.owner.duck".into(), via.to_string())
+            .open_session(seal_pk, credential, &work)
+            .await
+    })
 }
 
 fn saga_view(cluster: &Cluster, reader: usize, saga_id: &str) -> Option<SagaView> {
@@ -496,68 +544,103 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     // The SAME ungranted caller, and nothing below grants it anything. What
     // changes is that it presents a POINTER: a saga the OWNER submitted — so its
     // committed origin is the owner's node key, proven by the signature
-    // `/v1/submit` re-stamped on the op — which the saga module leased to the
-    // compute node. The lender resolves BOTH facts out of its own committed
-    // state; this side asserts neither and cannot.
+    // `/v1/submit` re-stamped on the op — pinned to the compute node and naming
+    // this credential. The lender resolves ALL of that out of its own committed
+    // state; this side asserts none of it and cannot.
+    let seal = record_ungranted.seal_pk;
     let delegated = "sched\u{1f}cred-lending-delegated";
-    trigger_pinned_saga(&cluster, 0, delegated, &compute_node);
+    trigger_pinned_saga(&cluster, 0, delegated, &compute_node, "owner-claude-1");
     wait_leased(&cluster, delegated, &compute_node);
-    rt.block_on(async {
-        AirlockClient::remote("airlock.owner.duck".into(), via_pre.clone())
-            .open_session(
-                &record_ungranted.seal_pk,
-                "owner-claude-1",
-                &WorkRef::Saga {
-                    saga_id: delegated.into(),
-                },
-            )
-            .await
-    })
-    .expect("an ungranted executor draws on the SUBMITTER's grant for work it holds the lease on");
+    open_session_as_node_1(
+        &rt,
+        &via_pre,
+        &seal,
+        "owner-claude-1",
+        WorkRef::Saga { saga_id: delegated.into() },
+    )
+    .expect("an ungranted executor draws on the SUBMITTER's grant for work it holds");
 
-    // NEGATIVE — the ASSIGNEE half, which is the one a "simplification" would
-    // drop. This saga's ORIGIN is the very same owner, so a gate that checked
-    // only the origin would admit it: every saga the owner ever submitted would
-    // become a key to the owner's subscription, for work the owner never
-    // assigned to this node.
+    // NEGATIVE — the EXECUTOR condition, the one a "simplification" would drop.
+    // This saga's ORIGIN is the very same owner, so a gate checking only the
+    // origin admits it: every saga the owner ever submitted would become a key to
+    // the owner's subscription, for work the owner never assigned to this node.
     let owners_own = "sched\u{1f}cred-lending-owners-own";
-    trigger_pinned_saga(&cluster, 0, owners_own, &owner_node);
+    trigger_pinned_saga(&cluster, 0, owners_own, &owner_node, "owner-claude-1");
     wait_leased(&cluster, owners_own, &owner_node);
-    let not_the_assignee = rt.block_on(async {
-        AirlockClient::remote("airlock.owner.duck".into(), via_pre.clone())
-            .open_session(
-                &record_ungranted.seal_pk,
-                "owner-claude-1",
-                &WorkRef::Saga {
-                    saga_id: owners_own.into(),
-                },
-            )
-            .await
-    });
-    let not_the_assignee =
-        not_the_assignee.expect_err("a pointer to work this caller does not hold is no grant");
+    let not_the_executor = open_session_as_node_1(
+        &rt,
+        &via_pre,
+        &seal,
+        "owner-claude-1",
+        WorkRef::Saga { saga_id: owners_own.into() },
+    )
+    .expect_err("a pointer to work this caller was not pinned to is no grant");
     assert!(
-        format!("{not_the_assignee}").contains("credential_not_granted"),
-        "pointing at somebody else's saga is a refusal, named as one: {not_the_assignee}"
+        format!("{not_the_executor}").contains("credential_not_granted"),
+        "pointing at somebody else's saga is a refusal, named as one: {not_the_executor}"
+    );
+
+    // NEGATIVE — the pointer buys ONE credential, the one the committed work
+    // names. Without this condition a single lease on the owner's saga opens a
+    // session for any credential any lender serves that the owner is granted on,
+    // including a third party's who never saw this saga. Same submitter, same
+    // executor, same pin — only the credential in the spec differs.
+    let names_another = "sched\u{1f}cred-lending-names-another";
+    trigger_pinned_saga(
+        &cluster,
+        0,
+        names_another,
+        &compute_node,
+        "a-totally-different-credential",
+    );
+    wait_leased(&cluster, names_another, &compute_node);
+    let wrong_credential = open_session_as_node_1(
+        &rt,
+        &via_pre,
+        &seal,
+        "owner-claude-1",
+        WorkRef::Saga { saga_id: names_another.into() },
+    )
+    .expect_err("work naming another credential entitles this session to nothing");
+    assert!(
+        format!("{wrong_credential}").contains("credential_not_granted"),
+        "a pointer is not a bearer token for the whole grant: {wrong_credential}"
+    );
+
+    // NEGATIVE — and the sharpest, because it is the SAME pointer that worked
+    // sixty lines up. The saga module clears no assignee and no pin on any
+    // terminal path, so without a liveness condition one finished run is a
+    // permanent, unmetered draw the owner has nothing to revoke: the executor
+    // holds no grant, so `user cred revoke` has no subject.
+    cancel_saga(&cluster, 0, delegated);
+    poll_until("the delegated saga to reach a terminal status", FINALIZE, || {
+        saga_view(&cluster, 0, delegated).filter(|view| view.status.is_terminal())
+    });
+    let finished = open_session_as_node_1(
+        &rt,
+        &via_pre,
+        &seal,
+        "owner-claude-1",
+        WorkRef::Saga { saga_id: delegated.into() },
+    )
+    .expect_err("a finished run is not a standing licence");
+    assert!(
+        format!("{finished}").contains("credential_not_granted"),
+        "the pointer that opened a session while the work ran must stop: {finished}"
     );
 
     // NEGATIVE — a pointer the lender cannot RESOLVE is undetermined, not
     // refused. A follower behind head sees exactly this shape, and answering 403
     // would send the borrower's operator to add a grant they may already hold —
     // the misdiagnosis the three-state taxonomy exists to prevent.
-    let unresolvable = rt.block_on(async {
-        AirlockClient::remote("airlock.owner.duck".into(), via_pre.clone())
-            .open_session(
-                &record_ungranted.seal_pk,
-                "owner-claude-1",
-                &WorkRef::Saga {
-                    saga_id: "sched\u{1f}never-committed".into(),
-                },
-            )
-            .await
-    });
-    let unresolvable =
-        unresolvable.expect_err("a saga the lender has not committed decides nothing");
+    let unresolvable = open_session_as_node_1(
+        &rt,
+        &via_pre,
+        &seal,
+        "owner-claude-1",
+        WorkRef::Saga { saga_id: "sched\u{1f}never-committed".into() },
+    )
+    .expect_err("a saga the lender has not committed decides nothing");
     assert!(
         format!("{unresolvable}").contains("503")
             && format!("{unresolvable}").contains("grant_authority_unavailable"),
@@ -629,7 +712,7 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     //
     // The runtime half — an ungranted node is refused by the real lender — ran
     // above, before the grant committed, in this same lane and with no sandbox,
-    // as did delegation and both of its negatives. What needs a real RUN, and
+    // as did delegation and all four of its negatives. What needs a real RUN, and
     // therefore podman, is the end-to-end proof that the executing node's own
     // broker composes that pointer without being told to:
     // `sched_pinned_run::a_delegated_run_draws_on_the_submitters_grant`.

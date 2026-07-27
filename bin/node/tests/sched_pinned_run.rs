@@ -28,6 +28,7 @@
 //!   | 0 | 0 submits, pinned to 1 | 1 admits nobody | `work_not_admitted` |
 //!   | 1 | 1 submits, pinned to itself | nobody granted | `credential_not_granted` |
 //!   | 2 | 0 submits, pinned to 1 | 1 admitted, **still ungranted** | `Done` + `PONG` |
+//!   | 2b | direction 2's pointer, replayed once its saga is terminal | unchanged | **refused** |
 //!   | 3 | 1 submits, pinned to itself | 1 granted | `Done` + `PONG` |
 //!
 //!   Direction 2 is the whole campaign: A submits, B executes, and the draw is
@@ -1036,6 +1037,38 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
         ),
         "and it did so with the executor on NO grant list — otherwise this \
          direction proves nothing the next one does not",
+    );
+
+    // ---- DIRECTION 2b: and the pointer DIES with the run -------------------
+    //
+    // The same saga id, the same executor, the same lender, one moment later —
+    // replayed by hand through node 1's browser gateway, exactly the path its own
+    // broker took to reach the lender above. The saga module clears neither
+    // `assignee` nor `pinned_assignee` on any terminal path, so without a
+    // liveness condition this one completed run is a permanent, unmetered
+    // licence: node 1 re-POSTs this body forever and mints a fresh token each
+    // time (the session budget is keyed on the CREDENTIAL and refilled on every
+    // open, so it caps nothing). The owner would have nothing to revoke — node 1
+    // holds no grant, so `user cred revoke` has no subject.
+    let (status, browser) = cluster.http(1, "GET", "/v1/gateway/browser", None);
+    assert_eq!(status, 200, "browser base failed: {browser}");
+    let via = browser["base"].as_str().unwrap().to_string();
+    let seal_pk = credential_record(&cluster, 1).expect("the record").seal_pk;
+    let replayed = rt.block_on(async {
+        AirlockClient::remote("airlock.owner.duck".into(), via)
+            .open_session(
+                &seal_pk,
+                CRED_NAME,
+                &airlock::wire::WorkRef::Saga {
+                    saga_id: delegated_id.into(),
+                },
+            )
+            .await
+    });
+    let replayed = replayed.expect_err("a finished run is not a standing licence");
+    assert!(
+        format!("{replayed}").contains("credential_not_granted"),
+        "the pointer that drew for a live run must stop drawing once it ends: {replayed}"
     );
 
     // ---- the grant, and the ONLY thing that changes -------------------------

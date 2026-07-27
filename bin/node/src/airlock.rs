@@ -49,7 +49,7 @@ use airlock::server::{GrantAnswer, GrantQuestion};
 use airlock::wire::WorkRef;
 use gateway::{CredentialRecord, GatewayQuery, GatewayReply, credential_use_allowed};
 use noded::node_link::NodeLink;
-use saga::{SagaOrigin, SagaQuery, SagaReply, SagaView};
+use saga::{SagaOrigin, SagaQuery, SagaReply, SagaStatus, SagaView};
 
 use crate::config;
 use crate::gateway_routes::RouteOwner;
@@ -308,10 +308,13 @@ pub(crate) fn lending_without_a_grant(storage: &Path, workspace: &Path) -> Optio
     Some(credentials)
 }
 
-/// A work pointer longer than this names no committed saga on any chain this
-/// node has ever seen, and turning it into a `/v1/query` would make an unadmitted
-/// caller's byte count this node's problem. Sagas in the tree are short
-/// (`sched\x1f<name>`, `dispatch\x1fruns\x1f<id>`); this is slack, not a policy.
+/// The longest work pointer this gate will turn into a `/v1/query`.
+///
+/// A REFUSAL, not an impossibility, and the difference is worth stating: the saga
+/// module's `Trigger` bounds `spec` and `reply_payload` but NOT `saga_id`, so a
+/// longer id is constructible. It is simply not a shape any product path emits
+/// (`sched\x1f<name>`, `dispatch\x1fruns\x1f<id>`), and an unadmitted caller's
+/// byte count is not this node's command lane's problem.
 const MAX_WORK_POINTER_BYTES: usize = 512;
 
 /// The committed-state grant gate the owner's own gateway enforces: given the
@@ -347,15 +350,7 @@ fn committed_grant_check(node: NodeLink) -> airlock::server::GrantCheck {
 async fn grant_answer(reader: &dyn CommittedReader, question: &GrantQuestion) -> GrantAnswer {
     let record = match committed_credential_record(reader, &question.credential).await {
         Ok(Some(record)) => record,
-        Ok(None) => {
-            tracing::debug!(
-                target: "ducktape::gateway",
-                reason = "credential_record_absent",
-                credential = %question.credential,
-                "airlock session refused"
-            );
-            return GrantAnswer::Refused;
-        }
+        Ok(None) => return refuse("credential_record_absent"),
         // The node is the AUTHORITY here, and it did not answer: a link timeout
         // ([`GRANT_QUERY_TIMEOUT`]), a refused connection while it restarts, a
         // resident whose `serving` is still None, a reply that would not decode.
@@ -364,7 +359,6 @@ async fn grant_answer(reader: &dyn CommittedReader, question: &GrantQuestion) ->
             tracing::debug!(
                 target: "ducktape::gateway",
                 reason = "grant_authority_unavailable",
-                credential = %question.credential,
                 "airlock session not decided: {error}"
             );
             return GrantAnswer::Undetermined;
@@ -377,23 +371,14 @@ async fn grant_answer(reader: &dyn CommittedReader, question: &GrantQuestion) ->
     match &question.work {
         // Nothing to delegate against. An interactive session takes this arm by
         // construction: there is no committed record of who asked for a pty.
-        WorkRef::Direct => {
-            tracing::debug!(
-                target: "ducktape::gateway",
-                reason = "credential_not_granted",
-                credential = %question.credential,
-                "airlock session refused"
-            );
-            GrantAnswer::Refused
-        }
-        WorkRef::Saga { saga_id } => {
-            delegated_answer(reader, &record, &question.caller, saga_id).await
-        }
+        WorkRef::Direct => refuse("credential_not_granted"),
+        WorkRef::Saga { saga_id } => delegated_answer(reader, &record, question, saga_id).await,
     }
 }
 
-/// One resolved half of the delegated check. THREE states for the same reason
-/// [`GrantAnswer`] has three: a read that did not answer is not a "no".
+/// One resolved condition of the delegated check that needed a committed read.
+/// THREE states for the same reason [`GrantAnswer`] has three: a read that did
+/// not answer is not a "no".
 enum Half {
     Yes,
     No,
@@ -402,35 +387,50 @@ enum Half {
 
 /// **Delegation: a run submitted by A and executed on B draws on A's grant.**
 ///
-/// BOTH halves are required, resolved from this lender's OWN committed state,
-/// and a future reader must not "simplify" either away:
+/// FOUR conditions, all required, all resolved from this lender's OWN committed
+/// state. A future reader must not "simplify" any of them away — each one is
+/// here because dropping it hands a stranger somebody's paid subscription:
 ///
-/// - **the saga's origin is an account this credential is granted to**, AND
-/// - **the caller is that saga's assignee.**
+/// 1. **the work is still LIVE** (`status == Pending`). A saga's `assignee` is
+///    never cleared on any terminal path, so without this one `Done` run is a
+///    permanent, network-wide, unmetered draw: the executor re-POSTs the same
+///    pointer forever and mints a fresh token each time (the session budget is
+///    keyed on the credential and REFILLED on every open, so it caps nothing).
+///    The owner would have nothing to revoke — the executor holds no grant, so
+///    `user cred revoke` has no subject.
+/// 2. **the work NAMES THIS CREDENTIAL.** Without it, one lease on A's saga
+///    opens a session for any credential any lender serves that A happens to be
+///    granted on — including Carol's, who never saw the saga and has no
+///    relationship with the executor at all.
+/// 3. **the caller is the saga's PINNED executor** — see
+///    [`caller_is_the_pinned_executor`] for why the pin and not the lease.
+/// 4. **the saga's origin is an account this credential is granted to** — see
+///    [`submitter_is_granted`].
 ///
-/// Drop the second and B may point at ANY saga A ever submitted and draw on A's
-/// grant for work A never assigned to it. Drop the first and this is just the
-/// old rule wearing a pointer. Neither is sufficient; the conjunction is the
-/// whole security argument.
+/// Drop 3 and B may point at ANY saga A ever submitted and draw on A's grant for
+/// work A never assigned to it. Drop 4 and this is just the old rule wearing a
+/// pointer. No condition is sufficient alone; the conjunction is the whole
+/// security argument.
 ///
 /// Nothing here trusts the caller beyond "which record to look up": the origin
 /// is a signature-proven node key (`/v1/submit` re-signs with the node's own
-/// signer), the assignee is what the saga module committed, and both are mapped
-/// to accounts through the identity module. See [`airlock::wire::WorkRef`].
+/// signer), the pin and the spec are what consensus committed, and node keys are
+/// mapped to accounts through the identity module. See
+/// [`airlock::wire::WorkRef`].
+///
+/// **Ordering is deliberate**: the two FREE conditions (1 and 2, both decided on
+/// bytes already read) run before either identity read, so a caller pointing at
+/// finished or unrelated work costs this node's command lane two queries rather
+/// than four.
 async fn delegated_answer(
     reader: &dyn CommittedReader,
     record: &CredentialRecord,
-    caller: &[u8],
+    question: &GrantQuestion,
     saga_id: &str,
 ) -> GrantAnswer {
     let pointer_is_plausible = saga_id.len() <= MAX_WORK_POINTER_BYTES;
     if !pointer_is_plausible {
-        tracing::debug!(
-            target: "ducktape::gateway",
-            reason = "work_pointer_oversized",
-            "airlock session refused"
-        );
-        return GrantAnswer::Refused;
+        return refuse("work_pointer_oversized");
     }
     let saga = match committed_saga(reader, saga_id).await {
         Ok(Some(saga)) => saga,
@@ -440,14 +440,7 @@ async fn delegated_answer(
         // which is the exact bug the three-state taxonomy exists to prevent; a
         // 503 tells them to retry, and a run whose saga never commits fails on
         // its own lane rather than on this one.
-        Ok(None) => {
-            tracing::debug!(
-                target: "ducktape::gateway",
-                reason = "delegated_work_unseen",
-                "airlock session not decided"
-            );
-            return GrantAnswer::Undetermined;
-        }
+        Ok(None) => return undecided("delegated_work_unseen"),
         Err(error) => {
             tracing::debug!(
                 target: "ducktape::gateway",
@@ -457,62 +450,105 @@ async fn delegated_answer(
             return GrantAnswer::Undetermined;
         }
     };
-    // HALF ONE, and it runs first because it is what binds the pointer to THIS
-    // caller. Short-circuiting also means a caller pointing at somebody else's
-    // saga never costs this node the second read.
-    match caller_holds_the_lease(reader, &saga, caller).await {
+    // ONE — free, and the difference between lending for a run and lending
+    // forever. A terminal saga is finished work; there is nothing left to draw
+    // for.
+    let work_is_live = match saga.status {
+        SagaStatus::Pending => true,
+        SagaStatus::Done
+        | SagaStatus::Failed
+        | SagaStatus::TimedOut
+        | SagaStatus::Cancelled => false,
+    };
+    if !work_is_live {
+        return refuse("delegated_work_finished");
+    }
+    // TWO — free. The committed work names exactly one credential; a session may
+    // draw on that one and no other.
+    let names_this_credential =
+        credential_the_work_names(&saga.spec).as_deref() == Some(question.credential.as_str());
+    if !names_this_credential {
+        return refuse("delegated_work_names_another_credential");
+    }
+    // THREE — the first read, and it binds the pointer to THIS caller.
+    match caller_is_the_pinned_executor(reader, &saga, &question.caller).await {
         Half::Unreadable => return GrantAnswer::Undetermined,
-        Half::No => {
-            tracing::debug!(
-                target: "ducktape::gateway",
-                reason = "delegated_caller_not_assignee",
-                "airlock session refused"
-            );
-            return GrantAnswer::Refused;
-        }
+        Half::No => return refuse("delegated_caller_not_the_executor"),
         Half::Yes => {}
     }
-    // HALF TWO.
+    // FOUR.
     match submitter_is_granted(reader, record, &saga.origin).await {
         Half::Yes => GrantAnswer::Granted,
-        Half::No => {
-            tracing::debug!(
-                target: "ducktape::gateway",
-                reason = "delegated_submitter_not_granted",
-                "airlock session refused"
-            );
-            GrantAnswer::Refused
-        }
+        Half::No => refuse("delegated_submitter_not_granted"),
         Half::Unreadable => GrantAnswer::Undetermined,
     }
 }
 
-/// Half one: does the vouched-for caller hold this saga's lease? Only the node
-/// the saga module actually assigned the attempt to may present its pointer.
+/// One refusal, one stable snake_case token. Never an account, a saga id, a
+/// credential name or a token — a `reason` is greppable and countable, and this
+/// ring is visible in the app.
+fn refuse(reason: &'static str) -> GrantAnswer {
+    tracing::debug!(target: "ducktape::gateway", reason, "airlock session refused");
+    GrantAnswer::Refused
+}
+
+fn undecided(reason: &'static str) -> GrantAnswer {
+    tracing::debug!(target: "ducktape::gateway", reason, "airlock session not decided");
+    GrantAnswer::Undetermined
+}
+
+/// Which credential the COMMITTED work names, read the way the EXECUTOR's own
+/// pool reads it: `WorkSpec.payload` is the run envelope verbatim, and
+/// `envelope::prepare` is the single place that schema lives. `None` for a spec
+/// that is not a work spec, a payload that is not the envelope, or a run that
+/// names no credential — each of which entitles the pointer to nothing.
+fn credential_the_work_names(spec: &[u8]) -> Option<String> {
+    let work = dispatch::decode_work_spec(spec).ok()?;
+    let envelope = String::from_utf8(work.payload).ok()?;
+    compute_service::envelope::prepare(&envelope).ok()?.credential
+}
+
+/// Condition three: is the vouched-for caller the node this saga is PINNED to?
 ///
-/// An attempt not yet leased has no assignee, and that is a real committed state
-/// rather than an unreadable one: nobody holds the lease, so nobody may draw on
+/// **`pinned_assignee`, not `assignee`, and the choice is load-bearing.** The pin
+/// is immutable — `Reassign` errors on a pinned saga, `Crank`'s re-lease returns
+/// the same pin, and `Accept` no-ops once an assignee exists — whereas the LEASE
+/// moves: for an UNPINNED saga a permissionless `Crank` re-leases through
+/// `pick_assignee`, whose height an attacker in the capability pool can time by
+/// choosing when to crank. Keying on the lease would let that rotation carry the
+/// submitter's credential to whoever won the roll.
+///
+/// So an unpinned saga simply cannot delegate. That costs nothing real: every
+/// credential-naming product path pins (`agent sched` always does), and this way
+/// the rule is enforced HERE rather than inherited from an invariant three crates
+/// away that nothing in this file could notice breaking.
+///
+/// It is also why the LEASE EXPIRY is deliberately not consulted. On a pinned
+/// saga an expired lease means "that attempt lapsed and the next one is the same
+/// node's", not "somebody else may hold it now" — refusing in that gap would
+/// refuse live work. `status` is the freshness question, and condition one asks
 /// it.
-async fn caller_holds_the_lease(
+async fn caller_is_the_pinned_executor(
     reader: &dyn CommittedReader,
     saga: &SagaView,
     caller: &[u8],
 ) -> Half {
-    let Some(assignee) = saga.assignee.as_deref() else {
+    let Some(pinned) = saga.pinned_assignee.as_deref() else {
         return Half::No;
     };
-    match account_of_node(reader, assignee).await {
+    match account_of_node(reader, pinned).await {
         Ok(Some(account)) => match account == caller {
             true => Half::Yes,
             false => Half::No,
         },
-        // The assignee node is bound to no account, so it is not this caller.
+        // The pinned node is bound to no account, so it is not this caller.
         Ok(None) => Half::No,
         Err(_) => Half::Unreadable,
     }
 }
 
-/// Half two: is the account that SUBMITTED this saga one the credential admits?
+/// Condition four: is the account that SUBMITTED this saga one the credential
+/// admits?
 ///
 /// `SagaOrigin::External` is the only attributable arm, and it is attributable
 /// precisely because `/v1/submit` re-signs with the node's own key. A saga a
@@ -616,14 +652,29 @@ mod tests {
         }
     }
 
+    /// The committed spec of a real `agent sched --cred <name>` run, composed
+    /// through the SAME two producers the CLI uses — a hand-rolled JSON blob here
+    /// would let the gate and the composer drift apart silently.
+    fn spec_naming(credential: &str) -> Vec<u8> {
+        dispatch::encode_work_spec(&dispatch::WorkSpec {
+            kind: dispatch::WORK_SPEC_KIND.into(),
+            dispatch_id: "delegated".into(),
+            capability: "sched-claude".into(),
+            payload: compute_service::envelope::compose_headless(SAGA, "PING", Some(credential))
+                .into_bytes(),
+            demands: Default::default(),
+            admission: dispatch::AdmissionPolicy::Queue,
+        })
+    }
+
     fn view(origin: SagaOrigin, assignee: Option<&[u8]>) -> SagaView {
         SagaView {
             origin,
             reply_to: None,
             reply_payload: Vec::new(),
-            spec: Vec::new(),
+            spec: spec_naming(CRED),
             capability: None,
-            status: saga::SagaStatus::Pending,
+            status: SagaStatus::Pending,
             attempt: 0,
             max_attempts: 1,
             assignee: assignee.map(<[u8]>::to_vec),
@@ -712,27 +763,16 @@ mod tests {
         );
     }
 
-    /// HALF ONE. The origin is the owner, so a gate that checked only the origin
-    /// admits this — and that is precisely the hole: every saga the owner ever
-    /// submitted would become a key to the owner's subscription, for work the
-    /// owner never assigned to this node.
+    /// The EXECUTOR condition. The origin is the owner, so a gate that checked
+    /// only the origin admits this — and that is precisely the hole: every saga
+    /// the owner ever submitted would become a key to the owner's subscription,
+    /// for work the owner never assigned to this node.
     #[tokio::test]
-    async fn a_caller_that_does_not_hold_the_lease_is_refused() {
+    async fn a_caller_that_is_not_the_pinned_executor_is_refused() {
         let state = Committed::new(
             SagaOrigin::External(OWNER_NODE.to_vec()),
             Some(STRANGER_NODE),
         );
-        assert_eq!(
-            grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
-            GrantAnswer::Refused
-        );
-    }
-
-    /// …and an attempt nobody holds yet is the same answer, from committed state
-    /// rather than from a failed read.
-    #[tokio::test]
-    async fn an_unleased_attempt_is_held_by_nobody() {
-        let state = Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), None);
         assert_eq!(
             grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
             GrantAnswer::Refused
@@ -849,6 +889,115 @@ mod tests {
             grant_answer(&RecordOnly, &question(EXEC_ACCOUNT, pointer())).await,
             GrantAnswer::Granted
         );
+    }
+
+    /// **A finished run is not a standing licence.** The saga module never clears
+    /// `assignee` on ANY terminal path, so without this the executor of one
+    /// `Done` run re-POSTs the same pointer forever and mints a fresh token each
+    /// time — a permanent, unmetered draw the owner cannot revoke, because the
+    /// executor holds no grant to revoke.
+    #[tokio::test]
+    async fn a_finished_run_is_not_a_standing_licence() {
+        for status in [
+            SagaStatus::Done,
+            SagaStatus::Failed,
+            SagaStatus::TimedOut,
+            SagaStatus::Cancelled,
+        ] {
+            let mut state =
+                Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
+            let saga = state.saga.as_mut().expect("the fixture commits a saga");
+            saga.status = status;
+            saga.attempt = 99;
+            assert_eq!(
+                grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+                GrantAnswer::Refused,
+                "a {status:?} saga must not still open sessions"
+            );
+        }
+    }
+
+    /// **The pointer buys ONE credential — the one the committed work names.**
+    /// Without this, a single lease on A's saga opens a session for any
+    /// credential any lender serves that A is granted on, including a third
+    /// party's who never saw the saga and has no relationship with the executor.
+    #[tokio::test]
+    async fn a_session_may_not_name_a_credential_the_work_does_not() {
+        let mut state = Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
+        state.saga.as_mut().expect("a saga").spec = spec_naming("a-totally-different-credential");
+        assert_eq!(
+            grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+            GrantAnswer::Refused
+        );
+    }
+
+    /// …and work whose credential cannot be read at all names none: a spec that
+    /// is not a work spec, and a run that carries no credential.
+    #[tokio::test]
+    async fn work_that_names_no_credential_delegates_nothing() {
+        for spec in [b"not a work spec at all".to_vec(), {
+            dispatch::encode_work_spec(&dispatch::WorkSpec {
+                kind: dispatch::WORK_SPEC_KIND.into(),
+                dispatch_id: "d".into(),
+                capability: "c".into(),
+                payload: compute_service::envelope::compose_headless(SAGA, "PING", None)
+                    .into_bytes(),
+                demands: Default::default(),
+                admission: dispatch::AdmissionPolicy::Queue,
+            })
+        }] {
+            let mut state =
+                Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
+            state.saga.as_mut().expect("a saga").spec = spec;
+            assert_eq!(
+                grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+                GrantAnswer::Refused
+            );
+        }
+    }
+
+    /// **The PIN is the binding, not the lease.** An unpinned saga's assignee
+    /// moves — a permissionless `Crank` re-leases through `pick_assignee` at a
+    /// height an attacker in the capability pool can choose, `Reassign` moves it
+    /// outright, and `Accept` claims one that landed unassigned. Keying on the
+    /// lease would carry the submitter's credential to whoever won that roll, so
+    /// an unpinned saga delegates to nobody — including to the node currently
+    /// holding its lease.
+    #[tokio::test]
+    async fn an_unpinned_saga_delegates_to_nobody() {
+        let mut state = Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
+        state.saga.as_mut().expect("a saga").pinned_assignee = None;
+        assert_eq!(
+            grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+            GrantAnswer::Refused,
+            "the lease alone is not the binding, even when it is this caller's"
+        );
+    }
+
+    /// The two FREE conditions are decided before either identity read, so a
+    /// caller pointing at finished or unrelated work costs this node's command
+    /// lane two queries rather than four. The reader PANICS on `identity`.
+    #[tokio::test]
+    async fn a_pointer_at_the_wrong_work_costs_no_identity_read() {
+        struct NoIdentity(Committed);
+        #[async_trait::async_trait]
+        impl CommittedReader for NoIdentity {
+            async fn read(&self, target: &str, request: Vec<u8>) -> Result<Vec<u8>, String> {
+                assert_ne!(target, "identity", "a free condition already settled this");
+                self.0.read(target, request).await
+            }
+        }
+        let mut finished =
+            Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
+        finished.saga.as_mut().expect("a saga").status = SagaStatus::Done;
+        let mut other = Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
+        other.saga.as_mut().expect("a saga").spec = spec_naming("some-other-credential");
+        for state in [finished, other] {
+            assert_eq!(
+                grant_answer(&NoIdentity(state), &question(EXEC_ACCOUNT, pointer())).await,
+                GrantAnswer::Refused
+            );
+        }
     }
 
     /// A pointer nobody could have committed is refused before it becomes a

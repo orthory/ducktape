@@ -1272,30 +1272,75 @@ async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, Str
         }
         AirlockTrust::PinnedSealPk(pk) => *pk,
     };
-    // The session names the CREDENTIAL and nothing else. On a lending gateway the
-    // grant subject is the account the owner's node vouched for when this request
-    // made the hop — this side does not get to name one, and the token that comes
-    // back carries no identity either.
-    let handshake = gateway
-        .open_session_sealed(&seal_pk, &cfg.sub, &cfg.work)
-        .await;
+    // The session names the CREDENTIAL and the WORK it draws for, and nothing
+    // else. On a lending gateway the grant subject is the account the owner's
+    // node vouched for when this request made the hop — this side does not get to
+    // name one, and the token that comes back carries no identity either.
+    //
     // A handshake failure is named for WHAT failed, before any credentialed
     // request. Every distinguishable cause has its own reason: the lender's
     // daemon not running, its route or credential absent, its grant gate saying
     // no — and only a token that will not unseal is a seal_pk mismatch.
-    let (token, keys) = match handshake {
+    let (token, keys) = match open_session_retrying(&gateway, &seal_pk, &cfg).await {
         Ok(opened) => opened,
-        Err(error) => {
-            let refusal = SessionRefusal::of(&error);
+        Err(refusal) => return Err(refusal.reason().to_string()),
+    };
+    Ok((AirlockSession { gateway, seal_pk, sub: cfg.sub, work: cfg.work, token, keys }, base))
+}
+
+/// How long the delegated lane waits out a lender that is a block behind.
+///
+/// A delegated session points at a saga, and the executor dials the LENDER the
+/// moment its OWN node executed the block emitting the work — so a lender one
+/// block behind has not committed that saga yet and honestly answers
+/// [`SessionRefusal::AuthorityUnavailable`] (503). That is the one refusal the
+/// taxonomy defines as "ask again", and nothing did: the pool turned it into an
+/// `OracleResult(Err)` that CONSUMED one of the run's attempts, with recovery
+/// then waiting a full lease window.
+///
+/// So this lane retries that one arm and no other. A refusal (403) is settled and
+/// re-asking is just a slower 403; only "I could not decide" can become a
+/// different answer by waiting. Roughly two block times of slack, which is the
+/// gap being covered.
+const SESSION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+const SESSION_RETRY_ATTEMPTS: u32 = 6;
+
+/// Open one sealed session, re-asking ONLY while the lender says it could not
+/// decide. Logs attempt 1 and then the last one — a bounded retry that narrates
+/// every turn is the log bomb the doctrine forbids, and `attempts` IS the
+/// diagnosis.
+async fn open_session_retrying(
+    gateway: &Gateway,
+    seal_pk: &[u8; 32],
+    cfg: &AirlockConfig,
+) -> Result<(String, airlock::handshake::SessionKeys), SessionRefusal> {
+    for attempt in 1..=SESSION_RETRY_ATTEMPTS {
+        let error = match gateway.open_session_sealed(seal_pk, &cfg.sub, &cfg.work).await {
+            Ok(opened) => return Ok(opened),
+            Err(error) => error,
+        };
+        let refusal = SessionRefusal::of(&error);
+        let worth_retrying = refusal == SessionRefusal::AuthorityUnavailable;
+        let last = attempt == SESSION_RETRY_ATTEMPTS;
+        if !worth_retrying || last {
             tracing::warn!(
                 target: "ducktape::gateway",
                 reason = refusal.reason(),
+                attempts = attempt,
                 "airlock session not opened: {error}"
             );
-            return Err(refusal.reason().to_string());
+            return Err(refusal);
         }
-    };
-    Ok((AirlockSession { gateway, seal_pk, sub: cfg.sub, work: cfg.work, token, keys }, base))
+        if attempt == 1 {
+            tracing::debug!(
+                target: "ducktape::gateway",
+                reason = refusal.reason(),
+                "airlock session undecided; asking again"
+            );
+        }
+        tokio::time::sleep(SESSION_RETRY_DELAY).await;
+    }
+    unreachable!("the loop returns on its final attempt")
 }
 
 /// Why a lender's gateway would not open a session.
@@ -3388,6 +3433,68 @@ mod tests {
     /// cannot, since `SessionRequest` carries none. This test formerly asserted
     /// the opposite ("only because the broker names the granted account in
     /// `account_b64`"), and that field was the credential-theft defect.
+    /// **A lender one block behind is asked again, not failed.** The delegated
+    /// lane dials the moment the EXECUTOR's node executed the block emitting the
+    /// work, so a lender that has not committed that saga yet honestly answers
+    /// 503 — the one refusal the taxonomy defines as "ask again". Failing there
+    /// consumed one of the run's three attempts and pushed recovery out a full
+    /// lease window.
+    ///
+    /// The gate answers Undetermined once, then Granted. The test waits on the
+    /// handshake's own completion, not on a clock.
+    #[tokio::test]
+    async fn a_lender_that_could_not_decide_yet_is_asked_again() {
+        let upstream = bearer_upstream("tok-grant").await;
+        let (kp, seal_pk) = seal_pair();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = asked.clone();
+        let check: airlock::server::GrantCheck = std::sync::Arc::new(move |_question| {
+            let first = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                match first {
+                    true => airlock::server::GrantAnswer::Undetermined,
+                    false => airlock::server::GrantAnswer::Granted,
+                }
+            })
+        });
+        let (app, _) = airlock::server::build_seeded_gated(
+            airlock::server::GatewayConfig {
+                attest: airlock::server::AttestMode::SelfHost,
+                seal_keypair: Some(kp),
+                anthropic_base: upstream.clone(),
+                openai_base: upstream.clone(),
+                oauth_token_url: format!("{upstream}/oauth/token"),
+                oauth_client_id: "test-client".into(),
+                session_ttl_secs: 3600,
+                max_requests: 100,
+            },
+            vec![(
+                "owner-claude-1".into(),
+                airlock::wire::CredentialKind::Claude,
+                airlock::wire::CredentialPayload::Bearer { access_token: "tok-grant".into() },
+            )],
+            Some(check),
+        )
+        .unwrap();
+        let app = airlock::testkit::behind_gateway_proxy(app, b"grantee");
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let gateway_url = format!("http://{addr}");
+        let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
+        AnthropicAuth::airlock(AirlockConfig::self_host(
+            &rc,
+            WorkRef::Saga { saga_id: "sched\u{1f}pending".into() },
+        ))
+        .await
+        .expect("a lender that answers on the second ask still opens the session");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2, "asked exactly twice");
+    }
+
     #[tokio::test]
     async fn a_gated_lender_admits_the_brokers_session_on_the_vouched_account() {
         let upstream = bearer_upstream("tok-grant").await;
