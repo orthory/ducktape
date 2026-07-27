@@ -19,14 +19,13 @@ use zeroize::{Zeroize as _, Zeroizing};
 // chat's client view model is module-owned (`chat::client`) — the rendered
 // row types, the composer parsing, the optimistic merges, and the op-delta
 // splices. re-exported here because the Ice externs resolve `crate::backend`.
-#[cfg(test)]
-pub use chat::client::paragraph_blocks;
 pub use chat::client::{
     ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage, ChatReaction, ChatSpan,
     append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
     apply_chat_thread, author_name, chat_message, contains_pending_message, mark_message_groups,
     merge_message_send_result, merge_pending_messages, merge_thread_reply, optimistic_message,
-    parse_message_with_members, rollback_pending_message, short_label, thread_offset_after_reply,
+    paragraph_blocks, parse_message_with_members, rollback_pending_message, short_label,
+    thread_offset_after_reply,
 };
 // forge's client view model, same arrangement: the tracker rows, the item
 // pane (reviews + merge-box tallies), and the op-refresh classification.
@@ -1090,7 +1089,11 @@ pub async fn files_preview(
         let eof = reply["eof"].as_bool().unwrap_or(true);
         let bytes = base64_decode(b64).unwrap_or_default();
         let (text, binary) = match String::from_utf8(bytes.clone()) {
-            Ok(text) if !text.chars().any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') => {
+            Ok(text)
+                if !text
+                    .chars()
+                    .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') =>
+            {
                 (text, false)
             }
             _ => (format!("{} binary bytes", bytes.len()), true),
@@ -7317,7 +7320,6 @@ mod tests {
                 target: target.into(),
                 payload,
             },
-            None,
         );
         rpc.submit_frame(frame).await.unwrap();
     }

@@ -559,7 +559,7 @@ impl ValidatorRuntime<'_> {
             } => {
                 let seq = self.next_seq;
                 self.next_seq += 1;
-                let frame = node::encode_frame(&self.signer, seq, &Msg { target, payload }, None);
+                let frame = node::encode_frame(&self.signer, seq, &Msg { target, payload });
                 self.submit_local_frame(frame, reply).await;
             }
             // an ALREADY-SIGNED frame: submitted VERBATIM, never re-signed and

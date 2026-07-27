@@ -602,25 +602,37 @@ fn unmet_hint(row: &ServiceRow) -> Option<String> {
 }
 
 /// The build column: the signaling daemon's stamp, and — only when it differs
-/// from this node's — the node's beside it.
+/// from the NODE's — the node's beside it.
 ///
 /// This IS the diagnostic that replaced the build gate. Skew is now visible
 /// and informational; it used to keep the daemon out of the catalog entirely,
 /// so this row could not have existed to show it.
-fn render_build(daemon: Option<&str>) -> String {
+///
+/// `node` is the stamp the NODE reported in its own `/v1/services` document,
+/// and reading this binary's `build_identity_or_unknown()` instead was a real
+/// defect: a CLI is whichever `ducktape` the operator happened to type, not the
+/// one running the node. `service status` from an older binary printed THAT
+/// binary's commit as "(this node: …)" — naming a build the node was not
+/// running, and calling a daemon skewed that was in step with it.
+///
+/// One rule for "do these two stamps disagree", and it is [`Skew`]'s: a side
+/// that cannot name its build proves nothing, and neither does a node that did
+/// not answer.
+fn render_build(daemon: Option<&str>, node: Option<&str>) -> String {
     let Some(daemon) = daemon else {
         return "-".into();
     };
-    let mine = noded::services::build_identity_or_unknown();
-    let matches_this_node = daemon == mine;
-    if matches_this_node {
+    let Some(node) = node else {
         return daemon.to_string();
+    };
+    match Skew::between(daemon, Some(node)) {
+        Skew::Matched | Skew::Unknown => daemon.to_string(),
+        Skew::Skewed => format!("{daemon} {}", paint(YELLOW, &format!("(this node: {node})"))),
     }
-    format!("{daemon} {}", paint(YELLOW, &format!("(this node: {mine})")))
 }
 
 /// `service status` — a readable block per service rather than a flat dump.
-fn render_status(rows: &[ServiceRow]) -> String {
+fn render_status(rows: &[ServiceRow], node_build: Option<&str>) -> String {
     if rows.is_empty() {
         return "no services signaling and none enabled\n".into();
     }
@@ -638,7 +650,7 @@ fn render_status(rows: &[ServiceRow]) -> String {
         let fields = [
             ("instance", row.instance.as_deref().unwrap_or("-").to_string()),
             ("version", row.version.as_deref().unwrap_or("-").to_string()),
-            ("build", render_build(row.build.as_deref())),
+            ("build", render_build(row.build.as_deref(), node_build)),
             ("offers", join_or_dash(&row.capabilities)),
             ("scopes", join_or_dash(&row.scopes)),
             ("needs", join_or_dash(&row.needs)),
@@ -864,65 +876,79 @@ pub(super) fn run(cmd: ServiceCmd) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// what `GET /v1/services` says: who is signaling, and WHICH NODE said so.
+#[derive(Debug, Default)]
+struct Catalog {
+    signaling: Vec<noded::services::Signaling>,
+    /// the node's OWN build stamp, straight out of the node process. `None` =
+    /// the node did not answer, which is not evidence of anything. Never this
+    /// binary's `build_identity_or_unknown()`: see [`render_build`].
+    node_build: Option<String>,
+}
+
 /// The services signaling to the workspace's own node. A node that is not
 /// running is NOT an error here: nothing signaling is exactly what `list` must
 /// render, and the grants still come off disk.
-fn signaling_now(workspace: &Path) -> Vec<noded::services::Signaling> {
-    match read_signaling(workspace) {
-        Ok(signaling) => signaling,
+fn catalog_now(workspace: &Path) -> Catalog {
+    match read_catalog(workspace) {
+        Ok(catalog) => catalog,
         // A node that is not running is the ordinary case — `list` must still
         // render the grants — so it stays quiet. Anything else (a 404, a 500,
         // a body whose shape changed) would otherwise be indistinguishable
         // from "nothing is signaling", which is exactly the wrong thing to
         // tell someone who is about to consent to something.
-        Err(crate::node_http::ReadFailure::Unreachable) => Vec::new(),
+        Err(crate::node_http::ReadFailure::Unreachable) => Catalog::default(),
         Err(error) => {
             let _ = write_err(&format!(
                 "{} could not read the signaling catalog: {error}\n",
                 paint(YELLOW, "warning:")
             ));
-            Vec::new()
+            Catalog::default()
         }
     }
 }
 
-fn read_signaling(
-    workspace: &Path,
-) -> Result<Vec<noded::services::Signaling>, crate::node_http::ReadFailure> {
+fn read_catalog(workspace: &Path) -> Result<Catalog, crate::node_http::ReadFailure> {
     use crate::node_http::ReadFailure;
     let base = config::http_base_in(workspace).map_err(ReadFailure::Rejected)?;
     let body = crate::node_http::get_json(&base, "/v1/services")?;
     let signaling = body.get("signaling").ok_or_else(|| {
         ReadFailure::Rejected("/v1/services carries no `signaling` field".into())
     })?;
-    serde_json::from_value(signaling.clone())
-        .map_err(|e| ReadFailure::Rejected(format!("unexpected /v1/services shape: {e}")))
+    Ok(Catalog {
+        signaling: serde_json::from_value(signaling.clone())
+            .map_err(|e| ReadFailure::Rejected(format!("unexpected /v1/services shape: {e}")))?,
+        node_build: body["build"].as_str().map(str::to_string),
+    })
 }
 
-
-fn view(args: &ReadArgs) -> Result<Vec<ServiceRow>, Box<dyn std::error::Error>> {
+/// the rendered rows and the node build they are to be judged against.
+fn view(args: &ReadArgs) -> Result<(Vec<ServiceRow>, Option<String>), Box<dyn std::error::Error>> {
     let workspace = args.workspace.dir()?;
     let grants = load(&workspace)?;
-    Ok(rows(&signaling_now(&workspace), &grants.grants))
+    let catalog = catalog_now(&workspace);
+    Ok((rows(&catalog.signaling, &grants.grants), catalog.node_build))
 }
 
 fn list(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let rows = view(&args)?;
+    let (rows, _node_build) = view(&args)?;
     if args.json {
         println!("{}", serde_json::to_string(&rows)?);
         return Ok(());
     }
+    // no build column in `list`: it is the one-line-per-service view, and the
+    // node's stamp belongs beside the daemon's, which only `status` has room for.
     write_out(&render_list(&rows))?;
     Ok(())
 }
 
 fn status(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let rows = view(&args)?;
+    let (rows, node_build) = view(&args)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
-    write_out(&render_status(&rows))?;
+    write_out(&render_status(&rows, node_build.as_deref()))?;
     Ok(())
 }
 
@@ -981,13 +1007,13 @@ pub(crate) fn plan_enable(
     service: &config::ServiceConfig,
     node_id: [u8; 32],
 ) -> Result<EnablePlan, String> {
-    plan_enable_from(workspace, kind, service, node_id, signaling_now(workspace))
+    plan_enable_from(workspace, kind, service, node_id, catalog_now(workspace).signaling)
 }
 
 /// The decide half, with the signaling catalog SUPPLIED rather than fetched.
 ///
 /// Split so the consent boundary's two refusals — an illegal tag and a
-/// cap-crossing union — are reachable from a test. `signaling_now` reads
+/// cap-crossing union — are reachable from a test. `catalog_now` reads
 /// `/v1/services` over HTTP, so with it inlined every rule in here could only be
 /// exercised against a running node, which in practice meant not at all.
 fn plan_enable_from(
@@ -1113,7 +1139,7 @@ pub(crate) fn commit_enable(
     // can produce, and this is a subset of it.
     let announce = crate::announce::announced_set(
         &services.grants,
-        &signaling_now(workspace),
+        &catalog_now(workspace).signaling,
         &plan.capacity,
     )
     .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))?;
@@ -1278,6 +1304,209 @@ fn serve_kind(
         })?,
     }
     Ok(Served::Stopped)
+}
+
+/// A daemon's stop signal: resolves when SIGTERM or SIGINT lands (see
+/// [`arm_stop_requested`]), or when the caller's own `also_stop` does — which is
+/// how a test drives the real serve path.
+///
+/// Boxed rather than a generic parameter: compute's intake pass is `?Send` and
+/// every daemon body would otherwise have to name the wrapper's opaque future
+/// type. One allocation per process.
+pub(crate) type Stop = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+
+/// Build a daemon's runtime, ARM its stop signals INSIDE it, and run `body`
+/// until it returns or a stop lands.
+///
+/// Every first-party daemon enters here — compute, agent and airlock — so the
+/// ordering that matters exists in ONE place: the handlers are installed before
+/// `body` is even constructed, which is what closes the window in which a
+/// default-disposition SIGTERM kills a daemon that has already published a
+/// gateway route or started a `podman system service`. That orphaned service
+/// child outlives its owner at ppid 1, still answering on its socket, with its
+/// containers still running — the defect this exists to prevent. Copying the
+/// ordering into three `serve` fns is how two of them drift; a body cannot get
+/// it wrong here, because it never touches it.
+///
+/// Multi-thread, because every daemon needs it: compute's pool hands `Send`
+/// futures to its `SpawnFn`, agent gives each session's pump and reaper a task
+/// of its own, and airlock's route beat runs beside its listener.
+pub(crate) fn serve_until_stopped<Body>(
+    also_stop: impl std::future::Future<Output = ()> + 'static,
+    body: impl FnOnce(Stop) -> Body,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    Body: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        // ARMED before `body` runs, and inside the runtime, which installing a
+        // signal handler REQUIRES. See [`arm_stop_requested`].
+        let signalled = arm_stop_requested();
+        let stop: Stop = Box::pin(async move {
+            tokio::select! {
+                () = signalled => {}
+                () = also_stop => {}
+            }
+        });
+        body(stop).await
+    })
+}
+
+/// Install the stop handlers NOW and return a future that waits on them: SIGTERM
+/// is what systemd and a killed shell send, SIGINT is Ctrl-C.
+///
+/// The split matters. `signal()` installs the handler when it is CALLED; the
+/// future it returns only waits. Building that future lazily inside a `select!`
+/// would leave a window between the daemon publishing something and the first
+/// poll in which a SIGTERM takes its DEFAULT disposition — killing the process
+/// with a live gateway route pointing at a port anything may then bind, or with
+/// a `podman system service` child that survives at ppid 1 with its containers
+/// still running.
+///
+/// It must also be called INSIDE a runtime: `signal()` PANICS outside a reactor
+/// rather than returning `Err`, so hoisting this out of
+/// [`serve_until_stopped`]'s `block_on` is a production-only crash with no
+/// compile-time complaint.
+///
+/// SIGKILL is deliberately NOT covered, and cannot be: nothing runs on a
+/// `kill -9`, so the service child and its containers survive it. The answer
+/// there is the next start of the same kind — `PodmanService::claim` reaps the
+/// podman service recorded under a root nobody holds any more, and each daemon's
+/// boot sweep ([`Sweep::CrashOrphans`]) removes its label-scoped containers over
+/// the new socket on the same graph root. That path must keep working; it is the
+/// only one a SIGKILL has.
+///
+/// A handler that will not install is NOT fatal — the daemon then dies the way
+/// it did before this arm existed, which is old behavior rather than a new
+/// failure. The future parks so the daemon keeps owning the process.
+///
+/// The other half is deliberately NOT closed, and should stay open: tokio's
+/// handlers remain installed after these `Signal`s drop, so a SECOND SIGTERM
+/// arriving during a teardown is swallowed and SIGKILL is the operator's only
+/// escape. A teardown is one file write or one container sweep — a hang there
+/// means an unwritable workspace or a wedged podman, which is the real problem —
+/// and a SIGTERM-count escalation is not worth its complexity. Do not "finish"
+/// this.
+fn arm_stop_requested() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let armed = (signal(SignalKind::terminate()), signal(SignalKind::interrupt()));
+    async move {
+        let (Ok(mut terminate), Ok(mut interrupt)) = armed else {
+            tracing::warn!(
+                target: "ducktape::service",
+                reason = "signal_handler_install_failed",
+                "this daemon will not run its teardown on exit"
+            );
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    }
+}
+
+/// Why a daemon is sweeping the containers carrying its own instance label —
+/// the ONE discriminant the report below branches on. The two ends of a daemon's
+/// life mean DIFFERENT things and must not be logged as one: a boot sweep
+/// destroys work a crash left running, a stop sweep is routine hygiene.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Sweep {
+    /// At BOOT. Whatever still carries this instance's label survived a death
+    /// that ran no code (SIGKILL, the OOM killer, power loss) — the stop path
+    /// leaves none. It is DESTROYED, not resumed: there is no attach path in
+    /// this tree, and a run's output lane, broker endpoint and provisioned
+    /// workspace all died with the process that owned them. The saga's lease
+    /// timeout re-leases the attempt and it executes again from the start, so
+    /// this is lost work and says so.
+    CrashOrphans,
+    /// At STOP. Our own live containers, taken down before the podman service
+    /// that hosts them — routine, and the reason a later boot can assume
+    /// anything it finds is an orphan.
+    Teardown,
+}
+
+/// What a finished sweep is worth saying. Decided here, written by
+/// [`sweep_own_containers`] — so the boot/stop distinction is checkable without
+/// a podman socket.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum SweepReport {
+    /// nothing carried the label: the ordinary boot, and every clean stop that
+    /// had no session running.
+    Quiet,
+    /// a crash left containers behind and their work is gone with them.
+    Destroyed(usize),
+    /// this daemon's own containers, removed on the way out.
+    Removed(usize),
+    /// the sweep itself failed. Never fatal — at boot it costs a stale
+    /// container, at stop it leaves one for the next boot to destroy.
+    Failed(String),
+}
+
+/// Decide what to say about a sweep. Pure: one discriminant, one match.
+pub(crate) fn sweep_report(sweep: Sweep, outcome: Result<usize, String>) -> SweepReport {
+    let removed = match outcome {
+        Ok(removed) => removed,
+        Err(error) => return SweepReport::Failed(error),
+    };
+    let swept_nothing = removed == 0;
+    if swept_nothing {
+        return SweepReport::Quiet;
+    }
+    match sweep {
+        Sweep::CrashOrphans => SweepReport::Destroyed(removed),
+        Sweep::Teardown => SweepReport::Removed(removed),
+    }
+}
+
+/// Remove every container carrying this instance's label, over this daemon's own
+/// podman socket.
+///
+/// The ONE sweep both daemons use, at both ends of their life — compute and
+/// agent differed only in the noun in their log line, which is not worth two
+/// copies of a rule about destroying an operator's work.
+///
+/// Best-effort by construction: a sweep failure is a line, never a boot failure
+/// and never a failed stop.
+pub(crate) async fn sweep_own_containers(
+    backend: &provider_host::SandboxBackend,
+    grant: &ServiceGrant,
+    sweep: Sweep,
+) {
+    let provider_host::SandboxBackend::Podman { socket, .. } = backend else {
+        // Tart clones and deletes a VM per run; there is no label to sweep.
+        return;
+    };
+    let label = provider_host::managed_label(&grant.display_id());
+    let outcome = provider_host::reap_by_label(socket, &label).await;
+    match sweep_report(sweep, outcome) {
+        SweepReport::Quiet => {}
+        // a crash destroyed work: once per boot, and the operator's runs are
+        // what was lost, so it is not an `info`.
+        SweepReport::Destroyed(removed) => tracing::warn!(
+            target: "ducktape::service",
+            instance = %grant.display_id(),
+            removed,
+            reason = "crash_orphans_destroyed",
+            "containers left by an earlier death were removed, not resumed — their work re-executes from the start"
+        ),
+        SweepReport::Removed(removed) => tracing::info!(
+            target: "ducktape::service",
+            instance = %grant.display_id(),
+            removed,
+            reason = "own_containers_removed",
+            "this instance's containers were removed before its sandbox service stopped"
+        ),
+        SweepReport::Failed(error) => tracing::warn!(
+            target: "ducktape::service",
+            instance = %grant.display_id(),
+            reason = "container_sweep_failed",
+            "could not sweep this instance's containers: {error}"
+        ),
+    }
 }
 
 /// the grant scopes a kind's daemon actually exercises — what the consent
@@ -1654,7 +1883,7 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
     // which `Services::validate` prevents on load.
     let announce = crate::announce::announced_set(
         &services.grants,
-        &signaling_now(&workspace),
+        &catalog_now(&workspace).signaling,
         &service.sandbox_capacity,
     )
     .map_err(|refusal| format!("{kind} was not disabled: {refusal}"))?;
@@ -1695,6 +1924,81 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stop arming, driven through the REAL entry every daemon serves from
+    /// — not a replica of the call, which is the guard that once shipped green
+    /// while the production ordering was broken.
+    ///
+    /// The body raises a REAL SIGTERM at this process the moment it starts, i.e.
+    /// at the first instant a daemon could have published a route or started a
+    /// `podman system service`. Delete the arming and the default disposition
+    /// ends the test binary right there; hoist it out of `block_on` and
+    /// `signal()` panics for want of a reactor. It then returns only because the
+    /// armed handler is WIRED into the stop the body was handed — `also_stop` is
+    /// `pending`, so nothing else can resolve it.
+    ///
+    /// It waits on the signal, never on a clock.
+    #[test]
+    fn a_daemon_starts_with_its_stop_handlers_already_armed() {
+        let served = serve_until_stopped(std::future::pending(), |stop| async move {
+            // SAFETY: `raise(3)` signals this process and has no memory effects.
+            // Delivery is synchronous, so an unarmed SIGTERM ends the process
+            // here rather than at some later, harder-to-read moment.
+            unsafe { libc::raise(libc::SIGTERM) };
+            stop.await;
+            Ok(())
+        });
+        served.expect("a signalled daemon stops cleanly");
+    }
+
+    /// The shape, guarded where a comment cannot reach: every daemon must ENTER
+    /// through [`serve_until_stopped`]. One that builds its own runtime again is
+    /// one whose `podman system service` outlives it at ppid 1 — and no test
+    /// above would notice, because the arming it skipped still works.
+    #[test]
+    fn every_daemon_enters_through_the_one_armed_entry() {
+        for (daemon, source) in [
+            ("compute", include_str!("compute/mod.rs")),
+            ("agent", include_str!("agent/mod.rs")),
+            ("airlock", include_str!("airlock.rs")),
+        ] {
+            assert!(
+                source.contains("serve_until_stopped"),
+                "the {daemon} daemon does not serve through the armed entry"
+            );
+            assert!(
+                !source.contains("tokio::runtime::Builder"),
+                "the {daemon} daemon builds its own runtime, so its stop handlers are its own to get wrong"
+            );
+        }
+    }
+
+    /// The two ends of a daemon's life are not the same event, and the log is
+    /// the only place an operator learns which one happened. A boot sweep
+    /// DESTROYS work a crash left running; a stop sweep is hygiene. Reporting
+    /// both as "reaped orphans" is what told a reader their in-flight run had
+    /// been re-adopted when it had been deleted and re-executed.
+    #[test]
+    fn a_boot_sweep_destroys_work_and_a_stop_sweep_does_not() {
+        assert_eq!(
+            sweep_report(Sweep::CrashOrphans, Ok(2)),
+            SweepReport::Destroyed(2),
+            "containers found at boot are lost work, not resumed work"
+        );
+        assert_eq!(
+            sweep_report(Sweep::Teardown, Ok(2)),
+            SweepReport::Removed(2),
+            "containers we take down on the way out are routine"
+        );
+        // nothing to say either way, which is the ordinary boot and most stops.
+        assert_eq!(sweep_report(Sweep::CrashOrphans, Ok(0)), SweepReport::Quiet);
+        assert_eq!(sweep_report(Sweep::Teardown, Ok(0)), SweepReport::Quiet);
+        // a sweep that could not run says so instead of claiming an empty one.
+        assert_eq!(
+            sweep_report(Sweep::Teardown, Err("no socket".into())),
+            SweepReport::Failed("no socket".into())
+        );
+    }
 
     const NODE_A: [u8; 32] = [7u8; 32];
     const NODE_B: [u8; 32] = [9u8; 32];
@@ -2242,18 +2546,25 @@ mod tests {
 
     /// Build skew is a DIAGNOSTIC now, not a refusal: a daemon on another build
     /// still signals, still enables, and `service status` names the difference.
+    ///
+    /// Every stamp here is a value the NODE reported. This CLI's own
+    /// `build_identity_or_unknown()` appears nowhere, which is the whole point
+    /// of the second test below.
     #[test]
-    fn a_skewed_build_is_rendered_beside_this_node_s_own_and_refuses_nothing() {
-        let mine = noded::services::build_identity_or_unknown();
+    fn a_skewed_build_is_rendered_beside_the_nodes_own_and_refuses_nothing() {
+        let node = "node-build-1";
 
         // not signaling: nothing to show, and no skew claim invented.
-        assert_eq!(render_build(None), "-");
+        assert_eq!(render_build(None, Some(node)), "-");
         // agreeing: the stamp alone, with no noise on the ordinary case.
-        assert_eq!(render_build(Some(mine)), mine);
+        assert_eq!(render_build(Some(node), Some(node)), node);
         // disagreeing: both stamps, so the operator can act on it.
-        let skewed = render_build(Some("0.0.0-ancient"));
+        let skewed = render_build(Some("0.0.0-ancient"), Some(node));
         assert!(skewed.contains("0.0.0-ancient"), "{skewed}");
-        assert!(skewed.contains(mine), "{skewed}");
+        assert!(skewed.contains(node), "{skewed}");
+        // a node that did not answer names no build: the daemon's stamp alone,
+        // never a skew claim against a value we do not have.
+        assert_eq!(render_build(Some("0.0.0-ancient"), None), "0.0.0-ancient");
 
         // and the row itself is `enabled`, never withheld: the old gate kept a
         // skewed daemon out of the catalog entirely, so it could not be seen.
@@ -2262,6 +2573,29 @@ mod tests {
         let rows = rows(&[live], &[grant("compute", mint_instance(&NODE_A, "compute", &NONCE))]);
         assert_eq!(rows[0].state, ServiceState::Enabled);
         assert_eq!(rows[0].build.as_deref(), Some("0.0.0-ancient"));
+    }
+
+    /// "(this node: …)" must name the NODE's build, never the build of whatever
+    /// `ducktape` binary the operator typed.
+    ///
+    /// Measured on a live box: `service status` run from an older binary against
+    /// a current node printed that binary's commit as the node's, and labelled
+    /// an agent daemon skewed that was on the node's build exactly. The daemon
+    /// stamp here IS this CLI's own build — the value the defect read — so a
+    /// render that reaches for it again matches, prints no skew, and reddens.
+    #[test]
+    fn this_binarys_own_stamp_is_never_passed_off_as_the_nodes() {
+        let cli = noded::services::build_identity_or_unknown();
+        let node = "the-node-actually-running";
+        let rendered = render_build(Some(cli), Some(node));
+        assert!(
+            rendered.contains(node),
+            "the node's own stamp must be the one compared against: {rendered}"
+        );
+        assert!(
+            rendered.starts_with(cli),
+            "the daemon's stamp is still what the column leads with: {rendered}"
+        );
     }
 
     #[test]
@@ -2412,10 +2746,10 @@ mod tests {
         };
         let rendered = [
             render_list(&rows),
-            render_status(&rows),
+            render_status(&rows, Some("node-build-1")),
             render_enable_summary(&plan),
             render_list(&[]),
-            render_status(&[]),
+            render_status(&[], None),
         ];
         for one in &rendered {
             let piped = through_anstream(one, anstream::ColorChoice::Never);

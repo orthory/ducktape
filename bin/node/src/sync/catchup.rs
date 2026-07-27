@@ -24,12 +24,11 @@ pub(crate) async fn apply_verified_suffix_frame(
     host.realize_module_swaps(served.height, code_source)
         .await
         .map_err(|e| format!("code-swap realization at height {}: {e}", served.height))?;
-    // the served frame is a BATCH: decode its members (an envelope
-    // re-applies WITH its continuation) and apply as ONE block, exactly like
-    // the live drain and recovery replay, so the disposition, roots, and
-    // root-hash reproduce what the peer served. disposition is DRAIN-based
-    // (any member or released continuation applied, or a System injection
-    // ran), never root-hash-based.
+    // the served frame is a BATCH: decode its members and apply as ONE block,
+    // exactly like the live drain and recovery replay, so the disposition,
+    // roots, and root-hash reproduce what the peer served. disposition is
+    // DRAIN-based (any member applied, or a System injection ran), never
+    // root-hash-based.
     let (outcome, dispatches) = match node::decode_batch(&served.frame) {
         Ok(members) => {
             let mut ops = Vec::new();

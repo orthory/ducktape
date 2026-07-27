@@ -1116,28 +1116,15 @@ fn runtime_dir() -> PathBuf {
     }
 }
 
-/// the pid of the process that owns a service root, and of the podman child it
-/// supervises. Plain files, because the question they answer ("is that process
-/// still alive, and is it what it claims to be?") is answered against /proc.
+/// the file whose FLOCK is ownership of a service root, and the pids recorded
+/// beside it. The lock decides; the pids only name a process in a message and
+/// tell a successor which podman child to reap.
+const OWNER_LOCK_FILE: &str = "owner.lock";
 const OWNER_PID_FILE: &str = "owner.pid";
 const PODMAN_PID_FILE: &str = "podman.pid";
 
 fn read_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-/// is `pid` alive AND running `exe`? Verified by executable so a recycled pid
-/// belonging to something else is never mistaken for ours.
-#[cfg(target_os = "linux")]
-fn runs_exe(pid: u32, exe: &Path) -> bool {
-    std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|running| running == exe)
-}
-
-/// no /proc: fail SAFE by claiming the root is free. The alternative — assuming
-/// an owner — would make a crash unrecoverable without hand cleanup.
-#[cfg(not(target_os = "linux"))]
-fn runs_exe(_pid: u32, _exe: &Path) -> bool {
-    false
 }
 
 /// Reap the `podman system service` a daemon recorded under `data_dir`.
@@ -1207,6 +1194,9 @@ fn nix_uid() -> String {
 pub struct PodmanService {
     socket: PathBuf,
     child: tokio::process::Child,
+    /// exclusive ownership of the service root, held open for exactly as long
+    /// as this service supervises it. See [`PodmanService::claim`].
+    _root_lock: std::fs::File,
 }
 
 impl PodmanService {
@@ -1289,7 +1279,7 @@ impl PodmanService {
         std::fs::write(hooks_dir.join("ducktape-egress.json"), hook_json)
             .map_err(|e| format!("podman service: write egress hook: {e}"))?;
         // SINGLETON, before anything binds. See [`Self::claim`].
-        Self::claim(&root, &socket, self_exe)?;
+        let root_lock = Self::claim(&root, &socket)?;
         // a leftover file (ours, from a crash) would make `service` fail to
         // bind, so clear it now that we know it is nobody's.
         let _ = std::fs::remove_file(&socket);
@@ -1314,12 +1304,16 @@ impl PodmanService {
         if let Some(pid) = child.id() {
             let _ = std::fs::write(root.join(PODMAN_PID_FILE), pid.to_string());
         }
-        let service = Self { socket, child };
+        let service = Self {
+            socket,
+            child,
+            _root_lock: root_lock,
+        };
         service.await_socket().await?;
         Ok(service)
     }
 
-    /// Take ownership of this service's root, or refuse.
+    /// Take exclusive ownership of this service ROOT, or refuse loudly.
     ///
     /// Two `service run <kind>` on one storage root is the hazard: unlinking the
     /// socket unconditionally would leave the first one's `podman system
@@ -1328,30 +1322,60 @@ impl PodmanService {
     /// leaves an identical-looking answering socket behind, and refusing THAT
     /// would make every crash need hand cleanup before the service could restart.
     ///
-    /// So the two are told apart by the recorded owner pid, verified BY
-    /// EXECUTABLE — the same discipline the repo's other reapers use, never a
-    /// bare pid and never a pattern match. A live owner means refuse; a dead one
-    /// means its podman child is an orphan, and it is killed (also by verified
-    /// exe) before this process binds.
-    fn claim(root: &Path, socket: &Path, self_exe: &Path) -> Result<(), String> {
-        let owner = read_pid(&root.join(OWNER_PID_FILE));
-        let live_sibling = owner
-            .filter(|pid| *pid != std::process::id())
-            .is_some_and(|pid| runs_exe(pid, self_exe));
-        if live_sibling {
+    /// The two are told apart by an advisory lock ON THE ROOT, which is the
+    /// thing that must be exclusive. The kernel releases a `flock` when the
+    /// holder dies — SIGKILL, OOM kill, power loss included — so "is this root
+    /// still owned?" is answered by the lock and never by asking a pid whether
+    /// it is who it claims to be.
+    ///
+    /// Keying on the OWNER'S EXECUTABLE, which this replaces, was wrong twice
+    /// over, and the second way happens daily: a second daemon started from a
+    /// DIFFERENT binary path compared unequal and took the root out from under a
+    /// live incumbent — killing its podman service, overwriting `owner.pid`, and
+    /// printing nothing — while the incumbent kept signaling, so the node's
+    /// catalog alternated between two builds every heartbeat. And rebuilding in
+    /// place makes `/proc/<pid>/exe` read `… (deleted)`, so the SAME path failed
+    /// the comparison too: the ordinary dev loop defeated the guard.
+    ///
+    /// The returned handle IS the ownership: dropping it releases the root, so
+    /// [`PodmanService`] holds it for as long as it supervises the service.
+    fn claim(root: &Path, socket: &Path) -> Result<std::fs::File, String> {
+        use std::os::unix::io::AsRawFd as _;
+        let path = root.join(OWNER_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("podman service: open {}: {e}", path.display()))?;
+        // SAFETY: `flock(2)` on a descriptor this function owns; no memory
+        // effects. LOCK_NB so a busy root refuses instead of blocking forever.
+        let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if !taken {
+            // the pid is a DIAGNOSTIC (the holder wrote it after locking); the
+            // lock is what decided. Loud, because a service that refuses to
+            // start must never look like one that started.
+            let holder = read_pid(&root.join(OWNER_PID_FILE))
+                .map_or_else(|| "unknown".to_string(), |pid| pid.to_string());
+            tracing::error!(
+                target: "ducktape::sandbox",
+                reason = "sandbox_root_owned_by_another_daemon",
+                holder = %holder,
+                "another daemon already supervises this service root"
+            );
             return Err(format!(
-                "another service daemon (pid {}) already owns {} — stop it before starting this one",
-                owner.unwrap_or_default(),
+                "another service daemon (pid {holder}) already owns {} — stop it before starting this one",
                 socket.display()
             ));
         }
-        // nobody owns the root, so any podman still answering here is our dead
-        // predecessor's `kill_on_drop` that never fired (SIGKILL unwinds nothing).
+        // the lock is ours, so no live process supervises this root: any podman
+        // recorded here is a dead owner's `kill_on_drop` that never fired
+        // (SIGKILL unwinds nothing).
         if let Some(pid) = read_pid(&root.join(PODMAN_PID_FILE)) {
             reap_orphan_podman(pid);
         }
         std::fs::write(root.join(OWNER_PID_FILE), std::process::id().to_string())
-            .map_err(|e| format!("podman service: claim {}: {e}", root.display()))
+            .map_err(|e| format!("podman service: claim {}: {e}", root.display()))?;
+        Ok(file)
     }
 
     /// the node-private socket path — what [`SandboxBackend::Podman`] carries.
@@ -1420,6 +1444,41 @@ pub async fn reap_by_label(socket: &Path, label: &str) -> Result<usize, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One service root admits ONE daemon, and the refusal does not depend on
+    /// what binary either of them runs.
+    ///
+    /// Both claims here come from THIS process — the same executable, at the
+    /// same path — so an executable comparison (the guard this replaces) sees no
+    /// difference at all and cannot be what refuses. That is the point: it also
+    /// saw no difference when a live incumbent ran from another path, or when
+    /// the operator rebuilt in place and `/proc/<pid>/exe` started reading
+    /// `… (deleted)`, and in both cases it let the newcomer take a live root.
+    ///
+    /// `flock` is per open file description, so two opens in one process
+    /// contend exactly as two processes do.
+    #[test]
+    fn one_service_root_admits_one_daemon_whatever_binary_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("podman");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("podman.sock");
+
+        let held = PodmanService::claim(&root, &socket).expect("a free root is claimable");
+        let refused =
+            PodmanService::claim(&root, &socket).expect_err("a root someone owns is refused");
+        assert!(refused.contains("already owns"), "{refused}");
+        // the owner is recorded for the message, and it is this process.
+        assert_eq!(
+            read_pid(&root.join(OWNER_PID_FILE)),
+            Some(std::process::id())
+        );
+
+        // and the root frees itself when its owner goes — a crash needs no hand
+        // cleanup, which is the property the pid check existed to preserve.
+        drop(held);
+        PodmanService::claim(&root, &socket).expect("a released root is free again");
+    }
 
     #[test]
     fn plan_hides_every_host_path_behind_ducktape() {

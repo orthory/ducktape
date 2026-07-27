@@ -101,31 +101,22 @@ pub(crate) fn serve(airlock: Airlock) -> Result<(), Box<dyn std::error::Error>> 
     )
 }
 
-/// Build the runtime, ARM the stop signals inside it, and serve until either a
-/// signal or `also_stop` resolves. [`serve`] is this with the config unpacked
-/// and `also_stop` never resolving, so a test driving this holds the real
-/// arming-before-publication ordering instead of a replica of it — and a replica
-/// is what the previous guard was: hoisting the arming out of `block_on`, the
-/// production-only panic it exists to prevent, left that test green.
+/// Serve until either a stop signal or `also_stop` resolves. [`serve`] is this
+/// with the config unpacked and `also_stop` never resolving, so a test driving
+/// this holds the real arming-before-publication ordering instead of a replica
+/// of it — and a replica is what an earlier guard was: hoisting the arming out
+/// of `block_on`, the production-only panic it exists to prevent, left that test
+/// green. The arming itself now belongs to
+/// [`crate::services::serve_until_stopped`], which every daemon enters through.
 fn serve_until(
     instance: String,
     storage: PathBuf,
     http_base: String,
     workspace: PathBuf,
-    also_stop: impl std::future::Future<Output = ()>,
+    also_stop: impl std::future::Future<Output = ()> + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    runtime.block_on(async move {
-        // ARMED before `run` publishes anything, and inside the runtime, which
-        // installing a signal handler REQUIRES. See [`arm_stop_requested`].
-        let signalled = arm_stop_requested();
-        let stop = async move {
-            tokio::select! {
-                () = signalled => {}
-                () = also_stop => {}
-            }
-        };
-        run(instance, storage, http_base, workspace, stop).await
+    crate::services::serve_until_stopped(also_stop, |stop| {
+        run(instance, storage, http_base, workspace, stop)
     })
 }
 
@@ -211,44 +202,6 @@ async fn run(
     let _ = refresh.await;
     retire_route(&workspace, &route, port);
     served
-}
-
-/// Install the stop handlers NOW and return a future that waits on them: SIGTERM
-/// is what systemd and a killed shell send, SIGINT is Ctrl-C.
-///
-/// The split matters. `signal()` installs the handler when it is CALLED; the
-/// future it returns only waits. Building that future lazily inside the
-/// `select!` would leave a window between publishing the route and the first
-/// poll in which a SIGTERM takes its DEFAULT disposition — killing the process
-/// with a live route pointing at a port anything may then bind.
-///
-/// A handler that will not install is NOT fatal — the daemon then dies without
-/// retiring its route, which is the behavior before this arm existed, not a new
-/// failure. The future parks so the server keeps owning the process.
-///
-/// The other half is deliberately NOT closed, and should stay open: tokio's
-/// handlers remain installed after these `Signal`s drop, so a SECOND SIGTERM
-/// arriving during [`retire_route`] is swallowed and SIGKILL is the operator's
-/// only escape. Retiring is one file write — a hang there means an unwritable
-/// workspace, which is the real problem — and a SIGTERM-count escalation is not
-/// worth its complexity. Do not "finish" this.
-fn arm_stop_requested() -> impl std::future::Future<Output = ()> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let armed = (signal(SignalKind::terminate()), signal(SignalKind::interrupt()));
-    async move {
-        let (Ok(mut terminate), Ok(mut interrupt)) = armed else {
-            tracing::warn!(
-                target: "ducktape::gateway",
-                reason = "signal_handler_install_failed",
-                "the airlock gateway route will not be retired on exit"
-            );
-            return std::future::pending().await;
-        };
-        tokio::select! {
-            _ = terminate.recv() => {}
-            _ = interrupt.recv() => {}
-        }
-    }
 }
 
 /// A forever-retry loop logs attempt 1, then every 30th — the counter IS the
