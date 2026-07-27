@@ -1,1 +1,242 @@
-// stub — filled by the design-parity campaign; see scratchpad/plan.json
+// FILES — the duckfs read surface, in the artifact's three panes: a 206px
+// content-addressed tree, an object table with real columns, and a 306px
+// object panel. Everything here is painted from what `EntryInfo` actually
+// carries — path, name, kind, size and the content address.
+//
+// FOUR DELIBERATE OMISSIONS, decided by the campaign and not to be re-litigated
+// per screen. Each is a fact the wire does not carry, not a layout we skipped:
+//
+// 1. HEIGHT and BY. `EntryInfo` (crates/duckfs/core/src/wire.rs:238) has no
+//    author and no height — only `SnapshotInfo` does. Recovering them per entry
+//    means walking every snapshot's diff. The table is NAME / SIZE / OBJECT.
+// 2. The PINNED badge and the GC pin toggle. duckfs pins are SNAPSHOT-scoped
+//    (name -> snapshot, wire.rs:285); there is no per-path pin to toggle, so a
+//    per-object Pin button would be a different verb wearing the same word.
+// 3. REFERENCED FROM. Nothing indexes "what points at this path".
+// 4. The per-object HISTORY rail. Same blame walk as (1).
+//
+// The artifact's file-row `note` is omitted for the same reason: its only home
+// would be `EntryInfo.meta`, which no writer populates today.
+
+// One directory in the whole-tree sidebar. The indent is the artifact's own
+// ladder — 11px, then 14px per level of depth — so the tree reads as a tree
+// without drawing a single guide line.
+component FsTreeRow(entry:FsEntry, selected:bool, depth:f64)
+  col #root w=fill
+    if selected
+      button label="Open directory" w=fill p=0.0 @ghost_action -> fs_open_dir(entry.path)
+        FsTreeFace name=entry.name depth=depth dimmed=false
+        active bg=subtle text=fg border=transparent border-w=1.0 r=7.0
+        hovered bg=subtle
+        pressed bg=rail_hover
+    if !selected
+      button label="Open directory" w=fill p=0.0 @ghost_action -> fs_open_dir(entry.path)
+        FsTreeFace name=entry.name depth=depth dimmed=true
+        active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
+        hovered bg=rail_hover
+        pressed bg=subtle
+
+// The tree row's contents, in one place so the selected and idle buttons can
+// never drift apart. The folder gold has no step in the ink ramp; `warning`
+// (#a07b32) is the ramp's own muted gold and the nearest true step to the
+// artifact's #a08a5a.
+component FsTreeFace(name:str, depth:f64, dimmed:bool)
+  row #root w=fill gap=7.0 align=center pt=6.0 pb=6.0 pr=12.0 pl=(11.0 + depth * 14.0)
+    Icon name="folder" tone="warning" px=13.0
+    if dimmed
+      text name w=fill size=12.0 wrap=none font=code_medium @text-muted
+    if !dimmed
+      text name w=fill size=12.0 wrap=none font=code_medium @text-fg
+
+// The crumb bar over the object table: where you are, what is here, and who is
+// allowed to write under it.
+//
+// The root crumb navigates; the segments do not. Ice's expression language has
+// no string split (len/empty/trim/some are the whole builtin set), and the
+// frozen signature carries the path as one `str` rather than a segment list, so
+// a per-segment crumb cannot be built from these props. The path prints as one
+// mono run beside a root crumb that does navigate.
+component CrumbBar(path:str, dirs:i64, files:i64)
+  col #root w=fill
+    box w=fill h=50.0 px=20.0
+      row w=fill h=fill gap=6.0 align=center
+        button label="Go to the duckfs root" p=0.0 @ghost_action -> fs_open_dir("")
+          text "duckfs" size=12.5 wrap=none font=code_semibold @text-primary
+          active bg=transparent text=primary border=transparent border-w=1.0 r=6.0
+          hovered bg=elevated
+          pressed bg=subtle
+        if !empty(path)
+          text path size=12.5 wrap=none font=code_semibold @text-primary
+        row gap=4.0 align=center pl=4.0
+          text files size=11.0 wrap=none font=code @text-hint
+          text "files ·" size=11.0 wrap=none font=code @text-hint
+          text dirs size=11.0 wrap=none font=code @text-hint
+          text "dirs" size=11.0 wrap=none font=code @text-hint
+        space w=fill
+        // duckfs write authority, stated in full rather than per-path: the
+        // module's own home tree, the shared tree, and nothing else
+        // (crates/duckfs/core/src/paths.rs check_authority). A path prefix test
+        // is not expressible here, and one honest rule beats a guessed branch.
+        text "writes · /home/<module-id> by that module · /shared by any member" size=10.5 wrap=none @text-meta
+    box w=fill h=1.0 bg=separator
+      space w=1.0 h=1.0
+
+// The object table's column header. It owns the column widths, and `ObjectRow`
+// reads the same numbers — the two must be mounted together or the table stops
+// lining up.
+component ObjectTableHeader()
+  col #root w=fill
+    box w=fill px=20.0 py=9.0
+      row w=fill gap=12.0 align=center
+        text "NAME" w=fill size=9.0 wrap=none font=code_semibold @text-gutter_ink
+        text "SIZE" w=72.0 align-x=right size=9.0 wrap=none font=code_semibold @text-gutter_ink
+        text "OBJECT" w=92.0 align-x=right size=9.0 wrap=none font=code_semibold @text-gutter_ink
+    box w=fill h=1.0 bg=elevated
+      space w=1.0 h=1.0
+
+// One entry. A directory opens; a file selects into the object panel. Only a
+// file is ever the selected row, so the three branches are the whole space.
+component ObjectRow(entry:FsEntry, selected:bool)
+  col #root w=fill
+    if entry.kind == "dir"
+      button label="Open directory" w=fill p=0.0 @ghost_action -> fs_open_dir(entry.path)
+        ObjectRowFace entry=entry
+        active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+        hovered bg=row_hover
+        pressed bg=subtle
+    if entry.kind != "dir" && selected
+      button label="Show object" w=fill p=0.0 @ghost_action -> fs_open_file(entry.path)
+        ObjectRowFace entry=entry
+        active bg=elevated text=fg border=transparent border-w=1.0 r=0.0
+        hovered bg=elevated
+        pressed bg=subtle
+    if entry.kind != "dir" && !selected
+      button label="Show object" w=fill p=0.0 @ghost_action -> fs_open_file(entry.path)
+        ObjectRowFace entry=entry
+        active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+        hovered bg=row_hover
+        pressed bg=subtle
+    box w=fill h=1.0 bg=muted_bg
+      space w=1.0 h=1.0
+
+// The row's contents. A directory has neither a size worth printing nor a
+// content address, so both machine columns read as an em dash rather than as
+// `0 B` and an empty cell.
+component ObjectRowFace(entry:FsEntry)
+  row #root w=fill gap=12.0 align=center px=20.0 py=11.0
+    row w=fill gap=9.0 align=center
+      if entry.kind == "dir"
+        Icon name="folder" tone="warning" px=16.0
+      if entry.kind != "dir"
+        Icon name="file" tone="label" px=16.0
+      text entry.name w=fill size=12.5 wrap=none font=code_medium @text-accent_fg
+    if entry.kind == "dir"
+      text "—" w=72.0 align-x=right size=11.0 wrap=none font=code @text-input
+    if entry.kind != "dir"
+      text size_label(entry.size) w=72.0 align-x=right size=11.0 wrap=none font=code @text-input
+    if empty(entry.object)
+      text "—" w=92.0 align-x=right size=11.0 wrap=none font=code @text-hint
+    if !empty(entry.object)
+      text entry.object w=92.0 align-x=right size=11.0 wrap=none font=code @text-hint
+
+// The 306px object panel: identity, then the machine values behind it. The
+// artifact's kind chip is an uppercased file extension; Ice cannot split a
+// string, so the chip carries the kind duckfs itself reports.
+component ObjectPanel(entry:FsEntry)
+  row #root w=306.0 h=fill
+    box w=1.0 h=fill bg=separator
+      space w=1.0 h=1.0
+    box w=fill h=fill bg=sidebar
+      col w=fill h=fill
+        box w=fill h=50.0 px=16.0
+          row w=fill h=fill gap=8.0 align=center
+            text "Object" size=13.0 wrap=none font=display @text-fg
+            space w=fill
+            if entry.kind == "dir"
+              box px=7.0 py=3.0 bg=elevated r=5.0
+                text "DIR" size=9.0 wrap=none font=code_semibold @text-input
+            if entry.kind != "dir"
+              box px=7.0 py=3.0 bg=elevated r=5.0
+                text "FILE" size=9.0 wrap=none font=code_semibold @text-input
+        box w=fill h=1.0 bg=separator
+          space w=1.0 h=1.0
+        scroll dir=vertical w=fill h=fill
+          col w=fill p=16.0
+            text entry.name w=fill size=13.5 font=code_semibold @text-primary
+            box w=fill pt=4.0
+              text entry.path w=fill size=10.5 font=code @text-hint
+            col w=fill gap=7.0 pt=14.0
+              if empty(entry.object)
+                ObjectFact label="object id" value="—"
+              if !empty(entry.object)
+                ObjectFact label="object id" value=entry.object
+              if entry.kind == "dir"
+                ObjectFact label="size" value="—"
+              if entry.kind != "dir"
+                ObjectFact label="size" value=size_label(entry.size)
+
+// One machine value, in the artifact's own r8 pill rather than the app's
+// `KeyValueRow` — the pills are separate outlines, not a divided card.
+component ObjectFact(label:str, value:str)
+  box #root w=fill px=12.0 py=9.0 border=card_line border-w=1.0 r=8.0
+    row w=fill gap=10.0 align=center
+      text label size=11.0 wrap=none font=code @text-meta
+      space w=fill
+      text value size=11.0 wrap=none font=code @text-secondary_fg
+
+// EXPLORER — one result. Presentational on purpose: the card carries no route,
+// because where a hit opens is the screen's decision, so `view.ice` wraps this
+// in the button that navigates.
+component ExplorerCard(hit:ExplorerHit)
+  box #root w=fill px=15.0 py=13.0 bg=surface border=separator border-w=1.0 r=11.0
+    row w=fill gap=12.0 align=start
+      ExplorerKindPlate kind=hit.kind code=hit.code
+      col w=fill gap=3.0
+        row w=fill gap=8.0 align=center
+          text hit.title w=fill size=13.0 wrap=none font=display @text-primary
+          ExplorerKindBadge kind=hit.kind
+        text hit.snippet w=fill size=12.0 wrap=none line-h=1.5 @text-input
+        text hit.meta w=fill size=10.5 wrap=none font=code @text-label
+
+// The 28px mono plate. Kind reads before the text does: one ink and one wash
+// per source, never a shared grey. `message` is the fallback tone.
+component ExplorerKindPlate(kind:str, code:str)
+  col #root
+    match kind
+      "page"
+        box w=28.0 h=28.0 align-x=center align-y=center bg=kind_page_bg r=8.0
+          text code size=10.0 wrap=none font=code_semibold @text-kind_page
+      "code"
+        box w=28.0 h=28.0 align-x=center align-y=center bg=kind_code_bg r=8.0
+          text code size=10.0 wrap=none font=code_semibold @text-kind_code
+      "file"
+        box w=28.0 h=28.0 align-x=center align-y=center bg=kind_file_bg r=8.0
+          text code size=10.0 wrap=none font=code_semibold @text-kind_file
+      "run"
+        box w=28.0 h=28.0 align-x=center align-y=center bg=kind_run_bg r=8.0
+          text code size=10.0 wrap=none font=code_semibold @text-kind_run
+      _
+        box w=28.0 h=28.0 align-x=center align-y=center bg=info_bg r=8.0
+          text code size=10.0 wrap=none font=code_semibold @text-info
+
+// The badge beside the title, on the same tint pair as the plate. The artifact
+// sets it at 8.5px, which is not a step on the type scale; 9px is the badge
+// step and the nearest one.
+component ExplorerKindBadge(kind:str)
+  col #root
+    match kind
+      "page"
+        box px=5.0 py=2.0 bg=kind_page_bg r=4.0
+          text "PAGE" size=9.0 wrap=none font=code_semibold @text-kind_page
+      "code"
+        box px=5.0 py=2.0 bg=kind_code_bg r=4.0
+          text "CODE" size=9.0 wrap=none font=code_semibold @text-kind_code
+      "file"
+        box px=5.0 py=2.0 bg=kind_file_bg r=4.0
+          text "FILE" size=9.0 wrap=none font=code_semibold @text-kind_file
+      "run"
+        box px=5.0 py=2.0 bg=kind_run_bg r=4.0
+          text "RUN" size=9.0 wrap=none font=code_semibold @text-kind_run
+      _
+        box px=5.0 py=2.0 bg=info_bg r=4.0
+          text "MESSAGE" size=9.0 wrap=none font=code_semibold @text-info
