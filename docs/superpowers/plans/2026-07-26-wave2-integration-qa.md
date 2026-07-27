@@ -2,7 +2,10 @@
 
 - **Date:** 2026-07-26. **Revised:** 2026-07-27 against `dev` @ `60d86b8ec`.
   **Repaired:** 2026-07-27 against `dev` @ `feec0a6db`, from the findings of its
-  own first execution.
+  own first execution. **Re-repaired:** 2026-07-27 against `dev` @ `02ad78b5e`,
+  because §0.4a documented delegation as unimplemented **after it shipped** —
+  a tester following it would have filed a working, live-verified cross-box
+  feature as a defect (§0.4a, T2-4, T2-5, §12).
 - **Status:** **partially executed.** The five credential-free sections
   (§Preconditions, §Isolation, §Podman co-tenancy, §Restart-and-skew,
   §Invariants) were run against real nodes, daemons and containers on
@@ -21,10 +24,18 @@
 - **Predecessors:** `2026-07-25-services-extraction.md` (wave 1),
   `2026-07-25-service-daemons.md` (wave 2),
   `2026-07-26-assumption-audit.md`, `2026-07-26-work-admission.md`.
-- **Target tree:** `dev` @ **`60d86b8ec`** (PR #839 merged), as it stands. **No
+- **Target tree:** `dev` @ **`02ad78b5e`** (PR #847 merged), as it stands. **No
   integration branch, no cherry-picks, no open PRs to wait for.** Code facts
-  below were established at `fc6334d8f` and re-checked against `60d86b8ec`; #839
-  touched the kernel host only, and `GENESIS_ROOT_HASH` is unmoved.
+  below were established at `fc6334d8f`, re-checked against `60d86b8ec`, and the
+  credential-plane ones re-checked again against `02ad78b5e`; `GENESIS_ROOT_HASH`
+  is unmoved by every merge since (#843, #845, #846 and #847 each state
+  `crates/modules/` is untouched).
+- **Nine PRs merged between the last repair and this one** (`60783b146` →
+  `02ad78b5e`). Six of them move a step: **#841** (a stopped daemon takes its
+  sandbox with it), **#843** + **#847** (delegation, and the lender's record of
+  it), **#844** (the lent claude TUI), **#845** (per-run config home) and
+  **#846** (CLI ergonomics). §0.2's table carries the rows; §0.4a carries the
+  one that inverted an instruction.
 
 The campaign's own record is why this document exists: **live QA has caught
 dead-on-arrival bugs three separate times while every unit gate was green.**
@@ -84,6 +95,12 @@ against a stranger's containers.
    CSOCK=$(own_sock compute) || exit 1
    ASOCK=$(own_sock agent)   || exit 1
    ```
+   **[#841] the pile-up this rule guards against is now a SIGKILL property, not
+   a property of every stop** — a SIGTERM'd daemon takes its podman service and
+   its containers with it (§0.5). The rule stands unchanged regardless: a shared
+   box still carries other people's sockets, and the quiet case is still the
+   dangerous one.
+
    `<data>/podman/podman.pid` is written by `PodmanService::start`
    (`crates/services/sandbox/src/podman_api.rs`) and the service is spawned as
    `podman --root <data>/podman/storage … system service --time=0
@@ -218,6 +235,12 @@ step below must either pass or fail.
 | **#836** | fixed `bin/simnode`'s status-during-genesis bug. simnode is **73/73**. |
 | **#838** | `[work] admit` — `work-admit.toml`, default owner-only, `ducktape node work {list,admit,revoke}`. **It already amended this runbook**: T2-4b, the X-1a/X-1b split, and four §0.4 bullets. Those amendments are preserved below; build on them. |
 | **#839** | deleted the **continuation lane** — the consensus-takeover class. Landed after this revision began; in the tree, **untested by this pass** (§0.4). `GENESIS_ROOT_HASH` unmoved. |
+| **#841** | **a stopped daemon takes its sandbox with it.** One `services::serve_until_stopped` arms SIGTERM/SIGINT for every daemon; teardown removes this instance's containers then stops the podman child. `PodmanService::claim` is a `flock` on `owner.lock`, not an exe-path compare. `/v1/services` carries the node's own build stamp. **Three of §0.5's five known-open bugs are fixed and C-3's three log strings are dead** — §0.5, P-3b, C-3, T1-4, R-3. |
+| **#844** | the lent claude TUI no longer lands on the login screen — `prepare_config_home` seeds `hasCompletedOnboarding`, on **every** platform. **T2-6's "Why not the macmini" box cited two env vars and a commit that are not in this tree.** Adds a per-request broker `debug` line (`ducktape::broker`, `brokered request`) — **T2-6, §10.** |
+| **#845** | a run's config home is 12 random bytes per run and is removed on drop. No step reads that path; adds one `reason="config_home_not_removed"` WARN — §10. |
+| **#846** | **CLI ergonomics, and it defuses T2-5's flag trap.** `--node <not-a-url>` is refused where it was typed instead of dying in reqwest; `-n/--network` is optional on a single-workspace box for `user`/`cred`/`agent`/`fs`/`service`; `user account-init` MINTS `user.key` (and prints a 24-word mnemonic) instead of failing on its absence; `service status <KIND>` parses. — **T2-5, T2-4, P-3b.** |
+| **#843** | **DELEGATION SHIPPED.** `SessionRequest` gained a required tagged `work: WorkRef`; a run submitted by A and executed on B draws on A's grant, with B sending only a saga POINTER. **It inverts what §0.4a used to instruct** — and with it T2-4's negative half and §12's honest-list bullet. Six new lender-side refusal tokens (§10). |
+| **#847** | the lender **records the draw**: `admit()` logs `airlock session opened credential=… caller=… work=direct\|delegated(…)` at **INFO**, target `ducktape::gateway`. Before it, an admitted session logged **nothing** — T1-7's `grep -c 'credential='` could not pass. `service run <kind>` now also tees `<workspace>/<kind>.log`. — **T1-7, T2-5, T2-6, §10**. |
 
 **`bin/node/src/validator/announce.rs` no longer exists.** #829 deleted the
 validator announce pump. Any step that cited `announce.rs:274` or
@@ -324,8 +347,10 @@ reads like a security pass and is not one.
   double duty as both the `ServiceAttach` credential and the ws topic
   admission, by design and by the same reasoning ("a second secret would be a
   second thing to leak").
-- **Delegation is not implemented, and the refusal you will see is correct.**
-  See §0.4a — this is the one most likely to be misread as a defect.
+- **Delegation SHIPS, and the refusals that remain are narrower than they were.**
+  See §0.4a. It is still the section most likely to produce a misfiled report —
+  the direction has simply inverted: the risk is now recording a working
+  cross-box draw as broken because a step told you to expect a refusal.
 - **The continuation-lane deletion (#839) landed in `dev` at `60d86b8ec`, and
   this pass does not test it.** The consensus-authorship finding
   (`2026-07-26-author-gated-ops.md`) — that `origin` is a *lane*, not an author,
@@ -350,51 +375,159 @@ reads like a security pass and is not one.
 - **Tart has no egress firewall.** The nft path is podman-only. A macmini Tart
   run can still reach the host's tailnet. Deferred by decision, not a finding.
 
-### 0.4a Delegation: A-submits, B-executes, drawing on A's grant — expected to FAIL
+### 0.4a Delegation: A-submits, B-executes, drawing on A's grant — this WORKS
 
-**Write this down before anyone runs T2-5, or the correct refusal will be filed
-as a bug.**
+**[#843, #847] Read this before T2-4, T2-5 or T2-6, or a working feature gets
+filed as a defect.** An earlier revision of this section said delegation "does
+not exist here" and told the tester to record the cross-box draw's failure as
+`EXPECTED-REFUSAL`. That instruction inverted after PR #843 merged
+(`c99a9a9c5` + `fad75d469`, in `dev` at `417cbae5c`) and it has been deleted.
+Delegation was subsequently **live-verified cross-box**: the dev box submitted
+with `--host-node <macmini>`, the macmini executed inside a Tart macOS guest
+whose own grant list was empty, and the run returned a real `PONG` drawing on
+the SUBMITTER's credential.
 
-Since #833 the credential path has no caller-asserted account. The drawing
-identity is minted by the node's gateway proxy from the mesh-verified WireGuard
-peer (`x-duck-caller-account`, `bin/node/src/gateway_plane.rs`), so **the
-gateway sees the node that MADE THE HOP — the executor — and never the
-submitter.**
+**What the executor sends is a POINTER, and only a pointer.** `SessionRequest`
+still has no account field — that field was the credential-theft defect #833
+deleted, and nothing put it back. It gained one required, tagged member:
+`work: WorkRef` (`crates/airlock/src/wire.rs`), with arms `Direct` and
+`Saga { saga_id }`. `deny_unknown_fields`, no `serde(default)`, so every
+producer states which arm it means. The compute daemon's resolver
+(`NodeCredentialResolver::resolve`, `bin/node/src/compute/cred.rs`) passes the
+run's `saga_id` through verbatim and reads nothing out of it; the interactive
+lane (`airlock_config`, `crates/services/agent/src/lib.rs`) sends
+`WorkRef::Direct` because a pty has no committed record of who asked for it.
 
-Consequence: **a grant to A does not travel with A's submission.** If A owns the
-credential and submits a run that B executes, the lender sees B, B is on no
-grant list, and the run is refused `credential_not_granted`. Only a grant naming
-**B's own account** works.
+**The LENDER resolves every fact from its OWN committed state.** `grant_answer`
+(`bin/node/src/airlock.rs`) checks the vouched-for caller's own grant first —
+unchanged since #833 — and only then, for a `Saga` pointer, enters
+`delegated_answer`, which asks its node over `/v1/query` for
+`SagaQuery::Get { saga_id }` → `SagaView`. The submitter's authority is proven
+by the lender's own consensus view, never asserted by the caller: `/v1/submit`
+discards a caller's claimed submitter id and re-signs with the node's own key,
+so the committed `SagaOrigin::External(..)` is a signature-proven node key.
 
-This is asserted by a merged test —
-`a_delegated_run_draws_as_the_executing_node_not_the_submitter`
-(`bin/node/tests/sched_pinned_run.rs`) — which walks all three directions
-explicitly:
+**Four conditions, all required, in this order** — the first two are free
+(decided on bytes already read) and run before either identity read:
 
-| direction | setup | asserted outcome |
+| # | condition | refusal token if it fails |
 |---|---|---|
-| **0** | executor has not admitted the submitter's account | refused by **work admission**, before the lender is dialled at all. No container, no gateway hop, no session. |
-| **1** | admitted; the credential **OWNER** submits; executor ungranted | **still fails** with `credential_not_granted` — "an ungranted EXECUTOR must fail even when the OWNER submitted" |
-| **2** | grant the **EXECUTOR's** account | succeeds. That grant is the only thing that changed. |
+| 1 | the work is still LIVE — `SagaStatus::Pending` | `delegated_work_finished` |
+| 2 | the committed spec NAMES THIS CREDENTIAL (`credential_the_work_names`, read through `compute_service::envelope::prepare` — the same producer the CLI composes with) | `delegated_work_names_another_credential` |
+| 3 | the vouched caller is the saga's `pinned_assignee` (`caller_is_the_pinned_executor` — the PIN, which is immutable, never the lease, which rotates) | `delegated_caller_not_the_executor` |
+| 4 | the saga's `origin` maps to an account the credential admits (`submitter_is_granted`) | `delegated_submitter_not_granted` |
 
-Delegation — carrying the submitter's authority to the executor — **is
-sequenced as its own PR and does not exist here.** The design is written up
-(`2026-07-26-work-admission.md` §4, "Delegation — after, not with": a required
-tagged `work: WorkRef` on `SessionRequest`, a widened `GrantCheck`, and a
-`grant_answer` that verifies `assignee`/`origin` from its own committed saga
-state). Its own decision line reads *"Delegation ships next, not with"*, and
-justifies the sequencing with the fact this step asserts: *"A's run on B drawing
-on **A's** grant has never worked, so sequencing regresses nothing."* **No
-implementation exists at `fc6334d8f`.**
+Two more arms on the same path: a pointer over `MAX_WORK_POINTER_BYTES` (512) is
+`work_pointer_oversized`, and a `SagaOrigin::Module(_)`/`System` saga names no
+account to draw as, so it takes condition 4's refusal. **A saga this lender has
+not committed yet is `delegated_work_unseen` → `Undetermined` → 503, which is
+NOT a refusal** — see the taxonomy note below.
 
-In this pass:
+Conditions 1 and 2 are what `fad75d469` added on top of `c99a9a9c5`, and they
+are the difference between lending for a run and lending forever: no terminal
+path clears a saga's assignee, so without condition 1 one `Done` run was a
+permanent, unmetered draw the owner could not revoke (the executor holds no
+grant, so `user cred revoke` has no subject); without condition 2 one lease on
+A's saga opened a session for any credential any lender serves that A is granted
+on, including a third party's.
 
-- direction 1 failing is a **PASS**, and must be recorded as `EXPECTED-REFUSAL`,
-  never `FAIL`;
-- T2-4 grants the **borrower's** account, not the submitter's, and the runbook
-  says so at the step;
-- a tester who "fixes" this by granting the submitter has broken the test, not
-  the product.
+#### the three directions, and which verdict changed
+
+| direction | setup | verdict | why |
+|---|---|---|---|
+| **0** | executor has not admitted the submitter's account | **UNCHANGED — refused** by **work admission**, before the lender is dialled at all. No container, no gateway hop, no session. Token `work_not_admitted`. | Two consents in opposite directions. The executor deciding whose work it runs is a different question from the lender deciding whose account may draw, and #843 touched only the second. |
+| **1** | admitted; the credential **OWNER** submits; executor ungranted | **CHANGED — now SUCCEEDS.** `Done`, with `PONG` in the saga result, and the executor still on no grant list. | This is exactly the delegated shape. The owner is always `credential_use_allowed`, the run is `Pending`, its spec names that credential, and the executor holds the pin — all four conditions hold. |
+| **2** | grant the **EXECUTOR's** account | **UNCHANGED — succeeds**, and it is now the non-regression half: an executor granted in its own right still draws in its own right, through `Draw::Direct`, with no pointer doing any work. | The caller's own grant is checked first and delegation is purely additive. |
+
+**Which grant a human should actually issue.** For T2-5's topology — the dev box
+owns the credential AND submits, the borrower executes — **no `user cred grant`
+is required at all.** `credential_use_allowed` (`crates/modules/system/gateway/src/interface.rs`)
+is `owner || grantee`, and the submitter here IS the owner. The grant to the
+**borrower's** account is what T2-6 needs: an interactive pty sends
+`WorkRef::Direct`, has no pointer, and is authorized on the executing node's own
+standing or not at all. T2-4 and T2-4b say which is which at the step.
+
+#### what still refuses, and must be recorded `EXPECTED-REFUSAL`
+
+Each of these is a real gate, and a pass that never sees one has not established
+that the positives can fail:
+
+- **direction 0** — the executor's `work admit` policy (T2-5's and T2-6's
+  deliberate-failure halves). Unchanged by #843.
+- **an ungranted, undelegated executor** — the borrower submits a run pinned to
+  ITSELF, naming the lender's credential, with no grant: origin, pin and vouched
+  caller are all the borrower, so there is no submitter to delegate from.
+  `credential_not_granted`. This is the cheapest CLI-level proof that the
+  credential gate is real, and it is T2-4's negative half now.
+- **an expired pointer** — replay a pointer whose saga has reached a terminal
+  status. `delegated_work_finished`.
+- **the single-credential bound** — a pointer presented for a credential the
+  committed work does not name. `delegated_work_names_another_credential`.
+- **a pointer to somebody else's work** — a caller that is not the saga's
+  `pinned_assignee`, or an UNPINNED saga (which delegates to nobody).
+  `delegated_caller_not_the_executor`.
+
+**The first fails on the saga lane and never dials the lender at all; the other
+four collapse on the wire into one `403 credential_not_granted`.** The
+granular token exists only in the LENDER's own log, at `debug`, target
+`ducktape::gateway`, message `airlock session refused`, carrying nothing but
+`reason` (§10). So a tester reading only the borrower's side cannot tell which
+condition failed — start the lender's daemon with
+`RUST_LOG=ducktape::gateway=debug` (`RUST_LOG` **adds to** the default filter,
+it does not replace it: `bin/noded/src/log.rs`, `boot_filter`) before running any
+negative half here.
+
+#### `Undetermined` is not a refusal, and the borrower now retries it
+
+The three-state `GrantAnswer` taxonomy is load-bearing and #843 leaned on it
+harder, so do not let a report collapse it:
+
+- `Granted` → the session opens.
+- `Refused` → **403 `credential_not_granted`**. Settled. Re-asking is a slower 403.
+- `Undetermined` → **503 `grant_authority_unavailable`**, which the borrower's
+  broker names `airlock_grant_authority_unavailable`. It means *"the lender could
+  not ASK"* — a `/v1/query` timeout, a restarting node, a resident not yet
+  serving, or a lender a block behind that has not committed this saga yet. It
+  **never** means denied, and reporting it as denied sends the operator to add a
+  grant they may already hold.
+
+`open_session_retrying` (`crates/services/broker/src/lib.rs`) re-asks **that one
+arm and no other**, `SESSION_RETRY_ATTEMPTS = 6` × `SESSION_RETRY_DELAY = 700 ms`
+— roughly two block times, sized for the lender-one-block-behind case. It logs
+attempt 1 at `debug` and the last at `warn` with an `attempts` field. So on the
+delegated lane a single 503 is *expected weather*, not a finding; six of them in
+a row is.
+
+#### the merged test that asserts all of this
+
+`a_delegated_run_draws_on_the_submitters_grant` (`bin/node/tests/sched_pinned_run.rs`).
+**The name this section used to cite —
+`a_delegated_run_draws_as_the_executing_node_not_the_submitter` — no longer
+exists anywhere in the tree**; #843 renamed it along with the behaviour, and any
+report or doc still naming it is reading a pre-#843 world.
+
+It runs FOUR directions plus a replay on ONE two-node cluster with a real
+`service run airlock` lender, a real compute daemon, real containers and a mock
+upstream, so exactly one thing differs between any two of them — and its
+numbering is its own, not this section's:
+
+| test direction | shape | outcome |
+|---|---|---|
+| 0 | 0 submits, pinned to 1; 1 admits nobody | `work_not_admitted` |
+| 1 | 1 submits, pinned to itself; nobody granted | `credential_not_granted` |
+| 2 | 0 submits, pinned to 1; 1 admitted, **still ungranted** | `Done` + `PONG` |
+| 2b | direction 2's pointer replayed once its saga is terminal | refused |
+| 3 | 1 submits, pinned to itself; 1 granted | `Done` + `PONG` |
+
+The negative constructs are
+`cred_lending::granted_credential_resolves_and_round_trips_across_nodes`
+(`bin/node/tests/cred_lending.rs`), which drives one positive delegated open and
+then four more against the same real lender daemon over the same real overlay:
+a pointer to work the caller is not pinned to, a pointer whose committed work
+names a different credential, and the same pointer replayed after its saga was
+cancelled — all three **403** — plus a pointer naming a saga the lender never
+committed, asserted to be **503 `grant_authority_unavailable`** and explicitly
+*not* a 403.
 
 ### 0.4b Two things this runbook deliberately does NOT test
 
@@ -410,10 +543,13 @@ Naming them here stops a later reader adding a step that cannot fail.
   `ducktape::term`), and **T1-8 asserting it would be an assertion that always
   passes.** Exercising it needs a new step that does not exist; if it is wanted,
   write it as one, do not bolt it onto the pty step.
-  (Doc drift while here: `2026-07-26-work-admission.md` still describes this
-  fix as a `MembersOnly` post policy. #835 explicitly rejected that route —
-  chat's `SetMembership` drops its `author`, so any member could add themselves
-  — and gated at `project_message` instead. Worth correcting in that doc.)
+  (That doc drift is **fixed** in the same PR as this revision:
+  `2026-07-26-work-admission.md` §7.1 described the fix as a `MembersOnly` post
+  policy with a participants roster. #835 explicitly rejected that route —
+  chat's `SetMembership` drops its `author`, so any member can add themselves to
+  any roster and post through a members-only policy — and gated at
+  `project_message` on `Channel.owner` instead, in
+  `bin/noded/src/term_consensus.rs` and nowhere else.)
 - **The three `#[ignore]`d provider tests still skip silently**
   (`crates/services/provider/src/lib.rs`:
   `podman_socket_interactive_session_drives_a_tty`,
@@ -425,17 +561,19 @@ Naming them here stops a later reader adding a step that cannot fail.
 
 ### 0.5 Known-open product bugs — record, do not re-file
 
-The first execution of the credential-free sections found these. **A separate
-PR is fixing them; they are not this pass's to fix and not this pass's to
-discover twice.** Where a step below touches one, it says so.
+The first execution of the credential-free sections found these. **PR #841
+(`a6436c486`) has since fixed three of the five and narrowed a fourth**; the
+table below is re-verified against `dev` @ `02ad78b5e` and now carries both
+verdicts, because a report comparing against an older run needs to know which
+line moved.
 
-| bug | what a step sees | steps that touch it |
-|---|---|---|
-| **the daemon orphans its podman service on every stop path** | `podman system service --time=0` survives SIGTERM *and* SIGKILL of its `service run`, so `$XDG_RUNTIME_DIR/ducktape/` accumulates live sockets across the pass — which is what makes rule 4's glob so dangerous | P-4, T1-4, C-2, C-3, R-1, R-4 |
-| **containers are killed rather than re-adopted across restart** | C-3's `reaped orphaned sandbox containers` fires where the design says the daemon should have re-adopted them; R-4's "re-adopts its container" half will not hold | C-3, R-4 |
-| **the singleton guard is keyed on exe path** | `PodmanService::claim`'s `runs_exe` comparison means a second daemon started from a *different* binary path (a rebuilt worktree, R-3's second binary) does **not** trip `another service daemon (pid N) already owns …` and both supervise one graph root | T1-4, R-3 |
-| **`service status` prints the CLI's own build stamp** | `service status` can render a `build` row that came from the CLI process rather than the catalog's hello, so a "builds agree" reading is not evidence | P-3, R-3 |
-| **the fixed 5 s podman-service budget** | §0.1 rule 5 | T1-4, K-1 |
+| bug | status at `02ad78b5e` | what a step sees | steps |
+|---|---|---|---|
+| **the daemon orphans its podman service on every stop path** | **NARROWED to SIGKILL only [#841]** | SIGTERM/SIGINT are handled now: both daemon bodies enter through `services::serve_until_stopped` (`bin/node/src/services.rs`), which arms the handlers inside `block_on` before the body exists, and both call `stop_sandbox` on the way out — containers first (`sweep_own_containers`), then `PodmanService::shutdown`. Compute additionally races `await_node` against the stop, so a daemon waiting on a down node is SIGTERM-able. **SIGKILL is explicitly not covered and is not papered over.** So rule 4's socket pile-up is now a property of the SIGKILL steps, not of every stop. | C-3, R-4, I-4 |
+| **containers are killed rather than re-adopted across restart** | **still open as behaviour; ALL THREE of C-3's strings are DEAD [#841]** | there is no attach path in the tree; the boot sweep destroys what a crash left. But `reaped orphaned sandbox containers` / `reason="own_orphans"` / `reason="reap_failed"` no longer exist anywhere in the tree — see C-3 for the replacements. | C-3, R-4 |
+| **the singleton guard is keyed on exe path** | **FIXED [#841]** | `runs_exe` is gone from the tree. `PodmanService::claim` (`crates/services/sandbox/src/podman_api.rs`) now takes an exclusive `libc::flock(LOCK_EX\|LOCK_NB)` on `<root>/owner.lock`, which the kernel releases on death — so a second daemon from a *different* binary path IS refused. Refusal text unchanged (`another service daemon (pid N) already owns …`, `pid` = `unknown` if `owner.pid` is unreadable), plus a new ERROR `reason="sandbox_root_owned_by_another_daemon"` on `ducktape::sandbox`. | T1-4, R-3, P-3b |
+| **`service status` prints the CLI's own build stamp** | **FIXED for the human view [#841]** | `/v1/services` carries the node's own stamp; the CLI reads it into `Catalog.node_build` and renders through `Skew::between` rather than its own `build_identity_or_unknown()`. **`--json` does not carry it**: `status --json` prints a bare array of `ServiceRow` and `list` discards the node build outright — so a `--json` "builds agree" read is still not evidence about the NODE. | P-3, R-3 |
+| **the fixed 5 s podman-service budget** | **still open, byte-identical** | §0.1 rule 5. `PodmanService::await_socket` is still `for _ in 0..100` × 50 ms then FATAL, and there is no env knob. | T1-4, K-1 |
 
 ---
 
@@ -1172,20 +1310,32 @@ RUST_LOG=info,ducktape::service=debug,ducktape::saga=debug \
 **Record that `instance=` value — it is R-1's observable.**
 Its own podman service is up and answers:
 ```bash
-ls "$WS/storage/services/compute/podman/"        # storage run hooks owner.pid podman.pid
+# [#841] owner.lock is new — it is the flock the singleton guard now holds
+ls "$WS/storage/services/compute/podman/"        # storage run hooks owner.lock owner.pid podman.pid
 CSOCK=$(own_sock compute) || exit 1              # §0.1 rule 4 — NEVER the glob
 curl -s --unix-socket "$CSOCK" http://d/_ping    # -> OK
 ```
 **Also do P-3b here** — this is the first moment the build stamp is readable:
 ```bash
+# [#846] `service status <KIND>` parses now (it used to answer
+# `error: unexpected argument 'compute' found`), and -n is optional on a
+# single-workspace box. [#841] --json is an ARRAY of rows, so index it.
 "$D" service status compute -n "$CHAIN" --json \
-  | python3 -c 'import sys,json;print(json.load(sys.stdin)["build"])'
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["build"])'
 ```
+> **[#841] that `--json` value is the DAEMON's stamp, not the node's.** `--json`
+> prints a bare array of `ServiceRow` and carries no node-build key at all;
+> `list` discards it outright. The node's own stamp reaches only the **human**
+> `service status` render, through `Skew::between`. So the "builds agree"
+> reading has to come from the human view — a `--json` read cannot make it.
+
 **Fail:** `another service daemon (pid <N>) already owns <socket> — stop it
 before starting this one` → a previous daemon survived; use `stop_by_config`,
-never a pattern kill. **[§0.5 known-open] that guard is keyed on exe path**, so
-it does **not** fire between two daemons started from different binary paths —
-if you are also running R-3's second binary, check `owner.pid` by hand.
+never a pattern kill. **[#841] that guard is a `flock` now, not an exe-path
+comparison**, so it DOES fire between two daemons started from different binary
+paths (R-3's second binary included) and the kernel releases it on death. A
+second structured line names it: ERROR, target `ducktape::sandbox`,
+`reason="sandbox_root_owned_by_another_daemon"`, `holder=<pid|unknown>`.
 **Fail:** `podman service did not answer on <path> within 5s` — **but read
 §0.1 rule 5 before recording it.** Re-run the same start alone and report
 `FLAKE(load=<avg>, alone=<secs>)` vs a real finding.
@@ -1386,12 +1536,24 @@ PY
   ```bash
   grep -cE 'airlock_gateway_unreachable|airlock_route_or_credential_absent|gateway_seal_pk_mismatch|airlock_caller_account_unverified' \
     "$LOGS"/*.log                       # -> 0
-  grep -c 'airlock daemon serving' "$LOGS/airlock.log"   # -> 1  (T2-2 ran first)
-  grep -c 'credential=' "$LOGS/airlock.log"              # -> >= 1: the gate DECIDED
+  grep -c 'airlock daemon serving' "$LOGS/airlock.log"        # -> 1  (T2-2 ran first)
+  grep -c 'airlock session opened' "$LOGS/airlock.log"        # -> >= 1: the gate ADMITTED
+  grep -c 'work=direct' "$LOGS/airlock.log"                   # -> >= 1: on the operator's own standing
   ```
   A zero in the first grep with a **zero** in the third is not a pass — it means
   the run never reached the gateway, and on this topology that cannot happen for
   a `--cred` run.
+
+  > **[#847] this assertion was unsatisfiable until PR #847 and is now the
+  > cheapest evidence in the step.** It used to read
+  > `grep -c 'credential=' "$LOGS/airlock.log"  # -> >= 1: the gate DECIDED`.
+  > Before #847 `grant_answer` returned `GrantAnswer::Granted` with **no
+  > `tracing` call at all**, and the refusal writer carries no `credential`
+  > field — so on a successful run that grep could only ever return 0, and on a
+  > failed one it still would. #847 routes both `Granted` returns through one
+  > `admit` writer at `info`. This is the same class of defect as the eight
+  > steps the first execution found that could not fail: an assertion whose
+  > evidence the product never emitted.
 
 **Deliberate-failure half — the airlock dependency, proved in one stop.** Stop
 the airlock daemon (`stop_by_config "service run airlock"`) and submit the same
@@ -1674,32 +1836,73 @@ list`/`status` read the *local* catalog, never the committed registry.
 > `height`.
 
 ### T2-4 — grant the credential to the BORROWER's account
-**Changed by #833 — the direction is the opposite of what it looks like.**
+**Two ways in, and this step issues only one of them. Read §0.4a first.**
 
 ```bash
-# borrower box
+# borrower box — [#846] this MINTS user.key when absent; no `user key init` first
 "$D" user account-init --name duke -n "$CHAIN"
 # dev box (lender)
 "$D" user cred grant eddy-claude-1 <borrower-account-hex> -n "$CHAIN"
 ```
 
-**The grant names the account of the node that will RUN the workload — not the
-account that submits.** Since #833 the credential path has no caller-asserted
-account: the drawing identity is `x-duck-caller-account`, minted by the node's
-gateway proxy from the mesh-verified WireGuard peer, and a caller-supplied
-`x-duck-*` header is refused at the proxy's own decode. So the lender sees the
-**executor**. Granting the submitter's account accomplishes nothing — see §0.4a.
+> **[#846] `account-init` on a fresh workspace now prints a 24-word mnemonic
+> before it submits anything** (`a new user key was minted at <path>` +
+> `write these 24 words down — they are the only way to restore it:`). It is a
+> secret: it does not go in the report, and it does not go in a shared terminal
+> transcript. A new failure mode replaces the old missing-file FATAL — if the
+> minted key does not re-open under the password that sealed it, the CLI
+> **removes it** and says so rather than leaving an unusable file.
+
+**Since #843 an account is granted TWO ways, and only the first is what this
+command issues:**
+
+1. **the caller's own standing** — any workload on a node bound to a granted
+   account may draw. This is what `cred grant` writes, and it is checked first
+   (`credential_use_allowed`, then `Draw::Direct`). It is what **T2-6's pty
+   needs**: an interactive session sends `WorkRef::Direct`, has no committed
+   record of who asked for it, and is authorized on the executing node's own
+   standing or not at all.
+2. **delegation** — a run an account SUBMITS may draw while it executes on the
+   node that account pinned it to, for the credential the committed work names,
+   until the run reaches a terminal status. Nothing is issued for this; it is
+   resolved by the lender from committed state per run.
+
+**So `--host-node` lets that node spend your subscription for that one run**,
+which is what `agent sched --cred`'s own help now says. The pin is what scopes
+it: the pinned node is the only one that may present the run as its reason for
+opening a session.
+
+**T2-5 does not need this grant at all** — the dev box owns the credential and
+submits, and `credential_use_allowed` is `owner || grantee`, so the delegated
+path admits the borrower on the owner's own standing. Issue it anyway, here, for
+T2-6.
 
 **Observable / pass:**
 - the `gateway` module's credential record lists the **borrower's** account as
   grantee, and `cred grant` reports `granted at height <N>`
 - **Do not assert that any scope is enforced** (§0.4).
 
-**Deliberate-failure half, and it is the delegation proof.** Before granting the
-borrower, grant the **lender's own** account instead and run T2-5. It must fail
-with `credential_not_granted` even though the credential's owner submitted.
-Record `EXPECTED-REFUSAL` and cite §0.4a. This is the single cheapest way to
-prove the caller-asserted account is really gone.
+**Deliberate-failure half — the cheapest CLI-level proof the credential gate is
+real.** Before issuing the grant, on the **borrower**, submit a run pinned to
+ITSELF that names the lender's credential:
+
+```bash
+# borrower box, BEFORE `user cred grant`
+"$D" agent sched claude --cred eddy-claude-1 -n "$CHAIN" -- "reply with exactly: PONG"
+```
+
+Origin, pin and vouched caller are all the borrower, so there is no submitter to
+delegate from and no standing grant either. **Pass:** the saga reaches `Failed`
+carrying `credential_not_granted`; record `EXPECTED-REFUSAL` and cite §0.4a.
+**Fail:** it succeeds — then the lender is authorizing something neither consent
+covers, and that is the headline finding.
+
+> **The old negative half here was the inverse of this, and it was wrong.** It
+> said to grant the lender's own account and run T2-5, asserting
+> `credential_not_granted` "even though the credential's owner submitted". That
+> is precisely the shape #843 made WORK (§0.4a, direction 1). Running it today
+> yields `Done` + `PONG`, and a tester following the old text would file the
+> feature as the defect.
 
 ### T2-4b — admit the submitter's work on the EXECUTING node
 
@@ -1737,17 +1940,32 @@ deliberately, and each has a deliberate-failure half below that proves it.
 "$D" agent sched claude --cred eddy-claude-1 --host-node duke -n "$CHAIN" -- "reply with exactly: PONG"
 ```
 
-> **[#832] THE FLAG TRAP — this one does not fail cleanly.** `agent --node` used
-> to mean "which peer runs the work". It now means **an http base url**, and the
-> peer-targeting flag is `--host-node`. Passing `--node duke` still **parses**:
-> `duke` becomes the top rung of the address ladder, **outranking `-n
-> "$CHAIN"`**, and the CLI tries `POST duke/v1/query`. You get a reqwest
-> URL-parse error, not "unknown host node", and the name never reaches
-> `resolve_host_node` at all. **Any `--node` you inherit from an older recipe is
-> silently pointing the CLI at the wrong thing.** The ladder is
-> `--node <http-url>` → `-n/--network <chain-id>` → `DUCKTAPE_NODE` → caller
-> context → lone registered workspace, and trailing slashes are trimmed on every
-> rung.
+> **[#832] THE FLAG TRAP — and [#846] it now fails cleanly.** `agent --node`
+> used to mean "which peer runs the work". It means **an http base url**, and the
+> peer-targeting flag is `--host-node`. `--node duke` still **parses** and still
+> **outranks `-n "$CHAIN"`** — `NodeAddr::ladder_rung` is unchanged — so the name
+> still never reaches `resolve_host_node`. What changed is the bottom of
+> `rung_base`: `Rung::Flag` now goes through `checked_base`
+> (`bin/node/src/cli_args.rs`) and is refused **where it was typed**, verbatim:
+>
+> ```
+> FATAL: --node is an http base url, and "duke" is not one (expected http://host:port) — for a network name use: -n/--network "duke"
+> ```
+>
+> `DUCKTAPE_NODE=duke` gives the same sentence naming `DUCKTAPE_NODE`. **The old
+> reqwest `builder error` is gone**, so a report still quoting one is from a
+> pre-#846 run. `Rung::Context` (a `.duckfs`-recorded url) is deliberately NOT
+> checked. The ladder is `--node <http-url>` → `-n/--network <chain-id>` →
+> `DUCKTAPE_NODE` → caller context → lone registered workspace, and trailing
+> slashes are trimmed on every rung.
+>
+> **[#846] `-n "$CHAIN"` is now optional on a single-workspace box** — for
+> `user`, `user cred`, `agent`, `fs` (via `Rung::LoneWorkspace` /
+> `WorkspaceSource::LoneRegistered`) and for `service` (via its own
+> `WorkspaceArgs::dir()`). **Keep it in every command below anyway.** With two or
+> more registered workspaces all of them refuse with a list of chain ids, and a
+> QA box that ran `node init` twice — R-3's second binary, a re-init — is exactly
+> that box.
 
 **Observable / pass:**
 - the run executes **on the borrower** and returns `PONG`, read the same way
@@ -1756,9 +1974,24 @@ deliberately, and each has a deliberate-failure half below that proves it.
   `recent_runs` will be `[]` here too** — see T1-7's box; they are the wrong
   lane for a `sched` saga on either box.
 - the borrower's broker opened a sealed airlock session: **zero** refusal
-  tokens in the borrower's logs
-- the lender's `airlock.log` shows the grant gate *deciding*, at `debug`, target
-  `ducktape::gateway`, carrying `credential=<name>` and **never** the account
+  tokens in the borrower's logs. A single
+  `reason="airlock_grant_authority_unavailable"` with `attempts=1` at `debug` is
+  **not** a refusal and not a finding — it is the lender being a block behind,
+  and the delegated lane re-asks it (§0.4a). Six of them ending in a `warn` is.
+- **[#847] the lender's `airlock.log` carries the DRAW, at `info`:**
+  ```
+  airlock session opened credential=eddy-claude-1 caller=<8 hex> work=delegated("sched\u{1f}<id>")
+  ```
+  target `ducktape::gateway`. `work=delegated(..)` — **not** `work=direct` — is
+  the assertion: it is the one field that separates a caller spending its own
+  entitlement from one spending the submitter's, and `direct` here would mean
+  T2-4's grant is doing the work and delegation is untested. `caller=` is a
+  4-byte account prefix, never the whole account; the credential is named
+  because by this line it has been matched against a record consensus committed.
+  This line is `info`, so it is visible at the default filter, and #847 also
+  makes `service run <kind>` tee `<workspace>/<kind>.log` — so it survives the
+  terminal that launched the daemon and is greppable there as well as in
+  `$LOGS/airlock.log`.
 - the run's output crossed the ring on the **borrower's** node (T1-7's gated
   subscribe, with the borrower's own `service-link.token`) — this is the
   positive evidence that stops the step passing on greps alone
@@ -1799,20 +2032,58 @@ is the whole point of the step.
 "$D" agent pty claude --cred eddy-claude-1 --host-node duke -n "$CHAIN"
 ```
 
-> **Why not the macmini.** The blocker is **credential plumbing, not the
-> sandbox.** The lent-credential last mile for interactive `claude` on macOS
-> needs `HOST_CREDS_FILE` + `PROVIDER_MANAGED_BY_HOST` (commit `b3d95723e`) to
-> reach the provider; without them macOS `claude` falls back to the login
-> keychain and its TUI gate asks for a login method. **Podman on the macmini
-> would not fix it** — the Tart backend is not what is failing. So:
-> - **this step runs with a Linux/podman borrower**, where the plumbing exists
->   and the headless token-only path is already proven;
-> - **the macOS interactive case is a separate item**, not a KNOWN-GAP verdict
->   inside this step. File it as its own bug against the credential plumbing and
->   name `HOST_CREDS_FILE` / `PROVIDER_MANAGED_BY_HOST` in it.
+> **Why not the macmini — and [#844] the reason this box used to give is
+> wrong.** It cited `HOST_CREDS_FILE` + `PROVIDER_MANAGED_BY_HOST` (commit
+> `b3d95723e`) as the missing plumbing. **Neither name exists anywhere in the
+> tree**, and `b3d95723e` is **not an ancestor of `02ad78b5e`** — its only file,
+> `crates/modules/system/capability-host/src/lib.rs`, no longer exists either.
+> Do not file a bug naming them; the mitigation it points at is not there to
+> cite.
 >
-> This removes the step's old escape hatch on purpose. With a Linux borrower
-> there is no "documented gap" arm left: it works or it is a finding.
+> **The "TUI asks for a login method" symptom itself is CLOSED, on every
+> platform.** #844 found the root cause and it was not the broker: Claude Code
+> runs its first-run wizard whenever `<CLAUDE_CONFIG_DIR>/.claude.json` does not
+> say onboarding is done, and `prepare_config_home` materializes that config home
+> fresh for every run — step two of the wizard is the login prompt, which is why
+> only the interactive lane broke while headless `claude -p` worked on the same
+> plumbing. `prepare_config_home`
+> (`crates/services/provider/src/lib.rs`) now seeds
+> `.claude.json` = `{"hasCompletedOnboarding":true}` and `settings.json` =
+> `{"skipWebFetchPreflight":true}`, gated only on
+> `isolation.broker == Some(BrokerKind::AnthropicMessages)` — **no `cfg(target_os)`
+> and no runtime platform branch.** #846 seeds `hasTrustDialogAccepted` for the
+> guest workdir the same way.
+>
+> So the step still runs with a **Linux/podman borrower** — that is where the
+> whole lane is proven end to end — but the macOS residual is now narrower and
+> honestly stated: **whether macOS `claude` prefers the login keychain over
+> `<CLAUDE_CONFIG_DIR>/.credentials.json` is Claude Code's own behaviour and is
+> not observable from this repo.** If the macOS interactive case fails, file it
+> as that, with the observed broker trace (below), and do not attribute it to
+> plumbing this tree does not contain.
+>
+> There is no "documented gap" arm left on the Linux borrower: it works or it is
+> a finding.
+
+> **[#844] the one debug line that settles a TUI auth failure in one grep.**
+> `log_request` (`crates/services/broker/src/lib.rs`) is `axum` middleware added
+> **last** = outermost on **both** broker routers, so even `DefaultBodyLimit`
+> rejections and `fallback(reject)` 403s are logged. `debug`, target
+> `ducktape::broker`, message `brokered request`, fields `method` / `path` /
+> `status` and nothing else — the URI query is dropped by construction.
+>
+> **It is off unless you ask for it.** Every `RUST_LOG` in this runbook is
+> `info,ducktape::service=debug` or `…gateway=debug`; none enables
+> `ducktape::broker=debug`. The broker runs inside the daemon that spawned the
+> run — **compute** for `sched`, **agent** for `pty` — so add it to that daemon's
+> `RUST_LOG` before T2-5/T2-6 or the line will not be in `compute.log` /
+> `agent.log`.
+>
+> The pre-#844 signature, for recognition: `method=HEAD path=/api/hello
+> status=403` and **no `/v1/messages` line at all** across a whole session — the
+> TUI never asked the broker anything about auth, it decided locally that it was
+> unonboarded. `/api/hello → 403` occurs in the WORKING case too, so on its own
+> it is not a fault; the absence of `/v1/messages` is.
 
 Note T1-8's constraint applies to the borrower: `agent pty` reads the workspace
 secret, so the box you run the CLI on must have read access to that node's
@@ -1820,7 +2091,12 @@ workspace.
 
 - **PASS** = the console renders, the session is interactive, and the provider
   answers on the **lent** credential (not a local one — confirm the lender's
-  `airlock.log` shows the grant gate deciding for this session).
+  `airlock.log` carries `airlock session opened credential=eddy-claude-1
+  caller=<8 hex> work=direct` at `info` for this session). **`work=direct` is
+  the expected value here and `delegated(..)` would be the bug**: a pty has no
+  committed record of who asked for it, so it sends `WorkRef::Direct` and draws
+  on the executing node's own grant — the one T2-4 issued. This is the step that
+  makes T2-4's grant load-bearing (§0.4a).
 - **FAIL** = anything that does not reach the provider: a refusal token, a spawn
   failure, a wedge on child exit, or a console that renders but authenticates
   against something other than the lent credential.
@@ -2056,16 +2332,37 @@ compute daemon and its podman service are gone.
 containers along. That is exactly why per-service services were chosen over
 labels.
 
-### C-3 — crash-orphan reap across restart
-SIGKILL the compute daemon mid-run so a container is left behind, then restart it.
-**Wait on:** `await_line "$LOGS/compute.log" 'reaped orphaned sandbox containers'`
-**Pass:** the line carries `removed=<n>` (n ≥ 1) and `reason="own_orphans"`, and
-**the same `$CSOCK` container list is shorter by n afterwards** — read it, do
-not infer it. This is the second reason instance ids must survive a restart: the
-daemon recognises its orphans only if it returns with the **same** id, which it
-does because the id is the grant hash and the grant persists in `services.toml`.
-**Fail:** `reason="reap_failed"`, or `removed=0` with a container still on the
-socket.
+### C-3 — crash-orphan sweep across restart
+**[#841] All three strings this step used to assert on are gone from the tree.**
+`reaped orphaned sandbox containers`, `reason="own_orphans"` and
+`reason="reap_failed"` return zero hits at `02ad78b5e`. Compute and agent now
+share one `sweep_own_containers` (`bin/node/src/services.rs`), used at BOTH ends
+of a daemon's life, and it names the two ends differently on purpose.
+
+**SIGKILL is now the only way to set this step up.** A clean stop sweeps its own
+containers before stopping the sandbox service, so a SIGTERM leaves nothing for
+the boot sweep to find. SIGKILL the compute daemon mid-run so a container is
+left behind, then restart it.
+
+**Wait on:** `await_line "$LOGS/compute.log" 'containers left by an earlier death were removed'`
+
+**Pass:** that line is **WARN**, target `ducktape::service`,
+`reason="crash_orphans_destroyed"`, and carries `instance=` and `removed=<n>`
+(n ≥ 1) — and **the same `$CSOCK` container list is shorter by n afterwards**;
+read it, do not infer it. This is the second reason instance ids must survive a
+restart: the daemon recognises its own containers only if it returns with the
+**same** id, which it does because the id is the grant hash and the grant
+persists in `services.toml`.
+
+**Fail:** `reason="container_sweep_failed"` (WARN, carries the error), or
+**no line at all** — `removed == 0` yields `SweepReport::Quiet` and logs
+**nothing** on either end, so silence here means the sweep found nothing, which
+with a container still on the socket is the failure.
+
+> **The clean-stop twin, for reference — it is not this step's line.** A
+> SIGTERM'd daemon logs **INFO** `reason="own_containers_removed"`, *"this
+> instance's containers were removed before its sandbox service stopped"*. If
+> C-3 shows you that one, you did not SIGKILL.
 
 > **The second FAIL clause — "or the count includes the agent's containers" — is
 > DELETED as unreachable.** `reap()` (`bin/node/src/compute/mod.rs`) destructures
@@ -2077,12 +2374,14 @@ socket.
 > *"Unreachable by construction, not pending cleanup."* Assert the label scoping
 > in C-1, where it is observable, and assert the count here.
 >
-> **[§0.5 known-open] this step names a bug the design says should not happen.**
-> The design intent is re-**adoption**; the code reaps. The `reaped orphaned
-> sandbox containers` line firing is the *current* behaviour and the step's pass
-> criterion — but record it as evidence for the open "containers killed rather
-> than re-adopted across restart" bug, and do **not** also record R-4's
-> "re-adopts its container" half as a fresh finding.
+> **[§0.5 known-open] this step names a behaviour the design says should not
+> happen, and #841 made the code SAY so instead of hiding it.** The design
+> intent is re-**adoption**; there is no attach path in the tree, so the boot
+> sweep destroys. It is a WARN now, and its own message states the consequence:
+> *"…were removed, not resumed — their work re-executes from the start."*
+> Record the line as evidence for the open "containers killed rather than
+> re-adopted across restart" item, and do **not** also record R-4's "re-adopts
+> its container" half as a fresh finding.
 
 ---
 
@@ -2847,7 +3146,7 @@ Pinned by `every_refusal_carries_the_name_of_what_actually_failed`.
 |---|---|
 | `airlock_gateway_unreachable` | transport error with no HTTP status, **or** HTTP 502. The lender's daemon is down, or its node cannot reach the daemon's loopback port. **Includes the stale-route case** (route registered, nothing listening). |
 | `airlock_route_or_credential_absent` | HTTP 404. No `airlock` route published on the lender, or no credential by that name in its store. |
-| `credential_not_granted` | HTTP 403 with that body token. The lender's grant gate consulted its committed record and the **vouched-for** account is neither owner nor grantee. **[#833] this no longer fires for a missing account** — see below. |
+| `credential_not_granted` | HTTP 403 with that body token. The lender's grant gate consulted its committed record and refused. **[#833] this no longer fires for a missing account** — see below. **[#843] it is now SEVEN different node-side decisions wearing one body token** — the caller's own grant plus the five delegated conditions plus an absent record; the lender's own log names which (see the lender-side table). Do not report a cause you did not read there. |
 | **`airlock_caller_account_unverified`** | **[#833] NEW.** HTTP 403 `caller_account_unverified`. The request reached the lender's listener **without the node's gateway proxy vouching for a caller** — so there was no verified identity to check a grant against. Distinct from "denied". |
 | `airlock_grant_authority_unavailable` | HTTP 503. The lender's gate could **not ask** its authority (query timeout, node restarting, resident not yet serving). Never means "denied". |
 | `airlock_gateway_refused` | any other HTTP status. |
@@ -2872,14 +3171,41 @@ Pinned by `every_refusal_carries_the_name_of_what_actually_failed`.
 
 Two layers, and they are not the same list. Do not conflate them.
 
-**Node-side decision** (`bin/node/src/airlock.rs`, DEBUG, target
-`ducktape::gateway`, carries `credential=<name>`, never the account):
+**Node-side REFUSAL** (`bin/node/src/airlock.rs`, `refuse()`, DEBUG, target
+`ducktape::gateway`, message `airlock session refused`). **[#843, #847] It
+carries `reason` and NOTHING else** — no credential, no account, no saga id.
+That is deliberate and pinned by
+`a_refusal_still_names_neither_the_credential_nor_the_caller`: a refusal is
+reachable by any admitted member with a `sub` of their own choosing, so naming
+the credential there would write a stranger's string into the owner's log. **A
+step that greps a refusal line for `credential=` will find nothing** — that
+field is on the ADMISSION line only.
 
 | `reason` | trigger | resolves to |
 |---|---|---|
 | `credential_record_absent` | query OK, gateway module returned no record for that name | `Refused` |
 | `grant_authority_unavailable` | the `/v1/query` itself failed — **note: no `airlock_` prefix on this side** | `Undetermined` |
-| `credential_not_granted` | record exists; the vouched account is neither owner nor grantee | `Refused` |
+| `credential_not_granted` | record exists; the vouched account is neither owner nor grantee **and the session presented `WorkRef::Direct`** (every interactive pty) | `Refused` |
+| **`work_pointer_oversized`** | **[#843]** a `Saga` pointer over `MAX_WORK_POINTER_BYTES` = 512. A refusal, not an impossibility — no product path emits one. | `Refused` |
+| **`delegated_work_unseen`** | **[#843]** this lender has not committed that saga: a follower behind head, or an id naming nothing. **Not a refusal** — the borrower re-asks (§0.4a). | `Undetermined` |
+| **`delegated_work_finished`** | **[#843]** the saga is terminal. A finished run is not a standing licence. | `Refused` |
+| **`delegated_work_names_another_credential`** | **[#843]** the committed spec names a different credential than the session's `sub`. The pointer buys one credential. | `Refused` |
+| **`delegated_caller_not_the_executor`** | **[#843]** the vouched caller is not the saga's `pinned_assignee` — including an UNPINNED saga, which delegates to nobody. | `Refused` |
+| **`delegated_submitter_not_granted`** | **[#843]** the saga's origin maps to an account the credential does not admit, or is `Module(_)`/`System`, which names no account to draw as. | `Refused` |
+
+**Node-side ADMISSION** (`bin/node/src/airlock.rs`, `admit()`, **INFO**, target
+`ducktape::gateway`, message `airlock session opened`). **[#847]** The owner's
+own audit record, and the only line on this path visible at the default filter:
+
+```
+airlock session opened credential=<name> caller=<4-byte hex prefix> work=direct
+airlock session opened credential=<name> caller=<4-byte hex prefix> work=delegated("sched\u{1f}<id>")
+```
+
+`work=` is a `Draw` discriminant, not a copy of the request: a session that
+carried a pointer but was admitted on the caller's OWN grant records `direct`,
+because the pointer bought nothing there. Never the token, the credential's
+value, or the caller's whole account.
 
 **Gateway-side HTTP** (`crates/airlock/src/server.rs`) — the plain body tokens a
 borrower actually sees:
@@ -2892,9 +3218,30 @@ borrower actually sees:
 | `grant_authority_unavailable` | **503** |
 | (decode failure — unknown/missing field) | **422** |
 
-`credential_record_absent` is a **node-side log token only**; on the wire both
-`Refused` arms collapse into `403 credential_not_granted`. A report that lists it
-as an HTTP reason is reading the wrong layer.
+**Every `Refused` arm above collapses into `403 credential_not_granted` on the
+wire, and every `Undetermined` arm into `503 grant_authority_unavailable`.** The
+node-side tokens exist only in the lender's own log, at `debug` — invisible at
+the default filter. A negative half that needs to tell the seven refusals apart
+must start the lender daemon with `RUST_LOG=ducktape::gateway=debug`
+(`RUST_LOG` **adds to** the default rather than replacing it,
+`bin/noded/src/log.rs`). A report that lists a node-side token as an HTTP reason
+is reading the wrong layer.
+
+### Borrower side — the broker's own per-request line (`crates/services/broker/src/lib.rs`)
+
+**[#844] `log_request`, DEBUG, target `ducktape::broker`, message
+`brokered request`, fields `method` / `path` / `status`.** Not a refusal table —
+it is the trace that tells a credential failure apart from a provider that never
+asked. Outermost middleware on both routers, so body-limit rejections and
+`fallback(reject)` 403s appear too. **Requires `ducktape::broker=debug` on the
+daemon that spawns the run** (compute for `sched`, agent for `pty`); no
+`RUST_LOG` in this runbook enables it by default.
+
+### Provider run home (`crates/services/provider/src/lib.rs`)
+
+| `reason` | level | meaning |
+|---|---|---|
+| **`config_home_not_removed`** | WARN, target `ducktape::provider`, `"the run's config home outlived its run"` | **[#845]** `RunHome`'s `Drop` could not remove `<workdir>/.ducktape-run/<slot>`. The path is deliberately absent from the line. Only a SIGKILLed host should leave one standing — `runtime_slot()` is 12 random bytes per run now, so no later run can name an inherited one. |
 
 ### Lender side — operational
 
@@ -3032,11 +3379,14 @@ Not exercised by any step here — see §0.4b.
   2. its topic table says **"7 families, none gated"** — #827 gated three of them
      behind the workspace secret. Wave 3's premise survives; the inventory does
      not.
-- **`docs/superpowers/plans/2026-07-26-work-admission.md` has one stale
-  paragraph** (§P10): it describes the shared-pty fix as a `MembersOnly` post
-  policy with a participants roster. #835 **rejected** that and gated at
-  `project_message` instead (§0.4b). Its §4 on delegation is current and is the
-  reference for §0.4a.
+- **`docs/superpowers/plans/2026-07-26-work-admission.md` — two stale places,
+  both corrected in the same PR as this revision.** (1) §7.1 described the
+  shared-pty fix as a `MembersOnly` post policy with a participants roster; #835
+  **rejected** that and gated at `project_message` on `Channel.owner` instead
+  (§0.4b). (2) §4 "Delegation — after, not with" and decision 8.3 "Delegation
+  ships next, not with" were **written before #843 and now describe shipped
+  work**; §4 is no longer the reference for §0.4a — the code is, and §0.4a cites
+  it directly. §5.5 also named a test that no longer exists under that name.
 - **`bin/node/tests/remote_session.rs`'s own header comment is stale** — it says
   the test *"SKIPS loudly when podman is absent"*; since #831 it FAILS. (That
   file is also the known-red baseline below; the two are unrelated.)
@@ -3090,8 +3440,11 @@ Plus, at the top:
   - `grant.scopes` gates nothing
   - a same-uid process can read `identity.key`
   - the `logs` and `module:<id>` ws topics are Public
-  - **delegation is not implemented** (§0.4a) — the refusal in T2-4's negative
-    half is correct behaviour, not a defect
+  - **delegation IS implemented** (#843/#847) and §0.4a says what it does and
+    does not authorize. What this pass proves about it is one live cross-box
+    round trip and the refusals it exercises — **not** the gate's own conjunction;
+    the four conditions are proven by `cred_lending` and `sched_pinned_run`, and
+    a green T2-5 alone is not evidence any one of them holds
   - the continuation-lane deletion (#839) is **in** this tree but **untested by
     this pass** — a green run is not evidence the consensus-takeover class is
     closed
@@ -3127,6 +3480,39 @@ Read this before comparing a report against an older run of the same step ids.
 **Steps whose pass criterion changed — an old PASS does not carry over:**
 P-3, P-4 (a+b), P-6, P-9, T1-2, T1-7, I-2, I-3 (now I-3a/I-3b), C-3, K-1, K-2,
 R-1, R-3, R-4, V-1, V-2, V-3, V-4, V-5.
+
+**Steps whose pass criterion changed AGAIN in the 2026-07-27 re-repair (#843,
+#847), and this set is sharper: an old EXPECTED-REFUSAL is now a FAIL.**
+
+- **T2-4** — its deliberate-failure half was the exact inverse of the shipped
+  behaviour. Old text: grant the lender's own account, run T2-5, expect
+  `credential_not_granted`. That shape now returns `Done` + `PONG`. Replaced
+  with a borrower-submits-pinned-to-itself refusal, which is a real gate.
+- **T2-5** — its lender-log observable moved from `debug`/"never the account" to
+  the `info` `airlock session opened` record, and gained the `work=delegated(..)`
+  assertion that is the only thing distinguishing a delegated draw from a
+  standing-grant one. It also gained the note that one 503 on this lane is
+  expected weather, not a finding.
+- **T2-6** — gained the mirrored `work=direct` assertion, and the statement that
+  T2-4's grant is what this step needs (a pty sends `WorkRef::Direct` and cannot
+  delegate).
+- **T1-7** — its `grep -c 'credential='` was unsatisfiable by construction until
+  #847 and is replaced with `airlock session opened` / `work=direct`.
+- **§0.4a, §10's lender-side table, §12's honest list** — rewritten.
+
+**And by the other four merges in the same window:**
+
+- **C-3** (#841) — all three strings it asserted on are gone from the tree, and
+  a clean stop now sweeps, so only a SIGKILL sets the step up at all.
+- **P-3b** (#841, #846) — `--json` is an array and carries no node build;
+  `service status <KIND>` parses now; the exe-path caveat is dead (`flock`).
+- **T1-4** (#841) — the singleton guard DOES fire between two binary paths now,
+  which is the opposite of what §0.5 said.
+- **T2-5's flag-trap box** (#846) — `--node duke` is refused where it was typed;
+  the reqwest `builder error` it told you to expect no longer happens.
+- **T2-6** (#844) — the "Why not the macmini" box named two env vars and a
+  commit that are not in this tree.
+- **§0.5** (#841) — three of five fixed, one narrowed, one unchanged.
 
 **Assertions deleted as unreachable, and why** (each is documented at its step —
 an assertion nothing can trip reads as coverage and is worse than none):
