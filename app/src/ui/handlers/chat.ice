@@ -57,6 +57,9 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
 
 on choose_channel(id)
   return if loading || mutation_phase != "idle"
+  active_dm_peer = ""
+  inspector_open = false
+  inspector_seq = 0
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   hydration_generation = hydration_generation + 1
@@ -84,6 +87,42 @@ on choose_channel(id)
   pending_reply = ""
   error = ""
   run load_chat(connected_rpc, id) -> chat_updated _ | failed _
+
+// A DM is not a second message plane: it is the two-party members-only channel
+// at `dm_channel_id(me, peer)`, resolved or created on the way in. Everything
+// downstream of `chat_updated` is the ordinary channel path.
+on choose_dm(peer_key)
+  return if loading || mutation_phase != "idle" || empty(peer_key)
+  active_dm_peer = peer_key
+  inspector_open = false
+  inspector_seq = 0
+  chat_search_generation = chat_search_generation + 1
+  chat_searching = false
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  loading = true
+  chat_search_hits = []
+  selected_message_seq = 0
+  hovered_message_seq = 0
+  selected_message_rev = 0
+  message_action = "toolbar"
+  message_edit_draft = ""
+  channel_settings_open = false
+  channel_name_draft = ""
+  member_key_draft = ""
+  active_thread_seq = 0
+  thread_target_seq = 0
+  thread_messages = []
+  thread_next_reply_offset = 0
+  thread_has_more = false
+  thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
+  thread_loading = false
+  reply_draft = ""
+  reply_editor = editor("")
+  pending_reply = ""
+  error = ""
+  run open_dm(connected_rpc, password, peer_key) -> chat_updated _ | failed _
 
 on create_channel_submit
   return if loading || mutation_phase != "idle" || empty(trim(channel_draft))
@@ -441,9 +480,35 @@ on begin_message_edit(seq, body, rev)
   message_edit_draft = body
   task widget focus #workspace-tabs/content/message-edit
 
+// THE INSPECTOR IS THE FINALITY MARK'S TARGET. The shield in the hover bar and
+// the settled chip on my own bubble both land here, and both name the same
+// right rail — so opening one closes the other.
+on open_message_inspector(seq)
+  return if seq <= 0 || empty(active_channel)
+  channel_settings_open = false
+  active_thread_seq = 0
+  thread_target_seq = 0
+  thread_messages = []
+  thread_next_reply_offset = 0
+  thread_has_more = false
+  thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
+  thread_loading = false
+  reply_draft = ""
+  reply_editor = editor("")
+  pending_reply = ""
+  inspector_seq = seq
+  inspector_open = true
+
+on close_message_inspector
+  inspector_open = false
+  inspector_seq = 0
+
 on open_thread_for(seq)
   return if seq <= 0 || empty(active_channel)
   channel_settings_open = false
+  inspector_open = false
+  inspector_seq = 0
   selected_message_seq = 0
   selected_message_rev = 0
   message_action = "toolbar"
