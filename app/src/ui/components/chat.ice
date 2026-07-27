@@ -152,6 +152,13 @@ component MessageContents(message:ChatMessage)
             text "✓" size=10.0 wrap=none font=code_semibold @text-success_tick
           space w=fill
       MessageBody message=message
+      // A row still in flight carries no height and no tick, so without this it
+      // is indistinguishable from a settled one. The chip is the only send-state
+      // surface the timeline has — the right-aligned own-message bubble the
+      // artifact draws is not mounted.
+      if message.pending
+        row w=fill pt=5.0
+          FinalityChip phase="finalizing" height=0
       // Reactions and the replies button STACK — the artifact gives each its
       // own line under the body, never one shared row.
       if !empty(message.reactions)
@@ -226,11 +233,13 @@ component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled
                 active bg=transparent text=muted r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
-              button label="Inspect event" disabled=disabled p=5.0 @icon_action -> open_message_inspector(message.seq)
-                Icon name="shield" tone="muted" px=15.0
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
+              // The artifact's shield sits here and opens an Event Inspector
+              // rail. The rail is NOT built: mounting it belongs to view.ice
+              // and needs an op hash the app would have to resolve through
+              // /v1/blocks. A shield that opens nothing — and whose handler
+              // discards the open thread and the half-typed reply on the way —
+              // is worse than no shield, so the seat stays empty until the rail
+              // lands. The ⋯ menu below is the only real actions surface.
               button "⋯" label="More message actions" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> open_message_actions(message.seq, message.body, message.rev)
                 active bg=transparent text=muted r=6.0
                 hovered bg=elevated text=fg
@@ -395,12 +404,30 @@ component ThreadRepliesRule(count:i64)
 // can answer from what it holds: who wrote this, into which channel, at which
 // height, and has it settled.
 //
+// NOTHING MOUNTS THIS YET. view.ice owns the right rail, and until it renders
+// `EventInspector` behind `inspector_open` the panel does not exist for a user.
+// That is why the message hover bar carries NO shield: `open_message_inspector`
+// closes the open thread and discards the half-typed reply on its way to a
+// surface that never appears, and a control that costs a draft and returns
+// nothing is worse than a missing control. The only remaining route into the
+// handler is the finality chip on `OwnMessageRow`, which is itself unmounted.
+// Whoever mounts the rail re-adds the shield; whoever decides not to should
+// delete this component, `OwnMessageRow`'s chip button, the two handlers in
+// handlers/chat.ice and the two state fields in state.ice together.
+//
 // DELIBERATELY ABSENT, and not stubbed: the 5-step consensus timeline (no
 // per-height batch id, merkle root or round is reachable from any RPC), the
-// quorum signer chips (no block certificate on the wire), Copy proof and
-// Verify (nothing to copy and nothing to check it against), and the raw wire
+// quorum signer chips (no block certificate on the wire), and the raw wire
 // JSON — `ChatMessage` is a projection of the op, not the op, so printing a
 // JSON-shaped block here would be a drawing of a record we never fetched.
+//
+// REACHABLE BUT NOT WIRED, so no faked chips: `GET /v1/blocks`
+// (bin/noded/src/index.rs) does serve a block `hash` and `commit_hash` and a
+// per-op `op_hash`, `proposer` and `disposition`, and app/src/backend.rs
+// already parses all of them into ExplorerBlock/ExplorerOp. What is missing is
+// a message -> op lookup, plus the fact that /v1/blocks only serves a recent
+// window, so an older message could not be resolved at all. Copy proof and
+// Verify wait on the same lookup.
 // ============================================================================
 
 component EventInspector(message:ChatMessage, channel_name:str)
