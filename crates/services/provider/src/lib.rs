@@ -1108,20 +1108,42 @@ impl CliProvider {
             .join(runtime_slot(ctx, workdir))
             .join("provider-config");
         create_private_dir(&dir)?;
-        // Claude Code reads settings from `<CLAUDE_CONFIG_DIR>/settings.json`.
-        // `skipWebFetchPreflight` cannot be expressed as an env var, so it rides
-        // this file in the fresh config home: without it, WebFetch preflights
-        // api.anthropic.com DIRECTLY, bypassing the broker, and fails behind
-        // isolation. Written only for the Anthropic broker (codex ignores it).
+        // The two Claude Code state files this FRESH config home must carry.
+        // Written only for the Anthropic broker (codex ignores both).
+        //
+        // `settings.json` / `skipWebFetchPreflight`: cannot be expressed as an
+        // env var. Without it, WebFetch preflights api.anthropic.com DIRECTLY,
+        // bypassing the broker, and fails behind isolation.
+        //
+        // `.claude.json` / `hasCompletedOnboarding`: Claude Code runs its
+        // FIRST-RUN WIZARD whenever this file does not say onboarding is done —
+        // and a fresh config home never does. Step two of that wizard is
+        // "Select login method", which opens a browser OAuth flow the sandbox
+        // can neither reach nor complete, so an INTERACTIVE session dead-ends
+        // there even though the seeded `.credentials.json` is valid and the
+        // broker is up. Headless `claude -p` never runs the wizard, which is
+        // exactly why only the TUI lane broke.
+        //
+        // The claim is TRUE, not a forged auth state. The wizard collects a
+        // theme and a login method; both are already decided — the operator
+        // logged in on the host and the broker holds that credential. Nothing
+        // here asserts the UPSTREAM will accept anything: a bad or revoked
+        // credential still fails honestly on the first `/v1/messages`, with the
+        // provider's own error, rather than being papered over.
         if self.spec.isolation.broker == Some(BrokerKind::AnthropicMessages) {
-            let settings = dir.join("settings.json");
-            std::fs::write(&settings, r#"{"skipWebFetchPreflight":true}"#).map_err(|e| {
-                format!(
-                    "{}: write claude settings {}: {e}",
-                    self.spec.tag,
-                    settings.display()
-                )
-            })?;
+            for (name, contents) in [
+                ("settings.json", r#"{"skipWebFetchPreflight":true}"#),
+                (".claude.json", r#"{"hasCompletedOnboarding":true}"#),
+            ] {
+                let path = dir.join(name);
+                std::fs::write(&path, contents).map_err(|e| {
+                    format!(
+                        "{}: write claude {name} {}: {e}",
+                        self.spec.tag,
+                        path.display()
+                    )
+                })?;
+            }
         }
         Ok(Some(dir))
     }
@@ -4308,6 +4330,69 @@ broker = "anthropic-messages"
         assert!(envs.iter().all(|(key, _)| {
             key != PROVIDER_CONTROL_URL_ENV && key != PROVIDER_CONTROL_TOKEN_ENV
         }));
+    }
+
+    /// A fresh claude config home is not usable EMPTY: Claude Code decides it is
+    /// on its first run and starts the onboarding wizard, whose second step is a
+    /// browser login the sandbox cannot complete — an interactive session
+    /// dead-ends there with a perfectly valid seeded credential. Both state files
+    /// are part of making the home usable, so both are asserted here.
+    #[test]
+    fn a_fresh_claude_config_home_is_seeded_past_the_first_run_wizard() {
+        let provider = CliProvider::from_spec(
+            anthropic_broker_spec("cl"),
+            PathBuf::from("/usr/bin/cl"),
+            SandboxBackend::Bare,
+        );
+        let workdir = scratch("claude_config_home_seed");
+        let dir = provider
+            .prepare_config_home(&workdir, &RunContext::default())
+            .expect("config home materializes")
+            .expect("a claude spec names a config home");
+
+        let read = |name: &str| -> serde_json::Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(dir.join(name))
+                    .unwrap_or_else(|e| panic!("{name} seeded into the config home: {e}")),
+            )
+            .unwrap_or_else(|e| panic!("{name} is json: {e}"))
+        };
+        assert_eq!(
+            read(".claude.json")["hasCompletedOnboarding"].as_bool(),
+            Some(true),
+            "without this, the TUI runs the first-run wizard and lands on \
+             'Select login method' instead of a prompt"
+        );
+        assert_eq!(
+            read("settings.json")["skipWebFetchPreflight"].as_bool(),
+            Some(true),
+            "without this, WebFetch preflights api.anthropic.com around the broker"
+        );
+    }
+
+    /// A CODEX config home stays EMPTY — the claude state files are not merely
+    /// unused there, an empty `CODEX_HOME` is what forces codex onto the broker
+    /// instead of the operator's real `auth.json`.
+    #[test]
+    fn a_codex_config_home_is_not_seeded_with_claude_state() {
+        let provider = CliProvider::from_spec(
+            broker_spec("cx"),
+            PathBuf::from("/usr/bin/cx"),
+            SandboxBackend::Bare,
+        );
+        let workdir = scratch("codex_config_home_seed");
+        let dir = provider
+            .prepare_config_home(&workdir, &RunContext::default())
+            .expect("config home materializes")
+            .expect("a codex spec names a config home");
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read config home")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "codex config home must be empty, got {entries:?}"
+        );
     }
 
     #[test]

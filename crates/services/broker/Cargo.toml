@@ -38,3 +38,7 @@ testkit = []
 # the in-process airlock custody test boots the gateway HTTP service itself
 # (server feature) to drive sandbox → broker → gateway → upstream end to end.
 airlock = { path = "../../airlock", features = ["client", "server", "verify", "testkit"] }
+# the per-request log line is a CONTRACT (it is the only way to see what a
+# wedged provider child asked for), so a test reads it back off a real
+# subscriber rather than trusting the macro is still there.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
