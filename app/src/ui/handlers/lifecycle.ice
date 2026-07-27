@@ -10,6 +10,14 @@ state
   // workspace larger than that shows a tree that stops, until the tree itself
   // learns to page on its `next` cursor.
   files_tree:[FsEntry] = []
+  // The consensus trio off /v1/status, held as the TEXT the console prints.
+  // `NodeFacts` carries them as `i64?` on purpose — a resident has no consensus
+  // block at all — and `optional_number` renders `—` for absent. Storing the
+  // rendered label is what keeps an absent reading from arriving as a measured
+  // zero, which is what `view 0 · 0/0 certs` on a healthy chain was.
+  node_view_label = "—"
+  node_quorum_label = "—"
+  node_reachable_label = "—"
 
 on mount
   loading = true
@@ -240,20 +248,26 @@ on live_resynced(next)
   selected_block_id = refreshed_selected_block(blocks, selected_block_id)
   selected_block_kind = retain_selected_string(selected_block_kind, selected_block_id)
   selected_block_checked = selected_block_checked && !empty(selected_block_id)
-  block_comments_open = block_comments_open && !empty(selected_block_id)
-  block_comments_target = retain_selected_string(block_comments_target, selected_block_id)
-  block_comment_threads = retain_selected_comment_threads(block_comment_threads, selected_block_id)
-  block_comment_thread_total = retain_selected_i64(block_comment_thread_total, selected_block_id)
-  block_comment_threads_next_from = retain_selected_i64(block_comment_threads_next_from, selected_block_id)
-  block_comment_threads_has_more = block_comment_threads_has_more && !empty(selected_block_id)
-  block_comment_threads_loading = block_comment_threads_loading && !empty(selected_block_id)
-  active_block_comment_thread = retain_selected_string(active_block_comment_thread, selected_block_id)
-  block_thread_comments = retain_selected_comments(block_thread_comments, selected_block_id)
-  block_thread_comments_next_from = retain_selected_i64(block_thread_comments_next_from, selected_block_id)
-  block_thread_comments_has_more = block_thread_comments_has_more && !empty(selected_block_id)
-  block_thread_comments_loading = block_thread_comments_loading && !empty(selected_block_id)
-  block_comment_draft = retain_selected_string(block_comment_draft, selected_block_id)
-  pending_block_comment = retain_selected_string(pending_block_comment, selected_block_id)
+  // THE COMMENTS RAIL IS DOCUMENT-SCOPED (handlers/pages.ice:300). Its anchor is
+  // the PAGE it was opened on, never a block selection — keyed on
+  // `selected_block_id` it closed itself, and threw the half-typed comment away,
+  // the moment the user clicked off the block whose ⋮ menu opened it. So the
+  // target is the one thing reconciled against the page identity here, and every
+  // other rail field keys on the target: one line decides the whole rail.
+  block_comments_target = retain_for_endpoint(block_comments_target, active_page, keep_str(next.pages_loaded, next.active_page, active_page))
+  block_comments_open = block_comments_open && !empty(block_comments_target)
+  block_comment_threads = retain_selected_comment_threads(block_comment_threads, block_comments_target)
+  block_comment_thread_total = retain_selected_i64(block_comment_thread_total, block_comments_target)
+  block_comment_threads_next_from = retain_selected_i64(block_comment_threads_next_from, block_comments_target)
+  block_comment_threads_has_more = block_comment_threads_has_more && !empty(block_comments_target)
+  block_comment_threads_loading = block_comment_threads_loading && !empty(block_comments_target)
+  active_block_comment_thread = retain_selected_string(active_block_comment_thread, block_comments_target)
+  block_thread_comments = retain_selected_comments(block_thread_comments, block_comments_target)
+  block_thread_comments_next_from = retain_selected_i64(block_thread_comments_next_from, block_comments_target)
+  block_thread_comments_has_more = block_thread_comments_has_more && !empty(block_comments_target)
+  block_thread_comments_loading = block_thread_comments_loading && !empty(block_comments_target)
+  block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)
+  pending_block_comment = retain_selected_string(pending_block_comment, block_comments_target)
   block_edit_draft = retain_selected_string(block_edit_draft, selected_block_id)
   block_delete_armed = block_delete_armed && !empty(selected_block_id)
   block_actions_open = block_actions_open && !empty(selected_block_id)
@@ -267,9 +281,24 @@ on live_resynced(next)
   error = ""
   block_comments_generation = block_comments_generation + 1
   live_thread_generation = live_thread_generation + 1
+  // The rail's live refresh must ask the SAME question the rail was filled
+  // from. `refresh_block_comments` asks `ThreadsForTargets` for the target
+  // ALONE, so with a page target it found only page-anchored threads and wiped
+  // every block-anchored one out of the open rail on the next pages event.
+  // `load_page_threads` fans out over the page AND its blocks, and answers on
+  // the handler pages.ice already routes its own loads through. Both routes
+  // ignore a closed rail, so a page event with no rail open costs one refused
+  // query and never touches the banner.
+  //
+  // The list is all that refreshes live. An OPEN thread's replies do not: a task
+  // group must be the final statement in a handler, so the comment-page load
+  // cannot be guarded on `active_block_comment_thread`, and firing it unguarded
+  // asks the node for thread "" — whose failure paints `block_comment_page_failed`
+  // over the rail every time anyone edits the page. Replies still arrive on post
+  // and on reopen; a page-scoped comment refresh in backend.rs closes the gap.
   parallel
     run refresh_live_thread(connected_rpc, active_channel, active_thread_seq, thread_target_seq, thread_next_reply_offset, live_thread_generation) -> live_thread_refreshed _ | live_thread_refresh_failed _
-    run refresh_block_comments(connected_rpc, block_comments_target, active_block_comment_thread, block_comments_generation) -> live_block_comments_refreshed _ | live_block_comments_failed _
+    run load_page_threads(connected_rpc, block_comments_target, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on live_resync_failed(cause)
   return if cause.generation != hydration_generation
@@ -290,25 +319,6 @@ on live_thread_refreshed(next)
 on live_thread_refresh_failed(cause)
   return if cause.generation != live_thread_generation
 
-on live_block_comments_refreshed(next)
-  return if next.generation != block_comments_generation || next.target != block_comments_target
-  block_comment_threads_loading = false
-  block_thread_comments_loading = false
-  block_comment_threads = next.threads
-  block_comment_thread_total = next.total
-  block_comment_threads_next_from = next.threads_next_from
-  block_comment_threads_has_more = next.threads_has_more
-  active_block_comment_thread = next.thread_id
-  block_thread_comments = next.comments
-  block_thread_comments_next_from = next.comments_next_from
-  block_thread_comments_has_more = next.comments_has_more
-
-on live_block_comments_failed(cause)
-  return if cause.generation != block_comments_generation
-  block_comment_threads_loading = false
-  block_thread_comments_loading = false
-  error = cause.message
-
 on select_shell_tab(next)
   shell_tab = next
   return if !connected
@@ -325,11 +335,15 @@ on select_shell_tab(next)
   node_facts_generation = node_facts_generation + 1
   explorer_loading = shell_tab == "explorer"
   fs_loading = shell_tab == "files"
+  // No `files_find` here. This block runs for EVERY tab but chat and pages, so
+  // a whole-workspace prefix walk was issued on the way into Settings, Forge,
+  // Members and Agents — for a `files_tree` no view reads, on a route whose
+  // failure paints the GLOBAL error banner over a screen with no file operation
+  // in sight. `fs_wrote` still refreshes the tree from inside the files tab.
   parallel
     run load_node_facts(connected_rpc, node_facts_generation) -> node_facts_loaded _ | node_facts_failed _
     run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
     run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
-    run files_find(connected_rpc, "", fs_generation) -> fs_tree_loaded _ | fs_failed _
     run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
     run load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
     run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
@@ -346,8 +360,12 @@ on forge_loaded(next)
 on forge_failed(cause)
   return if cause.generation != forge_generation
 
+// Picking a repo also DISMISSES the switcher. Nothing else clears it on this
+// route, so the popover stayed pinned over the first rows of the tracker list
+// the user just navigated to, with the crumb as the only way out.
 on forge_open_repo(name)
   return if !connected
+  forge_repo_menu = false
   forge_repo = name
   forge_item_number = 0
   forge_item_diff = ""
@@ -500,7 +518,6 @@ on forge_close_repo
 
 on forge_toggle_repo_menu
   forge_repo_menu = !forge_repo_menu
-  overlay_in = forge_repo_menu
 
 on forge_close_item
   forge_item_number = 0
@@ -546,7 +563,10 @@ on agents_loaded(next)
   return if next.generation != agents_generation
   agents_rows = next.agents
   // `pulse` is the console's only breathing dot and it repeats forever, so a
-  // live agent is the one fact that starts it. Nothing else animates.
+  // live agent is the one fact that starts it — and the ABSENCE of one is the
+  // fact that has to stop it. Written on both edges: an early return here would
+  // leave the dot lit for the rest of the session after the last agent pauses.
+  pulse = 0.0
   return if !any_agent_active(next.agents)
   pulse = 1.0
 
@@ -569,17 +589,19 @@ on peers_failed(cause)
 // The consensus facts /v1/status already publishes and the console dropped:
 // app-hash, view, quorum, reachable validators, finality and the gc watermark.
 //
-// `view`, `quorum` and `reachable_validators` are NOT stored: the contract made
-// them `Option<i64>` so a resident is not shown misleading zeroes, but Ice can
-// only WRAP an optional (`some(T)`), never read one — so an `i64?` cannot reach
-// an `i64` state field or a text node. Until NodeFacts carries the trio as
-// plain i64 beside a `consensus_known: bool`, `node_view`/`node_quorum`/
-// `node_reachable` stay at their defaults and nothing may print them.
+// `view`, `quorum` and `reachable_validators` arrive as `i64?` — a resident
+// publishes no consensus block at all — and Ice cannot read an optional into an
+// `i64`. `optional_number` is the seam: it renders the number, or `—` when the
+// node genuinely has no reading, so the console prints an absence as an absence
+// instead of as a measured zero.
 on node_facts_loaded(next)
   return if next.generation != node_facts_generation
   node_root_hash = next.root_hash
   node_last_finalized = next.last_finalized_at
   node_checkpoint = next.checkpoint_height
+  node_view_label = optional_number(next.view)
+  node_quorum_label = optional_number(next.quorum)
+  node_reachable_label = optional_number(next.reachable_validators)
 
 on node_facts_failed(cause)
   return if cause.generation != node_facts_generation
@@ -619,10 +641,18 @@ on receipts_pref_saved(saved)
 
 // DANGER ZONE — forget this workspace on THIS DEVICE and go back to onboarding.
 on forget_workspace_submit
-  return if !connected
+  return if !connected || mutation_phase != "idle"
+  mutation_phase = "forget-workspace"
+  error = ""
   run forget_workspace(connected_rpc) -> workspace_forgotten _ | mutation_failed _
 
-on workspace_forgotten(_result)
+// `forget_workspace` answers false when the prefs file could not be written.
+// Throwing her out to onboarding on that answer meant the workspace was back in
+// the picker at the next launch, looking like the app had ignored her.
+on workspace_forgotten(forgotten)
+  mutation_phase = "idle"
+  error = "This device could not forget the workspace."
+  return if !forgotten
   connected = false
   status = "Not connected"
   error = ""
@@ -633,12 +663,10 @@ on workspace_forgotten(_result)
 on copy_to_clipboard(text, label)
   toast = label
   toast_tone = "info"
-  overlay_in = true
   task clipboard write text
 
 on dismiss_toast
   toast = ""
-  overlay_in = false
 
 on governance_loaded(next)
   return if next.generation != gov_generation
@@ -701,18 +729,18 @@ on pick_members_filter(filter)
 // The invite modal is pure view state — minting is a separate, explicit act.
 on open_invite_modal
   invite_modal_open = true
-  overlay_in = true
 
 on close_invite_modal
   invite_modal_open = false
-  overlay_in = false
 
-// Pause or resume an agent. The payload is what the row reads NOW, so a live
-// agent pauses and a paused one resumes. Only its owner may ask: the view
-// offers this on `is_mine` rows, and the node refuses anyone else.
-on agent_set_status(agent_id, live)
+// Pause or resume an agent. The payload is the DESIRED state and it is named
+// for the backend parameter it becomes: `true` PAUSES, `false` resumes. The
+// roster's Pause control passes `true` and its Resume control passes `false`;
+// a row wired from `agent.status` would have to invert. Only its owner may ask:
+// the view offers this on `is_mine` rows, and the node refuses anyone else.
+on agent_set_status(agent_id, paused)
   return if !connected
-  run set_agent_status(connected_rpc, password, agent_id, live) -> agent_status_set _ | mutation_failed _
+  run set_agent_status(connected_rpc, password, agent_id, paused) -> agent_status_set _ | mutation_failed _
 
 on agent_status_set(_result)
   agents_generation = agents_generation + 1
@@ -870,7 +898,6 @@ on select_explorer_block(height)
 on toggle_palette
   return if !connected
   palette_open = !palette_open
-  overlay_in = palette_open
   palette_draft = ""
   palette_chat_hits = []
   palette_page_hits = []
@@ -881,18 +908,15 @@ on toggle_palette
 
 on close_palette
   palette_open = false
-  overlay_in = false
 
 // Opening the bell only opens it. Marking read is the Mark-all-read button's
 // job — doing it here cleared the badge and every unread row before the list
 // painted, and left that button with nothing to do.
 on toggle_bell
   bell_open = !bell_open
-  overlay_in = bell_open
 
 on close_bell
   bell_open = false
-  overlay_in = false
 
 on mark_bell_read_submit
   return if bell_unread <= 0
@@ -914,7 +938,6 @@ on global_key_pressed(event)
   return if palette_key == "none"
   return if palette_key == "open" && !connected
   palette_open = palette_key == "open"
-  overlay_in = palette_open
   palette_key = ""
   palette_draft = ""
   palette_chat_hits = []
