@@ -1541,8 +1541,12 @@ async fn live_peer_keys(rpc: &RpcClient) -> BTreeSet<String> {
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .filter(|peer| peer["live"].as_bool().unwrap_or(false))
-        .filter_map(|peer| peer["key"].as_str().map(str::to_string))
+        // `connected` and `peer`, NOT `live`/`key`: those are the names
+        // `PeerView` serializes (bin/noded/src/peers.rs). Reading the wrong
+        // ones made every lookup return null, so this set came back empty on
+        // every call and every member rendered offline.
+        .filter(|peer| peer["connected"].as_bool().unwrap_or(false))
+        .filter_map(|peer| peer["peer"].as_str().map(str::to_string))
         .collect()
 }
 
@@ -3577,6 +3581,10 @@ pub struct ProvisionStep {
     pub index: i64,
     pub label: String,
     pub state: String,
+    /// `state == "done"`, as a Copy field. The onboarding handler has to decide
+    /// whether the phase advances BEFORE it moves the step into the reading,
+    /// and reading `state` there would move the String out from under it.
+    pub settled: bool,
 }
 
 /// The five provisioning steps. Steps 1-3 are facts of the materialized
@@ -3656,11 +3664,13 @@ pub fn provision_progress(
                             index: 4,
                             label: "Local node starting".into(),
                             state: "running".into(),
+                            settled: false,
                         },
                         true => ProvisionStep {
                             index: 4,
                             label: format!("Start the node · ducktape node run -n {}", state.chain_id),
                             state: "blocked".into(),
+                            settled: false,
                         },
                     };
                     Some((step, state))
@@ -3677,6 +3687,7 @@ pub fn provision_progress(
                             index: 5,
                             label: format!("Node API listening · {listen}"),
                             state: "done".into(),
+                            settled: true,
                         },
                         state,
                     ))
@@ -3697,6 +3708,7 @@ fn registered_step(index: i64, label: &str, established: bool) -> ProvisionStep 
             true => "done".into(),
             false => "blocked".into(),
         },
+        settled: established,
     }
 }
 
