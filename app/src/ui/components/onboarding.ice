@@ -213,14 +213,27 @@ component ProgressCell(filled:bool)
 // `spin` is carried per the frozen signature and deliberately unconsumed: the
 // artifact's running marker is a CSS-keyframe arc with a transparent top edge,
 // which iced cannot stroke inside a border. The marker is a solid amber ring.
+// Reads each of the step's String fields exactly once, in exclusive `match`
+// arms: two `if` blocks both reading `step.label` move the same String twice
+// and the generated Rust will not compile. Copy fields have no such limit.
 component ProvisionRow(step:ProvisionStep, spin:f64)
   col #root w=fill gap=0.0
-    if step.state == "blocked"
-      GateNote reason=step.label next="This app is a client — it attaches to a node you start, it never starts one."
-    if step.state != "blocked"
-      row w=fill gap=12.0 align=center
-        ProvisionMark state=step.state
-        ProvisionLabel label=step.label state=step.state
+    match step.state
+      "blocked"
+        GateNote reason=step.label next="This app is a client — it attaches to a node you start, it never starts one."
+      "done"
+        ProvisionLine tone="done" label=step.label dim=false
+      "running"
+        ProvisionLine tone="running" label=step.label dim=false
+      _
+        ProvisionLine tone="pending" label=step.label dim=true
+
+// The mark and its label, one row. Split out so `tone` reaches the mark and
+// the label's dimming without either component reading a String twice.
+component ProvisionLine(tone:str, label:str, dim:bool)
+  row #root w=fill gap=12.0 align=center
+    ProvisionMark state=tone
+    ProvisionLabel label=label dim=dim
 
 // done ✓ on the success plate, running on an amber ring, pending on the
 // `pending_line` ring — the artifact's dashed outline at its own hex, solid,
@@ -239,12 +252,13 @@ component ProvisionMark(state:str)
           space w=1.0 h=1.0
 
 // A reached step reads forward; an unreached one recedes.
-component ProvisionLabel(label:str, state:str)
+component ProvisionLabel(label:str, dim:bool)
   col #root w=fill
-    if state == "pending"
-      text label w=fill size=13.5 line-h=1.45 @text-hint
-    if state != "pending"
-      text label w=fill size=13.5 line-h=1.45 @text-accent_fg
+    match dim
+      true
+        text label w=fill size=13.5 line-h=1.45 @text-hint
+      _
+        text label w=fill size=13.5 line-h=1.45 @text-accent_fg
 
 // LIVE. The hero, the reading, and the one thing this screen is for: an invite
 // another device can use.

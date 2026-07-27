@@ -27,6 +27,9 @@ mod tests {
             show_author: true,
             initial: "U".into(),
             avatar_kind: "human".into(),
+            mine: false,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         }
     }
@@ -103,6 +106,7 @@ mod tests {
             active_channel_archived: false,
             active_channel_members_only: false,
             active_channel_huddle_count: 0,
+            huddle_roster: Vec::new(),
             channel_members: Vec::new(),
             pages_loaded: true,
             pages: Vec::new(),
@@ -138,6 +142,7 @@ mod tests {
             active_channel_archived: false,
             active_channel_members_only: false,
             active_channel_huddle_count: 0,
+            huddle_roster: Vec::new(),
             channel_members: Vec::new(),
             selected_message_seq: 0,
             selected_message_rev: 0,
@@ -1097,6 +1102,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             show_author: true,
             initial: "U".into(),
             avatar_kind: "human".into(),
+            mine: false,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         };
         let (mut app, _) = Ducktape::__boot();

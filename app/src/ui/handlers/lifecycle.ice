@@ -662,7 +662,7 @@ on gov_execute(proposal_id)
 on gov_propose(action, target_key)
   return if !connected || !empty(gov_voting)
   gov_voting = target_key
-  run governance_propose(connected_rpc, password, action, target_key) -> gov_acted _ | gov_act_failed _
+  run governance_propose(connected_rpc, password, action, gov_voting) -> gov_acted _ | gov_act_failed _
 
 on gov_acted(_result)
   gov_voting = ""
