@@ -74,9 +74,16 @@ pub(crate) fn podman_backend(
     service: &config::ServiceConfig,
     kind: &str,
 ) -> Result<provider_host::SandboxBackend, String> {
-    let backend = service.sandbox.clone().ok_or(
-        "no [sandbox] table in node.toml: this host has no configured way to isolate a run",
-    )?;
+    // the fix is already IN the file this complains about: `node init` writes
+    // the whole `[sandbox]` block commented out, so "uncomment it" is a real
+    // instruction rather than a spec to go and look up.
+    let backend = service.sandbox.clone().ok_or_else(|| {
+        format!(
+            "no [sandbox] table in node.toml: this host has no configured way to isolate a run \
+             — uncomment the [sandbox] block at the end of {}/node.toml, then restart the node",
+            service.workspace.display()
+        )
+    })?;
     let provider_host::SandboxBackend::Podman { image, .. } = backend else {
         return Ok(backend);
     };
@@ -791,12 +798,35 @@ impl WorkspaceArgs {
             let (dir, _http) = config::resolve_network(needle)?;
             return Ok(dir);
         }
-        Err("service command needs --config <file>, --workspace <dir> or -n/--network <id>".into())
+        // the bottom rung `node run` and `node status` already stand on: with
+        // exactly one workspace registered there is nothing to disambiguate,
+        // and demanding a selector here made `service list` the only read verb
+        // on the box that refused to answer a machine with one network on it.
+        let mut workspaces = config::list_workspaces()?;
+        match workspaces.len() {
+            // `list_workspaces` yields the node.toml PATH, not the directory —
+            // this verb family wants the workspace that CONTAINS it.
+            1 => Ok(config::resolve_network(&workspaces.swap_remove(0).0)?.0),
+            0 => Err("no workspace: found one with `ducktape node init --name <name>` \
+                      or `ducktape node join <invite>`"
+                .into()),
+            _ => Err(format!(
+                "several workspaces are registered — pick one with -n:\n{}",
+                workspaces
+                    .iter()
+                    .map(|(chain_id, _)| format!("  {chain_id}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )),
+        }
     }
 }
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct ReadArgs {
+    /// show only this kind (`compute`, `agent`, `airlock`); omitted = all
+    #[arg(value_name = "KIND")]
+    kind: Option<String>,
     #[command(flatten)]
     workspace: WorkspaceArgs,
     /// emit one machine-readable JSON array instead of a table
@@ -927,7 +957,34 @@ fn view(args: &ReadArgs) -> Result<(Vec<ServiceRow>, Option<String>), Box<dyn st
     let workspace = args.workspace.dir()?;
     let grants = load(&workspace)?;
     let catalog = catalog_now(&workspace);
-    Ok((rows(&catalog.signaling, &grants.grants), catalog.node_build))
+    let all = rows(&catalog.signaling, &grants.grants);
+    Ok((only_kind(all, args.kind.as_deref())?, catalog.node_build))
+}
+
+/// Narrow the rendered rows to one kind, or say that kind is not here.
+///
+/// `service status compute` reads as the obvious invocation — it is the shape
+/// `enable`, `disable` and `run` all take — and answered
+/// `error: unexpected argument 'compute' found`, which reads like the command
+/// is broken rather than the invocation. Split out so the "named a kind that
+/// isn't there" message is drivable without a node.
+fn only_kind(rows: Vec<ServiceRow>, kind: Option<&str>) -> Result<Vec<ServiceRow>, String> {
+    let Some(kind) = kind else { return Ok(rows) };
+    let known: Vec<String> = rows.iter().map(|row| row.kind.clone()).collect();
+    let matched: Vec<ServiceRow> = rows.into_iter().filter(|row| row.kind == kind).collect();
+    if !matched.is_empty() {
+        return Ok(matched);
+    }
+    match known.as_slice() {
+        [] => Err(format!(
+            "{kind} is neither signaling nor enabled on this node — start it with: \
+             ducktape service run {kind}"
+        )),
+        here => Err(format!(
+            "no service {kind:?} on this node; there is: {}",
+            here.join(", ")
+        )),
+    }
 }
 
 fn list(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -957,6 +1014,30 @@ fn join_or_dash(items: &[String]) -> String {
         true => "-".into(),
         false => items.join(", "),
     }
+}
+
+/// How many capability tags a one-line startup banner may name before it stops
+/// being a line and becomes a wall.
+const BANNER_TAGS: usize = 6;
+
+/// The daemon's startup banner, which is NOT a consent surface: compute offers
+/// one tag per model × effort, so a real host signals ~37 of them and the whole
+/// banner — the `signaling to <chain>` half included — scrolls off the right of
+/// the terminal.
+///
+/// Deliberately NOT applied to the `enable` consent screen or to
+/// `service status`: those exist to show you exactly what you are agreeing to
+/// and exactly what is offered, and a truncated list there would be a lie of
+/// omission. This one only says "it started".
+fn summarize_capabilities(kind: &str, tags: &[String]) -> String {
+    if tags.len() <= BANNER_TAGS {
+        return join_or_dash(tags);
+    }
+    format!(
+        "{}, +{} more (ducktape service status {kind})",
+        tags[..BANNER_TAGS].join(", "),
+        tags.len() - BANNER_TAGS,
+    )
 }
 
 /// Everything `enable` needs to decide, gathered without writing anything.
@@ -1224,7 +1305,7 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         paint(GREEN, "●"),
         paint(BOLD, &kind),
         service.chain_id,
-        join_or_dash(&hello.capabilities),
+        summarize_capabilities(&kind, &hello.capabilities),
     ))?;
 
     offer_enable(&workspace, &kind, args.offer(), &service, node_key, &base)?;
@@ -1272,11 +1353,11 @@ fn serve_kind(
     let Some(grant) = load(workspace)?.grant(kind).cloned() else {
         // signaling without standing is the designed resting state, not an
         // error: the operator reviews the hello and enables when ready.
-        write_err(&format!(
-            "  {} — nothing will execute until it is enabled
-",
-            paint(YELLOW, "not enabled")
-        ))?;
+        //
+        // Silent HERE, deliberately: `offer_enable` ran one call earlier and
+        // has already said exactly this, with the command that fixes it. Two
+        // lines saying "not enabled" — one of them without the fix — is what
+        // `--no-enable` used to print.
         return Ok(Served::SignalOnly);
     };
     let http_base = base.to_string();
@@ -1721,8 +1802,10 @@ fn offer_enable(
         // already granted: straight to serving, never a prompt.
         return Ok(());
     }
+    // THE one "not enabled" line — `serve_kind` prints none, so this carries
+    // both halves: what it means, and what to type.
     let hint = format!(
-        "  {} — enable it with: ducktape service enable {kind}\n",
+        "  {} — nothing will execute; enable it with: ducktape service enable {kind}\n",
         paint(YELLOW, "not enabled")
     );
     let planned = match offer {
@@ -1835,21 +1918,36 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let chain_id = plan.chain_id.clone();
     let height = commit_enable(&workspace, &base, &plan)?;
     // stdout is the id alone, so `$(ducktape service enable compute)` is the
     // instance id and nothing else; the prose goes to stderr.
     println!("{}", plan.grant.display_id());
     write_err(&format!(
-        "{} enabled {} · announced at height {height}\n",
+        "{} enabled {} · {}\n",
         paint(GREEN, ServiceState::Enabled.glyph()),
-        plan.grant.display_id()
+        plan.grant.display_id(),
+        announced_line(&chain_id, height),
     ))?;
     if daemon_for(&plan.kind).is_some() {
-        // the daemon, not the node, is what has to be running — and the node
-        // needs no restart: the announce above already told the network.
-        write_err(&format!("  start it with: ducktape service run {}\n", plan.kind))?;
+        // RESTART, not start. `plan_enable` refuses a kind that is not
+        // signaling, so the daemon is running by construction every time this
+        // prints — and it read its grant once at startup, so the process that
+        // is up right now still executes nothing. "start it with" was advice
+        // for a situation that cannot occur on this line.
+        write_err(&format!(
+            "  restart the daemon to pick the grant up: ^C, then ducktape service run {}\n",
+            plan.kind
+        ))?;
     }
     Ok(())
+}
+
+/// How an on-chain announce reads to someone who has never heard the word
+/// "height": WHERE it landed and WHICH block. The number is the same one
+/// `node status` reports, so the two surfaces stay comparable.
+fn announced_line(chain_id: &str, height: u64) -> String {
+    format!("announced on {chain_id} at block {height}")
 }
 
 fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1897,9 +1995,10 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
     })?;
     println!("{}", retired.display_id());
     write_err(&format!(
-        "disabled {kind}; {} is retired (a re-enable mints a fresh id) · retracted at height \
-         {height}\n",
-        retired.display_id()
+        "disabled {kind}; {} is retired (a re-enable mints a fresh id) · retracted on {} at \
+         block {height}\n",
+        retired.display_id(),
+        service.chain_id,
     ))?;
     // the announce is already retracted above, but a RUNNING daemon keeps
     // executing the work it already holds: it read its grant once, at its own
@@ -1924,6 +2023,103 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(kind: &str) -> ServiceRow {
+        ServiceRow {
+            kind: kind.into(),
+            state: ServiceState::Signaling,
+            instance: None,
+            version: None,
+            build: None,
+            capabilities: Vec::new(),
+            scopes: Vec::new(),
+            needs: Vec::new(),
+            unmet_needs: Vec::new(),
+        }
+    }
+
+    /// `service status compute` is the invocation everyone types — `enable`,
+    /// `disable` and `run` all take a KIND there — and it answered
+    /// `error: unexpected argument 'compute' found`, which reads like the
+    /// command is broken rather than the call.
+    #[test]
+    fn a_read_verb_takes_the_kind_every_other_service_verb_takes() {
+        let all = || vec![row("agent"), row("compute")];
+
+        assert_eq!(only_kind(all(), None).unwrap().len(), 2, "no kind = all");
+        let one = only_kind(all(), Some("compute")).unwrap();
+        assert_eq!(
+            one.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            ["compute"]
+        );
+
+        // a kind this node HAS heard of, just not that one: name what there is.
+        let wrong = only_kind(all(), Some("airlock")).expect_err("not on this node");
+        assert!(wrong.contains("agent") && wrong.contains("compute"), "{wrong}");
+
+        // nothing at all: the only useful answer is how to start it.
+        let empty = only_kind(Vec::new(), Some("compute")).expect_err("nothing here");
+        assert!(
+            empty.contains("ducktape service run compute"),
+            "an empty node must be told what to run: {empty}"
+        );
+    }
+
+    /// A 37-tag capability list is not a line, it is a wall — it pushes the
+    /// `signaling to <chain>` half of the same banner off the terminal. The
+    /// summary keeps the count honest and says where the full list lives.
+    #[test]
+    fn the_startup_banner_summarizes_a_wall_of_tags_but_never_a_short_list() {
+        let few: Vec<String> = (0..BANNER_TAGS).map(|i| format!("tag{i}")).collect();
+        assert_eq!(
+            summarize_capabilities("compute", &few),
+            few.join(", "),
+            "a list that already fits is printed whole"
+        );
+
+        let many: Vec<String> = (0..37).map(|i| format!("tag{i}")).collect();
+        let line = summarize_capabilities("compute", &many);
+        assert!(line.contains("tag0") && line.contains("+31 more"), "{line}");
+        assert!(
+            !line.contains("tag36"),
+            "the point is that it stops: {line}"
+        );
+        assert!(
+            line.contains("ducktape service status compute"),
+            "and says where the whole list is: {line}"
+        );
+    }
+
+    /// The ungranted daemon says "not enabled" ONCE. `offer_enable` owns that
+    /// line because it is the half that also knows the command to fix it;
+    /// `serve_kind` used to print a second, fix-less copy right after it, which
+    /// is what `--no-enable` showed you.
+    ///
+    /// Source-parsed rather than eyeballed: the two writers are in different
+    /// functions, so nothing else can notice them drifting back apart.
+    #[test]
+    fn the_ungranted_daemon_says_not_enabled_exactly_once() {
+        let source = include_str!("services.rs");
+        let serve_kind = source
+            .split("fn serve_kind(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// ").next())
+            .expect("serve_kind has a body");
+        assert!(
+            !serve_kind.contains("write_err("),
+            "serve_kind must print nothing about the grant — offer_enable already \
+             said it, WITH the command that fixes it"
+        );
+        let offer = source
+            .split("fn offer_enable(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n/// ").next())
+            .expect("offer_enable has a body");
+        assert!(
+            offer.contains("nothing will execute") && offer.contains("ducktape service enable"),
+            "the one line must carry both halves: what it means and what to type"
+        );
+    }
 
     /// The stop arming, driven through the REAL entry every daemon serves from
     /// — not a replica of the call, which is the guard that once shipped green

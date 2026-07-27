@@ -51,6 +51,31 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) admin_exposure: noded::AdminExposure,
 }
 
+/// Bind one of the node's listeners, saying WHICH surface and WHICH address
+/// when it will not come up.
+///
+/// The bare `TcpListener::bind(addr)?` these replaced propagated the raw io
+/// error, so starting a node twice — far and away the most common way to reach
+/// this line — printed exactly `FATAL: Address already in use (os error 98)`:
+/// no port, no surface, no idea which of the four listeners lost, and no hint
+/// that the node you already have running is the reason.
+///
+/// `key` is the `node.toml` field, so the message ends with something to edit.
+pub(crate) fn bind_listener(
+    surface: &str,
+    key: &str,
+    addr: &str,
+) -> Result<std::net::TcpListener, String> {
+    std::net::TcpListener::bind(addr).map_err(|error| match error.kind() {
+        std::io::ErrorKind::AddrInUse => format!(
+            "the {surface} address {addr} is already taken — a node for this workspace is \
+             probably already running (`ducktape node list`, `ducktape node status`); \
+             otherwise change `{key}` in node.toml"
+        ),
+        _ => format!("cannot bind the {surface} on {addr}: {error} (`{key}` in node.toml)"),
+    })
+}
+
 pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
     let BindConfig {
         sync_only,
@@ -71,7 +96,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // serves local reads from its pre-synced boundary, a still-parked joiner
     // answers with a clear not-admitted error instead of a dead port.
     let rpc_listener = match rpc_listen.as_deref() {
-        Some(addr) if !sync_only => Some(std::net::TcpListener::bind(addr)?),
+        Some(addr) if !sync_only => Some(bind_listener("operator rpc", "rpc_listen", addr)?),
         _ => None,
     };
     // the http/ws app surface: same bind-early rule. the server itself runs on
@@ -87,7 +112,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             if address.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
                 return Err("gateway_listen must bind exactly 127.0.0.1".into());
             }
-            let listener = std::net::TcpListener::bind(address)?;
+            let listener = bind_listener("browser gateway", "gateway_listen", addr)?;
             listener.set_nonblocking(true)?;
             let actual = listener.local_addr()?;
             tracing::info!(
@@ -239,7 +264,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // reads only until promotion re-execs this process into a validator.)
     match http_listen.as_deref() {
         Some(addr) if !sync_only => {
-            let listener = std::net::TcpListener::bind(addr)?;
+            let listener = bind_listener("node HTTP API", "http_listen", addr)?;
             listener.set_nonblocking(true)?;
             tracing::info!(
                 target: "ducktape::http",
@@ -314,4 +339,44 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         session_requests,
         local_gateway_via,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Starting a node twice is the commonest way anyone reaches a bind
+    /// failure, and it used to print exactly `FATAL: Address already in use
+    /// (os error 98)` — no port, no surface, no hint that the node already
+    /// running is the reason. Every listener routes through here, so one test
+    /// covers all four.
+    #[test]
+    fn a_taken_port_names_the_surface_the_address_and_the_node_already_running() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = held.local_addr().expect("addr").to_string();
+
+        let why = bind_listener("operator rpc", "rpc_listen", &addr)
+            .expect_err("the port is held for the length of this test");
+        assert!(why.contains("operator rpc"), "which surface: {why}");
+        assert!(why.contains(&addr), "which address: {why}");
+        assert!(why.contains("rpc_listen"), "what to edit: {why}");
+        assert!(
+            why.contains("already running"),
+            "and the reason it usually is: {why}"
+        );
+        assert!(
+            !why.contains("os error"),
+            "the errno is noise once the sentence exists: {why}"
+        );
+        drop(held);
+
+        // a DIFFERENT failure must not borrow that explanation.
+        let refused = bind_listener("node HTTP API", "http_listen", "203.0.113.1:9")
+            .expect_err("that address is not ours to bind");
+        assert!(
+            !refused.contains("already running"),
+            "an unassignable address is not a second node: {refused}"
+        );
+        assert!(refused.contains("http_listen"), "{refused}");
+    }
 }

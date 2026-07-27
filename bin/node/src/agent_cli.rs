@@ -67,8 +67,8 @@ pub(crate) struct PtyArgs {
     /// credential name to serve the session (required for a cross-node host)
     #[arg(long, value_name = "NAME")]
     cred: Option<String>,
-    /// cpu-cores ceiling for the sandbox
-    #[arg(long, value_name = "CORES")]
+    /// cpu-cores ceiling for the sandbox (minimum 2)
+    #[arg(long, value_name = "CORES", value_parser = at_least_the_sandbox_floor)]
     cpu: Option<u64>,
     /// memory ceiling in GB for the sandbox
     #[arg(long, value_name = "GB")]
@@ -91,8 +91,8 @@ pub(crate) struct SchedArgs {
     /// present this run as its reason for opening a session.
     #[arg(long = "host-node", value_name = "NAME")]
     host_node: Option<String>,
-    /// cpu-cores demand
-    #[arg(long, value_name = "CORES")]
+    /// cpu-cores demand (minimum 2)
+    #[arg(long, value_name = "CORES", value_parser = at_least_the_sandbox_floor)]
     cpu: Option<u64>,
     /// memory demand in GB
     #[arg(long, value_name = "GB")]
@@ -100,6 +100,36 @@ pub(crate) struct SchedArgs {
     /// the prompt, after `--`
     #[arg(last = true, value_name = "PROMPT", required = true)]
     prompt: String,
+}
+
+/// Refuse a core count no sandbox will accept, AT SUBMIT.
+///
+/// `--cpu 1` used to be accepted here, accepted by placement, and accepted by
+/// the lease — and refused only by the spawn, on the executing box, with
+/// `Tart requires at least 2 cores, got 1`. That is the most expensive possible
+/// place to find out: it burns every `RUN_MAX_ATTEMPTS` retry and fails the
+/// saga, having told the submitter nothing they could have acted on.
+///
+/// The floor is the shipped one ([`provider_host::TART_MIN_CORES`]), not a
+/// number invented here, so it cannot drift from the backend that enforces it.
+///
+/// ponytail: ONE floor for every backend, and podman would in fact run a
+/// single-core guest. Announcing a per-backend floor in the capability set is
+/// the fuller fix and a wire change; a flat floor costs a configuration nobody
+/// wants and removes a class of run that can only ever fail late.
+fn at_least_the_sandbox_floor(value: &str) -> Result<u64, String> {
+    let cores: u64 = value
+        .parse()
+        .map_err(|_| format!("{value:?} is not a number of cores"))?;
+    let floor = provider_host::TART_MIN_CORES;
+    if cores < floor {
+        return Err(format!(
+            "a sandboxed run needs at least {floor} cores (a macOS/Tart executor \
+             refuses fewer, and the run would fail on its host after taking a lease) \
+             — try --cpu {floor}"
+        ));
+    }
+    Ok(cores)
 }
 
 pub(crate) fn run(args: AgentArgs) -> AgentResult {
@@ -509,8 +539,8 @@ fn resolve_provider(
         return provider
             .ok_or_else(|| "a provider (claude|codex) is required without --cred".into());
     };
-    let record =
-        query_credential(base, name)?.ok_or_else(|| format!("unknown credential {name:?}"))?;
+    let record = query_credential(base, name)?
+        .ok_or_else(|| format!("unknown credential {name:?} — {}", credential_hint(base)))?;
     let from_cred = provider_from_kind(record.kind);
     if let Some(explicit) = provider
         && explicit != from_cred
@@ -543,6 +573,23 @@ fn query_credential(
     match serde_json::from_value::<gateway::GatewayReply>(value)? {
         gateway::GatewayReply::Credential(record) => Ok(record),
         other => Err(format!("unexpected gateway reply: {other:?}").into()),
+    }
+}
+
+/// What to say after "unknown credential": the names that DO exist, or the
+/// command that makes the first one.
+///
+/// Best-effort by construction — this only ever runs on a path that is already
+/// failing, so a second query that also fails must not replace the real error
+/// with its own. It then says the one thing that is true regardless.
+fn credential_hint(base: &str) -> String {
+    const REGISTER_ONE: &str = "register one with: ducktape user cred add claude";
+    let Ok(records) = crate::cred_cli::list_credential_names(base) else {
+        return REGISTER_ONE.into();
+    };
+    match records.as_slice() {
+        [] => format!("no credentials are registered on this node — {REGISTER_ONE}"),
+        names => format!("registered here: {}", names.join(", ")),
     }
 }
 

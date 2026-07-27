@@ -226,20 +226,15 @@ impl VerbCtx {
     fn key_path(&self) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         let path = match &self.key {
             Some(explicit) => explicit.clone(),
-            None => {
-                let needle = self
-                    .addr
-                    .network
-                    .as_deref()
-                    .filter(|n| !n.is_empty())
-                    .ok_or("cred needs -n/--network (or an explicit --key) to locate the user key")?;
-                let (dir, _http) = config::resolve_network(needle)?;
-                dir.join("user.key")
-            }
+            // the shared ladder, which already knows how to infer the lone
+            // registered workspace and how to refuse an ambiguous one — this
+            // demanded `-n` outright even on a machine with exactly one.
+            None => self.addr.workspace()?.join("user.key"),
         };
         if !path.exists() {
             return Err(format!(
-                "no user key at {} — run `ducktape user account-init` first (or pass --key)",
+                "no user key at {} — run `ducktape user account-init --name <you>` first \
+                 (it mints one), or pass --key",
                 path.display()
             )
             .into());
@@ -247,18 +242,15 @@ impl VerbCtx {
         Ok(path)
     }
 
-    /// the co-hosted workspace resolved from `-n/--network`: chain id, the
+    /// the co-hosted workspace behind the node this verb dials: chain id, the
     /// node's consensus key, and its storage dir. Required by every verb that
-    /// mints an owner-signed statement or writes the store — `--node` alone
-    /// cannot locate the on-disk workspace.
+    /// mints an owner-signed statement or writes the store.
+    ///
+    /// [`NodeAddr::workspace`] is the ONE ladder that answers this, `--node`
+    /// included: a bare url names no directory, so it is resolved backwards
+    /// through the registry to the workspace that serves it.
     fn workspace(&self) -> Result<config::Resolved, Box<dyn std::error::Error>> {
-        let needle = self
-            .addr
-            .network
-            .as_deref()
-            .filter(|n| !n.is_empty())
-            .ok_or("cred needs -n/--network to locate the co-hosted node's workspace")?;
-        let (dir, _http) = config::resolve_network(needle)?;
+        let dir = self.addr.workspace()?;
         Ok(config::resolve(&dir.join("node.toml"))?)
     }
 }
@@ -739,6 +731,15 @@ fn submit_gateway(
 }
 
 /// Read every registered credential record from committed gateway state.
+/// the registered credential names — what a verb that could not find one says
+/// instead of leaving the reader to guess.
+pub(crate) fn list_credential_names(base: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(query_credentials(base)?
+        .into_iter()
+        .map(|record| record.name)
+        .collect())
+}
+
 fn query_credentials(
     base: &str,
 ) -> Result<Vec<gateway::CredentialRecord>, Box<dyn std::error::Error>> {

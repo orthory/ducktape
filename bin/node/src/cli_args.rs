@@ -205,7 +205,10 @@ const NO_NODE_ADDRESS: &str =
 /// routed here or the build fails.
 fn rung_base(rung: Rung) -> Result<String, String> {
     match rung {
-        Rung::Flag(url) | Rung::Env(url) | Rung::Context(url) => Ok(trim_base(&url)),
+        Rung::Flag(url) => checked_base("--node", &url),
+        Rung::Env(url) => checked_base("DUCKTAPE_NODE", &url),
+        // not a user-typed string: the caller's own recorded address.
+        Rung::Context(url) => Ok(trim_base(&url)),
         Rung::Network(needle) => http_of_workspace(&needle),
         Rung::LoneWorkspace => lone_workspace_base(),
     }
@@ -214,6 +217,24 @@ fn rung_base(rung: Rung) -> Result<String, String> {
 /// a trailing slash on the base would double up against every `/v1/...` path.
 fn trim_base(url: &str) -> String {
     url.trim_end_matches('/').to_string()
+}
+
+/// Refuse a `--node` / `DUCKTAPE_NODE` value that is not an http base, HERE —
+/// at the boundary that named it — instead of letting it travel to whichever
+/// verb dials first and die inside reqwest's url parser as `builder error`.
+///
+/// A chain id is the mistake this actually catches: `--node duke` parses,
+/// outranks `-n`, and then silently misdirects, so the message names the flag
+/// that WOULD have taken it.
+fn checked_base(source: &str, url: &str) -> Result<String, String> {
+    let is_http = url.starts_with("http://") || url.starts_with("https://");
+    if is_http {
+        return Ok(trim_base(url));
+    }
+    Err(format!(
+        "{source} is an http base url, and {url:?} is not one (expected http://host:port) — \
+         for a network name use: -n/--network {url:?}"
+    ))
 }
 
 fn http_of_workspace(needle: &str) -> Result<String, String> {
@@ -688,6 +709,36 @@ mod tests {
         // to say what there is to pick from.
         assert!(why.contains("chain-a") && why.contains("chain-b"), "{why}");
         assert!(why.contains("-n"), "{why}");
+    }
+
+    /// `--node duke` parses, OUTRANKS `-n`, and then dies inside reqwest's url
+    /// parser as `POST duke/v1/query: builder error` — a silent misdirection
+    /// reported by the wrong layer. Refuse it here, where the flag was named,
+    /// and point at the flag that would have taken it.
+    #[test]
+    fn a_node_flag_that_is_not_a_url_is_refused_where_it_was_typed() {
+        let chain_id = addr(Some("mynet#d0cdf950"), None).ladder_rung(None, || None);
+        let Err(why) = rung_base(chain_id) else {
+            panic!("a chain id is not an http base");
+        };
+        assert!(why.contains("--node"), "it names the flag that took it: {why}");
+        assert!(
+            why.contains("-n/--network"),
+            "and the flag that should have: {why}"
+        );
+
+        // the env rung is the same input by another name, and says so.
+        let Err(why) = rung_base(addr(None, None).ladder_rung(Some("duke".into()), || None)) else {
+            panic!("an env chain id is not an http base either");
+        };
+        assert!(why.contains("DUCKTAPE_NODE"), "{why}");
+
+        // and a real base still resolves, trailing slash and all.
+        assert_eq!(
+            rung_base(addr(Some("https://node.example:8844/"), None).ladder_rung(None, || None))
+                .unwrap(),
+            "https://node.example:8844"
+        );
     }
 
     /// an empty flag/env/context value is NOT an address — an exported but empty

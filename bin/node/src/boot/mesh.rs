@@ -7,6 +7,63 @@ use commonware_utils::{NZU32, ordered::Set};
 use crate::config::{self, hex_bytes};
 use crate::constants::MAX_MESSAGE_SIZE;
 
+/// The chain's overlay prefix, spelled the ONE way every reader of it must:
+/// derived from the same namespace string the per-use planes' `OverlayBook`
+/// and the reachability plane use.
+fn overlay_router_for(namespace: &[u8]) -> overlay_net::OverlayRouter {
+    overlay_net::OverlayRouter::for_prefix48(wireguard::ula_v6_prefix(
+        &String::from_utf8_lossy(namespace),
+    ))
+}
+
+/// Does this node hand out an address on the real network, or only its overlay
+/// ULA? The answer decides whether the mesh listener carries a KERNEL leg
+/// beside its virtual one — a node advertising only its ULA keeps the virtual
+/// leg alone, because no legitimate dial could ever reach the other.
+fn advertises_an_underlay_address(
+    overlay_router: &overlay_net::OverlayRouter,
+    advertised: &Ingress,
+) -> bool {
+    match advertised {
+        Ingress::Socket(addr) => !overlay_router.is_overlay(addr),
+        // a hostname advertisement is an underlay address by construction.
+        Ingress::Dns { .. } => true,
+    }
+}
+
+/// Whether `run_node` will really open an OS socket on `listen` — the
+/// precondition for [`preflight_mesh_listen`] to mean anything.
+///
+/// The two inputs are exactly the ones `build` decides the backend from, and
+/// this is why the predicate is a function rather than an inline expression:
+/// a preflight that guessed differently would refuse a perfectly good
+/// overlay-only node whose port happens to be busy for something else.
+pub(crate) fn binds_an_os_mesh_socket(
+    namespace: &[u8],
+    advertised: &Ingress,
+    overlay_enabled: bool,
+) -> bool {
+    !overlay_enabled || advertises_an_underlay_address(&overlay_router_for(namespace), advertised)
+}
+
+/// Take `listen` for a moment before the runtime does, so a port that is
+/// already spoken for is a clean startup error instead of
+/// `thread 'tokio-rt-worker' panicked … failed to bind listener: BindFailed`.
+///
+/// commonware's discovery listener binds INSIDE the runtime and `expect`s the
+/// result, ~10 seconds into boot — after every other surface has logged itself
+/// up — so the operator's reward for a taken port was a wall of healthy INFO
+/// and then a raw Rust panic with a crates.io path in it.
+///
+/// ponytail: a preflight, so a socket stolen between this bind and the real one
+/// still panics. That window is microseconds against the seconds-long boot it
+/// replaces, and closing it properly means handing commonware a pre-bound
+/// listener — a change to its API, not ours.
+pub(crate) fn preflight_mesh_listen(listen: std::net::SocketAddr) -> Result<(), String> {
+    crate::boot::surfaces::bind_listener("p2p mesh listener", "listen", &listen.to_string())
+        .map(drop)
+}
+
 /// `run_node`'s shared runtime head (phase P3): the head of the async
 /// closure `executor.start(|context| async move { … })` runs on — metrics
 /// registration, the tracked mesh set, the statesync source pick,
@@ -135,9 +192,7 @@ pub(crate) fn build(
     // the prefix derives from the SAME namespace string the per-use planes'
     // OverlayBook and the reachability plane use, so all three agree on
     // what "overlay" means.
-    let overlay_router = overlay_net::OverlayRouter::for_prefix48(
-        wireguard::ula_v6_prefix(&String::from_utf8_lossy(&namespace)),
-    );
+    let overlay_router = overlay_router_for(&namespace);
     // ADR phase 3: the backend follows the reachability plane. a
     // configured plane routes overlay dials/binds into the in-process
     // virtual stack (and gives the wildcard mesh listener its virtual
@@ -151,11 +206,7 @@ pub(crate) fn build(
     // receive a legitimate dial. it would sit unreachable as a wildcard
     // listener the host firewall alarms on (macOS prompts about every
     // wildcard bind) — such a node keeps the virtual leg only.
-    let underlay_ingress = match &advertised_reach {
-        Ingress::Socket(addr) => !overlay_router.is_overlay(addr),
-        // a hostname advertisement is an underlay address by construction.
-        Ingress::Dns { .. } => true,
-    };
+    let underlay_ingress = advertises_an_underlay_address(&overlay_router, &advertised_reach);
     let overlay_backend = if overlay_enabled {
         overlay_net::OverlayBackend::Userspace {
             slot: overlay_slot.clone(),

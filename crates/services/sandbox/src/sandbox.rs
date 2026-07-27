@@ -137,6 +137,21 @@ struct TartMount {
     read_only: bool,
 }
 
+/// Where a Tart run's guest tree lives INSIDE the VM, named by the VM.
+///
+/// Exported because the guest workdir is a real interface, not an internal
+/// detail: it is the path the executor's cwd becomes, and therefore the key
+/// anything reasoning about "which project is this?" has to use. Derived in one
+/// place so a second reader cannot spell it differently.
+pub fn tart_run_root(vm: &str) -> PathBuf {
+    Path::new("/tmp").join(format!("ducktape-{vm}"))
+}
+
+/// This Tart run's guest working directory — the executor's cwd in the VM.
+pub fn tart_guest_workdir(vm: &str) -> PathBuf {
+    tart_run_root(vm).join("workspace")
+}
+
 /// The two commands around a live Tart VM: boot argv and the remote executor
 /// script. Resource configuration is deliberately not here: Tart accepts it on
 /// `tart set`, which the lifecycle runs between clone and boot.
@@ -282,8 +297,8 @@ pub fn tart_plan(
     }
     run_argv.push(vm.to_string());
 
-    let run_root = Path::new("/tmp").join(format!("ducktape-{vm}"));
-    let guest_workdir = run_root.join("workspace");
+    let run_root = tart_run_root(vm);
+    let guest_workdir = tart_guest_workdir(vm);
     let mounted_workdir = translate_path(workdir, &mounts);
     let guest_home = run_root.join("home");
     let host_home = envs

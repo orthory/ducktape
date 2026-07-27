@@ -754,6 +754,8 @@ impl CliProvider {
         let home = canonical_mount_path(&home, "Podman HOME")?;
 
         let plan = podman_api::plan_mounts(&workdir, &bin_path, &ro_paths, &rw_dirs, &home);
+        // the guest cwd is known HERE and nowhere earlier — see the fn doc.
+        self.trust_guest_workdir(auth, &plan.guest_workdir)?;
         // translate env values + argv to the neutral guest paths (HOME is set
         // directly to the guest home; every other value is prefix-translated).
         let translated_env: Vec<(String, String)> = envs
@@ -881,6 +883,7 @@ impl CliProvider {
             std::process::id(),
             NEXT_VM.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
+        self.trust_guest_workdir(auth, &sandbox::tart_guest_workdir(&vm))?;
         sandbox::tart_plan(
             &vm,
             &bin,
@@ -1152,6 +1155,76 @@ impl CliProvider {
             }
         }
         Ok(Some(home))
+    }
+
+    /// Answer Claude Code's WORKSPACE-TRUST prompt for this run's guest
+    /// workdir, so an interactive session reaches a prompt instead of parking
+    /// on *"Quick safety check: Is this a project you created or one you
+    /// trust?"* forever.
+    ///
+    /// ## Why this is honestly answerable, and what it is NOT
+    ///
+    /// The prompt exists to protect an OPERATOR'S OWN MACHINE from a repo they
+    /// downloaded: `cd` into a stranger's checkout and its `.claude/settings.json`,
+    /// its hooks and its MCP servers would otherwise run against their real
+    /// home directory, keys and network.
+    ///
+    /// None of that is the situation here, and the reason is CONTAINMENT
+    /// rather than provenance — this deliberately does NOT claim the workdir's
+    /// contents are safe:
+    ///
+    /// - The child never runs on the host. `[sandbox] runtime` is `podman` or
+    ///   `tart` and there is no third arm, so the blast radius of "trusted" is
+    ///   a container or a VM this run created and destroys.
+    /// - That sandbox has a private netns and an egress allowlist (broker +
+    ///   node RPC + public), so a project hook reaches nothing the run was not
+    ///   already given.
+    /// - `$HOME` is never mounted (D7): the config home the trust decision is
+    ///   written into IS this run's, drawn per run and deleted with it.
+    /// - Above all, the process being asked is an agent already executing
+    ///   model-directed commands in that sandbox. A `.claude/settings.json`
+    ///   inside the workdir cannot widen a boundary the agent is already
+    ///   inside — it is strictly less than what the run can do by design.
+    ///
+    /// So the honest claim is narrow and true: *within this sandbox, this
+    /// workdir is as trusted as the run itself*. It asserts nothing about the
+    /// operator's machine, because the child cannot reach it.
+    ///
+    /// Keyed on the GUEST path, which is why this is not folded into
+    /// [`Self::prepare_config_home`]: the key is the cwd the executor actually
+    /// starts in, that path is backend-specific (`/ducktape/workspace` for
+    /// podman, `/tmp/ducktape-<vm>/workspace` for tart), and a Tart run mints a
+    /// fresh VM name per spawn — so a value decided once at config-home time
+    /// would be stale for the second invocation of the same run. It MERGES, so
+    /// each spawn adds its own key and none of them fight.
+    fn trust_guest_workdir(
+        &self,
+        auth: &RunAuth<'_>,
+        guest_workdir: &Path,
+    ) -> Result<(), String> {
+        // the same gate the rest of the claude state files carry: codex has no
+        // such prompt and no such file.
+        let for_claude = self.spec.isolation.broker == Some(BrokerKind::AnthropicMessages);
+        let Some(config) = auth.config_home.filter(|_| for_claude) else {
+            return Ok(());
+        };
+        let path = config.join(".claude.json");
+        let mut state: serde_json::Value = match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|e| format!("{}: {} is not json: {e}", self.spec.tag, path.display()))?,
+            // absent is not a failure: `prepare_config_home` only writes it for
+            // a claude spec, and this stays correct if that ever changes.
+            Err(_) => serde_json::json!({}),
+        };
+        state["projects"][guest_workdir.to_string_lossy().as_ref()]["hasTrustDialogAccepted"] =
+            serde_json::Value::Bool(true);
+        std::fs::write(&path, state.to_string()).map_err(|e| {
+            format!(
+                "{}: write claude trust state {}: {e}",
+                self.spec.tag,
+                path.display()
+            )
+        })
     }
 
     /// start this run's credential broker — `None` unless the spec declares one.
@@ -4416,6 +4489,86 @@ broker = "anthropic-messages"
             Some(true),
             "without this, WebFetch preflights api.anthropic.com around the broker"
         );
+    }
+
+    /// One screen past the login wizard is the WORKSPACE-TRUST prompt, and it
+    /// is the same failure shape: the TUI parks on "Quick safety check…" with
+    /// no error and no output, forever, on any unattended session.
+    ///
+    /// It is keyed on the GUEST cwd, so this drives the real spawn-path seam
+    /// with the two real guest layouts — and asserts that a SECOND spawn (a
+    /// Tart resume mints a fresh VM name, hence a fresh path) does not lose
+    /// the first one's answer.
+    #[test]
+    fn each_spawns_guest_workdir_is_trusted_and_the_previous_one_survives() {
+        let provider = CliProvider::from_spec(
+            anthropic_broker_spec("cl"),
+            PathBuf::from("/usr/bin/cl"),
+            SandboxBackend::Bare,
+        );
+        let workdir = scratch("claude_trust_seed");
+        let home = provider
+            .prepare_config_home(&workdir)
+            .expect("config home materializes")
+            .expect("a claude spec names a config home");
+        let auth = RunAuth {
+            config_home: Some(home.config()),
+            broker: None,
+        };
+        let read = || -> serde_json::Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(home.config().join(".claude.json"))
+                    .expect("the seeded state file"),
+            )
+            .expect("json")
+        };
+
+        // nothing is trusted until a spawn names a cwd.
+        assert!(read()["projects"].as_object().is_none_or(|p| p.is_empty()));
+
+        let podman = std::path::Path::new("/ducktape/workspace");
+        provider
+            .trust_guest_workdir(&auth, podman)
+            .expect("the podman guest cwd is answerable");
+        assert_eq!(
+            read()["projects"]["/ducktape/workspace"]["hasTrustDialogAccepted"].as_bool(),
+            Some(true),
+            "without this the TUI parks on the trust prompt with no error"
+        );
+
+        // a second spawn of the SAME run: Tart draws a new VM name, so a new
+        // guest path — and the seed must MERGE, not replace.
+        let tart = sandbox::tart_guest_workdir("ducktape-42-2");
+        provider
+            .trust_guest_workdir(&auth, &tart)
+            .expect("the tart guest cwd is answerable too");
+        let state = read();
+        assert_eq!(
+            state["projects"][tart.to_string_lossy().as_ref()]["hasTrustDialogAccepted"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            state["projects"]["/ducktape/workspace"]["hasTrustDialogAccepted"].as_bool(),
+            Some(true),
+            "the earlier spawn's answer must survive the later one"
+        );
+        // and the onboarding seed is still there beside it.
+        assert_eq!(state["hasCompletedOnboarding"].as_bool(), Some(true));
+    }
+
+    /// The trust claim is scoped to claude and to a run that HAS an isolated
+    /// config home. A spec with neither writes nothing — there is no file to
+    /// assert into and no prompt to answer.
+    #[test]
+    fn nothing_is_trusted_on_a_spec_that_has_no_isolated_config_home() {
+        let provider = CliProvider::from_spec(
+            anthropic_broker_spec("cl"),
+            PathBuf::from("/usr/bin/cl"),
+            SandboxBackend::Bare,
+        );
+        provider
+            .trust_guest_workdir(&RunAuth::default(), std::path::Path::new("/ducktape/workspace"))
+            .expect("no config home is not an error");
     }
 
     /// A CODEX config home stays EMPTY — the claude state files are not merely
