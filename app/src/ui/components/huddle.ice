@@ -17,6 +17,15 @@
 // The artifact's 5-bar wave glyph is the console's `success_dot` here: its bar
 // heights are a function of the running second, and the frozen component props
 // carry the elapsed time as a formatted string, not as a count.
+//
+// AND ONE THING THE ARTIFACT ALWAYS DRAWS THAT THESE SOMETIMES DO NOT: THE
+// CLOCK. `elapsed` is measured from the local 1 Hz tick between the instant
+// THIS process watched the join land and now — never from the roster row's
+// `joined_at`, which is a block HEIGHT on a validator network. A process that
+// finds itself already on the roster (a restart, or another device joining for
+// the same key) has no start instant, and the honest render of an unknown
+// duration is no duration: every `elapsed` here is empty-tolerant and the
+// surface falls back to the bare LIVE mark rather than a plausible 00:00.
 
 // THE CHANNEL-HEADER LIVE PILL — shown only in the channel whose huddle you are
 // in. The plate is the pop-out target; the ✕ beside it is its own button, which
@@ -30,7 +39,8 @@ component HuddleLivePill(name:str, elapsed:str)
         row gap=8.0 align=center
           PulseDot plate=6.0 tone="success"
           text "LIVE" size=10.5 wrap=none font=code_medium @text-toast_fg
-          text elapsed size=10.5 wrap=none font=code_medium @text-toast_fg
+          if !empty(elapsed)
+            text elapsed size=10.5 wrap=none font=code_medium @text-toast_fg
           Icon name="popout" tone="caption" px=11.0
         active bg=transparent text=toast_fg border=transparent border-w=1.0 r=6.0
         hovered bg=ink_hover text=toast_fg
@@ -64,7 +74,8 @@ component HuddleDockedPill(channel:str, elapsed:str)
       row gap=7.0 align=center
         PulseDot plate=6.0 tone="success"
         text channel size=10.5 wrap=none font=code_medium @text-toast_fg
-        text elapsed size=10.5 wrap=none font=code_medium @text-caption
+        if !empty(elapsed)
+          text elapsed size=10.5 wrap=none font=code_medium @text-caption
         Icon name="popout" tone="caption" px=11.0
       active bg=toast_bg text=toast_fg border=transparent border-w=1.0 r=8.0
       hovered bg=ink_hover text=toast_fg
@@ -85,7 +96,14 @@ component HuddleTile(person:HuddleParticipant)
       if !person.is_agent
         box w=34.0 h=34.0 align-x=center align-y=center bg=panel_tile r=17.0
           text person.initials size=12.0 wrap=none font=display @text-ink_soft
-      text person.label size=12.0 wrap=none font=medium @text-chevron_idle
+      // `is_you` is resolved against the same user bytes `signed_write` authors
+      // with, so the self tile is marked with the 9px caption the artifact uses
+      // for `you` in its member rows — the huddle grid otherwise renders four
+      // identical tiles and never says which one is her.
+      row gap=4.0 align=center
+        text person.label size=12.0 wrap=none font=medium @text-chevron_idle
+        if person.is_you
+          text "you" size=9.0 wrap=none font=medium @text-caption
 
 // THE POPPED PANEL — 296px, pinned bottom-right by the caller's stack. Three
 // bands: the traffic-light header with its dock button, the body (elapsed +
@@ -96,9 +114,16 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant])
     col w=fill
       box w=fill pl=11.0 pr=11.0 pt=9.0 pb=9.0
         row w=fill gap=9.0 align=center
+          // The artifact draws three static traffic lights. In a real window a
+          // red dot that eats the click is a trap, and this panel has exactly
+          // one way to close — docking it — so the red dot IS that control and
+          // the two beside it stay the chrome they are drawn as.
           row gap=5.0 align=center
-            box w=8.0 h=8.0 bg=danger_dot r=4.0
-              space w=1.0 h=1.0
+            button label="Dock the huddle window" w=8.0 h=8.0 @icon_action px-0px py-0px -> dock_huddle
+              space w=8.0 h=8.0
+              active bg=danger_dot text=danger_dot border=transparent border-w=1.0 r=4.0
+              hovered bg=danger_solid text=danger_solid
+              pressed bg=danger_solid_hover text=danger_solid_hover
             box w=8.0 h=8.0 bg=warning_dot r=4.0
               space w=1.0 h=1.0
             box w=8.0 h=8.0 bg=success_dot r=4.0
@@ -116,7 +141,10 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant])
         col w=fill gap=12.0
           row gap=8.0 align=center
             PulseDot plate=6.0 tone="success"
-            text elapsed size=12.0 wrap=none font=code_semibold @text-toast_fg
+            if !empty(elapsed)
+              text elapsed size=12.0 wrap=none font=code_semibold @text-toast_fg
+            if empty(elapsed)
+              text "LIVE" size=12.0 wrap=none font=code_semibold @text-toast_fg
           row w=fill gap=8.0 wrap wrap-gap=8.0
             for person in roster
               HuddleTile person=person
