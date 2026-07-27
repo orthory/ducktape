@@ -22,9 +22,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "svg", "tokio", "wgpu", "x11"] }
-ducktape-ui = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "17e8383f8c2791cb644e150c7b6e01b3a85c9e4f", default-features = false, features = ["full"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "17e8383f8c2791cb644e150c7b6e01b3a85c9e4f" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "17e8383f8c2791cb644e150c7b6e01b3a85c9e4f", version = "=0.1.0" }
+ducktape-ui = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "ffbefb8", default-features = false, features = ["full"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "ffbefb8" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "ffbefb8", version = "=0.1.0" }
 
 [dev-dependencies]
 commonware-cryptography.workspace = true
