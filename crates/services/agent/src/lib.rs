@@ -34,7 +34,7 @@
 //! so a surviving pty would be an orphaned container nobody can reach or close.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -82,7 +82,8 @@ struct Inner {
     /// container reaping to it.
     executing_node: String,
     /// per-session workdirs are created under here (the provider mounts one rw
-    /// into the container; the fresh mount namespace fences the rest off).
+    /// into the container; the fresh mount namespace fences the rest off), and
+    /// removed with the session that owns them — see [`SessionHome`].
     workdir_root: PathBuf,
     /// live sessions. `std::sync::Mutex`: every critical section clones an `Arc`
     /// out and drops the guard before any `.await`, so it never crosses an await
@@ -104,10 +105,11 @@ struct Inner {
     events: mpsc::Sender<wire::Event>,
 }
 
-/// a live session plus the drop-guard that cancels its wall-clock reaper. When
+/// a live session plus the drop-guards that end what the map entry owns. When
 /// the entry leaves the map, dropping `_reaper_cancel` resolves the reaper's
 /// cancel receiver, so its timer exits WITHOUT firing — an early end can never
-/// leave a stale timer around to reap a later session that reused this id.
+/// leave a stale timer around to reap a later session that reused this id — and
+/// dropping `_home` removes the session's workdir.
 struct Live {
     session: Arc<InteractiveSession>,
     /// this session's ordered input lane. Its only long-lived sender, so
@@ -115,6 +117,65 @@ struct Live {
     /// teardown the pump and reaper take.
     drive: mpsc::UnboundedSender<Drive>,
     _reaper_cancel: oneshot::Sender<()>,
+    /// declared LAST so it drops last: the container that mounts this directory
+    /// is torn down by [`Sessions::finish`] before the entry is dropped at all.
+    _home: SessionHome,
+}
+
+/// this session's workdir under [`Inner::workdir_root`] — created when the
+/// session starts and REMOVED when it ends, on every exit path (an explicit
+/// close, the pty's EOF, the wall-clock ceiling, a lost link, a spawn that never
+/// got off the ground), because a Drop runs on all of them.
+///
+/// The session's whole host footprint is in there: the provider mounts it rw
+/// into the container, the executor writes its state into it, and the run's
+/// fresh config home sits inside it. Nothing else ever reaped it, so a node
+/// accumulated one such tree for every pty session it had EVER hosted.
+///
+/// Removing it at session end loses nothing. A pty session is marked
+/// `portable` — host-local, never resumed or captured — and its container is
+/// destroyed by the same teardown, so once the session ends there is no longer
+/// anything that can reach this directory.
+///
+/// A SIGKILLed daemon is the one death that leaves one standing, and that is
+/// deliberately not swept: the node draws a session id at random, so no later
+/// session can name a leftover and inherit it, and what survives is inert bytes
+/// bounded by [`MAX_TERM_SESSIONS`] per kill. The part that is NOT inert — the
+/// containers — is what the daemon's boot sweep already reaps.
+struct SessionHome {
+    dir: PathBuf,
+}
+
+impl SessionHome {
+    /// materialize the session's workdir. The provider would `create_dir_all`
+    /// it too, but doing it HERE puts both ends of the directory's life in the
+    /// one place that owns [`Inner::workdir_root`] — and makes a spawn that
+    /// fails before the provider ever runs still leave nothing behind.
+    fn create(root: &Path, session: &str) -> Result<Self, String> {
+        let dir = root.join(session);
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("create session workdir: {error}"))?;
+        Ok(Self { dir })
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.clone()
+    }
+}
+
+impl Drop for SessionHome {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+            // the path is deliberately absent: it names a directory that held
+            // the session's credential material. the session id is the handle.
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "session_workdir_not_removed",
+                %error,
+                "the session workdir outlived its session"
+            );
+        }
+    }
 }
 
 /// one thing to do to a live pty, in the order it arrived.
@@ -284,13 +345,17 @@ impl Sessions {
         }
         // captured before the await: see `Inner::epoch`.
         let epoch = self.0.epoch.load(Ordering::SeqCst);
+        // built BEFORE the spawn below, so a spawn that fails takes its
+        // half-materialized workdir down with it on the `?`.
+        let home = SessionHome::create(&self.0.workdir_root, &spec.session)
+            .map_err(|detail| (wire::Refusal::SpawnFailed, detail))?;
         let ctx = RunContext {
             agent_id: Some(spec.provider.clone()),
             // podman requires the executing-node id for lifecycle scoping.
             executing_node: Some(self.0.executing_node.clone()),
-            // a fresh per-session workdir; the provider create_dir_all's it and
-            // mounts it rw into the container.
-            workdir_override: Some(self.0.workdir_root.join(&spec.session)),
+            // a fresh per-session workdir, mounted rw into the container and
+            // removed when `home` drops.
+            workdir_override: Some(home.path()),
             // a native pty session is a host-local optimization, never portable
             // state to resume/capture.
             portable: true,
@@ -329,6 +394,7 @@ impl Sessions {
                     session: session.clone(),
                     drive,
                     _reaper_cancel: cancel_tx,
+                    _home: home,
                 },
             );
         self.spawn_driver(spec.session.clone(), session.clone(), drive_rx);
@@ -430,13 +496,18 @@ impl Sessions {
     }
 
     /// end a session exactly once: remove it, release its slot, tell the node,
-    /// then tear the container down.
+    /// tear the container down, and take its workdir with it.
     ///
     /// Whoever removes the entry owns the teardown, so an explicit close racing
     /// the pump's EOF can never double-terminate. The `TermEnded` frame is
     /// emitted BEFORE `close()` because the terminator is what unblocks an
     /// attached client and the container teardown can take seconds — the frame
     /// ordering on the link is what makes this safe, not the timing.
+    ///
+    /// The workdir goes LAST, and by construction rather than by a statement:
+    /// `live` — and the [`SessionHome`] inside it — is dropped at the end of
+    /// this function, which the awaited `close()` above already precedes. The
+    /// directory the container mounts is never removed while it is mounted.
     async fn finish(&self, id: &str) {
         let removed = self
             .0
@@ -560,6 +631,112 @@ pub fn discover(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// a provider that spawns a pty on a plain host `cat` — no podman, no
+    /// broker, no image — so the session LIFECYCLE (which is what owns the
+    /// workdir) is exercisable without a sandbox. `spawns = false` is the
+    /// spawn-failure arm.
+    struct StubProvider {
+        spawns: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for StubProvider {
+        fn capability(&self) -> &str {
+            "stub"
+        }
+
+        async fn run(&self, _prompt: &str, _ctx: &RunContext) -> Result<String, String> {
+            Err("the stub provider is interactive-only".into())
+        }
+
+        async fn spawn_interactive(
+            &self,
+            _ctx: &RunContext,
+            _restricted: bool,
+        ) -> Result<InteractiveSession, String> {
+            if !self.spawns {
+                return Err("stub: no sandbox".into());
+            }
+            // `cat` sits on its pty until it is terminated — a live child with a
+            // real master fd, which is all the session lifecycle needs.
+            InteractiveSession::spawn_local(tokio::process::Command::new("cat"))
+        }
+    }
+
+    const STUB_SESSION: &str = "00000000deadbeef";
+
+    fn stub_create() -> wire::Create {
+        wire::Create {
+            session: STUB_SESSION.to_string(),
+            provider: "stub".to_string(),
+            restricted: false,
+            limits: std::collections::BTreeMap::new(),
+            credential: None,
+        }
+    }
+
+    /// a `Sessions` over a scratch workdir root, plus the root and the event
+    /// lane's receiver (held so `emit` never sees a closed channel).
+    fn plane(name: &str) -> (Sessions, PathBuf, mpsc::Receiver<wire::Event>) {
+        let root =
+            std::env::temp_dir().join(format!("ducktape-term-home-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (events, rx) = mpsc::channel(8);
+        let plane = Sessions::new(
+            ProviderSet::empty(),
+            "test-node".to_string(),
+            root.clone(),
+            events,
+        );
+        (plane, root, rx)
+    }
+
+    #[tokio::test]
+    async fn a_session_workdir_dies_with_its_session() {
+        // the leak this closes: every pty session a node hosted left
+        // `<storage>/term-sessions/<id>` — its config home and whatever the
+        // executor wrote — standing forever.
+        let (plane, root, _rx) = plane("ends");
+        let provider = StubProvider { spawns: true };
+        plane
+            .spawn(&provider, stub_create())
+            .await
+            .expect("the stub session spawns");
+        let dir = root.join(STUB_SESSION);
+        assert!(dir.is_dir(), "the session's workdir is materialized");
+
+        // `finish` IS the teardown seam — the explicit close, the pump's EOF,
+        // the wall-clock ceiling and a lost link all route through it.
+        plane.finish(STUB_SESSION).await;
+        assert!(
+            !dir.exists(),
+            "the session's workdir outlived the session: {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_spawn_that_fails_leaves_no_workdir_behind() {
+        // the guard is built BEFORE the spawn, so the failure path has to take
+        // the half-materialized directory with it — this session never reaches
+        // the map, so `finish` will never run for it.
+        let (plane, root, _rx) = plane("refused");
+        let provider = StubProvider { spawns: false };
+        let (refusal, _detail) = plane
+            .spawn(&provider, stub_create())
+            .await
+            .expect_err("the stub refuses to spawn");
+        assert_eq!(refusal, wire::Refusal::SpawnFailed);
+        let dir = root.join(STUB_SESSION);
+        assert!(
+            !dir.exists(),
+            "a refused create left a workdir behind: {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn the_reaper_fires_when_nothing_cancels_it() {
