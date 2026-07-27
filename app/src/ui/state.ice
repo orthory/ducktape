@@ -232,6 +232,7 @@ state
   onboarding_error = ""
   invite_link = ""
   workspace_slug = ""
+  provision_settled = false
   // NODE FACTS — everything /v1/status already publishes that the app dropped.
   // Backs the status-pill hover card, the FINALITY/ROUND cards and the gc line.
   node_facts_generation:i64 = 0

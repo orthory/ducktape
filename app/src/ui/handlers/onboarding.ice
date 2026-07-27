@@ -66,9 +66,13 @@ on workspace_materialized(init)
 // when the LAST step actually settled — a blocked or running step keeps it
 // here, showing what is wrong.
 on provision_stepped(step)
-  provision_steps = [step]
+  // Copy fields first, then the move: `provision_steps = [step]` takes the
+  // step whole, so any read of `index`/`state` after it is a use-after-move.
+  // `settled` exists precisely so this decision needs no String.
   provision_index = step.index
-  return if step.index != 5 || step.state != "done"
+  provision_settled = step.settled
+  provision_steps = [step]
+  return if provision_index != 5 || !provision_settled
   phase = "live"
   run mint_invite(onboarding_chain, "resident", 7) -> onboarding_invite_minted _ | onboarding_failed _
 
