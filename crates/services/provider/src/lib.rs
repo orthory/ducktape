@@ -1747,17 +1747,32 @@ impl RunHome {
 
 impl Drop for RunHome {
     fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_dir_all(&self.slot) {
-            // the path is deliberately absent: it names a directory that held
-            // credential material. the run's own workdir is the diagnosis.
-            tracing::warn!(
-                target: "ducktape::provider",
-                reason = "config_home_not_removed",
-                %error,
-                "the run's config home outlived its run"
-            );
+        let Err(error) = std::fs::remove_dir_all(&self.slot) else {
+            return;
+        };
+        if !removal_left_a_leak(&error) {
+            return;
         }
+        // the path is deliberately absent: it names a directory that held
+        // credential material. the run's own workdir is the diagnosis.
+        tracing::warn!(
+            target: "ducktape::provider",
+            reason = "config_home_not_removed",
+            %error,
+            "the run's config home outlived its run"
+        );
     }
+}
+
+/// did a failed removal actually leave the directory standing?
+///
+/// ALREADY GONE is a guard's POSTCONDITION, not a failure. An interactive
+/// session's owner removes the session's whole workdir when the session ends
+/// and this slot lives inside it, while the `Arc<InteractiveSession>` a pump
+/// task holds means the [`RunHome`] drop can run after that. Reporting it would
+/// fire once per pty session and say nothing.
+fn removal_left_a_leak(error: &std::io::Error) -> bool {
+    error.kind() != std::io::ErrorKind::NotFound
 }
 
 /// create a directory only this user can read. the provider's config home holds
@@ -4635,6 +4650,23 @@ broker = "anthropic-messages"
                 .collect();
             assert!(entries.is_empty(), "got {entries:?}");
         }
+    }
+
+    /// a run home whose whole tree was already taken away is NOT a leak.
+    ///
+    /// An interactive session's workdir is removed by its owner when the session
+    /// ends, and this run's slot lives inside it — while the pump task's
+    /// `Arc<InteractiveSession>` means the [`RunHome`] drop can run afterwards.
+    /// Calling that a leak would log a warn per pty session that names nothing.
+    #[test]
+    fn a_slot_that_is_already_gone_is_not_a_leak() {
+        let absent = scratch("run-home-already-gone").join("slot");
+        let error = std::fs::remove_dir_all(&absent).expect_err("nothing is there");
+        assert!(!removal_left_a_leak(&error));
+        // anything else IS the guard failing to keep its promise, and says so.
+        assert!(removal_left_a_leak(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
     }
 
     /// the two-runs-in-one-workspace proof, end to end: a fake CLI reports
