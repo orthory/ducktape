@@ -163,6 +163,32 @@ fn hold_macos_activity() {
     std::mem::forget(token);
 }
 
+/// The bare-`ducktape` screen: from nothing to a working node, in the order a
+/// person actually types it. Every line here is a command that runs as written
+/// on a machine with one network on it — no placeholders except the two that
+/// are genuinely yours to choose.
+///
+/// Deliberately NOT the full verb tree (`--help` on any family is that), and
+/// deliberately stops at "it is running": what comes after depends on what you
+/// want the node FOR, and each of those verbs points at its own next step.
+const GETTING_STARTED: &str = "\
+Getting started:
+  ducktape node init --name mynet     found your own network here
+  ducktape node join <invite>         ...or join someone else's
+  ducktape node run                   start it (^C checkpoints and exits)
+  ducktape user account-init --name <you>
+                                      claim an account on it (mints your key)
+  ducktape node status                height + root hash of the running node
+
+Then, to run agents on it:
+  ducktape service run compute        offer this host's sandbox, and enable it
+  ducktape user cred add claude       log a provider in, on this node
+  ducktape agent pty claude           attach a terminal to a sandboxed agent
+
+Each verb's own --help carries the rest. `ducktape node list` shows every
+network this machine is registered on; -n <chain-id> picks one when there is
+more than one.";
+
 // clap owns parsing, help, usage errors (exit 2) and `-V/--version`; the
 // `FATAL:` wrapper in `main` stays for runtime death.
 #[derive(clap::Parser)]
@@ -172,7 +198,11 @@ fn hold_macos_activity() {
     // clap prints "<name> <version>", so the version string must NOT repeat
     // the binary name the way `version_line()` (the `version` verb) does.
     version = env!("CARGO_PKG_VERSION"),
-    arg_required_else_help = true
+    arg_required_else_help = true,
+    // `arg_required_else_help` means a bare `ducktape` lands HERE, so this is
+    // the one screen every new operator sees. A list of eight families does
+    // not tell anyone what to type first; the shortest real path does.
+    after_help = GETTING_STARTED,
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -377,6 +407,15 @@ fn run_node(
     // probe the runtime themselves before they signal, and start their own
     // podman service before they serve. Probing here would have made a missing
     // podman a fatal BOOT error on a node that never needed one.
+
+    // THE MESH LISTENER, taken for a moment while a bind failure can still be
+    // a sentence. Everything below this line runs inside commonware's runtime,
+    // where the same failure is an unwinding panic in a worker thread.
+    // Skipped — not assumed — for an overlay-only node, which opens no OS
+    // socket for the mesh at all.
+    if boot::mesh::binds_an_os_mesh_socket(&namespace, &advertised, wireguard_listen.is_some()) {
+        boot::mesh::preflight_mesh_listen(listen)?;
+    }
 
     let gateway_enabled = gateway_can_start(
         sync_only,

@@ -72,6 +72,17 @@ pub(crate) struct AccountInitArgs {
     key: Option<PathBuf>,
 }
 
+/// What [`load_or_mint_user_signer`] had to do to produce a signer — ONE
+/// discriminant, so the ceremony below is a `match` and not a bool the caller
+/// threads through.
+enum KeyOrigin {
+    /// the key file was already there; the password opened it.
+    Opened,
+    /// there was no key: a fresh seed was generated and sealed, and these are
+    /// the 24 words that are the ONLY way back to it.
+    Minted(String),
+}
+
 /// `user key` lifecycle subcommands.
 #[derive(Debug, clap::Args)]
 pub(crate) struct UserKeyArgs {
@@ -293,19 +304,25 @@ fn cmd_user_account_init(
     use identity::{IdentityMsg, IdentityQuery, IdentityReply};
 
     let base = args.addr.resolve()?;
-    let needle = args
-        .addr
-        .network
-        .as_deref()
-        .filter(|n| !n.is_empty())
-        .ok_or("account-init needs -n/--network to locate the node's workspace")?;
-    let (dir, _http) = config::resolve_network(needle)?;
+    // THE shared node-addressing ladder, not a fourth hand-rolled copy of it:
+    // this used to demand `-n/--network` outright, so the very first command a
+    // new operator runs refused a machine with exactly one registered
+    // workspace — the one shape `node init` had just left behind, and the one
+    // `ducktape node run` (same ladder) is happy with.
+    let dir = args.addr.workspace()?;
     let resolved = config::resolve(&dir.join("node.toml"))?;
     // default the key to the network's canonical `<workspace>/user.key`, so a
     // later `cred add -n <net>` (no `--key`) finds the very key this bind used.
     let key_path = args.key.unwrap_or_else(|| dir.join("user.key"));
-    let user = load_user_signer(&key_path, stdin)?;
+    let (user, origin) = load_or_mint_user_signer(&key_path, stdin)?;
     let user_pub = user.public_key();
+    // the mnemonic BEFORE the submits: they take a block each, and a person
+    // who ^Cs on a slow chain must still have the only copy of their seed.
+    if let KeyOrigin::Minted(words) = origin {
+        println!("a new user key was minted at {}", key_path.display());
+        println!("write these 24 words down — they are the only way to restore it:");
+        println!("{words}");
+    }
 
     // Already bound? then the bind is a no-op — just (re)assert name + handle.
     let query = IdentityQuery::OfMember { member_key: user_pub.as_ref().to_vec() };
@@ -489,6 +506,20 @@ fn user_key_init(
     args: KeyOutArgs,
     stdin: &mut impl std::io::BufRead,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let (words, key) = mint_user_key(&args.out, stdin)?;
+    Ok((words, hex_bytes(key.public_key().as_ref())))
+}
+
+/// Generate a fresh seed, seal it under a password read from `stdin`, write it
+/// to `out` (refusing to overwrite), and hand back the words AND the signer.
+///
+/// The signer comes back so a caller that mints does not have to re-read the
+/// file with a password it would have to ask for a SECOND time — the shape
+/// that made "mint it if absent" impossible to offer here before.
+fn mint_user_key(
+    out: &std::path::Path,
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(String, ed25519::PrivateKey), Box<dyn std::error::Error>> {
     let password = prompt_stdin_line(stdin, "password")?;
     check_password_len(&password)?;
 
@@ -496,10 +527,75 @@ fn user_key_init(
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
     let words = userkey::mnemonic_of_seed(&seed);
     let line = userkey::seal_user_key(&seed, &password)?;
-    userkey::write_user_key_new(&args.out, &line)?;
+    userkey::write_user_key_new(out, &line)?;
 
     let key = ed25519::PrivateKey::decode(seed.as_slice()).expect("32 random bytes decode");
-    Ok((words, hex_bytes(key.public_key().as_ref())))
+    verify_the_key_reopens(out, &password, &key)?;
+    Ok((words, key))
+}
+
+/// Read the key back and open it, before telling anyone it exists.
+///
+/// The failure this prevents is SILENT and TOTAL: the operator is shown 24
+/// words, writes them down, and the file those words are supposed to unlock
+/// cannot be opened by anything, ever. Nothing later in the flow would notice —
+/// the mnemonic is correct, the file is present and well-formed, and the first
+/// symptom is a wrong-password error at some unrelated moment weeks later.
+///
+/// It is not hypothetical. Sealing runs a 64 MiB argon2id buffer through the
+/// host's memory, and on the machine this was written on a byte-identical
+/// `seal_with` call produced a DIFFERENT ciphertext roughly 1 run in 240 under
+/// parallel load — a silent bit flip on non-ECC memory. A short disk write
+/// would land the same way. One extra argon2 pass, once, at the only moment a
+/// key is irreplaceable, is the cheapest insurance in this file.
+///
+/// The unusable file is REMOVED on failure, because leaving it behind is worse
+/// than not writing it: `write_user_key_new` refuses to overwrite, so a
+/// corrupt key would block the retry that would have fixed it.
+fn verify_the_key_reopens(
+    path: &std::path::Path,
+    password: &str,
+    expected: &ed25519::PrivateKey,
+) -> Result<(), String> {
+    let reopened = read_key_line(path)
+        .and_then(|line| userkey::open_user_key(&line, password).map_err(|e| e.to_string()));
+    let intact = reopened
+        .as_ref()
+        .is_ok_and(|key| key.public_key() == expected.public_key());
+    if intact {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(path);
+    Err(format!(
+        "the key just written to {} does not open with the password that sealed it, so it \
+         has been removed rather than left unusable — this is a corrupted write (failing \
+         memory or a full/faulty disk), not a wrong password. Run the command again; if it \
+         happens twice, the host is at fault.",
+        path.display()
+    ))
+}
+
+/// Open `key_path`, or MINT it when there is nothing there yet.
+///
+/// Only `account-init` calls this, and that is the whole rule: creating the
+/// account IS the verb whose job is to bring an identity into existence, so an
+/// absent key there is the ordinary first run rather than a mistake. Everywhere
+/// else — `cred`, every `sign-*` — an absent key stays a loud error, because
+/// those verbs sign AS an already-bound account and a silently minted stranger
+/// would be a fresh unbound identity wearing the right path.
+fn load_or_mint_user_signer(
+    key_path: &std::path::Path,
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(ed25519::PrivateKey, KeyOrigin), Box<dyn std::error::Error>> {
+    if key_path.exists() {
+        return Ok((load_user_signer(key_path, stdin)?, KeyOrigin::Opened));
+    }
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let (words, key) = mint_user_key(key_path, stdin)?;
+    Ok((key, KeyOrigin::Minted(words)))
 }
 
 /// `user-key init --out <path>` — stdin: password. Generates a fresh seed,
@@ -1255,6 +1351,85 @@ mod userkey_verb_tests {
         let enc = userkey::read_user_key_file(&path).unwrap();
                 assert_eq!(hex_bytes(&enc.pubkey), pubkey_hex);
             }
+
+    /// A key that cannot be reopened is a key the operator has LOST, and they
+    /// would be holding 24 correct words while believing otherwise. The check
+    /// runs at mint time and refuses rather than reporting success — and it
+    /// takes the unusable file with it, because `write_user_key_new` will not
+    /// overwrite and a corpse there would block the retry that fixes this.
+    #[test]
+    fn a_key_that_does_not_reopen_is_refused_and_not_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.key");
+
+        // a real minted key verifies — the check is not vacuous.
+        let mut stdin = stdin_of(&["correct horse battery"]);
+        let (_, key) = mint_user_key(&path, &mut stdin).expect("a good seal verifies");
+        assert!(verify_the_key_reopens(&path, "correct horse battery", &key).is_ok());
+
+        // now corrupt the sealed line the way a bit flip would, and the same
+        // check must refuse it and remove it.
+        let flipped = {
+            let line = std::fs::read_to_string(&path).unwrap();
+            let mut bytes = line.trim().as_bytes().to_vec();
+            let last = bytes.len() - 1;
+            bytes[last] = if bytes[last] == b'A' { b'B' } else { b'A' };
+            String::from_utf8(bytes).unwrap()
+        };
+        std::fs::write(&path, &flipped).unwrap();
+        let why = verify_the_key_reopens(&path, "correct horse battery", &key)
+            .expect_err("a corrupted key must not pass");
+        assert!(
+            why.contains("not a wrong password"),
+            "it must not send the reader hunting for a typo: {why}"
+        );
+        assert!(
+            !path.exists(),
+            "an unusable key file must not be left to block the retry"
+        );
+    }
+
+    /// `account-init`'s `--key` help promises "minting it there if absent".
+    /// It did not: a fresh workspace answered the first command a new operator
+    /// ever runs with `FATAL: read ".../user.key": No such file or directory`,
+    /// and nothing on that path mentioned `user key init`. One password, one
+    /// mint, and the words that come back are the real seed.
+    #[test]
+    fn account_init_mints_the_user_key_when_the_workspace_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        // deliberately a path whose PARENT does not exist either.
+        let path = dir.path().join("fresh-workspace").join("user.key");
+
+        let mut mint_stdin = stdin_of(&["correct horse battery"]);
+        let (minted, origin) = load_or_mint_user_signer(&path, &mut mint_stdin).unwrap();
+        let KeyOrigin::Minted(words) = origin else {
+            panic!("an absent key must be minted, not opened");
+        };
+        assert_eq!(words.split_whitespace().count(), 24);
+        assert!(path.exists(), "the key lands at the path the caller named");
+
+        // the words are the ONLY copy: they must restore this exact identity.
+        let restored_to = dir.path().join("restored.key");
+        let mut restore_stdin = stdin_of(&[&words, "another password"]);
+        let restored = user_key_restore(
+            KeyOutArgs {
+                out: restored_to,
+            },
+            &mut restore_stdin,
+        )
+        .unwrap();
+        assert_eq!(restored, hex_bytes(minted.public_key().as_ref()));
+
+        // and a SECOND run opens the same key instead of minting over it —
+        // one password line, no mnemonic, the same identity.
+        let mut reopen_stdin = stdin_of(&["correct horse battery"]);
+        let (reopened, origin) = load_or_mint_user_signer(&path, &mut reopen_stdin).unwrap();
+        assert!(
+            matches!(origin, KeyOrigin::Opened),
+            "an existing key is opened, never re-minted"
+        );
+        assert_eq!(reopened.public_key(), minted.public_key());
+    }
 
     #[test]
     fn restore_round_trips_init_mnemonic_to_identical_pubkey() {

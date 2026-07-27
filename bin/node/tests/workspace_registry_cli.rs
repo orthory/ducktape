@@ -142,3 +142,72 @@ fn flagless_init_detects_the_platform_runtime_into_a_live_sandbox_table() {
         "no runtime on PATH keeps the commented example:\n{toml}"
     );
 }
+
+/// Run any family, not just `node`.
+fn ducktape_raw(home: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(args)
+        .env("DUCKTAPE_HOME", home)
+        .output()
+        .expect("run ducktape")
+}
+
+/// ONE registered workspace means there is nothing to disambiguate, and every
+/// family must agree about that — `node run` and `node status` always did,
+/// while `service`, `user account-init` and `user cred` each demanded
+/// `-n/--network` on a machine with exactly one network on it. That is the
+/// difference between `ducktape service list` and
+/// `ducktape service list -n 'mynet#d0cdf950'` for every command in a session.
+///
+/// Driven as a REAL subprocess against a real registry, because the bug this
+/// pins is not in the ladder: it is a family resolving the registry's
+/// `(chain-id, node.toml-path)` pair and using the PATH where a DIRECTORY was
+/// meant. A unit test of the ladder cannot see that; `service list` answering
+/// `read ".../node.toml/services.toml": Not a directory` can.
+#[test]
+fn one_registered_workspace_needs_no_selector_in_any_family() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let chain_id = init(home.path(), "solonet");
+
+    // `service` reads grants off disk and renders an unreachable node calmly,
+    // so this answers with no node running at all.
+    let out = ducktape_raw(home.path(), &["service", "list"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "service list must infer the lone workspace:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("node.toml/"),
+        "the workspace DIR was resolved, not its node.toml path: {stderr}"
+    );
+    assert!(
+        stdout.contains("none enabled") || stdout.contains("KIND"),
+        "service list rendered nothing: {stdout:?} {stderr:?}"
+    );
+
+    // and the KIND filter every other service verb takes is accepted here too.
+    let out = ducktape_raw(home.path(), &["service", "status", "compute"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "`service status <kind>` must parse: {stderr}"
+    );
+    assert!(
+        stderr.contains("ducktape service run compute"),
+        "an absent kind says how to start it: {stderr}"
+    );
+
+    // a SECOND network removes the inference — and the refusal names both, so
+    // the reader can pick.
+    let second = init(home.path(), "othernet");
+    let out = ducktape_raw(home.path(), &["service", "list"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "two workspaces must not be guessed at");
+    assert!(
+        stderr.contains(&chain_id) && stderr.contains(&second),
+        "an ambiguous registry names its candidates: {stderr}"
+    );
+    assert!(stderr.contains("-n"), "and the flag that picks one: {stderr}");
+}

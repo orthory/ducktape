@@ -25,6 +25,8 @@ _ducktape() {
     local fs_flags=(-n --network --json --node --message -m --no-rebase --snapshot --limit --prefix)
     local service_verbs=(run list enable disable status help)
     local service_flags=(--config --workspace -n --network --json --yes -y --enable --no-enable)
+    # every service verb takes a KIND now, `list`/`status` included.
+    local service_kinds=(compute agent airlock)
     local agent_verbs=(pty sched help)
     local agent_flags=(-n --network --node --host-node --cred --cpu --mem)
 
@@ -53,7 +55,12 @@ _ducktape() {
             ;;
         gateway) compadd -- $gateway_verbs $gateway_flags ;;
         fs)      compadd -- $fs_verbs $fs_flags ;;
-        service) compadd -- $service_verbs $service_flags ;;
+        service)
+            case $words[3] in
+                run|list|enable|disable|status) compadd -- $service_kinds $service_flags ;;
+                *) compadd -- $service_verbs $service_flags ;;
+            esac
+            ;;
         agent)   compadd -- $agent_verbs $agent_flags ;;
     esac
 }

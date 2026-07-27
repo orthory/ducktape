@@ -28,6 +28,8 @@ _ducktape() {
     local fs_flags="-n --network --json --node --message -m --no-rebase --snapshot --limit --prefix"
     local service_verbs="run list enable disable status help"
     local service_flags="--config --workspace -n --network --json --yes -y --enable --no-enable"
+    # every service verb takes a KIND now, `list`/`status` included.
+    local service_kinds="compute agent airlock"
     local agent_verbs="pty sched help"
     local agent_flags="-n --network --node --host-node --cred --cpu --mem"
 
@@ -57,7 +59,13 @@ _ducktape() {
             ;;
         gateway) COMPREPLY=( $(compgen -W "$gateway_verbs $gateway_flags" -- "$cur") ) ;;
         fs)      COMPREPLY=( $(compgen -W "$fs_verbs $fs_flags" -- "$cur") ) ;;
-        service) COMPREPLY=( $(compgen -W "$service_verbs $service_flags" -- "$cur") ) ;;
+        service)
+            case "${COMP_WORDS[2]}" in
+                run|list|enable|disable|status)
+                          COMPREPLY=( $(compgen -W "$service_kinds $service_flags" -- "$cur") ) ;;
+                *)        COMPREPLY=( $(compgen -W "$service_verbs $service_flags" -- "$cur") ) ;;
+            esac
+            ;;
         agent)   COMPREPLY=( $(compgen -W "$agent_verbs $agent_flags" -- "$cur") ) ;;
     esac
 }

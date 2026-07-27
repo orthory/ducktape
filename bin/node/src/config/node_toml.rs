@@ -23,13 +23,32 @@ use super::resolve::{DEFAULT_CHECKPOINT_BLOCKS, DEFAULT_PODMAN_IMAGE};
 /// with every surface up. Loopback for the operator surfaces (HTTP app
 /// API, browser gateway, admin RPC), dual-stack for the mesh, and the
 /// conventional WireGuard port for the tunnel plane.
-pub const DEFAULT_MESH_LISTEN: &str = "[::]:52200";
+///
+/// EVERY eagerly-bound TCP default sits BELOW [`EPHEMERAL_FLOOR`], and that is
+/// a correctness property rather than tidiness — see
+/// [`no_tcp_default_sits_in_the_ephemeral_range`]. The mesh listener was at
+/// `52200`, inside the range, where any outbound connection on the box can take
+/// the port first; commonware's discovery listener `expect`s its bind, so
+/// losing that race is an unwinding panic ten seconds into boot. It now sits
+/// beside the two operator surfaces, which were never at risk.
+pub const DEFAULT_MESH_LISTEN: &str = "[::]:8846";
 pub const DEFAULT_HTTP_LISTEN: &str = "127.0.0.1:8844";
 pub const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:8845";
 /// port 0 on purpose: the browser gateway prints its bound port and its
 /// consumers re-read it per session; a fixed port would only collide.
 pub const DEFAULT_GATEWAY_LISTEN: &str = "127.0.0.1:0";
+/// UDP, and deliberately still the CONVENTIONAL WireGuard port even though it
+/// is inside the ephemeral range: a firewall rule, a NAT forward and an
+/// operator's muscle memory all key on 51820, and the tunnel plane answers a
+/// bind failure with a logged retry rather than a panic — so the trade the mesh
+/// port made does not apply here.
 pub const DEFAULT_WIREGUARD_LISTEN: &str = "0.0.0.0:51820";
+
+/// The bottom of Linux's default `ip_local_port_range` (32768–60999). A
+/// listener whose default port sits above this is racing every outbound
+/// connection on the host for it.
+#[cfg(test)]
+pub const EPHEMERAL_FLOOR: u16 = 32768;
 
 /// the operator node.toml — the network shape, every key required.
 ///
@@ -429,6 +448,41 @@ mod tests {
     }
 
     /// the generated file round-trips through the strict parser and its
+    /// No TCP listener a node binds EAGERLY may default into the ephemeral
+    /// range, because the kernel hands those ports out to outbound connections
+    /// and the loser of that race is a node that will not start.
+    ///
+    /// The mesh listener is the one that bit: it sat at `52200`, and
+    /// commonware's discovery listener `expect`s its bind inside the runtime,
+    /// so losing the race was `thread 'tokio-rt-worker' panicked … BindFailed`
+    /// ten seconds into an otherwise healthy boot.
+    ///
+    /// Scoped to TCP on purpose. `wireguard_listen` is UDP, is the conventional
+    /// 51820 that firewalls and NAT forwards are written against, and answers a
+    /// failed bind with a logged retry rather than a panic — so it is named
+    /// here as a deliberate exclusion instead of quietly not being checked.
+    #[test]
+    fn no_tcp_default_sits_in_the_ephemeral_range() {
+        for (key, value) in [
+            ("listen", DEFAULT_MESH_LISTEN),
+            ("http_listen", DEFAULT_HTTP_LISTEN),
+            ("rpc_listen", DEFAULT_RPC_LISTEN),
+        ] {
+            let port = value
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok())
+                .unwrap_or_else(|| panic!("{key} default {value:?} names a port"));
+            assert!(
+                port < EPHEMERAL_FLOOR,
+                "{key} defaults to {port}, inside the kernel's ephemeral range \
+                 ({EPHEMERAL_FLOOR}+) — it will lose bind races to outbound sockets"
+            );
+        }
+        // the gateway is the one exception and it is the SAFE direction: port 0
+        // asks the kernel for a free port instead of racing for a fixed one.
+        assert!(DEFAULT_GATEWAY_LISTEN.ends_with(":0"));
+    }
+
     /// flagless defaults are a WORKING node: every surface up, every
     /// derivation materialized concretely.
     #[test]

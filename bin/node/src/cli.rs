@@ -214,7 +214,48 @@ fn cmd_node_status(args: StatusArgs) -> CommandResult {
     };
     let root_hash = status["root_hash"].as_str().unwrap_or("");
     println!("height={height} root_hash={root_hash}");
+    // WHOSE node this is — the fact `user cred grant <account>`, `node work
+    // admit <account>` and `agent sched --host-node` all stand on, and the one
+    // an operator otherwise had to hand-write a `/v1/query` `OfNode` for.
+    // Prose only: `--json` is the rpc's status document verbatim and stays a
+    // byte-for-byte contract.
+    println!(
+        "{}",
+        account_line(&rpc_addr, resolved.signer.public_key().as_ref())
+    );
     Ok(())
+}
+
+/// The `account=` line under `node status`: this node's own account, named.
+///
+/// Best-effort, and quiet about its own failures on purpose: the node's tip is
+/// the answer `status` promises, and a chain that cannot serve an identity read
+/// must not turn a working status into an error. An UNBOUND node is not a
+/// failure at all — it is the ordinary state between `node run` and
+/// `user account-init`, and the only state with a next step worth printing.
+///
+/// `node_key` comes from the workspace this verb already resolved, NOT from the
+/// rpc status document — which carries height, root hash and module roots and
+/// has never named the node. Asking the running process would be the stricter
+/// source, but this verb opened `identity.key` two lines up to find the rpc
+/// address at all, so there is no new exposure to buy with the round trip.
+fn account_line(rpc_addr: &str, node_key: &[u8]) -> String {
+    let query = identity::encode_query(&identity::IdentityQuery::OfNode {
+        node_key: node_key.to_vec(),
+    });
+    let Ok(view) = rpc_query(rpc_addr, "identity", &query)
+        .and_then(|bytes| identity::decode_reply(&bytes).map_err(|e| e.to_string()))
+    else {
+        return "account=unknown (the identity module did not answer)".into();
+    };
+    let identity::IdentityReply::Account(Some(account)) = view else {
+        return "account=none — claim one with: ducktape user account-init --name <you>".into();
+    };
+    let id = hex_bytes(&account.account_id);
+    match account.display_name {
+        Some(name) => format!("account={name} ({})", id.get(..16).unwrap_or(&id)),
+        None => format!("account={id}"),
+    }
 }
 
 /// `peers [--config <path> | -n <chain-id>] [--json]` — the RUNNING node's
@@ -732,8 +773,12 @@ fn cmd_admit(args: AdmitArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// one blocking json-lines rpc round-trip against the LOCAL node.
 fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json::Value, String> {
     use std::io::{BufRead as _, BufReader, Write as _};
-    let conn = std::net::TcpStream::connect(addr)
-        .map_err(|e| format!("connect rpc {addr}: {e} (is the node running?)"))?;
+    // the same calm sentence the http lane gives, for the same condition: an
+    // `os error 111` with a port in it is a diagnosis nobody asked for.
+    let conn = std::net::TcpStream::connect(addr).map_err(|error| match error.kind() {
+        std::io::ErrorKind::ConnectionRefused => crate::node_http::NODE_NOT_RUNNING.to_string(),
+        _ => format!("cannot reach this node's operator rpc on {addr}: {error}"),
+    })?;
     conn.set_read_timeout(Some(std::time::Duration::from_secs(15)))
         .map_err(|e| format!("rpc timeout: {e}"))?;
     let mut writer = conn.try_clone().map_err(|e| format!("rpc clone: {e}"))?;
