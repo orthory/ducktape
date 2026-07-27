@@ -224,3 +224,76 @@ state
   page_search_hits:[PageSearchHit] = []
   page_searching = false
   page_search_generation:i64 = 0
+  // ONBOARDING — the phase gate in front of the console. "console" is the only
+  // phase that renders the shell; the rest are the pre-workspace column.
+  phase = "console"
+  onboarding_name = ""
+  onboarding_invite = ""
+  onboarding_error = ""
+  invite_link = ""
+  workspace_slug = ""
+  // NODE FACTS — everything /v1/status already publishes that the app dropped.
+  // Backs the status-pill hover card, the FINALITY/ROUND cards and the gc line.
+  node_facts_generation:i64 = 0
+  node_root_hash = ""
+  node_view:i64 = 0
+  node_quorum:i64 = 0
+  node_reachable:i64 = 0
+  node_last_finalized:i64 = 0
+  node_checkpoint:i64 = 0
+  node_tab = "overview"
+  status_card_open = false
+  // ROSTER — members and agents share one screen, so they share one filter.
+  members_filter = "all"
+  members_selected = ""
+  agents_selected = ""
+  agent_runs_generation:i64 = 0
+  // FORGE — which tracker list, which repo menu, which half of an item.
+  forge_tab = "pulls"
+  forge_repo_menu = false
+  forge_item_tab = "conversation"
+  // DIRECT — a DM is a two-party members-only channel; these name the peer.
+  dm_peers_generation:i64 = 0
+  active_dm_peer = ""
+  active_dm_name = ""
+  active_dm_is_agent = false
+  // HUDDLE — whether SHE is in it, where, since when, and the tick that drives
+  // the elapsed clock.
+  huddle_joined = false
+  huddle_channel = ""
+  huddle_channel_name = ""
+  huddle_joined_at:i64 = 0
+  huddle_now:i64 = 0
+  huddle_popped = false
+  // The event inspector every finality mark opens.
+  inspector_open = false
+  inspector_seq:i64 = 0
+  // EXPLORER — one query across every module, filtered by result kind.
+  explorer_query = ""
+  explorer_kind = "all"
+  files_selected = ""
+  // Overlays: the mention popup, the invite modal, the toast, the arm-then-act
+  // guard on destructive buttons.
+  pref_receipts = true
+  mention_open = false
+  mention_draft = ""
+  invite_modal_open = false
+  invite_role = "resident"
+  invite_ttl:i64 = 7
+  toast = ""
+  toast_tone = "info"
+  leave_armed = false
+  // MOTION — the artifact's vocabulary, and all of it: a spinner, a status
+  // pulse, and the rise an overlay enters on. Nothing decorative.
+  spin:animation[f64] = 0.0
+    easing linear
+    duration 800ms
+    repeat forever
+  pulse:animation[f64] = 0.0
+    easing ease-in-out
+    duration 1700ms
+    repeat forever
+    auto-reverse true
+  overlay_in:animation[bool] = false
+    easing ease-out
+    duration 180ms
