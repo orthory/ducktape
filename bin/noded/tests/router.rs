@@ -677,7 +677,7 @@ async fn a_loopback_caller_without_the_operator_credential_cannot_drive_admin() 
 ///
 /// Two cliffs, one test. Without a `DefaultBodyLimit` layer axum applies its
 /// implicit 2 MiB default, and `crates/modules/apps/runs/component.wasm` is
-/// already 1.83 MB of that — so the next module to grow would have become
+/// already 1.73 MB of that — so the next module to grow would have become
 /// un-stageable behind an opaque tower error with no reason token. Above the
 /// real cap the refusal must still be a reason a client can branch on.
 #[tokio::test]

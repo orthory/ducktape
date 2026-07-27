@@ -356,9 +356,6 @@ impl Sessions {
             // a fresh per-session workdir, mounted rw into the container and
             // removed when `home` drops.
             workdir_override: Some(home.path()),
-            // a native pty session is a host-local optimization, never portable
-            // state to resume/capture.
-            portable: true,
             limits: spec.limits,
             airlock: spec.credential.map(airlock_config),
             ..Default::default()

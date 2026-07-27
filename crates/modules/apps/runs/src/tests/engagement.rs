@@ -54,7 +54,6 @@ fn pages_comment_mention_dispatches_without_a_chat_watch() {
         panic!("expected page dispatch")
     };
     let envelope: serde_json::Value = serde_json::from_slice(payload).unwrap();
-    assert_eq!(envelope["thread_key"], "pages:thread-1");
     assert!(
         envelope["conversation"]
             .as_str()
@@ -125,10 +124,6 @@ fn mention_policy_engages_only_this_modules_tagged_active_agents() {
     assert!(
         envelope.get("prompt_hash").is_none(),
         "the prompt pin retired: an agent is its curated skills"
-    );
-    assert_eq!(
-        envelope["thread_key"], "general#3",
-        "a non-thread anchor keys the thread by itself"
     );
     assert!(
         envelope["contract"]

@@ -67,8 +67,8 @@ struct StageReply {
 /// body cap for the stage lane, set EXPLICITLY rather than inherited.
 ///
 /// Without a layer axum applies its implicit 2 MiB default, and the largest
-/// module artifact in tree — `crates/modules/apps/runs/component.wasm`, 1.83 MB
-/// — already sits at 87% of that. The next module to cross it would have been
+/// module artifact in tree — `crates/modules/apps/runs/component.wasm`, 1.73 MB
+/// — already sits at 82% of that. The next module to cross it would have been
 /// un-stageable behind an opaque tower error carrying no reason token.
 ///
 /// 16 MiB is ~9x that artifact: room for a debug-info-heavy component or a

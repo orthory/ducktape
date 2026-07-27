@@ -272,8 +272,6 @@ fn an_issue_run_forks_dev_with_an_unborn_item_branch_and_requests_a_pr() {
     assert!(context.contains("title: Fix the gate"), "{context}");
     assert!(context.contains("repro inside"), "{context}");
     assert!(context.contains("work branch: agent/item-7"), "{context}");
-    // thread continuity: unchanged — replies land in the item discussion.
-    assert_eq!(v["thread_key"], "forge:app:7#2");
     // skills machinery is the duckfs lane's: the duckfs head still pins.
     assert_eq!(v["skills"].as_array().unwrap().len(), 0);
 }

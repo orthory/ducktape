@@ -2192,7 +2192,6 @@ format = "text"
             "agent_id": "bot",
             "run_id": "chat\u{1f}general\u{1f}7\u{1f}bot",
             "agent_display_name": "BOT",
-            "thread_key": "general#7",
             "instructions": "GENERIC",
             "contract": "CONTRACT",
             "conversation": "CONVERSATION",
@@ -2231,7 +2230,6 @@ format = "text"
             "the provider never sees envelope JSON"
         );
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
-        assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
     }
 
     #[tokio::test]
@@ -2271,7 +2269,6 @@ format = "text"
             "agent_id": "bot",
             "run_id": "chat\u{1f}forge:app:7\u{1f}2\u{1f}bot",
             "agent_display_name": "BOT",
-            "thread_key": "forge:app:7#2",
             "instructions": "GENERIC",
             "contract": "CONTRACT",
             "conversation": "CONVERSATION",
@@ -2837,7 +2834,6 @@ format = "text"
             Some(expected.display().to_string().as_str()),
             "the run-scoped workspace env was applied"
         );
-        assert!(ctx.portable, "a v1 run is portable");
         // the SOUL crosses provisioner → RunContext. it is assembled from the
         // MATERIALIZED skill mounts (only the provisioner can read them), so
         // this hop is the only way the persona ever reaches the model —

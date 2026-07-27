@@ -331,9 +331,6 @@ impl RunsModule {
             &self.id,
             agent,
             run_id,
-            channel_id,
-            anchor_seq,
-            thread_root,
             &transcript,
             portable,
         )

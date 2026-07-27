@@ -190,7 +190,6 @@ format = "text"
 |---|---|---|---|
 | `spec` | integer | yes | must be `1` |
 | `[workspace]` | table | no | per-agent persistent working directory — see [Workspace](#workspace--a-persistent-per-agent-working-directory) |
-| `[session]` | table | no | thread-continuity capture/resume — see [Session](#session--thread-continuity) |
 | `[isolation]` | table | no | host-owned auth broker + fresh executor config home — see [Isolation](#isolation--host-owned-auth) |
 | `[sandbox]` | table | no | the executor's own auth dirs, mounted into a sandbox — see [Isolation](#isolation--host-owned-auth) |
 | `[tools]` | table | no | argv injected into every argv the file produces — see [Tools](#tools--argv-injected-into-every-argv-the-file-produces) |
@@ -233,14 +232,6 @@ being silently ignored.
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `mode` | string | yes (when the section is present) | must be `"persistent"`; omit the whole section for the scratch default |
-
-### `[session]`
-
-| Field | Type | Required | Rules |
-|---|---|---|---|
-| `capture` | string | yes | `"jsonl-events"` \| `"json-result-field:<field>"` |
-| `resume_args` | string array | exactly one of the two | FULL replacement resume argv; must carry the `{session_id}` slot |
-| `resume_args_append` | string array | exactly one of the two | appended to the spec's own `args`; must carry the `{session_id}` slot |
 
 ### `[isolation]`
 
@@ -348,52 +339,6 @@ consensus — two nodes running the same agent have independent workspaces.
 
 ---
 
-## Session — thread continuity
-
-Agentic CLIs keep their own conversation state keyed by a **session id**.
-`[session]` teaches the host to capture that id from a successful run's
-stdout and to resume it on the next run of the same conversation thread:
-
-```toml
-[session]
-capture = "jsonl-events"                        # or "json-result-field:session_id"
-resume_args = ["exec", "resume", "{session_id}", "--json", "-"]
-# or, for flag-style CLIs:
-# resume_args_append = ["--resume", "{session_id}"]
-```
-
-- **capture** — how the id is read: `"jsonl-events"` scans the event stream
-  (`thread.started`.`thread_id`, a top-level `session_id`, or the older
-  `session_configured` envelope); `"json-result-field:<field>"` reads the
-  named string field of the single result object. Capture is **tolerant**:
-  no id in the output means no session is stored — never an error.
-- **resume** — how a stored id becomes the next invocation's argv. `resume_args`
-  REPLACES the argv wholesale (for CLIs where resuming is a subcommand);
-  `resume_args_append` appends to the spec's own `args` (for flag-style
-  resuming — every variant keeps its model/effort pins for free). Exactly one
-  of the two, and it must use the `{session_id}` slot.
-
-`{session_id}` is the **one substitution in the whole format**, filled
-host-side with an id the executor itself minted (validated: short, printable,
-space-free) — job content can never reach argv. This is host-local plumbing,
-NOT the removed dispatch-time model routing: nothing here touches consensus,
-and every tag still resolves to fixed argv shapes known at load time.
-
-Mechanics (all host-local):
-
-- Session ids live in `<data>/agent-sessions/<agent_id>/<sha256(thread_key)>`
-  (`DUCKTAPE_AGENT_SESSIONS` overrides the root). The thread key is hashed,
-  so any key content is filesystem-safe.
-- A **stale session degrades to a cold start**: if the resumed invocation
-  fails, the session file is deleted and the run retries ONCE cold before
-  reporting failure. Store writes are best-effort (a failure warns and costs
-  continuity, never the answer).
-- Sessions are **assignee-local by design**: another node executing the same
-  thread's next run finds no session file and starts cold — correct, because
-  the run envelope carries the full transcript either way.
-
----
-
 ## Tools — argv injected into every argv the file produces
 
 An agentic executor is only as useful as the tools it can reach. `[tools]`
@@ -416,14 +361,6 @@ It applies to **every argv the file produces**:
 - the `[invoke] args`;
 - **every** `[[variants]]` `args` list (variants inherit `[tools]` like they
   inherit everything else — they never repeat it);
-- the `[session]` `resume_args` replacement argv (and a variant's own
-  replacement), spliced after ITS `args[0]` the same way.
-
-`resume_args_append` is deliberately **not** spliced: that list is a *suffix*
-glued onto the spec's own `args`, not an argv of its own — splicing would land
-tool flags between a flag and its value. It needs nothing: the args it is
-appended to were already injected, so the composed resume argv carries the
-tools anyway.
 
 Everything else is the format's usual posture:
 
@@ -484,16 +421,11 @@ Each entry:
 |---|---|---|---|
 | `suffix` | string | yes | `<model>_<effort>`, each side `[a-z0-9.-]+` (so exactly one `_`) |
 | `args` | string array | yes | the variant's **full** argv — verbatim, complete, never merged with or derived from the parent's args |
-| `resume_args` | string array | no | FULL replacement for the inherited `[session]` resume argv (`{session_id}` slot required; parent must declare `[session]`) |
 
 A variant **inherits** `bin`, `env`, `prompt`, `timeout_secs`, `output`,
-`[workspace]`, and `[session]` (and `description`) from the parent spec;
+and `[workspace]` (and `description`) from the parent spec;
 `args` is its own, whole, and literal. There is no field merging and no
 placeholder substitution — the "argv is literal" invariant holds per tag.
-The one nuance is subcommand-style resuming: an inherited `resume_args`
-replacement cannot carry a per-variant model flag, so a variant may declare
-its own `resume_args` (the embedded codex family does; append-style families
-like claude never need to — the appended flags ride each variant's own args).
 
 **The tag grammar.** A composed tag is `{provider}_{model}_{effort}` and
 splits into **exactly three segments on `_`** — the contract the desktop
@@ -589,7 +521,6 @@ if the tunings follow the `provider_model_effort` grammar.
 | *(per spec)* `[detect].env` | each spec may name its own explicit-binary override var — see the embedded specs for theirs |
 | `DUCKTAPE_PROVIDER_TIMEOUT_SECS` | overrides **every** spec's `timeout_secs` at once |
 | `DUCKTAPE_AGENT_WORKSPACES` | overrides the persistent-workspaces root (default `<data>/agent-workspaces`) |
-| `DUCKTAPE_AGENT_SESSIONS` | overrides the session-store root (default `<data>/agent-sessions`) |
 
 ---
 
@@ -607,7 +538,11 @@ removed within v1 as a pre-release flag day: files that still carry them fail
 loudly at boot with an unknown-field error, never a silent behavior change.
 `[[variants]]` was likewise added within v1 pre-release — a build older than
 it rejects a file carrying variants loudly as an unknown field, never
-misreading it as a single-tag spec. `[workspace]`, `[session]` and `[tools]`
-follow the same pre-release precedent: an older build rejects a file carrying
-them as unknown fields rather than silently running scratch-and-cold, or
-tool-less.)
+misreading it as a single-tag spec. The `[session]` thread-continuity block
+(`capture` / `resume_args` / `resume_args_append` / the `{session_id}` slot,
+and a variant's `resume_args` override) was REMOVED within v1 the same way: a
+file that still declares it fails loudly at boot as an unknown field. Every
+run starts cold — a run's whole continuity is its prompt envelope, which is
+what lets any assignee execute it. `[workspace]` and `[tools]` follow the same
+pre-release precedent: an older build rejects a file carrying them as unknown
+fields rather than silently running scratch-and-cold, or tool-less.)
