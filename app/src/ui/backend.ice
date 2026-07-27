@@ -122,20 +122,21 @@ extern crate::backend
   sync proposal_kind_tone(action:str) -> str
   sync settled_proposals(rows:[ProposalRow]) -> [ProposalRow]
   sync pending_label(rows:[ProposalRow]) -> str
-  sync expires_in(deadline:i64) -> str
+  sync expires_in_blocks(deadline_height:i64, height:i64) -> str
   sync relative_time(unix_seconds:i64) -> str
-  sync clock_time(unix_seconds:i64) -> str
-  sync day_label(unix_seconds:i64) -> str
   sync mmss(seconds:i64) -> str
   sync network_label(account_name:str, rpc:str) -> str
   sync height_label(height:i64) -> str
+  sync height_label_short(height:i64) -> str
+  sync height_ago(then_height:i64, now_height:i64) -> str
   sync initial_of(name:str) -> str
   sync initials_of(name:str) -> str
   NodeLogLine(cursor:str, line:str)
   LogParts(time:str, level:str, message:str)
   sync split_log_line(line:str) -> LogParts
-  NodeFacts(generation:i64, root_hash:str, view:i64, quorum:i64, reachable_validators:i64, last_finalized_at:i64, checkpoint_height:i64, peers_live:i64, peers_total:i64)
+  NodeFacts(generation:i64, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, peers_live:i64, peers_total:i64)
   load_node_facts(rpc:str, generation:i64) -> NodeFacts ! HydrationError
+  sync optional_number(value:i64?) -> str
   PeerRow(key:str, height:i64, live:bool)
   PeersData(generation:i64, peers:[PeerRow])
   sync push_log_line(lines:[NodeLogLine], line:NodeLogLine) -> [NodeLogLine]
@@ -152,8 +153,6 @@ extern crate::backend
   load_bool_pref(rpc:str, key:str) -> bool
   save_bool_pref(rpc:str, key:str, on:bool) -> bool
   forget_workspace(rpc:str) -> bool ! AppError
-  Copied(label:str)
-  task copy_text(text:str, label:str) -> Copied
   ForgeRepo(name:str, head:str)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
   ForgeData(generation:i64, repos:[ForgeRepo])
@@ -184,7 +183,7 @@ extern crate::backend
   AgentSkill(name:str, always:bool)
   AgentCap(label:str, arg:str)
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_key:str, owner_handle:str, created_at:i64, is_mine:bool, tools:i64, secrets:i64, subagent_budget:i64, allowed_actions:[str], skills:[AgentSkill], caps:[AgentCap])
-  RunRow(run_id:str, agent_id:str, outcome:str, running:bool, created_at:i64, summary:str)
+  RunRow(run_id:str, agent_id:str, outcome:str, running:bool, created_at:i64)
   AgentRunsData(generation:i64, runs:[RunRow])
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
@@ -285,7 +284,6 @@ extern crate::backend
   join_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
   leave_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
   sync huddle_self(roster:[HuddleParticipant]) -> bool
-  stream huddle_tick() -> i64
   DmPeer(key:str, name:str, initials:str, is_agent:bool)
   DmPeersData(generation:i64, peers:[DmPeer])
   load_dm_peers(rpc:str, generation:i64) -> DmPeersData ! HydrationError

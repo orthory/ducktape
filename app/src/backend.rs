@@ -1983,9 +1983,13 @@ pub fn split_log_line(line: String) -> LogParts {
 pub struct NodeFacts {
     pub generation: i64,
     pub root_hash: String,
-    pub view: i64,
-    pub quorum: i64,
-    pub reachable_validators: i64,
+    /// The three consensus facts are OPTION on purpose: `operations.consensus`
+    /// is absent on a resident, a joiner and the embedded local daemon
+    /// "rather than being filled with misleading zeroes", so a plain i64 would
+    /// print a hard 0 as if it were measured.
+    pub view: Option<i64>,
+    pub quorum: Option<i64>,
+    pub reachable_validators: Option<i64>,
     pub last_finalized_at: i64,
     pub checkpoint_height: i64,
     pub peers_live: i64,
@@ -1993,8 +1997,8 @@ pub struct NodeFacts {
 }
 
 /// Load the node facts from the raw status document plus the peer sample.
-/// Sections the node omits for its role stay zero — the status projection
-/// leaves them out rather than filling them with misleading numbers.
+/// A section the node omits for its role stays `None` — the status projection
+/// leaves it out rather than filling it with misleading numbers, and so do we.
 pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, HydrationError> {
     async {
         let client = rpc_client(&rpc)?;
@@ -2006,9 +2010,9 @@ pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, 
         Ok(NodeFacts {
             generation,
             root_hash: status["root_hash"].as_str().unwrap_or_default().to_string(),
-            view: consensus["view"].as_i64().unwrap_or(0),
-            quorum: consensus["quorum"].as_i64().unwrap_or(0),
-            reachable_validators: consensus["reachable_validators"].as_i64().unwrap_or(0),
+            view: consensus["view"].as_i64(),
+            quorum: consensus["quorum"].as_i64(),
+            reachable_validators: consensus["reachable_validators"].as_i64(),
             last_finalized_at: operations["last_finalized_at"].as_i64().unwrap_or(0),
             checkpoint_height: operations["storage"]["checkpoint_height"]
                 .as_i64()
@@ -2027,6 +2031,15 @@ pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, 
         generation,
         message,
     })
+}
+
+/// A consensus fact the node did not publish for this role reads `—`, never a
+/// zero. The view has no way to branch on an absent value itself.
+pub fn optional_number(value: Option<i64>) -> String {
+    match value {
+        Some(number) => grouped_digits(number),
+        None => "—".into(),
+    }
 }
 
 /// One peer row.
@@ -2234,26 +2247,15 @@ pub struct RunRow {
     pub agent_id: String,
     pub outcome: String,
     pub running: bool,
+    /// A consensus counter (the creation block), NOT a unix stamp — render it
+    /// with `height_ago`/`height_label_short`, never with `relative_time`.
     pub created_at: i64,
-    pub summary: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AgentRunsData {
     pub generation: i64,
     pub runs: Vec<RunRow>,
-}
-
-/// What a settled run produced, in one line: the forge PR it moved, else the
-/// output ref it wrote, else how it ended.
-fn run_summary(record: &serde_json::Value, outcome: &str) -> String {
-    if let Some(number) = record["pr_number"].as_u64() {
-        return format!("pr #{number}");
-    }
-    match record["output_ref"].as_str() {
-        Some(output) if !output.is_empty() => output.to_string(),
-        _ => outcome.to_string(),
-    }
 }
 
 /// This agent's runs: the pending (RUNNING) entries first, then the delivered
@@ -2287,7 +2289,6 @@ pub async fn load_agent_runs(
                 outcome: "running".into(),
                 running: true,
                 created_at: record["created_at"].as_i64().unwrap_or(0),
-                summary: record["channel_id"].as_str().unwrap_or_default().to_string(),
             })
             .collect();
         runs.extend(
@@ -2297,16 +2298,12 @@ pub async fn load_agent_runs(
                 .unwrap_or_default()
                 .into_iter()
                 .filter(wanted)
-                .map(|record| {
-                    let outcome = tagged_name(&record["outcome"]);
-                    RunRow {
-                        run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
-                        agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
-                        running: false,
-                        created_at: record["created_at"].as_i64().unwrap_or(0),
-                        summary: run_summary(&record, &outcome),
-                        outcome,
-                    }
+                .map(|record| RunRow {
+                    run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
+                    agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
+                    running: false,
+                    created_at: record["created_at"].as_i64().unwrap_or(0),
+                    outcome: tagged_name(&record["outcome"]),
                 }),
         );
         Ok(AgentRunsData { generation, runs })
@@ -3747,19 +3744,6 @@ pub async fn save_bool_pref(rpc: String, key: String, on: bool) -> bool {
     write_prefs(&prefs)
 }
 
-/// Published when the clipboard task lands, so a toast can confirm WHAT was
-/// copied.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct Copied {
-    pub label: String,
-}
-
-/// The app's ONE clipboard seam: put `text` on the system clipboard, then
-/// report the label the toast names.
-pub fn copy_text(text: String, label: String) -> iced::Task<Copied> {
-    iced::clipboard::write::<Copied>(text).chain(iced::Task::done(Copied { label }))
-}
-
 /// The titlebar's chain label: the workspace this app is pointed at, then the
 /// bound account, then the endpoint's host, then the product name.
 pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
@@ -3788,7 +3772,32 @@ pub fn height_label(height: i64) -> String {
     if height < 0 {
         return "h —".into();
     }
-    let digits = height.to_string();
+    format!("h {}", grouped_digits(height))
+}
+
+/// The same `h 84,912` run, for the record meta where the artifact printed a
+/// wall clock this chain cannot supply.
+pub fn height_label_short(height: i64) -> String {
+    height_label(height)
+}
+
+/// The honest renderer for a consensus-stamped record time: `412 blocks ago`,
+/// `1 block ago`, `this block`. A record with no stamp prints nothing.
+pub fn height_ago(then_height: i64, now_height: i64) -> String {
+    if then_height <= 0 {
+        return String::new();
+    }
+    let elapsed = now_height.saturating_sub(then_height);
+    match elapsed {
+        blocks if blocks <= 0 => "this block".into(),
+        1 => "1 block ago".into(),
+        blocks => format!("{} blocks ago", grouped_digits(blocks)),
+    }
+}
+
+/// A non-negative count with thousands separators: `84,912`.
+fn grouped_digits(value: i64) -> String {
+    let digits = value.max(0).to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
         let boundary = index > 0 && (digits.len() - index).is_multiple_of(3);
@@ -3797,7 +3806,7 @@ pub fn height_label(height: i64) -> String {
         }
         grouped.push(digit);
     }
-    format!("h {grouped}")
+    grouped
 }
 
 /// TWO uppercase letters for a 28px+ avatar plate: the initials of the first
@@ -3825,7 +3834,14 @@ pub fn initials_of(name: impl AsRef<str>) -> String {
     }
 }
 
-/// `2h ago` / `40m ago` / `just now` — one renderer for every relative stamp.
+/// `2h ago` / `40m ago` / `just now`, for a genuine UNIX-SECONDS stamp.
+///
+/// In this app exactly two values qualify, both off `/v1/status`:
+/// `NodeFacts.last_finalized_at` and `operations.phase_since`. NEVER call it on
+/// a module record's time — the consensus validator stamps `consensus_time =
+/// height` (bin/noded/src/index.rs) and a single-writer noded stamps unix
+/// MILLIS, so a record time is a block height, not seconds. Render those with
+/// [`height_ago`] / [`height_label_short`].
 pub fn relative_time(unix_seconds: i64) -> String {
     if unix_seconds <= 0 {
         return String::new();
@@ -3838,14 +3854,16 @@ pub fn relative_time(unix_seconds: i64) -> String {
     format!("{value}{unit} ago")
 }
 
-/// `expires in 23h` / `expires in 2d`; a passed deadline reads `expired`.
-pub fn expires_in(deadline: i64) -> String {
-    let remaining = deadline.saturating_sub(now_seconds());
-    if remaining <= 0 {
-        return "expired".into();
+/// `expires in 412 blocks`; a passed deadline reads `expired`. A governance
+/// deadline is `consensus_time + voting_period` and `consensus_time` IS the
+/// height, so the remaining span is counted in blocks, never in hours.
+pub fn expires_in_blocks(deadline_height: i64, height: i64) -> String {
+    let remaining = deadline_height.saturating_sub(height);
+    match remaining {
+        blocks if blocks <= 0 => "expired".into(),
+        1 => "expires in 1 block".into(),
+        blocks => format!("expires in {} blocks", grouped_digits(blocks)),
     }
-    let (value, unit) = duration_parts(remaining);
-    format!("expires in {value}{unit}")
 }
 
 /// A span in seconds as its largest whole unit: `(45, "m")`, `(23, "h")`.
@@ -3860,43 +3878,10 @@ fn duration_parts(seconds: i64) -> (i64, &'static str) {
     }
 }
 
-/// Wall-clock `14:32` (UTC) for a message stamp.
-pub fn clock_time(unix_seconds: i64) -> String {
-    if unix_seconds <= 0 {
-        return String::new();
-    }
-    let day_seconds = unix_seconds.rem_euclid(86_400);
-    format!("{:02}:{:02}", day_seconds / 3_600, (day_seconds % 3_600) / 60)
-}
-
-/// `Today` / `Yesterday` / `2026-07-27` — the message list's date divider.
-pub fn day_label(unix_seconds: i64) -> String {
-    if unix_seconds <= 0 {
-        return String::new();
-    }
-    let day = unix_seconds.div_euclid(86_400);
-    let today = now_seconds().div_euclid(86_400);
-    match today - day {
-        0 => "Today".into(),
-        1 => "Yesterday".into(),
-        _ => civil_date(day),
-    }
-}
-
-/// `YYYY-MM-DD` from a count of days since the epoch (civil-from-days).
-fn civil_date(days: i64) -> String {
-    let shifted = days + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = shifted_month + if shifted_month < 10 { 3 } else { -9 };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}")
-}
+// A wall clock (`14:32`) and a day divider (`Today`) are DELIBERATELY absent:
+// a module record's stamp is a block height on a validator network and unix
+// millis on a single-writer node, so neither could be rendered honestly. The
+// artifact's clock is divergence, not a gap — see height_ago/height_label_short.
 
 /// Elapsed `mm:ss` for the huddle pills and panel.
 pub fn mmss(seconds: i64) -> String {
@@ -5038,14 +5023,8 @@ pub fn huddle_self(roster: Vec<HuddleParticipant>) -> bool {
     roster.iter().any(|participant| participant.is_you)
 }
 
-/// A 1 Hz wall-clock tick (unix seconds) — the app's only time subscription,
-/// driving the huddle's elapsed clock.
-pub fn huddle_tick() -> iced::futures::stream::BoxStream<'static, i64> {
-    Box::pin(iced::futures::stream::unfold((), |()| async {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        Some((now_seconds(), ()))
-    }))
-}
+// The huddle's elapsed clock is a LOCAL session fact on a NATIVE `every 1s`
+// subscription — ui-lang ships one, so this app has no tick stream of its own.
 
 pub async fn join_huddle(
     rpc: String,
@@ -6107,24 +6086,7 @@ pub async fn search_workspace(
         }));
     }
     hits.extend(search_forge_items(&rpc, &needle, generation).await);
-    if let Ok(files) = files_find(rpc.clone(), String::new(), generation).await {
-        hits.extend(
-            files
-                .entries
-                .into_iter()
-                .filter(|entry| entry.kind == "file")
-                .filter(|entry| entry.path.to_lowercase().contains(&needle))
-                .take(50)
-                .map(|entry| ExplorerHit {
-                    kind: "file".into(),
-                    code: "fl".into(),
-                    title: entry.name,
-                    snippet: size_label(entry.size),
-                    meta: format!("files · {}", entry.path),
-                    target: entry.path,
-                }),
-        );
-    }
+    hits.extend(search_files(&rpc, text.trim()).await);
     if let Ok(runs) = load_agent_runs(rpc, String::new(), generation).await {
         hits.extend(
             runs.runs
@@ -6132,14 +6094,15 @@ pub async fn search_workspace(
                 .filter(|run| {
                     run.run_id.to_lowercase().contains(&needle)
                         || run.agent_id.to_lowercase().contains(&needle)
-                        || run.summary.to_lowercase().contains(&needle)
                 })
                 .map(|run| ExplorerHit {
                     kind: "run".into(),
                     code: "ag".into(),
                     title: format!("{} · {}", run.run_id, run.agent_id),
-                    snippet: run.summary,
-                    meta: format!("agent · {}", relative_time(run.created_at)),
+                    snippet: run.outcome,
+                    // `created_at` is the creation BLOCK, so it prints as a
+                    // height — this search has no tip to count back from.
+                    meta: format!("agent · {}", height_label_short(run.created_at)),
                     target: run.run_id,
                 }),
         );
@@ -6163,6 +6126,37 @@ pub async fn search_workspace(
         hits,
         kinds,
     })
+}
+
+/// The duckfs half of the workspace search: `GET /v1/files/grep`, the node's
+/// only CONTENT search. `find`'s prefix is a raw path prefix in full-path
+/// order, so it answers "what is under this directory", never "who mentions
+/// this word" — a content query would come back empty through it.
+async fn search_files(rpc: &str, pattern: &str) -> Vec<ExplorerHit> {
+    let Ok(client) = rpc_client(rpc) else {
+        return Vec::new();
+    };
+    let Ok(reply) = client.files_get("grep", &[("pattern", pattern)]).await else {
+        return Vec::new();
+    };
+    reply["hits"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|hit| {
+            let path = hit["path"].as_str().unwrap_or_default().to_string();
+            let line = hit["line"].as_i64().unwrap_or(0);
+            ExplorerHit {
+                kind: "file".into(),
+                code: "fl".into(),
+                title: path.rsplit('/').next().unwrap_or(&path).to_string(),
+                snippet: hit["text"].as_str().unwrap_or_default().trim().to_string(),
+                meta: format!("{path}:{line}"),
+                target: path,
+            }
+        })
+        .collect()
 }
 
 /// The forge half of the workspace search: every repo's tracker, filtered on
@@ -7986,24 +7980,32 @@ mod tests {
         assert_eq!(initials_of("triage"), "TR");
         assert_eq!(initials_of(""), "?");
         assert_eq!(network_slug("Acme Research!".into()), "acme-research");
-        assert_eq!(clock_time(1_774_000_000), "09:46");
-        // an absent stamp prints nothing; a real one prints its civil date.
-        assert_eq!(day_label(0), "");
-        assert_eq!(day_label(86_400), "1970-01-02");
+        assert_eq!(height_label(84_912), "h 84,912");
+        assert_eq!(height_label_short(84_912), "h 84,912");
+        assert_eq!(height_label(-1), "h —");
+        assert_eq!(optional_number(Some(4)), "4");
+        // absent, not zero: a resident's status carries no consensus section.
+        assert_eq!(optional_number(None), "—");
     }
 
+    /// A record stamp is a BLOCK HEIGHT on this chain, so every record-time
+    /// string counts blocks. Only `/v1/status` supplies unix seconds.
     #[test]
-    fn relative_stamps_read_from_the_wall_clock() {
+    fn record_stamps_count_blocks_and_status_stamps_count_seconds() {
+        assert_eq!(height_ago(84_500, 84_912), "412 blocks ago");
+        assert_eq!(height_ago(84_911, 84_912), "1 block ago");
+        assert_eq!(height_ago(84_912, 84_912), "this block");
+        // a follower behind the record it is rendering still reads as now.
+        assert_eq!(height_ago(84_913, 84_912), "this block");
+        assert_eq!(height_ago(0, 84_912), "");
+        assert_eq!(expires_in_blocks(85_324, 84_912), "expires in 412 blocks");
+        assert_eq!(expires_in_blocks(84_913, 84_912), "expires in 1 block");
+        assert_eq!(expires_in_blocks(84_912, 84_912), "expired");
         let now = now_seconds();
         assert_eq!(relative_time(now - 30), "just now");
         assert_eq!(relative_time(now - 40 * 60), "40m ago");
         assert_eq!(relative_time(now - 2 * 60 * 60), "2h ago");
         assert_eq!(relative_time(0), "");
-        assert_eq!(expires_in(now + 23 * 60 * 60), "expires in 23h");
-        assert_eq!(expires_in(now + 2 * 24 * 60 * 60), "expires in 2d");
-        assert_eq!(expires_in(now - 1), "expired");
-        assert_eq!(day_label(now), "Today");
-        assert_eq!(day_label(now - 24 * 60 * 60), "Yesterday");
     }
 
     #[test]
