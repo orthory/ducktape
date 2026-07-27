@@ -22,6 +22,7 @@ use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
+use axum::middleware::Next;
 use axum::routing::{head, post};
 use futures::StreamExt as _;
 use rand::RngCore as _;
@@ -431,6 +432,9 @@ impl RunBroker {
             .route("/v1/control/provider-idle", post(provider_idle_control))
             .fallback(reject)
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            // added LAST so it is the OUTERMOST layer: a request the body limit
+            // or the fallback rejects still gets its line.
+            .layer(axum::middleware::from_fn(log_request))
             .with_state(state);
         let (shutdown, rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -494,6 +498,34 @@ impl Drop for RunBroker {
 
 async fn reject() -> StatusCode {
     StatusCode::FORBIDDEN
+}
+
+/// One `debug` line per brokered request — the observability floor for a plane
+/// whose entire job is proxying HTTP. Without it a wedged provider child is
+/// undiagnosable: the broker serves a CLOSED route set, so "which request did
+/// the child make that we answered 403" is the first question every time, and
+/// nothing else in the process can answer it.
+///
+/// `debug`, never `info`: this fires once per request and an interactive session
+/// makes thousands — at `info` it would evict the whole log ring.
+///
+/// METHOD, PATH and STATUS only. No credential, no account, no subject: the run
+/// bearer, the operator's upstream credential and (under delegation) the lending
+/// account are all out of the line by construction. The URI QUERY is dropped —
+/// doctrine forbids logging one, no broker route reads it, and it is the part a
+/// child could stuff.
+async fn log_request(request: Request, next: Next) -> Response<Body> {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let response = next.run(request).await;
+    tracing::debug!(
+        target: "ducktape::broker",
+        %method,
+        %path,
+        status = response.status().as_u16(),
+        "brokered request"
+    );
+    response
 }
 
 fn random_token() -> String {
@@ -1782,6 +1814,9 @@ impl RunBroker {
             .route("/", head(probe_ok))
             .fallback(reject)
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            // added LAST so it is the OUTERMOST layer: a request the body limit
+            // or the fallback rejects still gets its line.
+            .layer(axum::middleware::from_fn(log_request))
             .with_state(state);
         let (shutdown, rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -2290,6 +2325,47 @@ mod tests {
         path_and_query: Option<String>,
     }
 
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn lines(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// Install (once per test binary) a real subscriber over `ducktape::broker`
+    /// at `debug` and hand back its buffer. Process-global because axum serves on
+    /// its own spawned task, where a thread-local subscriber would not reach.
+    fn capture_debug_logs() -> LogCapture {
+        static SINK: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+        let sink = SINK.get_or_init(|| {
+            let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+            let writer = sink.clone();
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_env_filter(tracing_subscriber::EnvFilter::new("ducktape::broker=debug"))
+                    .with_ansi(false)
+                    .with_writer(move || SharedWriter(writer.clone()))
+                    .finish(),
+            )
+            .expect("install the broker test subscriber");
+            sink
+        });
+        LogCapture(sink.clone())
+    }
+
     /// spin up a mock Anthropic upstream that records the request and replies
     /// with `reply` (status, content-type, body). Returns (url, seen, task).
     async fn mock_upstream(
@@ -2527,6 +2603,52 @@ mod tests {
             .status();
         assert_eq!(status, reqwest::StatusCode::OK, "HEAD / is tolerated");
         upstream.abort();
+    }
+
+    /// Every brokered request leaves ONE `debug` line naming method, path and
+    /// status — including the ones the router REFUSES, which is the whole point:
+    /// a provider child that dead-ends on a route the broker does not serve is
+    /// invisible otherwise. And the line carries no query string: the URI query
+    /// is the part a child can stuff, and doctrine keeps it out of the ring.
+    #[tokio::test]
+    async fn every_brokered_request_leaves_a_debug_line_without_the_query() {
+        let log = capture_debug_logs();
+        let (url, _seen, upstream) = mock_upstream(StatusCode::OK, "application/json", "{}").await;
+        let broker =
+            start_anthropic_pointed_at(AnthropicAuth::ApiKey("host-secret".into()), url).await;
+        let client = reqwest::Client::new();
+        // a SERVED route, carrying the `?beta=true` Claude Code appends…
+        client
+            .post(format!(
+                "{}/v1/messages?beta=true",
+                broker.endpoint.base_url
+            ))
+            .bearer_auth(&broker.endpoint.run_bearer)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        // …and an UNSERVED one — the shape that made the TUI bug undiagnosable.
+        client
+            .head(format!("{}/api/hello", broker.endpoint.base_url))
+            .send()
+            .await
+            .unwrap();
+        upstream.abort();
+
+        let lines = log.lines();
+        assert!(
+            lines.contains("method=POST path=/v1/messages status=200"),
+            "served request not logged: {lines}"
+        );
+        assert!(
+            lines.contains("method=HEAD path=/api/hello status=403"),
+            "refused request not logged: {lines}"
+        );
+        assert!(
+            !lines.contains("beta=true"),
+            "the URI query must never reach the log: {lines}"
+        );
     }
 
     #[tokio::test]
