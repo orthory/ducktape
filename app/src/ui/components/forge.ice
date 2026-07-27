@@ -11,7 +11,9 @@
 // is faked with a plausible placeholder either.
 //
 // STATE IS A PLATE, NOT AN ICON. There is ONE pull-request glyph; open, merged
-// and draft are the plate behind it (`success_bg`, `merged_bg`, `elevated`).
+// and closed are the plate behind it (`success_bg`, `merged_bg`, `elevated`).
+// Those three are the whole vocabulary `state_key` emits — this wire has no
+// draft state, so nothing here draws one.
 // Issues are the only exception the artifact makes: it swaps the whole glyph
 // for `issue-open` / `issue-closed`, and so does this.
 //
@@ -43,8 +45,12 @@ component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str)
       box w=fill max-w=680.0
         text about w=fill size=12.5 line-h=1.5 @text-caption
 
-// One repo card. The title is org-qualified the way the artifact writes it, and
-// the only meta the wire carries is the head digest — the language dot, the
+// One repo card. The artifact org-qualifies the title, but the org it would be
+// qualified WITH is the network name the header and the breadcrumb are both fed
+// (`network_label(...)`), and `RepoCard(repo)` has no seat for it — printing a
+// literal `ducktape/` names a namespace that does not exist on a network called
+// anything else, so the card prints the name the node actually returned. The
+// only other meta the wire carries is the head digest; the language dot, the
 // PR/issue tallies and the `updated` stamp all want fields `RepoHead` does not
 // have, so the row holds what is true instead of what would look full.
 component RepoCard(repo:ForgeRepo)
@@ -53,9 +59,7 @@ component RepoCard(repo:ForgeRepo)
       col w=fill gap=10.0
         row w=fill gap=8.0 align=center
           Icon name="branch" tone="muted" px=14.0
-          row gap=0.0 align=center
-            text "ducktape/" size=14.0 wrap=none font=display @text-primary
-            text repo.name size=14.0 wrap=none font=display @text-primary
+          text repo.name size=14.0 wrap=none font=display @text-primary
         row w=fill gap=14.0 align=center
           text repo.head w=fill size=10.5 wrap=none font=code_medium @text-input
     active bg=surface text=fg border=card_line border-w=1.0 r=13.0
@@ -64,14 +68,15 @@ component RepoCard(repo:ForgeRepo)
 
 // ── REPO HEADER ───────────────────────────────────────────────────────────
 
-// `ducktape / <repo> ▾` plus the single default-branch pill. This replaces both
-// the generic screen header AND the every-branch chip scroller, which occupied
-// the row the artifact gives to the breadcrumb.
+// `<network> / <repo> ▾` plus the single default-branch pill. This replaces the
+// generic screen header, which occupied the row the artifact gives to the
+// breadcrumb.
 //
-// CHROME ONLY, ON PURPOSE. Making the two crumbs pressable needs a
-// `forge_close_repo` and a `forge_toggle_repo_menu` handler that
-// `handlers/lifecycle.ice` does not have yet; `open` is the switcher's state,
-// which lights the repo name the way the artifact's hover does.
+// THE ROW IS CHROME BECAUSE THE CALLER IS THE BUTTON: view.ice mounts the whole
+// crumb inside a `forge_toggle_repo_menu` button, so a nested button here would
+// be a button inside a button. `open` is the switcher's state, which lights the
+// repo name the way the artifact's hover does. `branch` renders only when the
+// caller has a default branch to name.
 component RepoCrumb(org:str, repo:str, branch:str, open:bool)
   row #root w=fill gap=9.0 align=center
     box w=28.0 h=28.0 align-x=center align-y=center bg=primary r=8.0
@@ -121,8 +126,10 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
 // One tracker row, for both kinds. The meta line is `#N · opened by <author>`:
 // the artifact also prints the source branch and an `opened <rel>` stamp, and
 // `ItemRow` carries neither, so neither is invented. The AGENT badge is missing
-// for the same reason — `ItemRow` drops the authorship kind that
-// `chat::client::avatar_kind` already derives.
+// for a narrower reason: `ItemRow.author` IS the `user:{hex}` / agent handle the
+// kind is derived from, but the one function that derives it
+// (`chat::client::avatar_kind`) is private to that crate, so surfacing the badge
+// is a module-crate change, not a view change.
 component TrackerRow(item:ForgeItem)
   col #root w=fill
     button label="Open item" description=item.title w=fill p=0.0 @icon_action -> forge_open_item(item.number)
@@ -234,18 +241,24 @@ component DiffCount(additions:i64, deletions:i64, files:i64)
         text files size=10.5 wrap=none font=code_medium @text-caption
         text "files" size=10.5 wrap=none font=code_medium @text-caption
 
-// The issue body as an authored card: a header strip that attributes it, then
-// the body. The artifact hangs a 30px avatar beside it whose SHAPE says whether
-// the author is a person or a machine — `ItemDetail` carries the author's
-// display name and not the handle it is derived from, so the plate would have
-// to guess. It is left out rather than drawn as a lie.
+// The item body as an authored card: a header strip that attributes it, then
+// the body. `open_item` stores a body for BOTH kinds and the caller renders this
+// for both, so the strip says `opened by <author>` — the artifact's
+// `opened this issue` / `opened this pull request` needs the kind, which this
+// component is not given, and naming the wrong artifact is worse than naming
+// none. It is the same phrasing `TrackerRow` already uses.
+//
+// The artifact hangs a 30px avatar beside it whose SHAPE says whether the author
+// is a person or a machine — `ItemDetail` carries the author's display name and
+// not the handle it is derived from, so the plate would have to guess. It is
+// left out rather than drawn as a lie.
 component IssueBodyCard(author:str, body:str)
   box #root w=fill max-w=660.0 bg=surface border=card_line border-w=1.0 r=11.0 clip=true
     col w=fill
       box w=fill pl=13.0 pr=13.0 pt=8.0 pb=8.0 bg=card_wash
         row w=fill gap=7.0 align=center
+          text "opened by" size=12.0 wrap=none @text-caption
           text author size=12.0 wrap=none font=display @text-primary
-          text "opened this issue" size=12.0 wrap=none @text-caption
       box w=fill h=1.0 bg=separator
         space w=1.0 h=1.0
       box w=fill pl=15.0 pr=15.0 pt=13.0 pb=13.0
@@ -261,11 +274,11 @@ component MergedBanner(note:str)
       text "✓" size=12.0 wrap=none font=code_semibold @text-merged
     text note w=fill size=13.0 wrap=none font=display @text-merged
 
-// The advisory above the merge button. The screen used to state the OPPOSITE
-// unconditionally — `Approvals are advisory — merging is never gated` — while a
-// reviewer's request for changes sat one card above it. This says the true half
-// the wire supports; the artifact's other half is a check-run state that does
-// not exist in this forge.
+// The advisory above the merge button, and the ONLY thing said there. It is a
+// recommendation, never a refusal: `ForgeMsg::MergePr` runs `author_from_origin`
+// and nothing else — no valset, tier or role check — so a request for changes
+// cannot and does not stop the write. The artifact pairs this with a check-run
+// state that does not exist in this forge, so only the reviewer half is drawn.
 component MergeAdvisory(change_requests:i64)
   col #root w=fill
     if change_requests == 1
@@ -293,17 +306,14 @@ component MergeButton(busy:bool, disabled:bool)
           Icon name="pull-request" tone="paper" px=13.0
           text "Merge pull request" size=13.0 wrap=none font=display @text-primary_fg
 
-// WHY a forge action is unavailable, in the chain's own tiers. `forge_gate`
-// returns "" when this node may write, so the note renders nothing at all for a
-// validator — a refusal plate over an action you are allowed to take is worse
-// than no plate.
-component ForgeGateNote(gate:str)
-  col #root w=fill
-    match gate
-      "resident_cannot_merge"
-        GateNote reason="This node is a resident — it may open, comment and review, but the node refuses the merge write itself." next="Merging needs a validator seat on this network."
-      "guest_read_only"
-        GateNote reason="This node is a guest — every forge write is refused at the node, not merely disabled here." next="A resident may comment and review; merging needs a validator seat."
+// THERE IS NO FORGE GATE, so there is no gate note. A `ForgeGateNote` keyed on
+// `forge_gate(member_tier(...))` briefly told a resident the node refuses its
+// merge and a guest that every forge write is refused; `ForgeMsg::MergePr`
+// authorizes on `author_from_origin` alone, so the merge succeeds and the plate
+// described a refusal that never happens — over a Merge button that stayed
+// enabled. It was keyed on the wrong principal too (a node's valset seat, where
+// the frame is signed by the USER key). GateNote belongs over a refusal the
+// product performs; if forge ever gets one, key it on that, never on a tier.
 
 // ── DIFF ──────────────────────────────────────────────────────────────────
 
@@ -311,12 +321,18 @@ component ForgeGateNote(gate:str)
 // their own plate, twin 34px gutters, the sign column, and a per-line tint.
 // `forge_item_diff` already holds the unified patch — this is the renderer it
 // never had.
+//
+// `file` IS THE BRANCH PAIR, not a filename: `forge_item_diff` is the whole
+// multi-file patch as one string, so there is no per-file header to hang here
+// (the patch's own `file` rows ride inside, drawn by `DiffRow`). The slot keeps
+// its contract name and wears the branch glyph, because a document icon beside
+// `feat/x → main` says the string is a path and it is not.
 component DiffPane(file:str, additions:i64, deletions:i64, lines:[DiffLine])
   box #root w=fill max-w=720.0 bg=surface border=card_line border-w=1.0 r=11.0 clip=true
     col w=fill
       box w=fill pl=14.0 pr=14.0 pt=10.0 pb=10.0 bg=card_wash
         row w=fill gap=9.0 align=center
-          Icon name="file" tone="muted" px=13.0
+          Icon name="branch" tone="muted" px=13.0
           text file size=12.0 wrap=none font=code_semibold @text-accent_fg
           DiffCount additions=additions deletions=deletions files=0
           space w=fill
