@@ -84,7 +84,7 @@ extern crate::backend
   create_network(name:str) -> WorkspaceInit ! AppError
   join_network(blob:str) -> WorkspaceInit ! AppError
   mint_invite(workspace:str, role:str, ttl_days:i64) -> str ! AppError
-  ProvisionStep(index:i64, label:str, state:str)
+  ProvisionStep(index:i64, label:str, state:str, settled:bool)
   stream provision_progress(workspace:str, rpc:str) -> ProvisionStep
   sync connection_degraded(status:str) -> bool
   sync palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
@@ -176,21 +176,20 @@ extern crate::backend
   sync diff_lines(diff:str) -> [DiffLine]
   sync filter_forge_items(items:[ForgeItem], kind:str) -> [ForgeItem]
   sync forge_open_count(items:[ForgeItem], kind:str) -> i64
-  sync forge_gate(tier:str) -> str
   sync forge_merge_note(merge_oid:str, branches:str) -> str
   sync verdict_label(verdict:str) -> str
   sync verdict_pick_label(current:str, key:str, label:str) -> str
   AgentSkill(name:str, always:bool)
   AgentCap(label:str, arg:str)
-  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_key:str, owner_handle:str, created_at:i64, is_mine:bool, tools:i64, secrets:i64, subagent_budget:i64, allowed_actions:[str], skills:[AgentSkill], caps:[AgentCap])
-  RunRow(run_id:str, agent_id:str, outcome:str, running:bool, created_at:i64)
+  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_key:str, owner_handle:str, created_at:i64, is_mine:bool, live:bool, tools:i64, secrets:i64, subagent_budget:i64, allowed_actions:[str], skills:[AgentSkill], caps:[AgentCap])
+  RunRow(run_id:str, agent_id:str, outcome:str, running:bool, created_at:i64, summary:str)
   AgentRunsData(generation:i64, runs:[RunRow])
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
   sync any_agent_active(rows:[AgentRow]) -> bool
   load_agent_runs(rpc:str, agent_id:str, generation:i64) -> AgentRunsData ! HydrationError
   set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError
-  ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, required_yes:i64, electorate:i64, open:bool)
+  ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, rule:str, required_yes:i64, electorate:i64, open:bool)
   GovernanceData(generation:i64, proposals:[ProposalRow])
   load_governance(rpc:str, generation:i64) -> GovernanceData ! HydrationError
   governance_vote(rpc:str, password:str, proposal_id:str, approve:bool) -> bool ! AppError

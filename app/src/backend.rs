@@ -1458,7 +1458,10 @@ pub struct MemberRow {
     pub is_agent: bool,
     /// an agent's capability tag; empty for a human member.
     pub model: String,
-    /// the mesh reports this key as a live peer (this node is live by definition).
+    /// a HUMAN row: the mesh reports this key as a live peer (this node is
+    /// live by definition). An AGENT row: the registry says active rather than
+    /// paused — `MemberPresence` renders the two vocabularies apart on
+    /// `is_agent`. Neither is "working right now"; that is `AgentRow.live`.
     pub live: bool,
 }
 
@@ -1503,7 +1506,8 @@ pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, H
             }
         }
         // registered agents are members of the workspace too — the roster shows
-        // people AND machines, keyed on the agent id (agents hold no node key).
+        // people AND machines, keyed on the agent id (agents hold no node key;
+        // the roster labels that cell "agent id", not "public key").
         let agents = load_agents(rpc, generation).await.map(|data| data.agents);
         for agent in agents.unwrap_or_default() {
             members.push(MemberRow {
@@ -1513,6 +1517,10 @@ pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, H
                 is_this_node: false,
                 is_agent: true,
                 model: agent.capability,
+                // for an agent row this is REGISTRATION state (active vs
+                // paused), which is what `MemberPresence` renders for a
+                // machine — not "working now". The run-in-flight fact is
+                // `AgentRow.live`, and only that one may pulse the rail.
                 live: agent.status == "active",
             });
         }
@@ -1588,8 +1596,15 @@ pub struct ProposalRow {
     pub deadline: i64,
     pub approvals: i64,
     pub rejections: i64,
-    /// the frozen voting rule's bar: `Threshold{required_yes}` /
-    /// `ParticipatingMajority{quorum}`. This, not the electorate, is the target.
+    /// the frozen rule's discriminant: `threshold` | `participating_majority`.
+    /// The two bars are NOT interchangeable — a threshold counts YES power, a
+    /// participating majority counts TURNOUT and then compares yes against no.
+    pub rule: String,
+    /// how many YES votes would pass this proposal AT ITS CURRENT TALLY, in
+    /// `approvals`' own unit — the one number the dots, the `3 / 4` reading and
+    /// the note may compare `approvals` against. Under
+    /// `ParticipatingMajority{quorum}` that is `max(quorum − no, no + 1)`, which
+    /// is exactly `turnout >= quorum && yes > no` restated as a yes count.
     pub required_yes: i64,
     pub electorate: i64,
     pub open: bool,
@@ -1624,6 +1639,7 @@ pub async fn load_governance(
                     .count();
                 let status = tagged_name(&view["status"]);
                 let action = tagged_name(&view["action"]);
+                let rejections = count_i64(votes.len() - approvals);
                 ProposalRow {
                     id: view["proposal_id"].as_str().unwrap_or_default().to_string(),
                     open: status == "open",
@@ -1631,8 +1647,9 @@ pub async fn load_governance(
                     proposer: short_label(&hex_encode(&json_bytes(&view["proposer"]))),
                     deadline: view["deadline"].as_i64().unwrap_or(0),
                     approvals: count_i64(approvals),
-                    rejections: count_i64(votes.len() - approvals),
-                    required_yes: voting_bar(&view["voting_rule"]),
+                    rule: tagged_name(&view["voting_rule"]),
+                    required_yes: yes_needed(&view["voting_rule"], rejections),
+                    rejections,
                     electorate: count_i64(
                         view["electorate"].as_array().map_or(0, |members| members.len()),
                     ),
@@ -1689,18 +1706,29 @@ fn gov_action_detail(action: &serde_json::Value) -> String {
     }
 }
 
-/// The frozen rule's bar: how many YES this proposal needs to pass.
-fn voting_bar(rule: &serde_json::Value) -> i64 {
+/// How many YES votes pass this proposal at its current tally.
+///
+/// `Threshold{required_yes}` is already that number. `ParticipatingMajority`
+/// is NOT: its `quorum` is a TURNOUT bar, and passing also needs `yes > no`
+/// (crates/modules/system/governance/src/lib.rs, `settle`). Reading `quorum`
+/// into a yes counter renders "quorum met" on a Signal vote that will not
+/// settle, so restate the whole rule as the yes count it implies —
+/// `yes >= quorum − no` IS `yes + no >= quorum`, and `yes >= no + 1` IS
+/// `yes > no`.
+fn yes_needed(rule: &serde_json::Value, rejections: i64) -> i64 {
     let Some(tagged) = rule.as_object() else {
         return 0;
     };
-    let Some((_, payload)) = tagged.iter().next() else {
+    let Some((variant, payload)) = tagged.iter().next() else {
         return 0;
     };
-    payload["required_yes"]
-        .as_i64()
-        .or_else(|| payload["quorum"].as_i64())
-        .unwrap_or(0)
+    match variant.as_str() {
+        "participating_majority" => {
+            let quorum = payload["quorum"].as_i64().unwrap_or(0);
+            quorum.saturating_sub(rejections).max(rejections + 1)
+        }
+        _ => payload["required_yes"].as_i64().unwrap_or(0),
+    }
 }
 
 /// Open a membership proposal. The app could vote and settle but never OPEN
@@ -2116,6 +2144,10 @@ pub struct AgentRow {
     pub owner_handle: String,
     pub created_at: i64,
     pub is_mine: bool,
+    /// this agent holds a RUN in flight right now — the runs module's pending
+    /// register, NOT `status`. `AgentStatus` is only Active|Paused and Active
+    /// is the registration default, so it says "not paused", never "working".
+    pub live: bool,
     pub tools: i64,
     pub secrets: i64,
     pub subagent_budget: i64,
@@ -2185,6 +2217,7 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
         let client = rpc_client(&rpc)?;
         let local = local_user_key().await.map(|key| hex_encode(&key));
         let reply: serde_json::Value = client.query("agent", &serde_json::json!("agents")).await?;
+        let working = agents_with_a_run_in_flight(&client).await;
         let agents = reply["agents"]
             .as_array()
             .cloned()
@@ -2195,8 +2228,9 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
                 let (owner_key, owner_handle) = agent_owner(&record["owner"]);
                 let name = record["display_name"].as_str().unwrap_or_default().to_string();
                 let caps = &record["caps"];
+                let id = record["agent_id"].as_str().unwrap_or_default().to_string();
                 AgentRow {
-                    id: record["agent_id"].as_str().unwrap_or_default().to_string(),
+                    live: working.contains(&id),
                     initials: initials_of(&name),
                     capability: record["capability"].as_str().unwrap_or_default().to_string(),
                     created_at: record["created_at"].as_i64().unwrap_or(0),
@@ -2222,6 +2256,7 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
                         })
                         .collect(),
                     caps: agent_caps(caps),
+                    id,
                     name,
                     status,
                     owner_key,
@@ -2238,9 +2273,28 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
     })
 }
 
+/// The agents holding a run in flight, from the runs module's pending
+/// register — the ONLY place in the product that knows an agent is working.
+/// A node that cannot answer the query reports nobody working, never everybody.
+async fn agents_with_a_run_in_flight(rpc: &RpcClient) -> BTreeSet<String> {
+    let Ok(reply) = rpc
+        .query::<_, serde_json::Value>("runs", &serde_json::json!("pending_runs"))
+        .await
+    else {
+        return BTreeSet::new();
+    };
+    let Some(pending) = reply["pending_runs"].as_array() else {
+        return BTreeSet::new();
+    };
+    pending
+        .iter()
+        .filter_map(|run| run["agent_id"].as_str().map(str::to_string))
+        .collect()
+}
+
 /// Whether any agent is engaging work right now — the rail's Forge pulse dot.
 pub fn any_agent_active(rows: Vec<AgentRow>) -> bool {
-    rows.iter().any(|row| row.status == "active")
+    rows.iter().any(|row| row.live)
 }
 
 /// One run of one agent: the RECENT RUNS card, the agent live chip and the
@@ -2254,12 +2308,28 @@ pub struct RunRow {
     /// A consensus counter (the creation block), NOT a unix stamp — render it
     /// with `height_ago`/`height_label_short`, never with `relative_time`.
     pub created_at: i64,
+    /// what the run PRODUCED, in one line: `RunRecord` carries `pr_number` and
+    /// `output_ref` and this is the only surface that reads them.
+    pub summary: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AgentRunsData {
     pub generation: i64,
     pub runs: Vec<RunRow>,
+}
+
+/// What a settled run produced, in one line: the forge PR it moved, else the
+/// output ref it wrote, else how it ended. Both fields ride `RunRecord`
+/// (crates/modules/apps/runs/src/interface.rs) — nothing here is invented.
+fn run_summary(record: &serde_json::Value, outcome: &str) -> String {
+    if let Some(number) = record["pr_number"].as_u64() {
+        return format!("pr #{number}");
+    }
+    match record["output_ref"].as_str() {
+        Some(output) if !output.is_empty() => output.to_string(),
+        _ => outcome.to_string(),
+    }
 }
 
 /// This agent's runs: the pending (RUNNING) entries first, then the delivered
@@ -2293,6 +2363,7 @@ pub async fn load_agent_runs(
                 outcome: "running".into(),
                 running: true,
                 created_at: record["created_at"].as_i64().unwrap_or(0),
+                summary: record["channel_id"].as_str().unwrap_or_default().to_string(),
             })
             .collect();
         runs.extend(
@@ -2302,12 +2373,16 @@ pub async fn load_agent_runs(
                 .unwrap_or_default()
                 .into_iter()
                 .filter(wanted)
-                .map(|record| RunRow {
-                    run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
-                    agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
-                    running: false,
-                    created_at: record["created_at"].as_i64().unwrap_or(0),
-                    outcome: tagged_name(&record["outcome"]),
+                .map(|record| {
+                    let outcome = tagged_name(&record["outcome"]);
+                    RunRow {
+                        run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
+                        agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
+                        running: false,
+                        created_at: record["created_at"].as_i64().unwrap_or(0),
+                        summary: run_summary(&record, &outcome),
+                        outcome,
+                    }
                 }),
         );
         Ok(AgentRunsData { generation, runs })
@@ -3134,16 +3209,11 @@ pub fn forge_open_count(items: Vec<ForgeItem>, kind: String) -> i64 {
     )
 }
 
-/// Why forge's write actions are unavailable to this node, as a stable reason
-/// token — empty when they ARE available. The product's tiers are validator /
-/// resident / guest; the artifact's viewer/maintainer/admin do not exist here.
-pub fn forge_gate(tier: String) -> String {
-    match tier.as_str() {
-        "validator" => String::new(),
-        "resident" => "resident_cannot_merge".into(),
-        _ => "guest_read_only".into(),
-    }
-}
+// There is NO forge write gate, and this file used to invent one. `MergePr`,
+// `SubmitReview` and the tracker verbs each check only `author_from_origin`
+// (crates/modules/apps/forge/src/lib.rs) — any user key may merge, and this
+// node's valset seat is not even the axis the write is signed on. A refusal
+// plate over an action the chain accepts is worse than no plate.
 
 pub fn forge_stats(files: i64, additions: i64, deletions: i64) -> String {
     format!("{files} files · +{additions} −{deletions}")
@@ -3219,10 +3289,12 @@ pub fn members_summary(validators: i64, residents: i64) -> String {
     format!("{validators} validators · {residents} residents")
 }
 
-/// `4 agents · 2 active` — the Agents title's machine subtitle.
+/// `4 agents · 2 working` — the Agents title's machine subtitle. `working` is
+/// runs in flight, not `AgentStatus::Active`: Active is the registration
+/// default and would report every registered agent as busy forever.
 pub fn agents_summary(rows: Vec<AgentRow>) -> String {
-    let active = rows.iter().filter(|row| row.status == "active").count();
-    format!("{} agents · {active} active", rows.len())
+    let working = rows.iter().filter(|row| row.live).count();
+    format!("{} agents · {working} working", rows.len())
 }
 
 /// `12 open · 3 settled` — the Approvals title's machine subtitle.
@@ -3643,7 +3715,9 @@ pub fn provision_progress(
                         .dir
                         .as_ref()
                         .is_some_and(|dir| dir.join("network.toml").is_file());
-                    Some((registered_step(3, "Workspace ready · 초대 링크 발급 가능", ready), state))
+                    // the artifact writes this step's tail in Korean; the shell
+                    // is English, so it ships as what that clause says.
+                    Some((registered_step(3, "Workspace ready · invite links available", ready), state))
                 }
                 3 => {
                     // the app attaches to a node it does not supervise: the
@@ -3778,26 +3852,53 @@ pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> Str
     host.to_string()
 }
 
+/// A consensus stamp at or above this is unix MILLIS, not a block height.
+///
+/// `consensus_time` is stamped `= height` by the validator lane
+/// (bin/noded/src/index.rs) and `= unix_millis()` by a single-writer noded
+/// (bin/noded/src/main.rs), and every module record time is that value. No
+/// chain reaches 10^12 blocks and no unix-millis clock has ever been below it,
+/// so the two lanes are told apart by the magnitude alone. Rendering the millis
+/// lane as a height is how `h 1,753,622,400,000` reaches the screen.
+const MILLIS_LANE_FLOOR: i64 = 1_000_000_000_000;
+
+/// The wall clock a stamp carries when it came off the unix-millis lane.
+fn wall_clock_seconds(stamp: i64) -> Option<i64> {
+    match stamp >= MILLIS_LANE_FLOOR {
+        true => Some(stamp / 1_000),
+        false => None,
+    }
+}
+
 /// The titlebar's machine value: `h 84,912`, grouped the way the artifact
-/// writes heights. A height the node has not reported yet reads `h —`.
+/// writes heights. A height the node has not reported yet reads `h —`; a
+/// unix-millis stamp reads as the wall clock it actually is.
 pub fn height_label(height: i64) -> String {
     if height < 0 {
         return "h —".into();
     }
+    if let Some(seconds) = wall_clock_seconds(height) {
+        return relative_time(seconds);
+    }
     format!("h {}", grouped_digits(height))
 }
 
-/// The same `h 84,912` run, for the record meta where the artifact printed a
-/// wall clock this chain cannot supply.
+/// The same `h 84,912` run under the name the record-meta call sites use, where
+/// the artifact printed a wall clock the validator lane cannot supply. One
+/// renderer on purpose — the two names mark the two slots, not two formats.
 pub fn height_label_short(height: i64) -> String {
     height_label(height)
 }
 
 /// The honest renderer for a consensus-stamped record time: `412 blocks ago`,
-/// `1 block ago`, `this block`. A record with no stamp prints nothing.
+/// `1 block ago`, `this block` — or, on the unix-millis lane, the real elapsed
+/// wall clock. A record with no stamp prints nothing.
 pub fn height_ago(then_height: i64, now_height: i64) -> String {
     if then_height <= 0 {
         return String::new();
+    }
+    if let Some(seconds) = wall_clock_seconds(then_height) {
+        return relative_time(seconds);
     }
     let elapsed = now_height.saturating_sub(then_height);
     match elapsed {
@@ -3867,9 +3968,19 @@ pub fn relative_time(unix_seconds: i64) -> String {
 }
 
 /// `expires in 412 blocks`; a passed deadline reads `expired`. A governance
-/// deadline is `consensus_time + voting_period` and `consensus_time` IS the
-/// height, so the remaining span is counted in blocks, never in hours.
+/// deadline is `consensus_time + voting_period`, so on the validator lane it is
+/// a HEIGHT and the remaining span is counted in blocks — never in hours. On
+/// the unix-millis lane the same field genuinely is a clock, and `height` is
+/// not comparable to it at all, so that lane is counted against the wall.
 pub fn expires_in_blocks(deadline_height: i64, height: i64) -> String {
+    if let Some(seconds) = wall_clock_seconds(deadline_height) {
+        let remaining = seconds.saturating_sub(now_seconds());
+        if remaining <= 0 {
+            return "expired".into();
+        }
+        let (value, unit) = duration_parts(remaining);
+        return format!("expires in {value}{unit}");
+    }
     let remaining = deadline_height.saturating_sub(height);
     match remaining {
         blocks if blocks <= 0 => "expired".into(),
@@ -4722,6 +4833,8 @@ pub async fn create_channel(
 
 /// One peer of the DM directory. There is no `status`: presence has no source
 /// anywhere in the product, and a dot that always reads "offline" is a lie.
+///
+/// `is_agent` is always false today — see [`load_dm_peers`].
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct DmPeer {
     pub key: String,
@@ -4736,8 +4849,17 @@ pub struct DmPeersData {
     pub peers: Vec<DmPeer>,
 }
 
-/// The people and machines this device can open a DM with: identity accounts
-/// for the humans, the agent registry for the machines.
+/// The people this device can open a DM with, one row per identity account.
+///
+/// Registered agents are NOT here: a DM is a chat channel seated on public
+/// KEYS, and an agent id is an arbitrary string that [`open_dm`]'s
+/// `public_key()` would reject outright. Until an agent is addressable as a
+/// channel member, an agent row in this directory would be a button that
+/// cannot work.
+///
+/// ponytail: the row is keyed on `account_id`, the account's FOUNDING member
+/// key, so a multi-device account is reachable only at that key. Pair-wide DMs
+/// need account-keyed membership in the chat module itself.
 pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, HydrationError> {
     async {
         let client = rpc_client(&rpc)?;
@@ -4750,10 +4872,17 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
             .await?;
         let mut peers: Vec<DmPeer> = Vec::new();
         for account in reply["accounts"].as_array().cloned().unwrap_or_default() {
-            let key = hex_encode(&json_bytes(&account["account_id"]));
-            if me.as_deref() == Some(key.as_str()) {
+            // self is any account THIS key is a member of — comparing against
+            // `account_id` alone puts a second device in its own directory.
+            let mine = account["member_keys"].as_array().is_some_and(|keys| {
+                keys.iter().any(|member| {
+                    me.as_deref() == Some(hex_encode(&json_bytes(&member["pubkey"])).as_str())
+                })
+            });
+            if mine {
                 continue;
             }
+            let key = hex_encode(&json_bytes(&account["account_id"]));
             let name = match account["display_name"].as_str() {
                 Some(name) if !name.is_empty() => name.to_string(),
                 _ => short_label(&key),
@@ -4765,15 +4894,6 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
                 name,
             });
         }
-        let agents = load_agents(rpc, generation).await.map(|data| data.agents);
-        for agent in agents.unwrap_or_default() {
-            peers.push(DmPeer {
-                initials: agent.initials,
-                name: agent.name,
-                key: agent.id,
-                is_agent: true,
-            });
-        }
         Ok(DmPeersData { generation, peers })
     }
     .await
@@ -4783,15 +4903,15 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
     })
 }
 
-/// The two-party channel id of a pair of member keys: sorted, so both sides
-/// derive the same id, and carrying both keys, so it cannot be forged by a
-/// channel the pair is not in.
+/// The two-party channel id of a pair of member keys, derived by the chat
+/// module's own client so the app and the module agree on one id.
+///
+/// It carries NO ':' deliberately: chat refuses a user-authored channel id in
+/// the module namespace (`crates/modules/apps/chat/src/lib.rs`,
+/// `validate_channel_namespace`), and a DM is created by the pair's own user
+/// key. `chat::client`'s test round-trips the minted id against that rule.
 pub fn dm_channel_id(a: String, b: String) -> String {
-    let (low, high) = match a <= b {
-        true => (a, b),
-        false => (b, a),
-    };
-    format!("dm:{low}:{high}")
+    chat::client::dm_channel_id(&a, &b)
 }
 
 /// True only when this channel IS the derived DM of its exactly-two members —
@@ -4805,6 +4925,10 @@ pub fn is_dm_channel(id: String, members: Vec<ChatMember>) -> bool {
 
 /// Open the DM with one peer: resolve the deterministic channel when it
 /// exists, else create it members-only and seat both keys, then load it.
+///
+/// NOT confidential. `MembersOnly` gates who may POST; every node replicates
+/// the channel's plaintext, so a DM is a two-person room, not a private one.
+/// Any copy on this surface that promises secrecy is a lie about the wire.
 pub async fn open_dm(
     rpc: String,
     password: String,
@@ -7887,12 +8011,21 @@ mod tests {
                 label: "b".into(),
             },
         ];
-        assert!(is_dm_channel(dm_channel_id(a.clone(), b), members.clone()));
-        assert!(!is_dm_channel("channel-7".into(), members));
-        assert!(!is_dm_channel(
-            dm_channel_id(a.clone(), a),
-            Vec::new()
+        assert!(is_dm_channel(
+            dm_channel_id(a.clone(), b.clone()),
+            members.clone()
         ));
+        assert!(!is_dm_channel("channel-7".into(), members));
+        assert!(!is_dm_channel(dm_channel_id(a.clone(), a.clone()), Vec::new()));
+
+        // the id the app mints is the id chat will accept from a USER author:
+        // ':' is reserved for module origins and '/' is refused outright, so a
+        // minted id carrying either is a DM that can never be created.
+        // `chat::client`'s own test runs the id through that rule directly.
+        let id = dm_channel_id(a, b);
+        assert!(!id.contains(':'), "a user-authored channel id may not carry ':'");
+        assert!(!id.contains('/'), "a channel id may not carry '/'");
+        assert!(id.starts_with("dm-") && id.len() == 67);
     }
 
     #[test]
@@ -7911,13 +8044,6 @@ mod tests {
             "members_only"
         );
         assert_eq!(post_gate(false, true, members, "beef".into()), "");
-    }
-
-    #[test]
-    fn the_forge_gate_speaks_the_products_own_tiers() {
-        assert_eq!(forge_gate("validator".into()), "");
-        assert_eq!(forge_gate("resident".into()), "resident_cannot_merge");
-        assert_eq!(forge_gate("guest".into()), "guest_read_only");
     }
 
     #[test]
@@ -8020,6 +8146,27 @@ mod tests {
         assert_eq!(relative_time(0), "");
     }
 
+    /// The OTHER lane: a single-writer noded stamps `consensus_time` in unix
+    /// MILLIS, so the very same fields arrive thirteen digits wide. Rendering
+    /// them as heights printed `h 1,753,622,400,000` on every record.
+    #[test]
+    fn a_unix_millis_stamp_is_a_clock_not_a_thirteen_digit_height() {
+        let two_hours_ago = (now_seconds() - 2 * 60 * 60) * 1_000;
+        assert_eq!(height_label(two_hours_ago), "2h ago");
+        assert_eq!(height_label_short(two_hours_ago), "2h ago");
+        assert_eq!(height_ago(two_hours_ago, 84_912), "2h ago");
+        assert_eq!(
+            expires_in_blocks((now_seconds() + 3 * 60 * 60) * 1_000, 84_912),
+            "expires in 3h"
+        );
+        assert_eq!(
+            expires_in_blocks((now_seconds() - 60) * 1_000, 84_912),
+            "expired"
+        );
+        // a real height is nowhere near the floor and still reads as one.
+        assert_eq!(height_label(84_912), "h 84,912");
+    }
+
     #[test]
     fn a_proposal_renders_its_payload_and_its_frozen_bar() {
         let view = serde_json::json!({
@@ -8027,9 +8174,19 @@ mod tests {
             "voting_rule": { "threshold": { "required_yes": 4 } }
         });
         assert_eq!(gov_action_detail(&view["action"]), "key 8c4fa211");
-        assert_eq!(voting_bar(&view["voting_rule"]), 4);
-        let majority = serde_json::json!({ "participating_majority": { "quorum": 3 } });
-        assert_eq!(voting_bar(&majority), 3);
+        // a threshold's bar does not move with the no votes.
+        assert_eq!(yes_needed(&view["voting_rule"], 0), 4);
+        assert_eq!(yes_needed(&view["voting_rule"], 2), 4);
+
+        // a participating majority's quorum is TURNOUT, and passing also needs
+        // yes > no — reading `quorum` straight into a yes counter says "quorum
+        // met" at 3/3 on a vote of 3 yes / 3 no, which does not settle.
+        let majority = serde_json::json!({ "participating_majority": { "quorum": 6 } });
+        assert_eq!(yes_needed(&majority, 0), 6);
+        assert_eq!(yes_needed(&majority, 2), 4, "two no votes count toward turnout");
+        assert_eq!(yes_needed(&majority, 3), 4, "…but yes must still exceed no");
+        assert_eq!(tally_note(3, yes_needed(&majority, 3)), "3 approvals · 1 more for quorum");
+
         assert_eq!(tagged_name(&view["action"]), "add_validator");
         assert_eq!(proposal_kind_tone("add_validator".into()), "access");
         assert_eq!(proposal_kind_tone("signal".into()), "neutral");
