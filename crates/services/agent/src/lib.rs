@@ -43,7 +43,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use provider_host::{
     AirlockConfig, CredentialKind, InteractiveSession, Provider, ProviderSet, ResolvedCredential,
-    RunContext,
+    RunContext, WorkRef,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -456,7 +456,6 @@ impl Sessions {
         live.session.close().await;
         tracing::info!(target: "ducktape::term", session = %id, "session_ended");
     }
-
 }
 
 impl Inner {
@@ -522,17 +521,27 @@ pub fn credential_wire(resolved: &ResolvedCredential) -> wire::Credential {
 
 /// rebuild the broker's self-host airlock config from the record the node
 /// resolved out of committed state. Nothing secret crosses — see [`wire`].
+///
+/// [`WorkRef::Direct`], and that is a statement rather than a default: an
+/// interactive session has NO committed record of who asked for it, so there is
+/// no pointer this side could offer and nothing a lender could resolve. The
+/// subject stays the account the lender's node vouches for on the hop — the
+/// node running this pty. Delegation is a saga-lane property because a saga is
+/// the thing consensus wrote down.
 fn airlock_config(credential: wire::Credential) -> AirlockConfig {
-    AirlockConfig::self_host(&ResolvedCredential {
-        name: credential.name,
-        kind: match credential.kind {
-            wire::CredentialKind::Claude => CredentialKind::Claude,
-            wire::CredentialKind::Codex => CredentialKind::Codex,
+    AirlockConfig::self_host(
+        &ResolvedCredential {
+            name: credential.name,
+            kind: match credential.kind {
+                wire::CredentialKind::Claude => CredentialKind::Claude,
+                wire::CredentialKind::Codex => CredentialKind::Codex,
+            },
+            authority: credential.authority,
+            via: credential.via,
+            seal_pk: credential.seal_pk,
         },
-        authority: credential.authority,
-        via: credential.via,
-        seal_pk: credential.seal_pk,
-    })
+        WorkRef::Direct,
+    )
 }
 
 /// build the sandbox-backed interactive provider set. Unlike the in-node
@@ -582,7 +591,7 @@ mod tests {
                 via: "http://v".into(),
                 seal_pk: [7u8; 32],
             };
-            let expected_config = AirlockConfig::self_host(&resolved);
+            let expected_config = AirlockConfig::self_host(&resolved, WorkRef::Direct);
             let built = airlock_config(wire::Credential {
                 name: "c".into(),
                 kind: wire_kind,

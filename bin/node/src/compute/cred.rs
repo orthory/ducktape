@@ -8,27 +8,35 @@
 //! gateway is (`airlock.<handle>.duck`), which vendor it fronts, and the public
 //! seal key to pin.
 //!
-//! ## it does not decide who is acting
+//! ## it does not decide who is acting — it says WHICH WORK, and nothing else
 //!
-//! It used to. It read the run's saga origin, mapped that submitting node to an
-//! account, and shipped that account to the lender as the grant subject — a
-//! claim by the COMPUTE layer about who a run acts for, which the lender had no
-//! way to check. The lender authorizes the account its own node vouched for when
-//! the request made the gateway hop, and that is the node running this sandbox.
-//! So the subject is not this resolver's to supply, and the local grant check
-//! that re-enforced the old meaning is gone with it: the owner's gateway is not
-//! merely "the final word", it is the only word.
+//! It used to decide. It read the run's saga origin, mapped that submitting node
+//! to an account, and shipped that ACCOUNT to the lender as the grant subject —
+//! a claim by the COMPUTE layer about who a run acts for, which the lender had
+//! no way to check. That was a reproduced credential-theft hole and PR #833
+//! deleted it.
 //!
-//! What that means for an operator: a grant names the account of the node that
-//! RUNS the workload. A run submitted by A and executed on B draws as B, so the
-//! lender must have granted B.
+//! What this resolver ships now is a POINTER: the run's `saga_id`, and nothing
+//! else. The lender resolves it in ITS OWN committed state — every node sees the
+//! same chain — and reads out of consensus who submitted the saga, who holds its
+//! lease, and whether that submitter is granted. The executor asserts none of
+//! those three facts and cannot influence any of them. The load-bearing reason
+//! this is safe is stated on [`airlock::wire::WorkRef`]: `/v1/submit` discards a
+//! caller's claimed submitter id and re-signs with the node's own key, so the
+//! committed `SagaOrigin::External` is a signature-proven node key.
+//!
+//! What that means for an operator: a run submitted by A and executed on B draws
+//! on A's grant when B holds A's lease — that is the delegated lane — and
+//! otherwise on B's own. Either consent alone is enough for the CREDENTIAL; the
+//! executor's separate `work admit` decision (whether it runs A's work at all)
+//! is a different consent in the opposite direction and both must hold.
 //!
 //! The resolver reads state over the same committed-query lane (`/v1/query`)
 //! the agent provisioner uses, so it sees exactly what consensus committed —
 //! and it runs in the COMPUTE DAEMON's process, so "the executing node" is the
 //! node this daemon serves.
 
-use provider_host::{AirlockConfig, CredentialKind, ResolvedCredential};
+use provider_host::{AirlockConfig, CredentialKind, ResolvedCredential, WorkRef};
 use compute_service::{CredentialResolver, Resolved};
 use gateway::{CredentialRecord, GatewayQuery, GatewayReply, HandleRegistration};
 use identity::{AccountView, IdentityQuery, IdentityReply};
@@ -116,7 +124,14 @@ impl NodeCredentialResolver {
     /// Build the broker's self-host config from a granted record: reach the
     /// owner's gateway at `<airlock>.<owner-handle>.duck` through this node's
     /// browser gateway, pinning the on-chain seal_pk (no TEE quote in self-host).
-    async fn build_airlock(&self, record: &CredentialRecord) -> Result<AirlockConfig, String> {
+    ///
+    /// `work` is the run's committed saga id, carried through so the lender can
+    /// resolve it. This side reads nothing out of it.
+    async fn build_airlock(
+        &self,
+        record: &CredentialRecord,
+        work: WorkRef,
+    ) -> Result<AirlockConfig, String> {
         let Some(via) = self.via.clone() else {
             return Err("this node has no browser gateway to route credential traffic".into());
         };
@@ -133,19 +148,24 @@ impl NodeCredentialResolver {
             via,
             seal_pk: record.seal_pk,
         };
-        Ok(AirlockConfig::self_host(&resolved))
+        Ok(AirlockConfig::self_host(&resolved, work))
     }
 }
 
 #[async_trait::async_trait]
 impl CredentialResolver for NodeCredentialResolver {
-    /// `saga_id` is unread: nothing about the run decides this any more. It stays
-    /// on the trait because the seam is the pool's, and a resolver that wanted to
-    /// name the run in a refusal would need it.
-    async fn resolve(&self, credential: &str, _saga_id: &str) -> Result<Resolved, String> {
+    /// `saga_id` becomes the session's [`WorkRef::Saga`] pointer verbatim. It is
+    /// NOT interpreted here — this process cannot see the account the lender's
+    /// node will stamp on the hop, so any local reading of the run's origin
+    /// could only ever be a second, uncheckable answer to a question the lender
+    /// resolves from consensus itself.
+    async fn resolve(&self, credential: &str, saga_id: &str) -> Result<Resolved, String> {
         let record = self.credential_record(credential).await?;
         let record = routable(credential, record)?;
-        let airlock = self.build_airlock(&record).await?;
+        let work = WorkRef::Saga {
+            saga_id: saga_id.to_string(),
+        };
+        let airlock = self.build_airlock(&record, work).await?;
         Ok(Resolved { airlock })
     }
 }

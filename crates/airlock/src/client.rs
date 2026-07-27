@@ -17,7 +17,7 @@ use crate::handshake;
 use crate::seal;
 use crate::wire::{
     AttestationResponse, CredentialKind, CredentialPayload, CredentialUpload, SessionRequest,
-    SessionResponse,
+    SessionResponse, WorkRef,
 };
 
 /// What failed AFTER the gateway's response arrived.
@@ -134,8 +134,16 @@ impl Gateway {
     /// lending gateway the grant subject is the account the node's proxy vouched
     /// for on the hop, and a caller that could name its own subject is the
     /// credential-theft defect.
-    pub async fn open_session(&self, seal_pk: &[u8; 32], sub: &str) -> Result<String> {
-        let (token, _keys) = self.open_session_with(seal_pk, sub, false).await?;
+    ///
+    /// `work` names WHICH WORK the session draws for and is a pointer, not a
+    /// claim — see [`WorkRef`].
+    pub async fn open_session(
+        &self,
+        seal_pk: &[u8; 32],
+        sub: &str,
+        work: &WorkRef,
+    ) -> Result<String> {
+        let (token, _keys) = self.open_session_with(seal_pk, sub, work, false).await?;
         Ok(token)
     }
 
@@ -146,14 +154,16 @@ impl Gateway {
         &self,
         seal_pk: &[u8; 32],
         sub: &str,
+        work: &WorkRef,
     ) -> Result<(String, handshake::SessionKeys)> {
-        self.open_session_with(seal_pk, sub, true).await
+        self.open_session_with(seal_pk, sub, work, true).await
     }
 
     async fn open_session_with(
         &self,
         seal_pk: &[u8; 32],
         sub: &str,
+        work: &WorkRef,
         body_seal: bool,
     ) -> Result<(String, handshake::SessionKeys)> {
         let (client_eph_pk, keys) = handshake::client_handshake(seal_pk);
@@ -166,6 +176,7 @@ impl Gateway {
                 sub: sub.to_string(),
                 client_eph_pk_b64: BASE64.encode(client_eph_pk),
                 body_seal,
+                work: work.clone(),
             })
             .send()
             .await?;

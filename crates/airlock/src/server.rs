@@ -29,7 +29,7 @@ use crate::seal::{self, SealKeypair};
 use crate::token::{self, Claims};
 use crate::wire::{
     AttestationResponse, CredentialKind, CredentialPayload, CredentialUpload, SessionRequest,
-    SessionResponse,
+    SessionResponse, WorkRef,
 };
 
 /// How the gateway proves its seal key to the broker.
@@ -145,10 +145,27 @@ pub enum GrantAnswer {
     Undetermined,
 }
 
-/// The co-hosted-lending grant gate, injected by the node. Given a credential
-/// `name` and the account the session acts on behalf of, it answers whether that
-/// account may draw on the credential — the node resolves this against its own
-/// COMMITTED gateway-module record (owner or a granted account).
+/// Everything the injected gate is given about one session-open. A struct, not a
+/// positional list: `credential` and `caller` are both opaque identifiers, and a
+/// security gate whose two arguments can be silently transposed is a defect
+/// waiting to happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantQuestion {
+    /// the credential NAME the session names (`SessionRequest::sub`).
+    pub credential: String,
+    /// the account the TRANSPORT vouched for — see [`CALLER_ACCOUNT_HEADER`].
+    /// The only identity input, and the request contributes nothing to it.
+    pub caller: Vec<u8>,
+    /// WHICH WORK the session draws for. A pointer into the lender's own
+    /// committed state, never a claim — see [`WorkRef`].
+    pub work: WorkRef,
+}
+
+/// The co-hosted-lending grant gate, injected by the node. Given a
+/// [`GrantQuestion`] it answers whether that session may open — the node
+/// resolves it against its own COMMITTED state (the gateway-module credential
+/// record, and for a delegated pointer the saga module and the identity module
+/// too).
 ///
 /// The account handed here is ALWAYS the one the node's proxy vouched for in
 /// [`CALLER_ACCOUNT_HEADER`]. There is no other source, and there must not be
@@ -157,10 +174,16 @@ pub enum GrantAnswer {
 /// request could carry admits everyone who can read the chain. See
 /// [`session_gate`].
 ///
+/// The `work` pointer is different in kind and that difference is the whole of
+/// the delegation design: it is an ID, and every fact derived from it is READ
+/// FROM CONSENSUS by the answering node. A caller that names a saga still
+/// cannot say who submitted it, who holds its lease, or whether that submitter
+/// is granted.
+///
 /// `None` on gateways that never lend (owner-local, TEE): there is no subject to
 /// check. See [`GrantAnswer`] for what each answer costs the borrower.
 pub type GrantCheck =
-    Arc<dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = GrantAnswer> + Send>> + Send + Sync>;
+    Arc<dyn Fn(GrantQuestion) -> Pin<Box<dyn Future<Output = GrantAnswer> + Send>> + Send + Sync>;
 
 /// Lazy store loader: given a credential name, return its payload from the
 /// on-disk store, or `None` if absent. Lets a running gateway pick up a
@@ -558,11 +581,15 @@ enum SessionGate {
 /// the on-chain record. Both before any handshake work — a session for an
 /// ungranted account never opens.
 ///
-/// The subject is the account of the node that made the hop, which is the node
-/// running the sandbox. That is the only subject this flow can express: the
+/// The caller is the account of the node that made the hop, which is the node
+/// running the sandbox — and the ONE identity this flow can establish, since the
 /// session token the sandbox ends up holding names a credential and nothing
-/// about who is acting, so a lender granting an account is lending to that
-/// account's NODE, for whatever workload it runs.
+/// about who is acting.
+///
+/// The request's [`WorkRef`] rides along so the authority can ALSO admit a
+/// session on the grant held by whoever the committed work says submitted it.
+/// That is not a second identity input: it is an id, and the authority derives
+/// every fact from it out of its own state.
 ///
 /// With no gate wired (owner-local, TEE) this gateway lends to nobody across
 /// accounts, so there is no subject to check.
@@ -574,10 +601,15 @@ async fn session_gate(
     let Some(check) = grant_check else {
         return SessionGate::Open;
     };
-    let Some(account) = vouched_caller(headers) else {
+    let Some(caller) = vouched_caller(headers) else {
         return SessionGate::CallerUnverified;
     };
-    match check(req.sub.clone(), account).await {
+    let question = GrantQuestion {
+        credential: req.sub.clone(),
+        caller,
+        work: req.work.clone(),
+    };
+    match check(question).await {
         GrantAnswer::Granted => SessionGate::Open,
         GrantAnswer::Refused => SessionGate::NotGranted,
         GrantAnswer::Undetermined => SessionGate::AuthorityUnavailable,

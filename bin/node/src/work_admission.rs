@@ -467,7 +467,12 @@ async fn owner_account(reader: &dyn CommittedReader, me: &[u8]) -> Result<Option
     account_of_node(reader, me).await
 }
 
-async fn account_of_node(
+/// The committed node→account binding. `pub(crate)` because the credential
+/// lender's delegation gate (`crate::airlock`) asks the same question of the
+/// same module over the same seam — it borrows this READ and nothing else, and
+/// in particular never touches the admission policy above: whose work a node
+/// runs and whose credential a run draws on are two separate consents.
+pub(crate) async fn account_of_node(
     reader: &dyn CommittedReader,
     node_key: &[u8],
 ) -> Result<Option<Vec<u8>>, String> {

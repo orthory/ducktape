@@ -95,6 +95,10 @@ pub fn max_concurrent_runs_from_env() -> usize {
 /// attempt before any provider spawns; a REFUSED grant fails slightly later, at
 /// `start_broker`, still before the sandbox spawns and still before any paid
 /// call.
+///
+/// `saga_id` is carried so the resolved config can name WHICH WORK the session
+/// draws for — a pointer the LENDER resolves in its own committed state. Passing
+/// it on is not a decision: an implementation reads nothing out of it.
 #[async_trait::async_trait]
 pub trait CredentialResolver: Send + Sync {
     async fn resolve(&self, credential: &str, saga_id: &str) -> Result<Resolved, String>;
@@ -1237,13 +1241,16 @@ format = "text"
     /// opaque here (private fields), so tests only assert that SOME config
     /// reached the run context.
     fn sample_airlock() -> AirlockConfig {
-        AirlockConfig::self_host(&provider_host::ResolvedCredential {
-            name: "jess-fable-1".into(),
-            kind: provider_host::CredentialKind::Claude,
-            authority: "airlock.owner.duck".into(),
-            via: "http://127.0.0.1:0".into(),
-            seal_pk: [7u8; 32],
-        })
+        AirlockConfig::self_host(
+            &provider_host::ResolvedCredential {
+                name: "jess-fable-1".into(),
+                kind: provider_host::CredentialKind::Claude,
+                authority: "airlock.owner.duck".into(),
+                via: "http://127.0.0.1:0".into(),
+                seal_pk: [7u8; 32],
+            },
+            provider_host::WorkRef::Direct,
+        )
     }
 
     #[tokio::test]
