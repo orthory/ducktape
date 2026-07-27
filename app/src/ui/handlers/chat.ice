@@ -122,7 +122,9 @@ on choose_dm(peer_key)
   reply_editor = editor("")
   pending_reply = ""
   error = ""
-  run open_dm(connected_rpc, password, peer_key) -> chat_updated _ | failed _
+  // Reads the peer back from state: `active_dm_peer = peer_key` above already
+  // moved the payload, so passing `peer_key` here would be a use after move.
+  run open_dm(connected_rpc, password, active_dm_peer) -> chat_updated _ | failed _
 
 on create_channel_submit
   return if loading || mutation_phase != "idle" || empty(trim(channel_draft))
@@ -139,8 +141,10 @@ on toggle_channel_create_members_only
 
 on toggle_channel_create
   channel_create_open = !channel_create_open
-  return if !channel_create_open
-  task widget focus #workspace-tabs/content/new-channel
+  // No focus task: the artifact's create-channel input now lives inside the
+  // ModalShell component, and a widget target cannot reach into a nested
+  // component's slot fill — every working path in this app stops at the first
+  // component boundary. Restore the focus when the language can address it.
 
 on toggle_channel_settings
   return if empty(active_channel)
@@ -199,6 +203,16 @@ on remove_channel_member_submit(key)
   error = ""
   run remove_channel_member(connected_rpc, password, active_channel, key) -> chat_acked _ | mutation_failed _
 
+// JOINING IS A SIGNED CHAIN WRITE, SO IT NEEDS AN INVERSE THE UI CAN REACH.
+// `huddle_joined` is the discriminant that splits the header's "Huddle" start
+// control from the LIVE pill carrying ✕ Leave, and it had no writer at all —
+// every reply that carries a channel's state now answers it from that
+// channel's roster, which is the chain's answer and never a local flag.
+//
+// It answers for the channel ON SCREEN only: `ChatData` carries the roster of
+// the active channel, and nothing on the wire says whether she is in a huddle
+// in some OTHER channel. So the docked titlebar pill and the "live elsewhere"
+// affordance stay dark rather than guess (see the report).
 on join_huddle_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived
   hydration_generation = hydration_generation + 1
@@ -207,13 +221,10 @@ on join_huddle_submit
   error = ""
   run join_huddle(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
 
-on leave_huddle_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_huddle_count <= 0
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  mutation_phase = "huddle"
-  error = ""
-  run leave_huddle(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
+// Leaving is `leave_huddle_here` in handlers/huddle.ice, which leaves the
+// HUDDLE'S channel rather than the one on screen — the same button serves the
+// channel-header ✕ and the popped panel, so a second leave that targets
+// `active_channel` would be a way to leave the wrong huddle.
 
 on send_message_submit
   return if loading || empty(active_channel) || active_channel_archived || empty(trim(editor_text(message_editor)))
@@ -254,6 +265,13 @@ on chat_updated(next)
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
   active_channel_huddle_count = next.active_channel_huddle_count
+  // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
+  // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
+  // clock and one that finds her out re-takes it for the next join.
+  huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
+  huddle_joined = huddle_self(next.huddle_roster)
+  huddle_channel = keep_str(huddle_joined, active_channel, "")
+  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
   selected_message_seq = next.selected_message_seq
   selected_message_rev = next.selected_message_rev
@@ -281,6 +299,13 @@ on chat_hit_loaded(next)
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
   active_channel_huddle_count = next.active_channel_huddle_count
+  // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
+  // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
+  // clock and one that finds her out re-takes it for the next join.
+  huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
+  huddle_joined = huddle_self(next.huddle_roster)
+  huddle_channel = keep_str(huddle_joined, active_channel, "")
+  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
   selected_message_seq = next.selected_message_seq
   selected_message_rev = next.selected_message_rev
@@ -311,6 +336,13 @@ on channel_created(next)
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
   active_channel_huddle_count = next.active_channel_huddle_count
+  // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
+  // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
+  // clock and one that finds her out re-takes it for the next join.
+  huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
+  huddle_joined = huddle_self(next.huddle_roster)
+  huddle_channel = keep_str(huddle_joined, active_channel, "")
+  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
   selected_message_seq = next.selected_message_seq
   selected_message_rev = next.selected_message_rev
