@@ -513,6 +513,24 @@ impl Manifest {
                 root_hash: host.root_hash(),
             })
             .map_err(|e| Error::Storage(format!("checkpoint capture: {e}")))?;
+        // a checkpoint is ALL-OR-NOTHING and that is deliberate: restore reads
+        // bytes back per module, so a manifest missing one module's snapshot is
+        // a checkpoint that cannot restore — and writing it would prune the
+        // journal below a floor nothing can recover from. refusing keeps the
+        // PREVIOUS checkpoint plus the journal, which still restores. every
+        // degraded module is named, not just the first in registry order.
+        if !snapshot.degraded.is_empty() {
+            let named = snapshot
+                .degraded
+                .iter()
+                .map(|m| format!("{}: {}", m.id, m.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(Error::Storage(format!(
+                "checkpoint capture: modules could not prepare a state-sync \
+                 handle, so this checkpoint could not restore — {named}"
+            )));
+        }
         let roots = snapshot
             .modules
             .iter()
@@ -1780,6 +1798,55 @@ mod tests {
                 .to_string()
                 .contains("field cap")
         );
+    }
+
+    struct DegradedModule(&'static str);
+
+    #[async_trait::async_trait(?Send)]
+    impl sdk::Module for DegradedModule {
+        fn id(&self) -> ModuleId {
+            self.0.into()
+        }
+
+        fn root(&self) -> StateRoot {
+            StateRoot([5; 32])
+        }
+
+        fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
+            Err(sdk::Error::Module("no pack for committed head".into()))
+        }
+
+        async fn execute(
+            &mut self,
+            _ctx: &mut dyn sdk::Ctx,
+            _msg: &sdk::Msg,
+        ) -> Result<(), sdk::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn checkpoint_capture_refuses_a_manifest_that_cannot_restore() {
+        // the host no longer aborts on a module failure, so the ALL-OR-NOTHING
+        // rule now lives here, where it belongs: restore reads snapshot bytes
+        // back per module, and writing a manifest without them would prune the
+        // journal below a floor nothing can recover from.
+        let host = Host::genesis(vec![
+            Box::new(DegradedModule("forge")),
+            Box::new(DegradedModule("chat")),
+        ])
+        .expect("genesis");
+
+        let err = Manifest::capture(&host, Some(9), 0, 0, vec![], vec![], None, 0, 1)
+            .expect_err("a checkpoint missing a module's bytes must not be written");
+
+        let msg = err.to_string();
+        assert!(msg.contains("forge"), "{msg}");
+        assert!(
+            msg.contains("chat"),
+            "every degraded module is named, not just the first: {msg}",
+        );
+        assert!(msg.contains("no pack for committed head"), "{msg}");
     }
 
     fn sample_manifest() -> Manifest {

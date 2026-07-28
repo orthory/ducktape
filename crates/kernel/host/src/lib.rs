@@ -321,32 +321,57 @@ pub struct ModuleSnapshot {
     pub state_sync: StateSyncHandle,
 }
 
+/// one module that could NOT prepare a sync surface at this boundary. its
+/// committed root is still known — `root()` is pure and cannot fail — so the
+/// boundary stays describable; only this module's transfer surface is missing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DegradedModule {
+    pub id: ModuleId,
+    pub root: StateRoot,
+    pub reason: Error,
+}
+
 /// a consistent registry view captured at a finalized root-hash boundary.
+///
+/// a module that fails to prepare its handle lands in `degraded` instead of
+/// aborting the capture: one module's bad state must not discard the rest of
+/// the registry's perfectly good snapshots, and every failure of the boundary
+/// is reported at once rather than only the first in registry order.
+/// what that means for the caller is the CALLER's policy, and the two differ —
+/// a joiner is told per-module (`statesync` serves the degraded module as
+/// `Unsupported`), while a recovery checkpoint refuses outright, because a
+/// checkpoint that cannot restore is worse than no checkpoint at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalizedSnapshot {
     pub height: u64,
     pub root_hash: StateRoot,
     pub modules: Vec<ModuleSnapshot>,
+    pub degraded: Vec<DegradedModule>,
 }
 
 impl FinalizedSnapshot {
-    /// find a module entry by id.
+    /// find a module entry by id. degraded modules are NOT entries — they have
+    /// no `state_sync` to return; they are listed in `degraded` instead.
     pub fn module(&self, id: &str) -> Option<&ModuleSnapshot> {
         self.modules.iter().find(|m| m.id == id)
     }
 
     /// true only when every module supplied self-contained snapshot bytes.
     pub fn has_all_snapshot_bytes(&self) -> bool {
-        self.modules
-            .iter()
-            .all(|m| m.state_sync.has_snapshot_bytes())
+        self.degraded.is_empty()
+            && self
+                .modules
+                .iter()
+                .all(|m| m.state_sync.has_snapshot_bytes())
     }
 
     /// true when every module can be rebuilt without an external resolver.
     pub fn is_self_contained(&self) -> bool {
-        self.modules
-            .iter()
-            .all(|m| m.state_sync.is_self_contained())
+        self.degraded.is_empty()
+            && self
+                .modules
+                .iter()
+                .all(|m| m.state_sync.is_self_contained())
     }
 }
 
@@ -442,7 +467,9 @@ impl From<Error> for SubmitError {
     }
 }
 
-/// failures while capturing a finalized snapshot.
+/// the one failure that aborts a whole capture: the boundary itself is wrong.
+/// a MODULE failure is not one of these — it is per-module and reported in
+/// [`FinalizedSnapshot::degraded`], so it can never take the boundary down.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SnapshotError {
     /// the caller asked for a boundary that no longer matches the host state.
@@ -450,8 +477,6 @@ pub enum SnapshotError {
         expected: StateRoot,
         actual: StateRoot,
     },
-    /// a module failed while preparing its state-sync handle.
-    Module { id: ModuleId, source: Error },
 }
 
 impl core::fmt::Display for SnapshotError {
@@ -461,12 +486,6 @@ impl core::fmt::Display for SnapshotError {
                 f,
                 "finalized root-hash mismatch: expected {expected:?}, actual {actual:?}",
             ),
-            Self::Module { id, source } => {
-                write!(
-                    f,
-                    "module {id} failed to prepare state-sync handle: {source}"
-                )
-            }
         }
     }
 }
@@ -839,29 +858,29 @@ impl Host {
             });
         }
 
-        let modules = self
-            .registry
-            .iter()
-            .map(|(id, module)| {
-                let state_sync =
-                    module
-                        .state_sync_handle()
-                        .map_err(|source| SnapshotError::Module {
-                            id: id.clone(),
-                            source,
-                        })?;
-                Ok(ModuleSnapshot {
+        let mut modules = Vec::with_capacity(self.registry.len());
+        let mut degraded = Vec::new();
+        for (id, module) in self.registry.iter() {
+            let root = module.root();
+            match module.state_sync_handle() {
+                Ok(state_sync) => modules.push(ModuleSnapshot {
                     id: id.clone(),
-                    root: module.root(),
+                    root,
                     state_sync,
-                })
-            })
-            .collect::<Result<Vec<_>, SnapshotError>>()?;
+                }),
+                Err(reason) => degraded.push(DegradedModule {
+                    id: id.clone(),
+                    root,
+                    reason,
+                }),
+            }
+        }
 
         Ok(FinalizedSnapshot {
             height: finalized.height,
             root_hash: finalized.root_hash,
             modules,
+            degraded,
         })
     }
 
