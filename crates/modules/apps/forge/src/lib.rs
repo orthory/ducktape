@@ -159,6 +159,21 @@ const MAX_REPO_NAME_LEN: usize = 64;
 /// never a valid repo dir name (repos are directories; this is a file).
 const TRACKER_FILE: &str = ".tracker.bin";
 
+/// the node-local file the per-repo CATCH-UP MAP persists to under `base`.
+///
+/// a branch's committed head is CONSENSUS state; the on-disk git ref is a
+/// node-local cache that legitimately lags it whenever the pack has not
+/// arrived (that decoupling IS forge's fork-safety invariant). so the
+/// committed map may NOT be re-derived from the ref cache alone at boot —
+/// doing that silently rewinds this node's forge root, and recovery then
+/// fail-stops on a root-hash recompose, bricking a node that was healthy.
+/// this file carries exactly the gap: `repo -> branch -> (head, pack digest)`.
+/// rewritten atomically at every commit, removed once nothing is outstanding.
+const PENDING_FILE: &str = ".pending.bin";
+
+/// the 4-byte magic the pending file leads with.
+const FORGE_PENDING_MAGIC: &[u8; 4] = b"FGP1";
+
 /// the domain tag folding the tracker's canonical-bytes hash into the root
 /// preimage — separates it from the branch material.
 const TRACKER_ROOT_DOMAIN: &[u8] = b"ducktape.forge.tracker.v1\x00";
@@ -202,6 +217,31 @@ const FORGE_ROOT_DOMAIN: &[u8] = b"ducktape.forge.multirepo.v1\x00";
 
 /// the 4-byte magic every forge snapshot container leads with.
 pub(crate) const FORGE_SNAPSHOT_MAGIC: &[u8; 4] = b"FGv1";
+
+/// parse the pending file: `FGP1 ++ u32(repo_count) ++ (name, catch-up map)*`.
+/// the bytes are untrusted (a tampered file), so every field is bounds-checked.
+fn decode_pending(bytes: &[u8]) -> Result<BTreeMap<String, refs::PendingMap>, Error> {
+    let body = bytes
+        .strip_prefix(FORGE_PENDING_MAGIC.as_slice())
+        .ok_or_else(|| Error::Module("forge pending file: missing the FGP1 magic".into()))?;
+    let mut r = codec::Reader::new(body);
+    let count = r.u32()?;
+    let mut out = BTreeMap::new();
+    for _ in 0..count {
+        let name = norm_repo(&r.str_()?)?;
+        if out.insert(name.clone(), refs::take_pending(&mut r)?).is_some() {
+            return Err(Error::Module(format!(
+                "forge pending file: duplicate repo {name}"
+            )));
+        }
+    }
+    if !r.done() {
+        return Err(Error::Module(
+            "forge pending file: trailing bytes after the map".into(),
+        ));
+    }
+    Ok(out)
+}
 
 /// parse exactly `OID_RAW_LEN` (20) raw sha1 bytes into an `Oid`, with a
 /// deterministic module error on any other length.
@@ -415,6 +455,20 @@ impl Forge {
             repos.insert(name, RepoState::with_refs(branches.into_iter().collect()));
         }
 
+        // re-adopt the catch-up map BEFORE the tracker: it carries the branches
+        // whose committed head runs ahead of the ref cache the loop above just
+        // read, so it is the authority wherever the two disagree. a corrupt
+        // file is FAIL-STOP for the same reason the tracker is — booting on a
+        // rewound branch map composes a wrong root.
+        let pending_path = base.join(PENDING_FILE);
+        if pending_path.exists() {
+            let bytes = std::fs::read(&pending_path)
+                .map_err(|e| Error::Module(format!("forge: read pending file: {e}")))?;
+            for (name, pending) in decode_pending(&bytes)? {
+                repos.entry(name).or_default().adopt_pending(pending);
+            }
+        }
+
         // re-adopt the persisted tracker. a corrupt file is FAIL-STOP (like a
         // corrupt repo): booting with a silently-empty tracker would compose a
         // wrong root and fork this node at its first root-hash check anyway.
@@ -453,7 +507,7 @@ impl Forge {
         for (name, state) in self.repos.iter_mut() {
             state.materialize(base, name, blobs)?;
         }
-        Ok(())
+        self.persist_pending()
     }
 
     /// atomically persist the COMMITTED tracker to [`TRACKER_FILE`].
@@ -464,6 +518,38 @@ impl Forge {
             .map_err(|e| Error::Module(format!("forge: write tracker file: {e}")))?;
         std::fs::rename(&tmp, &path)
             .map_err(|e| Error::Module(format!("forge: publish tracker file: {e}")))?;
+        Ok(())
+    }
+
+    /// atomically persist the per-repo catch-up map to [`PENDING_FILE`], or
+    /// remove the file once every branch has caught up — a stale file would
+    /// re-adopt heads the ref cache has since overtaken.
+    pub(crate) fn persist_pending(&self) -> Result<(), Error> {
+        let path = self.base.join(PENDING_FILE);
+        let outstanding: Vec<(&str, &refs::PendingMap)> = self
+            .repos
+            .iter()
+            .map(|(name, state)| (name.as_str(), state.pending()))
+            .filter(|(_, pending)| !pending.is_empty())
+            .collect();
+        if outstanding.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(Error::Module(format!("forge: clear pending file: {e}"))),
+            };
+        }
+        let mut out = FORGE_PENDING_MAGIC.to_vec();
+        codec::put_u32(&mut out, outstanding.len() as u32);
+        for (name, pending) in outstanding {
+            codec::put_str(&mut out, name);
+            refs::put_pending(&mut out, pending);
+        }
+        let tmp = self.base.join(".pending.bin.tmp");
+        std::fs::write(&tmp, &out)
+            .map_err(|e| Error::Module(format!("forge: write pending file: {e}")))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| Error::Module(format!("forge: publish pending file: {e}")))?;
         Ok(())
     }
 
@@ -1010,6 +1096,10 @@ impl Module for Forge {
         for (name, state) in self.repos.iter_mut() {
             state.publish(base, name, blobs)?;
         }
+        // publish both grows the catch-up map (a head whose pack has not
+        // arrived) and drains it (materialize caught one up) — either way the
+        // durable copy must land in the SAME commit as the heads it describes.
+        self.persist_pending()?;
         if let Some(t) = self.staged_tracker.take() {
             self.tracker = t;
             self.persist_tracker()?;
