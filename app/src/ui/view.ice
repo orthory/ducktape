@@ -22,6 +22,20 @@ component StatusBadge(label:str)
       _
         Badge.Outline label=label
 
+// One seat of the forge tab bar: the tracker under one kind filter. Both the
+// Pull requests and the Issues arms are this component with a different filter
+// and a different empty line, so the two lists can never drift apart.
+component ForgeTrackerList(items:[ForgeItem], empty_message:str)
+  col #root w=fill h=fill
+    if empty(items)
+      box w=fill p=22.0
+        EmptyPlate message=empty_message
+    if !empty(items)
+      scroll dir=vertical w=fill h=fill
+        col w=fill pl=12.0 pr=12.0 pt=6.0 pb=18.0 gap=1.0
+          for item in items
+            TrackerRow item=item
+
 // THE EXPLORER'S WORKSPACE SEARCH — state and route.
 //
 // These four handlers and the two fields belong in state.ice and
@@ -33,20 +47,50 @@ component StatusBadge(label:str)
 // Move them the next time lifecycle.ice is open.
 state
   explorer_hits:[ExplorerHit] = []
+  // The per-kind counts `search_workspace` already returns and the app threw
+  // away. They are what the chip strip is drawn FROM, so the strip can only
+  // ever name a kind the search actually ran — including Tasks, which has a
+  // loader again.
+  explorer_kinds:[KindCount] = []
   explorer_searching = false
   explorer_search_generation:i64 = 0
+  // THE FORGE CODE BROWSE. Same relocation note as the explorer block above:
+  // these belong in state.ice and handlers/lifecycle.ice, and they sit here
+  // because the components (`ForgeCodeTab` and the tree rows) landed with their
+  // click targets named and nothing declaring them — a Code tab with no route
+  // into it is the failure this pass exists to close.
+  forge_tree_path = ""
+  // WHICH REPO THE LISTING BELONGS TO. `forge_open_repo` lives in
+  // handlers/lifecycle.ice and clears none of this, so without the stamp a
+  // repo switch would leave another project's files painted under the new
+  // breadcrumb — a wrong reading, not just a stale one.
+  forge_tree_repo = ""
+  forge_tree_entries:[TreeEntry] = []
+  forge_file_path = ""
+  forge_file_text = ""
+  forge_file_binary = false
+  forge_file_truncated = false
+  forge_code_generation:i64 = 0
+  // THE REGISTERED MODULE SET, same relocation note again. `load_modules` reads
+  // /v1/status plus the lifecycle projection; it is only ever wanted while the
+  // Modules tab is open, so the tab's own button is what pulls it.
+  module_rows:[ModuleRow] = []
+  module_generation:i64 = 0
 
 on explorer_search_submit
   return if !connected || explorer_searching || empty(trim(explorer_query))
   explorer_search_generation = explorer_search_generation + 1
   explorer_searching = true
   explorer_hits = []
+  explorer_kinds = []
+  explorer_kind = "all"
   error = ""
   run search_workspace(connected_rpc, trim(explorer_query), explorer_search_generation) -> explorer_results_loaded _ | explorer_search_failed _
 
 on explorer_results_loaded(next)
   return if next.generation != explorer_search_generation
   explorer_hits = next.hits
+  explorer_kinds = next.kinds
   explorer_searching = false
   error = ""
 
@@ -59,7 +103,84 @@ on clear_explorer_search
   explorer_search_generation = explorer_search_generation + 1
   explorer_query = ""
   explorer_hits = []
+  explorer_kinds = []
+  explorer_kind = "all"
   explorer_searching = false
+
+// The kind strip's only act. `explorer_kind` has been in state.ice since wave 1
+// with nothing writing it and nothing reading it.
+on pick_explorer_kind(kind)
+  explorer_kind = kind
+
+// The forge tab bar's only act, same story: `forge_tab` was declared and never
+// touched. Picking Code (re)reads the repo root: `forge_tree` lists ONE
+// directory, so the browse always starts from a listing that belongs to the
+// repo currently open, and a tree left over from the previous repo can never
+// paint.
+on select_forge_tab(tab)
+  forge_tab = tab
+  return if tab != "code" || !connected || empty(forge_repo)
+  forge_code_generation = forge_code_generation + 1
+  forge_tree_path = ""
+  forge_tree_entries = []
+  forge_file_path = ""
+  forge_file_text = ""
+  forge_file_binary = false
+  forge_file_truncated = false
+  run forge_tree(connected_rpc, forge_repo, "", "", forge_code_generation) -> forge_tree_loaded _ | forge_code_failed _
+
+// A directory row NAVIGATES. `forge_tree` answers for one path, so there is no
+// whole-tree read to expand in place against — the same shape the duckfs tree
+// on the Files screen already has, and the reason every row sits at depth 0.
+on forge_open_dir(path)
+  return if !connected || empty(forge_repo)
+  forge_code_generation = forge_code_generation + 1
+  forge_tree_path = path
+  forge_tree_entries = []
+  run forge_tree(connected_rpc, forge_repo, "", path, forge_code_generation) -> forge_tree_loaded _ | forge_code_failed _
+
+on forge_tree_loaded(next)
+  return if next.generation != forge_code_generation
+  forge_tree_repo = next.repo
+  forge_tree_path = next.path
+  forge_tree_entries = next.entries
+  error = ""
+
+on forge_open_file(path)
+  return if !connected || empty(forge_repo)
+  forge_code_generation = forge_code_generation + 1
+  forge_file_path = path
+  forge_file_text = ""
+  run forge_blob(connected_rpc, forge_repo, "", path, forge_code_generation) -> forge_blob_loaded _ | forge_code_failed _
+
+on forge_blob_loaded(next)
+  return if next.generation != forge_code_generation
+  forge_file_path = next.path
+  forge_file_text = next.text
+  forge_file_binary = next.binary
+  forge_file_truncated = next.truncated
+  error = ""
+
+on forge_code_failed(cause)
+  return if cause.generation != forge_code_generation
+  error = cause.message
+
+// The Modules tab picks its own seat AND fetches its own reading — a tab whose
+// list is only filled by a refresh somewhere else opens empty on first click.
+on open_node_modules
+  node_tab = "modules"
+  return if !connected
+  module_generation = module_generation + 1
+  run load_modules(connected_rpc, module_generation) -> modules_loaded _ | modules_failed _
+
+on modules_loaded(next)
+  return if next.generation != module_generation
+  module_rows = next.rows
+  error = ""
+
+on modules_failed(cause)
+  return if cause.generation != module_generation
+  error = cause.message
 
 view
   // THE PHASE GATE — the one branch in front of the console. `phase` is the
@@ -76,7 +197,7 @@ view
     if phase != "console"
       OnboardingPhase phase=phase name=onboarding_name node_api=canonical_endpoint(rpc) invite=invite_link steps=provision_steps step_index=provision_index height=block_height peers_live=0 peers_total=0 tier=member_tier(members_rows) error=onboarding_error busy=(mutation_phase != "idle")
     if phase == "console"
-      WorkspaceTabs network=network_label(account_name, connected_rpc) status=status height=block_height loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab bell_count=bell_unread approvals=open_proposals(gov_rows) account=account_name agent_live=any_agent_active(agents_rows) phase=phase tier=member_tier(members_rows) root_hash=node_root_hash consensus_view=node_view quorum=node_quorum reachable=node_reachable last_finalized=node_last_finalized checkpoint=node_checkpoint #workspace-tabs
+      WorkspaceTabs network=network_label(account_name, connected_rpc) status=status height=block_height loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab bell_count=bell_unread bell_sev=bell_worst_severity(bell_items) approvals=open_proposals(gov_rows) account=account_name agent_live=any_agent_active(agents_rows) phase=phase tier=member_tier(members_rows) root_hash=node_root_hash consensus_view=node_view quorum=node_quorum reachable=node_reachable last_finalized=node_last_finalized checkpoint=node_checkpoint #workspace-tabs
         notice:
           col w=fill
             if error != ""
@@ -990,7 +1111,15 @@ view
               if !empty(fs_preview_path)
                 for entry in fs_entries
                   if entry.path == fs_preview_path
-                    ObjectPanel entry=entry
+                    // `changed_by` / `changed_height` are fed the "not answered"
+                    // pair on purpose. `last_changed_at_path` exists and the
+                    // panel gates its rows on `changed_height > 0`, but the
+                    // walk has to fire when the selected path CHANGES, and the
+                    // only place that can watch a state field is the one
+                    // `subscribe` block in handlers/lifecycle.ice — which this
+                    // file does not own. Wiring the load there lights these two
+                    // rows with no change here.
+                    ObjectPanel entry=entry changed_by="" changed_height=0
         members:
           row w=fill h=fill
             col w=fill h=fill
@@ -1115,14 +1244,109 @@ view
                             for branch in forge_branches
                               box h=20.0 pl=7.0 pr=7.0 align-y=center bg=surface border=border border-w=1.0 r=10.0
                                 text branch size=9.0 wrap=none font=code_semibold @text-meta
-                    if empty(forge_items)
-                      box w=fill p=22.0
-                        EmptyPlate message="No issues or pull requests — the tracker is empty for this repo."
-                    if !empty(forge_items)
-                      scroll dir=vertical w=fill h=fill
-                        col w=fill pl=12.0 pr=12.0 pt=6.0 pb=18.0 gap=1.0
-                          for item in forge_items
-                            TrackerRow item=item
+                    // THE TAB BAR THE TRACKER NEVER GOT. `forge_tab` has sat in
+                    // state.ice and `filter_forge_items`/`forge_open_count` in
+                    // backend.ice since wave 1 with no call site at all, so the
+                    // screen piled merged PRs and closed issues into one flat
+                    // list. The counts are OPEN work — a PR counts until it
+                    // merges, an issue until it closes.
+                    box w=fill pl=22.0 pr=22.0
+                      row w=fill gap=22.0 align=center
+                        button label="Browse the code" p=0.0 @ghost_action -> select_forge_tab("code")
+                          TabLabel label="Code" count=0 active=(forge_tab == "code")
+                          active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+                          hovered bg=transparent text=fg
+                          pressed bg=transparent text=fg
+                        button label="Show pull requests" p=0.0 @ghost_action -> select_forge_tab("pulls")
+                          TabLabel label="Pull requests" count=forge_open_count(forge_items, "pr") active=(forge_tab == "pulls")
+                          active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+                          hovered bg=transparent text=fg
+                          pressed bg=transparent text=fg
+                        button label="Show issues" p=0.0 @ghost_action -> select_forge_tab("issues")
+                          TabLabel label="Issues" count=forge_open_count(forge_items, "issue") active=(forge_tab == "issues")
+                          active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+                          hovered bg=transparent text=fg
+                          pressed bg=transparent text=fg
+                        space w=fill
+                    box w=fill h=1.0 bg=separator
+                      space w=1.0 h=1.0
+                    // One discriminant, one match: Code browses the tree, the
+                    // other two seats are the same tracker list under different
+                    // filters.
+                    match forge_tab
+                      "code"
+                        // The header carries the path from the repo root and
+                        // NOTHING ELSE. The artifact prefixes the repo name;
+                        // the breadcrumb directly above already says it, and
+                        // Ice has no string concatenation to join the two.
+                        // `message` / `author` / `stamp` are the last commit
+                        // under this path — the mirror could answer that with a
+                        // revwalk, and until a loader does the three slots stay
+                        // empty rather than printing a middot run around values
+                        // nobody read. ForgeCodeHeader drops each empty slot by
+                        // construction.
+                        ForgeCodeTab path=forge_file_path message="" author="" stamp=""
+                          files:
+                            // ONE GUARD, AT THE TOP OF THE PANE. The listing
+                            // paints only for the repo it was read from —
+                            // `forge_open_repo` lives in a handler file this one
+                            // does not own and clears none of this, and another
+                            // project's files under a new breadcrumb is a wrong
+                            // reading, not a stale one. Picking Code re-reads
+                            // the root, so the tab itself is the recovery.
+                            col w=fill
+                              if forge_tree_repo != forge_repo
+                                box w=fill pl=16.0 pr=16.0 pt=8.0
+                                  text "Pick Code again to browse this repository." w=fill size=11.5 line-h=1.5 @text-label
+                              if forge_tree_repo == forge_repo
+                                col w=fill
+                                  if !empty(forge_tree_path)
+                                    button label="Back to the repository root" w=fill p=0.0 @icon_action -> forge_open_dir("")
+                                      ForgeTreeDirRow name="/" depth=0.0 open=true
+                                      active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+                                      hovered bg=rail_hover text=fg
+                                      pressed bg=elevated text=fg
+                                  for entry in forge_tree_entries
+                                    col w=fill
+                                      if entry.kind == "dir"
+                                        button label="Open directory" description=entry.path w=fill p=0.0 @icon_action -> forge_open_dir(entry.path)
+                                          ForgeTreeDirRow name=entry.name depth=0.0 open=false
+                                          active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+                                          hovered bg=rail_hover text=fg
+                                          pressed bg=elevated text=fg
+                                      if entry.kind != "dir"
+                                        button label="Open file" description=entry.path w=fill p=0.0 @icon_action -> forge_open_file(entry.path)
+                                          ForgeTreeFileRow name=entry.name depth=0.0 selected=(entry.path == forge_file_path)
+                                          active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+                                          hovered bg=rail_hover text=fg
+                                          pressed bg=elevated text=fg
+                          source:
+                            // The reader's three states, each with its own true
+                            // reason. Nothing here claims a file is empty.
+                            col w=fill
+                              if empty(forge_file_path)
+                                ForgeCodeEmpty name="" note="Pick a file from the tree to read it."
+                              if !empty(forge_file_path) && forge_file_binary
+                                ForgeCodeEmpty name=forge_file_path note="This is not text — the reader shows no preview for it."
+                              if !empty(forge_file_path) && !forge_file_binary
+                                col w=fill p=13.0 gap=9.0
+                                  // ONE TEXT RUN, NOT NUMBERED LINES. The
+                                  // artifact's 44px gutter needs the blob split
+                                  // into rows, and `forge_blob` hands back one
+                                  // string — there is no line splitter on the
+                                  // wire and Ice has no string ops, so
+                                  // `ForgeCodeLine` has no list to walk yet.
+                                  // The source itself is real and complete; the
+                                  // numbering is what is missing, and inventing
+                                  // it here would mean guessing where the lines
+                                  // break.
+                                  text forge_file_text w=fill size=12.0 line-h=1.65 font=code @text-accent_fg
+                                  if forge_file_truncated
+                                    text "Truncated at the reader's 64 KiB window — the file on the node is whole." size=11.5 wrap=none @text-label
+                      "issues"
+                        ForgeTrackerList items=filter_forge_items(forge_items, "issue") empty_message="No issues — an issue opened against this repo appears here."
+                      _
+                        ForgeTrackerList items=filter_forge_items(forge_items, "pr") empty_message="No pull requests — a PR pushed to this repo appears here."
                     // NO GATE NOTE HERE. `ForgeGateNote` told a resident the
                     // node refuses their merge; `ForgeMsg::MergePr` authorizes
                     // on `author_from_origin` alone, so the write succeeds and
@@ -1388,6 +1612,12 @@ view
               // the node's own facts under Settings, reached from the rail footer.
               // This is that relocation, kept whole — Overview / Permissions /
               // Activity, with the log console under Activity.
+              //
+              // MODULES IS A TAB, NOT A SEAT. The artifact's own Modules screen
+              // hangs off a ninth rail capsule; this rail has eight and the
+              // campaign closed that question. The module set is a fact about
+              // THIS NODE — which code consensus is executing here — so it sits
+              // beside the node's other facts and takes no seat from anyone.
               box w=fill h=1.0 bg=separator
                 space w=1.0 h=1.0
               col w=fill gap=13.0
@@ -1414,7 +1644,15 @@ view
                     active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
                     hovered bg=row_hover text=fg
                     pressed bg=elevated text=fg
+                  button label="Node modules" p=0.0 @ghost_action -> open_node_modules
+                    box px=15.0 py=0.0
+                      TabLabel label="Modules" count=len(module_rows) active=(node_tab == "modules")
+                    active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
+                    hovered bg=row_hover text=fg
+                    pressed bg=elevated text=fg
                 match node_tab
+                  "modules"
+                    ModulesPanel rows=module_rows
                   "permissions"
                     col w=fill gap=18.0
                       NodeAccessCard tier=member_tier(members_rows) admin=members_is_admin(members_rows)
@@ -1470,10 +1708,7 @@ view
           col w=fill h=fill
             col w=fill pl=24.0 pr=24.0 pt=22.0 gap=16.0
               ScreenTitle title="Explorer" detail="Search everything this workspace has recorded, or read the blocks this node verified for itself — newest first, each one openable for the ops it carried."
-              // THE QUERY BOX, on the artifact's own 1.5px ink outline. The
-              // seven kind chips under it are OMITTED, not faked: filtering
-              // needs a `filter_explorer_hits(hits, kind)` the backend does not
-              // have, and `ExplorerResults.kinds` has nowhere to land.
+              // THE QUERY BOX, on the artifact's own 1.5px ink outline.
               box w=fill max-w=860.0
                 row w=fill gap=10.0 align=center
                   box w=fill pl=14.0 pr=14.0 pt=2.0 pb=2.0 bg=surface border=primary border-w=1.5 r=11.0
@@ -1495,6 +1730,29 @@ view
                   if explorer_loading
                     text "Loading…" size=12.5 wrap=none @text-caption
                   button "Refresh" disabled=explorer_loading h=30.0 p=7.0 @outline_action -> refresh_explorer
+              // THE KIND STRIP. Drawn FROM the reply, never from a fixed list
+              // of labels: every chip here names a kind `search_workspace`
+              // genuinely ran, so a count of 0 means "nothing matched", never
+              // "no loader". TASKS IS BACK — it was cut for having no text
+              // search, but the tasks index answers by status and the filtering
+              // is ours to do, which is the same deal every other kind takes.
+              // The kind filter itself is client-side over hits already in
+              // hand: a second round trip to narrow a list you are holding is
+              // waste.
+              if !empty(explorer_kinds)
+                box w=fill max-w=860.0
+                  flex w=fill wrap=wrap gap-x=7.0 gap-y=7.0 items=start
+                    button label="Show every result" p=0.0 @ghost_action -> pick_explorer_kind("all")
+                      FilterChip label="All" count=len(explorer_hits) selected=(explorer_kind == "all")
+                      active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                      hovered bg=row_hover text=fg
+                      pressed bg=elevated text=fg
+                    for kind_count in explorer_kinds
+                      button label="Filter results by kind" description=kind_count.label p=0.0 @ghost_action -> pick_explorer_kind(kind_count.kind)
+                        FilterChip label=kind_count.label count=kind_count.count selected=(explorer_kind == kind_count.kind)
+                        active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                        hovered bg=row_hover text=fg
+                        pressed bg=elevated text=fg
             col w=fill h=fill p=18.0 gap=11.0
               // RESULTS TAKE THE SCREEN while a query stands; the block ledger
               // is what the screen falls back to. A hit is a READING, not a
@@ -1505,7 +1763,16 @@ view
                   box w=fill max-w=860.0
                     col w=fill gap=8.0
                       for hit in explorer_hits
-                        ExplorerCard hit=hit
+                        if explorer_kind == "all" || hit.kind == explorer_kind
+                          ExplorerCard hit=hit
+              // A chip whose count is 0 is still selectable — the artifact draws
+              // every kind — so the pane it opens says so instead of going
+              // blank. The count is read back off the same strip the chip came
+              // from; there is no second source to disagree with.
+              if !empty(explorer_hits)
+                for kind_count in explorer_kinds
+                  if explorer_kind == kind_count.kind && kind_count.count <= 0
+                    EmptyPlate message="Nothing of that kind matched — the other chips still hold results."
               if empty(explorer_hits) && !explorer_searching && !empty(trim(explorer_query))
                 EmptyPlate message="Nothing matched that query in this workspace."
               if empty(explorer_hits) && empty(explorer_blocks) && !explorer_loading && empty(trim(explorer_query))
