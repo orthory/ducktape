@@ -53,16 +53,17 @@
 //! reads back whichever one consensus recorded.
 //!
 //! **The gate is here, not on the post policy, and that is deliberate.**
-//! `PostPolicy::MembersOnly` would be security theatre: chat's `SetMembership`
-//! ignores its author entirely (`chat/src/lib.rs`, the `SetMembership` arm
-//! passes `channel_id`/`user`/`member` and drops `author`), so any member can
-//! add THEMSELVES to any channel's roster and post right through it. The same
-//! is true of `JoinHuddle` under an open policy. Chat has exactly one
-//! author-gated principal — `owner` — so a multi-driver participant set is not
-//! expressible today without author-gating `SetMembership`, which is a
-//! `crates/modules/` change and a genesis flag day. Until then the rightful set
-//! is a set of ONE, and it is enforced where the effect happens rather than
-//! where the bytes become durable.
+//! `SetMembership` IS author-gated now — chat routes it through
+//! `check_channel_admin`, so only the channel's owner writes the roster — which
+//! means a multi-driver participant set has become expressible. It is still not
+//! adopted here, for a reason that is a product decision rather than a missing
+//! primitive: a `Shared` session spends the HOST's own env credential, which
+//! carries no grant record and therefore no grantee, so widening the driver set
+//! widens who spends the operator's personal subscription. Until that question
+//! is answered the rightful set stays ONE — the owner — and it is enforced
+//! where the effect happens rather than where the bytes become durable.
+//! `JoinHuddle` under an open policy remains self-service, so a huddle roster
+//! is not a candidate for this gate either.
 //!
 //! What this does NOT change: the node-local ws `TermCommand` lane
 //! (`crate::stream::handle_term_command`) still drives the same FIFO with a
