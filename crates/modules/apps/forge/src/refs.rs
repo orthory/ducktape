@@ -26,7 +26,9 @@ pub const MAIN_BRANCH: &str = "main";
 /// the protected, explicit-release branch.
 pub const INTEGRATION_BRANCH: &str = "dev";
 
-fn is_protected_branch(branch: &str) -> bool {
+/// `main` and the shared integration branch are the branches an owner gate
+/// covers — everything else is a feature branch anyone may force-push.
+pub(crate) fn is_protected_branch(branch: &str) -> bool {
     branch == MAIN_BRANCH || branch == INTEGRATION_BRANCH
 }
 
@@ -232,11 +234,15 @@ impl RepoState {
             }
             let Some(pack) = blobs.get_chunk(digest) else {
                 if self.warned.insert(branch.clone()) {
-                    eprintln!(
-                        "[forge] materialize: pack {} for repo {name} branch {branch} head {head} \
-                         not in the blob store yet; on-disk ref stays behind, root already \
-                         reflects the committed head",
-                        crate::hex(digest)
+                    tracing::warn!(
+                        target: "ducktape::forge",
+                        reason = "pack_missing",
+                        repo = %name,
+                        branch = %branch,
+                        head = %head,
+                        digest = %crate::hex(digest),
+                        "materialize: on-disk ref stays behind; root already reflects the \
+                         committed head"
                     );
                 }
                 continue;
@@ -250,9 +256,14 @@ impl RepoState {
                 is_protected_branch(branch),
             ) {
                 if self.warned.insert(branch.clone()) {
-                    eprintln!(
-                        "[forge] materialize: cannot advance repo {name} branch {branch} to head \
-                         {head}: {why}; leaving ref behind (root already correct)"
+                    tracing::warn!(
+                        target: "ducktape::forge",
+                        reason = "materialize_refused",
+                        repo = %name,
+                        branch = %branch,
+                        head = %head,
+                        why = %why,
+                        "materialize: leaving the on-disk ref behind; root already correct"
                     );
                 }
                 continue;

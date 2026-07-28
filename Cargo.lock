@@ -3401,11 +3401,13 @@ dependencies = [
  "futures",
  "git2",
  "host",
+ "identity",
  "sdk",
  "sdk-testkit",
  "serde",
  "serde_json",
  "sha2",
+ "tracing",
 ]
 
 [[package]]

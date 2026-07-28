@@ -33,12 +33,15 @@ const DEFAULT_REPO: &str = "default";
 
 use sdk_testkit::TestCtx;
 
-// forge's execute reads only env (consensus_time); me/height are cosmetic.
+// forge's execute reads env (consensus_time / origin); me/height are cosmetic.
+// a push binds a PRINCIPAL, so the origin must be an authenticated external
+// key; with no `identity` handler registered it resolves to itself, and the
+// same key births and then owns every repo here.
 fn at(consensus_time: u64) -> TestCtx {
     TestCtx::with_env(sdk::Env {
         height: 0,
         consensus_time,
-        origin: sdk::Origin::System,
+        origin: sdk::Origin::External(vec![1u8; 32]),
         me: "forge".into(),
     })
 }
