@@ -286,6 +286,15 @@ pub(crate) async fn run_validator(
         crate::constants::MAX_MODULE_CODE_BYTES,
         crate::constants::BLOB_FETCH_ATTEMPTS,
     )));
+    // the same lane, for forge's packs: a validator that was DOWN during a push
+    // was not a fanout target either, so it holds a committed head whose
+    // objects never arrived — see `blob_fetch::sweep_forge_packs`.
+    tokio::spawn(crate::blob_fetch::sweep_forge_packs(
+        blob_client.clone(),
+        blobs.clone(),
+        forge_repo.clone(),
+        label.clone(),
+    ));
 
     let engine::EngineState {
         node,
