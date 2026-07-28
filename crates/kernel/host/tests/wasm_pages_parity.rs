@@ -475,7 +475,7 @@ fn rejections_match_and_leave_no_trace() {
     deterministic::Runner::default().start(|context| async move {
         let mut native = native_host(&context).await;
         let mut wasm = wasm_host_(&context).await;
-        let alice = key(0xA1);
+        let (alice, bob) = (key(0xA1), key(0xB2));
 
         for host in [&mut native, &mut wasm] {
             host.submit_at(
@@ -497,12 +497,39 @@ fn rejections_match_and_leave_no_trace() {
             )
             .await
             .expect("insert");
+            // a second block to re-home a thread ONTO, and a thread ALICE
+            // opened on the first — the inputs of the opener gate below.
+            host.submit_at(
+                block(3, &alice),
+                op(&PageMsg::InsertBlock {
+                    parent: "home".into(),
+                    after: Some("b1".into()),
+                    block: nb("b2", BlockKind::Paragraph, "second"),
+                }),
+            )
+            .await
+            .expect("insert");
+            host.submit_at(
+                block(4, &alice),
+                op(&PageMsg::AddComment {
+                    thread_id: "t1".into(),
+                    comment_id: "c1".into(),
+                    target: "b1".into(),
+                    text: "looks good".into(),
+                    mentions: vec![],
+                    as_agent: None,
+                    anchor: None,
+                }),
+            )
+            .await
+            .expect("comment");
         }
 
         // the rejection matrix: distinct refusal families. each rejected block
         // must leave BOTH roots byte-identical (staged writes discarded).
-        let rejects: Vec<(PageMsg, &str)> = vec![
+        let rejects: Vec<(Vec<u8>, PageMsg, &str)> = vec![
             (
+                alice.clone(),
                 PageMsg::InsertBlock {
                     parent: "ghost".into(),
                     after: None,
@@ -511,6 +538,7 @@ fn rejections_match_and_leave_no_trace() {
                 "parent block not found",
             ),
             (
+                alice.clone(),
                 PageMsg::InsertBlock {
                     parent: "home".into(),
                     after: None,
@@ -519,6 +547,7 @@ fn rejections_match_and_leave_no_trace() {
                 "duplicate block id",
             ),
             (
+                alice.clone(),
                 PageMsg::SetKind {
                     block_id: "b1".into(),
                     kind: BlockKind::Page,
@@ -526,6 +555,7 @@ fn rejections_match_and_leave_no_trace() {
                 "page blocks cannot",
             ),
             (
+                alice.clone(),
                 PageMsg::MoveBlock {
                     block_id: "home".into(),
                     parent: Some("b1".into()),
@@ -534,6 +564,7 @@ fn rejections_match_and_leave_no_trace() {
                 "inside the moved subtree",
             ),
             (
+                alice.clone(),
                 PageMsg::MoveBlock {
                     block_id: "b1".into(),
                     parent: None,
@@ -542,6 +573,7 @@ fn rejections_match_and_leave_no_trace() {
                 "only page blocks",
             ),
             (
+                alice.clone(),
                 PageMsg::EditComment {
                     comment_id: "nope".into(),
                     text: "x".into(),
@@ -549,19 +581,50 @@ fn rejections_match_and_leave_no_trace() {
                 },
                 "comment not found",
             ),
+            // THE OPENER GATE, proven in the compiled component and not just
+            // natively: it reads `env().origin`, the one authorization input
+            // that crosses the WIT boundary, so a gate keyed on it is exactly
+            // the kind that can compile, review as correct, and be inert
+            // inside the guest.
+            //
+            // alice opened t1, so bob may not re-home it — and an ungated move
+            // was the aiming device for `RemoveBlock`'s comment purge: put a
+            // stranger's thread on a throwaway block, remove the block, and
+            // their comments are hard-deleted past `DeleteComment`'s own
+            // author check.
+            (
+                bob.clone(),
+                PageMsg::MoveCommentThread {
+                    thread_id: "t1".into(),
+                    target: "b2".into(),
+                    anchor: None,
+                },
+                "not the comment author",
+            ),
+            // and the pre-consensus empty external origin never passes as a
+            // real user here, exactly as on the four sibling comment ops.
+            (
+                Vec::new(),
+                PageMsg::MoveCommentThread {
+                    thread_id: "t1".into(),
+                    target: "b2".into(),
+                    anchor: None,
+                },
+                "empty origin",
+            ),
         ];
 
-        for (height, (msg, needle)) in rejects.into_iter().enumerate() {
-            let height = height as u64 + 3;
+        for (height, (who, msg, needle)) in rejects.into_iter().enumerate() {
+            let height = height as u64 + 5;
             let before = roots(&native);
             assert_eq!(before, roots(&wasm));
 
             let n_err = native
-                .submit_at(block(height, &alice), op(&msg))
+                .submit_at(block(height, &who), op(&msg))
                 .await
                 .expect_err("native must reject");
             let w_err = wasm
-                .submit_at(block(height, &alice), op(&msg))
+                .submit_at(block(height, &who), op(&msg))
                 .await
                 .expect_err("wasm must reject");
 
