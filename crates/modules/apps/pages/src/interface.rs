@@ -158,7 +158,10 @@ pub enum PageMsg {
         after: Option<String>,
     },
     /// remove a block AND its whole subtree. Removing a `Page` also removes
-    /// every nested page from the enumeration index.
+    /// every nested page from the enumeration index, and purges the comment
+    /// threads anchored to every block that goes — an implicit mutation on the
+    /// block op's own authority, which like every block op here is any origin
+    /// (see `purge_comments_for_target`).
     RemoveBlock { block_id: String },
 
     // ── comments ──
@@ -192,6 +195,11 @@ pub enum PageMsg {
     },
     /// Move a thread with text that crossed a block boundary during split or
     /// merge. The replacement anchor is validated against the new target.
+    /// Stored-author authority, the same rule as `EditComment`/`DeleteComment`:
+    /// only the thread's `opener` may re-home it. An ungated move was also how
+    /// a stranger aimed `RemoveBlock`'s comment purge at someone else's
+    /// comments — re-home the thread onto a throwaway block, remove it, and
+    /// the author check on `DeleteComment` is bypassed.
     MoveCommentThread {
         thread_id: String,
         target: String,
