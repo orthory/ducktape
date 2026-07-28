@@ -2182,6 +2182,9 @@ pub struct NodeFacts {
     pub view: Option<i64>,
     pub quorum: Option<i64>,
     pub reachable_validators: Option<i64>,
+    /// These two are under the SAME absent-on-a-resident `operations` object as
+    /// the trio above, so they get the same honesty — carried as [`UNMEASURED`]
+    /// rather than a plain `0`, which both renderers already print as `—`.
     pub last_finalized_at: i64,
     pub checkpoint_height: i64,
     pub peers_live: i64,
@@ -2206,10 +2209,12 @@ pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, 
             view: consensus["view"].as_i64(),
             quorum: consensus["quorum"].as_i64(),
             reachable_validators: consensus["reachable_validators"].as_i64(),
-            last_finalized_at: operations["last_finalized_at"].as_i64().unwrap_or(0),
+            last_finalized_at: operations["last_finalized_at"]
+                .as_i64()
+                .unwrap_or(UNMEASURED),
             checkpoint_height: operations["storage"]["checkpoint_height"]
                 .as_i64()
-                .unwrap_or(0),
+                .unwrap_or(UNMEASURED),
             peers_live: count_i64(
                 peers
                     .iter()
@@ -2225,6 +2230,19 @@ pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, 
         message,
     })
 }
+
+/// What an `operations` reading the node did not publish carries.
+///
+/// The rule is already written twice — `NodeFacts`'s consensus trio is
+/// `Option` "rather than being filled with misleading zeroes", and `state.ice`
+/// says an absent reading "must print `—`, never a measured `0`". The two
+/// `i64` fields beside them had no way to say it, because `0` is a legal
+/// height and a legal timestamp.
+///
+/// NEGATIVE is that way: `height_label` already renders `< 0` as `h —`, so
+/// this reuses a contract the renderer had rather than inventing one. Naming
+/// it keeps the `-1` from reading as arithmetic at the fill site.
+pub const UNMEASURED: i64 = -1;
 
 /// A consensus fact the node did not publish for this role reads `—`, never a
 /// zero. The view has no way to branch on an absent value itself.
@@ -4624,7 +4642,14 @@ pub fn initials_of(name: impl AsRef<str>) -> String {
 /// MILLIS, so a record time is a block height, not seconds. Render those with
 /// [`height_ago`] / [`height_label_short`].
 pub fn relative_time(unix_seconds: i64) -> String {
-    if unix_seconds <= 0 {
+    // [`UNMEASURED`] and "this record carries no stamp" are different facts and
+    // print differently: the first is a reading the node never published and
+    // owes the reader a `—`, the second is a record that legitimately has no
+    // time and prints nothing rather than an em dash on every row.
+    if unix_seconds < 0 {
+        return "—".into();
+    }
+    if unix_seconds == 0 {
         return String::new();
     }
     let elapsed = now_seconds().saturating_sub(unix_seconds);
@@ -8984,6 +9009,28 @@ mod tests {
         assert_eq!(optional_number(Some(4)), "4");
         // absent, not zero: a resident's status carries no consensus section.
         assert_eq!(optional_number(None), "—");
+    }
+
+    /// An `operations` reading the node never published prints `—`, not a
+    /// measured value.
+    ///
+    /// `operations` is absent on a resident, a joiner and the embedded local
+    /// daemon — which is exactly why the consensus trio beside these two is
+    /// `Option`. `last_finalized_at` and `checkpoint_height` are plain `i64`
+    /// because `0` is a legal height and a legal timestamp, so they carry
+    /// `UNMEASURED` instead and both renderers turn it into an em dash.
+    #[test]
+    fn an_unpublished_operations_reading_renders_as_unknown() {
+        assert_eq!(height_label(UNMEASURED), "h —");
+        assert_eq!(height_label_short(UNMEASURED), "h —");
+        assert_eq!(relative_time(UNMEASURED), "—");
+
+        // and a real reading of zero is still a real reading: height 0 is the
+        // genesis block, not an absence.
+        assert_eq!(height_label(0), "h 0");
+        // a record with no stamp keeps printing nothing — an em dash on every
+        // unstamped row would be noise, and that is a different fact.
+        assert_eq!(relative_time(0), "");
     }
 
     /// A record stamp is a BLOCK HEIGHT on this chain, so every record-time
