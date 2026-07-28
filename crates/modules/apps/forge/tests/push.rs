@@ -627,3 +627,40 @@ fn the_catch_up_map_clears_on_arrival_and_a_corrupt_one_is_fail_stop() {
     let _ = std::fs::remove_dir_all(&src_dir);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn pending_digests_is_the_node_side_pull_handle() {
+    // the node's blob plane reads this WITHOUT opening the module: node-local
+    // possession must never ride the deterministic `Module` surface, because a
+    // block that could read it would fork.
+    let (src_dir, _src, cap) = source_one("digests-src");
+    let dir = tmp_repo("digests");
+
+    assert_eq!(
+        forge::pending_digests(&dir).unwrap(),
+        Vec::<[u8; 32]>::new(),
+        "a workspace with no file is not an error",
+    );
+
+    let digest = cap.stash(&blobstore::BlobHandle::default());
+    let mut node =
+        Forge::with_blobs("forge", dir.clone(), blobstore::BlobHandle::default()).unwrap();
+    push(&mut node, None, &cap.head, &digest);
+
+    let want: [u8; 32] = digest.clone().try_into().unwrap();
+    assert_eq!(
+        forge::pending_digests(&dir).unwrap(),
+        vec![want],
+        "the outstanding pack is visible from outside the module",
+    );
+
+    // and it goes quiet once the objects land.
+    let arrived = blobstore::BlobHandle::default();
+    cap.stash(&arrived);
+    let mut caught_up = Forge::with_blobs("forge", dir.clone(), arrived).unwrap();
+    caught_up.materialize().unwrap();
+    assert!(forge::pending_digests(&dir).unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}

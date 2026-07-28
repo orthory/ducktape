@@ -459,6 +459,16 @@ pub(super) async fn park(
             crate::constants::MAX_MODULE_CODE_BYTES,
             crate::constants::BLOB_FETCH_ATTEMPTS,
         ));
+    // the forge pack sweep: a resident is never a submit-time fanout target, so
+    // it is the node most likely to hold a committed head whose objects never
+    // arrived. it pulls them through the SAME verified lane as `code_source`
+    // above, out of band — see `blob_fetch::sweep_forge_packs`.
+    tokio::spawn(crate::blob_fetch::sweep_forge_packs(
+        client.clone(),
+        blobs.clone(),
+        forge_repo.clone(),
+        label.clone(),
+    ));
     let mut recovery_slot = Some(recovery);
     let mut recovery_reopens = 0u32;
     // fold-driver state, all epoch-scoped and reset at (re)ascension:

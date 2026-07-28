@@ -243,6 +243,34 @@ fn decode_pending(bytes: &[u8]) -> Result<BTreeMap<String, refs::PendingMap>, Er
     Ok(out)
 }
 
+/// every pack digest a forge workspace is still waiting on, read from
+/// [`PENDING_FILE`] WITHOUT opening the module.
+///
+/// this is the node's pull handle. the catch-up map is node-local possession,
+/// never consensus state, so it deliberately does NOT ride the deterministic
+/// `Module` surface — a block that could read it would fork. the node's blob
+/// plane sweeps this out of band, fetches the bytes, and forge picks them up
+/// from its own blob store on its next `commit_block`; nothing here mutates.
+///
+/// a workspace with nothing outstanding has no file, which is `Ok(vec![])`.
+pub fn pending_digests(base: &std::path::Path) -> Result<Vec<[u8; 32]>, Error> {
+    let path = base.join(PENDING_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Module(format!("forge: read pending file: {e}"))),
+    };
+    let mut digests: Vec<[u8; 32]> = decode_pending(&bytes)?
+        .into_values()
+        .flat_map(|pending| pending.into_values().map(|(_, digest)| digest))
+        .collect();
+    // one pack can be the target of several branches (a push moving two refs
+    // to the same closure); fetch it once.
+    digests.sort_unstable();
+    digests.dedup();
+    Ok(digests)
+}
+
 /// parse exactly `OID_RAW_LEN` (20) raw sha1 bytes into an `Oid`, with a
 /// deterministic module error on any other length.
 fn parse_oid(bytes: &[u8], field: &str) -> Result<Oid, Error> {
