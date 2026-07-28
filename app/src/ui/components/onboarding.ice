@@ -9,6 +9,19 @@
 //       invite=invite_link steps=provision_steps step_index=provision_index
 //       height=block_height peers_live=… peers_total=… tier=member_tier(members_rows)
 //       error=onboarding_error busy=(mutation_phase != "idle")
+//       events
+//         go_welcome -> go_welcome
+//         go_create -> go_create
+//         go_join -> go_join
+//         create_network_submit -> create_network_submit _
+//         copy_onboarding_invite -> copy_onboarding_invite
+//         enter_console -> enter_console
+//         join_network_submit -> join_network_submit _
+//
+// Every route out of this column is a NAMED EVENT, and each event carries the
+// exact name and arity of the app handler it lands on — a component route may
+// only resolve local handlers and declared emissions, so an app handler is
+// never named inside this file.
 //
 // THREE THINGS THE ARTIFACT DRAWS THAT THIS APP REFUSES TO DRAW:
 //
@@ -30,19 +43,42 @@
 // so the artifact's `radial-gradient(#fdfdfb -> #f7f6f2)` lands as the flat
 // `bg_wash` step — the sanctioned substitution, same as every other plate.
 component OnboardingPhase(phase:str, name:str, node_api:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, peers_live:i64, peers_total:i64, tier:str, error:str, busy:bool)
+  emits
+    go_welcome
+    go_create
+    go_join
+    create_network_submit(str)
+    copy_onboarding_invite
+    enter_console
+    join_network_submit(str)
   box #root w=fill h=fill p=30.0 align-x=center align-y=center bg=bg_wash
     col gap=0.0
       match phase
         "welcome"
           WelcomeScreen
+            forward
+              go_create
+              go_join
         "create"
           CreateScreen node_api=node_api busy=busy error=error
+            forward
+              go_welcome
+              create_network_submit
         "provisioning"
           ProvisioningScreen name=name steps=steps step_index=step_index error=error
+            forward
+              go_welcome
         "live"
           LiveScreen name=name invite=invite height=height peers_live=peers_live peers_total=peers_total tier=tier busy=busy error=error
+            forward
+              go_welcome
+              copy_onboarding_invite
+              enter_console
         "join"
           JoinScreen busy=busy error=error
+            forward
+              go_welcome
+              join_network_submit
         _
           col gap=0.0
             space w=1.0 h=1.0
@@ -51,9 +87,13 @@ component OnboardingPhase(phase:str, name:str, node_api:str, invite:str, steps:[
 // doubles as the step label. `step` empty hides it, `title` empty hides the
 // heading — Welcome and Live carry their own hero instead.
 component OnboardingShell(phase:str, title:str, step:str)
+  emits
+    go_welcome
   col #root w=430.0 gap=0.0
     if step != ""
       OnboardingStepLabel phase=phase step=step
+        forward
+          go_welcome
     if title != ""
       box w=fill pt=16.0
         text title w=fill size=20.0 wrap=none font=display @text-primary
@@ -62,12 +102,14 @@ component OnboardingShell(phase:str, title:str, step:str)
 // On Create and Join the step label IS the way back. On Provisioning there is
 // no way back — the workspace already exists on disk — so it is plain text.
 component OnboardingStepLabel(phase:str, step:str)
+  emits
+    go_welcome
   col #root
     if phase == "provisioning"
       row gap=8.0 align=center
         text step size=11.0 wrap=none font=code_medium @text-meta
     if phase != "provisioning"
-      button label="Back" @ghost_action px-0px py-0px rounded-6px -> go_welcome
+      button label="Back" @ghost_action px-0px py-0px rounded-6px -> emit(go_welcome)
         row gap=8.0 align=center
           text "‹" size=14.0 wrap=none @text-meta
           text step size=11.0 wrap=none font=code_medium @text-meta
@@ -76,6 +118,9 @@ component OnboardingStepLabel(phase:str, step:str)
 // says where the key lives — and it does NOT repeat the artifact's `node boots
 // locally`, because this app never boots one.
 component WelcomeScreen()
+  emits
+    go_create
+    go_join
   col #root w=430.0 gap=0.0 align=center
     box w=50.0 h=50.0 align-x=center align-y=center bg=primary r=13.0
       text "D" size=22.0 wrap=none font=display @text-toast_fg
@@ -86,10 +131,10 @@ component WelcomeScreen()
         text "People and agents work on one shared record." size=13.5 line-h=1.55 @text-caption
         text "Chat, docs, code and approvals in one place." size=13.5 line-h=1.55 @text-caption
     box w=fill pt=28.0
-      button label="Create a workspace" w=fill @primary_action px-17px py-15px rounded-11px -> go_create
+      button label="Create a workspace" w=fill @primary_action px-17px py-15px rounded-11px -> emit(go_create)
         RouteCardBody title="Create a workspace" note="Registers a workspace on this device and generates your admin keypair." primary=true
     box w=fill pt=11.0
-      button label="Join with an invite" w=fill @outline_action px-17px py-15px rounded-11px border-control_line -> go_join
+      button label="Join with an invite" w=fill @outline_action px-17px py-15px rounded-11px border-control_line -> emit(go_join)
         RouteCardBody title="Join with an invite" note="Materializes this device's node from an invite blob." primary=false
     box w=fill pt=24.0
       col w=fill gap=0.0 align=center
@@ -119,10 +164,15 @@ component RouteCardBody(title:str, note:str, primary:bool)
 // facts are the Console file's set — the Onboarding file's `p2p port 7420` and
 // `quorum 4 of 6 validators` are both false against this code.
 component CreateScreen(node_api:str, busy:bool, error:str)
+  emits
+    go_welcome
+    create_network_submit(str)
   state
     draft = ""
   col #root w=430.0 gap=0.0
     OnboardingShell phase="create" title="Create a workspace" step="STEP 1 / 3"
+      forward
+        go_welcome
       col w=fill gap=0.0
         box w=fill pt=5.0
           text "A workspace is registered under ~/.ducktape and an admin keypair is generated on this device." w=fill size=13.0 line-h=1.5 @text-caption
@@ -132,7 +182,7 @@ component CreateScreen(node_api:str, busy:bool, error:str)
           box w=fill px=14.0 py=12.0 bg=surface border=primary border-w=1.5 r=10.0
             row w=fill gap=6.0 align=center
               text "#" size=14.0 wrap=none font=code_medium @text-label
-              input "" #create-name label="Workspace name" <-> draft hint="acme-research" disabled=busy submit=create_network_submit(draft) w=fill p=0.0 text-size=14.0 line-h=1.2 font=code_medium @control
+              input "" #create-name label="Workspace name" <-> draft hint="acme-research" disabled=busy submit=emit(create_network_submit, draft) w=fill p=0.0 text-size=14.0 line-h=1.2 font=code_medium @control
                 active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
                 disabled value=hint
         box w=fill pt=18.0
@@ -143,7 +193,7 @@ component CreateScreen(node_api:str, busy:bool, error:str)
             AdvancedRow label="node api" value=node_api
             AdvancedRow label="join policy" value="invite + approval"
         box w=fill pt=22.0
-          button label="Create network" disabled=(busy || empty(trim(draft))) w=fill @primary_action px-0px py-13px rounded-10px -> create_network_submit(draft)
+          button label="Create network" disabled=(busy || empty(trim(draft))) w=fill @primary_action px-0px py-13px rounded-10px -> emit(create_network_submit, draft)
             text "Create network →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
         OnboardingError message=error
 
@@ -171,8 +221,12 @@ component WorkspaceDirRow(slug:str)
 // The app does NOT supervise the daemon, so this screen never claims progress
 // it has not observed: it renders exactly what `provision_progress` emitted.
 component ProvisioningScreen(name:str, steps:[ProvisionStep], step_index:i64, error:str)
+  emits
+    go_welcome
   col #root w=430.0 gap=0.0
     OnboardingShell phase="provisioning" title="" step="STEP 2 / 3"
+      forward
+        go_welcome
       col w=fill gap=0.0
         box w=fill pt=13.0
           row w=fill gap=6.0 align=center
@@ -263,8 +317,14 @@ component ProvisionLabel(label:str, dim:bool)
 // LIVE. The hero, the reading, and the one thing this screen is for: an invite
 // another device can use.
 component LiveScreen(name:str, invite:str, height:i64, peers_live:i64, peers_total:i64, tier:str, busy:bool, error:str)
+  emits
+    go_welcome
+    copy_onboarding_invite
+    enter_console
   col #root w=430.0 gap=0.0
     OnboardingShell phase="live" title="" step=""
+      forward
+        go_welcome
       col w=fill gap=0.0
         row w=fill gap=10.0 align=center
           box w=24.0 h=24.0 align-x=center align-y=center bg=success_bg border=success_line border-w=1.0 r=12.0
@@ -281,12 +341,12 @@ component LiveScreen(name:str, invite:str, height:i64, peers_live:i64, peers_tot
           col w=fill gap=9.0
             box w=fill px=12.0 py=10.0 bg=muted_bg border=border border-w=1.0 r=9.0
               InviteValue invite=invite
-            button label="Copy invite" disabled=(busy || empty(invite)) w=fill @primary_action px-0px py-9px rounded-9px -> copy_onboarding_invite
+            button label="Copy invite" disabled=(busy || empty(invite)) w=fill @primary_action px-0px py-9px rounded-9px -> emit(copy_onboarding_invite)
               text "Copy link" w=fill size=12.0 wrap=none align-x=center font=display @text-primary_fg
         box w=fill pt=14.0
           text "Only a device holding this invite can join, and a member still has to approve it." w=fill size=12.0 line-h=1.55 @text-caption
         box w=fill pt=24.0
-          button label="Open console" w=fill @primary_action px-0px py-13px rounded-10px -> enter_console
+          button label="Open console" w=fill @primary_action px-0px py-13px rounded-10px -> emit(enter_console)
             text "Open console →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
         OnboardingError message=error
 
@@ -327,10 +387,15 @@ component LiveStatusStrip(height:i64, peers_live:i64, peers_total:i64, tier:str)
 // this app can decode an invite, so no reading is claimed; the card states the
 // node's own join ladder instead, including the wait the artifact never draws.
 component JoinScreen(busy:bool, error:str)
+  emits
+    go_welcome
+    join_network_submit(str)
   state
     blob = ""
   col #root w=430.0 gap=0.0
     OnboardingShell phase="join" title="Join a network" step="BACK"
+      forward
+        go_welcome
       col w=fill gap=0.0
         box w=fill pt=5.0
           text "Paste an invite to materialize this device's node, download the finalized history, verify it, and ask to join." w=fill size=13.0 line-h=1.5 @text-caption
@@ -338,7 +403,7 @@ component JoinScreen(busy:bool, error:str)
           text "INVITE BLOB" size=10.0 wrap=none font=code_semibold @text-label
         box w=fill pt=8.0
           box w=fill px=14.0 py=12.0 bg=surface border=primary border-w=1.5 r=10.0
-            input "" #join-invite label="Invite blob" <-> blob hint="🦆AAAA…" disabled=busy submit=join_network_submit(blob) w=fill p=0.0 text-size=12.0 line-h=1.2 font=code @control
+            input "" #join-invite label="Invite blob" <-> blob hint="🦆AAAA…" disabled=busy submit=emit(join_network_submit, blob) w=fill p=0.0 text-size=12.0 line-h=1.2 font=code @control
               active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
               disabled value=hint
         box w=fill pt=18.0
@@ -349,7 +414,7 @@ component JoinScreen(busy:bool, error:str)
               JoinPhaseRow phase_name="synced" note="finalized history downloaded and verified" tone="later"
               JoinPhaseRow phase_name="promoted" note="the console opens on live state" tone="later"
         box w=fill pt=22.0
-          button label="Join network" disabled=(busy || empty(trim(blob))) w=fill @primary_action px-0px py-13px rounded-10px -> join_network_submit(blob)
+          button label="Join network" disabled=(busy || empty(trim(blob))) w=fill @primary_action px-0px py-13px rounded-10px -> emit(join_network_submit, blob)
             text "Join →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
         OnboardingError message=error
 
