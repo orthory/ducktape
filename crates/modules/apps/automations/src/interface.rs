@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 pub struct Trigger {
     /// an exact channel id, or `None` for any channel.
     pub channel_id: Option<String>,
-    /// a substring tested against each mention's display form (see the
-    /// module's `display_author`); `None` = no mention constraint.
+    /// a substring tested against each mention's ACTOR string (see the module's
+    /// `actor_of`) — `ext:{hex}` for a user, `{module}/{agent_id}` for an
+    /// agent; `None` = no mention constraint.
     pub mention: Option<String>,
     /// a case-sensitive substring tested against the post's concatenated
     /// text blocks; `None` = no text constraint.
@@ -47,6 +48,12 @@ pub enum Action {
     },
     /// deliver an inbox notification. `kind` is literal; `member_template` and
     /// `body_template` are substituted at fire time.
+    ///
+    /// `member_template` must substitute to an inbox QUEUE NAME, which is an
+    /// origin's `sdk::Origin::actor_string` — inbox refuses an ack from anyone
+    /// but that origin. `{author}` is the ownable form (a rule only ever fires
+    /// on a user-authored post, so it renders `ext:{hex}`); a literal or a
+    /// `{mention}` of a non-user names a queue nobody can ever ack.
     DeliverInbox {
         member_template: String,
         kind: String,

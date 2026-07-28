@@ -1050,11 +1050,71 @@ fn chat_trigger_can_deliver_inbox_with_chat_placeholders() {
     let InboxMsg::Deliver { member, kind, body } = &delivered[0] else {
         panic!("expected Deliver");
     };
-    assert_eq!(member, "agent/helper", "member uses first mention display");
+    assert_eq!(member, "agent/helper", "member uses the first mention");
     assert_eq!(kind, "chat");
     assert_eq!(
         body,
-        "channel=general seq=1 author=user:03030303 text=please review mention=agent/helper"
+        "channel=general seq=1 author=ext:03030303 text=please review mention=agent/helper"
+    );
+}
+
+/// the regression #858 introduced and this module has to answer: an inbox
+/// member is a QUEUE NAME in `sdk::Origin::actor_string`'s domain, and inbox
+/// refuses a `MarkRead`/`Clear` naming any queue but the submitter's own — so a
+/// `{author}` member_template has to produce the queue that author owns.
+///
+/// asserted by DERIVATION from the triggering key, never by spelling: rendering
+/// the author as the index tier's `user:{hex}` display handle instead delivers
+/// mail to a queue no origin can ever ack.
+#[test]
+fn an_author_member_names_the_queue_that_author_owns() {
+    let author_key = vec![0x07; 4];
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "notify-author",
+            post_trigger(Some("general"), None),
+            inbox_action("{author}", "mention", "you were posted at"),
+        ),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let mut chat_ctx = CaptureCtx::new().with_chat_origin();
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted(
+            "general",
+            1,
+            AuthorRef::User(author_key.clone()),
+            Vec::new(),
+        ),
+    )
+    .expect("fire");
+
+    let delivered = chat_ctx.inbox_msgs();
+    assert_eq!(delivered.len(), 1);
+    let InboxMsg::Deliver { member, .. } = &delivered[0] else {
+        panic!("expected Deliver");
+    };
+    assert_eq!(
+        member,
+        &Origin::External(author_key).actor_string(),
+        "the delivered queue must be one its author can ack"
+    );
+    // and the run history records the member it actually emitted.
+    block_on(m.commit_block()).expect("commit fire");
+    let recs = history(&m, "notify-author", 16);
+    assert_eq!(recs.len(), 1);
+    assert!(recs[0].action_ok);
+    assert!(
+        recs[0].detail.contains("ext:07070707"),
+        "detail: {}",
+        recs[0].detail
     );
 }
 
@@ -1470,8 +1530,8 @@ fn fire_count_saturates_at_u64_max() {
 
 #[test]
 fn substitution_covers_all_placeholders_single_pass() {
-    // {author} for a user renders the hex pubkey; unknown tokens stay literal.
-    let author = display_author(&AuthorRef::User(vec![0xab, 0xcd]));
+    // {author} for a user renders its actor string; unknown tokens stay literal.
+    let author = actor_of(&AuthorRef::User(vec![0xab, 0xcd]));
     let out = substitute(
         "c={channel} s={seq} a={author} t={text} u={unknown}",
         "general",
@@ -1483,7 +1543,35 @@ fn substitution_covers_all_placeholders_single_pass() {
         out,
         format!("c=general s=9 a={author} t=hello u={{unknown}}")
     );
-    assert_eq!(author, "user:abcd");
+    assert_eq!(author, "ext:abcd");
+}
+
+/// every arm of the ONE author rendering is `sdk::Origin::actor_string` of the
+/// origin the handle names — derived, never spelled. the agent arm is the one
+/// refinement: its module's actor string plus the agent id, so a `mention`
+/// filter can address one agent instead of its whole module.
+#[test]
+fn every_author_renders_in_the_actor_string_domain() {
+    let key = vec![0x03; 4];
+    assert_eq!(
+        actor_of(&AuthorRef::User(key.clone())),
+        Origin::External(key).actor_string()
+    );
+    assert_eq!(
+        actor_of(&AuthorRef::Module("chat".into())),
+        Origin::Module("chat".into()).actor_string()
+    );
+    assert_eq!(actor_of(&AuthorRef::System), Origin::System.actor_string());
+    assert_eq!(
+        actor_of(&AuthorRef::Agent {
+            module: "agent".into(),
+            agent_id: "helper".into(),
+        }),
+        format!("{}/helper", Origin::Module("agent".into()).actor_string())
+    );
+    // and NOT the index tier's display handle: no origin's actor string is
+    // `user:…`, so a member rendered that way is a queue nobody can ack.
+    assert!(!actor_of(&AuthorRef::User(vec![0xab])).starts_with("user:"));
 }
 
 #[test]
