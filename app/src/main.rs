@@ -965,7 +965,6 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         ));
 
         let chat = include_str!("ui/screens/chat.ice");
-        let view = include_str!("ui/view.ice");
         assert!(
             chat.contains(
                 "overlay when=(selected_message_seq > 0 && message_action != \"toolbar\")"
