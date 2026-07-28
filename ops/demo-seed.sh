@@ -212,7 +212,18 @@ gateway_status=$?
 # core workspace (chat, tasks, pages, identity) is committed before this runs.
 case "$gateway_status" in
   0) ;;
-  *) GATEWAY_ROUTES=0; log "gateway routes skipped (exit $gateway_status) — see $WSDIR/seed.log" ;;
+  # name the LIKELY cause here too, not just in the closing banner: an operator
+  # reading the log tail should not have to reach the end to learn that an
+  # empty signing password (an existing key we hold no password for) is the
+  # overwhelmingly common reason, not helper drift.
+  *)
+    GATEWAY_ROUTES=0
+    if [ "${KEY_PROVISIONED:-0}" -eq 1 ]; then
+      log "gateway routes skipped (exit $gateway_status) — see $WSDIR/seed.log"
+    else
+      log "gateway routes skipped (exit $gateway_status) — demo-seed holds no password for the existing $USERKEY, so the helper signed with an empty one; see $WSDIR/seed.log"
+    fi
+    ;;
 esac
 
 log "seeded $N ops + $GATEWAY_ROUTES gateway web-app routes across pages, chat, tasks, agent, runs, jobs, inbox, automations, files, gateway"
@@ -244,9 +255,28 @@ fi
 
 if [ "$GATEWAY_ROUTES" -eq 0 ]; then
 cat <<EOF
-Gateway web apps were not published (the seed's route helper still drifts from
-the current gateway/duckdns wire) — see $WSDIR/seed.log for the exact rejection.
-This is a demo garnish only: chat, tasks, pages and your identity are all live.
+Gateway web apps were not published — see $WSDIR/seed.log for the exact
+rejection. This is a demo garnish only: chat, tasks, pages and your identity are
+all live.
+$(if [ "${KEY_PROVISIONED:-0}" -eq 1 ]; then
+cat <<'INNER'
+
+demo-seed minted this key and signed with it, so this is not a key problem —
+the route helper is out of step with the current gateway/duckdns wire.
+INNER
+else
+cat <<INNER
+
+Almost certainly your key, not the helper: demo-seed did not create $USERKEY, so
+it does not hold your password and passed an empty one — the helper cannot sign
+the routes with that. A raw-hex PLAINTEXT key fails here for the same reason, and
+is the same thing that makes the app refuse in-app writes with only the Settings
+PLAINTEXT warning to point at it.
+
+Re-run against a workspace with no user key (or move $USERKEY aside) to get the
+routes; nothing else in the seed depends on them.
+INNER
+fi)
 EOF
 else
 cat <<EOF
