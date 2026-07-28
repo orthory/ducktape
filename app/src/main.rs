@@ -1686,6 +1686,64 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         }
     }
 
+    /// Text painted on a status fill must stay readable in BOTH themes.
+    ///
+    /// `destructive` and `warning` do not invert between light and dark, they
+    /// SHIFT — and a foreground that does not shift with them loses contrast as
+    /// they do. The old React console painted a hardcoded `#fff` on them and
+    /// measured 3.62:1 in dark (#459). The palette now carries a real
+    /// `*_foreground` for each fill, which is the right shape; this asserts the
+    /// VALUES actually clear AA, because nothing else would notice a palette
+    /// that stopped clearing it.
+    ///
+    /// That matters here specifically because the palette is vendored from
+    /// another repo by git `rev`: a routine rev bump could darken a fill with no
+    /// review in this tree at all.
+    #[test]
+    fn every_status_fill_carries_a_readable_foreground_in_both_themes() {
+        /// WCAG 2.1 relative luminance — the sRGB channel transfer, then the
+        /// standard weights.
+        fn luminance(color: iced::Color) -> f32 {
+            fn channel(c: f32) -> f32 {
+                match c <= 0.039_28 {
+                    true => c / 12.92,
+                    false => ((c + 0.055) / 1.055).powf(2.4),
+                }
+            }
+            0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+        }
+        fn contrast(a: iced::Color, b: iced::Color) -> f32 {
+            let (x, y) = (luminance(a), luminance(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        }
+        /// AA for small text. Every one of these fills carries body-size text.
+        const AA_SMALL: f32 = 4.5;
+
+        for (theme_name, theme) in [
+            ("light", ducktape_ui::ui::theme::LIGHT),
+            ("dark", ducktape_ui::ui::theme::DARK),
+        ] {
+            let p = theme.palette;
+            for (fill_name, fill, foreground) in [
+                ("destructive", p.destructive, p.destructive_foreground),
+                ("warning", p.warning, p.warning_foreground),
+                ("success", p.success, p.success_foreground),
+                ("primary", p.primary, p.primary_foreground),
+                ("brand", p.brand, p.brand_foreground),
+                ("accent", p.accent, p.accent_foreground),
+                ("secondary", p.secondary, p.secondary_foreground),
+                ("toast", p.toast_background, p.toast_foreground),
+            ] {
+                let ratio = contrast(fill, foreground);
+                assert!(
+                    ratio >= AA_SMALL,
+                    "{theme_name}/{fill_name}: {ratio:.2}:1 is below WCAG AA {AA_SMALL}:1 — \
+                     a fill that shifts needs a foreground that shifts with it"
+                );
+            }
+        }
+    }
+
     #[test]
     fn composer_enter_sends_and_shift_enter_inserts_a_newline() {
         use iced::keyboard::key::{Named, NativeCode, Physical};
