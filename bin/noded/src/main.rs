@@ -197,13 +197,6 @@ fn run_node(
 ) {
     // forge_repo is derived by the caller (shared with the http upload-pack lane).
     let duckfs_dir = storage.join("duckfs");
-    // per-agent host state, rooted OUTSIDE <storage> (D7 isolation floor): the
-    // persistent executor workspaces + session files must NOT be descendants of
-    // the key/consensus/blob tree, so a `..` from a run's cwd can't reach
-    // user.key/node keys/qmdb/blobstore. `DUCKTAPE_AGENT_WORKSPACES` / _SESSIONS
-    // override — see capability-host. host-local only, never consensus.
-    // Persistent agent workspaces stay under <storage>; portable run mounts
-    // live under agent_runs_root outside it.
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 

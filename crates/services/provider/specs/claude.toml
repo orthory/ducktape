@@ -10,10 +10,10 @@
 #
 # Agentic posture: no --max-turns cap and `--permission-mode acceptEdits`
 # (verified present in claude 2.1.202), so the CLI may run tool-use loops and
-# edit files — confined to its cwd, which [workspace] pins to the agent's
-# persistent dir under the host's agent-workspaces root. Every run starts
-# cold: a run's whole continuity is the prompt envelope (full transcript),
-# which is what makes a run portable across assignees.
+# edit files — confined to its cwd, which is the workspace the run's
+# provisioner materialized for this attempt. Every run starts cold: a run's
+# whole continuity is the prompt envelope (full transcript), which is what
+# makes a run portable across assignees.
 
 spec = 1
 
@@ -46,11 +46,6 @@ timeout_secs = 600
 [output]
 # The single `{"type":"result",...}` object from --output-format json.
 format = "json-result"
-
-[workspace]
-# Persistent per-agent cwd (<data>/agent-workspaces/<agent_id>); omit this
-# section for the empty-scratch-dir fence.
-mode = "persistent"
 
 [interactive]
 # The pty-backed TUI argv, for interactive sessions (a member drives the claude

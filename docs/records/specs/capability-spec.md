@@ -61,11 +61,10 @@ in the same trust class as a shell profile or a systemd unit:
   interpretation** — no placeholders, no quoting, no expansion. The prompt
   reaches the child only via stdin, so job content cannot inject flags or
   commands.
-- The child process runs **fenced**: a working directory the spec's
-  `[workspace]` policy picks — an empty scratch dir by default, or a
-  per-agent persistent dir under the host's agent-workspaces root (never the
-  node's data dir itself) — non-interactive mode, and whatever sandbox flags
-  the spec's argv encodes. Fence flags live in the spec — audit them when you
+- The child process runs **fenced**: its working directory is the workspace
+  the run's provisioner materialized (an empty scratch dir when the embedder
+  provisions none, never the node's data dir itself), non-interactive mode,
+  and whatever sandbox flags the spec's argv encodes. Fence flags live in the spec — audit them when you
   audit the spec.
 
 **Auth: the operator brings a logged-in CLI; the spec decides where the
@@ -189,7 +188,6 @@ format = "text"
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `spec` | integer | yes | must be `1` |
-| `[workspace]` | table | no | per-agent persistent working directory — see [Workspace](#workspace--a-persistent-per-agent-working-directory) |
 | `[isolation]` | table | no | host-owned auth broker + fresh executor config home — see [Isolation](#isolation--host-owned-auth) |
 | `[sandbox]` | table | no | the executor's own auth dirs, mounted into a sandbox — see [Isolation](#isolation--host-owned-auth) |
 | `[tools]` | table | no | argv injected into every argv the file produces — see [Tools](#tools--argv-injected-into-every-argv-the-file-produces) |
@@ -226,12 +224,6 @@ being silently ignored.
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `format` | string | yes | `"jsonl-events"` \| `"json-result"` \| `"text"` |
-
-### `[workspace]`
-
-| Field | Type | Required | Rules |
-|---|---|---|---|
-| `mode` | string | yes (when the section is present) | must be `"persistent"`; omit the whole section for the scratch default |
 
 ### `[isolation]`
 
@@ -311,31 +303,6 @@ Inert under `Direct` (the child inherits `HOME` whole).
 
 Entries are validated at load: an absolute path or any `..` segment is rejected,
 since either would defeat the boundary the sandbox exists to hold.
-
----
-
-## Workspace — a persistent per-agent working directory
-
-The v1 fence ran every provider child in an **empty scratch directory**. An
-agentic run wants the opposite: a stable directory the executor can read and
-write across runs, so work accumulates instead of vanishing per invocation.
-
-```toml
-[workspace]
-mode = "persistent"
-```
-
-With `persistent`, a run that carries an agent identity (composed by the
-runs module's envelope — legacy envelope-less runs carry none) executes in
-`<data>/agent-workspaces/<agent_id>/`, created on demand. Everything else —
-no `[workspace]` section, a legacy run, an embedder that wired no workspaces
-root — keeps the scratch fence unchanged. The child still never sees the
-node's data directory itself, and the agent id is defensively rejected as a
-path component if it carries separators or traversal tokens.
-
-The workspaces root is host policy: the node binaries derive it from their
-data dir; `DUCKTAPE_AGENT_WORKSPACES` overrides it. Host-local state, never
-consensus — two nodes running the same agent have independent workspaces.
 
 ---
 
@@ -422,8 +389,8 @@ Each entry:
 | `suffix` | string | yes | `<model>_<effort>`, each side `[a-z0-9.-]+` (so exactly one `_`) |
 | `args` | string array | yes | the variant's **full** argv — verbatim, complete, never merged with or derived from the parent's args |
 
-A variant **inherits** `bin`, `env`, `prompt`, `timeout_secs`, `output`,
-and `[workspace]` (and `description`) from the parent spec;
+A variant **inherits** `bin`, `env`, `prompt`, `timeout_secs`, `output`
+(and `description`) from the parent spec;
 `args` is its own, whole, and literal. There is no field merging and no
 placeholder substitution — the "argv is literal" invariant holds per tag.
 
@@ -520,7 +487,6 @@ if the tunings follow the `provider_model_effort` grammar.
 | `DUCKTAPE_CAPABILITY_DIR` | operator spec directory (explicit; missing dir = boot error) |
 | *(per spec)* `[detect].env` | each spec may name its own explicit-binary override var — see the embedded specs for theirs |
 | `DUCKTAPE_PROVIDER_TIMEOUT_SECS` | overrides **every** spec's `timeout_secs` at once |
-| `DUCKTAPE_AGENT_WORKSPACES` | overrides the persistent-workspaces root (default `<data>/agent-workspaces`) |
 
 ---
 
@@ -543,6 +509,9 @@ misreading it as a single-tag spec. The `[session]` thread-continuity block
 and a variant's `resume_args` override) was REMOVED within v1 the same way: a
 file that still declares it fails loudly at boot as an unknown field. Every
 run starts cold — a run's whole continuity is its prompt envelope, which is
-what lets any assignee execute it. `[workspace]` and `[tools]` follow the same
-pre-release precedent: an older build rejects a file carrying them as unknown
-fields rather than silently running scratch-and-cold, or tool-less.)
+what lets any assignee execute it. The `[workspace]` per-agent-persistence
+block was removed the same way, for the same reason: a run's cwd is the
+workspace its provisioner materialized, so the section selected nothing.
+`[tools]` follows the same pre-release precedent: an older build rejects a
+file carrying it as an unknown field rather than silently running
+tool-less.)

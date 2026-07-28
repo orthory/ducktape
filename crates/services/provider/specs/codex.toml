@@ -14,11 +14,10 @@
 # no dispatch-time routing) — exactly as if each were its own spec file.
 #
 # Agentic posture: `--sandbox workspace-write` lets the CLI edit files in its
-# working directory — which [workspace] pins to the agent's own persistent
-# dir under the host's agent-workspaces root, so edits accumulate per agent
-# and never touch the node's data dir. Every run starts cold: a run's whole
-# continuity is the prompt envelope (full transcript), which is what makes a
-# run portable across assignees.
+# working directory — which is the workspace the run's provisioner
+# materialized for this attempt, so edits never touch the node's data dir.
+# Every run starts cold: a run's whole continuity is the prompt envelope (full
+# transcript), which is what makes a run portable across assignees.
 #
 # Format reference: docs/records/specs/capability-spec.md
 
@@ -37,7 +36,7 @@ env = "DUCKTAPE_CODEX_BIN"
 
 [invoke]
 # One-shot exec, workspace-write sandbox (edits confined to the cwd = the
-# agent's workspace), machine-readable event stream. The trailing "-" tells
+# run's provisioned workspace), machine-readable event stream. The trailing "-" tells
 # codex to read the prompt from stdin (fed concurrently, then EOF). Args are
 # fully literal — no placeholders.
 args = [
@@ -59,11 +58,6 @@ timeout_secs = 600
 [output]
 # The `codex exec --json` JSONL event stream: the LAST agent_message wins.
 format = "jsonl-events"
-
-[workspace]
-# Persistent per-agent cwd (<data>/agent-workspaces/<agent_id>); omit this
-# section for the empty-scratch-dir fence.
-mode = "persistent"
 
 [interactive]
 # The pty-backed TUI argv, for interactive sessions (a member drives the codex

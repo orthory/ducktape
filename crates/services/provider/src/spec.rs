@@ -80,7 +80,6 @@ use capability::validate_tag;
 use serde::Deserialize;
 
 use crate::variants::{self, RawVariant};
-use crate::workspace::{self, WorkspaceMode};
 
 /// the one spec format version this build understands. parsing rejects any
 /// other value loudly — an operator on a newer format gets "unsupported spec
@@ -117,9 +116,6 @@ pub struct CapabilitySpec {
     pub timeout_secs: u64,
     /// which named stdout parser extracts the assistant's final text.
     pub output: OutputFormat,
-    /// the child's working-directory policy — scratch unless the spec's
-    /// `[workspace]` opts into per-agent persistence (see [`crate::workspace`]).
-    pub workspace: WorkspaceMode,
     /// optional `[sandbox] rw_dirs` — the executor's own auth/state dirs
     /// (e.g. `~/.claude`, `~/.codex`) that must cross into a Podman sandbox
     /// read-write so the BYO CLI can authenticate. HOME-RELATIVE ONLY
@@ -168,7 +164,7 @@ pub struct InteractiveSpec {
 }
 
 /// where an executor auto-loads its ambient instructions from — a CLOSED set of
-/// location KINDS, like [`OutputFormat`] and [`WorkspaceMode`], never a raw path:
+/// location KINDS, like [`OutputFormat`], never a raw path:
 /// a spec that could name any path could aim a host-written file anywhere on the
 /// box, and there would be nothing left to validate. the file component is a
 /// plain name; the DIRECTORY is the host's to choose, per kind.
@@ -253,9 +249,6 @@ struct RawSpec {
     detect: RawDetect,
     invoke: RawInvoke,
     output: RawOutput,
-    /// optional `[workspace]` — validated in [`crate::workspace`].
-    #[serde(default)]
-    workspace: Option<workspace::RawWorkspace>,
     /// optional `[sandbox]` — the Podman-backend auth/state mounts.
     #[serde(default)]
     sandbox: Option<RawSandbox>,
@@ -580,13 +573,6 @@ impl CapabilitySpec {
                 ));
             }
         };
-        // scratch is expressed by OMITTING [workspace] — no redundant
-        // "scratch" spelling exists to drift from the default.
-        let workspace = raw
-            .workspace
-            .map(|w| workspace::parse_workspace(&w, origin))
-            .transpose()?
-            .unwrap_or_default();
         let rw_dirs = raw
             .sandbox
             .map(|s| validate_rw_dirs(&s, origin))
@@ -618,7 +604,6 @@ impl CapabilitySpec {
                 args: raw.invoke.args,
                 timeout_secs: raw.invoke.timeout_secs,
                 output,
-                workspace,
                 rw_dirs,
                 isolation,
                 context,
@@ -817,35 +802,20 @@ format = "text"
         assert!(err.contains("not a valid spec"), "got {err:?}");
     }
 
+    /// A RETIRED section is an unknown one: a stale operator spec that still
+    /// declares it fails loud at load rather than parsing into a block nothing
+    /// would ever read. (`~/.ducktape/capabilities` is operator-writable, so
+    /// this is the door a leftover file comes in.)
     #[test]
-    fn workspace_section_parses_and_defaults_off() {
-        // an absent section keeps the scratch-dir posture.
-        let plain = CapabilitySpec::parse(&spec_toml("ok"), "t").unwrap();
-        assert_eq!(plain.workspace, crate::WorkspaceMode::Scratch);
-
-        let full = format!(
-            "{}\n[workspace]\nmode = \"persistent\"\n",
-            spec_toml("ok")
-        );
-        let spec = CapabilitySpec::parse(&full, "t").unwrap();
-        assert_eq!(spec.workspace, crate::WorkspaceMode::Persistent);
-    }
-
-    #[test]
-    fn workspace_sections_fail_loud_on_unknown_or_bad_fields() {
+    fn retired_sections_fail_loud_at_load() {
         let base = spec_toml("ok");
         for (extra, expect) in [
-            // an unknown workspace mode and a typo'd field are both loud.
-            ("[workspace]\nmode = \"shared\"\n", "not supported"),
-            ("[workspace]\nmodes = \"persistent\"\n", "not a valid spec"),
-            (
-                "[workspace]\nmode = \"persistent\"\nroot = \"/x\"\n",
-                "not a valid spec",
-            ),
-            // the RETIRED [session] resume lane: a stale operator spec that
-            // still declares it fails loud at load rather than parsing into a
-            // block nothing would ever read. (`~/.ducktape/capabilities` is
-            // operator-writable, so this is the door a leftover file comes in.)
+            // the RETIRED [workspace] per-agent-persistence lane. every run's
+            // cwd is the workspace its provisioner materialized, so the section
+            // selected nothing even while it parsed.
+            ("[workspace]\nmode = \"persistent\"\n", "not a valid spec"),
+            ("[workspace]\nmode = \"scratch\"\n", "not a valid spec"),
+            // the RETIRED [session] resume lane.
             (
                 "[session]\ncapture = \"jsonl-events\"\nresume_args = [\"{session_id}\"]\n",
                 "not a valid spec",

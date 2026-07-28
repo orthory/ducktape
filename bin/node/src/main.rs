@@ -484,13 +484,6 @@ fn run_node(
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
     let storage_for_sync = storage.clone();
-    // per-agent host state, rooted OUTSIDE <storage> (D7 isolation floor): the
-    // persistent executor workspaces + session files must NOT be descendants of
-    // the key/consensus/blob tree, so a `..` from a run's cwd can't reach
-    // user.key/node keys/qmdb/blobstore. `DUCKTAPE_AGENT_WORKSPACES` / _SESSIONS
-    // override — see capability-host. host-local only, never consensus.
-    // Persistent agent workspaces stay under <storage>; portable run mounts
-    // live under agent_runs_root outside it.
     // 15s instead of commonware's 60s default: this read/write deadline is
     // the mesh's only half-open detector — see `constants::MESH_IO_TIMEOUT`.
     let rt_cfg = commonware_runtime::tokio::Config::default()

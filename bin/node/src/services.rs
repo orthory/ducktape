@@ -1676,7 +1676,6 @@ fn discover_executors(
     backend.probe().map_err(|error| format!("sandbox: {error}"))?;
     let providers = provider_host::discover(
         node_key,
-        provider_host::AgentDirs::under(&service.storage_dir),
         None,
         backend,
         kind,
