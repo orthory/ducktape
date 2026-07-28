@@ -83,6 +83,12 @@ fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
                 main_oid = oid;
             }
         }
+        // the pending section: branches whose objects the sender did not hold.
+        let pending_count = u32_at(bytes, &mut p);
+        for _ in 0..pending_count {
+            let bl = u32_at(bytes, &mut p);
+            p += bl + OID_LEN + 32;
+        }
         let pl = u32_at(bytes, &mut p);
         let pack = bytes[p..p + pl].to_vec();
         p += pl;
@@ -402,11 +408,20 @@ fn determinism_a_pushed_root_is_identical_without_the_pack() {
     assert_eq!(on_disk_head(&without_dir), None);
 
     // once the pack arrives, a retry catches the on-disk ref up — root unchanged.
+    // no second push is involved: the reopened node ALREADY holds the committed
+    // head (the catch-up map is durable) and knows the digest it is waiting on,
+    // so materialize alone closes the gap. re-pushing here would be a
+    // non-fast-forward, exactly as it would be against any other node.
     let arrived = blobstore::BlobHandle::default();
     let d2 = cap.stash(&arrived); // digest is identical (content-addressed)
     assert_eq!(d2, digest, "content-addressed digest is stable");
     let mut caught_up = Forge::with_blobs("forge", without_dir.clone(), arrived).unwrap();
-    push(&mut caught_up, None, &cap.head, &digest);
+    assert_eq!(
+        caught_up.root(),
+        cap.root,
+        "the reopened node keeps the committed head"
+    );
+    caught_up.materialize().unwrap();
     assert_eq!(caught_up.root(), cap.root, "root still sha256(new_oid)");
     assert_eq!(
         on_disk_head(&without_dir),
@@ -493,4 +508,122 @@ fn list_repos_reports_the_integration_head() {
 
     let _ = std::fs::remove_dir_all(&src_dir);
     let _ = std::fs::remove_dir_all(&dst_dir);
+}
+
+#[test]
+fn a_restart_without_the_pack_keeps_the_committed_head() {
+    // the committed head is CONSENSUS state; the on-disk git ref is a NODE-LOCAL
+    // cache that legitimately lags whenever the pack has not arrived. re-deriving
+    // the committed map from that lagging cache at boot silently rewinds this
+    // node's forge root — and recovery then fail-stops on
+    // "recomposed root_hash != sealed tip", bricking a node that was healthy.
+    let (src_dir, _src, cap) = source_one("restart-src");
+
+    let dir = tmp_repo("restart-nopack");
+    let blobs = blobstore::BlobHandle::default();
+    let digest = cap.stash(&blobstore::BlobHandle::default()); // digest only; NOT in `blobs`
+    let mut node = Forge::with_blobs("forge", dir.clone(), blobs).unwrap();
+    push(&mut node, None, &cap.head, &digest);
+    assert_eq!(
+        node.root(),
+        cap.root,
+        "committed head is live before the restart"
+    );
+    assert_eq!(on_disk_head(&dir), None, "no pack -> the ref cache lags");
+    drop(node);
+
+    // RESTART over the same directory, pack still absent.
+    let reopened =
+        Forge::with_blobs("forge", dir.clone(), blobstore::BlobHandle::default()).unwrap();
+    assert_eq!(
+        reopened.root(),
+        cap.root,
+        "a restart must not rewind the committed head to the lagging ref cache",
+    );
+    assert_eq!(
+        head_query(&reopened),
+        Some(cap.oid().to_string()),
+        "the committed head survives the restart",
+    );
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_pending_branch_still_snapshots() {
+    // `snapshot()` feeds BOTH recovery checkpointing and serving a joiner. a head
+    // whose objects this node does not hold is a state forge MODELS on purpose
+    // (that is the fork-safety invariant above) — so it must be serializable,
+    // not an error that stops this node checkpointing and admitting members.
+    let (src_dir, _src, cap) = source_one("snap-pending-src");
+
+    let dir = tmp_repo("snap-pending");
+    let digest = cap.stash(&blobstore::BlobHandle::default());
+    let mut node =
+        Forge::with_blobs("forge", dir.clone(), blobstore::BlobHandle::default()).unwrap();
+    push(&mut node, None, &cap.head, &digest);
+
+    let snap = node
+        .snapshot()
+        .expect("a committed head whose objects are absent must still serialize");
+
+    // and it round-trips onto a fresh namespace at the same root — the joiner
+    // lands in the SAME node-local state the server is in, pending and all.
+    let rt = tmp_repo("snap-pending-rt");
+    let mut fresh =
+        Forge::with_blobs("forge", rt.clone(), blobstore::BlobHandle::default()).unwrap();
+    fresh.install(&snap, cap.root).expect("install");
+    assert_eq!(fresh.root(), cap.root);
+    assert_eq!(on_disk_head(&rt), None, "the receiver is pending too");
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&rt);
+}
+
+#[test]
+fn the_catch_up_map_clears_on_arrival_and_a_corrupt_one_is_fail_stop() {
+    let (src_dir, _src, cap) = source_one("pendfile-src");
+    let dir = tmp_repo("pendfile");
+    let pending_file = dir.join(".pending.bin");
+
+    let digest = cap.stash(&blobstore::BlobHandle::default());
+    let mut node =
+        Forge::with_blobs("forge", dir.clone(), blobstore::BlobHandle::default()).unwrap();
+    push(&mut node, None, &cap.head, &digest);
+    assert!(
+        pending_file.exists(),
+        "an outstanding head must be durable, not RAM-only"
+    );
+
+    // a tampered map is FAIL-STOP, exactly like a corrupt tracker: booting on a
+    // rewound or invented branch map composes a wrong root either way.
+    let good = std::fs::read(&pending_file).unwrap();
+    std::fs::write(&pending_file, &good[..good.len() - 1]).unwrap();
+    assert!(
+        Forge::with_blobs("forge", dir.clone(), blobstore::BlobHandle::default()).is_err(),
+        "a truncated catch-up map must refuse to boot"
+    );
+    std::fs::write(&pending_file, b"XXXX").unwrap();
+    assert!(
+        Forge::with_blobs("forge", dir.clone(), blobstore::BlobHandle::default()).is_err(),
+        "a catch-up map without the magic must refuse to boot"
+    );
+
+    // once the pack arrives nothing is outstanding, so the file goes away.
+    std::fs::write(&pending_file, &good).unwrap();
+    let arrived = blobstore::BlobHandle::default();
+    cap.stash(&arrived);
+    let mut caught_up = Forge::with_blobs("forge", dir.clone(), arrived).unwrap();
+    caught_up.materialize().unwrap();
+    assert_eq!(on_disk_head(&dir), Some(cap.oid()), "materialized");
+    assert!(
+        !pending_file.exists(),
+        "nothing outstanding -> no stale file to re-adopt from"
+    );
+    assert_eq!(caught_up.root(), cap.root);
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&dir);
 }
