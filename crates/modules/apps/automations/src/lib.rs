@@ -47,12 +47,38 @@
 //! it detaches this module from that one channel instead of deleting a rule
 //! that also serves others.
 //!
+//! ## One author rendering, and it is the ACTOR domain
+//!
+//! [`actor_of`] is the ONE rendering of a chat author in this module:
+//! `sdk::Origin::actor_string` of the origin that author handle names. it feeds
+//! all three consumers — the `{author}`/`{mention}` substitutions, and the
+//! `mention` trigger filter — because the alternative is a rendering whose
+//! meaning depends on WHERE it is substituted, and the member path cannot
+//! afford that.
+//!
+//! an inbox member is not a display handle: it is a QUEUE NAME in the
+//! actor-string domain, and inbox refuses a `MarkRead`/`Clear` from anyone but
+//! `member`'s own origin. so a `member_template` of `{author}` produces
+//! `ext:{hex}` — the very string the triggering author's own signed frames
+//! carry — and the notification is ackable. rendering the same author as the
+//! index tier's `user:{hex}` display handle instead would create a queue no
+//! origin can ever own: mail that is delivered, counted, and unackable forever.
+//! that is exactly why there is one rendering here and it is the machine one.
+//!
 //! ## Loop prevention
 //!
 //! a rule fires ONLY when the event author is `AuthorRef::User(_)`. posts authored
 //! by modules or agents — including this module's own `PostMessage` follow-ups —
 //! never trigger rules, so an automation posting into a hooked channel cannot
 //! cascade. this mirrors the agent module's user-author-only decision.
+//!
+//! that guard is also what makes `{author}` safe as a member: the ONLY author a
+//! firing rule ever sees is an external user, so `{author}` always renders an
+//! ownable queue. `{mention}` carries no such guarantee (a mentioned agent or
+//! module is nobody's queue), and neither does a literal member string — both
+//! are the rule author's own choice, in the same class as any other direct
+//! `InboxMsg::Deliver`, which inbox takes from any origin to any member by
+//! design.
 //!
 //! ## No-fail hook arm, probes, and atomicity (P2)
 //!
@@ -125,8 +151,6 @@
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
-
-use std::fmt::Write as _;
 
 use chat::{
     AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, decode_event as chat_decode_event,
@@ -551,11 +575,8 @@ impl Automations {
         } else {
             Some(String::new())
         };
-        let author_display = display_author(&author);
-        let mention_display = mentions
-            .first()
-            .map(display_author)
-            .unwrap_or_else(String::new);
+        let author_actor = actor_of(&author);
+        let mention_actor = mentions.first().map(actor_of).unwrap_or_else(String::new);
 
         // evaluate in deterministic rule_id order (roster order).
         let mut budget = 0usize;
@@ -595,9 +616,9 @@ impl Automations {
             let vars = TemplateVars {
                 channel: &channel_id,
                 seq: Some(seq),
-                author: &author_display,
+                author: &author_actor,
                 text,
-                mention: &mention_display,
+                mention: &mention_actor,
             };
             match self
                 .build_and_emit(ctx, rule, &channel_id, seq, &vars)
@@ -822,7 +843,7 @@ impl Automations {
         if let Some(want) = &rule.trigger.mention
             && !mentions
                 .iter()
-                .any(|author| display_author(author).contains(want.as_str()))
+                .any(|author| actor_of(author).contains(want.as_str()))
         {
             return false;
         }
@@ -845,7 +866,7 @@ impl Automations {
     }
 }
 
-// ---- deterministic author display -------------------------------------------
+// ---- the one author rendering: the ACTOR-STRING domain -----------------------
 
 struct TemplateVars<'a> {
     channel: &'a str,
@@ -855,24 +876,34 @@ struct TemplateVars<'a> {
     mention: &'a str,
 }
 
-/// the deterministic display form matched by `mention` filters and substituted
-/// for `{author}`. users render as their hex pubkey; agents as `module/agent_id`
-/// so a `mention` filter of the agent id matches.
-fn display_author(author: &AuthorRef) -> String {
+/// the ONE deterministic rendering of a chat author: its
+/// [`sdk::Origin::actor_string`], DERIVED from the origin the author handle
+/// carries and never spelled here. it is what `{author}`/`{mention}` substitute
+/// to and what a `mention` filter matches against.
+///
+/// the actor domain is not cosmetic — a `member_template` substitutes through
+/// this same function, and an inbox queue IS named in this domain, so the
+/// rendering a rule produces has to be one an origin can actually own. the
+/// index tier's `user:{hex}` display handle is a DIFFERENT domain, and this
+/// module deliberately does not speak it: no origin's actor string is ever
+/// `user:…`, so a queue named that could never be marked read or cleared.
+///
+/// `AuthorRef::Agent` is the one arm with no origin of its own — an agent posts
+/// under `Origin::Module(module)`, and `agent_id` REFINES that module's actor
+/// string so a `mention` filter can address one agent rather than every post
+/// its module makes.
+fn actor_of(author: &AuthorRef) -> String {
     match author {
-        AuthorRef::User(bytes) => format!("user:{}", hex(bytes)),
-        AuthorRef::Agent { module, agent_id } => format!("{module}/{agent_id}"),
-        AuthorRef::Module(module) => module.clone(),
-        AuthorRef::System => "system".into(),
+        AuthorRef::User(key) => Origin::External(key.clone()).actor_string(),
+        AuthorRef::Agent { module, agent_id } => {
+            format!(
+                "{}/{agent_id}",
+                Origin::Module(module.clone()).actor_string()
+            )
+        }
+        AuthorRef::Module(module) => Origin::Module(module.clone()).actor_string(),
+        AuthorRef::System => Origin::System.actor_string(),
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 /// concatenate a message's text blocks: spans within paragraph/quote blocks are

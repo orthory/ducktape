@@ -246,6 +246,26 @@ async fn reject_roundtrip(
     assert_eq!(replies(native).await, replies(wasm).await);
 }
 
+/// one rule's run-history details off one host — the seam a `DeliverInbox`
+/// action records the member string it ACTUALLY emitted into, which is
+/// otherwise only observable as an inbox root (inbox has no wire query).
+async fn run_details(h: &Host, rule_id: &str) -> Vec<String> {
+    let reply = h
+        .query(
+            "automations",
+            &encode_query(&AutomationsQuery::RunHistory {
+                rule_id: rule_id.into(),
+                limit: 64,
+            }),
+        )
+        .await
+        .expect("history query");
+    let AutomationsReply::History(records) = decode_reply(&reply).expect("decode") else {
+        panic!("expected a history reply");
+    };
+    records.into_iter().map(|r| r.detail).collect()
+}
+
 /// decoded task list off one host (cross-host equality is separately pinned
 /// via the sibling roots; this is for spot checks).
 async fn task_ids(h: &Host) -> Vec<String> {
@@ -354,7 +374,12 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
                 "r-inbox",
                 on_general(None),
                 Action::DeliverInbox {
-                    member_template: "ops-{channel}".into(),
+                    // `{author}` is the member domain's whole point: an inbox
+                    // queue is named in `Origin::actor_string`, so the rendering
+                    // the GUEST computes has to be one the triggering author can
+                    // ack. rendered wrong, the delivered member differs from
+                    // native's and the inbox sibling root diverges below.
+                    member_template: "{author}".into(),
                     kind: "note".into(),
                     body_template: "{author} said: {text}".into(),
                 },
@@ -402,6 +427,19 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
             native.module_root("inbox").expect("inbox registered"),
             inbox_genesis,
             "the hooked post delivered nothing to the inbox"
+        );
+        // and it delivered into the ACKABLE queue: the member the COMPILED
+        // COMPONENT substituted for `{author}` is the triggering author's own
+        // actor string, derived here and never spelled. inbox refuses an ack
+        // from anyone but that origin, so any other rendering is mail nobody
+        // can ever mark read.
+        assert_eq!(
+            run_details(&wasm, "r-inbox").await,
+            vec![format!(
+                "delivered inbox note to {}",
+                Origin::External(key(0xA1)).actor_string()
+            )],
+            "the guest rendered the member outside the actor-string domain"
         );
 
         // ---- a post WITHOUT the text filter's needle: r-post skips (its
