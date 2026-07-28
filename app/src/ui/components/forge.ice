@@ -25,6 +25,11 @@
 // TIME IS A HEIGHT. A review's `created_at` IS its block height — this chain
 // stamps `consensus_time = height` — so a review is stamped with `FinalityChip`
 // at that height. No wall clock appears anywhere on this screen.
+//
+// EVERY ROUTE OUT OF THIS FILE IS A NAMED EVENT. A component may not name an
+// app handler — it declares what happened and the call site decides. The event
+// name here IS the handler name view.ice routes it back to, with the same
+// payload arity, so the wiring is `<event> -> <event> _`.
 
 // ── OVERVIEW ──────────────────────────────────────────────────────────────
 
@@ -59,7 +64,9 @@ component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str)
 // PR/issue tallies and the `updated` stamp all want fields `RepoHead` does not
 // have, so the row holds what is true instead of what would look full.
 component RepoCard(repo:ForgeRepo)
-  button label="Open repo" description=repo.name w=fill p=0.0 @icon_action -> forge_open_repo(repo.name)
+  emits
+    forge_open_repo(str)
+  button label="Open repo" description=repo.name w=fill p=0.0 @icon_action -> emit(forge_open_repo, repo.name)
     box w=fill pl=17.0 pr=17.0 pt=15.0 pb=15.0
       col w=fill gap=10.0
         row w=fill gap=8.0 align=center
@@ -108,9 +115,11 @@ component RepoCrumb(org:str, repo:str, branch:str, open:bool)
 // `N issue` tallies and its language dot are the same missing wire fields the
 // card omits, so the row is the name and the selection plate.
 component RepoMenuRow(repo:ForgeRepo, active:bool)
+  emits
+    forge_open_repo(str)
   col #root w=fill
     if active
-      button label="Switch repo" description=repo.name w=fill p=0.0 @icon_action -> forge_open_repo(repo.name)
+      button label="Switch repo" description=repo.name w=fill p=0.0 @icon_action -> emit(forge_open_repo, repo.name)
         box w=fill pl=9.0 pr=9.0 pt=8.0 pb=8.0
           row w=fill gap=9.0 align=center
             text repo.name w=fill size=13.0 wrap=none font=display @text-primary
@@ -118,7 +127,7 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
         hovered bg=elevated text=fg
         pressed bg=subtle text=fg
     if !active
-      button label="Switch repo" description=repo.name w=fill p=0.0 @icon_action -> forge_open_repo(repo.name)
+      button label="Switch repo" description=repo.name w=fill p=0.0 @icon_action -> emit(forge_open_repo, repo.name)
         box w=fill pl=9.0 pr=9.0 pt=8.0 pb=8.0
           row w=fill gap=9.0 align=center
             text repo.name w=fill size=13.0 wrap=none font=display @text-primary
@@ -299,8 +308,10 @@ component ForgeCodeEmpty(name:str, note:str)
 // zero on every row or a diff-per-row fan-out on every listing. When the
 // summary wire carries them, the label is `DiffCount` and nothing else.
 component TrackerRow(item:ForgeItem)
+  emits
+    forge_open_item(i64)
   col #root w=fill
-    button label="Open item" description=item.title w=fill p=0.0 @icon_action -> forge_open_item(item.number)
+    button label="Open item" description=item.title w=fill p=0.0 @icon_action -> emit(forge_open_item, item.number)
       box w=fill pl=24.0 pr=24.0 pt=13.0 pb=13.0
         row w=fill gap=13.0 align=start
           match item.kind
@@ -350,10 +361,12 @@ component IssueStateGlyph(state:str)
 
 // The back control names the list it returns to, rather than saying `Back`.
 component BackToList(kind:str)
+  emits
+    forge_close_item
   col #root
     match kind
       "pr"
-        button label="Back to pull requests" p=0.0 @icon_action -> forge_close_item
+        button label="Back to pull requests" p=0.0 @icon_action -> emit(forge_close_item)
           box pl=7.0 pr=9.0 pt=4.0 pb=4.0
             row gap=5.0 align=center
               text "‹" size=14.0 wrap=none @text-muted
@@ -362,7 +375,7 @@ component BackToList(kind:str)
           hovered bg=row_hover text=fg
           pressed bg=elevated text=fg
       "issue"
-        button label="Back to issues" p=0.0 @icon_action -> forge_close_item
+        button label="Back to issues" p=0.0 @icon_action -> emit(forge_close_item)
           box pl=7.0 pr=9.0 pt=4.0 pb=4.0
             row gap=5.0 align=center
               text "‹" size=14.0 wrap=none @text-muted
@@ -463,13 +476,15 @@ component MergeAdvisory(change_requests:i64)
 
 // The merge write, on the ink plate with the glyph the artifact gives it.
 component MergeButton(busy:bool, disabled:bool)
+  emits
+    forge_merge_submit
   col #root
     if busy
-      button label="Merging" disabled=true @primary_action px-18px py-9px rounded-9px -> forge_merge_submit
+      button label="Merging" disabled=true @primary_action px-18px py-9px rounded-9px -> emit(forge_merge_submit)
         row gap=7.0 align=center
           text "Merging…" size=13.0 wrap=none font=display @text-primary_fg
     if !busy
-      button label="Merge pull request" disabled=disabled @primary_action px-18px py-9px rounded-9px -> forge_merge_submit
+      button label="Merge pull request" disabled=disabled @primary_action px-18px py-9px rounded-9px -> emit(forge_merge_submit)
         row gap=7.0 align=center
           Icon name="pull-request" tone="paper" px=13.0
           text "Merge pull request" size=13.0 wrap=none font=display @text-primary_fg
