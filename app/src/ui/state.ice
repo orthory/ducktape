@@ -127,6 +127,10 @@ state
   settings_height:i64 = 0
   settings_key_path = ""
   settings_key_state = ""
+  // THIS DEVICE'S OWN USER KEY, full hex — the `me` the post gate tests against
+  // `channel_members`. `account_id` cannot serve: it is a short_label of the
+  // identity module's account id, not the key a membership row carries.
+  settings_user_key = ""
   settings_open_tabs:i64 = 0
   settings_generation:i64 = 0
   account_bound = false
@@ -236,6 +240,7 @@ state
   // NODE FACTS — everything /v1/status already publishes that the app dropped.
   // Backs the status-pill hover card, the FINALITY/ROUND cards and the gc line.
   node_facts_generation:i64 = 0
+  node_version = ""
   node_root_hash = ""
   node_view:i64 = 0
   node_quorum:i64 = 0
@@ -253,19 +258,22 @@ state
   forge_tab = "pulls"
   forge_repo_menu = false
   forge_item_tab = "conversation"
-  // DIRECT — a DM is a two-party members-only channel; these name the peer.
+  // DIRECT — a DM is a two-party members-only channel; `active_dm_peer` names
+  // the peer and `dm_peers` carries the rest of him, so the header plate is a
+  // filter over that list. There is deliberately no `active_dm_name` /
+  // `active_dm_is_agent` pair: nothing ever wrote them, and a header fed from
+  // two fields no handler fills renders a blank name.
   dm_peers_generation:i64 = 0
   active_dm_peer = ""
-  active_dm_name = ""
-  active_dm_is_agent = false
-  // HUDDLE — whether SHE is in it, where, since when, and the tick that drives
-  // the elapsed clock.
+  // HUDDLE — whether SHE is in it, where, since when, the tick that drives the
+  // elapsed clock, whether the panel is popped, and who else is on the call.
   huddle_joined = false
   huddle_channel = ""
   huddle_channel_name = ""
   huddle_joined_at:i64 = 0
   huddle_now:i64 = 0
   huddle_popped = false
+  huddle_roster:[HuddleParticipant] = []
   // The event inspector every finality mark opens.
   // EXPLORER — one query across every module, filtered by result kind.
   explorer_query = ""

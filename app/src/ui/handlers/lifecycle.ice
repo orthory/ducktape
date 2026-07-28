@@ -602,6 +602,7 @@ on peers_failed(cause)
 // instead of as a measured zero.
 on node_facts_loaded(next)
   return if next.generation != node_facts_generation
+  node_version = next.version
   node_root_hash = next.root_hash
   node_last_finalized = next.last_finalized_at
   node_checkpoint = next.checkpoint_height
@@ -624,6 +625,7 @@ on settings_loaded(next)
   settings_height = next.height
   settings_key_path = next.key_path
   settings_key_state = next.key_state
+  settings_user_key = next.user_key
   settings_open_tabs = next.open_tabs
 
 on settings_failed(cause)

@@ -49,15 +49,21 @@ component DmRow(peer:DmPeer, selected:bool)
 // The chat header's DM identity — a 24px peer plate and the peer's name, in
 // place of the `# channel` title. The AGENT badge marks a machine peer.
 //
-// NOT MOUNTED YET. It replaces `text "#"` + `text active_channel_name` at
-// view.ice:320-321, under `if !empty(active_dm_peer)` with those two lines
-// moved under the `if empty(active_dm_peer)` half. It needs NO new backend fn
-// and no new state: `active_dm_peer` is written at handlers/chat.ice:94 and
-// `dm_peers` already reaches the view at view.ice:296, so the peer is a filter
-// — `for peer in dm_peers` / `if peer.key == active_dm_peer`.
-// `active_dm_name`/`active_dm_is_agent` (state.ice:259-260) are NOT the route:
-// no handler anywhere writes either one, so they are dead declarations rather
-// than data, and feeding this plate from them would render a blank name.
+// MOUNTED in the chat header (view.ice), replacing `text "#"` + `text
+// active_channel_name` under `if !empty(active_dm_peer)`, with those two lines
+// kept for the `if empty(active_dm_peer)` half. It needs NO new backend fn and
+// no new state: `active_dm_peer` is written by `choose_dm` and `dm_peers`
+// already reaches the view, so the peer is a filter — `for peer in dm_peers` /
+// `if peer.key == active_dm_peer`.
+//
+// `active_dm_name`/`active_dm_is_agent` were NOT the route and are DELETED from
+// state.ice: no handler anywhere wrote either one, so they were dead
+// declarations rather than data, and feeding this plate from them would have
+// rendered a blank name over a permanently human avatar.
+//
+// A peer who is not on the identity roster matches no row and this draws
+// nothing; the header then falls through to the `#` title, which for a DM is
+// the derived two-party name. An empty plate is never the render.
 component DmHeader(peer:DmPeer)
   row #root gap=9.0 align=center
     PrincipalAvatar initials=peer.initials is_agent=peer.is_agent plate=24.0 ink=9.0 ring=""

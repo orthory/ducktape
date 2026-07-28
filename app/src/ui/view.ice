@@ -317,8 +317,21 @@ view
                     col w=fill
                       box w=fill h=50.0 pl=18.0 pr=18.0
                         row w=fill h=fill gap=9.0 align=center
-                          text "#" size=14.0 wrap=none font=medium @text-hint
-                          text active_channel_name size=14.0 wrap=none font=display @text-fg
+                          // A DM IS A PERSON, NOT A `#`. The peer is a filter
+                          // over `dm_peers` — Ice cannot index a list by field,
+                          // so the row that matches `active_dm_peer` draws and
+                          // the rest do not. A DM whose peer has left the
+                          // identity roster matches nothing and falls back to
+                          // the channel title below, which is the derived
+                          // two-party name — never a blank plate.
+                          if !empty(active_dm_peer)
+                            for peer in dm_peers
+                              if peer.key == active_dm_peer
+                                DmHeader peer=peer
+                          if empty(active_dm_peer)
+                            text "#" size=14.0 wrap=none font=medium @text-hint
+                          if empty(active_dm_peer)
+                            text active_channel_name size=14.0 wrap=none font=display @text-fg
                           if active_channel_archived
                             Badge.Outline label="Archived"
                           if active_channel_members_only
@@ -405,16 +418,26 @@ view
                                         box w=fill h=1.0 bg=brand/40
                                           text ""
                                     stack #message(message.id) w=fill
-                                      MessageCard message=message selected=(message.seq == selected_message_seq) hovered=(message.seq == hovered_message_seq) disabled=loading
-                                        events
-                                          message_entered -> message_entered _
-                                          message_exited -> message_exited _
-                                          add_reaction_at -> add_reaction_at _ _
-                                          remove_reaction_at -> remove_reaction_at _ _
-                                          open_thread_for -> open_thread_for _
-                                          open_message_actions_accessibly -> open_message_actions_accessibly _ _ _
-                                          open_message_reactions -> open_message_reactions _ _ _
-                                          open_message_actions -> open_message_actions _ _ _
+                                      // THE ONE DASHED BORDER IN THE CONSOLE.
+                                      // `message.pending` is this app's only
+                                      // optimistic write — seeded by
+                                      // `optimistic_message`, cleared by
+                                      // `merge_message_send_result` — so the
+                                      // design system's "not yet settled is
+                                      // dashed" rule is drawn here and nowhere
+                                      // else. The ring is over the card, so the
+                                      // card keeps its own plate.
+                                      UnfinalizedFrame pending=message.pending
+                                        MessageCard message=message selected=(message.seq == selected_message_seq) hovered=(message.seq == hovered_message_seq) disabled=loading
+                                          events
+                                            message_entered -> message_entered _
+                                            message_exited -> message_exited _
+                                            add_reaction_at -> add_reaction_at _ _
+                                            remove_reaction_at -> remove_reaction_at _ _
+                                            open_thread_for -> open_thread_for _
+                                            open_message_actions_accessibly -> open_message_actions_accessibly _ _ _
+                                            open_message_reactions -> open_message_reactions _ _ _
+                                            open_message_actions -> open_message_actions _ _ _
                         overlay when=(selected_message_seq > 0 && message_action != "toolbar") dismiss=clear_message_selection backdrop=transparent p=8.0 align-x=end align-y=start
                           content
                             space w=fill h=fill
@@ -533,10 +556,18 @@ view
                   // carries the artifact's own 12/16/14 region padding.
                   box w=fill h=1.0 bg=separator
                     space w=1.0 h=1.0
+                  // THE GATE ABOVE THE PLATE. `post_gate` is called here rather
+                  // than mirrored into a state field: it is pure over three
+                  // facts the view already holds, `channel_members` lands in
+                  // SEVEN handlers, and a seventh copy is six chances to drift.
+                  // An empty reason renders nothing and gates nothing.
+                  if !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key))
+                    box w=fill pl=16.0 pr=16.0 pt=12.0
+                      ComposerGate reason=post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
                   box w=fill pl=16.0 pr=16.0 pt=12.0 pb=14.0
                     box w=fill bg=surface border=control_line border-w=1.0 r=12.0 clip=true shadow=shadow_popover shadow-y=1.0 shadow-blur=2.0
                       col w=fill
-                        editor #message <-> message_editor hint="Message the channel…" disabled=(loading || !connected || empty(active_channel) || active_channel_archived) min-h=44.0 max-h=150.0 size=13.5 line-h=1.3 p=6.6 wrap=word key-binding=composer_keys() -> send_message_submit
+                        editor #message <-> message_editor hint="Message the channel…" disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key))) min-h=44.0 max-h=150.0 size=13.5 line-h=1.3 p=6.6 wrap=word key-binding=composer_keys() -> send_message_submit
                           active bg=transparent border=transparent value=fg placeholder=hint selection=fg/18 border-w=0.0 r=0.0
                           hovered bg=transparent border=transparent
                           focused bg=transparent border=ring border-w=1.0
@@ -545,7 +576,7 @@ view
                           row w=fill gap=10.0 align=center
                             space w=fill
                             text "↵ send · ⇧↵ newline" size=10.5 wrap=none font=code_medium @text-label
-                            button "Send" disabled=(loading || !connected || empty(active_channel) || active_channel_archived || empty(trim(editor_text(message_editor)))) h=29.0 p=7.0 @primary_action -> send_message_submit
+                            button "Send" disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)) || empty(trim(editor_text(message_editor)))) h=29.0 p=7.0 @primary_action -> send_message_submit
                 if channel_settings_open && !empty(active_channel)
                   box w=1.0 h=fill bg=fg/8
                     text ""
@@ -613,14 +644,27 @@ view
                             scroll dir=vertical w=fill h=fill
                               col w=fill gap=1.0
                                 for thread_message in thread_messages
-                                  ThreadMessageCard message=thread_message selected=(thread_message.seq == thread_target_seq) hovered=(thread_message.seq == thread_hovered_seq) disabled=loading
-                                    events
-                                      thread_message_entered -> thread_message_entered _
-                                      thread_message_exited -> thread_message_exited _
-                                      add_reaction_at -> add_reaction_at _ _
-                                      remove_reaction_at -> remove_reaction_at _ _
-                                      open_thread_message_actions -> open_thread_message_actions _ _ _
-                                      open_thread_message_reactions -> open_thread_message_reactions _ _ _
+                                  // THE ROOT GETS ITS OWN DIVIDED BLOCK. One
+                                  // loop, one discriminant: `active_thread_seq`
+                                  // IS the root's seq and `thread_messages`
+                                  // carries it, so the split needs no state and
+                                  // no fn. The root's read-only block is the
+                                  // artifact's; its hover bar, reactions and
+                                  // edit/delete are not lost, they stay on the
+                                  // same message in the stream one pane over,
+                                  // which is on screen the whole time this rail
+                                  // is.
+                                  if thread_message.seq == active_thread_seq
+                                    ThreadParentBlock message=thread_message
+                                  if thread_message.seq != active_thread_seq
+                                    ThreadMessageCard message=thread_message selected=(thread_message.seq == thread_target_seq) hovered=(thread_message.seq == thread_hovered_seq) disabled=loading
+                                      events
+                                        thread_message_entered -> thread_message_entered _
+                                        thread_message_exited -> thread_message_exited _
+                                        add_reaction_at -> add_reaction_at _ _
+                                        remove_reaction_at -> remove_reaction_at _ _
+                                        open_thread_message_actions -> open_thread_message_actions _ _ _
+                                        open_thread_message_reactions -> open_thread_message_reactions _ _ _
                                 if thread_has_more && thread_next_reply_offset >= 0
                                   button "Load more replies" disabled=(thread_loading || mutation_phase != "idle") w=fill h=28.0 p=5.0 @secondary_action -> load_more_thread
                                     active bg=transparent text=muted r=7.0
@@ -746,11 +790,12 @@ view
           row w=fill h=fill
             box w=230.0 h=fill bg=sidebar clip=true
               col w=fill h=fill gap=0.0
-                box w=fill pl=14.0 pr=14.0 pt=14.0 pb=11.0
-                  row w=fill gap=8.0 align=center
-                    text "Pages" size=13.5 wrap=none font=display @text-fg
-                    text len(pages) size=10.5 wrap=none font=code_medium @text-hint
-                    space w=fill
+                // THE SIDEBAR HEAD, from the component that owns the shape.
+                // Chat's head is deliberately NOT this one: it interleaves a
+                // connection dot BETWEEN the title and the count, which is past
+                // the `space w=fill` this signature puts the slot behind.
+                SidebarHeader title="Pages" count=len(pages)
+                  col
                     if !page_create_open
                       button label="New page" disabled=(loading || mutation_phase != "idle" || !connected) p=0.0 @icon_action -> toggle_page_create
                         Icon name="plus" tone="label" px=16.0
@@ -764,8 +809,6 @@ view
                         active bg=separator text=muted border=transparent border-w=1.0 r=5.0
                         hovered bg=subtle text=fg
                         pressed bg=subtle text=fg
-                box w=fill h=1.0 bg=separator
-                  space w=1.0 h=1.0
                 if page_create_open
                   row w=fill h=28.0 gap=5.0 align=center
                     input "" #new-page label="New page title" <-> page_draft hint="New page" disabled=(loading || mutation_phase != "idle" || !connected) submit=create_page_submit w=fill p=6.2 text-size=13.0 line-h=1.2 @control
@@ -1069,8 +1112,12 @@ view
                           button "Post" disabled=(mutation_phase != "idle" || empty(trim(block_comment_draft)) || block_comment_threads_loading || block_thread_comments_loading) h=28.0 p=5.0 @primary_action -> post_block_comment_submit
         files:
           col w=fill h=fill
-            ScreenHeader title="Files" meta=fs_path
-              space w=1.0 h=1.0
+            // THE CRUMB BAR, not a screen header: where you are, what is here,
+            // and who may write under it. The counts are pure folds over the
+            // listing already on screen — never a second `files_ls`.
+            CrumbBar path=fs_path dirs=fs_dir_count(fs_entries) files=fs_file_count(fs_entries)
+              events
+                fs_open_dir -> fs_open_dir _
             // WHERE THE WRITE CONTROLS LIVE — decided here, once. The artifact's
             // Files screen is a read-only browser, but this app ships a working
             // mkdir / new file / delete / edit and dropping them would be a
@@ -1434,18 +1481,17 @@ view
                               if !empty(forge_file_path) && forge_file_binary
                                 ForgeCodeEmpty name=forge_file_path note="This is not text — the reader shows no preview for it."
                               if !empty(forge_file_path) && !forge_file_binary
-                                col w=fill p=13.0 gap=9.0
-                                  // ONE TEXT RUN, NOT NUMBERED LINES. The
-                                  // artifact's 44px gutter needs the blob split
-                                  // into rows, and `forge_blob` hands back one
-                                  // string — there is no line splitter on the
-                                  // wire and Ice has no string ops, so
-                                  // `ForgeCodeLine` has no list to walk yet.
-                                  // The source itself is real and complete; the
-                                  // numbering is what is missing, and inventing
-                                  // it here would mean guessing where the lines
-                                  // break.
-                                  text forge_file_text w=fill size=12.0 line-h=1.65 font=code @text-accent_fg
+                                col w=fill pt=13.0 pb=13.0 gap=9.0
+                                  // NUMBERED LINES. `source_lines` is the exact
+                                  // counterpart `diff_lines` already is for a
+                                  // patch: `forge_blob` hands back ONE string
+                                  // and Ice has no string ops, so the split
+                                  // happens in backend.rs and the gutter counts
+                                  // the rows it actually produced rather than
+                                  // guessing where the file breaks.
+                                  col w=fill
+                                    for line in source_lines(forge_file_text)
+                                      ForgeCodeLine number=line.number code=line.text
                                   if forge_file_truncated
                                     text "Truncated at the reader's 64 KiB window — the file on the node is whole." size=11.5 wrap=none @text-label
                       "issues"
@@ -1804,6 +1850,7 @@ view
                           StatCard label="VALIDATORS REACHED" value=tally_label(node_reachable, node_quorum) note="of quorum"
                       GroupCard
                         col w=fill
+                          NodeBuildRow version=node_version last=false
                           KeyValueRow label="App hash" value=node_root_hash last=true
                       if !empty(node_peers)
                         col w=fill gap=9.0
@@ -1928,6 +1975,23 @@ view
                                   if !empty(op.trace)
                                     text op.trace size=12.0 font=code @text-muted
                                   text op.payload size=13.5 @text-fg
+        // HUDDLE — the docked pill when you are in one and looking elsewhere,
+        // the panel when you have popped it out. Both read the local session
+        // facts: the elapsed clock counts from `huddle_joined_at` against the
+        // 1 Hz tick, never against a chain value, because consensus_time is a
+        // block height on a validator network.
+        huddle:
+          col w=fill h=fill
+            if huddle_joined && huddle_popped
+              HuddlePanel channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at) roster=huddle_roster
+                events
+                  dock_huddle -> dock_huddle
+                  huddle_go_channel -> huddle_go_channel
+                  leave_huddle_here -> leave_huddle_here
+            if huddle_joined && !huddle_popped && huddle_channel != active_channel
+              HuddleDockedPill channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at)
+                events
+                  pop_huddle -> pop_huddle
         palette:
           stack w=fill h=fill
             // THE CHANNEL MODAL. The artifact picks VISIBILITY here; the chat

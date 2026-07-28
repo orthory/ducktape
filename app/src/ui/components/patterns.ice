@@ -2,17 +2,18 @@
 // so that no screen ever spells them itself. Finality words, the unfinalized
 // ring, the refusal plate, and the human-vs-agent shape all live here.
 //
-// TWO SANCTIONED SUBSTITUTIONS — settled, do not re-litigate per screen:
+// ONE SANCTIONED SUBSTITUTION — settled, do not re-litigate per screen:
 //
-// 1. DASHED BORDER -> 1.5px SOLID `pending_line`. The artifact draws anything
-//    not yet settled with a dashed outline. iced's Border is colour + width +
-//    radius only; ui-lang's `canvas` can stroke a dash, but at the pinned rev
-//    there is no `zstack`, `stack` cannot size a canvas from its sibling, and
-//    UnfinalizedFrame's signature carries no width/height to feed one. So the
-//    ring is solid at 1.5px in `pending_line` — the artifact's own dash hex.
-// 2. GRADIENT -> FLAT SURFACE. The console is deliberately opaque; every
-//    rgba()+backdrop-filter plate in the glass file is painted at its value
-//    from the designer's own non-glass variant.
+// GRADIENT -> FLAT SURFACE. The console is deliberately opaque; every
+// rgba()+backdrop-filter plate in the glass file is painted at its value from
+// the designer's own non-glass variant.
+//
+// THE DASH IS NO LONGER A SUBSTITUTION. It used to be: iced's Border is colour
+// + width + radius only, so the ring shipped SOLID at 1.5px in `pending_line`.
+// ui-lang 2.0 lowers `border-dash=` to a canvas stroke over the surface, so the
+// artifact's rule — "아직 확정되지 않은 것은 모두 점선 테두리입니다" — is now drawn
+// as the dashes it always said, and this component is the ONLY place that
+// spells them.
 
 // THE FINALITY STORY. Three phases, the same words on every surface that
 // carries a write: messages, reviews, merges, proposals, the inspector.
@@ -43,15 +44,22 @@ component FinalityChip(phase:str, height:i64)
             if height > 0
               text height size=9.0 wrap=none font=code_semibold @text-success_tick
 
-// UNFINALIZED MEANS A RING. Wrap any card, row or bubble whose write has not
-// settled; the ring is drawn over the child so the child keeps its own plate.
-// The radius is the app's card radius — the frozen signature carries no
+// UNFINALIZED MEANS A DASHED RING. Wrap any card, row or bubble whose write has
+// not settled; the ring is drawn over the child so the child keeps its own
+// plate. The radius is the app's card radius — the frozen signature carries no
 // radius prop, and every wrapped surface today is a 10-12px card.
+//
+// MOUNTED on the chat stream (view.ice), around every message while
+// `ChatMessage.pending` holds — the one optimistic write this app makes, seeded
+// by `optimistic_message` and cleared by `merge_message_send_result`. It is the
+// only surface in the console that draws a dash, which is the point: the rule
+// lives HERE, and a second screen that grows an unsettled write wraps it in
+// this rather than spelling a dash of its own.
 component UnfinalizedFrame(pending:bool)
   stack #root w=fill
     slot
     if pending
-      box w=fill h=fill bg=transparent border=pending_line border-w=1.5 r=10.0
+      box w=fill h=fill bg=transparent border=pending_line border-w=1.5 border-dash=(4.0, 3.0) r=10.0
         space w=1.0 h=1.0
 
 // PERMISSION GATING SHOWS ITS REASON. Never hide a control and never disable
@@ -131,20 +139,23 @@ component AgentSquare(initials:str, plate:f64, ink:f64, radius:f64)
 // machine, which is identity; this says what that machine is DOING, which is
 // activity. Both appear on the artifact's agent row, together.
 //
-// NOT MOUNTED YET, for want of the join rather than the geometry. The label is
-// the artifact's `#142 재분석 중` — a run, not an agent — and `AgentRow` carries
-// no run. `load_agent_runs` -> `[RunRow{agent_id, running, summary}]` is landed
-// in backend.rs and declared in backend.ice, and state.ice already holds
-// `agent_runs_generation`, but no `agent_runs` list is bound and nothing joins
-// a run to its agent. Whoever lands that binding mounts this on the agent row:
-// `AgentChip label=<run summary> live=<run running>`. A chip fed a constant
-// would be a fake liveness signal, so it stays dark until the join is real.
-component AgentChip(label:str, live:bool)
-  box #root px=10.0 py=4.0 bg=card_wash border=separator border-w=1.0 r=7.0
-    row gap=6.0 align=center
-      if live
-        PulseDot plate=6.0 tone="success"
-      text label size=10.5 wrap=none font=code_medium @text-secondary_fg
+// `AgentChip` (a pulse dot + the run's own summary, on the agent row) was built
+// here and is DELETED. It was waiting on a join the product does not have: the
+// label is the artifact's `#142 재분석 중`, which names a RUN, and `AgentRow`
+// carries no run. `load_agent_runs` -> `[RunRow{agent_id, running, summary}]` is
+// declared in backend.ice and is `run` from nowhere; the Agents screen loops
+// `agents_rows` straight into `AgentCard` with no selection and no detail pane,
+// so there is no surface holding one agent's runs to hang it from, and the
+// loader is per-agent — a list of N agents would need N calls.
+// It could NOT honestly be fed from what the row does carry: `AgentRow.status`
+// is already painted by the StatusBadge active/paused mapping, so a chip over
+// it would be the same fact twice, and `AgentRow.live` with a constant label is
+// a liveness signal with nothing behind it.
+// The values to keep for whoever lands the join: a 10px `card_wash` chip on a
+// `separator` hairline, r7, the label at 10.5 `font=code_medium`
+// `@text-secondary_fg`, and the pulse dot ONLY while the run is running.
+// Its dot survives below — `PulseDot` is the console's one breathing mark and
+// three live surfaces draw it.
 
 // The one dot the console breathes with — w4-motion-kit binds it to `pulse`.
 component PulseDot(plate:f64, tone:str)

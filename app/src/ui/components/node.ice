@@ -29,15 +29,10 @@
 // An unanswered status leaves `version` empty, which reads `—`. A zero-ish
 // placeholder like `v0.0.0` would be a claim we cannot make.
 //
-// NOT MOUNTED YET, and the three edits it needs are all outside this file. The
-// data is REAL and already decoded: `NodeFacts.version` (backend.rs, filled
-// from `status["version"]`) is on the ice-facing struct in backend.ice, and
-// `on node_facts_loaded` in handlers/lifecycle.ice binds six of its eight
-// fields but drops this one. Mounting is: a `node_version = ""` field in
-// state.ice beside `node_root_hash`; `node_version = next.version` in that
-// handler; and one line above the App hash row of the node Overview GroupCard
-// in view.ice — `NodeBuildRow version=node_version last=false`, with the App
-// hash row keeping `last=true`.
+// MOUNTED above the App hash row of the node Overview GroupCard (view.ice),
+// from `node_version` — `NodeFacts.version` is filled from `status["version"]`
+// in backend.rs and bound by `on node_facts_loaded` in handlers/lifecycle.ice,
+// which used to drop it.
 component NodeBuildRow(version:str, last:bool)
   col #root w=fill
     if empty(version)

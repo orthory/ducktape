@@ -44,6 +44,8 @@ test connection_panel_contract
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
+      huddle:
+        space w=1.0 h=1.0
       notice:
         space w=1.0 h=1.0
       chat:
@@ -90,6 +92,8 @@ test palette_escape_contract
 
 
 
+      huddle:
+        space w=1.0 h=1.0
       notice:
         space w=1.0 h=1.0
       chat:
@@ -183,6 +187,8 @@ test minimum_window_layout_contract
 
 
 
+      huddle:
+        space w=1.0 h=1.0
       notice:
         space w=1.0 h=1.0
       chat:

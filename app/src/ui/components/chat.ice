@@ -381,19 +381,23 @@ component ChatSearchResult(hit:ChatSearchHit)
 // into the sentence, and every sentence names the move that clears it. An
 // empty reason renders nothing at all — the composer itself is the else arm.
 //
-// MOUNT PENDING — this is the VIEW half of frozen contract item
-// `post_gate(archived, members_only, members, me) -> String` (backend.rs:5622,
-// already tested at backend.rs:8725). The composer today only greys the editor
-// on `active_channel_archived` (view.ice:539) and says nothing at all when a
-// members-only channel refuses the viewer's key. Mounting is three files this
-// component does not own:
-//   state.ice   — `post_gate:str`, seeded "" beside the other chat fields.
-//   handlers/chat.ice — set it wherever `channel_members` lands, from
-//     `post_gate(active_channel_archived, active_channel_members_only,
-//                channel_members, my_key)`.
-//   view.ice    — above the composer plate: `if !empty(post_gate)` ->
-//     `ComposerGate reason=post_gate`, and add `|| !empty(post_gate)` to the
-//     editor's and Send's `disabled=`.
+// MOUNTED above the composer plate (view.ice), as the VIEW half of frozen
+// contract item `post_gate(archived, members_only, members, me) -> String`. The
+// composer used to grey the editor on `active_channel_archived` alone and say
+// NOTHING at all when a members-only channel refused the viewer's key.
+//
+// `post_gate` is CALLED at the mount, not mirrored into a state field: it is
+// pure over facts the view already holds, and `channel_members` lands in seven
+// handlers — a mirrored field would be seven assignments and six chances to
+// drift. Its reason is now the whole gate, so `active_channel_archived` no
+// longer appears in the editor's or Send's `disabled=`: the archived case IS
+// the `channel_archived` arm, and one discriminant beats two.
+//
+// `me` is `settings_user_key` — full-hex, from `SettingsFacts`, which is what a
+// `ChatMember.key` carries. There was no such fact when this component landed:
+// `account_id` is a short_label of the identity module's ACCOUNT id and cannot
+// be compared with a membership row, so the key was added to SettingsFacts
+// rather than guessed at from the account card.
 component ComposerGate(reason:str)
   col #root w=fill
     match reason
@@ -421,16 +425,22 @@ component ComposerGate(reason:str)
 // it rather than follow the artifact literally.
 // ============================================================================
 
-// MOUNT PENDING — the view half of ledger gap "Thread rail gives the parent
-// message its own divided block". The data is already there: `active_thread_seq`
-// IS the root's seq and `thread_messages` contains the root, so view.ice:615
-// splits its existing loop instead of gaining any state field or backend fn —
-//   if thread_message.seq == active_thread_seq  -> ThreadParentBlock message=thread_message
-//   if thread_message.seq != active_thread_seq  -> ThreadMessageCard … (as today)
-// CAVEAT for whoever mounts it: the artifact's parent block is READ-ONLY, so
-// routing the root here costs it the hover bar, reactions and edit/delete that
-// ThreadMessageCard gives it today. That is a real interaction regression, not a
-// paint change — take it deliberately or not at all.
+// MOUNTED — the view half of ledger gap "Thread rail gives the parent message
+// its own divided block", closed by splitting the rail's existing loop in
+// view.ice on `thread_message.seq == active_thread_seq`. No state field and no
+// backend fn: `active_thread_seq` IS the root's seq and `thread_messages`
+// carries the root.
+//
+// THE TRADE, TAKEN DELIBERATELY: the artifact's parent block is READ-ONLY, so
+// the root loses the hover bar, reactions and edit/delete that ThreadMessageCard
+// gave it in the rail. It does NOT lose them from the product — the rail is a
+// 300px pane BESIDE the stream, never over it, so the same message is on screen
+// in the stream at the same moment with its full MessageCard toolbar. The cost
+// is one extra glance, not a capability.
+//
+// NO `N replies` RULE between the block and the replies. It was built, deleted,
+// and stays deleted: its count wants `thread_messages` minus the root, which is
+// the loaded page and not the reply count whenever `thread_has_more` holds.
 component ThreadParentBlock(message:ChatMessage)
   col #root w=fill
     row w=fill gap=10.0 align=start pb=14.0

@@ -48,28 +48,21 @@ component Toast.Confirm(message:str, tone:str)
             space w=1.0 h=1.0
       text message size=12.5 wrap=none @text-toast_fg
 
-// A 38x22 track with an 18px knob that slides 2px -> 18px. The press target is
-// the caller's button; this draws the state it is in.
-component Switch(on:bool, label:str, note:str)
-  row #root w=fill gap=12.0 align=center
-    col w=fill gap=1.0
-      text label size=12.5 wrap=none @text-accent_fg
-      if note != ""
-        text note size=12.5 @text-meta
-    if on
-      stack w=38.0 h=22.0
-        box w=38.0 h=22.0 bg=primary r=11.0
-          space w=1.0 h=1.0
-        pin x=18.0 y=2.0
-          box w=18.0 h=18.0 bg=surface r=9.0
-            space w=1.0 h=1.0
-    if !on
-      stack w=38.0 h=22.0
-        box w=38.0 h=22.0 bg=pending_line r=11.0
-          space w=1.0 h=1.0
-        pin x=2.0 y=2.0
-          box w=18.0 h=18.0 bg=surface r=9.0
-            space w=1.0 h=1.0
+// `Switch` (a 38x22 track with an 18px knob sliding 2px -> 18px, over the
+// label/note pair) was built here and is DELETED — this console has nothing to
+// switch. The app ships exactly ONE device preference, `receipts`, and view.ice
+// already records why it has no surface: every finality mark renders
+// unconditionally, so the toggle wrote a value nothing read, and it painted ON
+// from the state default before the loader answered `false` a beat later. Every
+// other boolean on screen is a disclosure (`channel_settings_open`,
+// `fs_history_open`, `bell_open`) whose control is the thing it opens, not a
+// track and a knob.
+// The label/note half of it is not lost: the Settings THIS DEVICE card draws
+// exactly that pair — 12.5 `@text-accent_fg` over 12.5 `@text-meta` — beside a
+// value and a button, which is the honest shape for a reading with an action.
+// The geometry to restore the day a real preference exists: 38x22 track, r11,
+// `primary` on / `pending_line` off, an 18px `surface` knob at y=2 sliding
+// x=2 -> x=18, and the press target on the CALLER's button, never here.
 
 // The floating card every dropdown wears — repo switcher, mention autocomplete,
 // message ⋯ menu, bell. The caller pins it (stack + pin, or an `overlay` layer)

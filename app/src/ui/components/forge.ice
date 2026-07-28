@@ -254,14 +254,12 @@ component ForgeCodeHeader(path:str, message:str, author:str, stamp:str)
 // `DiffLine.old_no` is — the renderer that splits the blob owns the numbering,
 // and a blank gutter has to be expressible.
 //
-// IT HAS NO CALL SITE YET, and that is a missing splitter, not a missing
-// decision. `forge_blob` returns `BlobView.text` as ONE string plus a line
-// COUNT; Ice has no string ops, so nothing can walk it. The pane therefore
-// prints the source as one mono run today (view.ice) and this row waits on the
-// exact counterpart `diff_lines` already has for a patch —
-// `sync source_lines(text:str) -> [SourceLine]` with `SourceLine(number:str,
-// text:str)` in backend.ice. Numbering the lines in the view would mean
-// guessing where they break.
+// MOUNTED in the Code pane's `source:` slot (view.ice), over
+// `source_lines(forge_file_text)` — the exact counterpart `diff_lines` already
+// is for a patch. `forge_blob` returns `BlobView.text` as ONE string and Ice
+// has no string ops, so the splitter lives in backend.rs; the gutter numbers
+// the rows it produced rather than guessing where the file breaks. A truncated
+// blob numbers what arrived, and the window note under the listing says so.
 //
 // The code is ONE ink. The design system is explicit that this viewer uses no
 // syntax colour ("코드는 구문 색을 쓰지 않고 단색") — emphasis is carried by the

@@ -96,6 +96,8 @@ extern crate::backend
   FsListing(generation:i64, path:str, entries:[FsEntry])
   FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
+  sync fs_dir_count(entries:[FsEntry]) -> i64
+  sync fs_file_count(entries:[FsEntry]) -> i64
   sync fs_parent(path:str) -> str
   sync fs_child(path:str, name:str) -> str
   files_mkdir(rpc:str, path:str) -> bool ! AppError
@@ -153,7 +155,7 @@ extern crate::backend
   AccountData(generation:i64, bound:bool, account_id:str, display_name:str, bio:str, members:i64, nodes:i64)
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
   set_account_name(rpc:str, password:str, display_name:str) -> bool ! AppError
-  SettingsFacts(generation:i64, endpoint:str, node_key:str, height:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64)
+  SettingsFacts(generation:i64, endpoint:str, node_key:str, height:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
   sync settings_data_dir(facts:SettingsFacts) -> str
@@ -187,6 +189,8 @@ extern crate::backend
   sync forge_stats(files:i64, additions:i64, deletions:i64) -> str
   DiffLine(kind:str, old_no:str, new_no:str, sign:str, text:str)
   sync diff_lines(diff:str) -> [DiffLine]
+  SourceLine(number:str, text:str)
+  sync source_lines(text:str) -> [SourceLine]
   sync filter_forge_items(items:[ForgeItem], kind:str) -> [ForgeItem]
   sync forge_open_count(items:[ForgeItem], kind:str) -> i64
   sync forge_merge_note(merge_oid:str, branches:str) -> str
@@ -256,6 +260,7 @@ extern crate::backend
   sync keep_channels(loaded:bool, next:[ChatChannel], current:[ChatChannel]) -> [ChatChannel]
   sync keep_messages(loaded:bool, next:[ChatMessage], current:[ChatMessage]) -> [ChatMessage]
   sync keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
+  sync keep_roster(joined:bool, next:[HuddleParticipant]) -> [HuddleParticipant]
   sync keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
   sync keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
   sync keep_str(loaded:bool, next:str, current:str) -> str

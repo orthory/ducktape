@@ -1019,6 +1019,20 @@ pub struct FsEntry {
     pub object: String,
 }
 
+/// What is under this crumb, counted. Ice cannot filter a list by field, so the
+/// crumb bar's two counts are pure folds over the listing it is already drawn
+/// beside — never a second `files_ls`.
+pub fn fs_dir_count(entries: Vec<FsEntry>) -> i64 {
+    count_i64(entries.iter().filter(|entry| entry.kind == "dir").count())
+}
+
+/// Everything that is not a directory. `files_ls` publishes one `kind` per row
+/// and the browser draws exactly two shapes, so the complement IS the file
+/// count — no third bucket can hide here.
+pub fn fs_file_count(entries: Vec<FsEntry>) -> i64 {
+    count_i64(entries.iter().filter(|entry| entry.kind != "dir").count())
+}
+
 /// One committed duckfs snapshot.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct FsSnapshot {
@@ -1959,6 +1973,13 @@ pub struct SettingsFacts {
     /// this workspace's directory on this device — the NETWORK card's Data dir.
     pub data_dir: String,
     pub open_tabs: i64,
+    /// THE VIEWER'S OWN KEY, full hex — the `me` every membership test needs.
+    /// `ChatMember.key` is `member_id(..)` at full width, and `account_id` is a
+    /// `short_label` of the identity module's ACCOUNT id, so neither the account
+    /// card nor the node key can answer "is this row me". Empty on a device with
+    /// no user key, which `post_gate` reads as "not seated" — the honest answer
+    /// when there is no identity to seat.
+    pub user_key: String,
 }
 
 /// The NETWORK card's Data dir row.
@@ -2000,6 +2021,10 @@ pub async fn load_settings_facts(
             key_state,
             data_dir,
             open_tabs: count_i64(tabs.len()),
+            user_key: local_user_key()
+                .await
+                .map(|key| hex_encode(&key))
+                .unwrap_or_default(),
         })
     }
     .await
@@ -3751,6 +3776,31 @@ pub struct DiffLine {
     pub text: String,
 }
 
+/// One numbered source line of a blob. `number` is a string for the same reason
+/// `DiffLine.old_no` is: the gutter is a rendered column, not an integer, and
+/// the splitter owns the numbering.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct SourceLine {
+    pub number: String,
+    pub text: String,
+}
+
+/// Split a blob into numbered rows. `BlobView.text` arrives as ONE string and
+/// Ice has no string ops, so the viewer cannot walk it — this is the exact
+/// counterpart `diff_lines` already is for a patch.
+///
+/// An empty blob has no lines, not one blank line: `"".lines()` is empty and
+/// that is the reading the empty plate is drawn for.
+pub fn source_lines(text: String) -> Vec<SourceLine> {
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| SourceLine {
+            number: (index + 1).to_string(),
+            text: line.to_string(),
+        })
+        .collect()
+}
+
 /// Split a unified patch into painted rows, tracking both line counters
 /// across hunk headers.
 pub fn diff_lines(diff: String) -> Vec<DiffLine> {
@@ -5402,6 +5452,14 @@ pub fn keep_members(
     current: Vec<ChatMember>,
 ) -> Vec<ChatMember> {
     if loaded { next } else { current }
+}
+
+/// The huddle roster, kept only while this device is IN the huddle. Every chat
+/// load carries the roster of the channel it loaded, so a load of any other
+/// channel must not leave the popped panel painting strangers — dropping it is
+/// the same guard `huddle_channel` itself carries.
+pub fn keep_roster(joined: bool, next: Vec<HuddleParticipant>) -> Vec<HuddleParticipant> {
+    if joined { next } else { Vec::new() }
 }
 
 pub fn keep_pages(loaded: bool, next: Vec<PageItem>, current: Vec<PageItem>) -> Vec<PageItem> {
@@ -8769,6 +8827,59 @@ mod tests {
             "members_only"
         );
         assert_eq!(post_gate(false, true, members, "beef".into()), "");
+    }
+
+    /// The three folds the mounted surfaces are drawn from — the crumb bar's
+    /// counts, the blob gutter, and the roster the popped panel keeps.
+    #[test]
+    fn the_crumb_counts_split_the_listing_in_two() {
+        let entries = ["dir", "file", "file"]
+            .into_iter()
+            .map(|kind| FsEntry {
+                path: format!("/shared/{kind}"),
+                name: kind.into(),
+                kind: kind.into(),
+                size: 0,
+                object: String::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fs_dir_count(entries.clone()), 1);
+        assert_eq!(fs_file_count(entries.clone()), 2);
+        assert_eq!(
+            fs_dir_count(entries.clone()) + fs_file_count(entries),
+            3,
+            "every row lands in exactly one bucket"
+        );
+        assert_eq!(fs_dir_count(Vec::new()), 0);
+        assert_eq!(fs_file_count(Vec::new()), 0);
+    }
+
+    #[test]
+    fn source_lines_number_from_one_and_an_empty_blob_has_none() {
+        let rows = source_lines("alpha\nbeta\n".into());
+        assert_eq!(rows.len(), 2, "a trailing newline is not a third line");
+        assert_eq!(rows[0].number, "1");
+        assert_eq!(rows[0].text, "alpha");
+        assert_eq!(rows[1].number, "2");
+        assert_eq!(rows[1].text, "beta");
+        assert!(source_lines(String::new()).is_empty());
+    }
+
+    #[test]
+    fn a_roster_survives_only_while_this_device_is_in_the_huddle() {
+        let roster = vec![HuddleParticipant {
+            key: "aa".into(),
+            label: "aa".into(),
+            initials: "A".into(),
+            is_agent: false,
+            is_you: true,
+            joined_at: 0,
+        }];
+        assert_eq!(keep_roster(true, roster.clone()).len(), 1);
+        assert!(
+            keep_roster(false, roster).is_empty(),
+            "another channel's roster never reaches the panel"
+        );
     }
 
     #[test]

@@ -266,6 +266,7 @@ on chat_updated(next)
   // clock and one that finds her out re-takes it for the next join.
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
   huddle_joined = huddle_self(next.huddle_roster)
+  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
@@ -300,6 +301,7 @@ on chat_hit_loaded(next)
   // clock and one that finds her out re-takes it for the next join.
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
   huddle_joined = huddle_self(next.huddle_roster)
+  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
@@ -337,6 +339,7 @@ on channel_created(next)
   // clock and one that finds her out re-takes it for the next join.
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
   huddle_joined = huddle_self(next.huddle_roster)
+  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members

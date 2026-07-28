@@ -270,7 +270,7 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
 // express (the slot is past the `space w=fill`), so chat either keeps its
 // hand-rolled head or the dot moves to the trailing slot — a design call, not
 // a mechanical one. The Files screen has no sidebar at all yet.
-component SidebarHeader(title:str, count:str)
+component SidebarHeader(title:str, count:i64)
   col #root w=fill
     box w=fill pl=14.0 pr=14.0 pt=14.0 pb=11.0
       row w=fill gap=8.0 align=center
@@ -337,3 +337,8 @@ component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degra
 
       slot palette
       slot bell
+      // The huddle rides every screen, so it is a window-level layer like the
+      // palette and the bell — not a prop on TitleBar. A titlebar seat would
+      // widen TitleBar's signature, which a source guard in main.rs pins, and
+      // it would land the pill on top of the status/bell cluster already there.
+      slot huddle
