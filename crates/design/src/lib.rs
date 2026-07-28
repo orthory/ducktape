@@ -35,14 +35,18 @@ pub mod type_scale {
     pub const LIST: f64 = 13.0;
     pub const BODY: f64 = 13.5;
     pub const PANE_HEADER: f64 = 14.0;
-    pub const HEADING: f64 = 14.5;
     pub const SECTION: f64 = 16.0;
     pub const SCREEN_TITLE: f64 = 20.0;
     pub const DISPLAY: f64 = 22.0;
 
     /// every legal `size=` literal in `.ice` sources, the guard's whitelist.
     /// `1.0` is the established off-screen focus-shim size, not a text step.
-    pub const ALL: [f64; 17] = [
+    ///
+    /// A role earns its place here by being USED. The whitelist is the only
+    /// thing standing between "a type role" and "whatever this screen needed",
+    /// so an entry with no caller costs the guard real teeth and buys nothing —
+    /// it silently pre-approves a size the design never asked for.
+    pub const ALL: [f64; 16] = [
         MICRO,
         BADGE,
         NAV,
@@ -55,7 +59,6 @@ pub mod type_scale {
         LIST,
         BODY,
         PANE_HEADER,
-        HEADING,
         SECTION,
         SCREEN_TITLE,
         DISPLAY,
