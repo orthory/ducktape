@@ -25,17 +25,6 @@ component KeyValueRow(label:str, value:str, last:bool)
       box w=fill h=1.0 bg=elevated
         space w=1.0 h=1.0
 
-// A row whose value is a caption rather than a machine value.
-component NoteRow(label:str, note:str, last:bool)
-  col #root w=fill
-    box w=fill px=15.0 py=13.0
-      col w=fill gap=1.0
-        text label size=12.5 @text-accent_fg
-        text note size=12.5 @text-meta
-    if !last
-      box w=fill h=1.0 bg=elevated
-        space w=1.0 h=1.0
-
 // The two shape-named entry points into `PrincipalAvatar`. The shape rule and
 // the radius ladder live there — these only spell the discriminant, so a call
 // site that already knows it is drawing a person keeps reading as one.

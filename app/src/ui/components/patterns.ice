@@ -24,7 +24,8 @@ component FinalityChip(phase:str, height:i64)
     match phase
       "finalizing"
         row gap=4.0 align=center
-          // the ring spins once w4-motion-kit binds it to `spin`
+          // static ring, not a spinner — nothing drives state.ice `spin`, so a
+          // turning arc would freeze mid-turn (see overlay.ice)
           box w=9.0 h=9.0 bg=transparent border=input border-w=1.5 r=4.5
             space w=1.0 h=1.0
           text "finalizing…" size=12.0 wrap=none @text-ink_soft
@@ -124,6 +125,20 @@ component AgentSquare(initials:str, plate:f64, ink:f64, radius:f64)
 
 // The machine marker in its one sanctioned form: what an agent is doing right
 // now, on a wash plate with a hairline. `live` lights the pulse.
+//
+// This is NOT the AGENT badge and does not duplicate it: the badge (RoleMarker
+// in kit.ice, and the same word in dm.ice and chat.ice) says a principal IS a
+// machine, which is identity; this says what that machine is DOING, which is
+// activity. Both appear on the artifact's agent row, together.
+//
+// NOT MOUNTED YET, for want of the join rather than the geometry. The label is
+// the artifact's `#142 재분석 중` — a run, not an agent — and `AgentRow` carries
+// no run. `load_agent_runs` -> `[RunRow{agent_id, running, summary}]` is landed
+// in backend.rs and declared in backend.ice, and state.ice already holds
+// `agent_runs_generation`, but no `agent_runs` list is bound and nothing joins
+// a run to its agent. Whoever lands that binding mounts this on the agent row:
+// `AgentChip label=<run summary> live=<run running>`. A chip fed a constant
+// would be a fake liveness signal, so it stays dark until the join is real.
 component AgentChip(label:str, live:bool)
   box #root px=10.0 py=4.0 bg=card_wash border=separator border-w=1.0 r=7.0
     row gap=6.0 align=center

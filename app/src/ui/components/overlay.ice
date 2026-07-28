@@ -125,13 +125,17 @@ component Eyebrow(label:str, note:str)
     if note != ""
       text note size=9.0 wrap=none font=code_semibold @text-label
 
-// The app's only spinner: the artifact's 2px ring with a transparent quarter,
-// turned by the caller's `animation.value(spin)` (state.ice `spin`, .8s linear
-// forever). One unit of `spin` is one full turn of the gap.
-component SpinRing(px:f64, spin:f64)
-  canvas #root w=px h=px
-    path stroke=warning_dot stroke-w=2.0 cap=butt
-      arc x=(px / 2.0) y=(px / 2.0) r=((px - 2.0) / 2.0) start=(spin * 6.283185) end=((spin * 6.283185) + 4.712389)
+// NO SPINNER COMPONENT. The artifact's 2px ring with a transparent quarter is
+// a CSS keyframe; the ice equivalent is a `canvas` arc turned by
+// `animation.value(spin)`. Nothing in this app drives `spin` — state.ice
+// declares it (.8s linear forever) but no handler ever assigns it, so an
+// `animation` that is never transitioned never ticks. A ring mounted on it
+// would paint a FROZEN arc: a spinner that claims work is in flight and then
+// stands still. Both running markers therefore ship static and say so —
+// `ProvisionMark` (onboarding.ice) is a solid amber ring, and every live
+// signal elsewhere is `PulseDot`. Reviving the ring costs a `spin = 1.0`
+// driver alongside `pulse` in handlers/lifecycle.ice plus one canvas; until
+// that driver exists, the honest marker is the static one.
 
 // One NETWORK stat card: a mono caps label over the machine reading, with an
 // optional unit suffix (`ms`) beside it.

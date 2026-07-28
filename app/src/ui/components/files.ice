@@ -63,6 +63,15 @@ component FsTreeFace(name:str, depth:f64, dimmed:bool)
 // The crumb bar over the object table: where you are, what is here, and who is
 // allowed to write under it.
 //
+// NOT MOUNTED YET, and the mount is not this file's to make. It replaces
+// `ScreenHeader title="Files" meta=fs_path` at the head of the Files arm in
+// view.ice, wired `fs_open_dir -> fs_open_dir _`. `path` is `fs_path`; the two
+// counts have no source — Ice cannot filter a list by field, so they need two
+// pure helpers over the already-resident `fs_entries` in backend.rs
+// (`fs_dir_count` / `fs_file_count`, counting `kind == "dir"` and everything
+// else). Until those exist, the bar cannot be fed and is deliberately dark
+// rather than mounted with two zeroes.
+//
 // The root crumb navigates; the segments do not. Ice's expression language has
 // no string split (len/empty/trim/some are the whole builtin set), and the
 // frozen signature carries the path as one `str` rather than a segment list, so
