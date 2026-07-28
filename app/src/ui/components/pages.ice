@@ -65,9 +65,11 @@ component PageTitleEditor(rpc:str, password:str, page_id:str, title:str, disable
 // `PageItem` carries one the prefix stays as the only hierarchy signal, moved
 // ahead of the icon so it indents the whole row instead of the title alone.
 component PageButton(page:PageItem, selected:bool)
+  emits
+    choose_page(str)
   col w=fill
     if selected
-      button label=page.title w=fill @ghost_action px-12px py-7px -> choose_page(page.id)
+      button label=page.title w=fill @ghost_action px-12px py-7px -> emit(choose_page, page.id)
         row w=fill gap=8.0 align=center
           if !empty(page.prefix)
             text page.prefix size=12.0 wrap=none font=code @text-label
@@ -77,7 +79,7 @@ component PageButton(page:PageItem, selected:bool)
         hovered bg=rail_hover text=fg
         pressed bg=subtle text=fg
     if !selected
-      button label=page.title w=fill @ghost_action px-12px py-7px -> choose_page(page.id)
+      button label=page.title w=fill @ghost_action px-12px py-7px -> emit(choose_page, page.id)
         row w=fill gap=8.0 align=center
           if !empty(page.prefix)
             text page.prefix size=12.0 wrap=none font=code @text-label
@@ -88,7 +90,9 @@ component PageButton(page:PageItem, selected:bool)
         pressed bg=subtle text=fg
 
 component PageSearchResult(hit:PageSearchHit)
-  button label=hit.text w=fill p=7.0 @ghost_action -> open_page_search_hit(hit.page_id, hit.block_id)
+  emits
+    open_page_search_hit(str, str)
+  button label=hit.text w=fill p=7.0 @ghost_action -> emit(open_page_search_hit, hit.page_id, hit.block_id)
     col w=fill gap=2.0
       row w=fill gap=7.0 align=center
         text hit.kind w=fill size=10.5 font=code_medium @text-muted
@@ -112,7 +116,9 @@ component PageSearchResult(hit:PageSearchHit)
 //     time nor `ThreadRow.anchor`. The right-hand slot shows the ordinal the
 //     record does have (`#3`, `#3 · edited`) instead of an invented age.
 component PageCommentThreadButton(thread:PageCommentThread)
-  button label=thread.author description=thread.meta w=fill @ghost_action px-12px py-11px -> open_block_comment_thread(thread.id)
+  emits
+    open_block_comment_thread(str)
+  button label=thread.author description=thread.meta w=fill @ghost_action px-12px py-11px -> emit(open_block_comment_thread, thread.id)
     col w=fill gap=7.0
       row w=fill gap=8.0 align=center
         PrincipalAvatar initials=initials_of(thread.author) is_agent=false plate=22.0 ink=9.0 ring=""
@@ -141,6 +147,8 @@ component PageCommentCard(comment:PageComment)
 // inline (see BlockContents) exactly as the artifact does — only the editor
 // keeps a gutter, so the caret does not jump when a block is selected.
 component BlockLine(block:PageBlock)
+  emits
+    set_todo_checked(str, bool)
   row w=fill gap=0.0 align=start
     match block.kind
       "Page"
@@ -155,6 +163,8 @@ component BlockLine(block:PageBlock)
       "Todo"
         box pt=3.0 pr=11.0
           TodoCheckbox block=block
+            forward
+              set_todo_checked
       "Toggle"
         box pr=11.0
           Icon name="chevron-right" tone="label" px=14.0
@@ -166,6 +176,8 @@ component BlockLine(block:PageBlock)
 // paragraph 8, bullet 6, todo 7, callout 14, quote 16, code 14 — so a heading
 // opens a section (Liquid Glass:913-926). A flat gap does not.
 component BlockContents(block:PageBlock)
+  emits
+    set_todo_checked(str, bool)
   col w=fill
     match block.kind
       "Page"
@@ -195,6 +207,8 @@ component BlockContents(block:PageBlock)
             text block.text w=fill size=14.0 line-h=1.65 wrap=word @text-accent_fg
       "Todo"
         TodoBlock block=block
+          forward
+            set_todo_checked
       "Toggle"
         box w=fill pt=8.0
           row w=fill gap=11.0 align=start
@@ -227,16 +241,18 @@ component BulletBlock(body:str)
 // ONE CLICK FINALIZES THE TICK. 17px, r5, ink when done and a 1.5px hairline
 // when open — the artifact's own control, not a menu round-trip.
 component TodoCheckbox(block:PageBlock)
+  emits
+    set_todo_checked(str, bool)
   col #root
     if block.checked
-      button label="Mark not done" w=17.0 h=17.0 p=0.0 @icon_action -> set_todo_checked(block.id, false)
+      button label="Mark not done" w=17.0 h=17.0 p=0.0 @icon_action -> emit(set_todo_checked, block.id, false)
         box w=fill h=fill align-x=center align-y=center
           text "✓" size=9.0 wrap=none font=code_semibold @text-primary_fg
         active bg=primary text=primary_fg border=primary border-w=1.5 r=5.0
         hovered bg=ink_hover text=primary_fg border=ink_hover
         pressed bg=primary text=primary_fg border=primary
     if !block.checked
-      button label="Mark done" w=17.0 h=17.0 p=0.0 @icon_action -> set_todo_checked(block.id, true)
+      button label="Mark done" w=17.0 h=17.0 p=0.0 @icon_action -> emit(set_todo_checked, block.id, true)
         space w=1.0 h=1.0
         active bg=surface border=control_line_hover border-w=1.5 r=5.0
         hovered bg=surface border=primary
@@ -244,10 +260,14 @@ component TodoCheckbox(block:PageBlock)
 
 // A done todo fades to `meta` and strikes through; an open one keeps body ink.
 component TodoBlock(block:PageBlock)
+  emits
+    set_todo_checked(str, bool)
   box #root w=fill pt=7.0
     row w=fill gap=0.0 align=start
       box pt=3.0 pr=11.0
         TodoCheckbox block=block
+          forward
+            set_todo_checked
       if block.checked
         rich-text w=fill size=14.0 line-h=1.65 wrap=word color=meta
           span block.text strike
@@ -280,7 +300,12 @@ component CodeBlock(body:str)
       text body w=fill size=12.0 line-h=1.6 wrap=none font=code @text-chevron_idle
 
 component DocumentBlock(block:PageBlock, selected:bool, hovered:bool, disabled:bool)
-  mouse enter=block_entered(block.id) exit=block_exited(block.id)
+  emits
+    block_entered(str)
+    block_exited(str)
+    open_block_insert(i64, str)
+    select_block(i64, str, str, str, bool, bool)
+  mouse enter=emit(block_entered, block.id) exit=emit(block_exited, block.id)
     stack w=fill
       box w=fill pl=56.0
         row w=fill align=start
@@ -294,13 +319,13 @@ component DocumentBlock(block:PageBlock, selected:bool, hovered:bool, disabled:b
               text block.prefix size=12.0 wrap=none font=code
             box w=56.0 h=28.0 bg=surface border=border border-w=1.0 r=7.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
               row w=fill gap=0.0 align=center
-                button label="Insert block below" disabled=disabled w=28.0 h=28.0 p=0.0 @icon_action -> open_block_insert(block.key, block.id)
+                button label="Insert block below" disabled=disabled w=28.0 h=28.0 p=0.0 @icon_action -> emit(open_block_insert, block.key, block.id)
                   box w=fill h=fill align-x=center align-y=center
                     text "+" size=14.0 font=medium
                   active bg=transparent text=muted r=5.0
                   hovered bg=fg/8 text=fg
                   pressed bg=fg/12 text=fg
-                button label="Block actions" disabled=disabled w=28.0 h=28.0 p=0.0 @icon_action -> select_block(block.key, block.id, block.kind, block.text, block.checked, true)
+                button label="Block actions" disabled=disabled w=28.0 h=28.0 p=0.0 @icon_action -> emit(select_block, block.key, block.id, block.kind, block.text, block.checked, true)
                   box w=fill h=fill align-x=center align-y=center
                     text "⋮⋮" size=13.0 font=medium
                   active bg=transparent text=muted r=5.0
@@ -308,50 +333,61 @@ component DocumentBlock(block:PageBlock, selected:bool, hovered:bool, disabled:b
                   pressed bg=fg/12 text=fg
 
 component BlockActionsMenu(block_id:str, kind:str, disabled:bool, delete_armed:bool, editable_kinds:[str])
+  emits
+    selected_block_kind_changed(str)
+    choose_page(str)
+    move_block_submit(str)
+    open_block_comments
+    arm_block_delete
+    remove_block_submit
+    close_block_actions
   box w=172.0 p=5.0 bg=surface border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
     col w=fill gap=3.0
       if kind != "Page"
-        pick editable_kinds some(kind) hint="Block type" w=fill menu-h=210.0 p=6.0 text-size=13.0 line-h=1.2 -> selected_block_kind_changed _
+        pick editable_kinds some(kind) hint="Block type" w=fill menu-h=210.0 p=6.0 text-size=13.0 line-h=1.2 -> emit(selected_block_kind_changed, _)
           active text=fg placeholder=muted handle=muted bg=transparent border=transparent border-w=0.0 r=6.0
           hovered text=fg placeholder=muted handle=fg bg=fg/8 border=fg/10 border-w=1.0 r=6.0
           opened text=fg placeholder=muted handle=fg bg=fg/11 border=ring border-w=1.0 r=6.0
           menu text=fg selected-text=fg selected-bg=fg/14 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
       if kind == "Page"
-        button "Open page" label="Open subpage" disabled=disabled w=fill h=28.0 p=6.0 @ghost_action -> choose_page(block_id)
+        button "Open page" label="Open subpage" disabled=disabled w=fill h=28.0 p=6.0 @ghost_action -> emit(choose_page, block_id)
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
       row w=fill gap=2.0 align=center
-        button "↑" label="Move block up" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> move_block_submit("up")
+        button "↑" label="Move block up" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> emit(move_block_submit, "up")
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
-        button "↓" label="Move block down" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> move_block_submit("down")
+        button "↓" label="Move block down" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> emit(move_block_submit, "down")
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
-        button "←" label="Outdent block" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> move_block_submit("outdent")
+        button "←" label="Outdent block" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> emit(move_block_submit, "outdent")
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
-        button "→" label="Indent block" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> move_block_submit("indent")
+        button "→" label="Indent block" disabled=disabled w=fill h=27.0 p=4.0 @ghost_action -> emit(move_block_submit, "indent")
           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
           hovered bg=fg/8 text=fg border=fg/9
           pressed bg=fg/12 text=fg border=fg/13
-      button "Comments" label="Comments" disabled=disabled w=fill h=28.0 p=6.0 @ghost_action -> open_block_comments
+      button "Comments" label="Comments" disabled=disabled w=fill h=28.0 p=6.0 @ghost_action -> emit(open_block_comments)
         active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
         hovered bg=fg/8 text=fg border=fg/9
         pressed bg=fg/12 text=fg border=fg/13
       if !delete_armed
-        button "Delete" label="Delete block" disabled=disabled w=fill h=28.0 p=6.0 @danger_action -> arm_block_delete
+        button "Delete" label="Delete block" disabled=disabled w=fill h=28.0 p=6.0 @danger_action -> emit(arm_block_delete)
       if delete_armed
-        button "Confirm delete" label="Confirm block deletion" disabled=disabled w=fill h=28.0 p=6.0 @danger_action -> remove_block_submit
-      button "Close" label="Close block actions" disabled=disabled w=fill h=28.0 p=6.0 @secondary_action -> close_block_actions
+        button "Confirm delete" label="Confirm block deletion" disabled=disabled w=fill h=28.0 p=6.0 @danger_action -> emit(remove_block_submit)
+      button "Close" label="Close block actions" disabled=disabled w=fill h=28.0 p=6.0 @secondary_action -> emit(close_block_actions)
         active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
         hovered bg=fg/8 text=fg border=fg/9
         pressed bg=fg/12 text=fg border=fg/13
 
 component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)
+  emits
+    new_block_kind_changed(str)
+    close_block_insert
   stack w=fill
     box w=fill pl=56.0 pr=118.0
       row w=fill
@@ -361,12 +397,12 @@ component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)
     box w=fill align-x=end align-y=start pr=4.0
       box p=2.0 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
         row gap=1.0 align=center
-          pick kinds some(kind) hint="Type" w=82.0 menu-h=210.0 p=4.0 text-size=13.0 line-h=1.2 -> new_block_kind_changed _
+          pick kinds some(kind) hint="Type" w=82.0 menu-h=210.0 p=4.0 text-size=13.0 line-h=1.2 -> emit(new_block_kind_changed, _)
             active text=fg placeholder=muted handle=muted bg=transparent border=transparent border-w=0.0 r=6.0
             hovered text=fg placeholder=muted handle=fg bg=fg/8 border=fg/10 border-w=1.0 r=6.0
             opened text=fg placeholder=muted handle=fg bg=fg/11 border=ring border-w=1.0 r=6.0
             menu text=fg selected-text=fg selected-bg=fg/14 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
-          button "×" label="Cancel block insertion" disabled=disabled w=26.0 h=26.0 p=4.0 @secondary_action -> close_block_insert
+          button "×" label="Cancel block insertion" disabled=disabled w=26.0 h=26.0 p=4.0 @secondary_action -> emit(close_block_insert)
             active bg=transparent text=muted r=6.0
             hovered bg=fg/8 text=fg
             pressed bg=fg/12 text=fg
