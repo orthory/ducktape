@@ -53,13 +53,15 @@ fn exact_comment_anchor_rebases_with_target_text() {
             query_thread(&p, "t1").await.unwrap().thread.anchor,
             Some(RelativeAnchor { start: 2, end: 4 })
         );
-        apply_commit(
+        // alice opened t1, so alice is who may re-home it.
+        apply_commit_as(
             &mut p,
             &PageMsg::MoveCommentThread {
                 thread_id: "t1".into(),
                 target: "b2".into(),
                 anchor: Some(RelativeAnchor { start: 0, end: 2 }),
             },
+            user("alice"),
         )
         .await;
         let moved = query_thread(&p, "t1").await.unwrap();
@@ -675,5 +677,79 @@ fn deleting_a_block_purges_its_comment_threads() {
         .await;
         assert!(query_thread(&p, "t2").await.is_none());
         assert_eq!(target_thread_count(&p, "p1").await, 0);
+    });
+}
+
+// re-homing a thread is the opener's call — the same stored-author rule
+// `EditComment`/`DeleteComment` already enforce. It is also what bounds the
+// comment purge: without it, a stranger aims `RemoveBlock` at comments they
+// may not delete by first moving the thread onto a block of their own.
+#[test]
+fn a_thread_moves_only_by_its_opener() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await; // p1 + b1,b2,b3
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "on b1"), user("alice")).await;
+
+        let move_to_b2 = PageMsg::MoveCommentThread {
+            thread_id: "t1".into(),
+            target: "b2".into(),
+            anchor: None,
+        };
+        // a stranger, a module and the system are all refused: the opener is a
+        // stored author, not an origin KIND, so nothing outranks it here.
+        for origin in [
+            user("mallory"),
+            sdk::Origin::Module("runs".into()),
+            sdk::Origin::System,
+        ] {
+            apply_err_as(&mut p, &move_to_b2, origin, "not the comment author").await;
+        }
+        // and the pre-consensus empty origin never passes as a real user,
+        // exactly as on `AddComment`/`EditComment`/`DeleteComment`.
+        apply_err_as(
+            &mut p,
+            &move_to_b2,
+            sdk::Origin::External(Vec::new()),
+            "empty origin",
+        )
+        .await;
+        assert_eq!(target_thread_count(&p, "b1").await, 1);
+        assert_eq!(target_thread_count(&p, "b2").await, 0);
+
+        // so mallory removing her OWN block takes nothing of alice's with it:
+        // the purge reaches exactly what was anchored to the removed subtree.
+        apply_commit(
+            &mut p,
+            &PageMsg::RemoveBlock {
+                block_id: "b2".into(),
+            },
+        )
+        .await;
+        assert!(query_comment(&p, "m1").await.is_some());
+        assert_eq!(query_thread(&p, "t1").await.unwrap().thread.target, "b1");
+
+        // the opener re-homes it herself, and then the purge does reach it —
+        // that is the block op's authority, and it is unchanged.
+        apply_commit_as(
+            &mut p,
+            &PageMsg::MoveCommentThread {
+                thread_id: "t1".into(),
+                target: "b3".into(),
+                anchor: None,
+            },
+            user("alice"),
+        )
+        .await;
+        assert_eq!(target_thread_count(&p, "b3").await, 1);
+        apply_commit(
+            &mut p,
+            &PageMsg::RemoveBlock {
+                block_id: "b3".into(),
+            },
+        )
+        .await;
+        assert!(query_thread(&p, "t1").await.is_none());
+        assert!(query_comment(&p, "m1").await.is_none());
     });
 }
