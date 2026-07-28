@@ -26,6 +26,8 @@ component StatusBadge(label:str)
 // Pull requests and the Issues arms are this component with a different filter
 // and a different empty line, so the two lists can never drift apart.
 component ForgeTrackerList(items:[ForgeItem], empty_message:str)
+  emits
+    forge_open_item(i64)
   col #root w=fill h=fill
     if empty(items)
       box w=fill p=22.0
@@ -35,6 +37,8 @@ component ForgeTrackerList(items:[ForgeItem], empty_message:str)
         col w=fill pl=12.0 pr=12.0 pt=6.0 pb=18.0 gap=1.0
           for item in items
             TrackerRow item=item
+              forward
+                forge_open_item
 
 // THE EXPLORER'S WORKSPACE SEARCH — state and route.
 //
@@ -196,8 +200,19 @@ view
     // printing a count nobody measured.
     if phase != "console"
       OnboardingPhase phase=phase name=onboarding_name node_api=canonical_endpoint(rpc) invite=invite_link steps=provision_steps step_index=provision_index height=block_height peers_live=0 peers_total=0 tier=member_tier(members_rows) error=onboarding_error busy=(mutation_phase != "idle")
+        events
+          go_welcome -> go_welcome
+          go_create -> go_create
+          go_join -> go_join
+          create_network_submit -> create_network_submit _
+          copy_onboarding_invite -> copy_onboarding_invite
+          enter_console -> enter_console
+          join_network_submit -> join_network_submit _
     if phase == "console"
       WorkspaceTabs network=network_label(account_name, connected_rpc) status=status height=block_height loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab bell_count=bell_unread bell_sev=bell_worst_severity(bell_items) approvals=open_proposals(gov_rows) account=account_name agent_live=any_agent_active(agents_rows) phase=phase tier=member_tier(members_rows) root_hash=node_root_hash consensus_view=node_view quorum=node_quorum reachable=node_reachable last_finalized=node_last_finalized checkpoint=node_checkpoint #workspace-tabs
+        events
+          select_shell_tab -> select_shell_tab _
+          toggle_bell -> toggle_bell
         notice:
           col w=fill
             if error != ""
@@ -266,6 +281,8 @@ view
                   col w=fill gap=2.0
                     for channel in channels
                       ChannelButton channel=channel selected=(channel.id == active_channel) unread=channel_is_unread(channel_reads, channel.id, channel.head_seq)
+                        events
+                          choose_channel -> choose_channel _
                 box w=fill h=1.0 bg=separator
                   space w=1.0 h=1.0
                 box w=fill pl=14.0 pr=14.0 pt=11.0 pb=11.0
@@ -296,10 +313,17 @@ view
                           // states — in it here, in it elsewhere, in none.
                           if huddle_joined && huddle_channel == active_channel
                             HuddleLivePill name=active_channel_name elapsed=mmss(huddle_now - huddle_joined_at)
+                              events
+                                pop_huddle -> pop_huddle
+                                leave_huddle_here -> leave_huddle_here
                           if huddle_joined && huddle_channel != active_channel
                             HuddleElsewhere name=huddle_channel_name
+                              events
+                                huddle_go_channel -> huddle_go_channel
                           if !huddle_joined && !active_channel_archived
                             HuddleStart
+                              events
+                                join_huddle_submit -> join_huddle_submit
                           // `· N added`, NOT `· N members`. `channel_members`
                           // holds the chat module's explicit `SetMembership`
                           // rows and `stage_channel` seeds none, so an ordinary
@@ -331,6 +355,8 @@ view
                           col w=fill gap=1.0
                             for hit in chat_search_hits
                               ChatSearchResult hit=hit
+                                events
+                                  open_chat_search_hit -> open_chat_search_hit _ _ _
                     if !connected
                       EmptyState title="Connect to a node" description="Set the RPC endpoint in the sidebar."
                     if connected && empty(messages)
@@ -366,6 +392,15 @@ view
                                           text ""
                                     stack #message(message.id) w=fill
                                       MessageCard message=message selected=(message.seq == selected_message_seq) hovered=(message.seq == hovered_message_seq) disabled=loading
+                                        events
+                                          message_entered -> message_entered _
+                                          message_exited -> message_exited _
+                                          add_reaction_at -> add_reaction_at _ _
+                                          remove_reaction_at -> remove_reaction_at _ _
+                                          open_thread_for -> open_thread_for _
+                                          open_message_actions_accessibly -> open_message_actions_accessibly _ _ _
+                                          open_message_reactions -> open_message_reactions _ _ _
+                                          open_message_actions -> open_message_actions _ _ _
                         overlay when=(selected_message_seq > 0 && message_action != "toolbar") dismiss=clear_message_selection backdrop=transparent p=8.0 align-x=end align-y=start
                           content
                             space w=fill h=fill
@@ -538,6 +573,8 @@ view
                           col w=fill gap=2.0
                             for member in channel_members
                               ChatMemberRow member=member disabled=(mutation_phase != "idle")
+                                events
+                                  remove_channel_member_submit -> remove_channel_member_submit _
                 if active_thread_seq > 0 && !channel_settings_open
                   box w=1.0 h=fill bg=fg/8
                     text ""
@@ -563,6 +600,13 @@ view
                               col w=fill gap=1.0
                                 for thread_message in thread_messages
                                   ThreadMessageCard message=thread_message selected=(thread_message.seq == thread_target_seq) hovered=(thread_message.seq == thread_hovered_seq) disabled=loading
+                                    events
+                                      thread_message_entered -> thread_message_entered _
+                                      thread_message_exited -> thread_message_exited _
+                                      add_reaction_at -> add_reaction_at _ _
+                                      remove_reaction_at -> remove_reaction_at _ _
+                                      open_thread_message_actions -> open_thread_message_actions _ _ _
+                                      open_thread_message_reactions -> open_thread_message_reactions _ _ _
                                 if thread_has_more && thread_next_reply_offset >= 0
                                   button "Load more replies" disabled=(thread_loading || mutation_phase != "idle") w=fill h=28.0 p=5.0 @secondary_action -> load_more_thread
                                     active bg=transparent text=muted r=7.0
@@ -721,6 +765,8 @@ view
                   col w=fill gap=2.0
                     for page in pages
                       PageButton page=page selected=(page.id == active_page)
+                        events
+                          choose_page -> choose_page _
             box w=1.0 h=fill bg=separator
               space w=1.0 h=1.0
             mouse move=pages_pointer_moved
@@ -819,6 +865,8 @@ view
                                   col w=fill gap=1.0
                                     for hit in page_search_hits
                                       PageSearchResult hit=hit
+                                        events
+                                          open_page_search_hit -> open_page_search_hit _ _
                             if !empty(orphaned_block_drafts) || !empty(orphaned_comment_drafts)
                               box w=fill p=7.0 bg=elevated border=fg/9 border-w=1.0 r=9.0
                                 col w=fill gap=5.0
@@ -847,6 +895,9 @@ view
                                   pressed bg=fg/8
                             if block_insert_open && empty(block_insert_after_id)
                               InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix="" #block-insert-row(block_insert_after_id)
+                                events
+                                  new_block_kind_changed -> new_block_kind_changed _
+                                  close_block_insert -> close_block_insert
                                 stack w=fill
                                   if new_block_kind != "Divider"
                                     col w=fill gap=2.0
@@ -869,24 +920,37 @@ view
                             keyed block in blocks by=block.key
                               col w=fill gap=1.0
                                 DocumentBlock block=block selected=(block.id == selected_block_id) hovered=(block.id == hovered_block_id) disabled=loading #block(block.id)
+                                  events
+                                    block_entered -> block_entered _
+                                    block_exited -> block_exited _
+                                    open_block_insert -> open_block_insert _ _
+                                    select_block -> select_block _ _ _ _ _ _
                                   col w=fill
                                     if block.pending
                                       box w=fill p=5.0 bg=fg/3 r=6.0
                                         BlockContents block=block
+                                          events
+                                            set_todo_checked -> set_todo_checked _ _
                                     if !block.pending && block.kind == "Page"
                                       button label=block.kind description=block.text w=fill p=5.0 @ghost_action -> choose_page(block.id)
                                         BlockContents block=block
+                                          events
+                                            set_todo_checked -> set_todo_checked _ _
                                         active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
                                         hovered bg=fg/3 text=fg border=transparent
                                         pressed bg=fg/6 text=fg
                                     if !block.pending && block.kind != "Page" && block.id != selected_block_id
                                       button label=block.kind description=block.text w=fill p=5.0 @ghost_action -> select_block(block.key, block.id, block.kind, block.text, block.checked, false)
                                         BlockContents block=block
+                                          events
+                                            set_todo_checked -> set_todo_checked _ _
                                         active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
                                         hovered bg=fg/3 text=fg border=transparent
                                         pressed bg=fg/6 text=fg
                                     if !block.pending && block.kind != "Page" && block.id == selected_block_id
                                       BlockLine block=block #line
+                                        events
+                                          set_todo_checked -> set_todo_checked _ _
                                         col w=fill
                                           if block.kind == "Divider"
                                             Separator
@@ -897,6 +961,9 @@ view
                                               disabled value=muted
                                 if block_insert_open && block.id == block_insert_after_id
                                   InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix=block.prefix #block-insert-row(block_insert_after_id)
+                                    events
+                                      new_block_kind_changed -> new_block_kind_changed _
+                                      close_block_insert -> close_block_insert
                                     stack w=fill
                                       if new_block_kind != "Divider"
                                         col w=fill gap=2.0
@@ -922,6 +989,14 @@ view
                       layer
                         float x=(block_menu_x + 10.0) y=block_menu_y
                           BlockActionsMenu block_id=selected_block_id kind=selected_block_kind disabled=(loading || mutation_phase != "idle") delete_armed=block_delete_armed editable_kinds=editable_block_kinds
+                            events
+                              selected_block_kind_changed -> selected_block_kind_changed _
+                              choose_page -> choose_page _
+                              move_block_submit -> move_block_submit _
+                              open_block_comments -> open_block_comments
+                              arm_block_delete -> arm_block_delete
+                              remove_block_submit -> remove_block_submit
+                              close_block_actions -> close_block_actions
                 // The artifact hangs a 306px rail off the document, not a
                 // floating card. The Spec tab is omitted: pages carry no kind,
                 // no last-editor and no derivation pipeline (see omissions).
@@ -950,6 +1025,8 @@ view
                                 text "No comments yet" w=fill size=12.5 align-x=center @text-muted
                               for comment_thread in block_comment_threads
                                 PageCommentThreadButton thread=comment_thread
+                                  events
+                                    open_block_comment_thread -> open_block_comment_thread _
                               if block_comment_threads_has_more
                                 button "More" disabled=(block_comment_threads_loading || mutation_phase != "idle") h=24.0 p=4.0 @secondary_action -> load_more_block_threads
                                   active bg=transparent text=muted r=6.0
@@ -1024,6 +1101,8 @@ view
                     for entry in fs_entries
                       if entry.kind == "dir"
                         FsTreeRow entry=entry selected=false depth=0.0
+                          events
+                            fs_open_dir -> fs_open_dir _
               box w=1.0 h=fill bg=separator
                 space w=1.0 h=1.0
               col w=fill h=fill
@@ -1073,6 +1152,9 @@ view
                         col w=fill
                           for entry in fs_entries
                             ObjectRow entry=entry selected=(entry.path == fs_preview_path)
+                              events
+                                fs_open_dir -> fs_open_dir _
+                                fs_open_file -> fs_open_file _
                     if !empty(fs_preview_path)
                       col w=fill h=300.0
                         box w=fill h=1.0 bg=separator
@@ -1180,6 +1262,11 @@ view
               for member in members_rows
                 if member.key == members_selected
                   MemberDetail member=member admin=members_is_admin(members_rows)
+                    events
+                      open_member -> open_member _
+                      copy_to_clipboard -> copy_to_clipboard _ _
+                      agent_set_status -> agent_set_status _ _
+                      gov_propose -> gov_propose _ _
         agents:
           col w=fill h=fill
             ScreenHeader title="Agents" meta=agents_summary(agents_rows)
@@ -1216,6 +1303,8 @@ view
                     grid min-cell=380.0 gap=13.0
                       for repo in forge_repos
                         RepoCard repo=repo
+                          events
+                            forge_open_repo -> forge_open_repo _
             if !empty(forge_repo)
               col w=fill h=fill
                 box w=fill pl=22.0 pr=22.0 pt=14.0 pb=12.0
@@ -1233,6 +1322,8 @@ view
                           col w=fill gap=1.0
                             for repo in forge_repos
                               RepoMenuRow repo=repo active=(repo.name == forge_repo)
+                                events
+                                  forge_open_repo -> forge_open_repo _
                 box w=fill h=1.0 bg=separator
                   space w=1.0 h=1.0
                 if forge_item_number <= 0
@@ -1345,8 +1436,12 @@ view
                                     text "Truncated at the reader's 64 KiB window — the file on the node is whole." size=11.5 wrap=none @text-label
                       "issues"
                         ForgeTrackerList items=filter_forge_items(forge_items, "issue") empty_message="No issues — an issue opened against this repo appears here."
+                          events
+                            forge_open_item -> forge_open_item _
                       _
                         ForgeTrackerList items=filter_forge_items(forge_items, "pr") empty_message="No pull requests — a PR pushed to this repo appears here."
+                          events
+                            forge_open_item -> forge_open_item _
                     // NO GATE NOTE HERE. `ForgeGateNote` told a resident the
                     // node refuses their merge; `ForgeMsg::MergePr` authorizes
                     // on `author_from_origin` alone, so the write succeeds and
@@ -1357,6 +1452,8 @@ view
                   scroll dir=vertical w=fill h=fill
                     col w=fill p=22.0 gap=14.0
                       BackToList kind=forge_item_kind
+                        events
+                          forge_close_item -> forge_close_item
                       row w=fill gap=9.0 align=center
                         text forge_item_title w=fill size=16.0 wrap=none font=display @text-primary
                         if forge_item_kind == "pr"
@@ -1398,6 +1495,8 @@ view
                               MergeAdvisory change_requests=forge_item_change_requests
                               row w=fill gap=10.0 align=center
                                 MergeButton busy=forge_merge_busy disabled=(!connected || empty(forge_item_source_oid))
+                                  events
+                                    forge_merge_submit -> forge_merge_submit
                                 // The tally belongs where the decision is made,
                                 // and it is loaded already. The sentence beside
                                 // it is the whole permission model this module
@@ -1477,6 +1576,9 @@ view
                   for proposal in gov_rows
                     if proposal.open
                       ProposalCard proposal=proposal busy=(!empty(gov_voting))
+                        events
+                          gov_vote -> gov_vote _ _
+                          gov_execute -> gov_execute _
               // The FINALIZED eyebrow is gated on the settled subset, never on the
               // combined register — otherwise it hangs over nothing.
               if !empty(settled_proposals(gov_rows))
