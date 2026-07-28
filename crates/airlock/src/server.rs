@@ -819,8 +819,22 @@ async fn proxy_inner(
         let rem = b
             .get_mut(&claims.sub)
             .ok_or_else(|| AppErr(StatusCode::FORBIDDEN, "no budget for sub".into()))?;
+        // A spent budget ENDS the session, exactly as its TTL lapsing does, and
+        // the remedy is identical: open a new one. So it answers 401 like the
+        // expiry above, not 429.
+        //
+        // 429 said "back off and retry later", which is false — waiting never
+        // refills this session, the budget is per-session and only a new
+        // handshake resets it. Worse, the caller cannot tell that 429 from the
+        // VENDOR's rate-limit 429, which is relayed from upstream and MUST pass
+        // through untouched. So the broker's re-handshake-on-401 never fired
+        // here and a borrowed credential simply died at `max_requests`, with the
+        // sandbox seeing a rate limit that would never clear.
         if *rem == 0 {
-            return Err(AppErr(StatusCode::TOO_MANY_REQUESTS, "budget exhausted".into()));
+            return Err(AppErr(
+                StatusCode::UNAUTHORIZED,
+                "session budget spent".into(),
+            ));
         }
         *rem -= 1;
     }

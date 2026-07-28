@@ -3383,6 +3383,7 @@ mod tests {
         )>,
         granted: Vec<u8>,
         verified_caller: Vec<u8>,
+        max_requests: u32,
     ) -> String {
         let check: airlock::server::GrantCheck = std::sync::Arc::new(move |question| {
             let granted = granted.clone();
@@ -3406,7 +3407,7 @@ mod tests {
                 oauth_token_url: format!("{upstream}/oauth/token"),
                 oauth_client_id: "test-client".into(),
                 session_ttl_secs: 3600,
-                max_requests: 100,
+                max_requests,
             },
             seeds,
             Some(check),
@@ -3509,6 +3510,7 @@ mod tests {
             )],
             b"grantee".to_vec(),
             b"grantee".to_vec(),
+            100,
         )
         .await;
         let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
@@ -3531,6 +3533,86 @@ mod tests {
         assert!(resp.text().await.unwrap().contains("AIRLOCK-OK"), "gated self-host round-trip");
     }
 
+    /// A BORROWED credential must be able to renew its session.
+    ///
+    /// The session token a lending gateway mints is scoped: it lapses at
+    /// `session_ttl_secs` or `max_requests`, whichever comes first, and the
+    /// gateway then 401s. The broker re-handshakes once and retries — and that
+    /// re-handshake goes to a gateway that is ALWAYS grant-gated, so it only
+    /// works if the second session is admitted on the same footing as the first.
+    ///
+    /// Two things had to be true and only one of them was.
+    ///
+    /// #825 named the first: `AirlockSession` carried no account, so the re-auth
+    /// handshake sent none and the gate refused it. That one is already gone —
+    /// the account field was DELETED from `SessionRequest` (the grant subject is
+    /// what the node's proxy VOUCHED for, never what the request claims), which
+    /// fixed it as a side effect. This test pins the property so it cannot come
+    /// back the next time that handshake is touched.
+    ///
+    /// The second was still live and is fixed here: a session that spent its
+    /// REQUEST budget answered 429, and the broker only re-handshakes on 401. So
+    /// the TTL half of the symptom recovered and the `max_requests` half did
+    /// not — the run just died, with the sandbox seeing a rate limit that would
+    /// never clear. A spent session is an ended session, so it now answers 401
+    /// like its expiry does.
+    ///
+    /// `max_requests: 1` forces that lapse deterministically: request two costs
+    /// the budget the first one spent, so no clock and no sleep is involved.
+    #[tokio::test]
+    async fn a_borrowed_credential_renews_its_session_through_the_grant_gate() {
+        let upstream = bearer_upstream("tok-renew").await;
+        let (kp, seal_pk) = seal_pair();
+        let gateway_url = boot_grant_gated_gateway(
+            &upstream,
+            kp,
+            vec![(
+                "owner-claude-1".into(),
+                airlock::wire::CredentialKind::Claude,
+                airlock::wire::CredentialPayload::Bearer { access_token: "tok-renew".into() },
+            )],
+            b"grantee".to_vec(),
+            b"grantee".to_vec(),
+            1,
+        )
+        .await;
+        let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
+        let (auth, messages_url) =
+            AnthropicAuth::airlock(AirlockConfig::self_host(&rc, WorkRef::Direct))
+                .await
+                .expect("the first session opens");
+        let broker = RunBroker::start_anthropic_with(auth, Reachability::Loopback, messages_url)
+            .await
+            .unwrap();
+        let ask = || async {
+            reqwest::Client::new()
+                .post(format!("{}/v1/messages", broker.endpoint.base_url))
+                .bearer_auth(&broker.endpoint.run_bearer)
+                .header("content-type", "application/json")
+                .body(r#"{"model":"claude","stream":true,"messages":[{"role":"user","content":"hi"}]}"#)
+                .send()
+                .await
+                .unwrap()
+        };
+
+        let first = ask().await;
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+        assert!(first.text().await.unwrap().contains("AIRLOCK-OK"));
+
+        // the session's whole budget is spent, so this one 401s at the gateway
+        // and only lands if the re-handshake was admitted.
+        let renewed = ask().await;
+        assert_eq!(
+            renewed.status(),
+            reqwest::StatusCode::OK,
+            "a lapsed session must re-handshake through the grant gate, not 403"
+        );
+        assert!(
+            renewed.text().await.unwrap().contains("AIRLOCK-OK"),
+            "the retried request must reach the upstream"
+        );
+    }
+
     /// The gate's teeth: an UNGRANTED account is refused at session open, before
     /// any credentialed request — the broker's account reaches the gate and the
     /// gate says no.
@@ -3548,6 +3630,7 @@ mod tests {
             )],
             b"grantee".to_vec(),
             b"stranger".to_vec(),
+            100,
         )
         .await;
         let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
@@ -3578,6 +3661,7 @@ mod tests {
             )],
             b"grantee".to_vec(),
             b"wedged".to_vec(),
+            100,
         )
         .await;
         let rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
