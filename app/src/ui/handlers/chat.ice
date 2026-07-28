@@ -404,7 +404,7 @@ on open_thread_message_actions(seq, body, rev)
   thread_message_action = "more"
   thread_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/thread-action-focus
+    task widget focus #workspace-tabs/content/chat/thread-action-focus
     task widget focus-next
 
 on open_thread_message_reactions(seq, body, rev)
@@ -415,7 +415,7 @@ on open_thread_message_reactions(seq, body, rev)
   thread_message_action = "reactions"
   thread_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/thread-reaction-focus
+    task widget focus #workspace-tabs/content/chat/thread-reaction-focus
     task widget focus-next
 
 on arm_thread_message_delete(seq, body, rev)
@@ -425,7 +425,7 @@ on arm_thread_message_delete(seq, body, rev)
   thread_message_action = "delete"
   thread_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/thread-delete-focus
+    task widget focus #workspace-tabs/content/chat/thread-delete-focus
     task widget focus-next
 
 on begin_thread_message_edit(seq, body, rev)
@@ -434,7 +434,7 @@ on begin_thread_message_edit(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = "editing"
   thread_edit_draft = body
-  task widget focus #workspace-tabs/content/thread-edit
+  task widget focus #workspace-tabs/content/chat/thread-edit
 
 on clear_thread_message_selection
   thread_selected_seq = 0
@@ -468,7 +468,7 @@ on open_message_actions(seq, body, rev)
   message_action = "more"
   message_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/message-action-focus
+    task widget focus #workspace-tabs/content/chat/message-action-focus
     task widget focus-next
 
 on open_message_actions_accessibly(seq, body, rev)
@@ -479,7 +479,7 @@ on open_message_actions_accessibly(seq, body, rev)
   message_action = "more"
   message_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/message-action-focus
+    task widget focus #workspace-tabs/content/chat/message-action-focus
     task widget focus-next
 
 on open_message_reactions(seq, body, rev)
@@ -490,7 +490,7 @@ on open_message_reactions(seq, body, rev)
   message_action = "reactions"
   message_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/message-reaction-focus
+    task widget focus #workspace-tabs/content/chat/message-reaction-focus
     task widget focus-next
 
 on arm_message_delete(seq, body, rev)
@@ -500,7 +500,7 @@ on arm_message_delete(seq, body, rev)
   message_action = "delete"
   message_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/message-delete-focus
+    task widget focus #workspace-tabs/content/chat/message-delete-focus
     task widget focus-next
 
 on begin_message_edit(seq, body, rev)
@@ -509,7 +509,7 @@ on begin_message_edit(seq, body, rev)
   selected_message_rev = rev
   message_action = "editing"
   message_edit_draft = body
-  task widget focus #workspace-tabs/content/message-edit
+  task widget focus #workspace-tabs/content/chat/message-edit
 
 // THE INSPECTOR IS THE FINALITY MARK'S TARGET. The shield in the hover bar and
 // the settled chip on my own bubble both land here, and both name the same

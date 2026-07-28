@@ -293,3 +293,27 @@ component BellBody(item:BellItem)
           text item.source size=9.0 wrap=none font=code_semibold @text-info
       text item.body w=fill size=12.0 line-h=1.45 @text-input
     text item.height size=10.5 wrap=none font=code_medium @text-label
+
+component StatusBadge(label:str)
+  row align=center
+    match label
+      "active"
+        Badge.Success label=label
+      "paused"
+        Badge.Warning label=label
+      "open"
+        Badge.Success label=label
+      "closed"
+        Badge.Destructive label=label
+      "merged"
+        Badge.Success label=label
+      "passed"
+        Badge.Success label=label
+      "rejected"
+        Badge.Destructive label=label
+      "applied"
+        Badge.Success label=label
+      "discarded"
+        Badge.Warning label=label
+      _
+        Badge.Outline label=label

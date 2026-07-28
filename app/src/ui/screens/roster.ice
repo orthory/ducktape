@@ -1,0 +1,102 @@
+// The two ROSTER screens: who may act on this network, and what the registry
+// says they may do.
+//
+// A screen is a component like any other, which means it cannot reach app state
+// — every reading it draws arrives as a prop, and every act it offers leaves as
+// a named event that `view.ice` routes back to the handler of the same name.
+// That is the whole contract; the bodies below are the ones that used to sit
+// inline in the view's `members:` and `agents:` slots, unchanged.
+
+component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:str, selected:str, admin:bool)
+  emits
+    pick_members_filter(str)
+    open_member(str)
+    copy_to_clipboard(str, str)
+    agent_set_status(str, bool)
+    gov_propose(str, str)
+  row w=fill h=fill
+    col w=fill h=fill
+      ScreenHeader title="Members" meta=members_summary(validators, residents)
+        // NO INVITE BUTTON YET. `mint_invite` exists in the backend, but nothing
+        // routes the mint itself, so the button would open a modal with no act
+        // in it.
+        space w=1.0 h=1.0
+      // All / Humans / Agents / Validators. `filter_members` owns the
+      // predicate so the strip and the list can never disagree.
+      col w=fill
+        box w=fill pl=22.0 pr=22.0 pt=12.0 pb=12.0
+          row w=fill gap=7.0 align=center
+            button label="Show every member" p=0.0 @ghost_action -> emit(pick_members_filter, "all")
+              FilterChip label="All" count=len(rows) selected=(filter == "all")
+              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+              hovered bg=row_hover text=fg
+              pressed bg=elevated text=fg
+            button label="Show people only" p=0.0 @ghost_action -> emit(pick_members_filter, "humans")
+              FilterChip label="Humans" count=len(filter_members(rows, "humans")) selected=(filter == "humans")
+              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+              hovered bg=row_hover text=fg
+              pressed bg=elevated text=fg
+            button label="Show agents only" p=0.0 @ghost_action -> emit(pick_members_filter, "agents")
+              FilterChip label="Agents" count=len(filter_members(rows, "agents")) selected=(filter == "agents")
+              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+              hovered bg=row_hover text=fg
+              pressed bg=elevated text=fg
+            button label="Show validators only" p=0.0 @ghost_action -> emit(pick_members_filter, "validators")
+              FilterChip label="Validators" count=len(filter_members(rows, "validators")) selected=(filter == "validators")
+              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+              hovered bg=row_hover text=fg
+              pressed bg=elevated text=fg
+            space w=fill
+        box w=fill h=1.0 bg=separator
+          space w=1.0 h=1.0
+      if empty(filter_members(rows, filter))
+        box w=fill h=fill p=22.0
+          EmptyPlate message="No members here yet — validators, residents and registered agents appear as they join."
+      if !empty(filter_members(rows, filter))
+        scroll dir=vertical w=fill h=fill
+          col w=fill pl=12.0 pr=12.0 pt=6.0 pb=6.0 gap=1.0
+            for member in filter_members(rows, filter)
+              col w=fill
+                if member.key == selected
+                  button label="Open member" description=member.label w=fill p=0.0 @ghost_action -> emit(open_member, member.key)
+                    MemberRowCard member=member
+                    active bg=elevated text=fg border=transparent border-w=1.0 r=9.0
+                    hovered bg=elevated text=fg
+                    pressed bg=subtle text=fg
+                if member.key != selected
+                  button label="Open member" description=member.label w=fill p=0.0 @ghost_action -> emit(open_member, member.key)
+                    MemberRowCard member=member
+                    active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
+                    hovered bg=row_hover text=fg
+                    pressed bg=elevated text=fg
+    if !empty(selected)
+      for member in rows
+        if member.key == selected
+          MemberDetail member=member admin=admin
+            forward
+              open_member
+              copy_to_clipboard
+              agent_set_status
+              gov_propose
+
+component AgentsScreen(rows:[AgentRow])
+  col w=fill h=fill
+    ScreenHeader title="Agents" meta=agents_summary(rows)
+      space w=1.0 h=1.0
+    // The registry explainer. The artifact states the whole model in this
+    // one strip and the English UI never did: the registry is the record of
+    // WHO may do WHAT under WHICH grant, and the doing itself is recorded
+    // separately as that agent's runs.
+    col w=fill
+      box w=fill pl=22.0 pr=22.0 pt=12.0 pb=10.0
+        text "The registry records who may act, what they may do, and under whose grant — every entry here is on chain. The acting itself is recorded separately, as each agent's runs." w=fill size=12.0 line-h=1.5 @text-caption
+      box w=fill h=1.0 bg=separator
+        space w=1.0 h=1.0
+    if empty(rows)
+      box w=fill h=fill p=22.0
+        EmptyPlate message="No agents registered — a registered agent appears here with its capability and grants."
+    if !empty(rows)
+      scroll dir=vertical w=fill h=fill
+        col w=fill p=18.0 gap=11.0
+          for agent in rows
+            AgentCard agent=agent

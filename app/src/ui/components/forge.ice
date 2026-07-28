@@ -621,3 +621,21 @@ component ReviewVerdict(verdict:str)
         text verdict_label(verdict) size=10.5 wrap=none font=code_medium @text-alert_fg
       _
         text verdict_label(verdict) size=10.5 wrap=none font=code_medium @text-meta
+
+// One seat of the forge tab bar: the tracker under one kind filter. Both the
+// Pull requests and the Issues arms are this component with a different filter
+// and a different empty line, so the two lists can never drift apart.
+component ForgeTrackerList(items:[ForgeItem], empty_message:str)
+  emits
+    forge_open_item(i64)
+  col #root w=fill h=fill
+    if empty(items)
+      box w=fill p=22.0
+        EmptyPlate message=empty_message
+    if !empty(items)
+      scroll dir=vertical w=fill h=fill
+        col w=fill pl=12.0 pr=12.0 pt=6.0 pb=18.0 gap=1.0
+          for item in items
+            TrackerRow item=item
+              forward
+                forge_open_item
