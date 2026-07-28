@@ -1413,7 +1413,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         let shell = include_str!("ui/components/shell.ice");
         // the shell is titlebar + optional degradation banner over the panes.
         assert!(shell.contains(
-            "component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)"
+            "component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)"
         ));
         // `phase` is the bar's ONE discriminant, matched twice — the network
         // chip on the left and the whole status/bell cluster on the right both

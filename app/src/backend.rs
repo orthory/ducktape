@@ -10149,25 +10149,30 @@ mod tests {
                 None => root_files.push(((*path).to_string(), blob)),
             }
         }
-        let mut root = mirror.treebuilder(None).unwrap();
-        for (name, blob) in root_files {
-            root.insert(&name, blob, 0o100644).unwrap();
-        }
-        for (directory, entries) in subtrees {
-            let mut sub = mirror.treebuilder(None).unwrap();
-            for (name, blob) in entries {
-                sub.insert(&name, blob, 0o100644).unwrap();
+        // Every git2 handle below borrows `mirror`, so they live in a block:
+        // the TreeBuilder is still alive at the end of the expression otherwise,
+        // and the repository cannot be moved out to the caller.
+        {
+            let mut root = mirror.treebuilder(None).unwrap();
+            for (name, blob) in root_files {
+                root.insert(&name, blob, 0o100644).unwrap();
             }
-            let oid = sub.write().unwrap();
-            root.insert(&directory, oid, 0o040000).unwrap();
+            for (directory, entries) in subtrees {
+                let mut sub = mirror.treebuilder(None).unwrap();
+                for (name, blob) in entries {
+                    sub.insert(&name, blob, 0o100644).unwrap();
+                }
+                let oid = sub.write().unwrap();
+                root.insert(&directory, oid, 0o040000).unwrap();
+            }
+            let tree = mirror.find_tree(root.write().unwrap()).unwrap();
+            let signature = git2::Signature::now("mule", "mule@localhost").unwrap();
+            let head = mirror
+                .commit(None, &signature, &signature, "seed", &tree, &[])
+                .unwrap();
+            let commit = mirror.find_commit(head).unwrap();
+            mirror.branch("main", &commit, true).unwrap();
         }
-        let tree = mirror.find_tree(root.write().unwrap()).unwrap();
-        let signature = git2::Signature::now("mule", "mule@localhost").unwrap();
-        let head = mirror
-            .commit(None, &signature, &signature, "seed", &tree, &[])
-            .unwrap();
-        let commit = mirror.find_commit(head).unwrap();
-        mirror.branch("main", &commit, true).unwrap();
         mirror
     }
 

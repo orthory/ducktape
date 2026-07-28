@@ -9,11 +9,13 @@
 // WorkspaceTabs routes eight screens plus settings; there is no `node` slot and
 // no Modules seat (its catalog has no data source at all).
 //
-// TYPE-SCALE SNAPS, decided rather than widening `design::type_scale`:
-//   network name  11.5 -> 12.0     the chip mark  7 -> 9.0
-//   card height   17   -> 14.0     (16.0 and 20.0 are sans-only by the guard,
-//                                   and a block height is a machine value)
-//   card footnote 10   -> 12.5     (10.0 is pinned to mono semibold)
+// TYPE SCALE. The artifact's own values where the scale carries them — the
+// network name is 11.5 and the chip mark 7 (nearest step 7.5). The scale was
+// widened to hold them rather than the view snapped to fit the guard; the
+// guard's own panic says so. Two remain snapped, and deliberately: the card's
+// height readout 17 -> 14.0 (16.0 and 20.0 are sans-only by the guard, and a
+// block height is a machine value) and the card footnote 10 -> 12.5 (10.0 is
+// pinned to mono semibold).
 
 component Brand()
   box #root w=30.0 h=30.0 align-x=center align-y=center bg=primary r=9.0
@@ -23,8 +25,8 @@ component Brand()
 component NetworkChip(name:str)
   row #root gap=7.0 align=center
     box w=15.0 h=15.0 align-x=center align-y=center bg=primary r=4.0
-      text "◆" size=9.0 wrap=none font=code_semibold @text-toast_fg
-    text name size=12.0 wrap=none font=display @text-accent_fg
+      text "◆" size=7.5 wrap=none font=code_semibold @text-toast_fg
+    text name size=11.5 wrap=none font=display @text-accent_fg
 
 // The one dot that carries connection state, at both the pill's 6px and the
 // status card's 7px. A stopped node wears `alert_dot`, never the traffic-light
