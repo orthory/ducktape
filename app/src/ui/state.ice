@@ -267,8 +267,6 @@ state
   huddle_now:i64 = 0
   huddle_popped = false
   // The event inspector every finality mark opens.
-  inspector_open = false
-  inspector_seq:i64 = 0
   // EXPLORER — one query across every module, filtered by result kind.
   explorer_query = ""
   explorer_kind = "all"

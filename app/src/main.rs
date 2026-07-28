@@ -60,14 +60,16 @@ mod tests {
     }
 
     fn default_ice_color(name: &str) -> iced::Color {
-        let source = include_str!("ui/ducktape-ui/default.ice");
+        // 2.0 allows ONE theme contract and one palette, so the kit's theme moved
+        // out of the vendored copy into the app's own file.
+        let source = include_str!("ui/theme.ice");
         let value = source
             .lines()
             .find_map(|line| {
                 let mut parts = line.split_ascii_whitespace();
                 (parts.next() == Some(name)).then(|| parts.next()).flatten()
             })
-            .unwrap_or_else(|| panic!("default.ice is missing `{name}`"));
+            .unwrap_or_else(|| panic!("theme.ice palette is missing `{name}`"));
         let hex = value
             .strip_prefix('#')
             .expect("default Ice colors use hexadecimal literals");
@@ -850,10 +852,10 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .split_once("component ThreadMessageCard")
             .unwrap()
             .0;
-        assert!(toolbar.contains("mouse enter=message_entered(message.seq)"));
+        assert!(toolbar.contains("mouse enter=emit(message_entered, message.seq)"));
         assert!(toolbar.contains("if !message.deleted && !message.pending && hovered"));
         assert!(toolbar.contains("if !message.deleted && !message.pending && !hovered"));
-        assert!(toolbar.contains("-> open_message_actions_accessibly("));
+        assert!(toolbar.contains("-> emit(open_message_actions_accessibly, message.seq, message.body, message.rev)"));
         assert!(!toolbar.contains("hovered || selected"));
         assert_eq!(toolbar.matches("w=26.0 h=26.0").count(), 1);
         // the artifact's hover bar is five 27×25 cells: three one-tap reactions,
@@ -896,7 +898,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             assert!(toolbar.contains(&format!("label=\"{label}\"")));
         }
         assert!(components.contains(
-            "button label=\"Open thread\" disabled=disabled p=5.0 @icon_action -> open_thread_for(message.seq)"
+            "button label=\"Open thread\" disabled=disabled p=5.0 @icon_action -> emit(open_thread_for, message.seq)"
         ));
 
         let view = include_str!("ui/view.ice");
@@ -977,15 +979,15 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .unwrap()
             .1;
         assert!(card.contains(
-            "mouse enter=thread_message_entered(message.seq) exit=thread_message_exited(message.seq)"
+            "mouse enter=emit(thread_message_entered, message.seq) exit=emit(thread_message_exited, message.seq)"
         ));
         assert!(
             card.contains(
-                "-> open_thread_message_reactions(message.seq, message.body, message.rev)"
+                "-> emit(open_thread_message_reactions, message.seq, message.body, message.rev)"
             )
         );
         assert!(
-            card.contains("-> open_thread_message_actions(message.seq, message.body, message.rev)")
+            card.contains("-> emit(open_thread_message_actions, message.seq, message.body, message.rev)")
         );
         // No open-thread action from inside a thread you are already reading.
         assert!(!card.contains("open_thread_for"));
@@ -1365,7 +1367,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(!ui.contains("white/"));
         assert!(!ui.contains("bg=glass_"));
 
-        let defaults = include_str!("ui/ducktape-ui/default.ice");
+        // The palette moved with the theme: 2.0 permits one contract and one
+        // palette, and the vendored kit copy no longer carries either.
+        let defaults = include_str!("ui/theme.ice");
         for material in [
             "bg         #fdfdfb",
             "surface    #ffffff",
@@ -1848,7 +1852,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
 
         let components = include_str!("ui/components/pages.ice");
         assert!(components.contains("label=\"Comments\""));
-        assert!(components.contains("-> open_block_comments"));
+        assert!(components.contains("-> emit(open_block_comments)"));
 
         let handlers = include_str!("ui/handlers/pages.ice");
         assert!(handlers.contains("on post_block_comment_submit"));

@@ -41,6 +41,9 @@ test connection_panel_contract
   viewport 1120 720
   mount
     WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view=0 quorum=0 reachable=0 last_finalized=0 checkpoint=0 #workspace-tabs
+      events
+        select_shell_tab -> select_shell_tab _
+        toggle_bell -> toggle_bell
       notice:
         space w=1.0 h=1.0
       chat:
@@ -81,6 +84,9 @@ test palette_escape_contract
   viewport 1120 720
   mount
     WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view=0 quorum=0 reachable=0 last_finalized=0 checkpoint=0 #workspace-tabs
+      events
+        select_shell_tab -> select_shell_tab _
+        toggle_bell -> toggle_bell
 
 
 
@@ -171,6 +177,9 @@ test minimum_window_layout_contract
   viewport 1280 800
   mount
     WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view=0 quorum=0 reachable=0 last_finalized=0 checkpoint=0 #workspace-tabs
+      events
+        select_shell_tab -> select_shell_tab _
+        toggle_bell -> toggle_bell
 
 
 

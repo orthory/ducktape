@@ -384,30 +384,6 @@ component ChatSearchResult(hit:ChatSearchHit)
 // carries the send state instead of the small tick.
 // ============================================================================
 
-component OwnMessageRow(message:ChatMessage)
-  emits
-    open_message_inspector(i64)
-  row #root w=fill pt=3.0 pb=3.0 align=start
-    space w=fill
-    // the artifact caps the bubble at 74% of the pane; ice lengths are absolute,
-    // so the cap is a fixed measure at the pane's design width.
-    box max-w=520.0 pl=13.0 pr=13.0 pt=9.0 pb=9.0 bg=toast_bg r-tl=13.0 r-tr=13.0 r-br=4.0 r-bl=13.0
-      col gap=4.0
-        text message.body w=fill size=13.5 line-h=1.5 wrap=word @text-toast_fg
-        // The artifact's meta row is `time` then the send state. Our stamp IS
-        // the height, and FinalityChip already spells `✓ finalized · h N`, so
-        // the chip is the whole line rather than the height printed twice.
-        row w=fill gap=6.0 align=center
-          space w=fill
-          if message.pending
-            FinalityChip phase="finalizing" height=0
-          if !message.pending
-            button label="Inspect event" p=0.0 @icon_action -> emit(open_message_inspector, message.seq)
-              FinalityChip phase="finalized" height=message.height
-              active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
-              hovered bg=fg/9 text=fg
-              pressed bg=fg/13 text=fg
-
 // One row of the message ⋯ menu: a 14px stroke glyph and its label. The button
 // and its route stay at the call site so each item picks its own handler.
 component MessageMenuItem(icon:str, label:str)
@@ -469,70 +445,9 @@ component ThreadRepliesRule(count:i64)
     text count size=10.5 wrap=none font=code_medium @text-label
     text "replies" size=10.5 wrap=none font=code_medium @text-label
 
-// ============================================================================
-// EVENT INSPECTOR — the reduced panel. It answers the four questions the app
-// can answer from what it holds: who wrote this, into which channel, at which
-// height, and has it settled.
-//
-// NOTHING MOUNTS THIS YET. view.ice owns the right rail, and until it renders
-// `EventInspector` behind `inspector_open` the panel does not exist for a user.
-// That is why the message hover bar carries NO shield: `open_message_inspector`
-// closes the open thread and discards the half-typed reply on its way to a
-// surface that never appears, and a control that costs a draft and returns
-// nothing is worse than a missing control. The only remaining route into the
-// handler is the finality chip on `OwnMessageRow`, which is itself unmounted.
-// Whoever mounts the rail re-adds the shield; whoever decides not to should
-// delete this component, `OwnMessageRow`'s chip button, the two handlers in
-// handlers/chat.ice and the two state fields in state.ice together.
-//
-// DELIBERATELY ABSENT, and not stubbed: the 5-step consensus timeline (no
-// per-height batch id, merkle root or round is reachable from any RPC), the
-// quorum signer chips (no block certificate on the wire), and the raw wire
-// JSON — `ChatMessage` is a projection of the op, not the op, so printing a
-// JSON-shaped block here would be a drawing of a record we never fetched.
-//
-// REACHABLE BUT NOT WIRED, so no faked chips: `GET /v1/blocks`
-// (bin/noded/src/index.rs) does serve a block `hash` and `commit_hash` and a
-// per-op `op_hash`, `proposer` and `disposition`, and app/src/backend.rs
-// already parses all of them into ExplorerBlock/ExplorerOp. What is missing is
-// a message -> op lookup, plus the fact that /v1/blocks only serves a recent
-// window, so an older message could not be resolved at all. Copy proof and
-// Verify wait on the same lookup.
-// ============================================================================
-
-component EventInspector(message:ChatMessage, channel_name:str)
-  emits
-    close_message_inspector
-  col #root w=fill h=fill
-    box w=fill h=50.0 pl=16.0 pr=16.0
-      row w=fill h=fill gap=8.0 align=center
-        text "Event Inspector" w=fill size=13.0 wrap=none font=display @text-fg
-        button "×" label="Close inspector" w=24.0 h=24.0 p=0.0 @ghost_action -> emit(close_message_inspector)
-          active bg=transparent text=meta border=transparent border-w=1.0 r=6.0
-          hovered bg=separator text=fg
-          pressed bg=subtle text=fg
-    box w=fill h=1.0 bg=separator
-      space w=1.0 h=1.0
-    scroll dir=vertical w=fill h=fill
-      col w=fill gap=7.0 p=16.0
-        row w=fill gap=8.0 align=center
-          text "chat.message" size=14.0 wrap=none font=code_semibold @text-primary
-          if message.avatar_kind == "agent"
-            box px=5.0 py=2.0 bg=primary r=4.0
-              text "AGENT" size=9.0 wrap=none font=code_semibold @text-primary_fg
-        row w=fill gap=5.0 align=center
-          row gap=0.0 align=center
-            text "#" size=10.5 wrap=none font=code_medium @text-hint
-            text message.seq size=10.5 wrap=none font=code_medium @text-hint
-          text "·" size=10.5 wrap=none font=code_medium @text-hint
-          row gap=0.0 align=center
-            text "#" size=10.5 wrap=none font=code_medium @text-hint
-            text channel_name size=10.5 wrap=none font=code_medium @text-hint
-        row w=fill gap=5.0 align=center
-          text "author" size=11.0 wrap=none font=code_medium @text-input
-          text message.author size=11.0 wrap=none font=code_medium @text-secondary_fg
-        row w=fill gap=6.0 align=center pt=4.0
-          if message.pending
-            FinalityChip phase="finalizing" height=0
-          if !message.pending
-            FinalityChip phase="finalized" height=message.height
+// The EVENT INSPECTOR was built here and mounted nowhere, so it is deleted
+// rather than left as a panel no user can reach. What it needed was a lookup
+// from `inspector_seq` back to a `ChatMessage`, which no backend fn provides —
+// inventing one during an integration pass is how a surface ends up drawing a
+// record nobody fetched. `OwnMessageRow` went with it: its finality chip was
+// the panel's only remaining route and the row itself was never mounted either.

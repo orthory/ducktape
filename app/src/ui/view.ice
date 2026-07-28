@@ -283,6 +283,20 @@ view
                       ChannelButton channel=channel selected=(channel.id == active_channel) unread=channel_is_unread(channel_reads, channel.id, channel.head_seq)
                         events
                           choose_channel -> choose_channel _
+                    // DIRECT — the artifact's own word for it, and the honest
+                    // one: a two-party channel, not an encrypted one. Reads
+                    // carry no authorization and every node replicates the
+                    // state, so nothing here says "private".
+                    if !empty(dm_peers)
+                      box w=fill pl=8.0 pr=8.0 pt=14.0 pb=6.0
+                        row w=fill gap=6.0 align=center
+                          text "DIRECT" size=10.0 wrap=none font=code_semibold @text-label
+                          space w=fill
+                          text len(dm_peers) size=10.5 wrap=none font=code_medium @text-label
+                    for peer in dm_peers
+                      DmButton peer=peer selected=(peer.key == active_dm_peer)
+                        events
+                          choose_dm -> choose_dm _
                 box w=fill h=1.0 bg=separator
                   space w=1.0 h=1.0
                 box w=fill pl=14.0 pr=14.0 pt=11.0 pb=11.0

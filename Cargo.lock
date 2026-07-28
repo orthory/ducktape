@@ -2960,7 +2960,7 @@ dependencies = [
 [[package]]
 name = "ducktape-ui"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=ffbefb8#ffbefb8299d4b3104a90288110ba46a530f3d999"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=3b34334#3b34334ea4fb128ef2ab4034bae3f707c82f9675"
 dependencies = [
  "iced",
 ]
@@ -4413,7 +4413,7 @@ dependencies = [
  "iced_renderer",
  "log",
  "num-traits",
- "qrcode",
+ "qrcode 0.13.0",
  "rustc-hash 2.1.2",
  "thiserror 2.0.18",
  "unicode-segmentation",
@@ -6802,6 +6802,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "166f136dfdb199f98186f3649cf7a0536534a61417a1a30221b492b4fb60ce3f"
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quanta"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9010,7 +9016,7 @@ dependencies = [
 [[package]]
 name = "ui-lang"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=ffbefb8#ffbefb8299d4b3104a90288110ba46a530f3d999"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=3b34334#3b34334ea4fb128ef2ab4034bae3f707c82f9675"
 dependencies = [
  "ui-lang-core",
 ]
@@ -9018,15 +9024,15 @@ dependencies = [
 [[package]]
 name = "ui-lang-core"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=ffbefb8#ffbefb8299d4b3104a90288110ba46a530f3d999"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=3b34334#3b34334ea4fb128ef2ab4034bae3f707c82f9675"
 dependencies = [
- "qrcode",
+ "qrcode 0.14.1",
 ]
 
 [[package]]
 name = "ui-lang-runtime"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=ffbefb8#ffbefb8299d4b3104a90288110ba46a530f3d999"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=3b34334#3b34334ea4fb128ef2ab4034bae3f707c82f9675"
 dependencies = [
  "accesskit",
  "accesskit_unix",
