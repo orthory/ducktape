@@ -106,10 +106,28 @@ component StatusCard(degraded:bool, loading:bool, height:i64, tier:str, root_has
           space w=1.0 h=1.0
         text "This node verifies every record itself · it takes no one's word for it" w=fill size=12.5 @text-meta
 
+// The badge over the bell: 13px tall, ringed 1.5px in the bar's own paper so
+// the plate reads as a badge and not as ink on the bell. Its fill is the WORST
+// UNREAD SEVERITY, never a fixed accent — three ALERTs and three INFOs are not
+// the same news, and the count alone cannot say which one you are looking at.
+// `plate` is the width the digit run needs; `sev` is the one discriminant.
+component BellBadge(count:i64, sev:str, plate:f64)
+  col #root
+    match sev
+      "alert"
+        box w=plate h=13.0 align-x=center align-y=center bg=alert_dot border=surface border-w=1.5 r=7.0
+          text count size=9.0 wrap=none font=code_semibold @text-brand_fg
+      "warn"
+        box w=plate h=13.0 align-x=center align-y=center bg=warning_dot border=surface border-w=1.5 r=7.0
+          text count size=9.0 wrap=none font=code_semibold @text-brand_fg
+      _
+        box w=plate h=13.0 align-x=center align-y=center bg=info_dot border=surface border-w=1.5 r=7.0
+          text count size=9.0 wrap=none font=code_semibold @text-brand_fg
+
 // 40px: a 39px bar over its 1px rule. During onboarding the bar keeps only the
 // window controls — the artifact drops the chip and the whole right cluster
 // until a workspace exists, and draws no title in their place.
-component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)
+component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)
   col #root w=fill
     box w=fill h=39.0 px=13.0 bg=elevated
       row w=fill h=fill gap=13.0 align=center
@@ -135,16 +153,15 @@ component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bo
                   active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                   hovered bg=surface text=fg border=transparent
                   pressed bg=subtle
-                // 13px tall, ringed 1.5px in the bar's own paper so the plate
-                // reads as a badge and not as ink on the bell.
+                // The badge is right-anchored: `pin` takes x/y only, so each
+                // width branch names the x that keeps its right edge on the
+                // artifact's line.
                 if bell_badge > 0 && bell_badge < 10
                   pin x=12.0 y=1.0
-                    box w=13.0 h=13.0 align-x=center align-y=center bg=info_dot border=surface border-w=1.5 r=7.0
-                      text bell_badge size=9.0 wrap=none font=code_semibold @text-brand_fg
+                    BellBadge count=bell_badge sev=bell_sev plate=13.0
                 if bell_badge > 9
                   pin x=7.0 y=1.0
-                    box w=18.0 h=13.0 align-x=center align-y=center bg=info_dot border=surface border-w=1.5 r=7.0
-                      text bell_badge size=9.0 wrap=none font=code_semibold @text-brand_fg
+                    BellBadge count=bell_badge sev=bell_sev plate=18.0
           _
             space w=1.0 h=1.0
     box w=fill h=1.0 bg=border
@@ -256,11 +273,11 @@ component ScreenHeader(title:str, meta:str)
     box w=fill h=1.0 bg=separator
       space w=1.0 h=1.0
 
-component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degraded:bool, tab:str, bell_count:i64, approvals:i64, account:str, agent_live:bool, phase:str, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)
+component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, phase:str, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)
   box w=fill h=fill clip=true bg=bg px-snap=true
     stack w=fill h=fill
       col w=fill h=fill
-        TitleBar phase=phase network=network height=height loading=loading degraded=degraded bell_badge=bell_count tier=tier root_hash=root_hash consensus_view=consensus_view quorum=quorum reachable=reachable last_finalized=last_finalized checkpoint=checkpoint #titlebar
+        TitleBar phase=phase network=network height=height loading=loading degraded=degraded bell_badge=bell_count bell_sev=bell_sev tier=tier root_hash=root_hash consensus_view=consensus_view quorum=quorum reachable=reachable last_finalized=last_finalized checkpoint=checkpoint #titlebar
         if degraded
           ConnectionBanner status=status
         row w=fill h=fill

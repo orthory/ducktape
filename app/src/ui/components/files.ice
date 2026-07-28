@@ -3,17 +3,22 @@
 // object panel. Everything here is painted from what `EntryInfo` actually
 // carries — path, name, kind, size and the content address.
 //
-// FOUR DELIBERATE OMISSIONS, decided by the campaign and not to be re-litigated
-// per screen. Each is a fact the wire does not carry, not a layout we skipped:
+// FOUR DELIBERATE OMISSIONS, decided by the campaign and not to be
+// re-litigated per screen. Each is a fact the wire does not carry, not a layout
+// we skipped:
 //
-// 1. HEIGHT and BY. `EntryInfo` (crates/duckfs/core/src/wire.rs:238) has no
-//    author and no height — only `SnapshotInfo` does. Recovering them per entry
-//    means walking every snapshot's diff. The table is NAME / SIZE / OBJECT.
+// 1. The table's HEIGHT and BY columns. `EntryInfo`
+//    (crates/duckfs/core/src/wire.rs:238) has no author and no height — only
+//    `SnapshotInfo` does — so a per-ROW stamp costs one diff walk per row on
+//    every listing. The table stays NAME / SIZE / OBJECT. The single selected
+//    path pays that walk once and shows it in the panel (see `ObjectPanel`).
 // 2. The PINNED badge and the GC pin toggle. duckfs pins are SNAPSHOT-scoped
 //    (name -> snapshot, wire.rs:285); there is no per-path pin to toggle, so a
 //    per-object Pin button would be a different verb wearing the same word.
 // 3. REFERENCED FROM. Nothing indexes "what points at this path".
-// 4. The per-object HISTORY rail. Same blame walk as (1).
+// 4. The per-object HISTORY rail. The panel names the LATEST change under the
+//    path; a rail would need every snapshot that touched it, which is the whole
+//    bounded history diffed one snapshot at a time.
 //
 // The artifact's file-row `note` is omitted for the same reason: its only home
 // would be `EntryInfo.meta`, which no writer populates today.
@@ -156,7 +161,15 @@ component ObjectRowFace(entry:FsEntry)
 // The 306px object panel: identity, then the machine values behind it. The
 // artifact's kind chip is an uppercased file extension; Ice cannot split a
 // string, so the chip carries the kind duckfs itself reports.
-component ObjectPanel(entry:FsEntry)
+//
+// `changed_by` / `changed_height` are the newest SNAPSHOT whose diff touches
+// this path — `SnapshotInfo` carries both an author and a height, the history
+// is bounded, and a diff takes a path prefix. That is a real fact and it is
+// labelled for exactly what it is: LAST CHANGED AT THIS PATH. It is NOT blob
+// authorship — a snapshot's author is whoever committed the tree, and the blob
+// under this name may have been written by someone else in an earlier one — so
+// the panel never says "author" or "by" alone.
+component ObjectPanel(entry:FsEntry, changed_by:str, changed_height:i64)
   row #root w=306.0 h=fill
     box w=1.0 h=fill bg=separator
       space w=1.0 h=1.0
@@ -190,6 +203,15 @@ component ObjectPanel(entry:FsEntry)
                 ObjectFact label="size" value="—"
               if entry.kind != "dir"
                 ObjectFact label="size" value=size_label(entry.size)
+              // Height 0 is the genesis block and no snapshot lands on it, so
+              // it is the honest "no stamp yet" — the walk has not answered, or
+              // no snapshot in the bounded history touches this path. Nothing
+              // is drawn then; a dash here would read as "nobody ever wrote
+              // this", which is a different claim than "we do not know".
+              if changed_height > 0
+                col w=fill gap=7.0
+                  ObjectFact label="last changed at this path" value=height_label(changed_height)
+                  ObjectFact label="in the snapshot by" value=changed_by
 
 // One machine value, in the artifact's own r8 pill rather than the app's
 // `KeyValueRow` — the pills are separate outlines, not a divided card. Clipped
