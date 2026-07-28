@@ -327,6 +327,13 @@ on live_thread_refresh_failed(cause)
 
 on select_shell_tab(next)
   shell_tab = next
+  // A hydration error belongs to the pane that raised it. Leaving it up after
+  // a navigation tells the user the pane they just opened is broken, which is
+  // a lie the banner has no way to walk back — it is dismissed by hand or not
+  // at all. Clearing here, ABOVE both early returns, is what makes that true
+  // for every tab: the `!connected` return and the chat/pages return each skip
+  // the generation bumps below, but neither should keep a stale banner alive.
+  error = ""
   return if !connected
   return if shell_tab == "chat" || shell_tab == "pages"
   explorer_generation = explorer_generation + 1

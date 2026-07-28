@@ -174,6 +174,38 @@ mod tests {
         assert_eq!(app.shell_tab, "chat");
     }
 
+    /// A hydration error belongs to the pane that raised it.
+    ///
+    /// The banner has no self-retiring path — it is dismissed by hand or it
+    /// stays — so leaving it up across a navigation tells the user the pane they
+    /// just opened is broken. `select_shell_tab` clears it ABOVE both of its
+    /// early returns, which is the part worth pinning: the `!connected` return
+    /// and the chat/pages return each skip the generation bumps, and a clear
+    /// placed below either one would silently cover only some tabs.
+    #[test]
+    fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
+        // the disconnected path returns first, and must still clear.
+        let (mut app, _) = Ducktape::__boot();
+        app.error = "could not reach the node".into();
+        let _ = app.__update(__DucktapeMessage::SelectShellTab("files".into()));
+        assert_eq!(app.error, "", "the !connected early return must still clear");
+
+        // the chat/pages path returns second, and must still clear.
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.error = "files: path not found".into();
+        let _ = app.__update(__DucktapeMessage::SelectShellTab("pages".into()));
+        assert_eq!(app.error, "", "the chat/pages early return must still clear");
+
+        // and the full path, which falls through to the generation bumps.
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.error = "explorer hydration failed".into();
+        let _ = app.__update(__DucktapeMessage::SelectShellTab("members".into()));
+        assert_eq!(app.error, "");
+        assert_eq!(app.shell_tab, "members");
+    }
+
     /// The app has NO polling loop: every live surface rides the delta stream.
     /// The only recurring subscriptions are wall clocks that nothing else can
     /// supply — the huddle call timer and the toast's own dismissal — and this
