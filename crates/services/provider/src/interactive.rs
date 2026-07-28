@@ -742,10 +742,8 @@ mod tests {
         }
         let image = std::env::var("DUCKTAPE_SANDBOX_IMAGE")
             .unwrap_or_else(|_| "localhost/ducktape-agent:dev".into());
-        let dirs = crate::AgentDirs::under(std::path::Path::new("/tmp/ducktape-codex-verify"));
         let set = crate::discover(
             b"verify-node-000000000000000000000",
-            dirs,
             None,
             crate::SandboxBackend::Podman {
                 image,
@@ -796,7 +794,6 @@ mod tests {
         Some(
             crate::discover(
                 b"verify-node-000000000000000000000",
-                crate::AgentDirs::under(std::path::Path::new("/tmp/ducktape-live-verify")),
                 None,
                 crate::SandboxBackend::Podman {
                 image,

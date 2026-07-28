@@ -41,12 +41,11 @@
 //!
 //! the CLIs are agentic, not plain inference endpoints, so a provider runs
 //! them fenced: non-interactive mode, the sandbox flags encoded in the spec's
-//! argv, and a working directory the spec's `[workspace]` policy picks — an
-//! empty scratch dir by default, or a stable per-agent workspace under the
-//! host's agent-workspaces root when the spec opts in (see [`workspace`]).
-//! either way the child never sees the node's data directory itself. every
-//! run starts cold — a run's whole continuity is its prompt envelope, which
-//! is what lets any assignee execute it.
+//! argv, and the workspace the provisioner materialized for this run as the
+//! child's cwd (an empty scratch dir when the embedder provisioned none). the
+//! child never sees the node's data directory itself. every run starts cold —
+//! a run's whole continuity is its prompt envelope, which is what lets any
+//! assignee execute it.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -185,12 +184,10 @@ pub use sandbox_host::podman_api::{
 pub(crate) use sandbox_host::sandbox;
 mod spec;
 mod variants;
-mod workspace;
 #[cfg(unix)]
 pub use interactive::InteractiveSession;
 pub use sandbox_host::{SandboxBackend, TART_MIN_CORES};
 pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
-pub use workspace::WorkspaceMode;
 
 /// canonical label-safe identity for the node executing a provider run.
 pub fn execution_node_id(identity: &[u8]) -> String {
@@ -470,35 +467,6 @@ impl ProviderSet {
     }
 }
 
-/// the host-wired root for per-agent state (see [`workspace`]): where
-/// persistent agent workspaces live. binaries derive it from their data dir
-/// ([`AgentDirs::under`]); `DUCKTAPE_AGENT_WORKSPACES` overrides it (the
-/// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` precedent). an absent root simply disables
-/// the feature it serves — embedders that never wire one keep the scratch-dir
-/// behavior.
-#[derive(Debug, Clone, Default)]
-pub struct AgentDirs {
-    pub workspaces_root: Option<PathBuf>,
-}
-
-impl AgentDirs {
-    /// the binaries' convention: the root under one data dir.
-    pub fn under(data_dir: &Path) -> Self {
-        Self {
-            workspaces_root: Some(data_dir.join("agent-workspaces")),
-        }
-    }
-
-    /// apply the env overrides — injected like every other env access here,
-    /// so tests never mutate process state.
-    fn resolved(self, env: &dyn Fn(&str) -> Option<OsString>) -> Self {
-        let over = |key: &str, wired: Option<PathBuf>| env(key).map(PathBuf::from).or(wired);
-        Self {
-            workspaces_root: over("DUCKTAPE_AGENT_WORKSPACES", self.workspaces_root),
-        }
-    }
-}
-
 /// a sandbox backend's env overlay (`(key, value)` pairs) plus the spec's
 /// `~/`-relative rw mount dirs expanded to absolute host paths.
 type SandboxEnvRw = (Vec<(String, String)>, Vec<PathBuf>);
@@ -527,19 +495,16 @@ struct RunAuth<'a> {
 pub(crate) struct CliProvider {
     spec: CapabilitySpec,
     bin: PathBuf,
-    /// the child's DEFAULT working directory — an empty scratch dir, never
+    /// the child's FALLBACK working directory — an empty scratch dir, never
     /// the node's data directory, so an agentic CLI has nothing to wander
-    /// into. a spec's `[workspace] mode = "persistent"` swaps this for a
-    /// per-agent dir under `dirs.workspaces_root` when the run carries an
-    /// agent id.
+    /// into. every production run overrides it with the workspace its
+    /// provisioner materialized (`RunContext::workdir_override`); this is what
+    /// an embedder that provisions none gets.
     workdir: PathBuf,
     /// the IDLE window, not a wall clock: any child output refreshes it, so
     /// a streaming agentic run outlives it freely; only silence this long
     /// kills the child. `idle × HARD_TIMEOUT_FACTOR` is the absolute cap.
     timeout: Duration,
-    /// host-wired roots for persistent workspaces and session files; both
-    /// default absent (scratch + cold runs).
-    dirs: AgentDirs,
     /// optional live per-line output sink. `None` means no output lines are
     /// forwarded; stdout/stderr are still accumulated for the existing parse
     /// and error contracts.
@@ -571,7 +536,6 @@ impl CliProvider {
             bin,
             workdir,
             timeout,
-            dirs: AgentDirs::default(),
             output_sink: None,
             backend,
             managed_owner: UNSCOPED_OWNER.to_string(),
@@ -586,11 +550,6 @@ impl CliProvider {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        self
-    }
-
-    pub fn with_agent_dirs(mut self, dirs: AgentDirs) -> Self {
-        self.dirs = dirs;
         self
     }
 
@@ -1604,65 +1563,41 @@ impl CliProvider {
         })
     }
 
-    /// where this run's child executes: the per-agent persistent workspace
-    /// when the spec opts in AND the run names an agent AND the host wired a
-    /// root — the scratch default otherwise. the agent id is defensively
-    /// checked as a path component even though registry caps bound it.
-    fn workdir_for(&self, ctx: &RunContext) -> Result<PathBuf, String> {
-        if let Some(workdir) = &ctx.workdir_override {
-            return Ok(workdir.clone());
-        }
-        if self.spec.workspace == WorkspaceMode::Persistent
-            && let (Some(root), Some(agent_id)) = (&self.dirs.workspaces_root, &ctx.agent_id)
-        {
-            workspace::safe_path_component(agent_id)?;
-            return Ok(root.join(agent_id));
-        }
-        Ok(self.workdir.clone())
-    }
-
-    /// resolve the run's cwd to a per-run WRITABLE directory, creating it.
+    /// resolve the run's cwd to a WRITABLE directory, creating it.
     ///
     /// a `workdir_override` is a workspace the provisioner ALREADY materialized
-    /// (the only setter is `compute-service`'s `bind_workspace`, after a
-    /// successful checkout — the envelope itself carries no host path, D7). if
-    /// creating it fails, the run must FAIL so the saga can retry elsewhere:
-    /// falling back would silently execute the run in `self.workdir` — a single
-    /// dir shared by every run of this capability tag on the node, so
-    /// concurrent runs would collide and the workspace commit would read the
-    /// untouched real mount and report a clean tree (W1 violation, masked).
+    /// (the only setters are `compute-service`'s `bind_workspace`, after a
+    /// successful checkout, and the agent daemon's per-session home — the
+    /// envelope itself carries no host path, D7). if creating it fails, the run
+    /// must FAIL so the saga can retry elsewhere: falling back would silently
+    /// execute the run in `self.workdir` — a single dir shared by every run of
+    /// this capability tag on the node, so concurrent runs would collide and
+    /// the workspace commit would read the untouched real mount and report a
+    /// clean tree (W1 violation, masked).
     ///
-    /// the persistent per-agent choice keeps its scratch fallback: it may sit
-    /// on a read-only volume, and those runs never promised a workspace.
+    /// no override = an embedder that provisions no workspace, which gets the
+    /// shared scratch fence and never promised one.
     fn ensure_writable_workdir(&self, ctx: &RunContext) -> Result<PathBuf, String> {
-        let preferred = self.workdir_for(ctx)?;
-        match std::fs::create_dir_all(&preferred) {
-            Ok(()) => Ok(preferred),
-            Err(e) if ctx.workdir_override.is_some() => Err(format!(
-                "provisioned workspace mount {} is unusable: {e}; refusing the \
-                 shared scratch fallback for a portable run (W1)",
-                preferred.display()
-            )),
-            Err(_) if preferred != self.workdir => {
-                std::fs::create_dir_all(&self.workdir).map_err(|e| {
-                    format!(
-                        "provider workdir {} is unusable and the scratch fallback \
-                         {} could not be created: {e}",
-                        preferred.display(),
-                        self.workdir.display()
-                    )
-                })?;
-                Ok(self.workdir.clone())
-            }
-            Err(e) => Err(format!("provider workdir {}: {e}", preferred.display())),
-        }
+        let Some(mount) = &ctx.workdir_override else {
+            return std::fs::create_dir_all(&self.workdir)
+                .map(|()| self.workdir.clone())
+                .map_err(|e| format!("provider workdir {}: {e}", self.workdir.display()));
+        };
+        std::fs::create_dir_all(mount)
+            .map(|()| mount.clone())
+            .map_err(|e| {
+                format!(
+                    "provisioned workspace mount {} is unusable: {e}; refusing the \
+                     shared scratch fallback for a portable run (W1)",
+                    mount.display()
+                )
+            })
     }
 }
 
 /// this run's subdirectory under [`RUN_RUNTIME_DIR`]. distinct runs can share a
-/// workdir (a persistent per-agent workspace serves every run of that agent, and
-/// the scratch dir is shared per tag), so the slot keeps two runs from stepping
-/// on each other's config home.
+/// workdir (the scratch fence is shared per tag), so the slot keeps two runs
+/// from stepping on each other's config home.
 ///
 /// DRAWN FRESH PER RUN, never derived from the run's coordinates. a name derived
 /// from (run key, agent, workdir) is a name a LATER run can produce again — and a
@@ -3475,11 +3410,7 @@ fn excerpt(s: &str) -> String {
 /// once (refreshed by child output; see [`HARD_TIMEOUT_FACTOR`]).
 /// what discovery finds is exactly what the node announces.
 ///
-/// per-agent roots: node binaries pass `AgentDirs::under(<data dir>)`;
-/// embedders with no data dir pass `AgentDirs::default()` (workspaces stay
-/// off beyond the env override). `DUCKTAPE_AGENT_WORKSPACES` overrides the
-/// wired root. `output_sink`
-/// installs a live tail on every discovered CLI provider.
+/// `output_sink` installs a live tail on every discovered CLI provider.
 /// `node_identity` is the verified local signer/origin bytes, kept for the run
 /// labels. `managed_owner` names the SERVICE INSTANCE that owns every container
 /// this set creates ([`managed_label`]) — `compute#deadbeef` for the compute
@@ -3489,7 +3420,6 @@ fn excerpt(s: &str) -> String {
 /// this is the second line of defence, not the only one.)
 pub fn discover(
     node_identity: &[u8],
-    dirs: AgentDirs,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
     managed_owner: &str,
@@ -3505,7 +3435,6 @@ pub fn discover(
         std::env::var_os("PATH"),
         &|k| std::env::var_os(k),
         timeout,
-        dirs.resolved(&|k| std::env::var_os(k)),
         output_sink,
         backend,
         managed_owner,
@@ -3538,14 +3467,12 @@ fn discover_with(
     path: Option<OsString>,
     env: &dyn Fn(&str) -> Option<OsString>,
     global_timeout: Option<Duration>,
-    dirs: AgentDirs,
 ) -> ProviderSet {
     discover_with_sink(
         specs,
         path,
         env,
         global_timeout,
-        dirs,
         None,
         SandboxBackend::Bare,
         UNSCOPED_OWNER,
@@ -3558,7 +3485,6 @@ fn discover_with_sink(
     path: Option<OsString>,
     env: &dyn Fn(&str) -> Option<OsString>,
     global_timeout: Option<Duration>,
-    dirs: AgentDirs,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
     managed_owner: &str,
@@ -3577,7 +3503,6 @@ fn discover_with_sink(
         };
         for spec in group {
             let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone(), backend.clone())
-                .with_agent_dirs(dirs.clone())
                 .with_managed_owner(managed_owner);
             if let Some(t) = global_timeout {
                 provider = provider.with_timeout(t);
@@ -4734,7 +4659,6 @@ broker = "anthropic-messages"
             Some(dir.clone().into_os_string()),
             &no_env,
             None,
-            AgentDirs::default(),
         );
         assert_eq!(set.capabilities(), vec!["alpha"], "only the installed one");
         assert!(set.find("alpha").is_some());
@@ -4754,7 +4678,6 @@ broker = "anthropic-messages"
             Some(dir.into_os_string()),
             &no_env,
             None,
-            AgentDirs::default(),
         );
         assert_eq!(set.capabilities(), vec!["alpha", "beta"], "sorted tag list");
     }
@@ -4789,7 +4712,6 @@ format = "text"
             None,
             &env,
             None,
-            AgentDirs::default(),
         );
         assert_eq!(set.capabilities(), vec!["alpha"]);
 
@@ -4802,7 +4724,6 @@ format = "text"
             Some(dir.into_os_string()),
             &env,
             None,
-            AgentDirs::default(),
         );
         assert!(
             set.find("alpha").is_none(),
@@ -4852,7 +4773,6 @@ format = "text"
             None,
             &env,
             None,
-            AgentDirs::default(),
         );
         assert_eq!(
             set.capabilities(),
@@ -4874,7 +4794,6 @@ format = "text"
             Some(dir.into_os_string()),
             &no_env,
             None,
-            AgentDirs::default(),
         );
         assert!(set.find("alpha").is_none(), "mode 644 is not executable");
     }
@@ -4906,7 +4825,6 @@ format = "text"
             Some(dir.into_os_string()),
             &no_env,
             None,
-            AgentDirs::default(),
         );
         assert_eq!(set.capabilities(), vec!["myllm"]);
     }
@@ -4925,7 +4843,6 @@ format = "text"
             Some(dir.into_os_string()),
             &no_env,
             None,
-            AgentDirs::default(),
         );
 
         // an installed capability resolves to its provider.
@@ -5463,83 +5380,11 @@ format = "text"
             Some(dir.into_os_string()),
             &no_env,
             Some(Duration::from_secs(7)),
-            AgentDirs::default(),
         );
         assert_eq!(
             set.capabilities(),
             vec!["slowpoke"],
             "override plumbed without error"
-        );
-    }
-
-    // ---- workspaces -----------------------------------------------------------
-
-    fn agent_ctx(agent: &str) -> RunContext {
-        RunContext {
-            agent_id: Some(agent.into()),
-            ..RunContext::default()
-        }
-    }
-
-    /// a persistent-workspace spec around an arbitrary mock CLI; args stay
-    /// empty so sh_provider's script-prepend keeps working.
-    fn persistent_spec(tag: &str) -> CapabilitySpec {
-        CapabilitySpec::parse(
-            &format!(
-                r#"
-spec = 1
-[capability]
-tag = "{tag}"
-[detect]
-bin = "{tag}"
-[invoke]
-args = []
-prompt = "stdin"
-[output]
-format = "text"
-[workspace]
-mode = "persistent"
-"#
-            ),
-            "test",
-        )
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn persistent_workspaces_pin_the_cwd_per_agent_and_default_to_scratch() {
-        let dir = scratch("workspace-cwd");
-        // the fake prints its own cwd — the observable workdir selection.
-        let bin = fake_cli(&dir, "wd", "cat > /dev/null\npwd");
-        let root = scratch("workspace-cwd-root");
-        let p = sh_provider(persistent_spec("wd"), bin, "workspace-cwd-scratch").with_agent_dirs(
-            AgentDirs {
-                workspaces_root: Some(root.clone()),
-            },
-        );
-
-        // an agent-carrying run lands in <root>/<agent_id>, created on demand.
-        let cwd = p.run("q", &agent_ctx("bot")).await.unwrap();
-        let expected = root.join("bot");
-        assert!(expected.is_dir(), "the workspace dir is created on demand");
-        assert_eq!(
-            PathBuf::from(&cwd),
-            expected.canonicalize().unwrap(),
-            "the child ran in the agent's persistent workspace"
-        );
-
-        // a second agent gets its own dir; a context-less run stays
-        // in the scratch dir even though the spec says persistent.
-        let other = p.run("q", &agent_ctx("other")).await.unwrap();
-        assert_eq!(
-            PathBuf::from(other),
-            root.join("other").canonicalize().unwrap()
-        );
-        let contextless = p.run("q", &RunContext::default()).await.unwrap();
-        assert_eq!(
-            PathBuf::from(contextless),
-            scratch("workspace-cwd-scratch").canonicalize().unwrap(),
-            "no agent id = the scratch fence, unchanged"
         );
     }
 
@@ -5625,43 +5470,6 @@ printf '%s\n' "$PATH"
         assert!(
             !scratch("w1-hard-fail-scratch").join("anything").exists(),
             "nothing executed in the shared scratch dir"
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_ids_with_separators_or_traversal_fail_the_run() {
-        let dir = scratch("workspace-defense");
-        let bin = fake_cli(&dir, "wd", "cat > /dev/null\npwd");
-        let root = scratch("workspace-defense-root");
-        let p = sh_provider(persistent_spec("wd"), bin, "workspace-defense-scratch")
-            .with_agent_dirs(AgentDirs {
-                workspaces_root: Some(root),
-            });
-        for bad in ["../escape", "a/b", ".."] {
-            let err = p.run("q", &agent_ctx(bad)).await.unwrap_err();
-            assert!(
-                err.contains("path") || err.contains("component"),
-                "agent id {bad:?} must fail the run by name, got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn agent_dir_env_overrides_win_over_wired_roots() {
-        let wired = AgentDirs::under(Path::new("/data"));
-        assert_eq!(
-            wired.workspaces_root.as_deref(),
-            Some(Path::new("/data/agent-workspaces"))
-        );
-
-        // injected env, no process-state mutation (the discover_with rule).
-        let env =
-            |k: &str| (k == "DUCKTAPE_AGENT_WORKSPACES").then(|| OsString::from("/elsewhere/ws"));
-        let resolved = wired.resolved(&env);
-        assert_eq!(
-            resolved.workspaces_root.as_deref(),
-            Some(Path::new("/elsewhere/ws")),
-            "the env override wins"
         );
     }
 

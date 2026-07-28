@@ -88,11 +88,8 @@ mod session_boundary_tests;
 /// the D7 relocation lever: the root per-run agent workspaces are minted
 /// under. MUST be outside `<storage>` — VALIDATED here at boot, never trusted.
 /// `DUCKTAPE_AGENT_RUNS_ROOT` overrides the base (operators point it at an
-/// isolated volume); deliberately NOT `DUCKTAPE_AGENT_WORKSPACES`, which
-/// already means the persistent per-agent root in `capability-host` —
-/// one knob must not govern two unrelated trees. the default is the system
-/// temp tree, the same safe scratch tree `CliProvider`'s fallback workdir
-/// already uses.
+/// isolated volume). the default is the system temp tree, the same safe
+/// scratch tree `CliProvider`'s fallback workdir already uses.
 ///
 /// the returned root is salted with a hash of THIS node's storage path, so
 /// co-located nodes (fleet tiles, multi-node test boxes) never share a

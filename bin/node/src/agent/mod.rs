@@ -111,7 +111,6 @@ async fn run(
 
     let providers = agent_service::discover(
         &node_key,
-        provider_host::AgentDirs::under(&service.storage_dir),
         // cloned: `discover` consumes the backend, and the teardown below needs
         // the same socket to sweep this instance's containers through.
         backend.clone(),

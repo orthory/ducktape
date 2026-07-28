@@ -618,11 +618,10 @@ fn airlock_config(credential: wire::Credential) -> AirlockConfig {
 /// would signal an interactive plane it cannot serve.
 pub fn discover(
     node_identity: &[u8],
-    dirs: provider_host::AgentDirs,
     backend: provider_host::SandboxBackend,
     owner: &str,
 ) -> Result<ProviderSet, String> {
-    provider_host::discover(node_identity, dirs, None, backend, owner)
+    provider_host::discover(node_identity, None, backend, owner)
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@
 //! a variant is pure sugar over the documented "finer tag with its own spec"
 //! pattern: each entry registers an ADDITIONAL spec under the composed tag
 //! `{parent_tag}_{suffix}`, inheriting `bin`/`env`/`prompt`/`output`/
-//! `timeout_secs`/`workspace`/`rw_dirs`/`isolation`/`context` (and `description`) from the parent,
+//! `timeout_secs`/`rw_dirs`/`isolation`/`context` (and `description`) from the parent,
 //! with the variant's own FULL argv. there is no
 //! merging, no placeholder, no substitution — the
 //! "argv is literal" invariant holds per tag, exactly as if the operator had
@@ -85,7 +85,6 @@ pub(crate) fn expand(
             args: variant.args.clone(),
             timeout_secs: base.timeout_secs,
             output: base.output,
-            workspace: base.workspace,
             // HOW the executor authenticates — its broker, its config home, its
             // auth/state dirs — is a property of the CLI, not of the model or the
             // effort a variant pins. so both auth sections inherit whole, and the
@@ -246,12 +245,9 @@ args = ["run", "--model", "m1", "--effort", "high"]
     }
 
     #[test]
-    fn variants_inherit_workspace_and_auth_and_context_sections() {
+    fn variants_inherit_auth_and_context_sections() {
         let toml = family_toml(
             r#"
-[workspace]
-mode = "persistent"
-
 [sandbox]
 rw_dirs = ["~/.prov"]
 
@@ -269,11 +265,9 @@ args = ["run", "--model", "m1"]
         let specs = CapabilitySpec::parse_all(&toml, "t").unwrap();
         let get = |tag: &str| specs.iter().find(|s| s.tag == tag).unwrap();
 
-        // workspace and BOTH auth sections inherited — how the CLI
-        // authenticates is a property of the CLI, not of the model/effort the
-        // variant pins.
+        // BOTH auth sections inherited — how the CLI authenticates is a
+        // property of the CLI, not of the model/effort the variant pins.
         let v = get("prov_m1_low");
-        assert_eq!(v.workspace, crate::WorkspaceMode::Persistent);
         assert_eq!(v.rw_dirs, vec!["~/.prov"], "sandbox rw_dirs inherited");
         assert_eq!(
             v.isolation,
@@ -408,15 +402,9 @@ args = ["run", "--model", "m1"]
             ],
         );
 
-        // the agentic posture rides every embedded spec: persistent per-agent
-        // workspaces and the slower agentic timeout budget.
+        // the agentic posture rides every embedded spec: the slower agentic
+        // timeout budget.
         for spec in &specs {
-            assert_eq!(
-                spec.workspace,
-                crate::WorkspaceMode::Persistent,
-                "{}: embedded specs opt into persistent workspaces",
-                spec.tag
-            );
             assert_eq!(spec.timeout_secs, 600, "{}: agentic timeout", spec.tag);
             // every shipped executor delivers the assembled soul NATIVELY (a file
             // its CLI auto-loads), never by inflating the stdin prompt. WHICH file
