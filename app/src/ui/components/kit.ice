@@ -171,6 +171,9 @@ component AgentStatusChip(status:str)
 // An open proposal: what it does, who opened it, and how close the electorate
 // is to settling it. The dots are the tally — the number is the confirmation.
 component ProposalCard(proposal:ProposalRow, busy:bool)
+  emits
+    gov_vote(str, bool)
+    gov_execute(str)
   box #root w=fill p=16.0 bg=surface border=border border-w=1.0 r=12.0
     col w=fill gap=5.0
       row w=fill gap=7.0 align=center
@@ -207,13 +210,13 @@ component ProposalCard(proposal:ProposalRow, busy:bool)
         // the artifact's slot holds exactly two buttons; Settle appears only
         // once the rule is met, because that is the only moment it can succeed
         row gap=8.0 align=center
-          button label="Reject" disabled=busy @outline_action px-15px py-7px text-secondary_fg border-control_line rounded-8px -> gov_vote(proposal.id, false)
+          button label="Reject" disabled=busy @outline_action px-15px py-7px text-secondary_fg border-control_line rounded-8px -> emit(gov_vote, proposal.id, false)
             text "Reject" size=12.0 wrap=none font=display @text-secondary_fg
           if proposal.approvals < proposal.required_yes
-            button label="Approve" disabled=busy @primary_action px-17px py-7px rounded-8px -> gov_vote(proposal.id, true)
+            button label="Approve" disabled=busy @primary_action px-17px py-7px rounded-8px -> emit(gov_vote, proposal.id, true)
               text approve_label(proposal.approvals, proposal.required_yes) size=12.0 wrap=none font=display @text-primary_fg
           if proposal.approvals >= proposal.required_yes
-            button label="Settle" disabled=busy @secondary_action px-17px py-7px rounded-8px -> gov_execute(proposal.id)
+            button label="Settle" disabled=busy @secondary_action px-17px py-7px rounded-8px -> emit(gov_execute, proposal.id)
               text "Settle →" size=12.0 wrap=none font=display @text-secondary_fg
 
 // ACCESS-class proposals wear the terracotta pair; everything else is neutral.

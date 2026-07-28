@@ -130,6 +130,8 @@ component BellBadge(count:i64, sev:str, plate:f64)
 // window controls — the artifact drops the chip and the whole right cluster
 // until a workspace exists, and draws no title in their place.
 component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)
+  emits
+    toggle_bell
   col #root w=fill
     box w=fill h=39.0 px=13.0 bg=elevated
       row w=fill h=fill gap=13.0 align=center
@@ -146,7 +148,7 @@ component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bo
                 StatusPill degraded=degraded loading=loading
                 StatusCard degraded=degraded loading=loading height=height tier=tier root_hash=root_hash consensus_view=consensus_view quorum=quorum reachable=reachable last_finalized=last_finalized checkpoint=checkpoint
               stack w=26.0 h=24.0
-                button label="Alerts" p=5.0 @icon_action -> toggle_bell
+                button label="Alerts" p=5.0 @icon_action -> emit(toggle_bell)
                   col align=center
                     if bell_badge > 0
                       Icon name="bell" tone="strong-ink" px=15.0
@@ -185,9 +187,11 @@ component ConnectionBanner(status:str)
 // selected state is a `subtle` tint capsule, never a second sheet of glass.
 // Forge alone wears a live dot while an agent is running.
 component RailButton(item:NavItem)
+  emits
+    select_shell_tab(str)
   stack #root w=58.0
     if item.active
-      button label=item.title w=58.0 p=0.0 @icon_action -> select_shell_tab(item.id)
+      button label=item.title w=58.0 p=0.0 @icon_action -> emit(select_shell_tab, item.id)
         col w=fill py=4.0 gap=4.0 align=center
           Icon name=item.icon tone="ink" px=19.0
           text item.title size=9.5 wrap=none font=display @text-strong_ink
@@ -195,7 +199,7 @@ component RailButton(item:NavItem)
         hovered bg=rail_hover text=fg
         pressed bg=subtle text=fg
     if !item.active
-      button label=item.title w=58.0 p=0.0 @icon_action -> select_shell_tab(item.id)
+      button label=item.title w=58.0 p=0.0 @icon_action -> emit(select_shell_tab, item.id)
         col w=fill py=4.0 gap=4.0 align=center
           Icon name=item.icon tone="idle" px=19.0
           text item.title size=9.5 wrap=none font=display @text-caption
@@ -218,6 +222,8 @@ component RailButton(item:NavItem)
           text item.badge size=9.0 wrap=none font=code_semibold @text-brand_fg
 
 component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
+  emits
+    select_shell_tab(str)
   box #root w=74.0 h=fill pt=13.0 pb=10.0 bg=rail clip=true
       col w=fill h=fill gap=0.0 align=center
         Brand
@@ -226,14 +232,16 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
           col w=fill gap=2.0 align=center
             for item in shell_nav(tab, approvals, agent_live)
               RailButton item=item
+                forward
+                  select_shell_tab
         if tab == "settings"
-          button label="Settings" p=8.0 @icon_action -> select_shell_tab("settings")
+          button label="Settings" p=8.0 @icon_action -> emit(select_shell_tab, "settings")
             Icon name="gear" tone="ink" px=18.0
             active bg=subtle text=fg border=transparent border-w=1.0 r=9.0
             hovered bg=rail_hover text=fg
             pressed bg=subtle text=fg
         if tab != "settings"
-          button label="Settings" p=8.0 @icon_action -> select_shell_tab("settings")
+          button label="Settings" p=8.0 @icon_action -> emit(select_shell_tab, "settings")
             Icon name="gear" tone="idle" px=18.0
             active bg=transparent text=muted border=transparent border-w=1.0 r=9.0
             hovered bg=rail_hover text=fg
@@ -242,7 +250,7 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
         // The avatar is the one thing hung below the footer button: a 1.5px
         // paper ring inside a 1px hairline halo, which no other person plate in
         // the app wears.
-        button label="Account" p=0.0 @icon_action -> select_shell_tab("settings")
+        button label="Account" p=0.0 @icon_action -> emit(select_shell_tab, "settings")
           box p=1.0 bg=pending_line r=16.5
             PrincipalAvatar initials=initial_of(account) is_agent=false plate=28.0 ink=10.0 ring="paper"
           active bg=transparent text=muted border=transparent border-w=1.0 r=16.5
@@ -276,14 +284,21 @@ component ScreenHeader(title:str, meta:str)
       space w=1.0 h=1.0
 
 component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, phase:str, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)
+  emits
+    select_shell_tab(str)
+    toggle_bell
   box w=fill h=fill clip=true bg=bg px-snap=true
     stack w=fill h=fill
       col w=fill h=fill
         TitleBar phase=phase network=network height=height loading=loading degraded=degraded bell_badge=bell_count bell_sev=bell_sev tier=tier root_hash=root_hash consensus_view=consensus_view quorum=quorum reachable=reachable last_finalized=last_finalized checkpoint=checkpoint #titlebar
+          forward
+            toggle_bell
         if degraded
           ConnectionBanner status=status
         row w=fill h=fill
           NavRail tab=tab approvals=approvals account=account agent_live=agent_live #rail
+            forward
+              select_shell_tab
           box w=1.0 h=fill bg=separator
             space w=1.0 h=1.0
           box #content w=fill h=fill bg=bg clip=true
