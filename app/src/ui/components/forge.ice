@@ -1,11 +1,16 @@
-// FORGE — the repo grid, the breadcrumb, the tracker rows, the painted diff,
-// and the review stamps. Everything the artifact draws for this screen that
-// `ForgeQuery` can actually answer today.
+// FORGE — the repo grid, the breadcrumb, the CODE BROWSER, the tracker rows,
+// the painted diff, and the review stamps.
 //
-// WHAT IS DELIBERATELY NOT HERE. The artifact's forge is richer than the wire:
-// label pills, check runs, reviewer digests, assignees, comment counts, a
-// per-repo language dot / about line / updated stamp, the agent-activity chips,
-// the conversation timeline and the Code tab's file tree each need a NEW field
+// THE CODE TAB NEEDS NO WIRE CHANGE, and the campaign was wrong to refuse it as
+// "blocked on new module queries". `sync_forge_mirror` (app/src/backend.rs:2957)
+// keeps a bare git2 mirror of every branch of every repo under the key root and
+// already fetches `+refs/heads/*` for the merge preflight. A tree listing, a
+// blob read and a per-path last-commit are `git2` calls against a repository the
+// app has already cloned — `ForgeQuery` is not on that path at all.
+//
+// WHAT IS STILL DELIBERATELY NOT HERE. Label pills, check runs, reviewer
+// digests, assignees, comment counts, a per-repo language dot / PR-issue tally,
+// the agent-activity chips and the conversation timeline each need a NEW field
 // on `ForgeQuery`/`ItemSummary`/`RepoHead`. A design-parity pass does not
 // smuggle a consensus-module wire change, so none of them is drawn — and none
 // is faked with a plausible placeholder either.
@@ -121,6 +126,161 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
         hovered bg=elevated text=fg
         pressed bg=subtle text=fg
 
+// ── CODE ──────────────────────────────────────────────────────────────────
+
+// The Code tab is TWO panes: a 258px FILES tree on `sidebar` behind a
+// `separator` rule, and the reader on `surface`. `ForgeCodeTab` owns both, and
+// takes each pane's rows through a named slot — the tree row's click target is
+// `forge_toggle_dir(path)` / `forge_open_file(path)` and the reader's content
+// depends on which of the three empty reasons applies, and neither decision
+// belongs to a component that draws the frame.
+//
+// THE ROW IS CHROME BECAUSE THE CALLER IS THE BUTTON — the same split
+// `RepoCrumb` uses. Those handlers live in app/src/ui/handlers, so the button
+// that carries them is mounted at the call site and these components paint its
+// face. The row's own hover (`rail_hover`) belongs to that button; the SELECTED
+// plate belongs here, because selection is a fact about the row and not about
+// the pointer.
+//
+// NO AI PLATE ON A FILE ROW, and no signed inline annotation beside a source
+// line. Both want per-path authorship: the plate needs each entry's last
+// committer AND whether that principal is a machine, and the annotation needs a
+// (path, line) anchor. `ReviewComment` (crates/modules/apps/forge/src/interface.rs)
+// stores its anchor as a pre-rendered display string, so there is nothing to
+// key a line against. A grey plate that says AI on every file would be a lie
+// about who wrote it.
+
+// The two-pane frame. 258px of `sidebar` under the FILES eyebrow, the
+// `separator` rule, then the reader's header over its own scroll region.
+//
+// `message` / `author` / `stamp` are the header's per-path commit meta and are
+// EMPTY today on purpose: `forge_tree` returns name/path/kind/size, so nothing
+// yet resolves the last commit under a path. Each slot is guarded, so an
+// unanswered fact prints nothing rather than a placeholder — when a per-path
+// log lands, the header fills without a layout change.
+component ForgeCodeTab(path:str, message:str, author:str, stamp:str)
+  row #root w=fill h=fill
+    box w=258.0 h=fill bg=sidebar
+      scroll dir=vertical w=fill h=fill
+        col w=fill pt=9.0 pb=9.0
+          box w=fill pl=16.0 pr=16.0 pt=5.0 pb=8.0
+            text "FILES" size=9.0 wrap=none font=code_semibold @text-label
+          slot files
+    box w=1.0 h=fill bg=separator
+      space w=1.0 h=1.0
+    col w=fill h=fill
+      ForgeCodeHeader path=path message=message author=author stamp=stamp
+      scroll dir=vertical w=fill h=fill
+        slot source
+
+// One directory row. The caret is the artifact's rotation drawn as the two
+// glyphs the icon set actually ships — there is no transform in this language,
+// and `chevron-down` IS `chevron-right` rotated 90°, which is exactly the
+// artifact's `rotate(90deg)`. A directory is open unless it was collapsed, so
+// the caller's collapsed-path set is the whole state.
+//
+// The indent ladder is the artifact's own: 10px, then 15px per level. The
+// folder gold has no step in the ink ramp; `warning` (#a07b32) is the ramp's
+// nearest true step to #a08a5a, as it is on the duckfs tree.
+component ForgeTreeDirRow(name:str, depth:f64, open:bool)
+  row #root w=fill gap=6.0 align=center pt=5.0 pb=5.0 pr=14.0 pl=(10.0 + depth * 15.0)
+    if open
+      Icon name="chevron-down" tone="meta" px=10.0
+    if !open
+      Icon name="chevron-right" tone="meta" px=10.0
+    Icon name="folder" tone="warning" px=13.0
+    text name w=fill size=12.5 wrap=none font=display @text-accent_fg
+
+// One file row. Selected wears `tree_selected` and the ink steps forward; the
+// file name is mono on both, because a path is a machine value.
+component ForgeTreeFileRow(name:str, depth:f64, selected:bool)
+  col #root w=fill
+    if selected
+      box w=fill bg=tree_selected
+        ForgeTreeFileFace name=name depth=depth selected=true
+    if !selected
+      box w=fill
+        ForgeTreeFileFace name=name depth=depth selected=false
+
+// The file row's contents, in one place so the two plates cannot drift apart.
+component ForgeTreeFileFace(name:str, depth:f64, selected:bool)
+  row #root w=fill gap=6.0 align=center pt=5.0 pb=5.0 pr=14.0 pl=(10.0 + depth * 15.0)
+    Icon name="file" tone="label" px=12.0
+    if selected
+      text name w=fill size=12.5 wrap=none font=code @text-primary
+    if !selected
+      text name w=fill size=12.5 wrap=none font=code @text-secondary_fg
+
+// The reader's 42px header: the path this pane is showing, the last commit
+// message under that path, and who landed it when.
+//
+// TIME IS A HEIGHT HERE TOO. `stamp` is whatever `height_ago` /
+// `height_label_short` rendered — never a wall clock, and never a git author
+// date dressed up as one. Each of the three trailing slots renders only when
+// the caller has the fact, so a tree read that carries paths and nothing else
+// prints the path alone rather than an empty middot run.
+component ForgeCodeHeader(path:str, message:str, author:str, stamp:str)
+  col #root w=fill
+    box w=fill h=42.0 pl=16.0 pr=16.0 bg=surface
+      row w=fill h=fill gap=10.0 align=center clip=true
+        text path size=12.0 wrap=none font=code_semibold @text-accent_fg
+        // The message takes the slack and is clipped by it — iced has no
+        // text-overflow, so the column IS the ellipsis. It renders even when
+        // empty, because it is also what holds the right-hand meta at the edge.
+        box w=fill clip=true
+          col w=fill
+            if !empty(message)
+              text message size=10.5 wrap=none font=code @text-meta
+        if !empty(author)
+          text author size=10.0 wrap=none font=code @text-label
+        if !empty(author) && !empty(stamp)
+          text "·" size=10.0 wrap=none font=code @text-label
+        if !empty(stamp)
+          text stamp size=10.0 wrap=none font=code @text-label
+    box w=fill h=1.0 bg=separator
+      space w=1.0 h=1.0
+
+// One source line: a 44px right-aligned gutter on `rail` at the artifact's own
+// `#cbc9bf`, then the code. `number` is a string for the same reason
+// `DiffLine.old_no` is — the renderer that splits the blob owns the numbering,
+// and a blank gutter has to be expressible.
+//
+// IT HAS NO CALL SITE YET, and that is a missing splitter, not a missing
+// decision. `forge_blob` returns `BlobView.text` as ONE string plus a line
+// COUNT; Ice has no string ops, so nothing can walk it. The pane therefore
+// prints the source as one mono run today (view.ice) and this row waits on the
+// exact counterpart `diff_lines` already has for a patch —
+// `sync source_lines(text:str) -> [SourceLine]` with `SourceLine(number:str,
+// text:str)` in backend.ice. Numbering the lines in the view would mean
+// guessing where they break.
+//
+// The code is ONE ink. The design system is explicit that this viewer uses no
+// syntax colour ("코드는 구문 색을 쓰지 않고 단색") — emphasis is carried by the
+// signed annotation card, which this wire cannot anchor, so nothing here tints
+// a token.
+component ForgeCodeLine(number:str, code:str)
+  row #root w=fill gap=0.0 align=center
+    box w=44.0 h=20.0 pr=12.0 align-y=center bg=rail
+      text number w=fill size=12.0 wrap=none align-x=right font=code @text-icon_idle
+    box w=fill h=20.0 pl=13.0 align-y=center clip=true
+      text code w=fill size=12.0 wrap=none font=code @text-accent_fg
+
+// The reader with nothing to read. This is one plate for three true reasons —
+// no file picked yet, a binary blob, a blob past the read cap — so the caller
+// says WHICH, and the plate never claims the file is empty.
+//
+// The standing line above it is a fact about this surface and not a seed
+// string: the mirror is a fetch of the node's own forge remote, and the app
+// ships no editor for it.
+component ForgeCodeEmpty(name:str, note:str)
+  box #root w=fill p=48.0 align-x=center
+    col gap=9.0 align=center
+      if !empty(name)
+        text name size=14.0 wrap=none font=code_semibold @text-caption
+      text "Synced from the node · view only" size=11.5 wrap=none @text-label
+      if !empty(note)
+        text note size=11.5 wrap=none @text-label
+
 // ── TRACKER ───────────────────────────────────────────────────────────────
 
 // One tracker row, for both kinds. The meta line is `#N · opened by <author>`:
@@ -130,6 +290,14 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
 // kind is derived from, but the one function that derives it
 // (`chat::client::avatar_kind`) is private to that crate, so surfacing the badge
 // is a module-crate change, not a view change.
+//
+// NO ±DIFF LABEL ON THE ROW. The artifact prints one, and the counts DO exist —
+// but only for the one open item: `additions`/`deletions`/`files_changed` ride
+// `ForgeQuery::PrDiff`, which `load_forge_item` issues per item, and the detail
+// header already spends them through `DiffCount`. `ForgeItem` is the LIST
+// projection and carries none of the three, so a row label would either be a
+// zero on every row or a diff-per-row fan-out on every listing. When the
+// summary wire carries them, the label is `DiffCount` and nothing else.
 component TrackerRow(item:ForgeItem)
   col #root w=fill
     button label="Open item" description=item.title w=fill p=0.0 @icon_action -> forge_open_item(item.number)
