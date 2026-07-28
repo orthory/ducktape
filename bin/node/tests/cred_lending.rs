@@ -282,6 +282,14 @@ fn trigger_pinned_saga(
     );
 }
 
+/// saga's id space is namespaced per trigger origin, and `/v1/submit` re-signs
+/// with the RECEIVING node's own key — so an id node `idx` can trigger lives
+/// under that node's actor namespace, and no other member can create it.
+fn node_sid(cluster: &Cluster, idx: usize, id: &str) -> String {
+    let key = Cluster::identity(cluster.peer_ids[idx]);
+    saga::namespaced_id(&sdk::Origin::External(key), id)
+}
+
 /// Cancel a saga from the node that triggered it — the saga module admits a
 /// cancel only from the recorded origin, so this is node 0 retiring its own work.
 /// The cheapest way to reach a TERMINAL saga on a cluster that executes nothing.
@@ -548,7 +556,7 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     // this credential. The lender resolves ALL of that out of its own committed
     // state; this side asserts none of it and cannot.
     let seal = record_ungranted.seal_pk;
-    let delegated = "sched\u{1f}cred-lending-delegated";
+    let delegated = &node_sid(&cluster, 0, "sched\u{1f}cred-lending-delegated");
     trigger_pinned_saga(&cluster, 0, delegated, &compute_node, "owner-claude-1");
     wait_leased(&cluster, delegated, &compute_node);
     open_session_as_node_1(
@@ -564,7 +572,7 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     // This saga's ORIGIN is the very same owner, so a gate checking only the
     // origin admits it: every saga the owner ever submitted would become a key to
     // the owner's subscription, for work the owner never assigned to this node.
-    let owners_own = "sched\u{1f}cred-lending-owners-own";
+    let owners_own = &node_sid(&cluster, 0, "sched\u{1f}cred-lending-owners-own");
     trigger_pinned_saga(&cluster, 0, owners_own, &owner_node, "owner-claude-1");
     wait_leased(&cluster, owners_own, &owner_node);
     let not_the_executor = open_session_as_node_1(
@@ -585,7 +593,7 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     // session for any credential any lender serves that the owner is granted on,
     // including a third party's who never saw this saga. Same submitter, same
     // executor, same pin — only the credential in the spec differs.
-    let names_another = "sched\u{1f}cred-lending-names-another";
+    let names_another = &node_sid(&cluster, 0, "sched\u{1f}cred-lending-names-another");
     trigger_pinned_saga(
         &cluster,
         0,
@@ -638,7 +646,9 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
         &via_pre,
         &seal,
         "owner-claude-1",
-        WorkRef::Saga { saga_id: "sched\u{1f}never-committed".into() },
+        WorkRef::Saga {
+            saga_id: node_sid(&cluster, 0, "sched\u{1f}never-committed"),
+        },
     )
     .expect_err("a saga the lender has not committed decides nothing");
     assert!(

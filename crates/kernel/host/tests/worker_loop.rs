@@ -93,6 +93,12 @@ impl Worker for FlakyOracle {
     }
 }
 
+/// saga's id space is namespaced per trigger origin; `Host::submit` carries
+/// the host's own bare external origin, whose namespace is `ext:`.
+fn sid(id: &str) -> String {
+    saga::namespaced_id(&sdk::Origin::External(Vec::new()), id)
+}
+
 fn trigger(id: &str, spec: &[u8], max_attempts: u32) -> Msg {
     Msg {
         target: "saga".into(),
@@ -127,10 +133,10 @@ fn a_trigger_drives_a_saga_to_done_via_the_mock_oracle() {
     block_on(async {
         let mut host = Host::genesis(vec![Box::new(SagaModule::new("saga"))]).expect("genesis");
         let workers: Vec<Box<dyn Worker>> = vec![Box::new(MockOracle)];
-        settle(&mut host, &workers, trigger("s1", b"hello", 1))
+        settle(&mut host, &workers, trigger(&sid("s1"), b"hello", 1))
             .await
             .expect("settle");
-        let v = get_saga(&host, "s1").await.expect("saga exists");
+        let v = get_saga(&host, &sid("s1")).await.expect("saga exists");
         assert_eq!(v.status, SagaStatus::Done, "the saga settled at Done");
         assert_eq!(v.result, Some(b"olleh".to_vec()), "oracle result committed");
     });
@@ -144,10 +150,13 @@ fn a_trigger_drives_a_saga_to_done_via_the_mock_oracle() {
 fn the_worker_is_load_bearing() {
     block_on(async {
         let mut host = Host::genesis(vec![Box::new(SagaModule::new("saga"))]).expect("genesis");
-        let out = host.submit(trigger("s1", b"hello", 1)).await.expect("submit");
+        let out = host
+            .submit(trigger(&sid("s1"), b"hello", 1))
+            .await
+            .expect("submit");
         assert_eq!(out.events.len(), 1, "exactly one WorkerRequest event");
         assert_eq!(
-            get_saga(&host, "s1").await.unwrap().status,
+            get_saga(&host, &sid("s1")).await.unwrap().status,
             SagaStatus::Pending,
             "no worker -> stuck at Pending"
         );
@@ -158,7 +167,10 @@ fn the_worker_is_load_bearing() {
             other => panic!("worker must claim the event, got {other:?}"),
         };
         settle(&mut host, &workers, follow).await.expect("settle");
-        assert_eq!(get_saga(&host, "s1").await.unwrap().status, SagaStatus::Done);
+        assert_eq!(
+            get_saga(&host, &sid("s1")).await.unwrap().status,
+            SagaStatus::Done
+        );
     });
 }
 
@@ -170,10 +182,10 @@ fn a_flaky_worker_retries_through_the_loop_and_settles_done() {
     block_on(async {
         let mut host = Host::genesis(vec![Box::new(SagaModule::new("saga"))]).expect("genesis");
         let workers: Vec<Box<dyn Worker>> = vec![Box::new(FlakyOracle)];
-        settle(&mut host, &workers, trigger("s1", b"hello", 2))
+        settle(&mut host, &workers, trigger(&sid("s1"), b"hello", 2))
             .await
             .expect("settle");
-        let v = get_saga(&host, "s1").await.expect("saga exists");
+        let v = get_saga(&host, &sid("s1")).await.expect("saga exists");
         assert_eq!(v.status, SagaStatus::Done, "the retry landed");
         assert_eq!(v.attempt, 1, "attempt 0 consumed by the Err outcome");
         assert_eq!(v.result, Some(b"olleh".to_vec()));

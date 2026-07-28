@@ -31,6 +31,13 @@ type Ed = commonware_cryptography::ed25519::PrivateKey;
 
 // ── shared wire builders ────────────────────────────────
 
+/// saga's id space is namespaced per trigger origin, and the sim stamps the
+/// caller-named origin verbatim as `Origin::External(name.as_bytes())` — so a
+/// caller can only ever trigger inside its own namespace.
+fn sid(origin: &str, id: &str) -> String {
+    saga::namespaced_id(&sdk::Origin::External(origin.as_bytes().to_vec()), id)
+}
+
 /// a fire-and-forget saga trigger carrying `spec` as its opaque work spec. the
 /// echo worker (behind `--echo-oracle`) claims the emitted `WorkerRequest`
 /// only when the spec decodes as a dispatch `WorkSpec`, so A3 hands it a real
@@ -162,10 +169,10 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     let spec = echo_work_spec();
 
     // two peer blocks commit two triggers; each enqueues one worker follow-up.
-    let b1 = sim.peer_block("saga", saga_trigger("s1", &spec), "peer");
+    let b1 = sim.peer_block("saga", saga_trigger(&sid("peer", "s1"), &spec), "peer");
     assert_eq!(b1["height"], 1, "first trigger committed: {b1}");
     assert_eq!(sim.sim_state()["oracle_queued"], 1, "one follow-up queued");
-    let b2 = sim.peer_block("saga", saga_trigger("s2", &spec), "peer");
+    let b2 = sim.peer_block("saga", saga_trigger(&sid("peer", "s2"), &spec), "peer");
     assert_eq!(b2["height"], 2, "second trigger committed: {b2}");
     assert_eq!(
         sim.sim_state()["oracle_queued"],
@@ -213,7 +220,7 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     );
 
     // both echo results actually landed — the sagas are Done, in submit order.
-    for id in ["s1", "s2"] {
+    for id in [sid("peer", "s1"), sid("peer", "s2")] {
         let saga = sim.query("saga", json!({ "get": { "saga_id": id } }));
         assert_eq!(
             saga["saga"]["status"], "done",
@@ -250,13 +257,21 @@ fn a_callback_that_would_wedge_a_saga_is_rejected_at_trigger_time() {
     };
 
     // a callback aimed at the saga module itself: rejected.
-    let error = sim.submit_rejected("saga", with_reply("s1", "saga"), Some("owner"));
+    let error = sim.submit_rejected(
+        "saga",
+        with_reply(&sid("owner", "s1"), "saga"),
+        Some("owner"),
+    );
     assert!(
         error.contains("reply_to must not target the saga module itself"),
         "self-targeting callback: {error}"
     );
     // a callback aimed at a module that was never registered: rejected.
-    let error = sim.submit_rejected("saga", with_reply("s2", "ghost"), Some("owner"));
+    let error = sim.submit_rejected(
+        "saga",
+        with_reply(&sid("owner", "s2"), "ghost"),
+        Some("owner"),
+    );
     assert!(
         error.contains("reply_to targets unknown module ghost"),
         "unknown-module callback: {error}"
@@ -272,7 +287,7 @@ fn a_callback_that_would_wedge_a_saga_is_rejected_at_trigger_time() {
         "each rejected trigger seals its own block (validator parity)"
     );
     // …and no wedged saga exists to be stuck at Pending.
-    for id in ["s1", "s2"] {
+    for id in [sid("owner", "s1"), sid("owner", "s2")] {
         let saga = sim.query("saga", json!({ "get": { "saga_id": id } }));
         assert!(saga["saga"].is_null(), "no wedged saga {id} exists: {saga}");
     }
@@ -342,7 +357,11 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
         ),
         // saga — fire-and-forget: stages a pending saga, emits a WorkerRequest
         // effect no worker claims (dropped). no follow-up in either mode.
-        ("saga", saga_trigger("s1", &spec), Some("owner".into())),
+        (
+            "saga",
+            saga_trigger(&sid("owner", "s1"), &spec),
+            Some("owner".into()),
+        ),
         // dispatch — an external RegisterRecipe (module-origin is only needed
         // for Dispatch itself).
         (

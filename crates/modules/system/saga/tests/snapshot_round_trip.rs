@@ -60,6 +60,18 @@ fn get(m: &SagaModule, id: &str) -> Option<SagaView> {
     }
 }
 
+/// saga's id space is namespaced per trigger origin, so every fixture id is
+/// built from the origin that triggers it — and no other origin could have.
+fn alice_id(id: &str) -> String {
+    saga::namespaced_id(&Origin::External(b"alice".to_vec()), id)
+}
+fn agent_id(id: &str) -> String {
+    saga::namespaced_id(&Origin::Module("agent".into()), id)
+}
+fn system_id(id: &str) -> String {
+    saga::namespaced_id(&Origin::System, id)
+}
+
 fn trigger(id: &str, reply_to: Option<&str>, max_attempts: u32, deadline: Option<u64>) -> SagaMsg {
     SagaMsg::Trigger {
         pinned_assignee: None,
@@ -88,31 +100,31 @@ fn source() -> SagaModule {
         &mut m,
         1,
         alice.clone(),
-        &trigger("s-cancelled", None, 1, None),
+        &trigger(&alice_id("s-cancelled"), None, 1, None),
     );
     exec(
         &mut m,
         1,
         Origin::Module("agent".into()),
-        &trigger("s-done", Some("agent"), 1, None),
+        &trigger(&agent_id("s-done"), Some("agent"), 1, None),
     );
     exec(
         &mut m,
         1,
         alice.clone(),
-        &trigger("s-failed", Some("agent"), 2, Some(50)),
+        &trigger(&alice_id("s-failed"), Some("agent"), 2, Some(50)),
     );
     exec(
         &mut m,
         1,
         Origin::System,
-        &trigger("s-pending", None, 3, Some(90)),
+        &trigger(&system_id("s-pending"), None, 3, Some(90)),
     );
     exec(
         &mut m,
         1,
         alice.clone(),
-        &trigger("s-timedout", None, 1, Some(2)),
+        &trigger(&alice_id("s-timedout"), None, 1, Some(2)),
     );
     // a capability-tagged saga: the tag is committed state and must survive
     // the round trip (the ctx serves no capability-registry reply, so the
@@ -124,7 +136,7 @@ fn source() -> SagaModule {
         alice.clone(),
         &SagaMsg::Trigger {
             pinned_assignee: None,
-            saga_id: "s-tagged".into(),
+            saga_id: alice_id("s-tagged"),
             spec: b"tagged-spec".to_vec(),
             reply_to: None,
             reply_payload: Vec::new(),
@@ -142,7 +154,7 @@ fn source() -> SagaModule {
         2,
         Origin::External(b"oracle".to_vec()),
         &SagaMsg::OracleResult {
-            saga_id: "s-done".into(),
+            saga_id: agent_id("s-done"),
             attempt: 0,
             outcome: Ok(b"agreed-answer".to_vec()),
             usage: None,
@@ -153,7 +165,7 @@ fn source() -> SagaModule {
         2,
         Origin::External(b"oracle".to_vec()),
         &SagaMsg::OracleResult {
-            saga_id: "s-failed".into(),
+            saga_id: alice_id("s-failed"),
             attempt: 0,
             outcome: Err("first worker crashed".into()),
             usage: None,
@@ -164,7 +176,7 @@ fn source() -> SagaModule {
         2,
         alice.clone(),
         &SagaMsg::Cancel {
-            saga_id: "s-cancelled".into(),
+            saga_id: alice_id("s-cancelled"),
         },
     );
     block_on(m.commit_block()).unwrap();
@@ -176,7 +188,7 @@ fn source() -> SagaModule {
         3,
         Origin::External(b"oracle".to_vec()),
         &SagaMsg::OracleResult {
-            saga_id: "s-failed".into(),
+            saga_id: alice_id("s-failed"),
             attempt: 1,
             outcome: Err("second worker crashed".into()),
             usage: None,
@@ -203,11 +215,11 @@ fn installed_snapshot_reconstructs_root_and_reads_across_every_status() {
     // the source really covers the whole status space (and the field space:
     // assignee/lease from the valset, deadline, result, error, origins).
     let statuses: Vec<SagaStatus> = [
-        "s-pending",
-        "s-done",
-        "s-failed",
-        "s-timedout",
-        "s-cancelled",
+        system_id("s-pending"),
+        agent_id("s-done"),
+        alice_id("s-failed"),
+        alice_id("s-timedout"),
+        alice_id("s-cancelled"),
     ]
     .iter()
     .map(|id| get(&src, id).unwrap().status)
@@ -222,22 +234,22 @@ fn installed_snapshot_reconstructs_root_and_reads_across_every_status() {
             SagaStatus::Cancelled,
         ]
     );
-    let pending = get(&src, "s-pending").unwrap();
+    let pending = get(&src, &system_id("s-pending")).unwrap();
     assert_eq!(pending.origin, SagaOrigin::System);
     assert!(
         pending.assignee.is_some(),
         "the valset assigned a lease holder"
     );
     assert!(pending.lease_expires_at.is_some());
-    let failed = get(&src, "s-failed").unwrap();
+    let failed = get(&src, &alice_id("s-failed")).unwrap();
     assert_eq!(failed.attempt, 1, "the failed saga consumed both attempts");
     assert_eq!(failed.error, Some("second worker crashed".to_string()));
     assert_eq!(
-        get(&src, "s-done").unwrap().origin,
+        get(&src, &agent_id("s-done")).unwrap().origin,
         SagaOrigin::Module("agent".into())
     );
     assert_eq!(
-        get(&src, "s-cancelled").unwrap().origin,
+        get(&src, &alice_id("s-cancelled")).unwrap().origin,
         SagaOrigin::External(b"alice".to_vec())
     );
 
@@ -248,7 +260,7 @@ fn installed_snapshot_reconstructs_root_and_reads_across_every_status() {
         &mut dst,
         0,
         Origin::System,
-        &trigger("s-staged", None, 1, None),
+        &trigger(&system_id("s-staged"), None, 1, None),
     );
 
     dst.install(&snap, src_root).unwrap();
@@ -262,22 +274,22 @@ fn installed_snapshot_reconstructs_root_and_reads_across_every_status() {
 
     // query parity, saga by saga, across every status and every field.
     for id in [
-        "s-pending",
-        "s-done",
-        "s-failed",
-        "s-timedout",
-        "s-cancelled",
+        system_id("s-pending"),
+        agent_id("s-done"),
+        alice_id("s-failed"),
+        alice_id("s-timedout"),
+        alice_id("s-cancelled"),
     ] {
-        assert_eq!(get(&dst, id), get(&src, id), "query parity for {id}");
+        assert_eq!(get(&dst, &id), get(&src, &id), "query parity for {id}");
     }
     assert_eq!(
-        get(&dst, "s-done").unwrap().result,
+        get(&dst, &agent_id("s-done")).unwrap().result,
         Some(b"agreed-answer".to_vec())
     );
 
     // the pre-install staged overlay is gone, not merged.
     assert_eq!(
-        get(&dst, "s-staged"),
+        get(&dst, &system_id("s-staged")),
         None,
         "install must clear the staged overlay"
     );
@@ -296,11 +308,11 @@ fn tampered_snapshot_is_rejected_and_leaves_state_untouched() {
         &mut dst,
         0,
         Origin::System,
-        &trigger("local", None, 1, None),
+        &trigger(&system_id("local"), None, 1, None),
     );
     block_on(dst.commit_block()).unwrap();
     let before_root = dst.root();
-    let before_view = get(&dst, "local");
+    let before_view = get(&dst, &system_id("local"));
 
     // flip one byte inside the last saga's trailing field: the bytes still
     // DECODE, but the re-derived root cannot match the agreed one.
@@ -317,7 +329,7 @@ fn tampered_snapshot_is_rejected_and_leaves_state_untouched() {
         "failed install must not move the root"
     );
     assert_eq!(
-        get(&dst, "local"),
+        get(&dst, &system_id("local")),
         before_view,
         "failed install must not touch committed state"
     );
@@ -329,14 +341,14 @@ fn tampered_snapshot_is_rejected_and_leaves_state_untouched() {
         "a mismatched expected root must be rejected"
     );
     assert_eq!(dst.root(), before_root);
-    assert_eq!(get(&dst, "local"), before_view);
+    assert_eq!(get(&dst, &system_id("local")), before_view);
 
     // and the failures left the module fully usable: the honest snapshot under
     // the honest root still lands.
     dst.install(&snap, src_root).unwrap();
     assert_eq!(dst.root(), src_root);
     assert_eq!(
-        get(&dst, "local"),
+        get(&dst, &system_id("local")),
         None,
         "install replaces committed state, never merges"
     );
@@ -389,11 +401,12 @@ fn truncated_or_padded_snapshot_is_rejected() {
 /// the canonical bytes of a single minimal saga (System origin, empty spec /
 /// payload, every option absent, no demands), with its id — the fixture the
 /// discriminant-tampering tests index into. the layout is pinned by the
-/// asserted length: count 8, id len 8 + 1, origin 1, reply_to tag 1,
-/// reply_payload len 8, spec len 8, capability tag 1, demands count 8,
-/// status 1, attempt 4, max_attempts 4, seven option tags at [53..60)
-/// (assignee, pinned_assignee, lease_views, lease_expires_at, deadline,
-/// result, error), created_at 8, updated_at 8 = 76 bytes.
+/// asserted length: count 8, id len 8 + 8 (the id is namespaced — `system`,
+/// KEY_SEP, one char), origin 1, reply_to tag 1, reply_payload len 8, spec
+/// len 8, capability tag 1, demands count 8, status 1, attempt 4,
+/// max_attempts 4, seven option tags at [60..67) (assignee, pinned_assignee,
+/// lease_views, lease_expires_at, deadline, result, error), created_at 8,
+/// updated_at 8 = 83 bytes.
 fn minimal_snapshot(id: &str) -> Vec<u8> {
     let mut m = SagaModule::new("saga");
     exec(
@@ -402,7 +415,7 @@ fn minimal_snapshot(id: &str) -> Vec<u8> {
         Origin::System,
         &SagaMsg::Trigger {
             pinned_assignee: None,
-            saga_id: id.into(),
+            saga_id: system_id(id),
             spec: Vec::new(),
             reply_to: None,
             reply_payload: Vec::new(),
@@ -417,7 +430,7 @@ fn minimal_snapshot(id: &str) -> Vec<u8> {
     let snap = m.snapshot();
     assert_eq!(
         snap.len(),
-        76,
+        83,
         "the minimal-saga layout this test indexes into"
     );
     snap
@@ -428,10 +441,10 @@ fn unknown_discriminants_and_tags_are_rejected() {
     let empty_root = SagaModule::new("saga").root();
     let snap = minimal_snapshot("a");
 
-    // origin discriminant (byte 17), status discriminant (byte 44), and an
-    // option tag (byte 53, the assignee) each admit exactly their known
+    // origin discriminant (byte 24), status discriminant (byte 51), and an
+    // option tag (byte 60, the assignee) each admit exactly their known
     // values — a state has ONE valid encoding.
-    for (index, what) in [(17usize, "origin"), (44, "status"), (53, "option tag")] {
+    for (index, what) in [(24usize, "origin"), (51, "status"), (60, "option tag")] {
         let mut bad = snap.clone();
         bad[index] = 9;
         let mut dst = SagaModule::new("saga");
@@ -484,7 +497,7 @@ fn non_ascending_or_duplicate_ids_are_rejected() {
                 Origin::System,
                 &SagaMsg::Trigger {
                     pinned_assignee: None,
-                    saga_id: id.into(),
+                    saga_id: system_id(id),
                     spec: Vec::new(),
                     reply_to: None,
                     reply_payload: Vec::new(),

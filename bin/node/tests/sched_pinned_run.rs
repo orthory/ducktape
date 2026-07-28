@@ -466,6 +466,14 @@ fn credential_record(cluster: &Cluster, reader: usize) -> Option<CredentialRecor
 // the sched trigger + its committed result
 // ===========================================================================
 
+/// saga's id space is namespaced per trigger origin, and `/v1/submit` re-signs
+/// with the RECEIVING node's own key — so an id node `idx` can trigger lives
+/// under that node's actor namespace, and no other member can create it.
+fn node_sid(cluster: &Cluster, idx: usize, id: &str) -> String {
+    let key = Cluster::identity(cluster.peer_ids[idx]);
+    saga::namespaced_id(&sdk::Origin::External(key), id)
+}
+
 /// Submit a bare `SagaMsg::Trigger` from node `idx` (its key stamps the origin),
 /// pinned to `target`, whose v3 envelope carries `CRED_NAME`. No demands — the
 /// smallest reliable execution shape (the cpu/mem → Podman limit-flag
@@ -794,7 +802,7 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     // dropped at the node as `malformed_run_id`, so the ring assertion below
     // could only ever have failed on a real run.
     let dispatch_id = "5c4ed0e2be5f0ab8f8dc5d0f4c2b1a9e7d3f60518c2a4b6d8e0f1a3c5e7b9d02";
-    let saga_id = format!("sched\u{1f}{dispatch_id}");
+    let saga_id = node_sid(&cluster, 0, &format!("sched\u{1f}{dispatch_id}"));
     submit_sched(&cluster, 0, &saga_id, &node_key, 3);
 
     let view = wait_terminal(&cluster, 0, &saga_id, ROUND_TRIP);
@@ -953,7 +961,7 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     // it and the saga module leases it to node 1, which is precisely what
     // direction 2 delegates on — and it makes no difference. One consent
     // satisfied is not the other consent granted.
-    let unadmitted_id = "sched\u{1f}sched-delegated-unadmitted";
+    let unadmitted_id = &node_sid(&cluster, 0, "sched\u{1f}sched-delegated-unadmitted");
     submit_sched(&cluster, 0, unadmitted_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 0, unadmitted_id, ROUND_TRIP);
     assert_eq!(
@@ -985,7 +993,7 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     // node stamps on the hop are all node 1, and node 1 is on no grant list. It
     // also takes the admission's `ThisNode` path, which isolates the CREDENTIAL
     // gate from the work gate direction 0 just proved.
-    let refused_id = "sched\u{1f}sched-delegated-ungranted";
+    let refused_id = &node_sid(&cluster, 1, "sched\u{1f}sched-delegated-ungranted");
     submit_sched(&cluster, 1, refused_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 1, refused_id, ROUND_TRIP);
     assert_eq!(
@@ -1016,7 +1024,7 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     // holds its lease — and authorizes the draw on the OWNER's grant. A run
     // submitted by A and executed on B, drawing as A: the thing that has never
     // worked before this PR.
-    let delegated_id = "sched\u{1f}sched-delegated-pointer";
+    let delegated_id = &node_sid(&cluster, 0, "sched\u{1f}sched-delegated-pointer");
     submit_sched(&cluster, 0, delegated_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 0, delegated_id, ROUND_TRIP);
     assert_eq!(
@@ -1090,7 +1098,7 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     // in its own right, with no pointer doing any work — origin, assignee and
     // caller are all node 1 again. The grant is the only thing that changed
     // since direction 1.
-    let granted_id = "sched\u{1f}sched-delegated-granted";
+    let granted_id = &node_sid(&cluster, 1, "sched\u{1f}sched-delegated-granted");
     submit_sched(&cluster, 1, granted_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 1, granted_id, ROUND_TRIP);
     assert_eq!(

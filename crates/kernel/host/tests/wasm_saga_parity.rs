@@ -144,6 +144,13 @@ async fn wasm_host_(members: &[Vec<u8>]) -> Host {
     .expect("genesis")
 }
 
+/// the only saga id a given member may trigger: saga's id space is namespaced
+/// per trigger origin ([`saga::namespaced_id`]), which is what stops one
+/// member from squatting an id another principal derives.
+fn sid(who: &[u8], id: &str) -> String {
+    saga::namespaced_id(&Origin::External(who.to_vec()), id)
+}
+
 /// one block's agreed context. consensus_time == height, as on the real
 /// validator network — saga compares lease/deadline views against
 /// consensus_time, so keeping them equal keeps the sweep arithmetic honest.
@@ -232,11 +239,11 @@ fn announce(capabilities: &[&str], resources: &[(&str, u64)]) -> Msg {
 /// the read matrix: per-id Get (present and absent ids alike), the crank
 /// pump's NextExpiry, and both members' AssignedPending projections (the
 /// resident worker pump's read — reconstructed WorkerRequests must agree).
-async fn replies(h: &Host, ids: &[&str], members: &[&[u8]]) -> Vec<Vec<u8>> {
+async fn replies(h: &Host, ids: &[String], members: &[&[u8]]) -> Vec<Vec<u8>> {
     let mut queries = vec![encode_query(&SagaQuery::NextExpiry)];
     for id in ids {
         queries.push(encode_query(&SagaQuery::Get {
-            saga_id: (*id).into(),
+            saga_id: id.clone(),
         }));
     }
     queries.push(encode_query(&SagaQuery::Get {
@@ -293,7 +300,7 @@ fn worker_requests(out: &BlockOutcome) -> Vec<WorkerRequest> {
 async fn roundtrip(
     native: &mut Host,
     wasm: &mut Host,
-    ids: &[&str],
+    ids: &[String],
     members: &[&[u8]],
     height: u64,
     origin: Origin,
@@ -349,7 +356,7 @@ async fn roundtrip(
 async fn reject_roundtrip(
     native: &mut Host,
     wasm: &mut Host,
-    ids: &[&str],
+    ids: &[String],
     members: &[&[u8]],
     height: u64,
     origin: Origin,
@@ -414,7 +421,13 @@ async fn same_ops_inner() {
     let members = vec![a.clone(), b.clone()];
     let member_keys: [&[u8]; 2] = [&a, &b];
     let ids = [
-        "t-open", "t-cap", "t-ann", "t-pin", "t-cxl", "t-renew", "t-re",
+        sid(&a, "t-open"),
+        sid(&b, "t-cap"),
+        sid(&a, "t-ann"),
+        sid(&a, "t-pin"),
+        sid(&a, "t-cxl"),
+        sid(&a, "t-renew"),
+        sid(&a, "t-re"),
     ];
 
     let mut native = native_host(&members).await;
@@ -466,9 +479,9 @@ async fn same_ops_inner() {
         Origin::External(a.clone()),
         saga_op(
             &Trig {
-            deadline: Some(500),
-            max_attempts: 2,
-            ..trigger("t-open")
+                deadline: Some(500),
+                max_attempts: 2,
+                ..trigger(&sid(&a, "t-open"))
             }
             .into(),
         ),
@@ -492,7 +505,7 @@ async fn same_ops_inner() {
         &member_keys,
         4,
         Origin::External(stranger),
-        oracle("t-open", 0, Ok(b"stolen".to_vec())),
+        oracle(&sid(&a, "t-open"), 0, Ok(b"stolen".to_vec())),
         false,
     )
     .await;
@@ -507,7 +520,7 @@ async fn same_ops_inner() {
         &member_keys,
         5,
         Origin::External(open_assignee),
-        oracle("t-open", 0, Ok(br#"{"answer":42}"#.to_vec())),
+        oracle(&sid(&a, "t-open"), 0, Ok(br#"{"answer":42}"#.to_vec())),
         true,
     )
     .await;
@@ -534,10 +547,10 @@ async fn same_ops_inner() {
         Origin::External(b.clone()),
         saga_op(
             &Trig {
-            max_attempts: 2,
-            capability: Some("llm".into()),
-            demands: BTreeMap::from([("cores".to_string(), 8u64)]),
-            ..trigger("t-cap")
+                max_attempts: 2,
+                capability: Some("llm".into()),
+                demands: BTreeMap::from([("cores".to_string(), 8u64)]),
+                ..trigger(&sid(&b, "t-cap"))
             }
             .into(),
         ),
@@ -559,13 +572,16 @@ async fn same_ops_inner() {
         &member_keys,
         7,
         Origin::External(a.clone()),
-        oracle("t-cap", 0, Err("transient".into())),
+        oracle(&sid(&b, "t-cap"), 0, Err("transient".into())),
         true,
     )
     .await;
     assert_eq!(n_reqs.len(), 1, "the retry re-emits one work order");
     assert_eq!(n_reqs[0].attempt, 1);
-    let retry_assignee = view_of(&wasm, "t-cap").await.assignee.expect("re-leased");
+    let retry_assignee = view_of(&wasm, &sid(&b, "t-cap"))
+        .await
+        .assignee
+        .expect("re-leased");
 
     // the FINAL attempt's Err lands Failed + callback (no further work order).
     let (n_reqs, _) = roundtrip(
@@ -575,12 +591,15 @@ async fn same_ops_inner() {
         &member_keys,
         8,
         Origin::External(retry_assignee),
-        oracle("t-cap", 1, Err("fatal".into())),
+        oracle(&sid(&b, "t-cap"), 1, Err("fatal".into())),
         true,
     )
     .await;
     assert!(n_reqs.is_empty(), "a terminal failure emits no work order");
-    assert_eq!(view_of(&wasm, "t-cap").await.status, SagaStatus::Failed);
+    assert_eq!(
+        view_of(&wasm, &sid(&b, "t-cap")).await.status,
+        SagaStatus::Failed
+    );
 
     // ---- t-ann: a tag NOBODY announced assigns nobody — the emitted work
     // order is an ANNOUNCEMENT (assignee None), and under Strict no result
@@ -594,8 +613,8 @@ async fn same_ops_inner() {
         Origin::External(a.clone()),
         saga_op(
             &Trig {
-            capability: Some("nobody-has-this".into()),
-            ..trigger("t-ann")
+                capability: Some("nobody-has-this".into()),
+                ..trigger(&sid(&a, "t-ann"))
             }
             .into(),
         ),
@@ -612,7 +631,7 @@ async fn same_ops_inner() {
         &member_keys,
         10,
         Origin::External(a.clone()),
-        oracle("t-ann", 0, Ok(b"premature".to_vec())),
+        oracle(&sid(&a, "t-ann"), 0, Ok(b"premature".to_vec())),
         false,
     )
     .await;
@@ -625,7 +644,7 @@ async fn same_ops_inner() {
         11,
         Origin::External(b.clone()),
         saga_op(&SagaMsg::Accept {
-            saga_id: "t-ann".into(),
+            saga_id: sid(&a, "t-ann"),
             attempt: 0,
         }),
         true,
@@ -641,7 +660,7 @@ async fn same_ops_inner() {
         12,
         Origin::External(a.clone()),
         saga_op(&SagaMsg::Accept {
-            saga_id: "t-ann".into(),
+            saga_id: sid(&a, "t-ann"),
             attempt: 0,
         }),
         false,
@@ -655,7 +674,7 @@ async fn same_ops_inner() {
         &member_keys,
         13,
         Origin::External(b.clone()),
-        oracle("t-ann", 0, Ok(b"claimed-and-done".to_vec())),
+        oracle(&sid(&a, "t-ann"), 0, Ok(b"claimed-and-done".to_vec())),
         true,
     )
     .await;
@@ -671,8 +690,8 @@ async fn same_ops_inner() {
         Origin::External(a.clone()),
         saga_op(
             &Trig {
-            pinned_assignee: Some(b.clone()),
-            ..trigger("t-pin")
+                pinned_assignee: Some(b.clone()),
+                ..trigger(&sid(&a, "t-pin"))
             }
             .into(),
         ),
@@ -687,7 +706,7 @@ async fn same_ops_inner() {
         &member_keys,
         15,
         Origin::External(b.clone()),
-        oracle("t-pin", 0, Ok(b"pinned-done".to_vec())),
+        oracle(&sid(&a, "t-pin"), 0, Ok(b"pinned-done".to_vec())),
         true,
     )
     .await;
@@ -703,8 +722,8 @@ async fn same_ops_inner() {
         Origin::External(a.clone()),
         saga_op(
             &Trig {
-            max_attempts: 3,
-            ..trigger("t-cxl")
+                max_attempts: 3,
+                ..trigger(&sid(&a, "t-cxl"))
             }
             .into(),
         ),
@@ -719,7 +738,7 @@ async fn same_ops_inner() {
         17,
         Origin::External(b.clone()),
         saga_op(&SagaMsg::Cancel {
-            saga_id: "t-cxl".into(),
+            saga_id: sid(&a, "t-cxl"),
         }),
         false,
     )
@@ -732,7 +751,7 @@ async fn same_ops_inner() {
         18,
         Origin::External(a.clone()),
         saga_op(&SagaMsg::Cancel {
-            saga_id: "t-cxl".into(),
+            saga_id: sid(&a, "t-cxl"),
         }),
         true,
     )
@@ -749,16 +768,19 @@ async fn same_ops_inner() {
         Origin::External(a.clone()),
         saga_op(
             &Trig {
-            lease_views: Some(4),
-            capability: Some("llm".into()),
-            ..trigger("t-renew")
+                lease_views: Some(4),
+                capability: Some("llm".into()),
+                ..trigger(&sid(&a, "t-renew"))
             }
             .into(),
         ),
         true,
     )
     .await;
-    let renew_holder = view_of(&wasm, "t-renew").await.assignee.expect("leased");
+    let renew_holder = view_of(&wasm, &sid(&a, "t-renew"))
+        .await
+        .assignee
+        .expect("leased");
     let stranger = members
         .iter()
         .find(|m| **m != renew_holder)
@@ -773,7 +795,7 @@ async fn same_ops_inner() {
         21,
         Origin::External(stranger),
         saga_op(&SagaMsg::RenewLease {
-            saga_id: "t-renew".into(),
+            saga_id: sid(&a, "t-renew"),
             attempt: 0,
         }),
         false,
@@ -789,7 +811,7 @@ async fn same_ops_inner() {
         22,
         Origin::External(renew_holder),
         saga_op(&SagaMsg::RenewLease {
-            saga_id: "t-renew".into(),
+            saga_id: sid(&a, "t-renew"),
             attempt: 0,
         }),
         true,
@@ -808,16 +830,19 @@ async fn same_ops_inner() {
         Origin::External(a.clone()),
         saga_op(
             &Trig {
-            max_attempts: 3,
-            capability: Some("llm".into()),
-            ..trigger("t-re")
+                max_attempts: 3,
+                capability: Some("llm".into()),
+                ..trigger(&sid(&a, "t-re"))
             }
             .into(),
         ),
         true,
     )
     .await;
-    let first_holder = view_of(&wasm, "t-re").await.assignee.expect("leased");
+    let first_holder = view_of(&wasm, &sid(&a, "t-re"))
+        .await
+        .assignee
+        .expect("leased");
     // a foreign reassign is a no-op (the origin gate reads the recorded
     // trigger origin, folded state on the wasm side)...
     roundtrip(
@@ -828,7 +853,7 @@ async fn same_ops_inner() {
         24,
         Origin::External(b.clone()),
         saga_op(&SagaMsg::Reassign {
-            saga_id: "t-re".into(),
+            saga_id: sid(&a, "t-re"),
             attempt: 0,
         }),
         false,
@@ -842,7 +867,7 @@ async fn same_ops_inner() {
         25,
         Origin::External(a.clone()),
         saga_op(&SagaMsg::Reassign {
-            saga_id: "t-re".into(),
+            saga_id: sid(&a, "t-re"),
             attempt: 0,
         }),
         true,
@@ -864,7 +889,7 @@ async fn same_ops_inner() {
         26,
         Origin::External(b.clone()),
         saga_op(&SagaMsg::Prune {
-            saga_ids: vec!["t-open".into(), "t-re".into()],
+            saga_ids: vec![sid(&a, "t-open"), sid(&a, "t-re")],
         }),
         false,
     )
@@ -877,7 +902,7 @@ async fn same_ops_inner() {
         27,
         Origin::External(a.clone()),
         saga_op(&SagaMsg::Prune {
-            saga_ids: vec!["t-open".into(), "t-re".into()],
+            saga_ids: vec![sid(&a, "t-open"), sid(&a, "t-re")],
         }),
         true,
     )
@@ -886,7 +911,7 @@ async fn same_ops_inner() {
         .query(
             "saga",
             &encode_query(&SagaQuery::Get {
-                saga_id: "t-open".into(),
+                saga_id: sid(&a, "t-open"),
             }),
         )
         .await
@@ -917,7 +942,7 @@ async fn crank_inner() {
     let (a, b) = (key(0xAA), key(0xBB));
     let members = vec![a.clone(), b.clone()];
     let member_keys: [&[u8]; 2] = [&a, &b];
-    let ids = ["t-dead", "t-lease"];
+    let ids = [sid(&a, "t-dead"), sid(&a, "t-lease")];
 
     let mut native = native_host(&members).await;
     let mut wasm = wasm_host_(&members).await;
@@ -932,8 +957,8 @@ async fn crank_inner() {
         Origin::External(a.clone()),
         saga_op(
             &Trig {
-            deadline: Some(4),
-            ..trigger("t-dead")
+                deadline: Some(4),
+                ..trigger(&sid(&a, "t-dead"))
             }
             .into(),
         ),
@@ -949,9 +974,9 @@ async fn crank_inner() {
         Origin::External(a.clone()),
         saga_op(
             &Trig {
-            lease_views: Some(2),
-            max_attempts: 2,
-            ..trigger("t-lease")
+                lease_views: Some(2),
+                max_attempts: 2,
+                ..trigger(&sid(&a, "t-lease"))
             }
             .into(),
         ),
@@ -987,9 +1012,12 @@ async fn crank_inner() {
     )
     .await;
     assert_eq!(n_reqs.len(), 1, "the expired lease re-emits one work order");
-    assert_eq!(n_reqs[0].saga_id, "t-lease");
+    assert_eq!(n_reqs[0].saga_id, sid(&a, "t-lease"));
     assert_eq!(n_reqs[0].attempt, 1);
-    assert_eq!(view_of(&wasm, "t-dead").await.status, SagaStatus::TimedOut);
+    assert_eq!(
+        view_of(&wasm, &sid(&a, "t-dead")).await.status,
+        SagaStatus::TimedOut
+    );
 
     // the SECOND lease expires with attempts exhausted: the next crank lands
     // Failed + callback (no further work order).
@@ -1005,7 +1033,7 @@ async fn crank_inner() {
     )
     .await;
     assert!(n_reqs.is_empty());
-    let view = view_of(&wasm, "t-lease").await;
+    let view = view_of(&wasm, &sid(&a, "t-lease")).await;
     assert_eq!(view.status, SagaStatus::Failed);
     assert_eq!(view.error.as_deref(), Some("lease attempts exhausted"));
 }
@@ -1019,7 +1047,7 @@ async fn rejections_inner() {
     let (a, b) = (key(0xAA), key(0xBB));
     let members = vec![a.clone(), b.clone()];
     let member_keys: [&[u8]; 2] = [&a, &b];
-    let ids = ["live", "solo", "pinned"];
+    let ids = [sid(&a, "live"), sid(&a, "solo"), sid(&a, "pinned")];
 
     let mut native = native_host(&members).await;
     let mut wasm = wasm_host_(&members).await;
@@ -1038,9 +1066,9 @@ async fn rejections_inner() {
             block(2, Origin::External(a.clone())),
             saga_op(
                 &Trig {
-                max_attempts: 3,
-                capability: Some("solo".into()),
-                ..trigger("live")
+                    max_attempts: 3,
+                    capability: Some("solo".into()),
+                    ..trigger(&sid(&a, "live"))
                 }
                 .into(),
             ),
@@ -1051,8 +1079,8 @@ async fn rejections_inner() {
             block(3, Origin::External(a.clone())),
             saga_op(
                 &Trig {
-                capability: Some("solo".into()),
-                ..trigger("solo")
+                    capability: Some("solo".into()),
+                    ..trigger(&sid(&a, "solo"))
                 }
                 .into(),
             ),
@@ -1063,9 +1091,9 @@ async fn rejections_inner() {
             block(4, Origin::External(a.clone())),
             saga_op(
                 &Trig {
-                max_attempts: 3,
-                pinned_assignee: Some(b.clone()),
-                ..trigger("pinned")
+                    max_attempts: 3,
+                    pinned_assignee: Some(b.clone()),
+                    ..trigger(&sid(&a, "pinned"))
                 }
                 .into(),
             ),
@@ -1075,7 +1103,7 @@ async fn rejections_inner() {
     }
     // "solo"'s only provider is A, so both live sagas lease to A.
     assert_eq!(
-        view_of(&wasm, "live").await.assignee.as_deref(),
+        view_of(&wasm, &sid(&a, "live")).await.assignee.as_deref(),
         Some(a.as_slice())
     );
 
@@ -1088,8 +1116,8 @@ async fn rejections_inner() {
             Origin::External(a.clone()),
             saga_op(
                 &Trig {
-                max_attempts: 0,
-                ..trigger("r1")
+                    max_attempts: 0,
+                    ..trigger(&sid(&a, "r1"))
                 }
                 .into(),
             ),
@@ -1099,8 +1127,8 @@ async fn rejections_inner() {
             Origin::External(a.clone()),
             saga_op(
                 &Trig {
-                reply_payload: vec![7; MAX_REPLY_PAYLOAD_BYTES + 1],
-                ..trigger("r2")
+                    reply_payload: vec![7; MAX_REPLY_PAYLOAD_BYTES + 1],
+                    ..trigger(&sid(&a, "r2"))
                 }
                 .into(),
             ),
@@ -1110,8 +1138,8 @@ async fn rejections_inner() {
             Origin::External(a.clone()),
             saga_op(
                 &Trig {
-                capability: Some(String::new()),
-                ..trigger("r3")
+                    capability: Some(String::new()),
+                    ..trigger(&sid(&a, "r3"))
                 }
                 .into(),
             ),
@@ -1121,8 +1149,8 @@ async fn rejections_inner() {
             Origin::External(a.clone()),
             saga_op(
                 &Trig {
-                capability: Some("x".repeat(MAX_CAPABILITY_BYTES + 1)),
-                ..trigger("r4")
+                    capability: Some("x".repeat(MAX_CAPABILITY_BYTES + 1)),
+                    ..trigger(&sid(&a, "r4"))
                 }
                 .into(),
             ),
@@ -1134,9 +1162,9 @@ async fn rejections_inner() {
             Origin::External(a.clone()),
             saga_op(
                 &Trig {
-                capability: Some("llm".into()),
-                demands: BTreeMap::from([("cores".to_string(), 0u64)]),
-                ..trigger("r5")
+                    capability: Some("llm".into()),
+                    demands: BTreeMap::from([("cores".to_string(), 0u64)]),
+                    ..trigger(&sid(&a, "r5"))
                 }
                 .into(),
             ),
@@ -1146,9 +1174,9 @@ async fn rejections_inner() {
             Origin::External(a.clone()),
             saga_op(
                 &Trig {
-                capability: Some("llm".into()),
-                demands: BTreeMap::from([("NOT A TAG".to_string(), 1u64)]),
-                ..trigger("r6")
+                    capability: Some("llm".into()),
+                    demands: BTreeMap::from([("NOT A TAG".to_string(), 1u64)]),
+                    ..trigger(&sid(&a, "r6"))
                 }
                 .into(),
             ),
@@ -1158,8 +1186,8 @@ async fn rejections_inner() {
             Origin::External(a.clone()),
             saga_op(
                 &Trig {
-                pinned_assignee: Some(Vec::new()),
-                ..trigger("r7")
+                    pinned_assignee: Some(Vec::new()),
+                    ..trigger(&sid(&a, "r7"))
                 }
                 .into(),
             ),
@@ -1172,8 +1200,8 @@ async fn rejections_inner() {
             Origin::External(a.clone()),
             saga_op(
                 &Trig {
-                reply_to: Some("saga".into()),
-                ..trigger("r8")
+                    reply_to: Some("saga".into()),
+                    ..trigger(&sid(&a, "r8"))
                 }
                 .into(),
             ),
@@ -1183,8 +1211,8 @@ async fn rejections_inner() {
             Origin::External(a.clone()),
             saga_op(
                 &Trig {
-                reply_to: Some("ghost".into()),
-                ..trigger("r9")
+                    reply_to: Some("ghost".into()),
+                    ..trigger(&sid(&a, "r9"))
                 }
                 .into(),
             ),
@@ -1194,19 +1222,19 @@ async fn rejections_inner() {
         // submitted from the assignee so the size check is what rejects.
         (
             Origin::External(a.clone()),
-            oracle("live", 0, Ok(vec![7; MAX_RESULT_BYTES + 1])),
+            oracle(&sid(&a, "live"), 0, Ok(vec![7; MAX_RESULT_BYTES + 1])),
             "oracle result is",
         ),
         (
             Origin::External(a.clone()),
-            oracle("live", 0, Err("e".repeat(MAX_ERROR_BYTES + 1))),
+            oracle(&sid(&a, "live"), 0, Err("e".repeat(MAX_ERROR_BYTES + 1))),
             "oracle error is",
         ),
         // the Accept origin gates.
         (
             Origin::System,
             saga_op(&SagaMsg::Accept {
-                saga_id: "live".into(),
+                saga_id: sid(&a, "live"),
                 attempt: 0,
             }),
             "Accept requires an external origin",
@@ -1214,7 +1242,7 @@ async fn rejections_inner() {
         (
             Origin::External(Vec::new()),
             saga_op(&SagaMsg::Accept {
-                saga_id: "live".into(),
+                saga_id: sid(&a, "live"),
                 attempt: 0,
             }),
             "non-empty submitter id",
@@ -1225,7 +1253,7 @@ async fn rejections_inner() {
         (
             Origin::External(a.clone()),
             saga_op(&SagaMsg::Reassign {
-                saga_id: "pinned".into(),
+                saga_id: sid(&a, "pinned"),
                 attempt: 0,
             }),
             "pinned saga cannot be reassigned",
@@ -1233,7 +1261,7 @@ async fn rejections_inner() {
         (
             Origin::External(a.clone()),
             saga_op(&SagaMsg::Reassign {
-                saga_id: "solo".into(),
+                saga_id: sid(&a, "solo"),
                 attempt: 0,
             }),
             "reassignment attempts exhausted",
@@ -1241,10 +1269,39 @@ async fn rejections_inner() {
         (
             Origin::External(a.clone()),
             saga_op(&SagaMsg::Reassign {
-                saga_id: "live".into(),
+                saga_id: sid(&a, "live"),
                 attempt: 0,
             }),
             "no alternate assignee is available",
+        ),
+        // the ID-SQUAT seam: the saga id space is OWNED per origin, so B
+        // cannot trigger into A's namespace, nor into the `dispatch` module's
+        // — the predictable `dispatch{SEP}{receiver}{SEP}{id}` shape a
+        // squatter would race a producer for. this is the one refusal here
+        // decided purely on `env().origin`, which is exactly the input that
+        // can cross the WIT boundary and do nothing inside the guest.
+        (
+            Origin::External(b.clone()),
+            saga_op(
+                &Trig {
+                    ..trigger(&sid(&a, "squat"))
+                }
+                .into(),
+            ),
+            "own namespace",
+        ),
+        (
+            Origin::External(b.clone()),
+            saga_op(
+                &Trig {
+                    ..trigger(&saga::namespaced_id(
+                        &Origin::Module("dispatch".into()),
+                        "chat\u{1f}run-7",
+                    ))
+                }
+                .into(),
+            ),
+            "own namespace",
         ),
         // the decode seam.
         (
@@ -1284,7 +1341,7 @@ async fn multi_dispatch_inner() {
     let a = key(0xAA);
     let members = vec![a.clone()];
     let member_keys: [&[u8]; 1] = [&a];
-    let ids = ["s1", "s2"];
+    let ids = [sid(&a, "s1"), sid(&a, "s2")];
 
     let mut native = native_host(&members).await;
     let mut wasm = wasm_host_(&members).await;
@@ -1295,15 +1352,18 @@ async fn multi_dispatch_inner() {
     // `__state` (the read-your-writes seam the adapter relies on). the P6
     // callback still fires from the middle dispatch.
     let batch = vec![
-        (Origin::External(a.clone()), saga_op(&trigger("s1").into())),
         (
             Origin::External(a.clone()),
-            oracle("s1", 0, Ok(b"same-block".to_vec())),
+            saga_op(&trigger(&sid(&a, "s1")).into()),
+        ),
+        (
+            Origin::External(a.clone()),
+            oracle(&sid(&a, "s1"), 0, Ok(b"same-block".to_vec())),
         ),
         (
             Origin::External(a.clone()),
             saga_op(&SagaMsg::Prune {
-                saga_ids: vec!["s1".into()],
+                saga_ids: vec![sid(&a, "s1")],
             }),
         ),
     ];
@@ -1340,7 +1400,7 @@ async fn multi_dispatch_inner() {
         .query(
             "saga",
             &encode_query(&SagaQuery::Get {
-                saga_id: "s1".into(),
+                saga_id: sid(&a, "s1"),
             }),
         )
         .await
@@ -1360,13 +1420,16 @@ async fn multi_dispatch_inner() {
     // the accepted subset alone, on both runtimes.
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
     let batch = vec![
-        (Origin::External(a.clone()), saga_op(&trigger("s2").into())),
+        (
+            Origin::External(a.clone()),
+            saga_op(&trigger(&sid(&a, "s2")).into()),
+        ),
         (
             Origin::External(a.clone()),
             saga_op(
                 &Trig {
-                max_attempts: 0,
-                ..trigger("s3")
+                    max_attempts: 0,
+                    ..trigger(&sid(&a, "s3"))
                 }
                 .into(),
             ),
@@ -1396,7 +1459,7 @@ async fn multi_dispatch_inner() {
                 .query(
                     "saga",
                     &encode_query(&SagaQuery::Get {
-                        saga_id: "s2".into()
+                        saga_id: sid(&a, "s2")
                     })
                 )
                 .await

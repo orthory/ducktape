@@ -34,6 +34,16 @@ use saga::{
 };
 use sdk::{Event, Msg};
 
+/// saga's id space is namespaced per trigger origin, and an op submitted
+/// through `OrderedNode::submit` carries its SIGNER's key as that origin.
+fn sid(signer: &commonware_cryptography::ed25519::PrivateKey, id: &str) -> String {
+    use commonware_cryptography::Signer as _;
+    saga::namespaced_id(
+        &sdk::Origin::External(signer.public_key().as_ref().to_vec()),
+        id,
+    )
+}
+
 fn trigger(id: &str, spec: &[u8]) -> Msg {
     Msg {
         target: "saga".into(),
@@ -130,7 +140,13 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
         }
 
         // (1) the Trigger op is agreed -> submit to every validator's order, drain.
-        broadcast(&mut nodes, &sk(1), 0, &trigger("s1", b"hello")).await;
+        broadcast(
+            &mut nodes,
+            &sk(1),
+            0,
+            &trigger(&sid(&sk(1), "s1"), b"hello"),
+        )
+        .await;
         for n in &mut nodes {
             drain_fixpoint(n).await;
         }
@@ -152,7 +168,7 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
                 "each node surfaced one WorkerRequest event"
             );
             assert_eq!(
-                saga_view(n, "s1").await.unwrap().status,
+                saga_view(n, &sid(&sk(1), "s1")).await.unwrap().status,
                 SagaStatus::Pending,
                 "still Pending: no oracle op yet"
             );
@@ -182,7 +198,7 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
                 done,
                 "all validators converge on the Done root-hash"
             );
-            let v = saga_view(n, "s1").await.expect("saga exists");
+            let v = saga_view(n, &sid(&sk(1), "s1")).await.expect("saga exists");
             assert_eq!(v.status, SagaStatus::Done, "every validator's saga is Done");
             assert_eq!(
                 v.result,
