@@ -2960,7 +2960,7 @@ dependencies = [
 [[package]]
 name = "ducktape-ui"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=5b271d1#5b271d1eb85a4487287cf4d31a2812a186085933"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=f8a7ee3#f8a7ee30a092b109270bb1ed7130bb97b559bd77"
 dependencies = [
  "iced",
 ]
@@ -9016,7 +9016,7 @@ dependencies = [
 [[package]]
 name = "ui-lang"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=5b271d1#5b271d1eb85a4487287cf4d31a2812a186085933"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=f8a7ee3#f8a7ee30a092b109270bb1ed7130bb97b559bd77"
 dependencies = [
  "ui-lang-core",
 ]
@@ -9024,26 +9024,15 @@ dependencies = [
 [[package]]
 name = "ui-lang-core"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=5b271d1#5b271d1eb85a4487287cf4d31a2812a186085933"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=f8a7ee3#f8a7ee30a092b109270bb1ed7130bb97b559bd77"
 dependencies = [
  "qrcode 0.14.1",
- "serde_json",
- "sha2",
- "ui-lang-live-protocol",
-]
-
-[[package]]
-name = "ui-lang-live-protocol"
-version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=5b271d1#5b271d1eb85a4487287cf4d31a2812a186085933"
-dependencies = [
- "serde",
 ]
 
 [[package]]
 name = "ui-lang-runtime"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=5b271d1#5b271d1eb85a4487287cf4d31a2812a186085933"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=f8a7ee3#f8a7ee30a092b109270bb1ed7130bb97b559bd77"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -9051,8 +9040,6 @@ dependencies = [
  "iced",
  "iced_test",
  "iced_tiny_skia",
- "serde_json",
- "ui-lang-live-protocol",
  "unicode-segmentation",
 ]
 
