@@ -1,6 +1,6 @@
 //! qmdb-backed deterministic user-defined automations over chat hooks.
 //!
-//! an operator registers rules — a [`Trigger`] (chat post filters) plus an
+//! a user registers rules — a [`Trigger`] (chat post filters) plus an
 //! [`Action`] (post a chat message, create a task, or deliver an inbox
 //! notification). when chat fans a post out to its hooks, this module evaluates
 //! every enabled rule and emits the matching actions as follow-up [`sdk::Msg`]s
@@ -20,6 +20,32 @@
 //!   [`AutomationsMsg::HookEvent`] from a non-chat origin is rejected — only
 //!   chat's own follow-ups ever wear `Origin::Module("chat")`, so a submitter
 //!   cannot forge a hook event.
+//!
+//! ## Rule ownership — CREATING a rule and RUNNING one are different principals
+//!
+//! every rule records an [`owner`](Rule::owner): the authenticated external
+//! submitter of its `CreateRule`, in the same raw-key domain `chat::Channel`
+//! records for its own owner. `SetEnabled` and `DeleteRule` are refused unless
+//! the submitter IS that owner, and [`rule_owner`] refuses every origin that
+//! cannot be one — the pre-consensus default `Origin::External(vec![])`, and
+//! `Origin::Module`/`Origin::System` outright (the `vaults` posture). so an
+//! ownerless rule is not a shape this module can mint.
+//!
+//! that gate binds rule AUTHORSHIP only. a FIRING rule still emits its action
+//! under `Origin::Module("automations")` — the host stamps that origin on the
+//! emitter, and those follow-ups go to chat/tasks/inbox, never back through
+//! this module's admin path. the hook arm is likewise routed by origin BEFORE
+//! the owner gate is reached. so gating creation costs a rule nothing at fire
+//! time, and the module's own authority can never be turned on itself: a
+//! module origin cannot create a rule.
+//!
+//! NOT the channel owner's call. a rule is not attached to a channel — its
+//! trigger channel is optional (`None` fires on every hooked channel) and its
+//! action targets a different channel, or tasks, or an inbox member entirely.
+//! a channel owner's lever over the automations reaching their channel is
+//! `ChatMsg::UnregisterHook`, which is theirs already and is better scoped:
+//! it detaches this module from that one channel instead of deleting a rule
+//! that also serves others.
 //!
 //! ## Loop prevention
 //!
@@ -57,11 +83,14 @@
 //! platform behavior — the rule's effect and the triggering event commit or
 //! abort as one atomic unit (P2).
 //!
-//! ## Hook registration is a separate operator op
+//! ## Hook registration is a separate op, and a separate authority
 //!
-//! registering a rule does NOT subscribe this module to any channel. the operator
-//! separately submits `ChatMsg::RegisterHook { channel_id, module_id: "automations" }`
-//! to chat for each channel whose posts should reach these rules.
+//! registering a rule does NOT subscribe this module to any channel. the
+//! channel's OWNER separately submits
+//! `ChatMsg::RegisterHook { channel_id, module_id: "automations" }` to chat for
+//! each channel whose posts should reach these rules — chat gates that on
+//! channel-admin authority, so a rule owner cannot wire their own rule into a
+//! channel they do not own.
 //!
 //! ## State model
 //!
@@ -138,6 +167,36 @@ pub const MAX_ACTIONS_PER_EVENT: usize = 8;
 /// wedge every syncing peer (the poison-value lesson), so the create op
 /// refuses loudly instead.
 pub const MAX_ROSTER_RECORD_BYTES: usize = 512 * 1024;
+
+/// derive the principal an admin op acts as — the ONLY ownership path, and the
+/// only place a [`Rule::owner`] is ever minted.
+///
+/// exhaustive on purpose: a rule is a standing capability that fires under this
+/// module's own authority, so only an authenticated external submitter may own
+/// one. `Origin::Module` is refused even though the host assigns it honestly —
+/// no module registers rules, and admitting one would let this module's own
+/// execution identity mint more of itself. `Origin::System` is refused for the
+/// same reason: nothing seeds a rule at genesis. that leaves the pre-consensus
+/// default `Origin::External(vec![])`, which is not a submitter.
+fn rule_owner(origin: &Origin) -> Result<Vec<u8>, Error> {
+    match origin {
+        Origin::External(key) => {
+            let is_authenticated_submitter = !key.is_empty();
+            if !is_authenticated_submitter {
+                return Err(Error::Module(
+                    "external origin must carry a non-empty submitter id".into(),
+                ));
+            }
+            Ok(key.clone())
+        }
+        Origin::Module(id) => Err(Error::Module(format!(
+            "a module origin cannot own an automation rule: {id}"
+        ))),
+        Origin::System => Err(Error::Module(
+            "a system origin cannot own an automation rule".into(),
+        )),
+    }
+}
 
 /// per-rule record key: prefix + 0 + id (the single-component shape chat
 /// uses). safe because every key literal below is fixed and none is another
@@ -349,8 +408,25 @@ impl Automations {
 
     // ---- admin ops ----------------------------------------------------------
 
+    /// authorize an op on an EXISTING rule. owner-only, and that is the whole
+    /// rule: a rule fires under this module's authority, so admitting anyone
+    /// but the principal who took responsibility for it hands a stranger
+    /// either a kill switch (`SetEnabled`/`DeleteRule` on someone else's
+    /// automation) or, worse, a way to swap the standing grant for their own.
+    fn check_rule_owner(rule: &Rule, submitter: &[u8]) -> Result<(), Error> {
+        let is_owner = rule.owner == submitter;
+        if !is_owner {
+            return Err(Error::Module(format!(
+                "only the owner may administer rule {}",
+                rule.rule_id
+            )));
+        }
+        Ok(())
+    }
+
     async fn stage_create_rule(
         &mut self,
+        owner: Vec<u8>,
         rule_id: String,
         trigger: Trigger,
         action: Action,
@@ -382,6 +458,7 @@ impl Automations {
             rule_key(&rule_id),
             &Rule {
                 rule_id: rule_id.clone(),
+                owner,
                 enabled: true,
                 trigger,
                 action,
@@ -392,11 +469,20 @@ impl Automations {
         Ok(())
     }
 
-    async fn stage_set_enabled(&mut self, rule_id: String, enabled: bool) -> Result<(), Error> {
+    async fn stage_set_enabled(
+        &mut self,
+        submitter: &[u8],
+        rule_id: String,
+        enabled: bool,
+    ) -> Result<(), Error> {
         require_non_empty("rule_id", &rule_id)?;
         let Some(mut rule) = self.rule(&rule_id).await? else {
             return Err(Error::Module(format!("unknown rule: {rule_id}")));
         };
+        // BEFORE the idempotency short-circuit: a gate a no-op walks past is
+        // not a gate, and a stranger must not learn a rule's enabled state
+        // from which of the two refusals comes back.
+        Self::check_rule_owner(&rule, submitter)?;
         if rule.enabled == enabled {
             // idempotent: staging nothing keeps the op log — and the root —
             // byte-identical to no write at all.
@@ -407,12 +493,18 @@ impl Automations {
         Ok(())
     }
 
-    async fn stage_delete_rule(&mut self, rule_id: String) -> Result<(), Error> {
+    async fn stage_delete_rule(&mut self, submitter: &[u8], rule_id: String) -> Result<(), Error> {
         require_non_empty("rule_id", &rule_id)?;
         let mut roster = self.roster().await?;
         let Ok(position) = roster.binary_search(&rule_id) else {
             return Err(Error::Module(format!("unknown rule: {rule_id}")));
         };
+        // the roster is the existence authority; the RECORD carries the owner.
+        // a rostered id without a record is a store bug — loud, as everywhere.
+        let Some(rule) = self.rule(&rule_id).await? else {
+            return Err(Error::Module(format!("missing rule record: {rule_id}")));
+        };
+        Self::check_rule_owner(&rule, submitter)?;
         roster.remove(position);
         self.staged.delete(rule_key(&rule_id));
         // shrinking keeps the roster under its create-time byte gate.
@@ -883,30 +975,39 @@ impl Module for Automations {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         // route by the HOST-ASSIGNED origin (spoof-proof): only chat's own
-        // follow-ups reach the hook arm; everything else is an admin op.
+        // follow-ups reach the hook arm; everything else is an admin op. the
+        // hook lane returns HERE, before the owner gate — a rule RUNS under a
+        // module origin and is CREATED under a submitter's, and conflating the
+        // two would either break every fire or leave creation ungated.
         let origin = ctx.env().origin.clone();
-        match origin {
-            Origin::Module(module) if module == self.chat => {
-                self.on_chat_event(ctx, &msg.payload).await
+        let is_chat_hook = origin == Origin::Module(self.chat.clone());
+        if is_chat_hook {
+            return self.on_chat_event(ctx, &msg.payload).await;
+        }
+        // every admin op below is owner-bound, so the submitter is derived
+        // ONCE — before the payload is even decoded — and every arm receives
+        // it. an arm that took no submitter would be the whole class of bug
+        // this gate exists to close.
+        let submitter = rule_owner(&origin)?;
+        match decode_msg(&msg.payload).map_err(Error::Module)? {
+            AutomationsMsg::CreateRule {
+                rule_id,
+                trigger,
+                action,
+            } => {
+                let consensus_time = ctx.env().consensus_time;
+                self.stage_create_rule(submitter, rule_id, trigger, action, consensus_time)
+                    .await
             }
-            _ => match decode_msg(&msg.payload).map_err(Error::Module)? {
-                AutomationsMsg::CreateRule {
-                    rule_id,
-                    trigger,
-                    action,
-                } => {
-                    let consensus_time = ctx.env().consensus_time;
-                    self.stage_create_rule(rule_id, trigger, action, consensus_time)
-                        .await
-                }
-                AutomationsMsg::SetEnabled { rule_id, enabled } => {
-                    self.stage_set_enabled(rule_id, enabled).await
-                }
-                AutomationsMsg::DeleteRule { rule_id } => self.stage_delete_rule(rule_id).await,
-                AutomationsMsg::HookEvent(_) => Err(Error::Module(
-                    "hook events must originate from the chat module".into(),
-                )),
-            },
+            AutomationsMsg::SetEnabled { rule_id, enabled } => {
+                self.stage_set_enabled(&submitter, rule_id, enabled).await
+            }
+            AutomationsMsg::DeleteRule { rule_id } => {
+                self.stage_delete_rule(&submitter, rule_id).await
+            }
+            AutomationsMsg::HookEvent(_) => Err(Error::Module(
+                "hook events must originate from the chat module".into(),
+            )),
         }
     }
 

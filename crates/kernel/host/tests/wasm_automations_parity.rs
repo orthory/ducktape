@@ -67,10 +67,7 @@ async fn siblings(
     vec![
         Box::new(Chat::new("chat", Box::new(store))),
         Box::new(Tasks::new("tasks")),
-        Box::new(Inbox::new(
-            "inbox",
-            Box::new(sdk_testkit::MemStore::new()),
-        )),
+        Box::new(Inbox::new("inbox", Box::new(sdk_testkit::MemStore::new()))),
     ]
 }
 
@@ -707,6 +704,60 @@ fn rejections_match_and_leave_no_trace() {
         for (height, (m, needle)) in rejects.into_iter().enumerate() {
             let height = height as u64 + 2;
             reject_roundtrip(&mut native, &mut wasm, height, ops.clone(), m, needle).await;
+        }
+
+        // the OWNER gate, proven in the compiled component and not just
+        // natively: `ops` owns `r-post`, and neither a stranger nor a
+        // module/system origin may touch it or mint a rule of their own.
+        // `env().origin` is the one authorization input that crosses the WIT
+        // boundary, so a gate keyed on it has to be checked on both sides.
+        let stranger = Origin::External(key(0xC3));
+        let unownable = [
+            (Origin::External(Vec::new()), "non-empty submitter id"),
+            // a NON-chat module id: the chat origin is the hook lane, which is
+            // routed before the owner gate and never rejects by design.
+            (Origin::Module("governance".into()), "module origin"),
+            (Origin::System, "system origin"),
+        ];
+        let mut height = 100;
+        for op in [
+            auto_op(&AutomationsMsg::SetEnabled {
+                rule_id: "r-post".into(),
+                enabled: false,
+            }),
+            auto_op(&AutomationsMsg::DeleteRule {
+                rule_id: "r-post".into(),
+            }),
+        ] {
+            reject_roundtrip(
+                &mut native,
+                &mut wasm,
+                height,
+                stranger.clone(),
+                op,
+                "only the owner",
+            )
+            .await;
+            height += 1;
+        }
+        for (origin, needle) in unownable {
+            reject_roundtrip(
+                &mut native,
+                &mut wasm,
+                height,
+                origin,
+                create_rule(
+                    "r-unowned",
+                    on_general(None),
+                    Action::CreateTask {
+                        task_id_prefix: "p".into(),
+                        title_template: "t".into(),
+                    },
+                ),
+                needle,
+            )
+            .await;
+            height += 1;
         }
     });
 }

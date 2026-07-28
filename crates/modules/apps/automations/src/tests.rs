@@ -40,6 +40,11 @@ const CHAT: &str = "chat";
 const TASKS: &str = "tasks";
 const INBOX: &str = "inbox";
 const ME: &str = "automations";
+/// the default admin submitter, and therefore the owner of every rule these
+/// tests create: only an authenticated EXTERNAL origin may own a rule.
+const OWNER: &[u8] = b"owner";
+/// a second submitter, who owns nothing.
+const STRANGER: &[u8] = b"stranger";
 
 /// a minimal `Ctx` capturing emitted msgs and serving canned chat
 /// transcripts / channels and a task list — enough to unit-test `execute`
@@ -64,7 +69,10 @@ impl CaptureCtx {
             env: Env {
                 height: 7,
                 consensus_time: 42,
-                origin: Origin::System,
+                // an admin ctx by default: rule CRUD is owner-bound, so the
+                // baseline origin is an authenticated submitter. hook-arm
+                // tests swap it with `with_chat_origin`.
+                origin: Origin::External(OWNER.to_vec()),
                 me: ME.into(),
             },
             transcripts: BTreeMap::new(),
@@ -533,6 +541,160 @@ fn hook_event_from_non_chat_origin_is_rejected() {
     // raw ChatEvent bytes from a non-chat origin fail to decode as an
     // AutomationsMsg — also rejected.
     assert!(exec(&mut m, &mut ext, &posted("general", 1, user(1), Vec::new()),).is_err());
+}
+
+#[test]
+fn a_rule_records_its_creator_and_only_the_creator_administers_it() {
+    let mut m = module();
+    let mut owner = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut owner,
+        &create("r", post_trigger(None, None), task_action("t", "T")),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+    assert_eq!(
+        get_rule(&m, "r").expect("r").owner,
+        OWNER,
+        "the submitter of CreateRule is the rule's owner"
+    );
+
+    // a stranger may neither disable nor delete it. a rule is a STANDING
+    // capability — an ungated SetEnabled is a kill switch on someone else's
+    // automation, and an ungated DeleteRule removes it outright.
+    let mut stranger = CaptureCtx::new().with_origin(Origin::External(STRANGER.to_vec()));
+    for op in [
+        AutomationsMsg::SetEnabled {
+            rule_id: "r".into(),
+            enabled: false,
+        },
+        AutomationsMsg::DeleteRule {
+            rule_id: "r".into(),
+        },
+    ] {
+        let err = exec(&mut m, &mut stranger, &admin(&op)).expect_err("stranger must be refused");
+        assert!(
+            matches!(&err, Error::Module(msg) if msg.contains("only the owner")),
+            "a non-owner must be refused: {err:?}"
+        );
+        block_on(m.abort_block()).expect("abort");
+    }
+    assert!(get_rule(&m, "r").expect("r").enabled, "nothing landed");
+
+    // the owner performs both.
+    exec(
+        &mut m,
+        &mut owner,
+        &admin(&AutomationsMsg::SetEnabled {
+            rule_id: "r".into(),
+            enabled: false,
+        }),
+    )
+    .expect("owner disables");
+    exec(
+        &mut m,
+        &mut owner,
+        &admin(&AutomationsMsg::DeleteRule {
+            rule_id: "r".into(),
+        }),
+    )
+    .expect("owner deletes");
+    block_on(m.commit_block()).expect("commit");
+    assert!(get_rule(&m, "r").is_none());
+    assert!(list_rules(&m).is_empty());
+}
+
+#[test]
+fn a_stranger_cannot_walk_past_the_gate_on_a_no_op_set_enabled() {
+    // SetEnabled to the value a rule ALREADY holds stages nothing, so the
+    // owner check must come BEFORE that short-circuit or the gate is
+    // bypassable — and a stranger must not learn the rule's state from which
+    // refusal comes back.
+    let mut m = module();
+    let mut owner = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut owner,
+        &create("r", post_trigger(None, None), task_action("t", "T")),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let mut stranger = CaptureCtx::new().with_origin(Origin::External(STRANGER.to_vec()));
+    let err = exec(
+        &mut m,
+        &mut stranger,
+        &admin(&AutomationsMsg::SetEnabled {
+            rule_id: "r".into(),
+            enabled: true,
+        }),
+    )
+    .expect_err("an idempotent op is still an op");
+    assert!(matches!(&err, Error::Module(msg) if msg.contains("only the owner")));
+}
+
+#[test]
+fn an_ownerless_rule_is_unrepresentable() {
+    // only an authenticated external submitter may own a rule, so every other
+    // origin is refused at CreateRule — there is no shape in which a rule
+    // exists without a principal answerable for it.
+    let mut m = module();
+    for (origin, refusal) in [
+        (Origin::System, "system origin"),
+        (Origin::Module("automations".into()), "module origin"),
+        (Origin::Module("governance".into()), "module origin"),
+        (Origin::External(Vec::new()), "non-empty submitter id"),
+    ] {
+        let mut ctx = CaptureCtx::new().with_origin(origin.clone());
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &create("r", post_trigger(None, None), task_action("t", "T")),
+        )
+        .expect_err("an unownable origin must be refused");
+        assert!(
+            matches!(&err, Error::Module(msg) if msg.contains(refusal)),
+            "{origin:?} must be refused with {refusal}: {err:?}"
+        );
+        block_on(m.abort_block()).expect("abort");
+    }
+    assert!(list_rules(&m).is_empty(), "no rule was staged");
+}
+
+#[test]
+fn creating_a_rule_is_gated_but_firing_one_is_not() {
+    // the two principals are different and must stay so: a rule is CREATED by
+    // its owner's external origin, and RUN under `Origin::Module("automations")`.
+    // the hook lane is routed before the owner gate, so a chat event still
+    // fires the rule and its action still leaves as a module-authority
+    // follow-up — while the module's own origin cannot mint a rule.
+    let mut m = module();
+    let mut owner = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut owner,
+        &create("r", post_trigger(None, None), task_action("auto", "T")),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let mut chat_ctx = CaptureCtx::new().with_chat_origin();
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("general", 1, user(1), Vec::new()),
+    )
+    .expect("hook events never carry a submitter, and never need one");
+    assert_eq!(
+        chat_ctx.task_msgs(),
+        vec![TaskMsg::CreateTask {
+            task_id: "auto-general-1".into(),
+            title: "T".into(),
+        }],
+        "the owner-gated rule still fires under module authority"
+    );
+    assert_eq!(get_rule(&m, "r").expect("r").owner, OWNER);
 }
 
 #[test]

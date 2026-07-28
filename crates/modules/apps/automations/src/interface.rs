@@ -58,6 +58,17 @@ pub enum Action {
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     pub rule_id: String,
+    /// who created it, and the ONLY principal that may enable, disable, or
+    /// delete it: the authenticated external submitter's raw key bytes — the
+    /// same principal domain `chat::Channel::owner` records.
+    ///
+    /// REQUIRED, never optional. A rule is a STANDING capability: once created
+    /// it keeps firing under `Origin::Module("automations")` — posting to
+    /// channels, creating tasks, delivering to inboxes — until someone deletes
+    /// it. An ownerless rule would be an unattributable standing grant, so the
+    /// record makes one unrepresentable and the create op refuses every origin
+    /// that is not an external submitter.
+    pub owner: Vec<u8>,
     pub enabled: bool,
     pub trigger: Trigger,
     pub action: Action,
@@ -80,21 +91,24 @@ pub struct RunRecord {
     pub detail: String,
 }
 
+/// the admin family is OWNER-BOUND: the submitter of a `CreateRule` becomes the
+/// new rule's [`Rule::owner`], and `SetEnabled`/`DeleteRule` are refused unless
+/// the submitter IS that owner. only an external submitter may own a rule, so
+/// module and system origins are refused outright on all three.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationsMsg {
+    /// register a rule owned by the submitter.
     CreateRule {
         rule_id: String,
         trigger: Trigger,
         action: Action,
     },
-    SetEnabled {
-        rule_id: String,
-        enabled: bool,
-    },
-    DeleteRule {
-        rule_id: String,
-    },
+    /// enable or disable an OWN rule — a disabled rule stays registered and
+    /// stops firing.
+    SetEnabled { rule_id: String, enabled: bool },
+    /// delete an OWN rule.
+    DeleteRule { rule_id: String },
     /// the chat hook payload: the `chat::ChatEvent` bytes chat delivers
     /// as a follow-up. HONORED ONLY when the dispatch origin is the chat module;
     /// a non-chat origin claiming a hook event is rejected as a spoof.
