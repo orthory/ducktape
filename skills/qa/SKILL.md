@@ -31,6 +31,25 @@ make test                                    # full local gate: wasm drift + wor
 above: this list omitted it for as long as this skill claimed `app/` had been
 removed, and every QA pass that followed the list silently skipped the crate.
 
+### On macOS: raise the fd limit first
+
+```bash
+ulimit -n 4096      # macOS defaults the SOFT limit to 256; the hard limit is unlimited
+```
+
+Without it, `cargo test -p ducktape-app` fails on macOS with
+`Too many open files` inside qmdb init, from the tests that boot a simnode in
+process. A node at rest holds ~340 fds and **317 of them are path-backed**
+(qmdb journal blobs) — fixed at boot, not scaling with peers — so 256 is not
+close to enough for even one in-process node.
+
+The shipped binary is unaffected: `resource_limits::raise_open_file_limit()`
+runs in `bin/node`'s `main()` and lifts the soft limit toward 65,536. A test
+harness never goes through that `main`, which is why only the test lane sees
+it. Measured 2026-07-28 on macmini-duke (macOS 26.5.2, arm64): `cargo check
+-p ducktape-app --tests` is clean and 85/86 tests pass — the one failure is
+exactly this limit.
+
 `bin/simnode` boots a deterministic node in-process for any crate's `#[test]`.
 For the embedding harness (`simnode::boot`) and the chat wire facts, see the
 `sim-lane` skill.
