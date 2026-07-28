@@ -7,6 +7,29 @@
 //! which is also the air-gap-native notification story. an external submitter
 //! may self-deliver a note; a module follow-up is the primary writer.
 //!
+//! ## Who owns a queue — DELIVERING and ACKING are different authorities
+//!
+//! a `member` is a queue name in the shared ACTOR-STRING domain
+//! ([`sdk::Origin::actor_string`]): the same domain this module already derives
+//! [`Notification::source`] in, and the one tasks' job board and files' owner
+//! use. that is the identity decision this module had deferred, and reusing the
+//! sdk convention rather than inventing a second spelling is the whole of it —
+//! a queue named `origin.actor_string()` is OWNED by that origin.
+//!
+//! - `Deliver` takes ANY origin and ANY member, unchanged. writing into someone
+//!   else's queue IS the feature: a notification is delivered BY one principal
+//!   TO another, and gating that would break every module follow-up.
+//! - `MarkRead`/`Clear` are refused unless `member` is the submitter's own
+//!   actor string ([`check_queue_owner`]). a submitter can therefore only ever
+//!   name their own queue, and "permanently delete another member's whole
+//!   notification history, unattributed" stops being expressible.
+//! - only an AUTHENTICATED EXTERNAL submitter owns a queue. `Origin::Module`
+//!   and `Origin::System` are refused outright (the `vaults` posture), as is
+//!   the pre-consensus default `Origin::External(vec![])`: nothing in the tree
+//!   emits an ack as a follow-up, so admitting a module origin would only have
+//!   handed the delivering module a lever over the queue it delivered to —
+//!   different principals, deliberately kept different.
+//!
 //! ## State model
 //!
 //! pure logic over a host-injected [`sdk::MerkleStore`]: one META record per
@@ -30,9 +53,12 @@
 //! - at most [`MAX_MEMBERS`] distinct members: a `Deliver` that would introduce
 //!   a NEW member beyond the cap is REJECTED.
 //!
-//! NO-OP TOLERANCE: `MarkRead`/`Clear` against an unknown member or seq are
-//! deterministic no-ops, never errors — a notification ack must never abort the
-//! block cascade that a delivering module started.
+//! NO-OP TOLERANCE: `MarkRead`/`Clear` against the submitter's OWN unknown
+//! member or seq are deterministic no-ops, never errors — acking a queue that
+//! holds nothing yet is a race a client cannot avoid, not an error. that
+//! tolerance is scoped to the seq/member LOOKUP and stops at the owner gate: a
+//! foreign member is a hard rejection, and no cascade is at risk from it
+//! because nothing in the tree emits an ack as a follow-up.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -56,9 +82,49 @@ mod index_guest;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use sdk::{
-    Ctx, Env, Error, MerkleStore, Module, ModuleId, Msg, ResolverSyncTarget, StagedStore,
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
 };
+
+/// the ONE ack-authority decision: `MarkRead`/`Clear` may only touch the
+/// submitter's OWN queue.
+///
+/// exhaustive on purpose. a queue's name IS its owner's
+/// [`Origin::actor_string`], so the owner is derived from the dispatch origin
+/// and compared — never taken from the payload. `Origin::Module` and
+/// `Origin::System` are refused outright rather than allowed to ack the queue
+/// named after them: no module or system op emits an ack anywhere in the tree,
+/// and admitting one would give a DELIVERING module a lever over the queue it
+/// delivered into. `Origin::External(vec![])` is the host's pre-consensus
+/// default, not a submitter, so it owns nothing either.
+fn check_queue_owner(origin: &Origin, member: &str) -> Result<(), Error> {
+    let owner = match origin {
+        Origin::External(key) => {
+            let is_authenticated_submitter = !key.is_empty();
+            if !is_authenticated_submitter {
+                return Err(Error::Module(
+                    "external origin must carry a non-empty submitter id".into(),
+                ));
+            }
+            origin.actor_string()
+        }
+        Origin::Module(id) => {
+            return Err(Error::Module(format!(
+                "a module origin owns no inbox queue: {id}"
+            )));
+        }
+        Origin::System => {
+            return Err(Error::Module("a system origin owns no inbox queue".into()));
+        }
+    };
+    let is_own_queue = owner == member;
+    if !is_own_queue {
+        return Err(Error::Module(format!(
+            "only the queue's own member may ack it: {owner} is not {member}"
+        )));
+    }
+    Ok(())
+}
 
 /// per-member META record key: prefix + 0 + member identity. safe because
 /// every key literal below is fixed and none is another followed by a 0 byte.
@@ -243,7 +309,16 @@ impl Inbox {
         Ok(seq)
     }
 
-    async fn stage_mark_read(&mut self, member: String, up_to_seq: u64) -> Result<(), Error> {
+    async fn stage_mark_read(
+        &mut self,
+        origin: &Origin,
+        member: String,
+        up_to_seq: u64,
+    ) -> Result<(), Error> {
+        // BEFORE the unknown-member short-circuit: a gate a no-op walks past is
+        // not a gate, and a stranger must not learn whether a queue exists from
+        // which answer comes back.
+        check_queue_owner(origin, &member)?;
         // unknown member: deterministic no-op (never stage, never error).
         let Some(meta) = self.meta(&member).await? else {
             return Ok(());
@@ -258,7 +333,14 @@ impl Inbox {
         Ok(())
     }
 
-    async fn stage_clear(&mut self, member: String, up_to_seq: u64) -> Result<(), Error> {
+    async fn stage_clear(
+        &mut self,
+        origin: &Origin,
+        member: String,
+        up_to_seq: u64,
+    ) -> Result<(), Error> {
+        // BEFORE the unknown-member short-circuit (see `stage_mark_read`).
+        check_queue_owner(origin, &member)?;
         // unknown member: deterministic no-op.
         let Some(mut meta) = self.meta(&member).await? else {
             return Ok(());
@@ -302,12 +384,19 @@ impl Module for Inbox {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let Env { consensus_time, .. } = *ctx.env();
+        // the submitter is bound ONCE, before the payload is decoded, and every
+        // arm receives it — an arm that took no origin would be exactly the
+        // class of bug the ack gate exists to close. `Deliver` uses it to derive
+        // `source`; the ack family uses it to derive the queue owner.
+        let consensus_time = ctx.env().consensus_time;
+        let origin = ctx.env().origin.clone();
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             InboxMsg::Deliver { member, kind, body } => {
                 // the delivering `source` is origin-derived — the only source of
-                // truth for who delivered, NEVER caller-supplied.
-                let source = ctx.env().origin.actor_string();
+                // truth for who delivered, NEVER caller-supplied. ANY origin may
+                // deliver to ANY member: that is the module's purpose, and it is
+                // routed here without ever reaching the owner gate.
+                let source = origin.actor_string();
                 let seq = self
                     .stage_deliver(member, kind, body, source, consensus_time)
                     .await?;
@@ -315,10 +404,10 @@ impl Module for Inbox {
                 Ok(())
             }
             InboxMsg::MarkRead { member, up_to_seq } => {
-                self.stage_mark_read(member, up_to_seq).await
+                self.stage_mark_read(&origin, member, up_to_seq).await
             }
             InboxMsg::Clear { member, up_to_seq } => {
-                self.stage_clear(member, up_to_seq).await
+                self.stage_clear(&origin, member, up_to_seq).await
             }
         }
     }

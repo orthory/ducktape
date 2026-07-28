@@ -58,6 +58,20 @@ fn sys(consensus_time: u64) -> TestCtx {
     ctx(Origin::System, consensus_time)
 }
 
+/// two distinct submitter keys. a MEMBER is an origin's actor string, so the
+/// queue a key owns is exactly `Origin::External(key).actor_string()` — these
+/// helpers keep the two in lockstep instead of hand-spelling hex.
+const ALICE_KEY: [u8; 4] = [0xa1, 0xa1, 0xa1, 0xa1];
+const STRANGER_KEY: [u8; 4] = [0xc3, 0xc3, 0xc3, 0xc3];
+
+fn queue_of(key: [u8; 4]) -> String {
+    Origin::External(key.to_vec()).actor_string()
+}
+
+fn submitter(key: [u8; 4], consensus_time: u64) -> TestCtx {
+    ctx(Origin::External(key.to_vec()), consensus_time)
+}
+
 fn fresh() -> Inbox {
     Inbox::new(INBOX, Box::new(MemStore::new()))
 }
@@ -288,9 +302,11 @@ fn member_cap_rejects_new_member() {
 fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
     block_on(async {
         let mut inbox = fresh();
+        // the acks below are alice's own, so the queue is named for her key.
+        let alice = queue_of(ALICE_KEY);
         for _ in 0..3 {
             inbox
-                .execute(&mut sys(1), &deliver("alice", "k", "b"))
+                .execute(&mut sys(1), &deliver(&alice, "k", "b"))
                 .await
                 .expect("deliver");
         }
@@ -298,11 +314,11 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
 
         // MarkRead up to seq 2 flips exactly seqs 1 and 2 in committed state.
         inbox
-            .execute(&mut sys(2), &mark_read("alice", 2))
+            .execute(&mut submitter(ALICE_KEY, 2), &mark_read(&alice, 2))
             .await
             .expect("mark read");
         inbox.commit_block().await.expect("commit mark read");
-        let (_, items) = queue(&inbox, "alice").await.expect("alice exists");
+        let (_, items) = queue(&inbox, &alice).await.expect("alice exists");
         assert_eq!(
             items.iter().map(|n| (n.seq, n.read)).collect::<Vec<_>>(),
             vec![(1, true), (2, true), (3, false)],
@@ -313,22 +329,23 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
         // idempotent re-ack: nothing flips, so nothing is staged and the
         // root holds byte-identical.
         inbox
-            .execute(&mut sys(2), &mark_read("alice", 2))
+            .execute(&mut submitter(ALICE_KEY, 2), &mark_read(&alice, 2))
             .await
             .expect("mark read again");
         inbox.commit_block().await.expect("commit re-ack");
         assert_eq!(inbox.root(), root_after_ack, "re-ack is idempotent");
 
-        // no-op tolerance: unknown member / seq must not error and must not
-        // move the root.
+        // no-op tolerance: a submitter acking their OWN queue before anything
+        // was ever delivered to it must not error and must not move the root.
+        let nobody = queue_of(STRANGER_KEY);
         inbox
-            .execute(&mut sys(3), &mark_read("nobody", 99))
+            .execute(&mut submitter(STRANGER_KEY, 3), &mark_read(&nobody, 99))
             .await
-            .expect("mark read unknown member is a no-op");
+            .expect("mark read on an empty own queue is a no-op");
         inbox
-            .execute(&mut sys(3), &clear("nobody", 99))
+            .execute(&mut submitter(STRANGER_KEY, 3), &clear(&nobody, 99))
             .await
-            .expect("clear unknown member is a no-op");
+            .expect("clear on an empty own queue is a no-op");
         inbox.commit_block().await.expect("commit no-ops");
         assert_eq!(
             inbox.root(),
@@ -339,15 +356,15 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
         // Clear removes items but never rewinds next_seq: the next delivery
         // gets seq 4, not a reused low seq.
         inbox
-            .execute(&mut sys(4), &clear("alice", 2))
+            .execute(&mut submitter(ALICE_KEY, 4), &clear(&alice, 2))
             .await
             .expect("clear up to 2");
         inbox
-            .execute(&mut sys(5), &deliver("alice", "k", "after clear"))
+            .execute(&mut sys(5), &deliver(&alice, "k", "after clear"))
             .await
             .expect("deliver after clear");
         inbox.commit_block().await.expect("commit clear+deliver");
-        let (next, items) = queue(&inbox, "alice").await.expect("alice exists");
+        let (next, items) = queue(&inbox, &alice).await.expect("alice exists");
         assert_eq!(next, 5);
         assert_eq!(
             tuples(&items),
@@ -467,8 +484,9 @@ fn module_follow_up_delivers_atomically_with_source_of_emitter() {
     });
 }
 
-/// a producer that emits a Deliver followed by a no-op MarkRead ack: the ack
-/// must not abort the cascade the delivery began.
+/// a producer that emits a Deliver followed by a MarkRead ack — the shape a
+/// delivering module would use if it could also ack what it delivered. it
+/// cannot: delivering and acking are different principals.
 struct ProducerWithAck;
 
 #[async_trait::async_trait(?Send)]
@@ -483,39 +501,159 @@ impl Module for ProducerWithAck {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
         ctx.emit_msg(deliver("alice", "event", "produced"));
-        // a MarkRead against a member/seq that does not yet exist must be a
-        // deterministic no-op, never a block-aborting error.
-        ctx.emit_msg(mark_read("ghost", 999));
+        // the module's OWN actor string: even the queue named after the
+        // emitter is not the emitter's to ack.
+        ctx.emit_msg(mark_read("producer-ack", 999));
         Ok(())
     }
 }
 
 #[test]
-fn noop_ack_follow_up_does_not_abort_the_block() {
+fn a_module_follow_up_cannot_ack_any_queue() {
     block_on(async {
         let mut host = Host::genesis(vec![Box::new(fresh()), Box::new(ProducerWithAck)])
             .expect("genesis");
+        let app0 = host.root_hash();
 
-        host.submit_at(
-            BlockContext {
-                height: 1,
-                consensus_time: 7,
-                origin: Origin::System,
-            },
-            Msg {
-                target: "producer-ack".into(),
-                payload: Vec::new(),
-            },
-        )
-        .await
-        .expect("no-op ack must not fail the block");
-
-        // the delivery still committed — and the ghost ack left no trace
-        // (the twin never staged a "ghost" member).
-        assert_eq!(
-            host.module_root(INBOX),
-            Some(expected_root("producer-ack", 7).await)
+        // fail CLOSED: the ack is refused, which aborts the cascade its own
+        // delivery began. that is the correct trade — nothing in the tree
+        // emits an ack as a follow-up, and admitting a module origin would
+        // hand every delivering module a lever over the queue it wrote to.
+        let err = host
+            .submit_at(
+                BlockContext {
+                    height: 1,
+                    consensus_time: 7,
+                    origin: Origin::System,
+                },
+                Msg {
+                    target: "producer-ack".into(),
+                    payload: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("a module-origin ack must be refused");
+        assert!(
+            format!("{err:?}").contains("a module origin owns no inbox queue"),
+            "unexpected refusal: {err:?}"
         );
+        assert_eq!(host.root_hash(), app0, "the aborted cascade left no trace");
+    });
+}
+
+// ---- the ack gate: only a queue's own member acks it -------------------------
+
+#[test]
+fn only_the_queues_own_member_may_ack_it() {
+    block_on(async {
+        let mut inbox = fresh();
+        let alice = queue_of(ALICE_KEY);
+        for _ in 0..3 {
+            inbox
+                .execute(&mut ctx(Origin::Module("chat".into()), 1), &deliver(&alice, "k", "b"))
+                .await
+                .expect("a module delivers into alice's queue");
+        }
+        inbox.commit_block().await.expect("commit deliveries");
+        let sealed = inbox.root();
+
+        // a stranger may neither read-mark nor DELETE alice's queue. Clear is
+        // permanent — this is the whole defect: an unattributed wipe of another
+        // member's notification history.
+        for op in [mark_read(&alice, 3), clear(&alice, 3)] {
+            let err = inbox
+                .execute(&mut submitter(STRANGER_KEY, 2), &op)
+                .await
+                .expect_err("a stranger must be refused");
+            assert!(
+                matches!(&err, Error::Module(m) if m.contains("only the queue's own member may ack it")),
+                "unexpected refusal: {err:?}"
+            );
+            inbox.abort_block().await.expect("abort");
+        }
+        assert_eq!(inbox.root(), sealed, "a refused ack stages nothing");
+        let (_, items) = queue(&inbox, &alice).await.expect("alice exists");
+        assert_eq!(items.len(), 3, "nothing was cleared");
+        assert!(items.iter().all(|n| !n.read), "nothing was marked");
+
+        // alice performs both on her own queue.
+        inbox
+            .execute(&mut submitter(ALICE_KEY, 3), &mark_read(&alice, 3))
+            .await
+            .expect("the member marks her own queue read");
+        inbox
+            .execute(&mut submitter(ALICE_KEY, 4), &clear(&alice, 3))
+            .await
+            .expect("the member clears her own queue");
+        inbox.commit_block().await.expect("commit alice's acks");
+        let (next, items) = queue(&inbox, &alice).await.expect("the meta survives");
+        assert_eq!((next, items.len()), (4, 0), "her own clear landed");
+    });
+}
+
+#[test]
+fn only_an_authenticated_external_submitter_owns_a_queue() {
+    block_on(async {
+        let mut inbox = fresh();
+        // every origin that cannot own a queue, against a queue named exactly
+        // after it — so the refusal is about the ORIGIN KIND, never a mismatch.
+        for (origin, member, refusal) in [
+            (
+                Origin::Module("chat".into()),
+                "chat",
+                "a module origin owns no inbox queue",
+            ),
+            (Origin::System, "system", "a system origin owns no inbox queue"),
+            (
+                Origin::External(Vec::new()),
+                "ext:",
+                "external origin must carry a non-empty submitter id",
+            ),
+        ] {
+            for op in [mark_read(member, 1), clear(member, 1)] {
+                let err = inbox
+                    .execute(&mut ctx(origin.clone(), 1), &op)
+                    .await
+                    .expect_err("an unownable origin must be refused");
+                assert!(
+                    matches!(&err, Error::Module(m) if m.contains(refusal)),
+                    "{origin:?} must be refused with {refusal}: {err:?}"
+                );
+                inbox.abort_block().await.expect("abort");
+            }
+        }
+        assert!(
+            queue(&inbox, "chat").await.is_none(),
+            "no refused ack staged anything"
+        );
+    });
+}
+
+#[test]
+fn delivering_is_ungated_and_stays_ungated() {
+    block_on(async {
+        // the ack gate binds ACKS only. every origin shape still delivers to a
+        // queue it does not own — the module's entire purpose, and the reason
+        // the owner check lives in the ack arms and not above the match.
+        let mut inbox = fresh();
+        let alice = queue_of(ALICE_KEY);
+        for (height, origin) in [
+            Origin::Module("chat".into()),
+            Origin::System,
+            Origin::External(STRANGER_KEY.to_vec()),
+            Origin::External(Vec::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            inbox
+                .execute(&mut ctx(origin, height as u64), &deliver(&alice, "k", "b"))
+                .await
+                .expect("any origin delivers to any member");
+        }
+        inbox.commit_block().await.expect("commit");
+        let (next, items) = queue(&inbox, &alice).await.expect("alice exists");
+        assert_eq!((next, items.len()), (5, 4));
     });
 }
 
