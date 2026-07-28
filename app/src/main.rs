@@ -319,7 +319,6 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             "open_page_search_hit(page_id, block_id)",
             "choose_page(id)",
             "select_block(key, id, kind, text, checked, open_actions)",
-            "clear_block_selection",
             "pages_mutated(next)",
         ] {
             let rest = pages.split_once(&format!("on {name}")).unwrap().1;
@@ -822,15 +821,19 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert_eq!(app.message_action, "more");
         let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "hello".into(), 2));
         assert_eq!(app.message_action, "editing");
-        let _ = app.__update(__DucktapeMessage::CancelMessageAction);
+        // Every cancel affordance in the view routes `clear_message_selection`
+        // (view.ice:441, :467, :511, :523, :538), so that is the transition
+        // under test — it drops to the toolbar AND drops the selection.
+        let _ = app.__update(__DucktapeMessage::ClearMessageSelection);
         assert_eq!(app.message_action, "toolbar");
+        assert_eq!(app.selected_message_seq, 0);
         let _ = app.__update(__DucktapeMessage::OpenMessageReactions(
             7,
             "hello".into(),
             2,
         ));
         assert_eq!(app.message_action, "reactions");
-        let _ = app.__update(__DucktapeMessage::CancelMessageAction);
+        let _ = app.__update(__DucktapeMessage::ClearMessageSelection);
         let _ = app.__update(__DucktapeMessage::ArmMessageDelete(7, "hello".into(), 2));
         assert_eq!(app.message_action, "delete");
         let _ = app.__update(__DucktapeMessage::OpenMessageActionsAccessibly(
@@ -1417,7 +1420,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         let shell = include_str!("ui/components/shell.ice");
         // the shell is titlebar + optional degradation banner over the panes.
         assert!(shell.contains(
-            "component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)"
+            "component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)"
         ));
         // `phase` is the bar's ONE discriminant, matched twice — the network
         // chip on the left and the whole status/bell cluster on the right both

@@ -19,7 +19,14 @@ state
   node_quorum_label = "—"
   node_reachable_label = "—"
 
+// FIRST RUN ASKS DISK, NOT THE DEFAULT. `phase` used to initialize to
+// "console" and `mount` went straight to `connect`, so a device with no
+// workspace booted an empty shell over a connection error and the five
+// onboarding screens were reachable only by `Leave workspace`. The disk answer
+// is the discriminant: no registered, unforgotten workspace means "welcome".
 on mount
+  phase = onboarding_phase()
+  return if phase != "console"
   loading = true
   run connect(rpc) -> workspace_connected _ | failed _
 
@@ -162,7 +169,6 @@ on workspace_connected(next)
   dm_peers_generation = dm_peers_generation + 1
   parallel
     run load_doc_tabs(connected_rpc) -> doc_tabs_loaded _
-    run load_bool_pref(connected_rpc, "receipts") -> receipts_pref_loaded _
     run load_dm_peers(connected_rpc, dm_peers_generation) -> dm_peers_loaded _ | dm_peers_failed _
     run load_node_facts(connected_rpc, node_facts_generation) -> node_facts_loaded _ | node_facts_failed _
     run load_bell(connected_rpc, bell_generation) -> bell_loaded _ | bell_failed _
@@ -623,6 +629,7 @@ on settings_loaded(next)
   settings_endpoint = next.endpoint
   settings_node_key = next.node_key
   settings_height = next.height
+  settings_data_dir = next.data_dir
   settings_key_path = next.key_path
   settings_key_state = next.key_state
   settings_user_key = next.user_key
@@ -636,17 +643,6 @@ on settings_clear_tabs
   run clear_doc_tabs(connected_rpc) -> doc_tabs_saved _
 
 // PREFERENCES — device-local, one endpoint at a time.
-on receipts_pref_loaded(enabled)
-  pref_receipts = enabled
-
-on toggle_receipts_pref
-  pref_receipts = !pref_receipts
-  run save_bool_pref(connected_rpc, "receipts", pref_receipts) -> receipts_pref_saved _
-
-on receipts_pref_saved(saved)
-  return if saved
-  error = "This device could not save the preference."
-
 // DANGER ZONE — forget this workspace on THIS DEVICE and go back to onboarding.
 on forget_workspace_submit
   return if !connected || mutation_phase != "idle"
@@ -735,12 +731,6 @@ on pick_members_filter(filter)
   members_filter = filter
 
 // The invite modal is pure view state — minting is a separate, explicit act.
-on open_invite_modal
-  invite_modal_open = true
-
-on close_invite_modal
-  invite_modal_open = false
-
 // Pause or resume an agent. The payload is the DESIRED state and it is named
 // for the backend parameter it becomes: `true` PAUSES, `false` resumes. The
 // roster's Pause control passes `true` and its Resume control passes `false`;
@@ -902,17 +892,6 @@ on explorer_failed(cause)
 
 on select_explorer_block(height)
   explorer_selected = height
-
-on toggle_palette
-  return if !connected
-  palette_open = !palette_open
-  palette_draft = ""
-  palette_chat_hits = []
-  palette_page_hits = []
-  palette_generation = palette_generation + 1
-  palette_searching = false
-  return if !palette_open
-  task widget focus #workspace-tabs/palette-input
 
 on close_palette
   palette_open = false

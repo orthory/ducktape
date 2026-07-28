@@ -63,7 +63,7 @@ component StatusPill(degraded:bool, loading:bool)
 // no state field holds them) and the 26-bar sparkline (it needs the newest 26
 // of a 100-block window with a clamped bar height, and neither a slice nor a
 // clamp exists as a helper). Both are named in the handoff report.
-component StatusCard(degraded:bool, loading:bool, height:i64, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)
+component StatusCard(degraded:bool, loading:bool, height:i64, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
   box #root w=284.0 pl=14.0 pr=14.0 pt=13.0 pb=13.0
     col w=fill gap=11.0
       row w=fill gap=7.0 align=center
@@ -116,10 +116,10 @@ component StatusCard(degraded:bool, loading:bool, height:i64, tier:str, root_has
 component BellBadge(count:i64, sev:str, plate:f64)
   col #root
     match sev
-      "alert"
+      "danger"
         box w=plate h=13.0 align-x=center align-y=center bg=alert_dot border=surface border-w=1.5 r=7.0
           text count size=9.0 wrap=none font=code_semibold @text-brand_fg
-      "warn"
+      "warning"
         box w=plate h=13.0 align-x=center align-y=center bg=warning_dot border=surface border-w=1.5 r=7.0
           text count size=9.0 wrap=none font=code_semibold @text-brand_fg
       _
@@ -129,7 +129,7 @@ component BellBadge(count:i64, sev:str, plate:f64)
 // 40px: a 39px bar over its 1px rule. During onboarding the bar keeps only the
 // window controls — the artifact drops the chip and the whole right cluster
 // until a workspace exists, and draws no title in their place.
-component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)
+component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
   emits
     toggle_bell
   col #root w=fill
@@ -294,7 +294,7 @@ component ScreenHeader(title:str, meta:str)
     box w=fill h=1.0 bg=separator
       space w=1.0 h=1.0
 
-component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, phase:str, tier:str, root_hash:str, consensus_view:i64, quorum:i64, reachable:i64, last_finalized:i64, checkpoint:i64)
+component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, phase:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
   emits
     select_shell_tab(str)
     toggle_bell

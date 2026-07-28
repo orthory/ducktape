@@ -60,9 +60,14 @@ component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str)
 // (`network_label(...)`), and `RepoCard(repo)` has no seat for it — printing a
 // literal `ducktape/` names a namespace that does not exist on a network called
 // anything else, so the card prints the name the node actually returned. The
-// only other meta the wire carries is the head digest; the language dot, the
-// PR/issue tallies and the `updated` stamp all want fields `RepoHead` does not
-// have, so the row holds what is true instead of what would look full.
+// `about`, `language` and `updated_at` ARE on the wire now — `load_forge`
+// derives all three off the local mirror — so the card draws them. Only the
+// PR/issue tallies still want a `ForgeQuery` field, and they stay out.
+//
+// Each is guarded: a repo with no README draws no about line, a repo whose head
+// resolves no dominant extension draws no language dot, and `updated_at` is
+// rendered with `relative_time` because it is the head commit's UNIX committer
+// time — NOT a block height, and not `height_label_short`.
 component RepoCard(repo:ForgeRepo)
   emits
     forge_open_repo(str)
@@ -72,8 +77,17 @@ component RepoCard(repo:ForgeRepo)
         row w=fill gap=8.0 align=center
           Icon name="branch" tone="muted" px=14.0
           text repo.name size=14.0 wrap=none font=display @text-primary
+        if !empty(repo.about)
+          text repo.about w=fill size=12.0 line-h=1.5 @text-caption
         row w=fill gap=14.0 align=center
+          if !empty(repo.language)
+            row gap=5.0 align=center
+              box w=7.0 h=7.0 bg=kind_code r=3.5
+                space w=1.0 h=1.0
+              text repo.language size=10.5 wrap=none @text-meta
           text repo.head w=fill size=10.5 wrap=none font=code_medium @text-input
+          if repo.updated_at > 0
+            text relative_time(repo.updated_at) size=10.5 wrap=none font=code_medium @text-hint
     active bg=surface text=fg border=card_line border-w=1.0 r=13.0
     hovered bg=card_wash_hover text=fg border=pending_line
     pressed bg=elevated text=fg

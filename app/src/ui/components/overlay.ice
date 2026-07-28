@@ -7,7 +7,7 @@
 // from the `overlay` widget, which is also the only way to close on scrim
 // click.
 //
-//   overlay when=invite_modal_open dismiss=close_invite_modal backdrop=scrim
+//   overlay when=channel_create_open dismiss=close_channel_modal backdrop=scrim
 //           p=30.0 align-x=center align-y=center
 //     content
 //       space w=fill h=fill

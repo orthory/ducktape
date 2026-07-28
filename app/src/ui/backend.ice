@@ -122,6 +122,7 @@ extern crate::backend
   QuorumSeat(filled:bool)
   sync quorum_dots(approvals:i64, required:i64) -> [QuorumSeat]
   sync tally_label(approvals:i64, required:i64) -> str
+  sync reading_pair(left:str, right:str) -> str
   sync tally_tone(approvals:i64, required:i64) -> str
   sync tally_note(approvals:i64, required:i64) -> str
   sync approve_label(approvals:i64, required:i64) -> str
@@ -158,9 +159,6 @@ extern crate::backend
   SettingsFacts(generation:i64, endpoint:str, node_key:str, height:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
-  sync settings_data_dir(facts:SettingsFacts) -> str
-  load_bool_pref(rpc:str, key:str) -> bool
-  save_bool_pref(rpc:str, key:str, on:bool) -> bool
   forget_workspace(rpc:str) -> bool ! AppError
   ForgeRepo(name:str, head:str, about:str, language:str, updated_at:i64)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
@@ -305,7 +303,7 @@ extern crate::backend
   DmPeersData(generation:i64, peers:[DmPeer])
   load_dm_peers(rpc:str, generation:i64) -> DmPeersData ! HydrationError
   sync dm_channel_id(a:str, b:str) -> str
-  sync is_dm_channel(id:str, members:[ChatMember]) -> bool
+  sync rooms_only(channels:[ChatChannel], peers:[DmPeer], me:str) -> [ChatChannel]
   open_dm(rpc:str, password:str, peer_key:str) -> ChatData ! AppError
   sync post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str
   send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError

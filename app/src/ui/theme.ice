@@ -134,6 +134,8 @@ theme contract AppTheme
   kind_file_bg
   kind_run
   kind_run_bg
+  kind_task
+  kind_task_bg
 
 // Surfaces first, then the lines that separate them, then the ink ramp, then
 // the functional layers.
@@ -273,3 +275,5 @@ palette app for AppTheme
   kind_file_bg #f2f1ed
   kind_run #b9714e
   kind_run_bg #faf0e9
+  kind_task #c08a3e
+  kind_task_bg #faf3e6

@@ -270,33 +270,6 @@ on selected_block_kind_changed(next)
   error = ""
   run save_block(connected_rpc, password, active_page, selected_block_id, selected_block_kind, block_edit_draft) -> pages_mutated _ | mutation_failed _
 
-on clear_block_selection
-  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
-  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
-  block_autosave_generation = block_autosave_generation + 1
-  selected_block_id = ""
-  selected_block_kind = ""
-  selected_block_checked = false
-  block_comments_generation = block_comments_generation + 1
-  block_comments_open = false
-  block_comments_target = ""
-  block_comment_threads = []
-  block_comment_thread_total = 0
-  block_comment_threads_next_from = 0
-  block_comment_threads_has_more = false
-  block_comment_threads_loading = false
-  active_block_comment_thread = ""
-  block_thread_comments = []
-  block_thread_comments_next_from = 0
-  block_thread_comments_has_more = false
-  block_thread_comments_loading = false
-  block_comment_draft = ""
-  pending_block_comment = ""
-  block_edit_draft = ""
-  block_autosave_status = "idle"
-  block_delete_armed = false
-  block_actions_open = false
-
 // THE COMMENTS RAIL IS DOCUMENT-SCOPED. The artifact lists every comment on the
 // page under one `N comments` label and never involves a block selection
 // (Liquid Glass:940-941). `load_page_threads` asks the node's own plural

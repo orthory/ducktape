@@ -75,8 +75,9 @@ component MemberRowCard(member:MemberRow)
           row gap=6.0 align=center
             text member.label size=13.5 wrap=none font=display @text-fg
             // the artifact writes `you` in SANS medium and the key line in mono
-            // regular; the type-scale guard pins 9.0/10.0 to code_semibold, so
-            // these take the neighbouring steps that carry the right FACE.
+            // regular. The type-scale guard fixes the SIZE only and asserts no
+            // size→face pairing (main.rs), so the face here is a free choice;
+            // these steps are the nearest ones on the scale.
             if member.is_this_node
               text "you" size=9.5 wrap=none font=display @text-meta
           text member.key size=10.5 wrap=none font=code_medium @text-hint
@@ -250,10 +251,20 @@ component SettledProposalRow(proposal:ProposalRow)
         text proposal.status size=11.0 wrap=none font=code_medium @text-meta
         text "·" size=11.0 wrap=none font=code_medium @text-meta
         text tally_label(proposal.approvals, proposal.required_yes) size=11.0 wrap=none font=code_medium @text-meta
+        // NO ✓ WITHOUT A HEIGHT BEHIND IT — the row draws a finality tick, so it
+        // states the block it settled in. `settle_heights` folds it off the
+        // module's own settle op; a row whose op predates that fold has 0 and
+        // prints nothing rather than `h 0`.
+        if proposal.settled_height > 0
+          text "·" size=11.0 wrap=none font=code_medium @text-meta
+        if proposal.settled_height > 0
+          text height_label_short(proposal.settled_height) size=11.0 wrap=none font=code_medium @text-hint
 
 
-// One alert: a severity dot, the title with its severity marker, the body, and
-// when it landed. Unread rows sit on a warmer plate than read ones.
+// One alert: a severity dot, the title, the source that raised it, the body,
+// and the block it landed in. Unread rows sit on a warmer plate than read ones
+// AND pulse; a read row keeps the same severity colour, held still. `height` is
+// a BLOCK, so it prints as one — this chain publishes no wall clock.
 component BellRow(item:BellItem)
   col #root w=fill
     if item.read
@@ -265,14 +276,19 @@ component BellRow(item:BellItem)
 
 component BellBody(item:BellItem)
   row #root w=fill gap=9.0 align=start
+    // The dot carries SEVERITY, which is what `bell_severity` was written for
+    // and what the titlebar badge already keys on — a row that colours by read
+    // state instead says the same blue for a failure and a mention. Read vs
+    // unread is the plate and the pulse; the hue is the severity either way.
     if item.read
-      box w=7.0 h=7.0 bg=avatar_bg r=3.5
-        space w=1.0 h=1.0
+      StillDot plate=7.0 tone=bell_severity(item.kind)
     if !item.read
-      PulseDot plate=7.0 tone="info"
+      PulseDot plate=7.0 tone=bell_severity(item.kind)
     col w=fill gap=3.0
       row w=fill gap=7.0 align=center
         text item.kind w=fill size=12.0 wrap=none @text-primary
+        if item.height > 0
+          text height_label_short(item.height) size=9.5 wrap=none font=code_medium @text-hint
         box px=4.0 py=1.0 bg=info_bg border=info_line border-w=1.0 r=4.0
           text item.source size=9.0 wrap=none font=code_semibold @text-info
       text item.body w=fill size=12.0 line-h=1.45 @text-input

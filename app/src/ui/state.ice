@@ -125,6 +125,7 @@ state
   settings_endpoint = ""
   settings_node_key = ""
   settings_height:i64 = 0
+  settings_data_dir = ""
   settings_key_path = ""
   settings_key_state = ""
   // THIS DEVICE'S OWN USER KEY, full hex — the `me` the post gate tests against
@@ -242,9 +243,10 @@ state
   node_facts_generation:i64 = 0
   node_version = ""
   node_root_hash = ""
-  node_view:i64 = 0
-  node_quorum:i64 = 0
-  node_reachable:i64 = 0
+  // The consensus trio is NOT here: it lives in handlers/lifecycle.ice as the
+  // already-rendered `node_view_label` / `node_quorum_label` /
+  // `node_reachable_label`, because /v1/status reports each as optional and an
+  // absent reading must print `—`, never a measured `0`.
   node_last_finalized:i64 = 0
   node_checkpoint:i64 = 0
   node_tab = "overview"
@@ -253,11 +255,12 @@ state
   members_filter = "all"
   members_selected = ""
   agents_selected = ""
-  agent_runs_generation:i64 = 0
   // FORGE — which tracker list, which repo menu, which half of an item.
-  forge_tab = "pulls"
+  // Code is the artifact's first seat, and opening a repo to its file tree is
+  // what "open a repo" means; landing on Pull requests answered a question the
+  // reader had not asked yet.
+  forge_tab = "code"
   forge_repo_menu = false
-  forge_item_tab = "conversation"
   // DIRECT — a DM is a two-party members-only channel; `active_dm_peer` names
   // the peer and `dm_peers` carries the rest of him, so the header plate is a
   // filter over that list. There is deliberately no `active_dm_name` /
@@ -281,10 +284,6 @@ state
   files_selected = ""
   // Overlays: the mention popup, the invite modal, the toast, the arm-then-act
   // guard on destructive buttons.
-  pref_receipts = true
-  mention_open = false
-  mention_draft = ""
-  invite_modal_open = false
   invite_role = "resident"
   invite_ttl:i64 = 7
   toast = ""

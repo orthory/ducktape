@@ -373,10 +373,18 @@ component LiveStatusStrip(height:i64, peers_live:i64, peers_total:i64, tier:str)
         text "· h" size=11.0 wrap=none font=code_medium @text-secondary_fg
       if height >= 0
         text height size=11.0 wrap=none font=code_medium @text-secondary_fg
-      text "· peers" size=11.0 wrap=none font=code_medium @text-secondary_fg
-      text peers_live size=11.0 wrap=none font=code_medium @text-secondary_fg
-      text "/" size=11.0 wrap=none font=code_medium @text-secondary_fg
-      text peers_total size=11.0 wrap=none font=code_medium @text-secondary_fg
+      // GUARDED, like the height and tier runs beside it. Nothing measures the
+      // gossip reading — the caller passes literal zeros — and an unguarded run
+      // printed `· peers 0 / 0` as a measured fact on a healthy node. The
+      // segment drops until a peer count has a source.
+      if peers_total > 0
+        text "· peers" size=11.0 wrap=none font=code_medium @text-secondary_fg
+      if peers_total > 0
+        text peers_live size=11.0 wrap=none font=code_medium @text-secondary_fg
+      if peers_total > 0
+        text "/" size=11.0 wrap=none font=code_medium @text-secondary_fg
+      if peers_total > 0
+        text peers_total size=11.0 wrap=none font=code_medium @text-secondary_fg
       if tier != ""
         text "· you are" size=11.0 wrap=none font=code_medium @text-secondary_fg
       if tier != ""

@@ -158,6 +158,24 @@ component AgentSquare(initials:str, plate:f64, ink:f64, radius:f64)
 // three live surfaces draw it.
 
 // The one dot the console breathes with — w4-motion-kit binds it to `pulse`.
+// The same severity ladder as PulseDot, held still — for a row that has been
+// read but still carries the severity it arrived with.
+component StillDot(plate:f64, tone:str)
+  col #root
+    match tone
+      "warning"
+        box w=plate h=plate bg=warning_dot/55 r=(plate / 2.0)
+          space w=1.0 h=1.0
+      "danger"
+        box w=plate h=plate bg=danger_dot/55 r=(plate / 2.0)
+          space w=1.0 h=1.0
+      "info"
+        box w=plate h=plate bg=info_dot/55 r=(plate / 2.0)
+          space w=1.0 h=1.0
+      _
+        box w=plate h=plate bg=success_dot/55 r=(plate / 2.0)
+          space w=1.0 h=1.0
+
 component PulseDot(plate:f64, tone:str)
   col #root
     match tone

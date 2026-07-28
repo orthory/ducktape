@@ -277,6 +277,9 @@ component ExplorerKindPlate(kind:str, code:str)
       "run"
         box w=28.0 h=28.0 align-x=center align-y=center bg=kind_run_bg r=8.0
           text code size=10.0 wrap=none font=code_semibold @text-kind_run
+      "task"
+        box w=28.0 h=28.0 align-x=center align-y=center bg=kind_task_bg r=8.0
+          text code size=10.0 wrap=none font=code_semibold @text-kind_task
       _
         box w=28.0 h=28.0 align-x=center align-y=center bg=info_bg r=8.0
           text code size=10.0 wrap=none font=code_semibold @text-info
@@ -299,6 +302,9 @@ component ExplorerKindBadge(kind:str)
       "run"
         box px=5.0 py=2.0 bg=kind_run_bg r=4.0
           text "RUN" size=9.0 wrap=none font=code_semibold @text-kind_run
+      "task"
+        box px=5.0 py=2.0 bg=kind_task_bg r=4.0
+          text "TASK" size=9.0 wrap=none font=code_semibold @text-kind_task
       _
         box px=5.0 py=2.0 bg=info_bg r=4.0
           text "MESSAGE" size=9.0 wrap=none font=code_semibold @text-info

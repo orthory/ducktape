@@ -542,10 +542,6 @@ on open_thread_for(seq)
   error = ""
   run load_thread(connected_rpc, active_channel, seq, 0, 0, thread_generation) -> thread_loaded _ | thread_failed _
 
-on cancel_message_action
-  return if selected_message_seq <= 0
-  message_action = "toolbar"
-
 on clear_message_selection
   selected_message_seq = 0
   selected_message_rev = 0

@@ -112,9 +112,13 @@ component PageSearchResult(hit:PageSearchHit)
 //     carry a flattened author STRING, and `page_author_name` throws the
 //     `AuthorRef::Agent` variant away (backend.rs:5213). Every plate is drawn
 //     as a person until the discriminant survives the boundary.
-//   * the relative timestamp and the anchor quote — the row carries neither a
-//     time nor `ThreadRow.anchor`. The right-hand slot shows the ordinal the
-//     record does have (`#3`, `#3 · edited`) instead of an invented age.
+//   * the relative timestamp and the anchor quote. NOT because the wire lacks
+//     them — `ThreadRow` carries both `anchor` and `created_at`
+//     (crates/modules/apps/pages/src/index.rs) — but because
+//     `page_comment_thread` (backend.rs) drops the pair before the boundary.
+//     Carrying them through is a projection change, not a view change; until
+//     then the right-hand slot shows the ordinal the record does have
+//     (`#3`, `#3 · edited`) rather than an invented age.
 component PageCommentThreadButton(thread:PageCommentThread)
   emits
     open_block_comment_thread(str)

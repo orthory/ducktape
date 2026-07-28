@@ -1983,10 +1983,6 @@ pub struct SettingsFacts {
 }
 
 /// The NETWORK card's Data dir row.
-pub fn settings_data_dir(facts: SettingsFacts) -> String {
-    facts.data_dir
-}
-
 /// Load the settings facts: node identity from /v1/status, the local user
 /// key's location and state, and the persisted tab count.
 pub async fn load_settings_facts(
@@ -4011,6 +4007,15 @@ pub fn tally_label(approvals: i64, required: i64) -> String {
     format!("{approvals} / {required}")
 }
 
+/// `tally_label` for two readings that are ALREADY rendered — the consensus
+/// trio off `/v1/status` is optional per field, so each arrives as its own
+/// `optional_number` string (`—` when the node reports nothing). Joining the
+/// numbers instead would mean carrying them as `i64` and printing a measured
+/// `0` for "not reported".
+pub fn reading_pair(left: impl AsRef<str>, right: impl AsRef<str>) -> String {
+    format!("{} / {}", left.as_ref(), right.as_ref())
+}
+
 /// `near` one vote from quorum (or past it), else `far` — success vs meta ink.
 pub fn tally_tone(approvals: i64, required: i64) -> String {
     match approvals >= required.saturating_sub(1) {
@@ -4493,20 +4498,6 @@ pub async fn forget_workspace(rpc: String) -> Result<bool, AppError> {
     Ok(write_prefs(&prefs))
 }
 
-/// One device-local boolean preference (the only key that ships is `receipts`).
-pub async fn load_bool_pref(rpc: String, key: String) -> bool {
-    read_prefs()["prefs"][&canonical_endpoint(rpc)][&key]
-        .as_bool()
-        .unwrap_or(false)
-}
-
-/// Persist one device-local boolean preference.
-pub async fn save_bool_pref(rpc: String, key: String, on: bool) -> bool {
-    let mut prefs = read_prefs();
-    prefs["prefs"][canonical_endpoint(rpc)][key] = serde_json::json!(on);
-    write_prefs(&prefs)
-}
-
 /// The titlebar's chain label: the workspace this app is pointed at, then the
 /// bound account, then the endpoint's host, then the product name.
 pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
@@ -4866,9 +4857,13 @@ pub fn bell_severity(kind: String) -> String {
     let kind = kind.to_lowercase();
     let names_error = ERROR.iter().any(|token| kind.contains(token));
     let names_warning = WARN.iter().any(|token| kind.contains(token));
+    // These three strings ARE the tone vocabulary `PulseDot`, `StillDot` and
+    // `BellBadge` match on. They used to be `error`/`warn`, which no arm of
+    // `BellBadge` carried, so a failed run painted the badge info-blue through
+    // the fallthrough. One name per severity, spoken everywhere.
     match (names_error, names_warning) {
-        (true, _) => "error".into(),
-        (false, true) => "warn".into(),
+        (true, _) => "danger".into(),
+        (false, true) => "warning".into(),
         (false, false) => "info".into(),
     }
 }
@@ -4881,11 +4876,11 @@ pub fn bell_worst_severity(items: Vec<BellItem>) -> String {
         .filter(|item| !item.read)
         .map(|item| bell_severity(item.kind.clone()))
         .collect();
-    let any_error = severities.iter().any(|severity| severity == "error");
-    let any_warning = severities.iter().any(|severity| severity == "warn");
+    let any_error = severities.iter().any(|severity| severity == "danger");
+    let any_warning = severities.iter().any(|severity| severity == "warning");
     match (any_error, any_warning) {
-        (true, _) => "error".into(),
-        (false, true) => "warn".into(),
+        (true, _) => "danger".into(),
+        (false, true) => "warning".into(),
         (false, false) => "info".into(),
     }
 }
@@ -5644,13 +5639,30 @@ pub fn dm_channel_id(a: String, b: String) -> String {
     chat::client::dm_channel_id(&a, &b)
 }
 
-/// True only when this channel IS the derived DM of its exactly-two members —
-/// a user-created channel cannot fake the id.
-pub fn is_dm_channel(id: String, members: Vec<ChatMember>) -> bool {
-    let [first, second] = members.as_slice() else {
-        return false;
-    };
-    id == dm_channel_id(first.key.clone(), second.key.clone())
+/// The channel list MINUS this viewer's DMs. A DM *is* an ordinary chat
+/// channel, so it arrives in the same listing as the rooms and used to appear
+/// twice over — once under CHANNELS wearing its derived id as a name, and once
+/// under DIRECT wearing the peer's. The id is DERIVED, so this needs no
+/// per-channel membership (which the list projection does not carry): a
+/// channel is this viewer's DM exactly when its id is `dm_channel_id(me, peer)`
+/// for some peer in the directory. A user-created channel cannot fake the id —
+/// the module's namespace rule reserves it for the pair's own keys.
+pub fn rooms_only(
+    channels: Vec<ChatChannel>,
+    peers: Vec<DmPeer>,
+    me: String,
+) -> Vec<ChatChannel> {
+    if me.is_empty() {
+        return channels;
+    }
+    let dm_ids: BTreeSet<String> = peers
+        .iter()
+        .map(|peer| dm_channel_id(me.clone(), peer.key.clone()))
+        .collect();
+    channels
+        .into_iter()
+        .filter(|channel| !dm_ids.contains(&channel.id))
+        .collect()
 }
 
 /// Open the DM with one peer: resolve the deterministic channel when it
@@ -8784,22 +8796,28 @@ mod tests {
             dm_channel_id(b.clone(), a.clone()),
             "both sides derive the same channel"
         );
-        let members = vec![
-            ChatMember {
-                key: a.clone(),
-                label: "a".into(),
-            },
-            ChatMember {
-                key: b.clone(),
-                label: "b".into(),
-            },
-        ];
-        assert!(is_dm_channel(
-            dm_channel_id(a.clone(), b.clone()),
-            members.clone()
-        ));
-        assert!(!is_dm_channel("channel-7".into(), members));
-        assert!(!is_dm_channel(dm_channel_id(a.clone(), a.clone()), Vec::new()));
+        // the sidebar's own filter: the pair's derived channel drops out of
+        // CHANNELS, an ordinary room stays, and an unknown viewer filters
+        // nothing rather than guessing.
+        let channel = |id: &str| ChatChannel {
+            id: id.into(),
+            name: id.into(),
+            archived: false,
+            members_only: false,
+            huddle_count: 0,
+            head_seq: 0,
+        };
+        let peers = vec![DmPeer {
+            key: b.clone(),
+            name: "b".into(),
+            initials: "B".into(),
+            is_agent: false,
+        }];
+        let listing = vec![channel(&dm_channel_id(a.clone(), b.clone())), channel("general")];
+        let rooms = rooms_only(listing.clone(), peers.clone(), a.clone());
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].id, "general");
+        assert_eq!(rooms_only(listing, peers, String::new()).len(), 2);
 
         // the id the app mints is the id chat will accept from a USER author:
         // ':' is reserved for module origins and '/' is refused outright, so a
@@ -10424,8 +10442,8 @@ mod tests {
 
     #[test]
     fn bell_severity_projects_the_kind_and_defaults_to_info() {
-        assert_eq!(bell_severity("run_failed".into()), "error");
-        assert_eq!(bell_severity("review_requested".into()), "warn");
+        assert_eq!(bell_severity("run_failed".into()), "danger");
+        assert_eq!(bell_severity("review_requested".into()), "warning");
         assert_eq!(bell_severity("mentioned".into()), "info");
         // an unnamed kind is a notice, never an alarm.
         assert_eq!(bell_severity("brand_new_kind".into()), "info");
@@ -10444,12 +10462,12 @@ mod tests {
 
         assert_eq!(
             bell_worst_severity(vec![item(1, "mentioned", false), item(2, "run_failed", false)]),
-            "error"
+            "danger"
         );
         // a READ error does not keep the badge red.
         assert_eq!(
             bell_worst_severity(vec![item(1, "run_failed", true), item(2, "review_requested", false)]),
-            "warn"
+            "warning"
         );
         assert_eq!(bell_worst_severity(Vec::new()), "info");
     }

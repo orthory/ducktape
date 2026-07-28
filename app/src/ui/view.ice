@@ -209,7 +209,7 @@ view
           enter_console -> enter_console
           join_network_submit -> join_network_submit _
     if phase == "console"
-      WorkspaceTabs network=network_label(account_name, connected_rpc) status=status height=block_height loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab bell_count=bell_unread bell_sev=bell_worst_severity(bell_items) approvals=open_proposals(gov_rows) account=account_name agent_live=any_agent_active(agents_rows) phase=phase tier=member_tier(members_rows) root_hash=node_root_hash consensus_view=node_view quorum=node_quorum reachable=node_reachable last_finalized=node_last_finalized checkpoint=node_checkpoint #workspace-tabs
+      WorkspaceTabs network=network_label(account_name, connected_rpc) status=status height=block_height loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab bell_count=bell_unread bell_sev=bell_worst_severity(bell_items) approvals=open_proposals(gov_rows) account=account_name agent_live=any_agent_active(agents_rows) phase=phase tier=member_tier(members_rows) root_hash=node_root_hash consensus_view=node_view_label quorum=node_quorum_label reachable=node_reachable_label last_finalized=node_last_finalized checkpoint=node_checkpoint #workspace-tabs
         events
           select_shell_tab -> select_shell_tab _
           toggle_bell -> toggle_bell
@@ -263,7 +263,7 @@ view
                   row w=fill gap=6.0 align=center
                     text "CHANNELS" size=10.0 wrap=none font=code_semibold @text-label
                     space w=fill
-                    text len(channels) size=10.5 wrap=none font=code_medium @text-label
+                    text len(rooms_only(channels, dm_peers, settings_user_key)) size=10.5 wrap=none font=code_medium @text-label
                     if !channel_create_open
                       button label="New channel" disabled=(loading || mutation_phase != "idle" || !connected) p=0.0 @icon_action -> toggle_channel_create
                         Icon name="plus" tone="label" px=16.0
@@ -279,7 +279,10 @@ view
                         pressed bg=subtle text=fg
                 scroll dir=vertical w=fill h=fill bar=hidden
                   col w=fill gap=2.0
-                    for channel in channels
+                    // DMs are filtered out here, not hidden by CSS: they are real
+                    // channels and would otherwise list twice, once under each
+                    // eyebrow. See `rooms_only`.
+                    for channel in rooms_only(channels, dm_peers, settings_user_key)
                       ChannelButton channel=channel selected=(channel.id == active_channel) unread=channel_is_unread(channel_reads, channel.id, channel.head_seq)
                         events
                           choose_channel -> choose_channel _
@@ -836,6 +839,34 @@ view
                       box w=fill h=50.0 pl=22.0 pr=22.0
                         row w=fill h=fill gap=9.0 align=center
                           text active_page_title w=fill size=13.5 wrap=none font=display @text-fg
+                          // DOCUMENT ACTIONS BELONG IN THE DOCUMENT HEADER. The
+                          // artifact's B1 bar is title + meta + the sync chip and
+                          // its block canvas opens on the doc H1; these three sat
+                          // in the canvas instead, floating above the title with
+                          // no plate under them while this 50px bar ran empty.
+                          // The parent crumb takes the artifact's `pgMeta` seat.
+                          if !empty(active_page_parent)
+                            text active_page_parent size=11.0 wrap=none font=code @text-hint
+                          input "" #page-search label="Search pages" <-> page_search_draft hint="Search pages…" disabled=(!connected || page_searching) submit=search_pages_submit w=190.0 p=6.2 text-size=13.0 line-h=1.2 @control
+                            active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                            hovered bg=fg/5 border=fg/8
+                            disabled value=muted
+                          if !empty(page_search_hits)
+                            button label="Clear page search" w=28.0 h=28.0 p=0.0 @icon_action -> clear_page_search
+                              box w=fill h=fill align-x=center align-y=center
+                                text "×" size=14.0
+                              active bg=transparent text=muted r=7.0
+                              hovered bg=fg/10 text=fg
+                              pressed bg=fg/15
+                          if !page_delete_armed
+                            button label="Page menu" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @icon_action -> arm_page_delete
+                              box w=fill h=fill align-x=center align-y=center
+                                text "•••" size=13.0
+                              active bg=transparent text=muted r=7.0
+                              hovered bg=fg/10 text=fg
+                              pressed bg=fg/15
+                          if page_delete_armed
+                            button "Delete page" disabled=(mutation_phase != "idle") h=26.0 p=5.0 @danger_action -> delete_page_submit
                           // THE TICK IS EARNED, NEVER ASSUMED. One discriminant,
                           // one match, and `✓ synced` is painted for "saved"
                           // alone: a write the node REFUSED says so, and an edit
@@ -889,31 +920,6 @@ view
                       scroll dir=vertical w=fill h=fill bar=hidden
                         box w=fill max-w=720.0 mx=auto pl=22.0 pr=22.0 pt=26.0 pb=40.0
                           col w=fill gap=8.0
-                            row w=fill h=28.0 gap=5.0 align=center
-                              if !empty(active_page_parent)
-                                text active_page_parent w=fill size=12.0 wrap=none font=code @text-muted
-                              if empty(active_page_parent)
-                                space w=fill
-                              input "" #page-search label="Search pages" <-> page_search_draft hint="Search pages…" disabled=(!connected || page_searching) submit=search_pages_submit w=190.0 p=6.2 text-size=13.0 line-h=1.2 @control
-                                active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
-                                hovered bg=fg/5 border=fg/8
-                                disabled value=muted
-                              if !empty(page_search_hits)
-                                button label="Clear page search" w=28.0 h=28.0 p=0.0 @icon_action -> clear_page_search
-                                  box w=fill h=fill align-x=center align-y=center
-                                    text "×" size=14.0
-                                  active bg=transparent text=muted r=7.0
-                                  hovered bg=fg/10 text=fg
-                                  pressed bg=fg/15
-                              if !page_delete_armed
-                                button label="Page menu" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @icon_action -> arm_page_delete
-                                  box w=fill h=fill align-x=center align-y=center
-                                    text "•••" size=13.0
-                                  active bg=transparent text=muted r=7.0
-                                  hovered bg=fg/10 text=fg
-                                  pressed bg=fg/15
-                              if page_delete_armed
-                                button "Delete page" disabled=(mutation_phase != "idle") h=26.0 p=5.0 @danger_action -> delete_page_submit
                             box w=fill pl=56.0
                               PageTitleEditor rpc=connected_rpc password=password page_id=active_page title=active_page_title disabled=(loading || !connected || mutation_phase != "idle") #page-title(scope_key(connected_rpc, active_page))
                             if !empty(page_search_hits)
@@ -1157,13 +1163,27 @@ view
               // is the current level's directories, not a recursively expanded tree
               // — depth stays 0 until a per-level expansion state exists.
               box w=206.0 h=fill bg=sidebar clip=true
-                scroll dir=vertical w=fill h=fill bar=hidden
-                  col w=fill pl=6.0 pr=6.0 pt=8.0 pb=8.0 gap=1.0
-                    for entry in fs_entries
-                      if entry.kind == "dir"
-                        FsTreeRow entry=entry selected=false depth=0.0
-                          events
-                            fs_open_dir -> fs_open_dir _
+                col w=fill h=fill
+                  // The artifact's A1 header. Without it a level with no
+                  // subdirectories rendered a blank 206px column that reads as a
+                  // broken pane rather than an empty one. The subtitle states
+                  // what duckfs IS and needs no reading to back it.
+                  box w=fill pl=14.0 pr=14.0 pt=14.0 pb=11.0
+                    col w=fill gap=2.0
+                      text "duckfs" size=13.5 wrap=none font=display @text-fg
+                      text "content-addressed · replicated" size=9.5 wrap=none font=code @text-hint
+                  box w=fill h=1.0 bg=separator
+                    space w=1.0 h=1.0
+                  scroll dir=vertical w=fill h=fill bar=hidden
+                    col w=fill pl=6.0 pr=6.0 pt=8.0 pb=8.0 gap=1.0
+                      if fs_dir_count(fs_entries) <= 0
+                        box w=fill pl=12.0 pr=12.0 pt=6.0 pb=6.0
+                          text "No folders here." size=11.0 @text-hint
+                      for entry in fs_entries
+                        if entry.kind == "dir"
+                          FsTreeRow entry=entry selected=false depth=0.0
+                            events
+                              fs_open_dir -> fs_open_dir _
               box w=1.0 h=fill bg=separator
                 space w=1.0 h=1.0
               col w=fill h=fill
@@ -1357,7 +1377,7 @@ view
             if empty(forge_repo)
               scroll dir=vertical w=fill h=fill
                 col w=fill p=22.0 gap=18.0
-                  ForgeOrgHeader org=network_label(account_name, connected_rpc) about="" repos=len(forge_repos) tier=member_tier(members_rows)
+                  ForgeOrgHeader org=network_label(account_name, connected_rpc) about=account_bio repos=len(forge_repos) tier=member_tier(members_rows)
                   if empty(forge_repos)
                     EmptyPlate message="No repos — a consensus-backed repo appears here once it is created."
                   if !empty(forge_repos)
@@ -1563,7 +1583,14 @@ view
                                 // has: none. Approvals never block a merge.
                                 text forge_item_approvals size=12.0 wrap=none font=code_medium @text-meta
                                 text "approvals" size=12.5 wrap=none @text-caption
-                                text "Approvals are advisory — merging is never gated." w=fill size=12.5 @text-caption
+                                // The blanket sentence is the NO-ADVISORY half only.
+                                // MergeAdvisory above already says "a reviewer
+                                // requested changes — merge not recommended", and
+                                // printing both left the box asserting that nothing
+                                // gates the merge directly under a line recommending
+                                // against it.
+                                if forge_item_change_requests <= 0
+                                  text "Approvals are advisory — merging is never gated." w=fill size=12.5 @text-caption
                       if forge_item_kind == "pr"
                         col w=fill gap=9.0
                           GroupLabel label="REVIEWS"
@@ -1659,6 +1686,7 @@ view
                       KeyValueRow label="Endpoint" value=settings_endpoint last=false
                       KeyValueRow label="Node key" value=settings_node_key last=false
                       KeyValueRow label="Block height" value=height_label(settings_height) last=false
+                      KeyValueRow label="Data directory" value=settings_data_dir last=false
                       // The artifact's last NETWORK row: the roster reading with an
                       // inline accent link onto the Members screen.
                       box w=fill px=15.0 py=13.0
@@ -1847,7 +1875,7 @@ view
                         StatCard label="LAST FINALIZED" value=relative_time(node_last_finalized) note=""
                       if members_is_admin(members_rows)
                         grid min-cell=170.0 gap=10.0
-                          StatCard label="VALIDATORS REACHED" value=tally_label(node_reachable, node_quorum) note="of quorum"
+                          StatCard label="VALIDATORS REACHED" value=reading_pair(node_reachable_label, node_quorum_label) note="of quorum"
                       GroupCard
                         col w=fill
                           NodeBuildRow version=node_version last=false
@@ -1944,7 +1972,10 @@ view
                 row w=fill h=fill gap=10.0
                   box w=340.0 h=fill p=6.0 bg=muted_bg border=fg/10 border-w=1.0 r=10.0
                     scroll dir=vertical w=fill h=fill
-                      col w=fill gap=1.0
+                      // `pr` is the scrollbar's gutter: the bar paints OVER the
+                      // content, and without it the op count on every row was
+                      // clipped by the track.
+                      col w=fill pr=10.0 gap=1.0
                         for block in explorer_blocks
                           button label="Inspect block" w=fill p=6.0 @ghost_action -> select_explorer_block(block.height)
                             row w=fill h=fill gap=8.0 align=center
@@ -1980,18 +2011,28 @@ view
         // facts: the elapsed clock counts from `huddle_joined_at` against the
         // 1 Hz tick, never against a chain value, because consensus_time is a
         // block height on a validator network.
+        // This slot is the whole window, so it needs an anchor of its own: it
+        // was a bare `col w=fill h=fill`, pinned top-left, which dropped the
+        // pill and the 296px panel over the NetworkChip. Both belong at the
+        // bottom-right, clear of the titlebar and the composer.
         huddle:
-          col w=fill h=fill
-            if huddle_joined && huddle_popped
-              HuddlePanel channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at) roster=huddle_roster
-                events
-                  dock_huddle -> dock_huddle
-                  huddle_go_channel -> huddle_go_channel
-                  leave_huddle_here -> leave_huddle_here
-            if huddle_joined && !huddle_popped && huddle_channel != active_channel
-              HuddleDockedPill channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at)
-                events
-                  pop_huddle -> pop_huddle
+          box w=fill h=fill align-x=end align-y=end pr=16.0 pb=16.0
+            col
+              if huddle_joined && huddle_popped
+                HuddlePanel channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at) roster=huddle_roster
+                  events
+                    dock_huddle -> dock_huddle
+                    huddle_go_channel -> huddle_go_channel
+                    leave_huddle_here -> leave_huddle_here
+              // The pill says "you are still in a call elsewhere". It hides only
+              // where the live pill in the channel header already says so — the
+              // Chat tab, looking at the huddle's own channel. On every OTHER
+              // screen it must show even when that channel is the selected one,
+              // which the missing `shell_tab` term used to suppress.
+              if huddle_joined && !huddle_popped && (shell_tab != "chat" || huddle_channel != active_channel)
+                HuddleDockedPill channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at)
+                  events
+                    pop_huddle -> pop_huddle
         palette:
           stack w=fill h=fill
             // THE CHANNEL MODAL. The artifact picks VISIBILITY here; the chat
