@@ -1,7 +1,10 @@
 //! finalized snapshot capture: the host can expose the registry roots and
 //! per-module state-sync handles for the exact root-hash a finalized block
 //! produced. capture must not serve stale heights after the registry advances,
-//! and it must not expose staged writes from an aborted block.
+//! and it must not expose staged writes from an aborted block. one module that
+//! cannot produce a handle is reported as degraded, never as a failed capture:
+//! this call feeds BOTH recovery checkpointing and serving a joiner, so letting
+//! a single module abort it stopped the whole node from doing either.
 
 use commonware_runtime::{Runner as _, deterministic};
 use host::{BlockContext, FinalizedBlock, Host, SnapshotError};
@@ -9,6 +12,8 @@ use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle}
 
 const BYTES_ID: &str = "bytes";
 const RESOLVER_ID: &str = "resolver";
+const DEGRADED_ID: &str = "degraded";
+const SECOND_DEGRADED_ID: &str = "degraded2";
 
 struct BytesModule {
     committed: u8,
@@ -61,6 +66,51 @@ impl Module for BytesModule {
 
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.staged = None;
+        Ok(())
+    }
+}
+
+/// a module whose committed state cannot be turned into a sync surface — the
+/// forge shape: a head it accepted names objects it does not hold, so
+/// `snapshot()` errors forever while `root()` stays perfectly well defined.
+struct DegradedBytesModule;
+
+#[async_trait::async_trait(?Send)]
+impl Module for DegradedBytesModule {
+    fn id(&self) -> ModuleId {
+        DEGRADED_ID.into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot([3u8; sdk::ROOT_LEN])
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Err(Error::Module("missing pack for committed head".into()))
+    }
+
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+struct SecondDegradedModule;
+
+#[async_trait::async_trait(?Send)]
+impl Module for SecondDegradedModule {
+    fn id(&self) -> ModuleId {
+        SECOND_DEGRADED_ID.into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot([4u8; sdk::ROOT_LEN])
+    }
+
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Err(Error::Module("also broken".into()))
+    }
+
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -189,5 +239,73 @@ fn snapshot_capture_uses_the_finalized_root_hash_boundary() {
                 actual: moved.root_hash,
             },
         );
+    });
+}
+
+#[test]
+fn one_module_that_cannot_snapshot_does_not_abort_the_capture() {
+    deterministic::Runner::default().start(|_| async move {
+        let host = Host::genesis(vec![
+            Box::new(BytesModule::new(1)),
+            Box::new(DegradedBytesModule),
+            Box::new(ResolverBackedModule),
+        ])
+        .expect("genesis");
+
+        let snapshot = host
+            .capture_finalized_snapshot(block(4, host.root_hash()))
+            .expect("a module's own bad state must not take the boundary down");
+
+        // the healthy modules are captured in full — the amplifier was that
+        // ONE `?` discarded every one of these.
+        assert_eq!(
+            snapshot.module(BYTES_ID).expect("bytes module").state_sync,
+            StateSyncHandle::SnapshotBytes(vec![1]),
+        );
+        assert!(snapshot.module(RESOLVER_ID).is_some());
+        assert!(
+            snapshot.module(DEGRADED_ID).is_none(),
+            "a degraded module has no sync surface, so it is not an entry",
+        );
+
+        // and the failure is named, with the root it still has.
+        assert_eq!(snapshot.degraded.len(), 1);
+        let degraded = &snapshot.degraded[0];
+        assert_eq!(degraded.id, DEGRADED_ID);
+        assert_eq!(degraded.root, StateRoot([3u8; sdk::ROOT_LEN]));
+        assert_eq!(
+            degraded.reason,
+            Error::Module("missing pack for committed head".into()),
+        );
+
+        assert!(!snapshot.has_all_snapshot_bytes());
+        assert!(
+            !snapshot.is_self_contained(),
+            "a degraded module cannot be rebuilt from the capture at all",
+        );
+    });
+}
+
+#[test]
+fn every_degraded_module_is_reported_not_just_the_first() {
+    deterministic::Runner::default().start(|_| async move {
+        let host = Host::genesis(vec![
+            Box::new(DegradedBytesModule),
+            Box::new(SecondDegradedModule),
+        ])
+        .expect("genesis");
+
+        let snapshot = host
+            .capture_finalized_snapshot(block(1, host.root_hash()))
+            .expect("capture");
+
+        let mut ids: Vec<_> = snapshot.degraded.iter().map(|m| m.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![DEGRADED_ID, SECOND_DEGRADED_ID],
+            "collecting into Result stopped at the first failure in registry order",
+        );
+        assert!(snapshot.modules.is_empty());
     });
 }

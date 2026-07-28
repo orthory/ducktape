@@ -8,6 +8,99 @@ use statesync::{
     decode_response, encode_request, encode_response,
 };
 
+const DEGRADED_ID: &str = "degraded";
+const HEALTHY_ID: &str = "healthy";
+
+struct HealthyModule;
+
+#[async_trait::async_trait(?Send)]
+impl sdk::Module for HealthyModule {
+    fn id(&self) -> sdk::ModuleId {
+        HEALTHY_ID.into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot([1u8; 32])
+    }
+
+    fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
+        Ok(sdk::StateSyncHandle::SnapshotBytes(vec![42]))
+    }
+
+    async fn execute(
+        &mut self,
+        _ctx: &mut dyn sdk::Ctx,
+        _msg: &sdk::Msg,
+    ) -> Result<(), sdk::Error> {
+        Ok(())
+    }
+}
+
+struct DegradedModule;
+
+#[async_trait::async_trait(?Send)]
+impl sdk::Module for DegradedModule {
+    fn id(&self) -> sdk::ModuleId {
+        DEGRADED_ID.into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot([2u8; 32])
+    }
+
+    fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
+        Err(sdk::Error::Module("no pack for committed head".into()))
+    }
+
+    async fn execute(
+        &mut self,
+        _ctx: &mut dyn sdk::Ctx,
+        _msg: &sdk::Msg,
+    ) -> Result<(), sdk::Error> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_module_that_cannot_serve_is_refused_per_module_not_by_the_whole_boundary() {
+    // the joiner's answer to "one module cannot serve": it still gets the
+    // boundary and every other module's payload, and that ONE module comes
+    // back Unsupported. before, the module's error aborted the capture and
+    // this node could not admit anyone at all.
+    let host =
+        Host::genesis(vec![Box::new(HealthyModule), Box::new(DegradedModule)]).expect("genesis");
+    let coords = BoundaryCoords {
+        epoch: 1,
+        view_base: 0,
+        participants: vec![],
+        residents: vec![],
+        floor_cert: None,
+    };
+    let finalized = host::FinalizedBlock {
+        height: 12,
+        root_hash: host.root_hash(),
+    };
+
+    let (id, data) = block_on(statesync::capture_boundary(&host, finalized, &coords))
+        .expect("a degraded module must not take the boundary down");
+
+    let mut srv = SyncServer::new();
+    srv.install_capture(id, data);
+    let SyncResponse::Manifest(manifest) = srv.manifest_for(id).expect("manifest") else {
+        panic!("manifest_for must answer with a manifest");
+    };
+
+    let healthy = manifest.entry(HEALTHY_ID).expect("healthy entry");
+    assert_eq!(healthy.kind, PayloadKind::Snapshot);
+    let degraded = manifest.entry(DEGRADED_ID).expect("degraded entry");
+    assert_eq!(degraded.kind, PayloadKind::Unsupported);
+    assert_eq!(
+        degraded.root,
+        StateRoot([2u8; 32]),
+        "the committed root is still known — only the transfer surface is gone",
+    );
+}
+
 #[test]
 fn captures_keyed_by_boundary_id_not_height() {
     let mut srv = SyncServer::new();

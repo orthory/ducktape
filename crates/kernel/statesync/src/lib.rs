@@ -1157,6 +1157,20 @@ pub async fn capture_boundary(
             },
         );
     }
+    // a module that could not prepare a handle at all serves as Unsupported —
+    // the SAME thing a joiner is told about a module that declares no sync
+    // surface, because from the joiner's side they are the same fact. it is
+    // reported PER MODULE and the rest of the boundary still transfers: one
+    // module's bad state must not make this node unable to admit anyone.
+    for m in snapshot.degraded {
+        modules.insert(
+            m.id,
+            CapturedModule {
+                root: m.root,
+                payload: CapturedPayload::Unsupported,
+            },
+        );
+    }
     Ok((
         id,
         CaptureData {
