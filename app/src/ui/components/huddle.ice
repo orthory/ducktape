@@ -73,6 +73,15 @@ component HuddleStart()
 
 // THE DOCKED PILL — the titlebar's, shown on every screen EXCEPT the huddle's
 // own chat view, where the header pill above says the same thing louder.
+//
+// NOT MOUNTED YET, and not blocked on a fact: `huddle_joined`, `huddle_popped`,
+// `huddle_channel`, `huddle_channel_name` and `huddle_now - huddle_joined_at`
+// are all in state.ice:263-268, and `pop_huddle` is a live handler
+// (handlers/huddle.ice:21). What is missing is the titlebar SLOT — shell.ice's
+// `TitleBar`/`WorkspaceTabs` carry no huddle props — so mounting is two props
+// and one event on those two signatures plus the pass-through at view.ice:212.
+// The artifact's visibility rule is `huddle_joined && !huddle_popped &&
+// !(shell_tab == "chat" && huddle_channel == active_channel)`.
 component HuddleDockedPill(channel:str, elapsed:str)
   emits
     pop_huddle
@@ -116,6 +125,17 @@ component HuddleTile(person:HuddleParticipant)
 // bands: the traffic-light header with its dock button, the body (elapsed +
 // roster grid + controls), and nothing else. See the file header for the four
 // bands the artifact has that this one honestly refuses to draw.
+//
+// NOT MOUNTED YET, and it is the ONLY consumer of `huddle_popped` — the LIVE
+// pill above is already on screen at view.ice:328 and its `pop_huddle` click
+// currently changes nothing anyone can see. Mounting needs one
+// `huddle_roster:[HuddleParticipant]` held in app state: `next.huddle_roster`
+// already reaches handlers/chat.ice:268 and is dropped the instant
+// `huddle_self` has read it. It must be kept ONLY while `active_channel ==
+// huddle_channel`, the same guard `huddle_channel` itself carries — a load of
+// any other channel carries THAT channel's roster, and this panel follows you
+// off the huddle's channel. Then a `pin`ned mount in view.ice's full-window
+// stack under `if huddle_joined && huddle_popped`.
 component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant])
   emits
     dock_huddle

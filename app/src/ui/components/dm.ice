@@ -48,6 +48,16 @@ component DmRow(peer:DmPeer, selected:bool)
 
 // The chat header's DM identity — a 24px peer plate and the peer's name, in
 // place of the `# channel` title. The AGENT badge marks a machine peer.
+//
+// NOT MOUNTED YET. It replaces `text "#"` + `text active_channel_name` at
+// view.ice:320-321, under `if !empty(active_dm_peer)` with those two lines
+// moved under the `if empty(active_dm_peer)` half. It needs NO new backend fn
+// and no new state: `active_dm_peer` is written at handlers/chat.ice:94 and
+// `dm_peers` already reaches the view at view.ice:296, so the peer is a filter
+// — `for peer in dm_peers` / `if peer.key == active_dm_peer`.
+// `active_dm_name`/`active_dm_is_agent` (state.ice:259-260) are NOT the route:
+// no handler anywhere writes either one, so they are dead declarations rather
+// than data, and feeding this plate from them would render a blank name.
 component DmHeader(peer:DmPeer)
   row #root gap=9.0 align=center
     PrincipalAvatar initials=peer.initials is_agent=peer.is_agent plate=24.0 ink=9.0 ring=""
