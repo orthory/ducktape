@@ -37,6 +37,8 @@ extern crate::backend
   sync apply_bell(items:[BellItem], delta:BellDelta) -> [BellItem]
   sync bell_unread_after(unread:i64, items:[BellItem], delta:BellDelta) -> i64
   sync bell_head(items:[BellItem]) -> i64
+  sync bell_severity(kind:str) -> str
+  sync bell_worst_severity(items:[BellItem]) -> str
   load_bell(rpc:str, generation:i64) -> BellData ! HydrationError
   mark_bell_read(rpc:str, password:str, up_to_seq:i64) -> bool ! AppError
   ForgeRefresh(repo:str, number:i64, refs_moved:bool)
@@ -107,6 +109,8 @@ extern crate::backend
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
   files_find(rpc:str, prefix:str, generation:i64) -> FsListing ! HydrationError
+  ChangeStamp(generation:i64, path:str, author:str, height:i64)
+  last_changed_at_path(rpc:str, path:str, generation:i64) -> ChangeStamp ! HydrationError
   sync size_label(bytes:i64) -> str
   sync shell_nav(tab:str, approvals:i64, agent_live:bool) -> [NavItem]
   sync open_proposals(rows:[ProposalRow]) -> i64
@@ -134,7 +138,7 @@ extern crate::backend
   NodeLogLine(cursor:str, line:str)
   LogParts(time:str, level:str, message:str)
   sync split_log_line(line:str) -> LogParts
-  NodeFacts(generation:i64, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, peers_live:i64, peers_total:i64)
+  NodeFacts(generation:i64, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, peers_live:i64, peers_total:i64)
   load_node_facts(rpc:str, generation:i64) -> NodeFacts ! HydrationError
   sync optional_number(value:i64?) -> str
   PeerRow(key:str, height:i64, live:bool)
@@ -143,6 +147,9 @@ extern crate::backend
   sync filter_log_lines(lines:[NodeLogLine], filter:str) -> [NodeLogLine]
   stream node_logs(rpc:str) -> NodeLogLine
   load_peers(rpc:str, generation:i64) -> PeersData ! HydrationError
+  ModuleRow(id:str, category:str, root:str, code_hash:str, pending_hash:str, activation_height:i64, readiness:i64, ready:bool)
+  ModulesData(generation:i64, rows:[ModuleRow])
+  load_modules(rpc:str, generation:i64) -> ModulesData ! HydrationError
   AccountData(generation:i64, bound:bool, account_id:str, display_name:str, bio:str, members:i64, nodes:i64)
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
   set_account_name(rpc:str, password:str, display_name:str) -> bool ! AppError
@@ -167,6 +174,13 @@ extern crate::backend
   load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError
   load_forge_item(rpc:str, repo:str, number:i64, generation:i64) -> ForgeItemData ! HydrationError
   load_forge_discussion(rpc:str, channel_id:str, generation:i64) -> ForgeDiscussionData ! HydrationError
+  TreeEntry(name:str, path:str, kind:str, size:i64)
+  ForgeTreeData(generation:i64, repo:str, rev:str, path:str, entries:[TreeEntry])
+  BlobView(generation:i64, repo:str, rev:str, path:str, text:str, truncated:bool, binary:bool, lines:i64)
+  RepoAbout(generation:i64, repo:str, description:str, language:str, updated_at:i64)
+  forge_tree(rpc:str, repo:str, rev:str, path:str, generation:i64) -> ForgeTreeData ! HydrationError
+  forge_blob(rpc:str, repo:str, rev:str, path:str, generation:i64) -> BlobView ! HydrationError
+  repo_about(rpc:str, repo:str, generation:i64) -> RepoAbout ! HydrationError
   submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str) -> bool ! AppError
   merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
   forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:str, module:str, scope:ForgeRefresh, generation:i64) -> ForgeLiveData ! HydrationError
@@ -189,7 +203,7 @@ extern crate::backend
   sync any_agent_active(rows:[AgentRow]) -> bool
   load_agent_runs(rpc:str, agent_id:str, generation:i64) -> AgentRunsData ! HydrationError
   set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError
-  ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, rule:str, required_yes:i64, electorate:i64, open:bool)
+  ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, rule:str, required_yes:i64, electorate:i64, open:bool, settled_height:i64)
   GovernanceData(generation:i64, proposals:[ProposalRow])
   load_governance(rpc:str, generation:i64) -> GovernanceData ! HydrationError
   governance_vote(rpc:str, password:str, proposal_id:str, approve:bool) -> bool ! AppError

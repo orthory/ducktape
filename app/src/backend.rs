@@ -1387,6 +1387,89 @@ pub async fn files_diff(
     })
 }
 
+/// Who last changed one duckfs PATH, and at which block.
+///
+/// This is the path's last COMMIT — never blob authorship. duckfs stores
+/// content-addressed objects with no per-blob author, so the honest label is
+/// "last changed at this path", which is exactly what walking the snapshot
+/// window answers.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChangeStamp {
+    pub generation: i64,
+    pub path: String,
+    /// The committing member, short form; empty when no commit in the window
+    /// touched this path.
+    pub author: String,
+    /// The committing block height; 0 with an empty author.
+    pub height: i64,
+}
+
+/// How far back a last-changed walk looks. A path untouched in this many
+/// commits reads as unknown rather than wrong.
+//
+// ponytail: one diff round-trip per snapshot until the first hit — recent
+// paths answer in one or two. Bound it lower, or ask the module for a
+// per-path log, if a cold path ever makes this walk visible.
+const CHANGE_STAMP_WINDOW: usize = 50;
+
+/// Walk the committed snapshots newest-first and stop at the first one whose
+/// diff against its parent touches `path`.
+pub async fn last_changed_at_path(
+    rpc: String,
+    path: String,
+    generation: i64,
+) -> Result<ChangeStamp, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let limit = CHANGE_STAMP_WINDOW.to_string();
+        let history = client
+            .files_get("history", &[("limit", limit.as_str())])
+            .await?;
+        // `history` is newest-first, which is the order this walk wants.
+        let snapshots = history["snapshots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for snapshot in &snapshots {
+            let id = snapshot["id"].as_str().unwrap_or_default();
+            let stamp = ChangeStamp {
+                generation,
+                path: path.clone(),
+                author: short_digest(snapshot["author"].as_str().unwrap_or_default()),
+                height: snapshot["height"].as_i64().unwrap_or(0),
+            };
+            // The root snapshot has no parent to diff against: everything the
+            // window still holds was introduced there.
+            let Some(parent) = snapshot["parent"].as_str() else {
+                return Ok(stamp);
+            };
+            let diff = client
+                .files_get(
+                    "diff",
+                    &[("from", parent), ("to", id), ("prefix", path.as_str())],
+                )
+                .await?;
+            let touched = diff["entries"]
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty());
+            if touched {
+                return Ok(stamp);
+            }
+        }
+        Ok(ChangeStamp {
+            generation,
+            path,
+            author: String::new(),
+            height: 0,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -1608,6 +1691,10 @@ pub struct ProposalRow {
     pub required_yes: i64,
     pub electorate: i64,
     pub open: bool,
+    /// The block a settled proposal was EXECUTED at, derived from the op feed
+    /// (see [`settle_heights`]). 0 when the proposal is still open, or when it
+    /// settled further back than the op window reaches.
+    pub settled_height: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -1653,11 +1740,19 @@ pub async fn load_governance(
                     electorate: count_i64(
                         view["electorate"].as_array().map_or(0, |members| members.len()),
                     ),
+                    settled_height: 0,
                     action,
                     status,
                 }
             })
             .collect();
+        let any_settled = proposals.iter().any(|proposal| !proposal.open);
+        if any_settled {
+            let settled = settle_heights(&rpc).await;
+            for proposal in &mut proposals {
+                proposal.settled_height = settled.get(&proposal.id).copied().unwrap_or(0);
+            }
+        }
         proposals.sort_by(|left, right| {
             right
                 .open
@@ -1674,6 +1769,46 @@ pub async fn load_governance(
         generation,
         message,
     })
+}
+
+/// How far back the settle-height derivation reads the op feed.
+const SETTLE_SCAN_BLOCKS: usize = 400;
+
+/// Proposal id -> the height it SETTLED at.
+///
+/// `ProposalView` omits the settle height, but settling is an ordinary op:
+/// `GovMsg::Execute { proposal_id }` applied against the governance module. So
+/// the height is recoverable from the block feed every explorer row already
+/// reads — no module change, and no invented number: a proposal that settled
+/// before the window simply has no entry, and its row prints no height.
+async fn settle_heights(client: &RpcClient) -> BTreeMap<String, i64> {
+    let Ok(blocks) = client.blocks(SETTLE_SCAN_BLOCKS).await else {
+        return BTreeMap::new();
+    };
+    let mut heights = BTreeMap::new();
+    for block in &blocks {
+        let height = block["height"].as_i64().unwrap_or(0);
+        for op in block["ops"].as_array().cloned().unwrap_or_default() {
+            let governance_op = op["target"].as_str() == Some("governance");
+            let applied = op["disposition"].as_str() == Some("applied");
+            if !governance_op || !applied {
+                continue;
+            }
+            // The feed carries the payload as its json TEXT preview, so the
+            // execute variant is read back out of that text.
+            let Some(payload) = op["payload"].as_str() else {
+                continue;
+            };
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(payload) else {
+                continue;
+            };
+            let Some(id) = message["execute"]["proposal_id"].as_str() else {
+                continue;
+            };
+            heights.insert(id.to_string(), height);
+        }
+    }
+    heights
 }
 
 /// The `GovAction` payload as one readable clause — what the op DOES, which
@@ -2014,6 +2149,10 @@ pub fn split_log_line(line: String) -> LogParts {
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NodeFacts {
     pub generation: i64,
+    /// The daemon's build version, verbatim off `/v1/status` (its own
+    /// `CARGO_PKG_VERSION`). A build/commit SHA is NOT published anywhere, so
+    /// the version line carries the version alone.
+    pub version: String,
     pub root_hash: String,
     /// The three consensus facts are OPTION on purpose: `operations.consensus`
     /// is absent on a resident, a joiner and the embedded local daemon
@@ -2041,6 +2180,7 @@ pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, 
         let peers = peers["peers"].as_array().cloned().unwrap_or_default();
         Ok(NodeFacts {
             generation,
+            version: status["version"].as_str().unwrap_or_default().to_string(),
             root_hash: status["root_hash"].as_str().unwrap_or_default().to_string(),
             view: consensus["view"].as_i64(),
             quorum: consensus["quorum"].as_i64(),
@@ -2111,6 +2251,107 @@ pub async fn load_peers(rpc: String, generation: i64) -> Result<PeersData, Hydra
         generation,
         message,
     })
+}
+
+/// One registered module, as the node itself reports it.
+///
+/// There is no MARKETPLACE behind this row and there cannot be: a publisher, a
+/// verification badge, an install count and a catalog description exist in no
+/// module, no index and no manifest. This is the INSTALLED/RUNTIME truth —
+/// what is registered, at which code, with which swap pending.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ModuleRow {
+    pub id: String,
+    /// `workspace` | `developer` | `automation` | `system` — the presentation
+    /// category the status projection attaches by id. Never consensus state.
+    pub category: String,
+    /// The module's own state root, short form.
+    pub root: String,
+    /// The active component's sha256, short form. Empty when this network runs
+    /// no lifecycle module (the daemon's default set does not).
+    pub code_hash: String,
+    /// The scheduled swap's target hash, short form; empty when none is armed.
+    pub pending_hash: String,
+    /// The pending swap's activation height (0 when none is armed).
+    pub activation_height: i64,
+    /// Validators that have verified the pending bytes locally.
+    pub readiness: i64,
+    /// The pending swap has full coverage and will activate at its height.
+    pub ready: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ModulesData {
+    pub generation: i64,
+    pub rows: Vec<ModuleRow>,
+}
+
+/// The registered module set: `/v1/status` publishes id, root and category for
+/// every module, and the lifecycle module (where a network runs one) adds the
+/// active code hash and any armed swap.
+///
+/// The lifecycle half is BEST EFFORT on purpose — the daemon's default module
+/// set has no `lifecycle`, and a network without one still has a real,
+/// complete registered set to show.
+pub async fn load_modules(rpc: String, generation: i64) -> Result<ModulesData, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let status = client.status_json().await?;
+        let code = module_code_by_id(&client).await;
+        let rows = status["modules"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|module| {
+                let id = module["id"].as_str().unwrap_or_default().to_string();
+                let lifecycle = code.get(&id);
+                let pending =
+                    lifecycle.map_or(serde_json::Value::Null, |entry| entry["pending"].clone());
+                ModuleRow {
+                    category: module["category"].as_str().unwrap_or_default().to_string(),
+                    root: short_digest(module["root"].as_str().unwrap_or_default()),
+                    code_hash: lifecycle
+                        .map(|entry| short_digest(&hex_encode(&json_bytes(&entry["active_code_hash"]))))
+                        .unwrap_or_default(),
+                    pending_hash: short_digest(&hex_encode(&json_bytes(&pending["code_hash"]))),
+                    activation_height: pending["activation_height"].as_i64().unwrap_or(0),
+                    readiness: count_i64(
+                        pending["readiness"].as_array().map_or(0, |signals| signals.len()),
+                    ),
+                    ready: pending["ready"].as_bool().unwrap_or(false),
+                    id,
+                }
+            })
+            .collect();
+        Ok(ModulesData { generation, rows })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// `LifecycleQuery::ModuleStatus` keyed by module id, empty when this network
+/// runs no lifecycle module.
+async fn module_code_by_id(client: &RpcClient) -> BTreeMap<String, serde_json::Value> {
+    let Ok(reply) = client
+        .query::<_, serde_json::Value>("lifecycle", &serde_json::json!("module_status"))
+        .await
+    else {
+        return BTreeMap::new();
+    };
+    reply["module_status"]["modules"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| {
+            let id = entry["module_id"].as_str()?.to_string();
+            Some((id, entry))
+        })
+        .collect()
 }
 
 /// One curated skill of an agent: the ref's name and whether it loads as
@@ -3028,6 +3269,360 @@ impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// One entry of a repo's tree at one revision. `kind` is `dir` | `file`; a
+/// directory has no size on the wire and reads 0.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct TreeEntry {
+    pub name: String,
+    /// The full path from the repo root, so a row navigates without the view
+    /// having to re-join it against the current directory.
+    pub path: String,
+    pub kind: String,
+    pub size: i64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeTreeData {
+    pub generation: i64,
+    pub repo: String,
+    pub rev: String,
+    pub path: String,
+    pub entries: Vec<TreeEntry>,
+}
+
+/// One file's contents at one revision, in the shape the preview pane reads.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BlobView {
+    pub generation: i64,
+    pub repo: String,
+    pub rev: String,
+    pub path: String,
+    pub text: String,
+    pub truncated: bool,
+    pub binary: bool,
+    pub lines: i64,
+}
+
+/// A repo's derived summary: the README's opening prose, the language its
+/// files are mostly written in, and when its head last moved.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct RepoAbout {
+    pub generation: i64,
+    pub repo: String,
+    pub description: String,
+    pub language: String,
+    /// The head commit's committer time in UNIX SECONDS — a real wall clock,
+    /// because a forge commit is authored by a git client, not stamped with
+    /// consensus time. 0 when the repo has no born branch.
+    pub updated_at: i64,
+}
+
+/// The default revision a repo browse opens at: the integration branch the
+/// module itself prefers (`dev`, else `main`), else whatever is born.
+fn default_rev(mirror: &git2::Repository) -> Result<String, String> {
+    for preferred in ["dev", "main"] {
+        if mirror.find_branch(preferred, git2::BranchType::Local).is_ok() {
+            return Ok(preferred.to_string());
+        }
+    }
+    let branches = mirror.branches(Some(git2::BranchType::Local)).map_err(git_err)?;
+    for branch in branches {
+        let (branch, _) = branch.map_err(git_err)?;
+        if let Some(name) = branch.name().map_err(git_err)? {
+            return Ok(name.to_string());
+        }
+    }
+    Err("this repo has no born branch yet".into())
+}
+
+/// Resolve `rev` (a branch name, or empty for the default) to its commit.
+fn mirror_commit_at<'repo>(
+    mirror: &'repo git2::Repository,
+    rev: &str,
+) -> Result<git2::Commit<'repo>, String> {
+    let rev = match rev.is_empty() {
+        true => default_rev(mirror)?,
+        false => rev.to_string(),
+    };
+    let object = mirror
+        .revparse_single(&rev)
+        .map_err(|_| format!("no such revision {rev:?} in this repo"))?;
+    object.peel_to_commit().map_err(git_err)
+}
+
+/// The tree at `path` under `rev`, directories first then files, name order.
+fn read_tree(
+    mirror: &git2::Repository,
+    rev: &str,
+    path: &str,
+) -> Result<Vec<TreeEntry>, String> {
+    let commit = mirror_commit_at(mirror, rev)?;
+    let root = commit.tree().map_err(git_err)?;
+    let path = path.trim_matches('/');
+    let tree = match path.is_empty() {
+        true => root,
+        false => {
+            let entry = root
+                .get_path(Path::new(path))
+                .map_err(|_| format!("no such path {path:?} at this revision"))?;
+            entry
+                .to_object(mirror)
+                .map_err(git_err)?
+                .peel_to_tree()
+                .map_err(|_| format!("{path:?} is a file, not a directory"))?
+        }
+    };
+    let mut entries = Vec::with_capacity(tree.len());
+    for entry in tree.iter() {
+        let name = entry.name().unwrap_or_default().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let is_dir = entry.kind() == Some(git2::ObjectType::Tree);
+        let size = match is_dir {
+            true => 0,
+            false => entry
+                .to_object(mirror)
+                .ok()
+                .and_then(|object| object.into_blob().ok())
+                .map_or(0, |blob| count_i64(blob.size())),
+        };
+        entries.push(TreeEntry {
+            path: match path.is_empty() {
+                true => name.clone(),
+                false => format!("{path}/{name}"),
+            },
+            kind: match is_dir {
+                true => "dir".into(),
+                false => "file".into(),
+            },
+            name,
+            size,
+        });
+    }
+    entries.sort_by(|left, right| {
+        let dirs_lead = (right.kind == "dir").cmp(&(left.kind == "dir"));
+        dirs_lead.then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(entries)
+}
+
+/// List one repo directory at one revision. No new module wire: the app
+/// already keeps a bare mirror of every branch for the client-computed merge,
+/// so the whole tree is readable locally.
+pub async fn forge_tree(
+    rpc: String,
+    repo: String,
+    rev: String,
+    path: String,
+    generation: i64,
+) -> Result<ForgeTreeData, HydrationError> {
+    async {
+        tokio::task::spawn_blocking(move || {
+            let mirror = sync_forge_mirror(&rpc, &repo)?;
+            let entries = read_tree(&mirror, &rev, &path)?;
+            Ok::<_, String>(ForgeTreeData {
+                generation,
+                repo,
+                rev,
+                path,
+                entries,
+            })
+        })
+        .await
+        .map_err(|error| format!("forge tree task failed: {error}"))?
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The preview window one blob read returns, matching duckfs's 64 KiB cap.
+const MAX_BLOB_PREVIEW: usize = 64 * 1024;
+
+/// One blob's decoded head, its truncation flag and its line count.
+fn read_blob(
+    mirror: &git2::Repository,
+    repo: String,
+    rev: String,
+    path: String,
+    generation: i64,
+) -> Result<BlobView, String> {
+    let commit = mirror_commit_at(mirror, &rev)?;
+    let tree = commit.tree().map_err(git_err)?;
+    let entry = tree
+        .get_path(Path::new(path.trim_matches('/')))
+        .map_err(|_| format!("no such path {path:?} at this revision"))?;
+    let blob = entry
+        .to_object(mirror)
+        .map_err(git_err)?
+        .into_blob()
+        .map_err(|_| format!("{path:?} is a directory, not a file"))?;
+    let content = blob.content();
+    let truncated = content.len() > MAX_BLOB_PREVIEW;
+    let window = &content[..content.len().min(MAX_BLOB_PREVIEW)];
+    let readable = std::str::from_utf8(window)
+        .ok()
+        .filter(|text| !text.contains('\0'));
+    let Some(text) = readable else {
+        return Ok(BlobView {
+            generation,
+            repo,
+            rev,
+            path,
+            text: format!("{} binary bytes", content.len()),
+            truncated: false,
+            binary: true,
+            lines: 0,
+        });
+    };
+    Ok(BlobView {
+        generation,
+        repo,
+        rev,
+        path,
+        lines: count_i64(text.lines().count()),
+        text: text.to_string(),
+        truncated,
+        binary: false,
+    })
+}
+
+/// Read one file at one revision out of the local mirror.
+pub async fn forge_blob(
+    rpc: String,
+    repo: String,
+    rev: String,
+    path: String,
+    generation: i64,
+) -> Result<BlobView, HydrationError> {
+    async {
+        tokio::task::spawn_blocking(move || {
+            let mirror = sync_forge_mirror(&rpc, &repo)?;
+            read_blob(&mirror, repo, rev, path, generation)
+        })
+        .await
+        .map_err(|error| format!("forge blob task failed: {error}"))?
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The README names a repo browse recognizes, in preference order.
+const README_NAMES: &[&str] = &["README.md", "README", "readme.md", "README.txt"];
+
+/// The repo "about" line: the README's first prose paragraph, headings and
+/// badges skipped. Empty when there is no README — the card keeps its
+/// min-height rather than inventing a description.
+fn readme_about(mirror: &git2::Repository, commit: &git2::Commit) -> String {
+    let Ok(tree) = commit.tree() else {
+        return String::new();
+    };
+    let found = README_NAMES.iter().find_map(|name| {
+        let entry = tree.get_name(name)?;
+        let blob = entry.to_object(mirror).ok()?.into_blob().ok()?;
+        String::from_utf8(blob.content().to_vec()).ok()
+    });
+    let Some(text) = found else {
+        return String::new();
+    };
+    let prose = text.lines().map(str::trim).find(|line| {
+        let empty = line.is_empty();
+        let heading = line.starts_with('#');
+        let badge = line.starts_with('[') || line.starts_with('!');
+        !empty && !heading && !badge
+    });
+    let prose = prose.unwrap_or_default();
+    match prose.char_indices().nth(200) {
+        Some((cut, _)) => format!("{}…", &prose[..cut]),
+        None => prose.to_string(),
+    }
+}
+
+/// The repo's language, by which source extension owns the most files at the
+/// head revision.
+//
+// ponytail: a file-count heuristic over a bounded walk, not linguist's
+// byte-weighted classifier — upgrade to bytes-per-extension if a repo of
+// generated files starts reading wrong.
+fn dominant_language(commit: &git2::Commit) -> String {
+    const MAX_WALKED_ENTRIES: usize = 4096;
+    const LANGUAGES: &[(&str, &str)] = &[
+        ("rs", "Rust"),
+        ("ts", "TypeScript"),
+        ("tsx", "TypeScript"),
+        ("js", "JavaScript"),
+        ("py", "Python"),
+        ("go", "Go"),
+        ("swift", "Swift"),
+        ("kt", "Kotlin"),
+        ("java", "Java"),
+        ("c", "C"),
+        ("h", "C"),
+        ("cpp", "C++"),
+        ("rb", "Ruby"),
+        ("sh", "Shell"),
+        ("ice", "Ice"),
+        ("md", "Markdown"),
+    ];
+    let Ok(tree) = commit.tree() else {
+        return String::new();
+    };
+    let mut walked = 0usize;
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
+        walked += 1;
+        if walked > MAX_WALKED_ENTRIES {
+            return git2::TreeWalkResult::Abort;
+        }
+        let name = entry.name().unwrap_or_default();
+        let extension = name.rsplit_once('.').map(|(_, tail)| tail).unwrap_or("");
+        if let Some((_, language)) = LANGUAGES.iter().find(|(suffix, _)| *suffix == extension) {
+            *counts.entry(*language).or_default() += 1;
+        }
+        git2::TreeWalkResult::Ok
+    });
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(language, _)| language.to_string())
+        .unwrap_or_default()
+}
+
+/// A repo's about line, language and last-moved stamp — all derived from the
+/// local mirror, none of it a new module field.
+pub async fn repo_about(
+    rpc: String,
+    repo: String,
+    generation: i64,
+) -> Result<RepoAbout, HydrationError> {
+    async {
+        tokio::task::spawn_blocking(move || {
+            let mirror = sync_forge_mirror(&rpc, &repo)?;
+            let commit = mirror_commit_at(&mirror, "")?;
+            Ok::<_, String>(RepoAbout {
+                generation,
+                description: readme_about(&mirror, &commit),
+                language: dominant_language(&commit),
+                updated_at: commit.time().seconds(),
+                repo,
+            })
+        })
+        .await
+        .map_err(|error| format!("forge about task failed: {error}"))?
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
 }
 
 /// True when one live update invalidates forge state: a folded forge op, a
@@ -4166,6 +4761,51 @@ pub fn bell_unread_after(unread: i64, items: Vec<BellItem>, delta: BellDelta) ->
 /// The mark-read watermark of the current list.
 pub fn bell_head(items: Vec<BellItem>) -> i64 {
     inbox::client::bell_head_seq(&items)
+}
+
+/// One notification's severity — `info` | `warn` | `error` — for the row dot,
+/// the INFO/WARN/ALERT chip and the badge tint.
+///
+/// THE WIRE CARRIES NO SEVERITY. `Notification` is seq/member/kind/body/source/
+/// created_at/read (crates/modules/apps/inbox/src/interface.rs), so this is a
+/// PROJECTION of the delivering module's `kind` token, not a field anything
+/// signed. A kind this mapping does not name reads `info`: an unclassified
+/// notice is a notice, never an alarm.
+pub fn bell_severity(kind: String) -> String {
+    const WARN: &[&str] = &[
+        "review_requested",
+        "changes_requested",
+        "proposal_opened",
+        "vote_needed",
+        "run_cancelled",
+        "quota",
+    ];
+    const ERROR: &[&str] = &["failed", "error", "rejected", "conflict", "revoked"];
+    let kind = kind.to_lowercase();
+    let names_error = ERROR.iter().any(|token| kind.contains(token));
+    let names_warning = WARN.iter().any(|token| kind.contains(token));
+    match (names_error, names_warning) {
+        (true, _) => "error".into(),
+        (false, true) => "warn".into(),
+        (false, false) => "info".into(),
+    }
+}
+
+/// The worst severity among the UNREAD rows, for the bell badge's tint —
+/// `info` when nothing is unread.
+pub fn bell_worst_severity(items: Vec<BellItem>) -> String {
+    let severities: Vec<String> = items
+        .iter()
+        .filter(|item| !item.read)
+        .map(|item| bell_severity(item.kind.clone()))
+        .collect();
+    let any_error = severities.iter().any(|severity| severity == "error");
+    let any_warning = severities.iter().any(|severity| severity == "warn");
+    match (any_error, any_warning) {
+        (true, _) => "error".into(),
+        (false, true) => "warn".into(),
+        (false, false) => "info".into(),
+    }
 }
 
 /// One explorer block row.
@@ -6223,6 +6863,7 @@ pub async fn search_workspace(
     }
     hits.extend(search_forge_items(&rpc, &needle, generation).await);
     hits.extend(search_files(&rpc, text.trim()).await);
+    hits.extend(search_tasks(&rpc, &needle).await);
     if let Ok(runs) = load_agent_runs(rpc, String::new(), generation).await {
         hits.extend(
             runs.runs
@@ -6248,6 +6889,7 @@ pub async fn search_workspace(
         ("page", "Pages"),
         ("code", "Code"),
         ("file", "Files"),
+        ("task", "Tasks"),
         ("run", "Runs"),
     ]
     .into_iter()
@@ -6293,6 +6935,57 @@ async fn search_files(rpc: &str, pattern: &str) -> Vec<ExplorerHit> {
             }
         })
         .collect()
+}
+
+/// The tasks half of the workspace search: the three bounded status pages of
+/// the tasks index, filtered on title and id client-side (that index has no
+/// text query either). A workspace with no tasks yet contributes no hits and
+/// its chip reads 0 — empty is not the same as absent.
+async fn search_tasks(rpc: &str, needle: &str) -> Vec<ExplorerHit> {
+    const STATUS_PAGES: &[(&str, &str)] = &[
+        ("open", "open"),
+        ("in_progress", "in progress"),
+        ("done", "done"),
+    ];
+    const PAGE_LIMIT: usize = 256;
+    let Ok(client) = rpc_client(rpc) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for (status, label) in STATUS_PAGES {
+        let query = serde_json::json!({
+            "by_status": { "status": status, "limit": PAGE_LIMIT }
+        });
+        let Ok(reply) = client.view::<_, serde_json::Value>("tasks", &query).await else {
+            return hits;
+        };
+        for row in reply["tasks"]["tasks"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            let title = row["title"].as_str().unwrap_or_default().to_string();
+            let id = row["task_id"].as_str().unwrap_or_default().to_string();
+            let matched =
+                title.to_lowercase().contains(needle) || id.to_lowercase().contains(needle);
+            if !matched {
+                continue;
+            }
+            let author = short_label(row["created_by"].as_str().unwrap_or_default());
+            // `updated_height` is a BLOCK, so it prints as a height — this
+            // search has no tip to count back from.
+            let updated = height_label_short(row["updated_height"].as_i64().unwrap_or(0));
+            hits.push(ExplorerHit {
+                kind: "task".into(),
+                code: "tk".into(),
+                title,
+                snippet: (*label).to_string(),
+                meta: format!("{author} · tasks · {updated}"),
+                target: id,
+            });
+        }
+    }
+    hits
 }
 
 /// The forge half of the workspace search: every repo's tracker, filtered on
@@ -9436,5 +10129,169 @@ mod tests {
             panic!("competing edits must conflict");
         };
         assert_eq!(paths, vec!["a.txt".to_string()]);
+    }
+
+    /// A bare mirror carrying one `main` commit, in the shape the browse
+    /// readers take it: a born branch they can resolve by default. A path with
+    /// one slash lands in a real subtree, which `mirror_commit`'s flat
+    /// treebuilder cannot express.
+    fn browsable_mirror(dir: &tempfile::TempDir, files: &[(&str, &str)]) -> git2::Repository {
+        let mirror = git2::Repository::init_bare(dir.path()).unwrap();
+        let mut root_files: Vec<(String, git2::Oid)> = Vec::new();
+        let mut subtrees: BTreeMap<String, Vec<(String, git2::Oid)>> = BTreeMap::new();
+        for (path, contents) in files {
+            let blob = mirror.blob(contents.as_bytes()).unwrap();
+            match path.split_once('/') {
+                Some((directory, name)) => subtrees
+                    .entry(directory.to_string())
+                    .or_default()
+                    .push((name.to_string(), blob)),
+                None => root_files.push(((*path).to_string(), blob)),
+            }
+        }
+        let mut root = mirror.treebuilder(None).unwrap();
+        for (name, blob) in root_files {
+            root.insert(&name, blob, 0o100644).unwrap();
+        }
+        for (directory, entries) in subtrees {
+            let mut sub = mirror.treebuilder(None).unwrap();
+            for (name, blob) in entries {
+                sub.insert(&name, blob, 0o100644).unwrap();
+            }
+            let oid = sub.write().unwrap();
+            root.insert(&directory, oid, 0o040000).unwrap();
+        }
+        let tree = mirror.find_tree(root.write().unwrap()).unwrap();
+        let signature = git2::Signature::now("mule", "mule@localhost").unwrap();
+        let head = mirror
+            .commit(None, &signature, &signature, "seed", &tree, &[])
+            .unwrap();
+        let commit = mirror.find_commit(head).unwrap();
+        mirror.branch("main", &commit, true).unwrap();
+        mirror
+    }
+
+    #[test]
+    fn tree_listing_puts_directories_first_and_sizes_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = browsable_mirror(
+            &dir,
+            &[
+                ("zebra.rs", "fn main() {}\n"),
+                ("src/lib.rs", "pub fn one() {}\n"),
+                ("alpha.md", "# title\n"),
+            ],
+        );
+
+        let root = read_tree(&mirror, "main", "").unwrap();
+        let names: Vec<&str> = root.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["src", "alpha.md", "zebra.rs"]);
+        assert_eq!(root[0].kind, "dir");
+        assert_eq!(root[0].size, 0);
+        assert_eq!(root[1].size, "# title\n".len() as i64);
+
+        // an empty rev resolves to the default branch, and a nested path lists
+        // that subtree with full paths.
+        let nested = read_tree(&mirror, "", "src").unwrap();
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].path, "src/lib.rs");
+        assert_eq!(nested[0].kind, "file");
+    }
+
+    #[test]
+    fn blob_read_counts_lines_and_names_binary_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = browsable_mirror(
+            &dir,
+            &[("a.txt", "one\ntwo\n"), ("bin.dat", "head\0tail")],
+        );
+
+        let text = read_blob(
+            &mirror,
+            "repo".into(),
+            "main".into(),
+            "a.txt".into(),
+            7,
+        )
+        .unwrap();
+        assert_eq!(text.generation, 7);
+        assert_eq!(text.lines, 2);
+        assert!(!text.binary && !text.truncated);
+
+        let binary = read_blob(
+            &mirror,
+            "repo".into(),
+            "main".into(),
+            "bin.dat".into(),
+            7,
+        )
+        .unwrap();
+        assert!(binary.binary, "a NUL byte marks the blob binary");
+        assert_eq!(binary.lines, 0);
+
+        let missing = read_blob(&mirror, "repo".into(), "main".into(), "nope".into(), 7);
+        assert!(missing.is_err(), "a path that is not there must not read empty");
+    }
+
+    #[test]
+    fn about_skips_headings_and_badges_and_names_the_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = browsable_mirror(
+            &dir,
+            &[
+                (
+                    "README.md",
+                    "# ducktape\n\n[![badge](x)](y)\n\nThe consensus core.\nMore prose.\n",
+                ),
+                ("a.rs", "fn a() {}\n"),
+                ("b.rs", "fn b() {}\n"),
+                ("c.rs", "fn c() {}\n"),
+            ],
+        );
+        let commit = mirror_commit_at(&mirror, "").unwrap();
+
+        assert_eq!(readme_about(&mirror, &commit), "The consensus core.");
+        assert_eq!(dominant_language(&commit), "Rust");
+    }
+
+    #[test]
+    fn about_is_empty_without_a_readme_rather_than_invented() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = browsable_mirror(&dir, &[("a.rs", "fn a() {}\n")]);
+        let commit = mirror_commit_at(&mirror, "").unwrap();
+
+        assert!(readme_about(&mirror, &commit).is_empty());
+    }
+
+    #[test]
+    fn bell_severity_projects_the_kind_and_defaults_to_info() {
+        assert_eq!(bell_severity("run_failed".into()), "error");
+        assert_eq!(bell_severity("review_requested".into()), "warn");
+        assert_eq!(bell_severity("mentioned".into()), "info");
+        // an unnamed kind is a notice, never an alarm.
+        assert_eq!(bell_severity("brand_new_kind".into()), "info");
+    }
+
+    #[test]
+    fn bell_badge_takes_the_worst_unread_severity() {
+        let item = |seq: i64, kind: &str, read: bool| BellItem {
+            seq,
+            kind: kind.into(),
+            body: String::new(),
+            source: String::new(),
+            height: 0,
+            read,
+        };
+
+        assert_eq!(
+            bell_worst_severity(vec![item(1, "mentioned", false), item(2, "run_failed", false)]),
+            "error"
+        );
+        // a READ error does not keep the badge red.
+        assert_eq!(
+            bell_worst_severity(vec![item(1, "run_failed", true), item(2, "review_requested", false)]),
+            "warn"
+        );
+        assert_eq!(bell_worst_severity(Vec::new()), "info");
     }
 }
