@@ -375,9 +375,16 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SyncClient for ServeLaneBlobC
 /// it costs one `stat` per tick when nothing is outstanding.
 const PACK_SWEEP_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// the largest forge pack this lane will pull. one push's object closure —
-/// generous, and bounded so a lying source cannot make us stage forever.
-pub const MAX_FORGE_PACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// the largest forge pack this lane will pull — the smart-HTTP push lane's own
+/// body limit (`GIT_PACK_BODY_LIMIT`), because that is the ceiling on a pack
+/// that could legitimately have reached consensus in the first place.
+///
+/// The bound is load-bearing, not tidiness. A digest here was chosen by whoever
+/// submitted the push; naming an enormous blob some colluding node will serve
+/// would otherwise have every node in the network stage it, every tick, before
+/// the hash check could reject it. Sizing the cap to what a real push can be
+/// keeps that to one legitimate pack's worth of disk.
+pub const MAX_FORGE_PACK_BYTES: u64 = 512 * 1024 * 1024;
 
 /// pull the packs forge is waiting on, forever.
 ///
