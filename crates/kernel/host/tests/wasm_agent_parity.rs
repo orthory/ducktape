@@ -471,6 +471,9 @@ async fn same_ops_inner(context: &deterministic::Context) {
     // at the agent module; the terminal result's same-block callback must be
     // swallowed as a no-op breadcrumb on BOTH runtimes (the agent root holds
     // through both blocks — the trigger's, and the callback's).
+    // saga's id space is namespaced per trigger origin, so the stranger's
+    // dead letter can only live under the stranger's own namespace.
+    let dead_letter = saga::namespaced_id(&stranger, "dead-letter");
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
     for host in [&mut native, &mut wasm] {
         host.submit_at(
@@ -478,7 +481,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
             Msg {
                 target: "saga".into(),
                 payload: saga_encode_msg(&SagaMsg::Trigger {
-                    saga_id: "dead-letter".into(),
+                    saga_id: dead_letter.clone(),
                     spec: b"noise".to_vec(),
                     reply_to: Some("agent".into()),
                     reply_payload: b"corr".to_vec(),
@@ -500,7 +503,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
             Msg {
                 target: "saga".into(),
                 payload: saga_encode_msg(&SagaMsg::OracleResult {
-                    saga_id: "dead-letter".into(),
+                    saga_id: dead_letter.clone(),
                     attempt: 0,
                     outcome: Ok(b"done".to_vec()),
                     usage: None,
@@ -515,7 +518,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
             Msg {
                 target: "saga".into(),
                 payload: saga_encode_msg(&SagaMsg::OracleResult {
-                    saga_id: "dead-letter".into(),
+                    saga_id: dead_letter.clone(),
                     attempt: 0,
                     outcome: Ok(b"done".to_vec()),
                     usage: None,

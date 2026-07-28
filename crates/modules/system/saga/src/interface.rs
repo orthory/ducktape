@@ -34,8 +34,34 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// a saga's stable id, chosen by the trigger.
+/// a saga's stable id, chosen by the trigger — inside the trigger's OWN
+/// namespace (see [`namespaced_id`]).
 pub type SagaId = String;
+
+/// compose the only saga id a given origin may trigger: its own actor
+/// namespace ([`sdk::Origin::actor_string`] — a module id verbatim,
+/// `ext:<hex>` for an external submitter, `system`), then [`sdk::KEY_SEP`],
+/// then the caller's local id.
+///
+/// the id space is OWNED, not first-come: a saga id is a public handle other
+/// components re-derive (dispatch's `dispatch{SEP}{receiver}{SEP}{id}`, and
+/// `runs`' mirror of it), so an unowned space lets any member SQUAT a
+/// predictable id ahead of its producer. the producer's own trigger would
+/// then hit the duplicate no-op and its work would sit at `Pending` forever,
+/// under the squatter's `Cancel`/`Prune`. the namespace makes the id prove
+/// who created it, and [`SagaMsg::Trigger`] enforces it.
+pub fn namespaced_id(origin: &sdk::Origin, local_id: &str) -> SagaId {
+    format!("{}{}{local_id}", origin.actor_string(), sdk::KEY_SEP)
+}
+
+/// true when `saga_id` sits inside `origin`'s own namespace — the exact
+/// admission [`SagaMsg::Trigger`] applies, factored out so producers and
+/// tests can ask the same question without rebuilding the string.
+pub fn owns_id(origin: &sdk::Origin, saga_id: &str) -> bool {
+    saga_id
+        .strip_prefix(&origin.actor_string())
+        .is_some_and(|rest| rest.starts_with(sdk::KEY_SEP))
+}
 
 /// hard cap on an accepted oracle result's byte length — a consensus constant,
 /// enforced at execute time so an oversized result can never commit into the
@@ -125,6 +151,9 @@ pub enum SagaMsg {
     /// must name a registered module (validated at trigger time — the
     /// callback-poison rule) and `max_attempts` must be >= 1.
     Trigger {
+        /// must sit in the trigger origin's OWN namespace ([`namespaced_id`]);
+        /// a trigger for anyone else's namespace is REJECTED, so the duplicate
+        /// no-op above can only ever swallow the id owner's own retrigger.
         saga_id: SagaId,
         /// opaque work spec (e.g. a dispatch WorkSpec), echoed to the worker.
         spec: Vec<u8>,

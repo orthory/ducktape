@@ -185,7 +185,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
                 target: "saga".into(),
                 payload: saga_encode_msg(&SagaMsg::Trigger {
                     pinned_assignee: None,
-                    saga_id: "greet".into(),
+                    saga_id: saga::namespaced_id(&sdk::Origin::System, "greet"),
                     spec: b"reverse hello".to_vec(),
                     reply_to: None,
                     reply_payload: Vec::new(),

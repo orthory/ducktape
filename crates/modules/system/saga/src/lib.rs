@@ -757,6 +757,19 @@ impl Module for SagaModule {
                 demands,
                 pinned_assignee,
             } => {
+                // the id space is OWNED: a trigger may only write inside its
+                // own actor namespace. checked FIRST, because the duplicate
+                // no-op below is what a squatter weaponizes — without this,
+                // any member could trigger a predictable id (dispatch's
+                // `dispatch{SEP}{receiver}{SEP}{id}`) ahead of its producer,
+                // whose own trigger would then no-op, wedging the work at
+                // Pending forever under the squatter's Cancel/Prune.
+                if !owns_id(&ctx.env().origin, &saga_id) {
+                    return Err(Error::Module(format!(
+                        "trigger saga_id must be in the trigger's own namespace {:?}",
+                        ctx.env().origin.actor_string()
+                    )));
+                }
                 // a duplicate saga_id — staged this block or already committed
                 // — is a DETERMINISTIC NO-OP. (v1 silently reset the saga and
                 // re-fired the worker, letting any later trigger clobber an
@@ -1004,12 +1017,7 @@ impl Module for SagaModule {
                 let Some(next) = next else {
                     return Err(Error::Module("no alternate assignee is available".into()));
                 };
-                self.cancel_attempt(
-                    ctx,
-                    &saga_id,
-                    old_attempt,
-                    old_assignee.as_deref(),
-                );
+                self.cancel_attempt(ctx, &saga_id, old_attempt, old_assignee.as_deref());
                 self.request_assigned(ctx, saga_id, saga, Some(next));
             }
             SagaMsg::Accept { saga_id, attempt } => {
@@ -1088,33 +1096,18 @@ impl Module for SagaModule {
                     if deadline_hit {
                         // the whole-saga deadline dominates the lease: no
                         // retry may outlive it.
-                        self.cancel_attempt(
-                            ctx,
-                            &saga_id,
-                            old_attempt,
-                            old_assignee.as_deref(),
-                        );
+                        self.cancel_attempt(ctx, &saga_id, old_attempt, old_assignee.as_deref());
                         saga.status = SagaStatus::TimedOut;
                         Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::TimedOut);
                         self.stage(saga_id, saga);
                     } else if saga.attempt + 1 < saga.max_attempts {
                         // an expired lease consumes the attempt and re-leases.
-                        self.cancel_attempt(
-                            ctx,
-                            &saga_id,
-                            old_attempt,
-                            old_assignee.as_deref(),
-                        );
+                        self.cancel_attempt(ctx, &saga_id, old_attempt, old_assignee.as_deref());
                         saga.attempt += 1;
                         self.lease_and_request(ctx, saga_id, saga).await;
                     } else {
                         let error = "lease attempts exhausted".to_string();
-                        self.cancel_attempt(
-                            ctx,
-                            &saga_id,
-                            old_attempt,
-                            old_assignee.as_deref(),
-                        );
+                        self.cancel_attempt(ctx, &saga_id, old_attempt, old_assignee.as_deref());
                         saga.status = SagaStatus::Failed;
                         saga.error = Some(error.clone());
                         Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::Failed(error));
@@ -1136,12 +1129,7 @@ impl Module for SagaModule {
                     return Ok(());
                 }
                 let mut saga = current.clone();
-                self.cancel_attempt(
-                    ctx,
-                    &saga_id,
-                    saga.attempt,
-                    saga.assignee.as_deref(),
-                );
+                self.cancel_attempt(ctx, &saga_id, saga.attempt, saga.assignee.as_deref());
                 saga.status = SagaStatus::Cancelled;
                 saga.updated_at = ctx.env().consensus_time;
                 Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::Cancelled);
@@ -1260,8 +1248,8 @@ impl Module for SagaModule {
 mod tests {
     use super::*;
     use crate::{
-        decode_callback, decode_reply, decode_worker_control, decode_worker_request,
-        encode_msg, encode_query, encode_worker_control,
+        decode_callback, decode_reply, decode_worker_control, decode_worker_request, encode_msg,
+        encode_query, encode_worker_control,
     };
     use futures::executor::block_on;
     use sdk::{Env, Event};
@@ -1337,9 +1325,7 @@ mod tests {
             self.events
                 .iter()
                 .filter(|event| decode_worker_control(&event.payload).is_err())
-                .map(|event| {
-                    decode_worker_request(&event.payload).expect("worker request payload")
-                })
+                .map(|event| decode_worker_request(&event.payload).expect("worker request payload"))
                 .collect()
         }
         fn worker_controls(&self) -> Vec<WorkerControl> {
@@ -1393,6 +1379,15 @@ mod tests {
             self.trace.push("event");
             self.events.push(ev);
         }
+    }
+
+    /// the SYSTEM-namespaced form of a short scenario id. every trigger id is
+    /// owned by its origin's namespace, and `CaptureCtx`'s default origin is
+    /// `System`, so scenarios that are not ABOUT the origin keep short ids and
+    /// let the helpers namespace them exactly as `Trigger` demands. a scenario
+    /// that triggers under another origin builds its ids with `namespaced_id`.
+    fn sid(id: &str) -> String {
+        namespaced_id(&Origin::System, id)
     }
 
     /// a trigger with fire-and-forget defaults; tests override fields inline.
@@ -1490,7 +1485,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "job".into(),
+                saga_id: sid("job"),
                 spec: b"the work spec".to_vec(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -1527,7 +1522,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Accept {
-                saga_id: "job".into(),
+                saga_id: sid("job"),
                 attempt: 0,
             }),
         )
@@ -1546,7 +1541,7 @@ mod tests {
 
     #[test]
     fn worker_control_codec_is_versioned_and_disjoint_from_worker_requests() {
-        let control = WorkerControl::cancel_attempt("s1".into(), 2, b"node-a".to_vec());
+        let control = WorkerControl::cancel_attempt(sid("s1"), 2, b"node-a".to_vec());
         let bytes = encode_worker_control(&control);
         assert_eq!(decode_worker_control(&bytes).unwrap(), control);
         assert!(
@@ -1562,7 +1557,7 @@ mod tests {
         assert!(decode_worker_control(&encode_worker_control(&wrong)).is_err());
 
         let request = WorkerRequest {
-            saga_id: "s1".into(),
+            saga_id: sid("s1"),
             attempt: 2,
             spec: b"work".to_vec(),
             deadline: None,
@@ -1577,17 +1572,15 @@ mod tests {
     fn an_unassigned_cancel_emits_no_worker_control() {
         let mut m = SagaModule::new("saga");
         let mut ctx = CaptureCtx::new();
-        exec(&mut m, &mut ctx, &trigger("s1", b"work")).unwrap();
+        exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"work")).unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, "s1").unwrap().assignee, None);
+        assert_eq!(get(&m, &sid("s1")).unwrap().assignee, None);
 
         let mut ctx = CaptureCtx::new();
         exec(
             &mut m,
             &mut ctx,
-            &msg(&SagaMsg::Cancel {
-                saga_id: "s1".into(),
-            }),
+            &msg(&SagaMsg::Cancel { saga_id: sid("s1") }),
         )
         .unwrap();
         assert!(ctx.worker_controls().is_empty());
@@ -1604,7 +1597,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: b"hello".to_vec(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -1621,7 +1614,7 @@ mod tests {
         assert_eq!(
             ctx.worker_requests(),
             vec![WorkerRequest {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 attempt: 0,
                 spec: b"hello".to_vec(),
                 deadline: Some(99),
@@ -1631,7 +1624,7 @@ mod tests {
         );
 
         // read-your-writes shows Pending before commit; root only moves on commit.
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.status, SagaStatus::Pending);
         assert_eq!(v.attempt, 0);
         assert_eq!(v.max_attempts, 3);
@@ -1650,22 +1643,18 @@ mod tests {
     fn duplicate_trigger_is_a_deterministic_no_op() {
         let mut m = SagaModule::new("saga");
         let mut ctx = CaptureCtx::new();
-        exec(&mut m, &mut ctx, &trigger("s1", b"first")).unwrap();
+        exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"first")).unwrap();
 
         // a STAGED duplicate in the same block: no reset, no second effect.
-        exec(&mut m, &mut ctx, &trigger("s1", b"second")).unwrap();
-        assert_eq!(
-            ctx.events.len(),
-            1,
-            "a staged duplicate re-fires no worker"
-        );
-        assert_eq!(get(&m, "s1").unwrap().spec, b"first".to_vec());
+        exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"second")).unwrap();
+        assert_eq!(ctx.events.len(), 1, "a staged duplicate re-fires no worker");
+        assert_eq!(get(&m, &sid("s1")).unwrap().spec, b"first".to_vec());
         commit(&mut m);
         let committed_root = m.root();
 
         // a COMMITTED duplicate in a later block: root unchanged, no effect.
         let mut ctx2 = CaptureCtx::new().at(7);
-        exec(&mut m, &mut ctx2, &trigger("s1", b"third")).unwrap();
+        exec(&mut m, &mut ctx2, &trigger(&sid("s1"), b"third")).unwrap();
         assert!(
             ctx2.events.is_empty(),
             "a committed duplicate re-fires no worker"
@@ -1677,9 +1666,45 @@ mod tests {
             "a duplicate trigger is a no-op — root unchanged"
         );
         assert_eq!(
-            get(&m, "s1").unwrap().spec,
+            get(&m, &sid("s1")).unwrap().spec,
             b"first".to_vec(),
             "the original spec survives"
+        );
+    }
+
+    /// the duplicate no-op above is only safe because the id space is OWNED.
+    /// a member CANNOT squat a predictable producer id (dispatch's
+    /// `dispatch{SEP}{receiver}{SEP}{id}`) ahead of its producer and wedge the
+    /// work at Pending under a foreign Cancel/Prune — and the producer's own
+    /// trigger still lands afterwards, because the squat never committed.
+    #[test]
+    fn a_member_cannot_trigger_into_another_principal_namespace() {
+        let mallory = Origin::External(b"mallory".to_vec());
+        let dispatch = Origin::Module("dispatch".into());
+        let squatted = namespaced_id(&dispatch, "chat\u{1f}run-7");
+
+        let mut m = SagaModule::new("saga");
+        let mut ctx = CaptureCtx::new().with_origin(mallory.clone());
+        let err = exec(&mut m, &mut ctx, &trigger(&squatted, b"squat")).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("own namespace"),
+            "the squat is refused: {err:?}"
+        );
+        assert!(ctx.events.is_empty(), "a refused trigger fires no worker");
+        commit(&mut m);
+        assert_eq!(get(&m, &squatted), None, "the squat staged nothing");
+
+        // mallory's OWN namespace is hers, and the producer's id is still free.
+        let mine = namespaced_id(&mallory, "run-7");
+        let mut ctx = CaptureCtx::new().with_origin(mallory);
+        exec(&mut m, &mut ctx, &trigger(&mine, b"mine")).unwrap();
+        let mut ctx = CaptureCtx::new().with_origin(dispatch);
+        exec(&mut m, &mut ctx, &trigger(&squatted, b"real")).unwrap();
+        commit(&mut m);
+        assert_eq!(
+            get(&m, &squatted).unwrap().spec,
+            b"real".to_vec(),
+            "the producer's own trigger lands"
         );
     }
 
@@ -1692,7 +1717,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: Vec::new(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -1706,7 +1731,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Module(_)));
         assert!(ctx.events.is_empty(), "a rejected trigger fires no worker");
-        assert_eq!(get(&m, "s1"), None);
+        assert_eq!(get(&m, &sid("s1")), None);
     }
 
     #[test]
@@ -1720,7 +1745,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: Vec::new(),
                 reply_to: Some("nope".into()),
                 reply_payload: Vec::new(),
@@ -1736,7 +1761,7 @@ mod tests {
             matches!(err, Error::Module(_)),
             "unknown reply_to rejects at trigger"
         );
-        assert_eq!(get(&m, "s1"), None, "no saga was staged");
+        assert_eq!(get(&m, &sid("s1")), None, "no saga was staged");
 
         // a self-targeting callback can never decode: equally poison.
         let err = exec(
@@ -1744,7 +1769,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s2".into(),
+                saga_id: sid("s2"),
                 spec: Vec::new(),
                 reply_to: Some("saga".into()),
                 reply_payload: Vec::new(),
@@ -1767,7 +1792,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s3".into(),
+                saga_id: sid("s3"),
                 spec: Vec::new(),
                 reply_to: Some("agent".into()),
                 reply_payload: Vec::new(),
@@ -1779,7 +1804,10 @@ mod tests {
             }),
         )
         .unwrap();
-        assert_eq!(get(&m, "s3").unwrap().reply_to, Some("agent".to_string()));
+        assert_eq!(
+            get(&m, &sid("s3")).unwrap().reply_to,
+            Some("agent".to_string())
+        );
     }
 
     #[test]
@@ -1791,7 +1819,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: b"work".to_vec(),
                 reply_to: Some("agent".into()),
                 reply_payload: b"corr-7".to_vec(),
@@ -1807,10 +1835,15 @@ mod tests {
         let pending_root = m.root();
 
         let mut ctx = CaptureCtx::new().at(5).knowing("agent");
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"answer".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 0, Ok(b"answer".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
 
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.status, SagaStatus::Done);
         assert_eq!(v.result, Some(b"answer".to_vec()));
         assert_eq!(v.updated_at, 5);
@@ -1822,7 +1855,7 @@ mod tests {
         assert_eq!(
             ctx.callbacks(),
             vec![SagaCallback {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 payload: b"corr-7".to_vec(),
                 outcome: SagaOutcome::Done(b"answer".to_vec()),
             }]
@@ -1838,7 +1871,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: b"work".to_vec(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -1858,11 +1891,11 @@ mod tests {
         exec(
             &mut m,
             &mut ctx,
-            &oracle("s1", 0, Err("worker crashed".into())),
+            &oracle(&sid("s1"), 0, Err("worker crashed".into())),
         )
         .unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(
             v.status,
             SagaStatus::Pending,
@@ -1884,11 +1917,11 @@ mod tests {
         exec(
             &mut m,
             &mut ctx,
-            &oracle("s1", 1, Ok(b"recovered".to_vec())),
+            &oracle(&sid("s1"), 1, Ok(b"recovered".to_vec())),
         )
         .unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.status, SagaStatus::Done);
         assert_eq!(v.result, Some(b"recovered".to_vec()));
         assert_eq!(v.attempt, 1);
@@ -1903,7 +1936,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: Vec::new(),
                 reply_to: Some("agent".into()),
                 reply_payload: b"c".to_vec(),
@@ -1918,9 +1951,9 @@ mod tests {
         commit(&mut m);
 
         let mut ctx = CaptureCtx::new().knowing("agent");
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Err("boom".into()))).unwrap();
+        exec(&mut m, &mut ctx, &oracle(&sid("s1"), 0, Err("boom".into()))).unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.status, SagaStatus::Failed);
         assert_eq!(v.error, Some("boom".to_string()));
         assert!(
@@ -1930,7 +1963,7 @@ mod tests {
         assert_eq!(
             ctx.callbacks(),
             vec![SagaCallback {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 payload: b"c".to_vec(),
                 outcome: SagaOutcome::Failed("boom".into()),
             }],
@@ -1947,7 +1980,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: Vec::new(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -1964,29 +1997,44 @@ mod tests {
         // fail attempt 0 -> now on attempt 1. a STALE result for attempt 0
         // (an executor that lost its lease) must be a no-op.
         let mut ctx = CaptureCtx::new();
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Err("slow".into()))).unwrap();
+        exec(&mut m, &mut ctx, &oracle(&sid("s1"), 0, Err("slow".into()))).unwrap();
         commit(&mut m);
         let retry_root = m.root();
         let mut ctx = CaptureCtx::new();
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"stale".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 0, Ok(b"stale".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
         assert_eq!(
             m.root(),
             retry_root,
             "a stale-attempt result is a no-op — root unchanged"
         );
-        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+        assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Pending);
 
         // land attempt 1, then a DUPLICATE result must not overwrite it.
         let mut ctx = CaptureCtx::new();
-        exec(&mut m, &mut ctx, &oracle("s1", 1, Ok(b"first".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 1, Ok(b"first".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
         let done_root = m.root();
         let mut ctx = CaptureCtx::new();
-        exec(&mut m, &mut ctx, &oracle("s1", 1, Ok(b"second".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 1, Ok(b"second".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
         assert_eq!(
-            get(&m, "s1").unwrap().result,
+            get(&m, &sid("s1")).unwrap().result,
             Some(b"first".to_vec()),
             "first agreed result wins"
         );
@@ -1998,7 +2046,12 @@ mod tests {
 
         // and a result for an UNKNOWN saga is equally a no-op.
         let mut ctx = CaptureCtx::new();
-        exec(&mut m, &mut ctx, &oracle("ghost", 0, Ok(b"x".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("ghost"), 0, Ok(b"x".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
         assert_eq!(m.root(), done_root);
     }
@@ -2017,7 +2070,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: vec![0u8; MAX_SPEC_BYTES + 1],
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -2041,7 +2094,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: b"w".to_vec(),
                 reply_to: None,
                 reply_payload: vec![0u8; MAX_REPLY_PAYLOAD_BYTES + 1],
@@ -2063,23 +2116,28 @@ mod tests {
 
         // an oversized Err string aborts instead of committing into the root.
         let mut ctx = CaptureCtx::new();
-        exec(&mut m, &mut ctx, &trigger("s1", b"w")).unwrap();
+        exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"w")).unwrap();
         commit(&mut m);
         let pending_root = m.root();
         let mut ctx = CaptureCtx::new();
         let huge = "e".repeat(MAX_ERROR_BYTES + 1);
-        let err = exec(&mut m, &mut ctx, &oracle("s1", 0, Err(huge))).unwrap_err();
+        let err = exec(&mut m, &mut ctx, &oracle(&sid("s1"), 0, Err(huge))).unwrap_err();
         assert!(matches!(err, Error::Module(_)), "oversized error errs");
         block_on(m.abort_block()).unwrap();
         assert_eq!(m.root(), pending_root, "the aborted block left no trace");
-        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+        assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Pending);
 
         // boundary sizes are accepted: an at-cap Err lands as Failed.
         let mut ctx = CaptureCtx::new();
         let at_cap = "e".repeat(MAX_ERROR_BYTES);
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Err(at_cap.clone()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 0, Err(at_cap.clone())),
+        )
+        .unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.status, SagaStatus::Failed);
         assert_eq!(v.error, Some(at_cap));
     }
@@ -2088,7 +2146,7 @@ mod tests {
     fn oversized_result_aborts_and_the_boundary_is_accepted() {
         let mut m = SagaModule::new("saga");
         let mut ctx = CaptureCtx::new();
-        exec(&mut m, &mut ctx, &trigger("s1", b"w")).unwrap();
+        exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"w")).unwrap();
         commit(&mut m);
         let pending_root = m.root();
 
@@ -2098,7 +2156,7 @@ mod tests {
         let err = exec(
             &mut m,
             &mut ctx,
-            &oracle("s1", 0, Ok(vec![0u8; MAX_RESULT_BYTES + 1])),
+            &oracle(&sid("s1"), 0, Ok(vec![0u8; MAX_RESULT_BYTES + 1])),
         )
         .unwrap_err();
         assert!(
@@ -2107,18 +2165,18 @@ mod tests {
         );
         block_on(m.abort_block()).unwrap();
         assert_eq!(m.root(), pending_root, "the aborted block left no trace");
-        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+        assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Pending);
 
         // exactly the cap is accepted.
         let mut ctx = CaptureCtx::new();
         exec(
             &mut m,
             &mut ctx,
-            &oracle("s1", 0, Ok(vec![0u8; MAX_RESULT_BYTES])),
+            &oracle(&sid("s1"), 0, Ok(vec![0u8; MAX_RESULT_BYTES])),
         )
         .unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.status, SagaStatus::Done);
         assert_eq!(v.result.unwrap().len(), MAX_RESULT_BYTES);
     }
@@ -2135,7 +2193,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: Vec::new(),
                 reply_to: Some("agent".into()),
                 reply_payload: Vec::new(),
@@ -2150,7 +2208,7 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
-        let assignee = get(&m, "s1").unwrap().assignee.unwrap();
+        let assignee = get(&m, &sid("s1")).unwrap().assignee.unwrap();
 
         // before the deadline (and before the lease expires) a crank is a
         // strict no-op: root byte-identical.
@@ -2170,7 +2228,7 @@ mod tests {
         let mut ctx = CaptureCtx::new().at(10).knowing("agent");
         exec(&mut m, &mut ctx, &crank()).unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(
             v.status,
             SagaStatus::TimedOut,
@@ -2179,7 +2237,7 @@ mod tests {
         assert_eq!(v.attempt, 0, "a timeout consumes no attempt");
         assert_eq!(
             ctx.worker_controls(),
-            vec![WorkerControl::cancel_attempt("s1".into(), 0, assignee)],
+            vec![WorkerControl::cancel_attempt(sid("s1"), 0, assignee)],
             "the timed-out attempt is stopped without issuing replacement work"
         );
         assert_eq!(
@@ -2190,7 +2248,7 @@ mod tests {
         assert_eq!(
             ctx.callbacks(),
             vec![SagaCallback {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 payload: Vec::new(),
                 outcome: SagaOutcome::TimedOut,
             }]
@@ -2209,7 +2267,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: b"w".to_vec(),
                 reply_to: Some("agent".into()),
                 reply_payload: Vec::new(),
@@ -2222,18 +2280,16 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
-        let first = get(&m, "s1").unwrap();
+        let first = get(&m, &sid("s1")).unwrap();
         assert_eq!(first.lease_expires_at, Some(5));
         let assignee = first.assignee.unwrap();
 
         // first expiry: attempts remain, so the crank re-leases and re-asks
         // the worker under attempt 1.
-        let mut ctx = CaptureCtx::new()
-            .at(5)
-            .with_validators(validators.clone());
+        let mut ctx = CaptureCtx::new().at(5).with_validators(validators.clone());
         exec(&mut m, &mut ctx, &crank()).unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.status, SagaStatus::Pending);
         assert_eq!(v.attempt, 1);
         assert_eq!(
@@ -2247,7 +2303,7 @@ mod tests {
         assert_eq!(
             ctx.worker_controls(),
             vec![WorkerControl::cancel_attempt(
-                "s1".into(),
+                sid("s1"),
                 0,
                 assignee.clone()
             )]
@@ -2260,12 +2316,12 @@ mod tests {
         let mut ctx = CaptureCtx::new().at(10);
         exec(&mut m, &mut ctx, &crank()).unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.status, SagaStatus::Failed);
         assert_eq!(v.error, Some("lease attempts exhausted".to_string()));
         assert_eq!(
             ctx.worker_controls(),
-            vec![WorkerControl::cancel_attempt("s1".into(), 1, assignee)]
+            vec![WorkerControl::cancel_attempt(sid("s1"), 1, assignee)]
         );
         assert_eq!(ctx.events.len(), 1, "exhaustion issues no replacement");
         assert_eq!(ctx.trace, vec!["event", "msg"]);
@@ -2273,6 +2329,9 @@ mod tests {
 
     #[test]
     fn assignee_renews_and_requester_reassigns_with_attempt_fencing() {
+        // the requester here is the dispatch MODULE, so every id in the
+        // scenario lives in the `dispatch` namespace, not the default `system`.
+        let sid = |id: &str| namespaced_id(&Origin::Module("dispatch".into()), id);
         let validators = vec![b"node-a".to_vec(), b"node-b".to_vec()];
         let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
         let mut ctx = CaptureCtx::new()
@@ -2282,7 +2341,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: b"w".to_vec(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -2296,7 +2355,7 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
-        let first = get(&m, "s1").unwrap().assignee.unwrap();
+        let first = get(&m, &sid("s1")).unwrap().assignee.unwrap();
 
         let mut ctx = CaptureCtx::new()
             .at(4)
@@ -2306,13 +2365,13 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::RenewLease {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 attempt: 0,
             }),
         )
         .unwrap();
         commit(&mut m);
-        let view = get(&m, "s1").unwrap();
+        let view = get(&m, &sid("s1")).unwrap();
         assert_eq!(view.lease_expires_at, Some(10));
         assert_eq!(view.updated_at, 4, "every valid heartbeat is observable");
 
@@ -2324,13 +2383,13 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::RenewLease {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 attempt: 0,
             }),
         )
         .unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, "s1").unwrap().lease_expires_at, Some(15));
+        assert_eq!(get(&m, &sid("s1")).unwrap().lease_expires_at, Some(15));
 
         let before = m.root();
         let mut ctx = CaptureCtx::new()
@@ -2341,7 +2400,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Reassign {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 attempt: 0,
             }),
         )
@@ -2358,22 +2417,24 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Reassign {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 attempt: 0,
             }),
         )
         .unwrap();
         commit(&mut m);
-        let view = get(&m, "s1").unwrap();
+        let view = get(&m, &sid("s1")).unwrap();
         assert_eq!(view.attempt, 1);
         assert_ne!(view.assignee.as_deref(), Some(first.as_slice()));
         assert_eq!(ctx.events.len(), 2);
         assert_eq!(
             decode_worker_control(&ctx.events[0].payload).unwrap(),
-            WorkerControl::cancel_attempt("s1".into(), 0, first.clone())
+            WorkerControl::cancel_attempt(sid("s1"), 0, first.clone())
         );
         assert_eq!(
-            decode_worker_request(&ctx.events[1].payload).unwrap().attempt,
+            decode_worker_request(&ctx.events[1].payload)
+                .unwrap()
+                .attempt,
             1
         );
         assert_eq!(ctx.worker_requests()[0].attempt, 1);
@@ -2387,7 +2448,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Reassign {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 attempt: 0,
             }),
         )
@@ -2400,7 +2461,12 @@ mod tests {
             .at(9)
             .with_origin(Origin::External(first))
             .with_validators(validators);
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"stale".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 0, Ok(b"stale".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
         assert_eq!(m.root(), fenced_root, "the revoked attempt cannot finish");
     }
@@ -2417,7 +2483,7 @@ mod tests {
                 &mut ctx,
                 &msg(&SagaMsg::Trigger {
                     pinned_assignee: None,
-                    saga_id: format!("s{i:02}"),
+                    saga_id: sid(&format!("s{i:02}")),
                     spec: Vec::new(),
                     reply_to: None,
                     reply_payload: Vec::new(),
@@ -2438,14 +2504,14 @@ mod tests {
         exec(&mut m, &mut ctx, &crank()).unwrap();
         commit(&mut m);
         let timed_out = (0..33)
-            .filter(|i| get(&m, &format!("s{i:02}")).unwrap().status == SagaStatus::TimedOut)
+            .filter(|i| get(&m, &sid(&format!("s{i:02}"))).unwrap().status == SagaStatus::TimedOut)
             .count();
         assert_eq!(
             timed_out as u32, CRANK_BUDGET,
             "one crank does exactly its budget"
         );
         assert_eq!(
-            get(&m, "s32").unwrap().status,
+            get(&m, &sid("s32")).unwrap().status,
             SagaStatus::Pending,
             "the overflow saga waits"
         );
@@ -2454,12 +2520,14 @@ mod tests {
         let mut ctx = CaptureCtx::new().at(11);
         exec(&mut m, &mut ctx, &crank()).unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, "s32").unwrap().status, SagaStatus::TimedOut);
+        assert_eq!(get(&m, &sid("s32")).unwrap().status, SagaStatus::TimedOut);
     }
 
     #[test]
     fn cancel_is_gated_to_the_trigger_origin() {
         let alice = Origin::External(b"alice".to_vec());
+        // alice triggers, so the whole scenario lives in HER namespace.
+        let sid = |id: &str| namespaced_id(&Origin::External(b"alice".to_vec()), id);
         let mallory = Origin::External(b"mallory".to_vec());
         let validators = vec![b"node-a".to_vec()];
 
@@ -2473,7 +2541,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: Vec::new(),
                 reply_to: Some("agent".into()),
                 reply_payload: Vec::new(),
@@ -2487,7 +2555,7 @@ mod tests {
         .unwrap();
         commit(&mut m);
         let pending_root = m.root();
-        let assignee = get(&m, "s1").unwrap().assignee.unwrap();
+        let assignee = get(&m, &sid("s1")).unwrap().assignee.unwrap();
 
         // a FOREIGN cancel is a no-op, not an error — a finalized foreign
         // cancel must not abort blocks.
@@ -2495,14 +2563,12 @@ mod tests {
         exec(
             &mut m,
             &mut ctx,
-            &msg(&SagaMsg::Cancel {
-                saga_id: "s1".into(),
-            }),
+            &msg(&SagaMsg::Cancel { saga_id: sid("s1") }),
         )
         .unwrap();
         commit(&mut m);
         assert_eq!(m.root(), pending_root, "a foreign cancel is a no-op");
-        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+        assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Pending);
         assert!(ctx.events.is_empty());
 
         // the trigger origin cancels: terminal + callback.
@@ -2513,16 +2579,14 @@ mod tests {
         exec(
             &mut m,
             &mut ctx,
-            &msg(&SagaMsg::Cancel {
-                saga_id: "s1".into(),
-            }),
+            &msg(&SagaMsg::Cancel { saga_id: sid("s1") }),
         )
         .unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Cancelled);
+        assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Cancelled);
         assert_eq!(
             ctx.worker_controls(),
-            vec![WorkerControl::cancel_attempt("s1".into(), 0, assignee)]
+            vec![WorkerControl::cancel_attempt(sid("s1"), 0, assignee)]
         );
         assert_eq!(
             ctx.trace,
@@ -2532,7 +2596,7 @@ mod tests {
         assert_eq!(
             ctx.callbacks(),
             vec![SagaCallback {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 payload: Vec::new(),
                 outcome: SagaOutcome::Cancelled,
             }]
@@ -2544,16 +2608,14 @@ mod tests {
         exec(
             &mut m,
             &mut ctx,
-            &msg(&SagaMsg::Cancel {
-                saga_id: "s1".into(),
-            }),
+            &msg(&SagaMsg::Cancel { saga_id: sid("s1") }),
         )
         .unwrap();
         exec(
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Cancel {
-                saga_id: "ghost".into(),
+                saga_id: sid("ghost"),
             }),
         )
         .unwrap();
@@ -2568,52 +2630,62 @@ mod tests {
         let alice = Origin::External(b"alice".to_vec());
         let mallory = Origin::External(b"mallory".to_vec());
 
+        // each id lives in ITS trigger's namespace — which is also why
+        // mallory could not have squatted one of alice's in the first place.
+        let sid = |id: &str| namespaced_id(&Origin::External(b"alice".to_vec()), id);
+        let their = |id: &str| namespaced_id(&Origin::External(b"mallory".to_vec()), id);
+
         let mut m = SagaModule::new("saga");
         // "done" and "open" belong to alice; "theirs" to mallory.
         let mut ctx = CaptureCtx::new().with_origin(alice.clone());
-        exec(&mut m, &mut ctx, &trigger("done", b"a")).unwrap();
-        exec(&mut m, &mut ctx, &trigger("open", b"b")).unwrap();
-        let mut ctx = CaptureCtx::new().with_origin(mallory);
-        exec(&mut m, &mut ctx, &trigger("theirs", b"c")).unwrap();
+        exec(&mut m, &mut ctx, &trigger(&sid("done"), b"a")).unwrap();
+        exec(&mut m, &mut ctx, &trigger(&sid("open"), b"b")).unwrap();
+        let mut ctx = CaptureCtx::new().with_origin(mallory.clone());
+        exec(&mut m, &mut ctx, &trigger(&their("theirs"), b"c")).unwrap();
         commit(&mut m);
         let mut ctx = CaptureCtx::new();
-        exec(&mut m, &mut ctx, &oracle("done", 0, Ok(b"r".to_vec()))).unwrap();
-        exec(&mut m, &mut ctx, &oracle("theirs", 0, Ok(b"r".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("done"), 0, Ok(b"r".to_vec())),
+        )
+        .unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&their("theirs"), 0, Ok(b"r".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
 
         // alice prunes everything she can name: only HER TERMINAL saga goes.
         // "open" (non-terminal), "theirs" (foreign), "ghost" (unknown) are
         // skipped as no-ops.
-        let mut ctx = CaptureCtx::new().with_origin(alice);
+        let mut ctx = CaptureCtx::new().with_origin(alice.clone());
         exec(
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Prune {
-                saga_ids: vec![
-                    "done".into(),
-                    "open".into(),
-                    "theirs".into(),
-                    "ghost".into(),
-                ],
+                saga_ids: vec![sid("done"), sid("open"), their("theirs"), sid("ghost")],
             }),
         )
         .unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, "done"), None, "own terminal saga pruned");
+        assert_eq!(get(&m, &sid("done")), None, "own terminal saga pruned");
         assert_eq!(
-            get(&m, "open").unwrap().status,
+            get(&m, &sid("open")).unwrap().status,
             SagaStatus::Pending,
             "non-terminal survives"
         );
         assert_eq!(
-            get(&m, "theirs").unwrap().status,
+            get(&m, &their("theirs")).unwrap().status,
             SagaStatus::Done,
             "foreign survives"
         );
 
         // a pruned id may be re-triggered: GC really removed it.
-        let mut ctx = CaptureCtx::new();
-        exec(&mut m, &mut ctx, &trigger("done", b"again")).unwrap();
+        let mut ctx = CaptureCtx::new().with_origin(alice);
+        exec(&mut m, &mut ctx, &trigger(&sid("done"), b"again")).unwrap();
         assert_eq!(ctx.events.len(), 1, "a pruned id triggers as new work");
     }
 
@@ -2622,12 +2694,12 @@ mod tests {
         let validators = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]];
         let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Open);
         let mut ctx = CaptureCtx::new().at(4).with_validators(validators.clone());
-        exec(&mut m, &mut ctx, &trigger("s1", b"w")).unwrap();
+        exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"w")).unwrap();
         commit(&mut m);
 
         // the trigger assigned a lease-holder from the set with the default
         // window, and advertised it in the WorkerRequest.
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         let assignee = v.assignee.clone().expect("an assignee was computed");
         assert!(
             validators.contains(&assignee),
@@ -2641,9 +2713,9 @@ mod tests {
         let mut ctx = CaptureCtx::new()
             .with_origin(outsider)
             .with_validators(validators);
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
+        exec(&mut m, &mut ctx, &oracle(&sid("s1"), 0, Ok(b"r".to_vec()))).unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Done);
+        assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Done);
     }
 
     #[test]
@@ -2651,9 +2723,9 @@ mod tests {
         let validators = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]];
         let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
         let mut ctx = CaptureCtx::new().with_validators(validators.clone());
-        exec(&mut m, &mut ctx, &trigger("s1", b"w")).unwrap();
+        exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"w")).unwrap();
         commit(&mut m);
-        let assignee = get(&m, "s1").unwrap().assignee.expect("assigned");
+        let assignee = get(&m, &sid("s1")).unwrap().assignee.expect("assigned");
         let non_assignee = validators
             .iter()
             .find(|v| **v != assignee)
@@ -2665,22 +2737,32 @@ mod tests {
         let mut ctx = CaptureCtx::new()
             .with_origin(Origin::External(non_assignee))
             .with_validators(validators.clone());
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"intruder".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 0, Ok(b"intruder".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
         assert_eq!(
             m.root(),
             pending_root,
             "a non-assignee result is a no-op under strict"
         );
-        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+        assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Pending);
 
         // the assignee's result lands.
         let mut ctx = CaptureCtx::new()
             .with_origin(Origin::External(assignee))
             .with_validators(validators);
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"legit".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 0, Ok(b"legit".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.status, SagaStatus::Done);
         assert_eq!(v.result, Some(b"legit".to_vec()));
     }
@@ -2693,9 +2775,9 @@ mod tests {
         // the winner's result counts.
         let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
         let mut ctx = CaptureCtx::new().with_validators(Vec::new());
-        exec(&mut m, &mut ctx, &trigger("s1", b"w")).unwrap();
+        exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"w")).unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.assignee, None, "an empty set assigns no one");
         assert_eq!(
             v.lease_expires_at, None,
@@ -2707,10 +2789,10 @@ mod tests {
         let mut ctx = CaptureCtx::new()
             .with_origin(Origin::External(b"anyone".to_vec()))
             .with_validators(Vec::new());
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
+        exec(&mut m, &mut ctx, &oracle(&sid("s1"), 0, Ok(b"r".to_vec()))).unwrap();
         commit(&mut m);
         assert_eq!(m.root(), pending_root, "no result lands unclaimed");
-        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+        assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Pending);
 
         // the FIRST accept claims the attempt: assignee + lease + the actual
         // work order re-emitted naming the winner.
@@ -2722,7 +2804,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Accept {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 attempt: 0,
             }),
         )
@@ -2732,7 +2814,7 @@ mod tests {
         assert_eq!(requests[0].assignee, Some(b"node-a".to_vec()));
         assert_eq!(requests[0].attempt, 0);
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.assignee, Some(b"node-a".to_vec()));
         assert_eq!(
             v.lease_expires_at,
@@ -2749,7 +2831,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Accept {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 attempt: 0,
             }),
         )
@@ -2762,15 +2844,25 @@ mod tests {
         let mut ctx = CaptureCtx::new()
             .with_origin(Origin::External(b"node-b".to_vec()))
             .with_validators(Vec::new());
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"stolen".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 0, Ok(b"stolen".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+        assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Pending);
         let mut ctx = CaptureCtx::new()
             .with_origin(Origin::External(b"node-a".to_vec()))
             .with_validators(Vec::new());
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"legit".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 0, Ok(b"legit".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.status, SagaStatus::Done);
         assert_eq!(v.result, Some(b"legit".to_vec()));
     }
@@ -2780,10 +2872,10 @@ mod tests {
         let validators = vec![vec![1u8; 32]];
         let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
         let mut ctx = CaptureCtx::new().with_validators(validators.clone());
-        exec(&mut m, &mut ctx, &trigger("assigned", b"w")).unwrap();
+        exec(&mut m, &mut ctx, &trigger(&sid("assigned"), b"w")).unwrap();
         commit(&mut m);
         assert_eq!(
-            get(&m, "assigned").unwrap().assignee,
+            get(&m, &sid("assigned")).unwrap().assignee,
             Some(validators[0].clone()),
             "a one-node pool rendezvous-assigns that node"
         );
@@ -2802,7 +2894,7 @@ mod tests {
                     &mut m,
                     &mut ctx,
                     &msg(&SagaMsg::Accept {
-                        saga_id: "assigned".into(),
+                        saga_id: sid("assigned"),
                         attempt: 0,
                     }),
                 )
@@ -2859,7 +2951,6 @@ mod tests {
             .with_capable_providers(capable)
     }
 
-
     #[test]
     fn an_unassigned_announcement_does_not_burn_the_attempt_budget() {
         // an attempt nobody holds has no lease to expire. Before this was
@@ -2869,14 +2960,15 @@ mod tests {
         // lane for a daemon to come back exhausted `max_attempts` and reached
         // `Failed` while no node had ever held it.
         let only = vec![9u8; 32];
-        let mut m = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut m =
+            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
         // the sole provider is announced at trigger time, so the attempt leases.
         let mut ctx = capability_ctx_with(vec![only.clone()], vec![only.clone()]);
         exec(
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: b"w".to_vec(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -2890,7 +2982,7 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, "s1").unwrap().assignee, Some(only.clone()));
+        assert_eq!(get(&m, &sid("s1")).unwrap().assignee, Some(only.clone()));
 
         // the provider's daemon dies and its node retracts the announce, so the
         // pool is empty from here on. The expired lease consumes ONE attempt and
@@ -2899,9 +2991,12 @@ mod tests {
             let mut ctx = capability_ctx_with(Vec::new(), Vec::new()).at(height);
             exec(&mut m, &mut ctx, &crank()).unwrap();
             commit(&mut m);
-            let v = get(&m, "s1").unwrap();
+            let v = get(&m, &sid("s1")).unwrap();
             assert_eq!(v.assignee, None, "nobody holds it");
-            assert_eq!(v.lease_expires_at, None, "and so there is no lease to expire");
+            assert_eq!(
+                v.lease_expires_at, None,
+                "and so there is no lease to expire"
+            );
             assert_eq!(v.attempt, 1, "the announcement must not consume attempts");
             assert_eq!(
                 v.status,
@@ -2911,18 +3006,20 @@ mod tests {
         }
 
         // and it is still claimable: the lease starts when someone takes it.
-        let mut ctx = CaptureCtx::new().at(30).with_origin(Origin::External(only.clone()));
+        let mut ctx = CaptureCtx::new()
+            .at(30)
+            .with_origin(Origin::External(only.clone()));
         exec(
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Accept {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 attempt: 1,
             }),
         )
         .unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.assignee, Some(only), "the claim lane still works");
         assert_eq!(
             v.lease_expires_at,
@@ -2943,10 +3040,10 @@ mod tests {
             .at(4)
             .with_validators(validators.clone())
             .with_providers(vec![provider.clone()]);
-        exec(&mut m, &mut ctx, &capability_trigger("s1", "alpha")).unwrap();
+        exec(&mut m, &mut ctx, &capability_trigger(&sid("s1"), "alpha")).unwrap();
         commit(&mut m);
 
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.capability.as_deref(), Some("alpha"));
         assert_eq!(
             v.assignee,
@@ -2962,7 +3059,12 @@ mod tests {
             .with_origin(Origin::External(validators[0].clone()))
             .with_validators(validators.clone())
             .with_providers(vec![provider.clone()]);
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"intruder".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 0, Ok(b"intruder".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
         assert_eq!(m.root(), pending_root, "a non-provider result is a no-op");
 
@@ -2971,9 +3073,14 @@ mod tests {
             .with_origin(Origin::External(provider))
             .with_validators(validators)
             .with_providers(vec![vec![9u8; 32]]);
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"legit".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 0, Ok(b"legit".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.status, SagaStatus::Done);
         assert_eq!(v.result, Some(b"legit".to_vec()));
     }
@@ -2985,10 +3092,10 @@ mod tests {
         let mut ctx = CaptureCtx::new()
             .with_validators(vec![vec![1u8; 32]])
             .with_providers(Vec::new());
-        exec(&mut m, &mut ctx, &capability_trigger("s1", "alpha")).unwrap();
+        exec(&mut m, &mut ctx, &capability_trigger(&sid("s1"), "alpha")).unwrap();
         commit(&mut m);
         assert_eq!(
-            get(&m, "s1").unwrap().assignee,
+            get(&m, &sid("s1")).unwrap().assignee,
             None,
             "no providers -> no assignee (the valset is NOT a fallback pool)"
         );
@@ -2998,9 +3105,9 @@ mod tests {
             .with_origin(Origin::External(b"anyone".to_vec()))
             .with_validators(vec![vec![1u8; 32]])
             .with_providers(Vec::new());
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
+        exec(&mut m, &mut ctx, &oracle(&sid("s1"), 0, Ok(b"r".to_vec()))).unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
+        assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Pending);
 
         // a node that CAN run the capability claims it, then its result lands.
         let mut ctx = CaptureCtx::new()
@@ -3011,7 +3118,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Accept {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 attempt: 0,
             }),
         )
@@ -3021,9 +3128,9 @@ mod tests {
             .with_origin(Origin::External(b"provider".to_vec()))
             .with_validators(vec![vec![1u8; 32]])
             .with_providers(Vec::new());
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
+        exec(&mut m, &mut ctx, &oracle(&sid("s1"), 0, Ok(b"r".to_vec()))).unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Done);
+        assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Done);
     }
 
     #[test]
@@ -3033,9 +3140,9 @@ mod tests {
         let mut ctx = CaptureCtx::new()
             .with_validators(validators.clone())
             .with_providers(vec![vec![9u8; 32]]);
-        exec(&mut m, &mut ctx, &trigger("s1", b"w")).unwrap();
+        exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"w")).unwrap();
         commit(&mut m);
-        let assignee = get(&m, "s1").unwrap().assignee.expect("assigned");
+        let assignee = get(&m, &sid("s1")).unwrap().assignee.expect("assigned");
         assert!(
             validators.contains(&assignee),
             "untagged work stays on the valset"
@@ -3057,7 +3164,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: b"w".to_vec(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -3072,7 +3179,7 @@ mod tests {
         .unwrap();
         commit(&mut m);
 
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.assignee, Some(pinned.clone()), "attempt 0 leases pinned");
         assert_eq!(v.pinned_assignee, Some(pinned.clone()));
         assert_eq!(v.lease_expires_at, Some(4 + DEFAULT_LEASE_VIEWS));
@@ -3080,7 +3187,12 @@ mod tests {
         // strict: the announced provider does NOT hold this lease...
         let pending_root = m.root();
         let mut ctx = CaptureCtx::new().with_origin(Origin::External(vec![9u8; 32]));
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"foreign".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 0, Ok(b"foreign".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
         assert_eq!(m.root(), pending_root, "a non-pinned result is a no-op");
 
@@ -3091,9 +3203,14 @@ mod tests {
             .with_origin(Origin::External(pinned.clone()))
             .with_validators(vec![vec![1u8; 32]])
             .with_providers(vec![vec![9u8; 32]]);
-        exec(&mut m, &mut ctx, &oracle("s1", 0, Err("transient".into()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("s1"), 0, Err("transient".into())),
+        )
+        .unwrap();
         commit(&mut m);
-        let v = get(&m, "s1").unwrap();
+        let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.attempt, 1);
         assert_eq!(v.assignee, Some(pinned.clone()), "the retry stays pinned");
         assert_eq!(ctx.worker_requests()[0].assignee, Some(pinned));
@@ -3107,7 +3224,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: Vec::new(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -3134,7 +3251,7 @@ mod tests {
                 &mut ctx,
                 &msg(&SagaMsg::Trigger {
                     pinned_assignee: None,
-                    saga_id: "s1".into(),
+                    saga_id: sid("s1"),
                     spec: Vec::new(),
                     reply_to: None,
                     reply_payload: Vec::new(),
@@ -3149,7 +3266,7 @@ mod tests {
             assert!(matches!(err, Error::Module(_)), "got {err:?} for {bad:?}");
         }
         assert!(ctx.events.is_empty(), "rejected triggers fire no worker");
-        assert_eq!(get(&m, "s1"), None, "nothing was staged");
+        assert_eq!(get(&m, &sid("s1")), None, "nothing was staged");
     }
 
     #[test]
@@ -3171,7 +3288,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "a".into(),
+                saga_id: sid("a"),
                 spec: Vec::new(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -3188,7 +3305,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "b".into(),
+                saga_id: sid("b"),
                 spec: Vec::new(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -3200,13 +3317,13 @@ mod tests {
             }),
         )
         .unwrap();
-        exec(&mut m, &mut ctx, &trigger("c", b"w")).unwrap();
+        exec(&mut m, &mut ctx, &trigger(&sid("c"), b"w")).unwrap();
         commit(&mut m);
         assert_eq!(next_expiry(&m), Some(7), "the lease at view 7 is earliest");
 
         // resolving the leased saga drops it out; the deadline remains.
         let mut ctx = CaptureCtx::new();
-        exec(&mut m, &mut ctx, &oracle("b", 0, Ok(b"r".to_vec()))).unwrap();
+        exec(&mut m, &mut ctx, &oracle(&sid("b"), 0, Ok(b"r".to_vec()))).unwrap();
         commit(&mut m);
         assert_eq!(next_expiry(&m), Some(50), "terminal sagas carry no expiry");
     }
@@ -3232,7 +3349,7 @@ mod tests {
             &mut ctx,
             &msg(&SagaMsg::Trigger {
                 pinned_assignee: None,
-                saga_id: "job".into(),
+                saga_id: sid("job"),
                 spec: b"the work spec".to_vec(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -3263,7 +3380,12 @@ mod tests {
         let mut ctx = CaptureCtx::new()
             .at(5)
             .with_origin(Origin::External(me.clone()));
-        exec(&mut m, &mut ctx, &oracle("job", 0, Ok(b"done".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("job"), 0, Ok(b"done".to_vec())),
+        )
+        .unwrap();
         commit(&mut m);
         assert!(
             assigned_pending(&m, &me).is_empty(),
@@ -3277,6 +3399,7 @@ mod tests {
         // instances, must produce byte-identical snapshots (and thus roots)
         // after every block.
         fn script() -> Vec<Vec<Msg>> {
+            let sid = |id: &str| namespaced_id(&Origin::External(b"alice".to_vec()), id);
             let alice = |saga_id: &str, max_attempts: u32, deadline: Option<u64>| {
                 msg(&SagaMsg::Trigger {
                     pinned_assignee: None,
@@ -3293,14 +3416,14 @@ mod tests {
             };
             vec![
                 vec![
-                    alice("a", 2, None),
-                    alice("b", 1, Some(6)),
-                    alice("c", 1, None),
+                    alice(&sid("a"), 2, None),
+                    alice(&sid("b"), 1, Some(6)),
+                    alice(&sid("c"), 1, None),
                     // a capability-tagged saga: the tag rides the committed
                     // encoding, so it must replay byte-identically too.
                     msg(&SagaMsg::Trigger {
                         pinned_assignee: None,
-                        saga_id: "d".into(),
+                        saga_id: sid("d"),
                         spec: b"spec".to_vec(),
                         reply_to: None,
                         reply_payload: Vec::new(),
@@ -3312,15 +3435,13 @@ mod tests {
                     }),
                 ],
                 vec![
-                    oracle("a", 0, Err("retry me".into())),
-                    oracle("c", 0, Ok(b"done".to_vec())),
+                    oracle(&sid("a"), 0, Err("retry me".into())),
+                    oracle(&sid("c"), 0, Ok(b"done".to_vec())),
                 ],
                 vec![crank()],
-                vec![msg(&SagaMsg::Cancel {
-                    saga_id: "a".into(),
-                })],
+                vec![msg(&SagaMsg::Cancel { saga_id: sid("a") })],
                 vec![msg(&SagaMsg::Prune {
-                    saga_ids: vec!["a".into(), "b".into()],
+                    saga_ids: vec![sid("a"), sid("b")],
                 })],
             ]
         }
@@ -3360,7 +3481,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
-                saga_id: "s-demand".into(),
+                saga_id: sid("s-demand"),
                 spec: b"w".to_vec(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -3389,7 +3510,7 @@ mod tests {
         let big = b"node-big".to_vec();
         let small = b"node-small".to_vec();
         let trigger_msg = SagaMsg::Trigger {
-            saga_id: "s-demand".into(),
+            saga_id: sid("s-demand"),
             spec: b"w".to_vec(),
             reply_to: None,
             reply_payload: Vec::new(),
@@ -3408,7 +3529,7 @@ mod tests {
         commit(&mut m);
         let src_root = m.root();
         assert_eq!(
-            get(&m, "s-demand").unwrap().assignee,
+            get(&m, &sid("s-demand")).unwrap().assignee,
             Some(big.clone()),
             "the demand-capable node holds the initial lease"
         );
@@ -3422,8 +3543,8 @@ mod tests {
             "installed root must equal the source root — demands ride the snapshot"
         );
         assert_eq!(
-            get(&dst, "s-demand"),
-            get(&m, "s-demand"),
+            get(&dst, &sid("s-demand")),
+            get(&m, &sid("s-demand")),
             "query parity after install"
         );
 
@@ -3438,7 +3559,7 @@ mod tests {
             &mut dst,
             &mut ctx2,
             &msg(&SagaMsg::Reassign {
-                saga_id: "s-demand".into(),
+                saga_id: sid("s-demand"),
                 attempt: 0,
             }),
         )
@@ -3462,7 +3583,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
-                saga_id: "s1".into(),
+                saga_id: sid("s1"),
                 spec: Vec::new(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -3482,7 +3603,7 @@ mod tests {
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Trigger {
-                saga_id: "s2".into(),
+                saga_id: sid("s2"),
                 spec: Vec::new(),
                 reply_to: None,
                 reply_payload: Vec::new(),
@@ -3498,8 +3619,8 @@ mod tests {
         assert!(matches!(err, Error::Module(_)), "got {err:?}");
 
         assert!(ctx.events.is_empty(), "rejected triggers fire no worker");
-        assert_eq!(get(&m, "s1"), None, "nothing was staged");
-        assert_eq!(get(&m, "s2"), None, "nothing was staged");
+        assert_eq!(get(&m, &sid("s1")), None, "nothing was staged");
+        assert_eq!(get(&m, &sid("s2")), None, "nothing was staged");
     }
 }
 

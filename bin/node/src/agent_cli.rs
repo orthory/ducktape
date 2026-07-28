@@ -392,7 +392,13 @@ fn cmd_sched(args: SchedArgs, base: &str) -> AgentResult {
     preflight_provider(base, &target, tag)?;
 
     let dispatch_id = fresh_dispatch_id();
-    let saga_id = format!("sched\u{1f}{dispatch_id}");
+    // saga's id space is namespaced per trigger origin, and `/v1/submit`
+    // re-signs with THIS node's key — so the run's id lives under this node's
+    // own actor namespace and no other member can create or squat it.
+    let saga_id = saga::namespaced_id(
+        &sdk::Origin::External(own_node_key(base)?),
+        &format!("sched\u{1f}{dispatch_id}"),
+    );
     let payload =
         compute_service::envelope::compose_headless(&saga_id, &args.prompt, Some(&args.cred))
             .into_bytes();
@@ -756,6 +762,21 @@ mod tests {
             "the gate also requires ascii-hex: {id}"
         );
         assert_ne!(id, fresh_dispatch_id(), "a fresh id is fresh");
+    }
+
+    /// `sched` composes the run's saga id under the SUBMITTING node's own actor
+    /// namespace, because `/v1/submit` re-signs with that key and saga refuses a
+    /// trigger for anybody else's namespace. Composing a bare `sched\x1f<id>`
+    /// here (what this used to do) would make every scheduled run reject.
+    #[test]
+    fn a_sched_saga_id_is_owned_by_the_submitting_node() {
+        let node = sdk::Origin::External(vec![0xAB; 32]);
+        let id = saga::namespaced_id(&node, &format!("sched\u{1f}{}", fresh_dispatch_id()));
+        assert!(saga::owns_id(&node, &id), "saga would refuse {id:?}");
+        assert!(
+            !saga::owns_id(&sdk::Origin::Module("dispatch".into()), &id),
+            "and it belongs to nobody else"
+        );
     }
 
     #[test]
