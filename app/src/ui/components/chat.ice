@@ -377,23 +377,23 @@ component ChatSearchResult(hit:ChatSearchHit)
     hovered bg=fg/6 text=fg border=fg/9
     pressed bg=fg/10 text=fg border=fg/13
 
-// ============================================================================
-// MY OWN POSTS — the artifact branches the message list on authorship, so this
-// is a sibling of MessageCard rather than a fifth arm inside it. A post of mine
-// is a right-aligned ink bubble: no avatar, no hover bar, and a meta line that
-// carries the send state instead of the small tick.
-// ============================================================================
-
-// One row of the message ⋯ menu: a 14px stroke glyph and its label. The button
-// and its route stay at the call site so each item picks its own handler.
-component MessageMenuItem(icon:str, label:str)
-  row #root w=fill gap=9.0 align=center
-    Icon name=icon tone="muted" px=14.0
-    text label w=fill size=12.5 wrap=none @text-accent_fg
-
 // THE REFUSED COMPOSER. `post_gate` names the refusal; this turns the token
 // into the sentence, and every sentence names the move that clears it. An
 // empty reason renders nothing at all — the composer itself is the else arm.
+//
+// MOUNT PENDING — this is the VIEW half of frozen contract item
+// `post_gate(archived, members_only, members, me) -> String` (backend.rs:5622,
+// already tested at backend.rs:8725). The composer today only greys the editor
+// on `active_channel_archived` (view.ice:539) and says nothing at all when a
+// members-only channel refuses the viewer's key. Mounting is three files this
+// component does not own:
+//   state.ice   — `post_gate:str`, seeded "" beside the other chat fields.
+//   handlers/chat.ice — set it wherever `channel_members` lands, from
+//     `post_gate(active_channel_archived, active_channel_members_only,
+//                channel_members, my_key)`.
+//   view.ice    — above the composer plate: `if !empty(post_gate)` ->
+//     `ComposerGate reason=post_gate`, and add `|| !empty(post_gate)` to the
+//     editor's and Send's `disabled=`.
 component ComposerGate(reason:str)
   col #root w=fill
     match reason
@@ -405,27 +405,32 @@ component ComposerGate(reason:str)
         space w=1.0 h=1.0
 
 // ============================================================================
-// THREAD RAIL — a 50px header bar, the parent message in its own divided
-// block, then the replies under their own count rule.
+// THREAD RAIL — the artifact opens the rail body with the root message in its
+// own divided block, at a type scale one notch under a reply.
+//
+// The rail's 50px HEADER BAR is not a component: it is drawn inline by view.ice
+// (view.ice:600), it is a pane header — which main.rs pins as a view.ice-only
+// shape, never a second header inside a component file — and closing its ledger
+// gap also moves the 300px plate to 330px `bg=sidebar` with a 16px body inset,
+// all attributes of the box in view.ice. The artifact's values for whoever owns
+// that edit: 50px plate, `pl=16 pr=16`, bottom 1px `separator` hairline,
+// `Thread` at 13.0 `font=display`, then `#<channel>` at 11.0 `@text-caption`,
+// then a right-aligned 24×24 r6 `×`. Note the artifact has NO reply count in
+// the header and no "Thread result" title — view.ice ships both today, and the
+// second one is the only signpost a chat-search hit has, so the port must keep
+// it rather than follow the artifact literally.
 // ============================================================================
 
-component ThreadPanelHeader(channel_name:str)
-  emits
-    close_thread
-  col #root w=fill
-    box w=fill h=50.0 pl=16.0 pr=16.0
-      row w=fill h=fill gap=8.0 align=center
-        text "Thread" size=13.0 wrap=none font=display @text-fg
-        row w=fill gap=0.0 align=center
-          text "#" size=11.0 wrap=none font=code_medium @text-caption
-          text channel_name size=11.0 wrap=none font=code_medium @text-caption
-        button "×" label="Close thread" w=24.0 h=24.0 p=0.0 @ghost_action -> emit(close_thread)
-          active bg=transparent text=meta border=transparent border-w=1.0 r=6.0
-          hovered bg=separator text=fg
-          pressed bg=subtle text=fg
-    box w=fill h=1.0 bg=separator
-      space w=1.0 h=1.0
-
+// MOUNT PENDING — the view half of ledger gap "Thread rail gives the parent
+// message its own divided block". The data is already there: `active_thread_seq`
+// IS the root's seq and `thread_messages` contains the root, so view.ice:615
+// splits its existing loop instead of gaining any state field or backend fn —
+//   if thread_message.seq == active_thread_seq  -> ThreadParentBlock message=thread_message
+//   if thread_message.seq != active_thread_seq  -> ThreadMessageCard … (as today)
+// CAVEAT for whoever mounts it: the artifact's parent block is READ-ONLY, so
+// routing the root here costs it the hover bar, reactions and edit/delete that
+// ThreadMessageCard gives it today. That is a real interaction regression, not a
+// paint change — take it deliberately or not at all.
 component ThreadParentBlock(message:ChatMessage)
   col #root w=fill
     row w=fill gap=10.0 align=start pb=14.0
@@ -440,10 +445,14 @@ component ThreadParentBlock(message:ChatMessage)
     box w=fill h=1.0 bg=separator
       space w=1.0 h=1.0
 
-component ThreadRepliesRule(count:i64)
-  row #root w=fill gap=5.0 align=center pt=13.0 pb=4.0
-    text count size=10.5 wrap=none font=code_medium @text-label
-    text "replies" size=10.5 wrap=none font=code_medium @text-label
+// The artifact's `N replies` rule between the parent block and the replies was
+// built here and is deleted: two `text` widgets are markup, not a component, and
+// it could not have told the truth anyway. Its count wanted `thread_messages`
+// MINUS the root, and no fn returns that — `len(thread_messages)` (the count
+// view.ice already shows in the rail header) is one too many for a reply count.
+// Whoever mounts ThreadParentBlock gets the rule for free in the same view.ice
+// edit, from the loop's own arms; the artifact draws it at 10.5 `font=code_medium`
+// `@text-label` with `pt=13.0 pb=4.0`.
 
 // The EVENT INSPECTOR was built here and mounted nowhere, so it is deleted
 // rather than left as a panel no user can reach. What it needed was a lookup
@@ -451,3 +460,18 @@ component ThreadRepliesRule(count:i64)
 // inventing one during an integration pass is how a surface ends up drawing a
 // record nobody fetched. `OwnMessageRow` went with it: its finality chip was
 // the panel's only remaining route and the row itself was never mounted either.
+// The stale `MY OWN POSTS` banner that survived that deletion is gone too — it
+// described a right-aligned own-message bubble no arm of MessageCard draws.
+
+// `MessageMenuItem` (a 14px icon + its label) was built here for the message ⋯
+// menu and is deleted. The menu it was shaped for is the ARTIFACT's — Inspect
+// event / Reply in thread / Copy link / Copy proof / Pin to channel — and this
+// app can honestly serve exactly one of those five: there is no inspector rail
+// (see the empty shield seat in MessageCard), no `ducktape://` link builder, no
+// op hash to copy as a proof, and no pin. A shared row component earns its keep
+// by repetition, and the repetition here was four surfaces that do not exist.
+// The menu the app actually ships is React / Edit / Delete / Close, inline in
+// view.ice:659, and its real gap is that those four rows carry no icon. That is
+// one `Icon name=… tone="muted" px=14.0` added to four buttons in view.ice, in
+// the file that owns them. The artifact's row metrics for that edit: `gap=9.0`,
+// label 12.5 `@text-accent_fg`, `p=8.0`/`pl=9.0`, `r=7.0`, on a 184px plate.
