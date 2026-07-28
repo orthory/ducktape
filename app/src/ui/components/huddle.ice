@@ -33,9 +33,12 @@
 // NOTE: the frozen signature carries no roster, so the artifact's overlapping
 // 18px face stack inside this pill cannot be drawn here (see the report).
 component HuddleLivePill(name:str, elapsed:str)
+  emits
+    pop_huddle
+    leave_huddle_here
   box #root bg=toast_bg r=9.0 pl=9.0 pr=10.0 pt=5.0 pb=5.0
     row gap=8.0 align=center
-      button label=name @icon_action px-0px py-0px -> pop_huddle
+      button label=name @icon_action px-0px py-0px -> emit(pop_huddle)
         row gap=8.0 align=center
           PulseDot plate=6.0 tone="success"
           text "LIVE" size=10.5 wrap=none font=code_medium @text-toast_fg
@@ -47,7 +50,7 @@ component HuddleLivePill(name:str, elapsed:str)
         pressed bg=ink_hover text=toast_fg
       box w=1.0 h=14.0 bg=panel_tile
         space w=1.0 h=1.0
-      button label="Leave the huddle" w=20.0 h=20.0 @icon_action px-0px py-0px -> leave_huddle_here
+      button label="Leave the huddle" w=20.0 h=20.0 @icon_action px-0px py-0px -> emit(leave_huddle_here)
         box w=fill h=fill align-x=center align-y=center
           text "✕" size=10.5 wrap=none font=code_medium @text-danger_soft
         active bg=transparent text=danger_soft border=transparent border-w=1.0 r=5.0
@@ -58,7 +61,9 @@ component HuddleLivePill(name:str, elapsed:str)
 // shipped in the design crate since the icon adoption and this is its first
 // call site. Shown when no huddle is running anywhere.
 component HuddleStart()
-  button #root label="Start a huddle" @icon_action px-9px py-5px -> join_huddle_submit
+  emits
+    join_huddle_submit
+  button #root label="Start a huddle" @icon_action px-9px py-5px -> emit(join_huddle_submit)
     row gap=7.0 align=center
       Icon name="headphones" tone="muted" px=14.0
       text "Huddle" size=12.0 wrap=none font=display @text-accent_fg
@@ -69,8 +74,10 @@ component HuddleStart()
 // THE DOCKED PILL — the titlebar's, shown on every screen EXCEPT the huddle's
 // own chat view, where the header pill above says the same thing louder.
 component HuddleDockedPill(channel:str, elapsed:str)
+  emits
+    pop_huddle
   box #root r=8.0 shadow=shadow_toast shadow-y=2.0 shadow-blur=8.0 clip=true
-    button label="Open the huddle window" @icon_action px-8px py-4px -> pop_huddle
+    button label="Open the huddle window" @icon_action px-8px py-4px -> emit(pop_huddle)
       row gap=7.0 align=center
         PulseDot plate=6.0 tone="success"
         text channel size=10.5 wrap=none font=code_medium @text-toast_fg
@@ -110,6 +117,10 @@ component HuddleTile(person:HuddleParticipant)
 // roster grid + controls), and nothing else. See the file header for the four
 // bands the artifact has that this one honestly refuses to draw.
 component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant])
+  emits
+    dock_huddle
+    huddle_go_channel
+    leave_huddle_here
   box #root w=296.0 bg=toast_bg border=accent_fg border-w=1.0 r=15.0 clip=true shadow=shadow_modal shadow-y=30.0 shadow-blur=70.0
     col w=fill
       box w=fill pl=11.0 pr=11.0 pt=9.0 pb=9.0
@@ -119,7 +130,7 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant])
           // one way to close — docking it — so the red dot IS that control and
           // the two beside it stay the chrome they are drawn as.
           row gap=5.0 align=center
-            button label="Dock the huddle window" w=8.0 h=8.0 @icon_action px-0px py-0px -> dock_huddle
+            button label="Dock the huddle window" w=8.0 h=8.0 @icon_action px-0px py-0px -> emit(dock_huddle)
               space w=8.0 h=8.0
               active bg=danger_dot text=danger_dot border=transparent border-w=1.0 r=4.0
               hovered bg=danger_solid text=danger_solid
@@ -130,7 +141,7 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant])
               space w=1.0 h=1.0
           text "Huddle ·" size=10.5 wrap=none font=code_medium @text-ink_soft
           text channel w=fill size=10.5 wrap=none font=code_medium @text-ink_soft
-          button label="Dock the huddle window" @icon_action p-4px -> dock_huddle
+          button label="Dock the huddle window" @icon_action p-4px -> emit(dock_huddle)
             Icon name="collapse" tone="caption" px=12.0
             active bg=transparent text=caption border=transparent border-w=1.0 r=5.0
             hovered bg=ink_hover text=toast_fg
@@ -149,7 +160,7 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant])
             for person in roster
               HuddleTile person=person
           row w=fill gap=7.0 align=center
-            button label="Open the huddle channel" @icon_action px-11px py-0px -> huddle_go_channel
+            button label="Open the huddle channel" @icon_action px-11px py-0px -> emit(huddle_go_channel)
               box h=32.0 align-y=center
                 row gap=3.0 align=center
                   text "open" size=12.0 wrap=none font=medium @text-chevron_idle
@@ -159,7 +170,7 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant])
               hovered bg=strong_ink text=toast_fg
               pressed bg=strong_ink text=toast_fg
             space w=fill
-            button label="Leave the huddle" @icon_action px-13px py-0px -> leave_huddle_here
+            button label="Leave the huddle" @icon_action px-13px py-0px -> emit(leave_huddle_here)
               box h=32.0 align-y=center
                 text "Leave" size=12.0 wrap=none font=display @text-primary_fg
               active bg=danger_solid text=primary_fg border=transparent border-w=1.0 r=9.0
@@ -170,7 +181,9 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant])
 // running in another channel. Clicking jumps to it; the pulse dot is the same
 // live mark the sidebar row wears.
 component HuddleElsewhere(name:str)
-  button #root label="Open the channel the huddle is in" @icon_action px-11px py-5px -> huddle_go_channel
+  emits
+    huddle_go_channel
+  button #root label="Open the channel the huddle is in" @icon_action px-11px py-5px -> emit(huddle_go_channel)
     row gap=7.0 align=center
       PulseDot plate=6.0 tone="success"
       text "#" size=12.0 wrap=none font=display @text-hint

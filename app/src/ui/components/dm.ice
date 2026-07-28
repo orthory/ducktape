@@ -14,17 +14,19 @@
 // creates the two-party channel, so the peer list itself is the entry point and
 // the DIRECT eyebrow needs no `+`, exactly as in the artifact.
 component DmButton(peer:DmPeer, selected:bool)
+  emits
+    choose_dm(str)
   box #root w=fill pl=8.0 pr=8.0
     col w=fill
       if selected
-        button label=peer.name w=fill p=0.0 @icon_action -> choose_dm(peer.key)
+        button label=peer.name w=fill p=0.0 @icon_action -> emit(choose_dm, peer.key)
           box w=fill pl=10.0 pr=10.0 pt=6.0 pb=6.0
             DmRow peer=peer selected=true
           active bg=subtle text=fg border=transparent border-w=1.0 r=7.0
           hovered bg=subtle text=fg
           pressed bg=rail_hover text=fg
       if !selected
-        button label=peer.name w=fill p=0.0 @icon_action -> choose_dm(peer.key)
+        button label=peer.name w=fill p=0.0 @icon_action -> emit(choose_dm, peer.key)
           box w=fill pl=10.0 pr=10.0 pt=6.0 pb=6.0
             DmRow peer=peer selected=false
           active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
