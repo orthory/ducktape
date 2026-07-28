@@ -829,11 +829,83 @@ mod tests {
         }
     }
 
-    /// Everything ONE gate call logged, on a subscriber scoped to that call.
+    /// What ONE gate call wants captured: its buffer, and the level below which
+    /// it wants nothing — the filter the subscriber used to own, moved to the
+    /// writer because the subscriber is now shared by the whole binary.
+    struct Capture {
+        max: tracing::Level,
+        lines: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    tokio::task_local! {
+        /// The gate call currently being captured, if any. Task-local rather
+        /// than thread-local because the seam being captured is an `await`.
+        static CAPTURING: Capture;
+    }
+
+    /// The one writer the shared subscriber owns: it hands an event to the gate
+    /// call currently being captured, and throws the line away when that is
+    /// nobody — every other test in this binary — or when the event sits above
+    /// the level that call asked for.
+    struct RouteToTheCapturingCall;
+
+    /// Where one formatted line goes: a capture's buffer, or nowhere.
+    struct Route(Option<Arc<std::sync::Mutex<Vec<u8>>>>);
+
+    impl std::io::Write for Route {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(lines) = &self.0 {
+                lines.lock().unwrap().extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for RouteToTheCapturingCall {
+        type Writer = Route;
+
+        fn make_writer(&self) -> Route {
+            Route(None)
+        }
+
+        fn make_writer_for(&self, meta: &tracing::Metadata<'_>) -> Route {
+            Route(
+                CAPTURING
+                    .try_with(|capture| {
+                        let wanted = *meta.level() <= capture.max;
+                        wanted.then(|| capture.lines.clone())
+                    })
+                    .ok()
+                    .flatten(),
+            )
+        }
+    }
+
+    /// Everything ONE gate call logged, captured off a subscriber installed ONCE
+    /// for the whole test binary at TRACE.
     ///
-    /// Scoped, not the process-wide `set_global_default` the broker's capture
-    /// installs: these tests share a binary with every other `bin/node` unit
-    /// test, and a global subscriber is a race the first installer wins.
+    /// Process-wide, NOT the `with_subscriber` scope this used to use, and that
+    /// is the whole fix. `tracing` caches a callsite's interest globally and
+    /// computes it the first time the callsite is HIT; while exactly one
+    /// dispatcher is registered, `tracing_core` takes a shortcut and asks *the
+    /// hitting thread's current* dispatcher instead of the registry
+    /// (`callsite::Dispatchers::rebuilder` → `Rebuilder::JustOne` →
+    /// `dispatcher::get_default`). A scoped subscriber is current only on the
+    /// thread inside its own future, so whichever sibling reached [`refuse`] or
+    /// [`admit`] first — on a thread carrying no subscriber at all, i.e.
+    /// `NoSubscriber`, which is interested in nothing — cached that callsite as
+    /// `never` for the rest of the process, and every later capture of it came
+    /// back EMPTY. Under the parallel test runner that was a 3% flake. A
+    /// process-wide subscriber is the current one on EVERY thread, so the
+    /// shortcut answers with it and the interest is always "yes".
+    ///
+    /// Which is why EVERY gate call in this module goes through here, including
+    /// the ones that assert nothing about the log: the install has to happen
+    /// before anything can register those callsites, and
+    /// [`every_gate_call_goes_through_the_capture`] keeps it that way.
     ///
     /// `max` is load-bearing rather than decoration. The draw record is asserted
     /// at INFO — what the DEFAULT filter admits — because a record only
@@ -846,37 +918,52 @@ mod tests {
         state: &dyn CommittedReader,
         question: &GrantQuestion,
     ) -> (GrantAnswer, String) {
-        use tracing::instrument::WithSubscriber as _;
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_writer(RouteToTheCapturingCall)
+                    .finish(),
+            )
+            .expect("no other unit test in this binary installs a global subscriber");
+        });
 
-        #[derive(Clone, Default)]
-        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl tracing_subscriber::fmt::MakeWriter<'_> for Sink {
-            type Writer = Self;
-            fn make_writer(&self) -> Self {
-                self.clone()
-            }
-        }
-
-        let sink = Sink::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(max)
-            .with_writer(sink.clone())
-            .finish();
-        let answer = grant_answer(state, question)
-            .with_subscriber(subscriber)
+        let lines: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+        let capture = Capture {
+            max,
+            lines: lines.clone(),
+        };
+        let answer = CAPTURING
+            .scope(capture, grant_answer(state, question))
             .await;
-        let text = String::from_utf8(sink.0.lock().unwrap().clone()).expect("utf8 log output");
+        let text = String::from_utf8(lines.lock().unwrap().clone()).expect("utf8 log output");
         (answer, text)
+    }
+
+    /// The gate, for the tests that assert on the ANSWER. Still goes through
+    /// [`logged`] — see there for why calling [`grant_answer`] directly from a
+    /// test breaks a different test.
+    async fn answered(state: &dyn CommittedReader, question: &GrantQuestion) -> GrantAnswer {
+        logged(tracing::Level::TRACE, state, question).await.0
+    }
+
+    /// The capture works only because no callsite of this gate can be registered
+    /// before [`logged`] has installed the subscriber. One direct
+    /// [`grant_answer`] call from a test would register [`refuse`]/[`admit`] with
+    /// no subscriber current, cache them as "never" for the whole binary, and
+    /// silently empty the capture in whichever sibling ran later — so the shape
+    /// is checked rather than asked for.
+    #[test]
+    fn every_gate_call_goes_through_the_capture() {
+        let source = include_str!("airlock.rs");
+        let (_, tests) = source.split_once("mod tests {").expect("the test module");
+        assert_eq!(
+            tests.matches(concat!("grant_answer", "(")).count(),
+            1,
+            "a test calls grant_answer directly instead of logged/answered"
+        );
     }
 
     /// THE DELEGATED ADMISSION: the executor holds the lease AND the submitter is
@@ -886,7 +973,7 @@ mod tests {
     async fn a_pointer_admits_the_lease_holder_on_the_submitters_grant() {
         let state = Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
         assert_eq!(
-            grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+            answered(&state, &question(EXEC_ACCOUNT, pointer())).await,
             GrantAnswer::Granted
         );
     }
@@ -970,6 +1057,28 @@ mod tests {
         assert!(!log.contains(SAGA), "{log}");
     }
 
+    /// The `max` [`logged`] takes still FILTERS, now that it lives in the writer
+    /// rather than in a per-call subscriber. Without this, a capture that took
+    /// every level would keep passing if [`admit`] were ever demoted to `debug`
+    /// — and the whole point of asserting the draw record at INFO is that the
+    /// owner sees it under the DEFAULT filter. Same refusal as above, which is a
+    /// `debug!`, asked for at INFO: nothing.
+    #[tokio::test]
+    async fn a_capture_below_the_events_level_records_nothing() {
+        let state = Committed::new(
+            SagaOrigin::External(STRANGER_NODE.to_vec()),
+            Some(EXEC_NODE),
+        );
+        let (answer, log) = logged(
+            tracing::Level::INFO,
+            &state,
+            &question(EXEC_ACCOUNT, pointer()),
+        )
+        .await;
+        assert_eq!(answer, GrantAnswer::Refused);
+        assert_eq!(log, "");
+    }
+
     /// The EXECUTOR condition. The origin is the owner, so a gate that checked
     /// only the origin admits this — and that is precisely the hole: every saga
     /// the owner ever submitted would become a key to the owner's subscription,
@@ -981,7 +1090,7 @@ mod tests {
             Some(STRANGER_NODE),
         );
         assert_eq!(
-            grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+            answered(&state, &question(EXEC_ACCOUNT, pointer())).await,
             GrantAnswer::Refused
         );
     }
@@ -995,7 +1104,7 @@ mod tests {
             Some(EXEC_NODE),
         );
         assert_eq!(
-            grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+            answered(&state, &question(EXEC_ACCOUNT, pointer())).await,
             GrantAnswer::Refused
         );
     }
@@ -1010,7 +1119,7 @@ mod tests {
         );
         state.grants = vec![STRANGER_ACCOUNT.to_vec()];
         assert_eq!(
-            grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+            answered(&state, &question(EXEC_ACCOUNT, pointer())).await,
             GrantAnswer::Granted
         );
     }
@@ -1023,7 +1132,7 @@ mod tests {
         let mut state = Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
         state.saga = None;
         assert_eq!(
-            grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+            answered(&state, &question(EXEC_ACCOUNT, pointer())).await,
             GrantAnswer::Undetermined
         );
     }
@@ -1036,7 +1145,7 @@ mod tests {
                 Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
             state.unreadable = unreadable;
             assert_eq!(
-                grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+                answered(&state, &question(EXEC_ACCOUNT, pointer())).await,
                 GrantAnswer::Undetermined,
                 "an unanswered {unreadable:?} read must not read as a refusal"
             );
@@ -1052,7 +1161,7 @@ mod tests {
         for origin in [SagaOrigin::Module("dispatch".into()), SagaOrigin::System] {
             let state = Committed::new(origin, Some(EXEC_NODE));
             assert_eq!(
-                grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+                answered(&state, &question(EXEC_ACCOUNT, pointer())).await,
                 GrantAnswer::Refused
             );
         }
@@ -1064,7 +1173,7 @@ mod tests {
     async fn a_direct_session_never_delegates() {
         let state = Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
         assert_eq!(
-            grant_answer(&state, &question(EXEC_ACCOUNT, WorkRef::Direct)).await,
+            answered(&state, &question(EXEC_ACCOUNT, WorkRef::Direct)).await,
             GrantAnswer::Refused,
             "a delegable saga existing does not delegate a session that never named it"
         );
@@ -1093,7 +1202,7 @@ mod tests {
             }
         }
         assert_eq!(
-            grant_answer(&RecordOnly, &question(EXEC_ACCOUNT, pointer())).await,
+            answered(&RecordOnly, &question(EXEC_ACCOUNT, pointer())).await,
             GrantAnswer::Granted
         );
     }
@@ -1117,7 +1226,7 @@ mod tests {
             saga.status = status;
             saga.attempt = 99;
             assert_eq!(
-                grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+                answered(&state, &question(EXEC_ACCOUNT, pointer())).await,
                 GrantAnswer::Refused,
                 "a {status:?} saga must not still open sessions"
             );
@@ -1133,7 +1242,7 @@ mod tests {
         let mut state = Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
         state.saga.as_mut().expect("a saga").spec = spec_naming("a-totally-different-credential");
         assert_eq!(
-            grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+            answered(&state, &question(EXEC_ACCOUNT, pointer())).await,
             GrantAnswer::Refused
         );
     }
@@ -1157,7 +1266,7 @@ mod tests {
                 Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
             state.saga.as_mut().expect("a saga").spec = spec;
             assert_eq!(
-                grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+                answered(&state, &question(EXEC_ACCOUNT, pointer())).await,
                 GrantAnswer::Refused
             );
         }
@@ -1175,7 +1284,7 @@ mod tests {
         let mut state = Committed::new(SagaOrigin::External(OWNER_NODE.to_vec()), Some(EXEC_NODE));
         state.saga.as_mut().expect("a saga").pinned_assignee = None;
         assert_eq!(
-            grant_answer(&state, &question(EXEC_ACCOUNT, pointer())).await,
+            answered(&state, &question(EXEC_ACCOUNT, pointer())).await,
             GrantAnswer::Refused,
             "the lease alone is not the binding, even when it is this caller's"
         );
@@ -1201,7 +1310,7 @@ mod tests {
         other.saga.as_mut().expect("a saga").spec = spec_naming("some-other-credential");
         for state in [finished, other] {
             assert_eq!(
-                grant_answer(&NoIdentity(state), &question(EXEC_ACCOUNT, pointer())).await,
+                answered(&NoIdentity(state), &question(EXEC_ACCOUNT, pointer())).await,
                 GrantAnswer::Refused
             );
         }
@@ -1232,7 +1341,7 @@ mod tests {
             saga_id: "x".repeat(MAX_WORK_POINTER_BYTES + 1),
         };
         assert_eq!(
-            grant_answer(&RecordThenPanic, &question(EXEC_ACCOUNT, oversized)).await,
+            answered(&RecordThenPanic, &question(EXEC_ACCOUNT, oversized)).await,
             GrantAnswer::Refused
         );
     }
