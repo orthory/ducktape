@@ -82,7 +82,11 @@ install-coordinator:
 test: wasm-modules-check
 	$(CARGO) test --workspace
 	$(CARGO) test -p consensus --features sim
-	$(CARGO) build -p noded -p simnode
+# ducktape-app rides this line for a reason: `cargo test` builds the TEST
+# target, which links dev-dependencies, so a product path reaching for a
+# dev-only crate compiles under every test lane and breaks only the BINARY.
+# That is not hypothetical — it shipped and sat on dev for 81 commits.
+	$(CARGO) build -p noded -p simnode -p ducktape-app
 
 ## rebuild every wasm guest module into its componentized artifact and refresh
 ## EVERY committed copy in one sweep (the canonical node-embedded artifact +
