@@ -1,6 +1,5 @@
 ---
 import "@fontsource-variable/inter";
-import "@fontsource-variable/noto-sans-kr";
 import "@fontsource-variable/jetbrains-mono";
 import "../styles/globals.css";
 import "../styles/prose.css";
@@ -26,9 +25,7 @@ const {
   entryId,
 } = Astro.props;
 
-const routeLocale = Astro.url.pathname.split("/")[1];
-const isKoreanRoute = routeLocale === "ko";
-const lang = isKoreanRoute ? "ko" : config.locale ?? "en";
+const lang = config.locale ?? "en";
 // Per-page agent-index pointer. For pages in non-primary or version
 // collections, this resolves to `/<prefix>/llms.txt` (e.g. `/v0/llms.txt`
 // for a v0 docs page, `/blog/llms.txt` for a blog post). Falls back to

@@ -15,7 +15,7 @@
 //!   the newest posting, which the reversed key makes an O(1) probe.
 //!
 //! extraction grammar (see the design doc): `#` + 1..=64 chars of Unicode
-//! letters/digits/`_`/`-` (Hangul included), opened only at start-of-text or
+//! letters/digits/`_`/`-`, opened only at start-of-text or
 //! after whitespace/punctuation — never mid-word (`foo#bar`), after another
 //! `#`, or after `/`/`&` (URL fragments, HTML entities). Paragraph and Quote
 //! spans only; Code blocks and Link-marked spans never carry tags. the index
@@ -438,10 +438,10 @@ mod tests {
     }
 
     #[test]
-    fn extracts_hangul_underscore_and_hyphen_tags() {
+    fn extracts_non_ascii_underscore_and_hyphen_tags() {
         assert_eq!(
-            labels(&para("#한글 지원 #snake_case #kebab-case")),
-            ["한글", "snake_case", "kebab-case"]
+            labels(&para("#naïve support #snake_case #kebab-case")),
+            ["naïve", "snake_case", "kebab-case"]
         );
     }
 
@@ -505,12 +505,11 @@ mod tests {
     }
 
     #[test]
-    fn labels_normalize_nfc_lowercase_and_dedup() {
+    fn normalizes_nfc_lowercase_and_dedups_labels() {
+        // decomposed E + acute accent folds to the lowercase precomposed character.
+        assert_eq!(normalize("E\u{301}"), "é");
         // three spellings, one label.
         assert_eq!(labels(&para("#Rust #RUST #rust")), ["rust"]);
-        // decomposed jamo (U+1100 U+1161) folds to the precomposed syllable.
-        assert_eq!(labels(&para("#\u{1100}\u{1161}")), ["\u{AC00}"]);
-        assert_eq!(labels(&para("#\u{1100}\u{1161} #\u{AC00}")), ["\u{AC00}"]);
     }
 
     #[test]
@@ -520,9 +519,9 @@ mod tests {
         // one char over: the whole run is rejected, not truncated — and the
         // run does not re-open a tag mid-way.
         assert!(labels(&para(&format!("#{max}b"))).is_empty());
-        // hangul counts CHARS, not bytes.
-        let hangul = "가".repeat(MAX_TAG_CHARS);
-        assert_eq!(labels(&para(&format!("#{hangul}"))), [hangul]);
+        // non-ASCII text counts CHARS, not bytes.
+        let accented = "é".repeat(MAX_TAG_CHARS);
+        assert_eq!(labels(&para(&format!("#{accented}"))), [accented]);
     }
 
     #[test]

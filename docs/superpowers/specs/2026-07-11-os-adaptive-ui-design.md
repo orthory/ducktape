@@ -10,7 +10,7 @@ A full sweep of `app/src` + `app/src-tauri` found the platform seam largely in p
 
 - **Detection:** `isMacDesktop()` (`app/src/domain/node-bootstrap.ts:48`) on the frontend; `#[cfg(target_os)]` in Rust. No other detection needed.
 - **Shortcut handlers** all accept `metaKey || ctrlKey` (`ConsoleShell.tsx:79`, `PagesView.tsx:123`) — Ctrl works today on Linux/Windows.
-- **Fonts** are self-hosted (`@fontsource` Geist Sans/Mono, IBM Plex Sans KR) — identical rendering everywhere; `-apple-system` is only a dead-tail fallback.
+- **Fonts** are self-hosted (`@fontsource` Geist Sans/Mono) — identical rendering everywhere; `-apple-system` is only a dead-tail fallback.
 - **Scrollbars:** `::-webkit-scrollbar` styling applies on WebKitGTK and WebView2 alike.
 - **Traffic-light inset** (`WindowFrame.tsx:22`) is already `isMacDesktop() ? 69 : 0`.
 - **Tray + popover + vibrancy** (`tray.rs`), **app menu** (`menu.rs`), **badge/tray-title** (`notify/present.rs`) are `cfg(target_os = "macos")`-gated no-ops elsewhere.

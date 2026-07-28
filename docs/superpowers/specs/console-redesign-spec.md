@@ -84,7 +84,7 @@ and the per-view files named in §4, and match them.
 
 ---
 
-## 2. Frontend architecture (the "리팩토링")
+## 2. Frontend architecture (the refactor)
 
 Current state: one **918-line `DucktapeProvider.tsx`** + a **61-field
 `ConsoleState`** mixing domain projections, transient UI state (`hoverMsg`,

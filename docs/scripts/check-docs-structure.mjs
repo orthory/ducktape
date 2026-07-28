@@ -44,14 +44,8 @@ const required = [
   'src/layouts/DocsLayout.astro',
   'src/layouts/LandingLayout.astro',
   'src/pages/index.mdx',
-  ...humanPages.flatMap((page) => [
-    `src/content/docs/en/human/${page}`,
-    `src/content/docs/ko/human/${page}`,
-  ]),
-  ...agentPages.flatMap((page) => [
-    `src/content/docs/en/agent/${page}`,
-    `src/content/docs/ko/agent/${page}`,
-  ]),
+  ...humanPages.map((page) => `src/content/docs/en/human/${page}`),
+  ...agentPages.map((page) => `src/content/docs/en/agent/${page}`),
 ]
 
 const failures = []
@@ -90,9 +84,6 @@ if (!/"packageManager":\s*"bun@/.test(packageJson)) {
 if (!packageJson.includes('"@cloudflare/nimbus-docs"')) {
   failures.push('package.json must depend on @cloudflare/nimbus-docs')
 }
-if (!packageJson.includes('"@fontsource-variable/noto-sans-kr"')) {
-  failures.push('package.json must bundle a Korean-capable font')
-}
 if (!packageJson.includes('"build": "astro build"')) {
   failures.push('package.json must build with Astro')
 }
@@ -104,12 +95,12 @@ if (/\bpnpm\b/.test(packageJson)) {
 }
 
 const config = readFileSync(join(root, 'astro.config.ts'), 'utf8')
-for (const route of ['en/human', 'ko/human', 'en/agent', 'ko/agent']) {
+for (const route of ['en/human', 'en/agent']) {
   if (!config.includes(`segment: "/${route}"`)) {
     failures.push(`astro.config.ts must include the ${route} navigation track`)
   }
 }
-for (const label of ['Human · English', 'Human · 한국어', 'Agent · English', 'Agent · 한국어']) {
+for (const label of ['Human · English', 'Agent · English']) {
   if (!config.includes(`label: "${label}"`)) {
     failures.push(`astro.config.ts must include navigation label ${label}`)
   }
@@ -164,8 +155,8 @@ if (!/^title:\s*Ducktape\s*$/m.test(landing) || !/^layout:\s*\.\.\/layouts\/Land
   failures.push('src/pages/index.mdx must use the Ducktape Nimbus landing layout')
 }
 
-if (pages.length !== 54) {
-  failures.push(`expected 54 routed content pages, found ${pages.length}`)
+if (pages.length !== 25) {
+  failures.push(`expected 25 routed content pages, found ${pages.length}`)
 }
 
 if (failures.length) {
@@ -174,4 +165,4 @@ if (failures.length) {
   process.exit(1)
 }
 
-console.log('docs structure ok (54 pages across 4 reader/language tracks + landing)')
+console.log('docs structure ok (25 pages across 2 reader tracks + landing)')

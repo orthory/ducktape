@@ -220,8 +220,8 @@ export function Landing() {
       </FeatureGrid>
 
       <SectionHead eyebrow="Two reader tracks" title="Docs for the people building it — and the agents running it">
-        Every topic is written twice, on purpose. Pick the track that matches how you
-        read; switch languages from the top navigation.
+        Pick the track that matches how you read: product context for people or
+        implementation detail for coding agents.
       </SectionHead>
 
       <TrackCards>
@@ -229,8 +229,7 @@ export function Landing() {
           kind="human"
           title="Product & architecture"
           links={[
-            { label: 'English', href: '/en/human' },
-            { label: '한국어', href: '/ko/human' },
+            { label: 'Read docs', href: '/en/human' },
           ]}
         >
           Platform shape, the consensus core, the module model, product modules,
@@ -241,8 +240,7 @@ export function Landing() {
           kind="agent"
           title="Operating notes for agents"
           links={[
-            { label: 'English', href: '/en/agent' },
-            { label: '한국어', href: '/ko/agent' },
+            { label: 'Read docs', href: '/en/agent' },
           ]}
         >
           Tighter implementation maps: determinism and state-sync contracts, validator

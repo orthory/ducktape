@@ -7,9 +7,7 @@ Status: implementation plan of record for **Slice 1** of the
 
 Design of record:
 `docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`,
-Component 2 ("Typed reach hint + v3 signed invite"). Byte-layout analysis of the
-current v2 format: `docs/records/admission/invitation-protocol-deep-dive.md` §1–2 (the `config.rs`
-wire format + the genesis fingerprint).
+Component 2 ("Typed reach hint + v3 signed invite").
 
 ## Scope
 
@@ -1191,10 +1189,7 @@ full gate one last time.
   expiry) with v2 as parse-only, and update the `INVITE_PREFIX_V2` doc line.
 - Add a short "v3 invite" note to
   `docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`'s
-  Component 2 marking Slice 1 landed, OR add a one-paragraph subsection to
-  `docs/records/admission/invitation-protocol-deep-dive.md` §1 documenting the v3 layout (keep the
-  analysis doc current). Prefer the deep-dive note since it is the byte-layout
-  reference.
+  Component 2 marking Slice 1 landed.
 - Out of scope, listed as follow-ups (do **not** do here): the desktop
   `OnboardingGate` placeholder text still says `ducktape-invite-v2:…`; `decode`
   accepts both prefixes so pastes keep working, and the UI copy update belongs to

@@ -25,8 +25,8 @@ Three approaches considered:
 
 ## Tag syntax + normalization
 
-- A tag is `#` followed by 1..=64 chars of Unicode letters/digits/`_`/`-`
-  (must include Hangul — primary user is Korean). Terminated by anything else.
+- A tag is `#` followed by 1..=64 chars of Unicode letters/digits/`_`/`-`.
+  Terminated by anything else.
 - `#` must be at start-of-text or preceded by whitespace/punctuation (don't
   tag `foo#bar` or URLs' fragments).
 - Extracted from `Paragraph` and `Quote` blocks only — never `Code` blocks or
@@ -83,7 +83,7 @@ New view queries (node-local wire, no consensus concern; follow
 
 ## Testing
 
-- Rust: tag extraction unit tests (Hangul, `_`/`-`, code-block exclusion,
+- Rust: tag extraction unit tests (non-ASCII text, `_`/`-`, code-block exclusion,
   mid-word `#` rejection, 16-tag cap, NFC/lowercase normalization); fold
   tests for post/edit/delete; fold-vs-rebuild parity; `Tags`/`TagSearch`
   query tests incl. channel scoping and limit clamp.

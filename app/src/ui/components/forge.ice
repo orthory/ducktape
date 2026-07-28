@@ -278,7 +278,7 @@ component ForgeCodeHeader(path:str, message:str, author:str, stamp:str)
 // blob numbers what arrived, and the window note under the listing says so.
 //
 // The code is ONE ink. The design system is explicit that this viewer uses no
-// syntax colour ("코드는 구문 색을 쓰지 않고 단색") — emphasis is carried by the
+// syntax colour ("code uses a single colour, not syntax highlighting") — emphasis is carried by the
 // signed annotation card, so nothing here tints a token. (A BLOB has no
 // annotation affordance — `ReviewComment` anchors into a PR's diff, not into a
 // file read at a rev; `DiffRow` below is where a line comment is authored.)

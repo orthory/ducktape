@@ -28,9 +28,7 @@ const { showSidebar = true } = Astro.props;
 const currentSlug = Astro.url.pathname.replace(/\/$/, "") || "/";
 const tracks = [
   { label: "Human · English", shortLabel: "Human EN", href: "/en/human" },
-  { label: "Human · 한국어", shortLabel: "Human KO", href: "/ko/human" },
   { label: "Agent · English", shortLabel: "Agent EN", href: "/en/agent" },
-  { label: "Agent · 한국어", shortLabel: "Agent KO", href: "/ko/agent" },
 ].map((track) => ({ ...track, isActive: currentSlug.startsWith(track.href) }));
 const hasActiveTrack = tracks.some((track) => track.isActive);
 ---

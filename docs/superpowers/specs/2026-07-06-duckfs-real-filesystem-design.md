@@ -473,5 +473,5 @@ New/changed surfaces: `crates/apps/files` (single crate: pure core +
 `native` feature incl. `FsCap`, per the modularization section), `crates/apps/memory` (deleted), a new `duckfs-client` crate, noded (blob-receipt store internalized; duckfs HTTP
 endpoints; sandbox workspace RPC), bin/node + bin/demo registration sites,
 kernel statesync resolver wiring for `duckfs-odb`, app TS client + FilesView,
-docs (en+ko module pages). Branching per `.project/work.md`: worktree from
+docs module pages. Branching per `.project/work.md`: worktree from
 `origin/dev`, PR to `dev`.

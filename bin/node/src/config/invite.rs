@@ -42,7 +42,7 @@ pub use governance::invite::{
 /// mint a BEARER invite token binding an invite to `binding` (the genesis
 /// namespace), with `role` and `expires_unix_secs`: fresh OS randomness for the
 /// nonce, signed by this member's identity. minting IS the admission decision —
-/// there is no target (기명 dropped — see the join ADR); whoever presents a
+/// there is no target (the targeted form was dropped — see the join ADR); whoever presents a
 /// valid join proof for the nonce first redeems it, single-use.
 pub fn mint_invite_token(
     signer: &ed25519::PrivateKey,

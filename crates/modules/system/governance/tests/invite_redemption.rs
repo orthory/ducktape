@@ -3,7 +3,7 @@
 //! joiner's proof-of-possession grants standing with no ballot — and the
 //! redeemed-nonce set makes every token single-use.
 //!
-//! the join protocol: EVERY invite is bearer (무기명). There is no target lock;
+//! the join protocol: EVERY invite is bearer. There is no target lock;
 //! whoever presents a valid join proof for the nonce first wins the grant, and
 //! single-use bounds it. The role (`Resident`/`Client`) selects which standing
 //! plane the grant lands in.

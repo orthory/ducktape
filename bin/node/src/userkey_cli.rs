@@ -861,7 +861,7 @@ fn user_redeem_invite(
     if invite.token.role != config::InviteRole::Client {
         return Err("this is a node (resident) invite — use `ducktape node join`".into());
     }
-    // every invite is bearer (기명 dropped — see the join ADR): no target lock — this user
+    // every invite is bearer (the targeted form was dropped — see the join ADR): no target lock — this user
     // key redeems the client invite directly, bound by the join proof below and
     // made single-use by the nonce.
     let user = load_user_signer(&args.key, stdin)?;

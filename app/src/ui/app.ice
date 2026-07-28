@@ -6,9 +6,6 @@ app Ducktape
   id "dev.ducktape.app"
   font "../../../crates/design/assets/fonts/Geist[wght].ttf"
   font "../../../crates/design/assets/fonts/GeistMono[wght].ttf"
-  font "../../../crates/design/assets/fonts/IBMPlexSansKR-Regular.ttf"
-  font "../../../crates/design/assets/fonts/IBMPlexSansKR-Medium.ttf"
-  font "../../../crates/design/assets/fonts/IBMPlexSansKR-SemiBold.ttf"
   text-size 13.5
   antialiasing true
   window

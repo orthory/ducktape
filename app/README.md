@@ -55,7 +55,7 @@ crate owns only application font assets and the product type scale; drift
 guards hold the Ice sources to both authorities.
 
 - Faces: **Geist** (UI), **Geist Mono** (machine values, metadata, field
-  labels, and badges), **IBM Plex Sans KR** as the per-glyph CJK fallback.
+  labels, and badges).
   The files are embedded from `crates/design/assets/fonts/` at build time.
 - Scale: 22 display · 20 screen title · 16 section · 14 pane header · 13.5
   body · 13 list · 12.5 caption · 12 machine value · 11/10.5 meta · 10 field

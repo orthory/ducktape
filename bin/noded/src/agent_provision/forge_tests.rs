@@ -706,7 +706,7 @@ fn missing_unsafe_and_oversized_proposals_fall_back_to_the_forge_title() {
         Some("dispatch\u{1f}runs\u{1f}private:0"),
         Some(oversized.as_str()),
     ] {
-        let long_name = "오리".repeat(100);
+        let long_name = "🦆".repeat(100);
         let safe_name = sanitize_display_name(&long_name);
         assert!(safe_name.len() <= MAX_DISPLAY_NAME_BYTES);
         assert!(safe_name.is_char_boundary(safe_name.len()));
