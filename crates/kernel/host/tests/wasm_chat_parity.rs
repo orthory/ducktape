@@ -41,10 +41,16 @@ fn op(m: &ChatMsg) -> Msg {
 
 /// one block's agreed context: both runtimes must see the identical env.
 fn block(height: u64, who: &[u8]) -> BlockContext {
+    block_as(height, Origin::External(who.to_vec()))
+}
+
+/// the same, for the origin KINDS an external key cannot express — a
+/// module-minted (and therefore UNOWNED) channel is one of them.
+fn block_as(height: u64, origin: Origin) -> BlockContext {
     BlockContext {
         height,
         consensus_time: 1_000 + height,
-        origin: Origin::External(who.to_vec()),
+        origin,
     }
 }
 
@@ -489,6 +495,19 @@ fn rejections_match_and_leave_no_trace() {
             host.submit_at(block(3, &alice), op(&post("general", "m1", "hello", None)))
                 .await
                 .expect("post");
+            // a MODULE-minted channel — the `forge:<repo>:<n>` shape — which
+            // is UNOWNED by construction: the principal that minted it is a
+            // module, and no user is it.
+            host.submit_at(
+                block_as(4, Origin::Module("sink".into())),
+                op(&ChatMsg::CreateChannel {
+                    channel_id: "sink:room".into(),
+                    name: "Sink Room".into(),
+                    post_policy: PostPolicy::Open,
+                }),
+            )
+            .await
+            .expect("module-minted channel");
         }
 
         // the rejection matrix: distinct refusal families. each rejected block
@@ -569,10 +588,61 @@ fn rejections_match_and_leave_no_trace() {
                 },
                 "unknown hook module",
             ),
+            // CHANNEL-ADMIN AUTHORITY, proven in the compiled component and
+            // not just natively: the gate reads `env().origin`, the one
+            // authorization input that crosses the WIT boundary, so a gate
+            // keyed on it is exactly the kind that can compile, review as
+            // correct, and be inert inside the guest.
+            //
+            // alice owns "general"; carol writes neither its roster nor its
+            // hook list. the roster IS `PostPolicy::MembersOnly`'s admission
+            // list, so an ungated `SetMembership` let carol admit HERSELF and
+            // post straight through the only admission rule chat has.
+            (
+                carol.clone(),
+                ChatMsg::SetMembership {
+                    channel_id: "general".into(),
+                    user: carol.clone(),
+                    member: true,
+                },
+                "only the owner",
+            ),
+            // a hook is a standing subscription to everything posted there.
+            (
+                carol.clone(),
+                ChatMsg::RegisterHook {
+                    channel_id: "general".into(),
+                    module_id: "sink".into(),
+                },
+                "only the owner",
+            ),
+            // and the sharper half: an ungated unregister is a one-message off
+            // switch for every automation on the channel.
+            (
+                carol.clone(),
+                ChatMsg::UnregisterHook {
+                    channel_id: "general".into(),
+                    module_id: "sink".into(),
+                },
+                "only the owner",
+            ),
+            // an UNOWNED channel admits NO user — not even alice, who
+            // administers channels of her own. the module that minted it is
+            // its principal, and `check_channel_admin` fails closed rather
+            // than letting the `None` owner fall through.
+            (
+                alice.clone(),
+                ChatMsg::SetMembership {
+                    channel_id: "sink:room".into(),
+                    user: alice.clone(),
+                    member: true,
+                },
+                "is unowned",
+            ),
         ];
 
         for (height, (who, msg, needle)) in rejects.into_iter().enumerate() {
-            let height = height as u64 + 4;
+            let height = height as u64 + 5;
             let before = roots(&native);
             assert_eq!(before, roots(&wasm));
 
