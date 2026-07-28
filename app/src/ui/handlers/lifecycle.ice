@@ -353,6 +353,12 @@ on select_shell_tab(next)
     run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     run load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_failed _
 
+// Every row arrives carrying its own about line, language and `updated_at`.
+// `updated_at` is UNIX SECONDS off the head commit's git committer time, so it
+// renders with `relative_time(...)` — NOT with `height_label_short()` like the
+// rest of this app. Every other record time here is a consensus stamp (the
+// validator sets consensus_time = height), which is why heights print
+// everywhere else; a git client wrote this one against a real wall clock.
 on forge_loaded(next)
   return if next.generation != forge_generation
   forge_repos = next.repos

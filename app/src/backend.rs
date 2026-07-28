@@ -2749,11 +2749,22 @@ pub async fn set_account_name(
     Ok(true)
 }
 
-/// One forge repo row.
-#[derive(Clone, Debug, Hash, PartialEq)]
+/// One forge repo row: the module's committed head, plus the card facts
+/// derived from the local mirror at that head.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct ForgeRepo {
     pub name: String,
     pub head: String,
+    /// The README's opening prose. Empty when the repo has none — the card
+    /// keeps its min-height rather than inventing a description.
+    pub about: String,
+    /// The extension that owns the most files at the head revision.
+    pub language: String,
+    /// The head commit's committer time in UNIX SECONDS — a real wall clock,
+    /// because a forge commit is stamped by a git client, not by consensus.
+    /// Render it with `relative_time`, NOT with `height_label_short`. 0 when
+    /// the repo has no born head.
+    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -2797,21 +2808,38 @@ pub struct ForgeItemData {
     pub change_requests: i64,
 }
 
-/// The repo namespace with committed heads.
+/// The repo namespace with committed heads, each row carrying the about line,
+/// language and last-moved stamp the repo card renders.
 pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
     async {
-        let rpc = rpc_client(&rpc)?;
-        let reply: serde_json::Value = rpc.query("forge", &serde_json::json!("list_repos")).await?;
-        let repos = reply["repos"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|repo| ForgeRepo {
-                name: repo["name"].as_str().unwrap_or_default().to_string(),
-                head: short_digest(repo["head"].as_str().unwrap_or("(unborn)")),
-            })
-            .collect();
+        let client = rpc_client(&rpc)?;
+        let reply: serde_json::Value = client
+            .query("forge", &serde_json::json!("list_repos"))
+            .await?;
+        let listed = reply["repos"].as_array().cloned().unwrap_or_default();
+        let mut deriving = Vec::with_capacity(listed.len());
+        for repo in listed {
+            let name = repo["name"].as_str().unwrap_or_default().to_string();
+            let head = repo["head"].as_str().unwrap_or("(unborn)").to_string();
+            let endpoint = rpc.clone();
+            deriving.push(tokio::task::spawn_blocking(move || {
+                let (about, language, updated_at) = repo_card_facts(&endpoint, &name, &head);
+                ForgeRepo {
+                    head: short_digest(&head),
+                    name,
+                    about,
+                    language,
+                    updated_at,
+                }
+            }));
+        }
+        let mut repos = Vec::with_capacity(deriving.len());
+        for task in deriving {
+            let row = task
+                .await
+                .map_err(|error| format!("forge about task failed: {error}"))?;
+            repos.push(row);
+        }
         Ok(ForgeData { generation, repos })
     }
     .await
@@ -3305,20 +3333,6 @@ pub struct BlobView {
     pub lines: i64,
 }
 
-/// A repo's derived summary: the README's opening prose, the language its
-/// files are mostly written in, and when its head last moved.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct RepoAbout {
-    pub generation: i64,
-    pub repo: String,
-    pub description: String,
-    pub language: String,
-    /// The head commit's committer time in UNIX SECONDS — a real wall clock,
-    /// because a forge commit is authored by a git client, not stamped with
-    /// consensus time. 0 when the repo has no born branch.
-    pub updated_at: i64,
-}
-
 /// The default revision a repo browse opens at: the integration branch the
 /// module itself prefers (`dev`, else `main`), else whatever is born.
 fn default_rev(mirror: &git2::Repository) -> Result<String, String> {
@@ -3596,33 +3610,51 @@ fn dominant_language(commit: &git2::Commit) -> String {
         .unwrap_or_default()
 }
 
-/// A repo's about line, language and last-moved stamp — all derived from the
-/// local mirror, none of it a new module field.
-pub async fn repo_about(
-    rpc: String,
-    repo: String,
-    generation: i64,
-) -> Result<RepoAbout, HydrationError> {
-    async {
-        tokio::task::spawn_blocking(move || {
-            let mirror = sync_forge_mirror(&rpc, &repo)?;
-            let commit = mirror_commit_at(&mirror, "")?;
-            Ok::<_, String>(RepoAbout {
-                generation,
-                description: readme_about(&mirror, &commit),
-                language: dominant_language(&commit),
-                updated_at: commit.time().seconds(),
-                repo,
-            })
-        })
-        .await
-        .map_err(|error| format!("forge about task failed: {error}"))?
+/// One repo's card facts — about line, language, head committer time — read
+/// off the local mirror at the module's committed head. A repo whose head the
+/// mirror cannot produce renders blank rather than a guess.
+///
+/// BLOCKING: git2 walks a tree and may fetch. Callers run it on the blocking
+/// pool.
+fn repo_card_facts(endpoint: &str, repo: &str, head_oid: &str) -> (String, String, i64) {
+    const BLANK: (String, String, i64) = (String::new(), String::new(), 0);
+    let Ok(head) = git2::Oid::from_str(head_oid) else {
+        return BLANK;
+    };
+    let Ok(mirror) = mirror_holding(endpoint, repo, head) else {
+        return BLANK;
+    };
+    let Ok(commit) = mirror.find_commit(head) else {
+        return BLANK;
+    };
+    (
+        readme_about(&mirror, &commit),
+        dominant_language(&commit),
+        commit.time().seconds(),
+    )
+}
+
+/// The mirror holding `head`. The mirror IS the cache: a head the resident
+/// clone already carries costs no network, so re-listing the repos after every
+/// forge event never refetches a repo whose head has not moved.
+fn mirror_holding(endpoint: &str, repo: &str, head: git2::Oid) -> Result<git2::Repository, String> {
+    let dir = forge_mirror_dir(endpoint, repo)?;
+    let resident = git2::Repository::open_bare(&dir).ok();
+    let already_holds_head = resident.filter(|mirror| mirror.find_commit(head).is_ok());
+    match already_holds_head {
+        Some(mirror) => Ok(mirror),
+        None => sync_forge_mirror(endpoint, repo),
     }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message,
-    })
+}
+
+/// The listed row for `name`, so the open repo's body reads its about line,
+/// language and updated stamp out of the resident list instead of re-deriving
+/// them. An unknown name yields a blank row.
+pub fn forge_repo_row(repos: Vec<ForgeRepo>, name: String) -> ForgeRepo {
+    repos
+        .into_iter()
+        .find(|repo| repo.name == name)
+        .unwrap_or_default()
 }
 
 /// True when one live update invalidates forge state: a folded forge op, a
@@ -10257,6 +10289,17 @@ mod tests {
 
         assert_eq!(readme_about(&mirror, &commit), "The consensus core.");
         assert_eq!(dominant_language(&commit), "Rust");
+    }
+
+    // An unborn repo has no head oid to resolve, so the card gets nothing —
+    // never a fabricated about line, language or stamp. The guard fires before
+    // any mirror is opened, so the unreachable endpoint below is never dialled.
+    #[test]
+    fn an_unborn_head_derives_no_card_facts() {
+        assert_eq!(
+            repo_card_facts("http://127.0.0.1:1", "core", "(unborn)"),
+            (String::new(), String::new(), 0)
+        );
     }
 
     #[test]

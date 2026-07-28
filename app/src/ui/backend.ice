@@ -160,7 +160,7 @@ extern crate::backend
   load_bool_pref(rpc:str, key:str) -> bool
   save_bool_pref(rpc:str, key:str, on:bool) -> bool
   forget_workspace(rpc:str) -> bool ! AppError
-  ForgeRepo(name:str, head:str)
+  ForgeRepo(name:str, head:str, about:str, language:str, updated_at:i64)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
   ForgeData(generation:i64, repos:[ForgeRepo])
   ForgeRepoData(generation:i64, repo:str, branches:[str], items:[ForgeItem])
@@ -177,14 +177,13 @@ extern crate::backend
   TreeEntry(name:str, path:str, kind:str, size:i64)
   ForgeTreeData(generation:i64, repo:str, rev:str, path:str, entries:[TreeEntry])
   BlobView(generation:i64, repo:str, rev:str, path:str, text:str, truncated:bool, binary:bool, lines:i64)
-  RepoAbout(generation:i64, repo:str, description:str, language:str, updated_at:i64)
   forge_tree(rpc:str, repo:str, rev:str, path:str, generation:i64) -> ForgeTreeData ! HydrationError
   forge_blob(rpc:str, repo:str, rev:str, path:str, generation:i64) -> BlobView ! HydrationError
-  repo_about(rpc:str, repo:str, generation:i64) -> RepoAbout ! HydrationError
   submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str) -> bool ! AppError
   merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
   forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:str, module:str, scope:ForgeRefresh, generation:i64) -> ForgeLiveData ! HydrationError
   sync forge_live_hit(kind:str, module:str) -> bool
+  sync forge_repo_row(repos:[ForgeRepo], name:str) -> ForgeRepo
   sync forge_stats(files:i64, additions:i64, deletions:i64) -> str
   DiffLine(kind:str, old_no:str, new_no:str, sign:str, text:str)
   sync diff_lines(diff:str) -> [DiffLine]
