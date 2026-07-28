@@ -22,20 +22,27 @@
 //
 // The artifact's file-row `note` is omitted for the same reason: its only home
 // would be `EntryInfo.meta`, which no writer populates today.
+//
+// Nothing here reaches an app handler directly. Every navigation leaves as a
+// named component event carrying the path, and the screen that mounts the row
+// decides where it lands; the event names match the handlers the Files screen
+// routes them to (`fs_open_dir`, `fs_open_file`) so the wiring reads as identity.
 
 // One directory in the whole-tree sidebar. The indent is the artifact's own
 // ladder — 11px, then 14px per level of depth — so the tree reads as a tree
 // without drawing a single guide line.
 component FsTreeRow(entry:FsEntry, selected:bool, depth:f64)
+  emits
+    fs_open_dir(str)
   col #root w=fill
     if selected
-      button label="Open directory" w=fill p=0.0 @ghost_action -> fs_open_dir(entry.path)
+      button label="Open directory" w=fill p=0.0 @ghost_action -> emit(fs_open_dir, entry.path)
         FsTreeFace name=entry.name depth=depth dimmed=false
         active bg=subtle text=fg border=transparent border-w=1.0 r=7.0
         hovered bg=subtle
         pressed bg=rail_hover
     if !selected
-      button label="Open directory" w=fill p=0.0 @ghost_action -> fs_open_dir(entry.path)
+      button label="Open directory" w=fill p=0.0 @ghost_action -> emit(fs_open_dir, entry.path)
         FsTreeFace name=entry.name depth=depth dimmed=true
         active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
         hovered bg=rail_hover
@@ -62,10 +69,12 @@ component FsTreeFace(name:str, depth:f64, dimmed:bool)
 // a per-segment crumb cannot be built from these props. The path prints as one
 // mono run beside a root crumb that does navigate.
 component CrumbBar(path:str, dirs:i64, files:i64)
+  emits
+    fs_open_dir(str)
   col #root w=fill
     box w=fill h=50.0 px=20.0
       row w=fill h=fill gap=6.0 align=center
-        button label="Go to the duckfs root" p=0.0 @ghost_action -> fs_open_dir("")
+        button label="Go to the duckfs root" p=0.0 @ghost_action -> emit(fs_open_dir, "")
           text "duckfs" size=12.5 wrap=none font=code_semibold @text-primary
           active bg=transparent text=primary border=transparent border-w=1.0 r=6.0
           hovered bg=elevated
@@ -105,21 +114,24 @@ component ObjectTableHeader()
 // One entry. A directory opens; a file selects into the object panel. Only a
 // file is ever the selected row, so the three branches are the whole space.
 component ObjectRow(entry:FsEntry, selected:bool)
+  emits
+    fs_open_dir(str)
+    fs_open_file(str)
   col #root w=fill
     if entry.kind == "dir"
-      button label="Open directory" w=fill p=0.0 @ghost_action -> fs_open_dir(entry.path)
+      button label="Open directory" w=fill p=0.0 @ghost_action -> emit(fs_open_dir, entry.path)
         ObjectRowFace entry=entry
         active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
         hovered bg=row_hover
         pressed bg=subtle
     if entry.kind != "dir" && selected
-      button label="Show object" w=fill p=0.0 @ghost_action -> fs_open_file(entry.path)
+      button label="Show object" w=fill p=0.0 @ghost_action -> emit(fs_open_file, entry.path)
         ObjectRowFace entry=entry
         active bg=elevated text=fg border=transparent border-w=1.0 r=0.0
         hovered bg=elevated
         pressed bg=subtle
     if entry.kind != "dir" && !selected
-      button label="Show object" w=fill p=0.0 @ghost_action -> fs_open_file(entry.path)
+      button label="Show object" w=fill p=0.0 @ghost_action -> emit(fs_open_file, entry.path)
         ObjectRowFace entry=entry
         active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
         hovered bg=row_hover

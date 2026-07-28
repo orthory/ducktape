@@ -27,6 +27,16 @@
 // quorum seat — and it gates the membership proposals, not the whole panel:
 // a non-admin still sees WHY the writes are refused.
 component MemberDetail(member:MemberRow, admin:bool)
+  // Every route out of this panel is a named event, so the panel stays closed
+  // over the app. The names are the app handlers the screen routes them back
+  // to, and the payloads are those handlers' own arities — an empty key closes
+  // the panel, `agent_set_status` carries the DESIRED paused state, and
+  // `gov_propose` carries the action then the target key.
+  emits
+    open_member(str)
+    copy_to_clipboard(str, str)
+    agent_set_status(str, bool)
+    gov_propose(str, str)
   row #root h=fill
     box w=1.0 h=fill bg=separator
       space w=1.0 h=1.0
@@ -35,7 +45,7 @@ component MemberDetail(member:MemberRow, admin:bool)
         box w=fill h=56.0 px=16.0
           row w=fill h=fill gap=8.0 align=center
             text "Member" w=fill size=13.0 wrap=none font=display @text-fg
-            button label="Close member" w=24.0 h=24.0 p=0.0 @icon_action -> open_member("")
+            button label="Close member" w=24.0 h=24.0 p=0.0 @icon_action -> emit(open_member, "")
               text "×" size=16.0 wrap=none font=code_medium @text-meta
               active bg=transparent r=6.0
               hovered bg=separator
@@ -68,14 +78,14 @@ component MemberDetail(member:MemberRow, admin:bool)
             col w=fill pt=16.0 gap=8.0
               // your own row's only action: the key you hand someone to invite you
               if member.is_this_node
-                button label="Copy your key" w=fill @secondary_action px-12px py-10px rounded-9px -> copy_to_clipboard(member.key, "Key copied")
+                button label="Copy your key" w=fill @secondary_action px-12px py-10px rounded-9px -> emit(copy_to_clipboard, member.key, "Key copied")
                   PanelActionLabel label="Copy your key" tag="" danger=false
               // an agent is paused and resumed by its OWNER, immediately — no ballot
               if member.is_agent && member.live
-                button label="Pause agent" w=fill @secondary_action px-12px py-10px rounded-9px -> agent_set_status(member.key, true)
+                button label="Pause agent" w=fill @secondary_action px-12px py-10px rounded-9px -> emit(agent_set_status, member.key, true)
                   PanelActionLabel label="Pause agent" tag="" danger=false
               if member.is_agent && !member.live
-                button label="Resume agent" w=fill @secondary_action px-12px py-10px rounded-9px -> agent_set_status(member.key, false)
+                button label="Resume agent" w=fill @secondary_action px-12px py-10px rounded-9px -> emit(agent_set_status, member.key, false)
                   PanelActionLabel label="Resume agent" tag="" danger=false
               // STATED AS THE RULE, NOT AS A REFUSAL. `MemberRow` carries no
               // ownership bit, so this panel cannot tell the owner from anyone
@@ -84,10 +94,10 @@ component MemberDetail(member:MemberRow, admin:bool)
                 GateNote reason="Pause and resume are owner-gated writes." next="The registry accepts them only from the signer that registered this agent."
               // membership moves are ballots: this opens the proposal, it does not settle it
               if admin && !member.is_agent && member.role == "resident"
-                button label="Promote to validator" w=fill @secondary_action px-12px py-10px rounded-9px -> gov_propose("add_validator", member.key)
+                button label="Promote to validator" w=fill @secondary_action px-12px py-10px rounded-9px -> emit(gov_propose, "add_validator", member.key)
                   PanelActionLabel label="Promote to validator" tag="needs quorum" danger=false
               if admin && !member.is_agent && member.role == "validator" && !member.is_this_node
-                button label="Remove from the validator set" w=fill @secondary_action px-12px py-10px rounded-9px border-alert_line -> gov_propose("remove_validator", member.key)
+                button label="Remove from the validator set" w=fill @secondary_action px-12px py-10px rounded-9px border-alert_line -> emit(gov_propose, "remove_validator", member.key)
                   PanelActionLabel label="Remove from the validator set" tag="needs quorum" danger=true
               if !admin && !member.is_this_node && !member.is_agent
                 GateNote reason="Only a validator node may open a membership proposal." next="This node holds no quorum seat, so the network refuses the write."
