@@ -96,9 +96,15 @@ impl Item {
     }
 }
 
-/// one repo's tracker: the shared number space and its items.
+/// one repo's tracker: its owner, the shared number space, and its items.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct RepoTracker {
+    /// the principal that owns this repo — `None` until a push births it.
+    /// pinned by the BIRTHING push and never reassigned; only this principal
+    /// may move a protected branch (`main`/`dev`) afterwards. see
+    /// [`crate::Forge::stage_push_refs`] for why authorization is the whole of
+    /// protected-branch safety.
+    pub owner: Option<Vec<u8>>,
     /// the LAST assigned number; 0 = none yet. the next item gets `+1`.
     pub last_number: u64,
     pub items: BTreeMap<u64, Item>,
@@ -113,15 +119,18 @@ pub struct Tracker {
 
 /// derive the item author from the dispatch origin — the same posture as
 /// chat: authorship is NEVER a payload field. an empty external id is the
-/// pre-consensus probe and is rejected.
+/// pre-consensus probe and is rejected, and so are module/system origins: a
+/// tracker item is a MEMBER action, and no module in the tree opens or edits
+/// one (the same refusal chat, pages, automations and inbox landed).
 pub fn author_from_origin(origin: &Origin) -> Result<AuthorRef, Error> {
     match origin {
         Origin::External(id) if id.is_empty() => Err(Error::Module(
             "forge: tracker ops require an authenticated origin".into(),
         )),
         Origin::External(id) => Ok(AuthorRef::User(id.clone())),
-        Origin::Module(m) => Ok(AuthorRef::Module(m.clone())),
-        Origin::System => Ok(AuthorRef::System),
+        Origin::Module(_) | Origin::System => Err(Error::Module(
+            "forge: tracker ops require an authenticated external origin".into(),
+        )),
     }
 }
 
@@ -155,8 +164,25 @@ pub fn parse_hex_oid(s: &str, field: &str) -> Result<Oid, Error> {
 }
 
 impl Tracker {
+    /// LOAD-BEARING: a repo owner is consensus state, so an owner alone must
+    /// make the tracker non-empty. otherwise `compose_state_root` skips the
+    /// tracker fold and the owner becomes UNAUTHENTICATED state — a joiner
+    /// could install a snapshot naming any owner it liked.
     pub fn is_empty(&self) -> bool {
-        self.repos.values().all(|r| r.items.is_empty() && r.last_number == 0)
+        self.repos
+            .values()
+            .all(|r| r.owner.is_none() && r.items.is_empty() && r.last_number == 0)
+    }
+
+    /// the principal that owns `repo`, if a push has birthed it.
+    pub fn owner(&self, repo: &str) -> Option<&[u8]> {
+        self.repos.get(repo).and_then(|r| r.owner.as_deref())
+    }
+
+    /// pin the owner of the repo this block's push is BIRTHING. the caller has
+    /// already established that the repo has none.
+    pub fn claim_owner(&mut self, repo: &str, principal: Vec<u8>) {
+        self.repos.entry(repo.to_string()).or_default().owner = Some(principal);
     }
 
     fn item(&self, repo: &str, number: u64) -> Result<&Item, Error> {
@@ -405,6 +431,9 @@ impl Tracker {
         codec::put_u32(&mut out, self.repos.len() as u32);
         for (repo, rt) in &self.repos {
             codec::put_str(&mut out, repo);
+            // an EMPTY owner is `None`: an empty principal is never a valid
+            // origin, so the two can never be confused.
+            codec::put_bytes(&mut out, rt.owner.as_deref().unwrap_or_default());
             codec::put_u64(&mut out, rt.last_number);
             codec::put_u32(&mut out, rt.items.len() as u32);
             for item in rt.items.values() {
@@ -423,6 +452,9 @@ impl Tracker {
         let mut repos = BTreeMap::new();
         for _ in 0..repo_count {
             let name = r.str_()?;
+            let owner_len = r.u32()? as usize;
+            let owner = r.take(owner_len)?;
+            let owner = (!owner.is_empty()).then(|| owner.to_vec());
             let last_number = r.u64()?;
             let item_count = r.u32()?;
             let mut items = BTreeMap::new();
@@ -438,7 +470,14 @@ impl Tracker {
                 }
             }
             if repos
-                .insert(name, RepoTracker { last_number, items })
+                .insert(
+                    name,
+                    RepoTracker {
+                        owner,
+                        last_number,
+                        items,
+                    },
+                )
                 .is_some()
             {
                 return Err(Error::Module("forge tracker: duplicate repo".into()));

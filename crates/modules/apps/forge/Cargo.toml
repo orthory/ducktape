@@ -21,7 +21,14 @@ sha2 = { workspace = true }
 # emit_msg follow-ups — the same seam runs/automations use. forge reuses
 # chat's AuthorRef so the app renders forge authors through the same path.
 chat = { workspace = true }
+# identity's WIRE TYPES only: forge resolves a ref-moving origin to the account
+# it belongs to, so the SAME human's node-key `git push` and user-key app merge
+# land on one owner principal (see `Forge::principal_of_origin`).
+identity = { workspace = true }
 async-trait = { workspace = true }
+# the node's log plane — `materialize`'s pack-missing / refused-advance warnings
+# must reach the app's Logs tab and `RUST_LOG`, which a `println!` never does.
+tracing = { workspace = true }
 # vendored libgit2 (built via cmake + cc). default-features=false drops the
 # ssh/https transport (openssl/libssh2) — forge only touches local repos.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }

@@ -73,6 +73,22 @@
 //! branch are protected (never deleted, fast-forward-guarded at materialize);
 //! feature branches may force-push and be deleted — the GitHub flow.
 //!
+//! ## repo ownership — the ONLY protected-branch lever there is
+//!
+//! consensus CANNOT check ref descendancy: a validator may not hold the
+//! objects, and reading them would break the determinism invariant above. so
+//! AUTHORIZATION is the whole of protected-branch safety. the push that BIRTHS
+//! a repo pins its owner — the Identity ACCOUNT id the origin resolves to (see
+//! [`Forge::principal_of_origin`]; `git push` signs with the NODE key, the
+//! app's merge with the USER key, and both collapse onto one account) — and
+//! only that owner may move `main`/`dev` afterwards, whether by
+//! [`ForgeMsg::PushRefs`] or by [`ForgeMsg::MergePr`] onto a protected target.
+//! FEATURE branches stay open to every member.
+//!
+//! without the gate one signed op from any member CAS-moves `main` to bytes no
+//! pack closes: `materialize` then refuses forever and `snapshot()` errors on
+//! every node, so the network stops checkpointing and cannot admit joiners.
+//!
 //! ## the default repo
 //!
 //! every [`ForgeMsg`] carries a required `repo` field; an empty slug maps to
@@ -117,11 +133,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use git2::Oid;
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
+use identity::{IdentityQuery, IdentityReply};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 
-use crate::refs::{INTEGRATION_BRANCH, MAIN_BRANCH, RepoState, norm_branch};
+use crate::refs::{INTEGRATION_BRANCH, MAIN_BRANCH, RepoState, is_protected_branch, norm_branch};
 use crate::tracker::{Tracker, author_from_origin, parse_hex_oid};
+
+/// the Identity module's genesis-constant id — the account registry every
+/// forge principal resolves through. mirrors `bin/node/src/host_state.rs`'s
+/// `IDENTITY_MODULE_ID`; it is not a per-network choice, so it is not a knob.
+const IDENTITY_MODULE: &str = "identity";
 
 /// the well-known repo an empty `repo` field maps to — the single-repo wire
 /// (see the module docstring).
@@ -272,6 +294,51 @@ pub(crate) fn compose_state_root<'a>(
     StateRoot(outer.finalize().into())
 }
 
+/// the push-side owner gate: a push may move `main`/`dev` only for the
+/// principal that owns the repo. every other branch is open to any member.
+fn require_owner_for_protected(
+    repo: &str,
+    owner: &[u8],
+    principal: &[u8],
+    updates: &[RefUpdate],
+) -> Result<(), Error> {
+    let moves_protected = updates.iter().any(|u| is_protected_branch(&u.ref_name));
+    if moves_protected && owner != principal {
+        return Err(Error::Module(format!(
+            "forge: only the owner of repo {repo:?} may move a protected branch"
+        )));
+    }
+    Ok(())
+}
+
+/// CAS every update of ONE atomic push onto `state`. detached from the repo map
+/// so the caller decides whether a birthing repo's entry survives a refusal.
+fn stage_updates(
+    state: &mut RepoState,
+    updates: &[RefUpdate],
+    digest: Option<[u8; 32]>,
+) -> Result<(), Error> {
+    for u in updates {
+        let prev = u
+            .prev_oid
+            .as_deref()
+            .map(|b| parse_oid(b, "prev_oid"))
+            .transpose()?;
+        let new = u
+            .new_oid
+            .as_deref()
+            .map(|b| parse_oid(b, "new_oid"))
+            .transpose()?;
+        state.stage_update(
+            &u.ref_name,
+            prev,
+            new,
+            new.is_some().then(|| digest.unwrap()),
+        )?;
+    }
+    Ok(())
+}
+
 pub struct Forge {
     id: ModuleId,
     /// node-local container dir — NOT consensus state (the path may differ per
@@ -379,13 +446,6 @@ impl Forge {
         self
     }
 
-    /// ensure a [`RepoState`] entry exists for `name` (already normalized).
-    fn ensure_repo(&mut self, name: &str) {
-        if !self.repos.contains_key(name) {
-            self.repos.insert(name.to_string(), RepoState::default());
-        }
-    }
-
     /// node-local catch-up across ALL repos (see [`refs::RepoState::materialize`]).
     pub fn materialize(&mut self) -> Result<(), Error> {
         let base = &self.base;
@@ -440,12 +500,96 @@ impl Forge {
         Ok(())
     }
 
-    /// stage an atomic multi-branch push: validate the update list, then CAS
-    /// every branch. PURE and deterministic — no repo opened, nothing
-    /// installed, no ref moves (see [`refs::RepoState::stage_update`]).
+    /// the Identity ACCOUNT id a key belongs to, or `None`.
+    ///
+    /// a host with no identity module at all (the minimal test hosts) has no
+    /// accounts, so nothing resolves — the only tolerated query failures are
+    /// exactly "that module is not here".
+    async fn identity_account(
+        ctx: &dyn Ctx,
+        query: IdentityQuery,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let reply = match ctx
+            .query(IDENTITY_MODULE, &identity::encode_query(&query))
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(Error::UnknownModule(_) | Error::QueryUnsupported) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        match identity::decode_reply(&reply).map_err(Error::Module)? {
+            IdentityReply::Account(account) => Ok(account.map(|a| a.account_id)),
+            other => Err(Error::Module(format!(
+                "forge: identity answered an account query with {other:?}"
+            ))),
+        }
+    }
+
+    /// the PRINCIPAL a ref-moving op speaks for.
+    ///
+    /// the two ref-move doors sign under DIFFERENT key domains: `git push`
+    /// rides the NODE key (bin/noded's smart-HTTP lane submits, and the
+    /// validator ingress discards the claimed origin and re-signs with the node
+    /// key), while the app's merge is signed by the USER key. collapsing both
+    /// through Identity onto ONE account id is what lets the same human push
+    /// from the CLI and merge the PR from the app — a raw-key owner would
+    /// refuse the second.
+    ///
+    /// a key Identity knows nothing about is its OWN principal. that keeps a
+    /// single-operator or identity-less network self-consistent and does not
+    /// widen the gate: an unbound key still only ever matches itself.
+    async fn principal_of_origin(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
+        let Origin::External(key) = &ctx.env().origin else {
+            return Err(Error::Module(
+                "forge: a ref-moving op requires an authenticated external origin".into(),
+            ));
+        };
+        if key.is_empty() {
+            return Err(Error::Module(
+                "forge: a ref-moving op requires an authenticated external origin".into(),
+            ));
+        }
+        let as_member = Self::identity_account(
+            ctx,
+            IdentityQuery::OfMember {
+                member_key: key.clone(),
+            },
+        )
+        .await?;
+        if let Some(account) = as_member {
+            return Ok(account);
+        }
+        let as_node = Self::identity_account(
+            ctx,
+            IdentityQuery::OfNode {
+                node_key: key.clone(),
+            },
+        )
+        .await?;
+        Ok(as_node.unwrap_or_else(|| key.clone()))
+    }
+
+    /// stage an atomic multi-branch push: validate the update list, settle
+    /// ownership, then CAS every branch. PURE and deterministic — no repo
+    /// opened, nothing installed, no ref moves (see
+    /// [`refs::RepoState::stage_update`]).
+    ///
+    /// OWNERSHIP is the whole of protected-branch safety, and it has to be:
+    /// consensus CANNOT check ref descendancy, because a validator may not hold
+    /// the objects (that is forge's determinism invariant). without this gate
+    /// any member CAS-moves `main` to arbitrary bytes naming a pack it
+    /// legitimately holds, `materialize` then refuses forever, and `snapshot()`
+    /// errors on every node — one signed op stops the network checkpointing and
+    /// admitting joiners.
+    ///
+    /// the push that BIRTHS a repo pins its owner; afterwards only that owner
+    /// may move `main`/`dev`. FEATURE branches stay force-pushable by any
+    /// member — the GitHub flow this module documents, and what the dogfood
+    /// loop's second node pushes under its own key.
     fn stage_push_refs(
         &mut self,
         name: &str,
+        principal: Vec<u8>,
         updates: Vec<RefUpdate>,
         pack_digest: Option<Vec<u8>>,
     ) -> Result<(), Error> {
@@ -475,24 +619,47 @@ impl Forge {
             ));
         }
 
-        let state = self.repos.get_mut(name).expect("ensured by caller");
-        for u in &updates {
-            let prev = u
-                .prev_oid
-                .as_deref()
-                .map(|b| parse_oid(b, "prev_oid"))
-                .transpose()?;
-            let new = u
-                .new_oid
-                .as_deref()
-                .map(|b| parse_oid(b, "new_oid"))
-                .transpose()?;
-            state.stage_update(
-                &u.ref_name,
-                prev,
-                new,
-                new.is_some().then(|| digest.unwrap()),
-            )?;
+        // one discriminant: the repo either has an owner or this push births it.
+        // the CAS runs AFTER, so a stale prev_oid from the rightful owner still
+        // reports the non-fast-forward, not an authorization refusal.
+        match self.tracker_view().owner(name).map(<[u8]>::to_vec) {
+            None => self.staged_tracker_mut().claim_owner(name, principal),
+            Some(owner) => require_owner_for_protected(name, &owner, &principal, &updates)?,
+        }
+
+        // a repo the push BIRTHS is only inserted once EVERY CAS succeeded —
+        // `abort_block` drops staged fates but never a map entry, so inserting
+        // first would leave a phantom repo behind a rejected push (visible to
+        // `ListRepos`, and gone again after a restart re-adopt).
+        match self.repos.remove(name) {
+            Some(mut state) => {
+                let staged = stage_updates(&mut state, &updates, digest);
+                self.repos.insert(name.to_string(), state);
+                staged
+            }
+            None => {
+                let mut state = RepoState::default();
+                stage_updates(&mut state, &updates, digest)?;
+                self.repos.insert(name.to_string(), state);
+                Ok(())
+            }
+        }
+    }
+
+    /// refuse a merge onto a PROTECTED target branch from anyone but the repo
+    /// owner. `MergePr` is a SECOND raw ref-move door: `merge_oid` is
+    /// client-computed and its parentage is unverifiable in consensus, and
+    /// `OpenPr` lets any member open a PR onto `main` — so gating `PushRefs`
+    /// alone would close nothing.
+    fn require_merge_owner(&self, name: &str, target: &str, principal: &[u8]) -> Result<(), Error> {
+        if !is_protected_branch(target) {
+            return Ok(());
+        }
+        if self.tracker_view().owner(name) != Some(principal) {
+            return Err(Error::Module(format!(
+                "forge: only the owner of repo {name:?} may merge onto protected branch \
+                 {target:?}"
+            )));
         }
         Ok(())
     }
@@ -536,8 +703,8 @@ impl Module for Forge {
                 pack_digest,
             } => {
                 let name = norm_repo(&repo)?;
-                self.ensure_repo(&name);
-                self.stage_push_refs(&name, updates, pack_digest)
+                let principal = Self::principal_of_origin(ctx).await?;
+                self.stage_push_refs(&name, principal, updates, pack_digest)
             }
             ForgeMsg::OpenIssue { repo, title, body } => {
                 let name = norm_repo(&repo)?;
@@ -618,7 +785,11 @@ impl Module for Forge {
             }
             ForgeMsg::SetItemState { repo, number, open } => {
                 let name = norm_repo(&repo)?;
-                author_from_origin(&ctx.env().origin)?;
+                // DELIBERATELY open to any authenticated member: closing and
+                // reopening is triage, `Merged` is terminal and refused below,
+                // and the inverse op is one message away. the binding is here
+                // for its AUTHENTICATION effect only.
+                let _closer = author_from_origin(&ctx.env().origin)?;
                 if let Some(verb) = self
                     .staged_tracker_mut()
                     .set_state(&name, number, open, now)?
@@ -636,7 +807,7 @@ impl Module for Forge {
                 pack_digest,
             } => {
                 let name = norm_repo(&repo)?;
-                author_from_origin(&ctx.env().origin)?;
+                let principal = Self::principal_of_origin(ctx).await?;
                 let prev_target = parse_hex_oid(&prev_target_oid, "prev_target_oid")?;
                 let expected_source = parse_hex_oid(&expected_source_oid, "expected_source_oid")?;
                 let merge = parse_hex_oid(&merge_oid, "merge_oid")?;
@@ -644,6 +815,7 @@ impl Module for Forge {
 
                 // the PR must be an open PR; pull its branches.
                 let (source, target) = self.tracker_view().pr_branches(&name, number)?;
+                self.require_merge_owner(&name, &target, &principal)?;
 
                 // double CAS on COMMITTED refs: the target must not have moved
                 // under the merger, and the merge must have been computed
@@ -865,8 +1037,10 @@ mod tests {
 
     // forge's execute reads only env (consensus_time / origin) and CAPTURES
     // emitted follow-ups; the shared TestCtx captures them (read via `msgs()`).
+    // no `identity` handler is registered, so a principal resolves to the
+    // origin key itself — the identity-less host path.
     fn ctx_at(consensus_time: u64) -> TestCtx {
-        ctx_with_origin(consensus_time, sdk::Origin::System)
+        ctx_with_origin(consensus_time, user_origin(1))
     }
     fn ctx_with_origin(consensus_time: u64, origin: sdk::Origin) -> TestCtx {
         TestCtx::with_env(sdk::Env {
@@ -909,7 +1083,7 @@ mod tests {
         message: &str,
     ) {
         let name = norm_repo(repo).unwrap();
-        forge.ensure_repo(&name);
+        forge.repos.entry(name.clone()).or_default();
         let git_repo = refs::open_or_init_repo(&forge.base, &name).unwrap();
         let state = forge.repos.get_mut(&name).unwrap();
         let parent = state
@@ -1398,8 +1572,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    fn user_key(b: u8) -> Vec<u8> {
+        vec![b; 8]
+    }
     fn user_origin(b: u8) -> sdk::Origin {
-        sdk::Origin::External(vec![b; 8])
+        sdk::Origin::External(user_key(b))
+    }
+
+    /// an `identity` query handler that answers EVERY account lookup with the
+    /// same account — i.e. this key is bound to it, whichever key domain the
+    /// caller asked about.
+    fn identity_of(account_id: Vec<u8>) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
+        move |_req| {
+            Ok(identity::encode_reply(&IdentityReply::Account(Some(
+                identity::AccountView {
+                    account_id: account_id.clone(),
+                    display_name: None,
+                    avatar: None,
+                    bio: None,
+                    nonce: 0,
+                    member_keys: Vec::new(),
+                    nodes: Vec::new(),
+                    updated_at: 0,
+                },
+            ))))
+        }
     }
 
     #[test]
@@ -1584,8 +1781,9 @@ mod tests {
         let digest = vec![9u8; 32];
 
         // seed a repo with release main, integration dev, and a feature branch
-        // (fabricated oids — packs never gate consensus).
-        let mut ctx = ctx_at(1);
+        // (fabricated oids — packs never gate consensus). the birthing push
+        // pins user 2 as the owner, which is who merges onto `dev` below.
+        let mut ctx = ctx_with_origin(1, user_origin(2));
         exec_commit(
             &mut forge,
             &mut ctx,
@@ -1926,6 +2124,294 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    // ---- ownership ----------------------------------------------------------
+
+    fn push(
+        forge: &mut Forge,
+        ctx: &mut TestCtx,
+        repo: &str,
+        branch: &str,
+        prev: Option<Oid>,
+        new: Oid,
+    ) -> Result<(), Error> {
+        let r = exec(
+            forge,
+            ctx,
+            &ForgeMsg::PushRefs {
+                repo: repo.into(),
+                updates: vec![RefUpdate {
+                    ref_name: branch.into(),
+                    prev_oid: prev.map(|o| o.as_bytes().to_vec()),
+                    new_oid: Some(new.as_bytes().to_vec()),
+                }],
+                pack_digest: Some(vec![7u8; 32]),
+            },
+        );
+        match &r {
+            Ok(()) => futures::executor::block_on(forge.commit_block()).unwrap(),
+            Err(_) => futures::executor::block_on(forge.abort_block()).unwrap(),
+        }
+        r
+    }
+
+    // the CORE gate: the birthing push owns the repo, and only that owner may
+    // move `main`/`dev` afterwards. without it one signed op from any member
+    // wedges materialize on every node and stops the network snapshotting.
+    #[test]
+    fn only_the_birthing_owner_moves_a_protected_branch() {
+        let base = tmp_base("owner-protected");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let (a, b, c) = (oid('a'), oid('b'), oid('c'));
+
+        let mut owner = ctx_with_origin(1, user_origin(1));
+        push(&mut forge, &mut owner, "demo", "main", None, a).expect("the birth claims the repo");
+
+        let mut stranger = ctx_with_origin(2, user_origin(9));
+        let err = push(&mut forge, &mut stranger, "demo", "main", Some(a), b)
+            .expect_err("a stranger may not move main");
+        assert!(err.to_string().contains("only the owner"), "{err}");
+        assert_eq!(
+            forge.read_head("demo"),
+            Some(a.to_string()),
+            "the refused push moved nothing"
+        );
+
+        // dev is protected too, even unborn.
+        let err = push(&mut forge, &mut stranger, "demo", "dev", None, b)
+            .expect_err("a stranger may not birth dev either");
+        assert!(err.to_string().contains("only the owner"), "{err}");
+
+        // FEATURE branches stay open — the GitHub flow the dogfood loop needs.
+        push(&mut forge, &mut stranger, "demo", "agent/item-1", None, b)
+            .expect("any member force-pushes a feature branch");
+
+        // and the owner still moves main.
+        let mut owner = ctx_with_origin(3, user_origin(1));
+        push(&mut forge, &mut owner, "demo", "main", Some(a), c).expect("the owner moves main");
+        assert_eq!(forge.read_head("demo"), Some(c.to_string()));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // the node-key push and the user-key merge sign under DIFFERENT key
+    // domains; Identity collapses both onto one account, so the human who
+    // pushed from the CLI can merge from the app.
+    #[test]
+    fn a_node_key_and_a_member_key_of_one_account_share_the_owner() {
+        let base = tmp_base("owner-account");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let account = vec![0xACu8; 32];
+        let node_key = vec![0xB0u8; 32];
+
+        let mut node = ctx_with_origin(1, sdk::Origin::External(node_key))
+            .on_query("identity", identity_of(account.clone()));
+        push(&mut forge, &mut node, "demo", "main", None, oid('a')).expect("node births the repo");
+
+        // a DIFFERENT key, same account -> same principal -> allowed.
+        let mut member =
+            ctx_with_origin(2, user_origin(5)).on_query("identity", identity_of(account.clone()));
+        push(
+            &mut forge,
+            &mut member,
+            "demo",
+            "main",
+            Some(oid('a')),
+            oid('b'),
+        )
+        .expect("the same account's member key moves main");
+
+        // a key bound to NO account is its own principal -> refused.
+        let mut outsider = ctx_with_origin(3, user_origin(7)).on_query("identity", |_: &[u8]| {
+            Ok(identity::encode_reply(&IdentityReply::Account(None)))
+        });
+        let err = push(
+            &mut forge,
+            &mut outsider,
+            "demo",
+            "main",
+            Some(oid('b')),
+            oid('c'),
+        )
+        .expect_err("an unbound key is not the owner");
+        assert!(err.to_string().contains("only the owner"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // MergePr is the SECOND ref-move door: gating the push alone closes nothing.
+    #[test]
+    fn merging_onto_a_protected_target_is_owner_only() {
+        let base = tmp_base("owner-merge");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let digest = vec![9u8; 32];
+        let mut owner = ctx_with_origin(1, user_origin(1));
+        exec_commit(
+            &mut forge,
+            &mut owner,
+            &ForgeMsg::PushRefs {
+                repo: "demo".into(),
+                updates: vec![
+                    RefUpdate {
+                        ref_name: "dev".into(),
+                        prev_oid: None,
+                        new_oid: Some(oid('a').as_bytes().to_vec()),
+                    },
+                    RefUpdate {
+                        ref_name: "feat".into(),
+                        prev_oid: None,
+                        new_oid: Some(oid('b').as_bytes().to_vec()),
+                    },
+                ],
+                pack_digest: Some(digest.clone()),
+            },
+        );
+        // any member may OPEN a PR onto dev — that is the door.
+        let mut stranger = ctx_with_origin(2, user_origin(9));
+        exec_commit(
+            &mut forge,
+            &mut stranger,
+            &ForgeMsg::OpenPr {
+                repo: "demo".into(),
+                title: "sneak".into(),
+                body: String::new(),
+                source_branch: "feat".into(),
+                target_branch: "dev".into(),
+            },
+        );
+        let merge = ForgeMsg::MergePr {
+            repo: "demo".into(),
+            number: 1,
+            prev_target_oid: oid('a').to_string(),
+            expected_source_oid: oid('b').to_string(),
+            merge_oid: oid('c').to_string(),
+            pack_digest: hex(&digest),
+        };
+        let mut stranger = ctx_with_origin(3, user_origin(9));
+        let err = exec(&mut forge, &mut stranger, &merge).expect_err("a stranger may not merge");
+        assert!(err.to_string().contains("only the owner"), "{err}");
+        futures::executor::block_on(forge.abort_block()).unwrap();
+
+        let mut owner = ctx_with_origin(4, user_origin(1));
+        exec_commit(&mut forge, &mut owner, &merge);
+        assert_eq!(
+            forge.repos["demo"].refs["dev"],
+            oid('c'),
+            "the owner's merge lands"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // SetItemState stays open ON PURPOSE — but it is still authenticated.
+    #[test]
+    fn any_member_closes_an_item_but_an_unauthenticated_origin_cannot() {
+        let base = tmp_base("close-open");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let mut author = ctx_with_origin(1, user_origin(1));
+        exec_commit(
+            &mut forge,
+            &mut author,
+            &ForgeMsg::OpenIssue {
+                repo: "demo".into(),
+                title: "triage me".into(),
+                body: String::new(),
+            },
+        );
+        let close = ForgeMsg::SetItemState {
+            repo: "demo".into(),
+            number: 1,
+            open: false,
+        };
+
+        // an item is a MEMBER action: the pre-consensus probe, a module and
+        // the system are all refused.
+        for origin in [
+            sdk::Origin::External(Vec::new()),
+            sdk::Origin::Module("automations".into()),
+            sdk::Origin::System,
+        ] {
+            let mut probe = ctx_with_origin(2, origin.clone());
+            assert!(
+                exec(&mut forge, &mut probe, &close).is_err(),
+                "{origin:?} must not close an item"
+            );
+            futures::executor::block_on(forge.abort_block()).unwrap();
+        }
+
+        let mut stranger = ctx_with_origin(3, user_origin(9));
+        exec_commit(&mut forge, &mut stranger, &close);
+        let item = forge.tracker.get("demo", 1).expect("item");
+        assert_eq!(
+            item.summary.state,
+            ItemState::Closed,
+            "triage is open to all"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // a REFUSED push must leave no repo behind: `abort_block` drops staged
+    // fates, never a map entry, so the entry can only be inserted on success.
+    #[test]
+    fn a_refused_push_creates_no_repo() {
+        let base = tmp_base("phantom");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let mut ctx = ctx_at(1);
+        // a CAS against an unborn branch — the repo has never existed.
+        push(
+            &mut forge,
+            &mut ctx,
+            "ghost",
+            "main",
+            Some(oid('a')),
+            oid('b'),
+        )
+        .expect_err("prev_oid on an unborn branch fails the CAS");
+        assert!(!forge.repos.contains_key("ghost"), "no phantom repo");
+
+        let reply = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::ListRepos)))
+            .unwrap();
+        let ForgeReply::Repos(repos) = decode_reply(&reply).unwrap() else {
+            panic!("wrong reply")
+        };
+        assert!(repos.is_empty(), "ListRepos stays empty: {repos:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // an owner is consensus state: it must move root() on its own, or a joiner
+    // could install a snapshot naming any owner it liked.
+    #[test]
+    fn an_owner_alone_moves_the_root_and_survives_a_restart() {
+        let base = tmp_base("owner-root");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let mut tracker = Tracker::default();
+        assert!(tracker.is_empty());
+        tracker.claim_owner("demo", vec![4u8; 32]);
+        assert!(
+            !tracker.is_empty(),
+            "an owner alone makes the tracker non-empty"
+        );
+        assert_ne!(
+            compose_state_root(std::iter::empty(), &tracker),
+            StateRoot::ZERO,
+            "an owner alone moves the root"
+        );
+        assert_eq!(
+            Tracker::decode(&tracker.canonical_bytes()).unwrap(),
+            tracker,
+            "the owner round-trips through the canonical bytes"
+        );
+
+        let mut ctx = ctx_with_origin(1, user_origin(1));
+        push(&mut forge, &mut ctx, "demo", "main", None, oid('a')).unwrap();
+        drop(forge);
+        let reopened = Forge::init("forge", base.clone()).unwrap();
+        assert_eq!(
+            reopened.tracker.owner("demo"),
+            Some(user_key(1).as_slice()),
+            "the owner is re-adopted from the persisted tracker"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
