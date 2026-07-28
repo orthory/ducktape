@@ -165,13 +165,20 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
 // plate belongs here, because selection is a fact about the row and not about
 // the pointer.
 //
-// NO AI PLATE ON A FILE ROW, and no signed inline annotation beside a source
-// line. Both want per-path authorship: the plate needs each entry's last
-// committer AND whether that principal is a machine, and the annotation needs a
-// (path, line) anchor. `ReviewComment` (crates/modules/apps/forge/src/interface.rs)
-// stores its anchor as a pre-rendered display string, so there is nothing to
-// key a line against. A grey plate that says AI on every file would be a lie
-// about who wrote it.
+// NO AI PLATE ON A FILE ROW. It wants per-path authorship — each entry's last
+// committer AND whether that principal is a machine — and `forge_tree` returns
+// name/path/kind/size only, so nothing resolves it. A grey plate that says AI
+// on every file would be a lie about who wrote it.
+//
+// The inline annotation is a DIFFERENT case and it is NOT blocked by the wire:
+// `ReviewComment` (crates/modules/apps/forge/src/tracker_iface.rs) is
+// `{ path: String, line: u32, side: DiffSide, body: String }` — a real
+// (path, line, side) anchor, with `ReviewView.commit_oid` carrying the
+// outdated-detection anchor beside it. `diff_lines()` (backend.rs) already
+// splits a patch into numbered rows. What is missing is only the authoring
+// affordance: a hover on `DiffRow` emitting (path, old_no|new_no parsed back to
+// u32, side), and `submit_forge_review` taking those instead of its hardcoded
+// `comments: Vec::new()`. Tracked in #804.
 
 // The two-pane frame. 258px of `sidebar` under the FILES eyebrow, the
 // `separator` rule, then the reader's header over its own scroll region.
@@ -277,8 +284,9 @@ component ForgeCodeHeader(path:str, message:str, author:str, stamp:str)
 //
 // The code is ONE ink. The design system is explicit that this viewer uses no
 // syntax colour ("코드는 구문 색을 쓰지 않고 단색") — emphasis is carried by the
-// signed annotation card, which this wire cannot anchor, so nothing here tints
-// a token.
+// signed annotation card, so nothing here tints a token. (The annotation is
+// unbuilt, not unanchorable: see the DiffRow note above for why the wire
+// already supports it.)
 component ForgeCodeLine(number:str, code:str)
   row #root w=fill gap=0.0 align=center
     box w=44.0 h=20.0 pr=12.0 align-y=center bg=rail
