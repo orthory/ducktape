@@ -63,6 +63,22 @@ pub fn canonical(path: &str) -> Result<Vec<String>, String> {
     Ok(segments)
 }
 
+/// the two STRUCTURAL namespace roots: `/home` and `/shared`.
+///
+/// They are not ordinary directories anybody made — [`check_authority`] refuses
+/// to write either of them ("root is not writable"), and nothing materializes
+/// them in the tree either, so on a fresh filesystem they exist in the rule and
+/// not in the store. That asymmetry is the whole reason this predicate exists:
+/// a READ of one must answer like the filesystem root does (an empty listing),
+/// not `path not found`, which would tell a caller to create something the
+/// authority rule forbids them from creating.
+///
+/// Exactly one segment. `/shared/nope` is a genuinely absent path and must
+/// still say so.
+pub fn is_namespace_root(segments: &[String]) -> bool {
+    matches!(segments, [only] if only == "home" || only == "shared")
+}
+
 /// decide whether `owner` may write to the already-canonicalized `segments`.
 /// `system` writes anywhere; `/home/<o>/**` is writable only by `o`, and the
 /// home root itself (`/home` or `/home/<o>`) is never a writable file — only
