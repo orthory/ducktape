@@ -977,11 +977,14 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         // the pointer sensor is the stack's FIRST child, so it measures the
         // message list itself and not whatever an overlay happens to cover.
         // The screen holds the SEAT and the mount fills it: `sensor` cannot
-        // route to a component event (its show/resize check takes only bare
-        // `_` payloads), so the measurement stays in the caller's scope.
+        // the sensor is the stack's FIRST child, so it measures the message
+        // list and not the pane around it.
         let sensor = chat.split_once("stack w=fill h=fill\n").unwrap().1;
-        assert!(sensor.trim_start().starts_with("slot chat_sensor"));
-        assert!(view.contains("sensor show=chat_resized resize=chat_resized"));
+        assert!(
+            sensor
+                .trim_start()
+                .starts_with("sensor show=emit(chat_resized, _, _)")
+        );
         let overlay_content = chat
             .split_once("                  content\n")
             .unwrap()
@@ -1065,12 +1068,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         );
         assert!(thread.contains("float x=0.0 y=thread_menu_y"));
         assert!(thread.contains("mouse move=emit(thread_pointer_moved, _, _)"));
-        // Same seat-and-fill split as the message list: the screen holds
-        // `slot thread_sensor`, the mount supplies the sensor.
-        assert!(thread.contains("slot thread_sensor"));
+        // same seat as the message list — the rail measures itself
         assert!(
-            include_str!("ui/view.ice")
-                .contains("sensor show=thread_resized resize=thread_resized")
+            thread.contains("sensor show=emit(thread_resized, _, _)")
         );
         // The picker reuses the seq-targeted reaction mutations against the thread selection.
         assert!(thread.contains("-> emit(add_reaction_at, thread_selected_seq, \"👍\")"));

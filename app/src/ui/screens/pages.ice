@@ -17,12 +17,10 @@
 // among them — `PageTitleEditor` owns a local draft and autosaves through its
 // own `run`, so `title` stays an ordinary read-only prop.
 //
-// THE SIZE SENSOR ARRIVES THROUGH THE SLOT, and that is not a style choice.
-// `sensor show=`/`resize=` accept exactly two bare `_` payloads and reject
-// anything else, so a named component event cannot ride one and the sensor
-// cannot emit. It stays authored at the call site, where `pages_resized` is in
-// scope, and is handed in as the canvas stack's FIRST child — the same seat it
-// held inline — so it keeps measuring the canvas rather than the whole tab.
+// The size sensor is the canvas stack's FIRST child, so it measures the canvas
+// and not the whole tab. It reports through this screen's own `pages_resized`;
+// it was briefly a caller-filled slot, because a sensor could not carry a
+// component event until ui-lang#239.
 component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:str, connected:bool, connected_rpc:str, password:str, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_delete_armed:bool, block_autosave_status:str, doc_tabs:[str], blocks:[PageBlock], orphaned_block_drafts:[str], orphaned_comment_drafts:[str], bind block_draft:str, block_insert_open:bool, block_insert_after_id:str, new_block_kind:str, block_kinds:[str], editable_block_kinds:[str], selected_block_id:str, selected_block_kind:str, hovered_block_id:str, bind block_edit_draft:str, block_actions_open:bool, block_menu_x:f64, block_menu_y:f64, block_delete_armed:bool, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
   emits
     toggle_page_create()
@@ -62,6 +60,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
     close_block_comment_thread()
     load_more_block_comments()
     post_block_comment_submit()
+    pages_resized(f64, f64)
   row w=fill h=fill
     box w=230.0 h=fill bg=sidebar clip=true
       col w=fill h=fill gap=0.0
@@ -182,7 +181,8 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                         hovered bg=fg/8 text=fg
                         pressed bg=fg/12
           stack w=fill h=fill clip=true
-            slot
+            sensor show=emit(pages_resized, _, _) resize=emit(pages_resized, _, _)
+              space w=fill h=fill
             if !connected
               EmptyState title="Connect to a node" description="Set the RPC endpoint in the sidebar."
             if connected && empty(active_page)
