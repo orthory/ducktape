@@ -193,10 +193,10 @@ pub enum ChatMsg {
         post_policy: PostPolicy,
     },
     /// rename a channel, reusing `CreateChannel`'s name validation (non-empty +
-    /// the reserved `:` namespace gate + the record byte cap). only the
-    /// channel's `owner` (a `User` origin) may rename an owned channel; an
-    /// unowned (module/system-minted) channel admits any user, mirroring
-    /// `SetMembership`. module and system origins pass as elsewhere.
+    /// the reserved `:` namespace gate + the record byte cap). channel-admin
+    /// authority: only the channel's `owner` may rename an owned channel, and
+    /// no user at all may rename an unowned (module/system-minted) one. module
+    /// and system origins pass as elsewhere.
     RenameChannel { channel_id: String, name: String },
     /// archive or unarchive a channel. an archived channel rejects posts,
     /// reactions, and huddle joins; membership, rename, and unarchive stay
@@ -238,18 +238,23 @@ pub enum ChatMsg {
         seq: u64,
         emoji: String,
     },
-    /// subscribe a module to this channel's post notifications. any non-empty
-    /// origin may register for now — admin gating is future work.
+    /// subscribe a module to this channel's post notifications. channel-admin
+    /// authority (same rule as `RenameChannel`): a hook sees everything posted
+    /// to the channel, so attaching one is the owner's call.
     RegisterHook {
         channel_id: String,
         module_id: String,
     },
+    /// detach a hook module. channel-admin authority, and the sharper half of
+    /// the pair — an ungated unregister silently disables every automation
+    /// registered on the channel.
     UnregisterHook {
         channel_id: String,
         module_id: String,
     },
-    /// add/remove an external user from the channel member set. any non-empty
-    /// origin may modify for now — admin gating is future work.
+    /// add/remove an external user from the channel member set. channel-admin
+    /// authority: this roster IS `PostPolicy::MembersOnly`'s admission list, so
+    /// only the owner writes it — a self-service roster is no admission rule.
     SetMembership {
         channel_id: String,
         user: Vec<u8>,
@@ -265,8 +270,10 @@ pub enum ChatMsg {
     LeaveHuddle { channel_id: String },
     /// evict a huddle member — call liveness is not consensus-observable
     /// (a crashed client cannot leave), so cleanup is social: any author the
-    /// channel's post policy admits may sweep a stale entry, mirroring
-    /// `SetMembership`'s trust posture. sweeping an absent user is a
+    /// channel's post policy admits may sweep a stale entry. deliberately NOT
+    /// channel-admin authority (unlike `SetMembership`): a huddle roster is
+    /// ephemeral call presence, not an admission list, and the only harm a
+    /// wrongful sweep does is a rejoin. sweeping an absent user is a
     /// deterministic no-op.
     SweepHuddle { channel_id: String, user: Vec<u8> },
 }

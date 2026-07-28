@@ -121,7 +121,13 @@ fn an_expired_lease_reclaims_exactly_past_its_deadline() {
 fn a_matching_post_fires_its_rule_atomically_in_the_same_block() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
-    sim.submit_ok("chat", create_channel("general", "General"), None);
+    // the operator creates — and therefore OWNS — the channel: registering a
+    // hook is channel-admin authority, so the owner is who may wire one up.
+    sim.submit_ok(
+        "chat",
+        create_channel("general", "General"),
+        Some("operator"),
+    );
     sim.submit_ok(
         "chat",
         serde_json::json!({ "register_hook": { "channel_id": "general", "module_id": "automations" } }),

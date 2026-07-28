@@ -410,18 +410,34 @@ impl Chat {
         }
     }
 
-    /// authorize a channel-admin op (rename/archive). an owned channel admits
-    /// only its owner among `User` origins; an unowned (module/system-minted)
-    /// channel admits any user, mirroring `SetMembership`'s trust posture;
-    /// module/agent/system origins are genesis-fixed trusted code and always pass.
+    /// authorize a channel-admin op — rename, archive, membership, and hook
+    /// (un)registration, i.e. every write that changes who may write. an owned
+    /// channel admits only its owner among `User` origins; an UNOWNED
+    /// (module/system-minted) channel admits NO user, because the principal
+    /// that minted it is a module and a user is not it — `forge:<repo>:<n>` is
+    /// the live case, and admitting any user there would hand a stranger the
+    /// roster and the hook list of another module's channel. module/agent/system
+    /// origins are genesis-fixed trusted code and always pass.
+    ///
+    /// exhaustive on purpose, both levels: a security decision must never route
+    /// a new `AuthorRef` variant — or the `None` owner — through a wildcard.
     fn check_channel_admin(channel: &Channel, author: &AuthorRef) -> Result<(), Error> {
         match author {
             AuthorRef::User(user) => match &channel.owner {
-                Some(owner) if owner != user => Err(Error::Module(format!(
-                    "only the owner may administer channel {}",
+                None => Err(Error::Module(format!(
+                    "channel {} is unowned; no user may administer it",
                     channel.id
                 ))),
-                _ => Ok(()),
+                Some(owner) => {
+                    let is_owner = owner == user;
+                    if !is_owner {
+                        return Err(Error::Module(format!(
+                            "only the owner may administer channel {}",
+                            channel.id
+                        )));
+                    }
+                    Ok(())
+                }
             },
             AuthorRef::Module(_) | AuthorRef::Agent { .. } | AuthorRef::System => Ok(()),
         }
@@ -812,14 +828,19 @@ impl Chat {
         )
     }
 
+    /// register a hook module on a channel. channel-admin authority: a hook is
+    /// a standing subscription to everything posted there, so attaching one is
+    /// the owner's call, not any member's.
     async fn stage_register_hook(
         &mut self,
+        author: &AuthorRef,
         channel_id: &str,
         module_id: String,
     ) -> Result<(), Error> {
         Self::validate_non_empty("channel_id", channel_id)?;
         Self::validate_non_empty("module_id", &module_id)?;
         let mut channel = self.require_channel(channel_id).await?;
+        Self::check_channel_admin(&channel, author)?;
         if channel.hooks.contains(&module_id) {
             // idempotent: registering twice stages nothing.
             return Ok(());
@@ -836,13 +857,18 @@ impl Chat {
         )
     }
 
+    /// unregister a hook module. same authority as registration — an ungated
+    /// unregister is a one-message off switch for every automation on the
+    /// channel, which is the sharper half of the pair.
     async fn stage_unregister_hook(
         &mut self,
+        author: &AuthorRef,
         channel_id: &str,
         module_id: &str,
     ) -> Result<(), Error> {
         Self::validate_non_empty("channel_id", channel_id)?;
         let mut channel = self.require_channel(channel_id).await?;
+        Self::check_channel_admin(&channel, author)?;
         let before = channel.hooks.len();
         channel.hooks.retain(|hook| hook != module_id);
         if channel.hooks.len() == before {
@@ -856,8 +882,13 @@ impl Chat {
         )
     }
 
+    /// add/remove a user from the channel roster. channel-admin authority: the
+    /// roster IS `PostPolicy::MembersOnly`'s admission list, so a self-service
+    /// roster is no admission rule at all — anyone could add themselves and
+    /// post right through the policy.
     async fn stage_membership(
         &mut self,
+        author: &AuthorRef,
         channel_id: &str,
         user: Vec<u8>,
         member: bool,
@@ -866,7 +897,8 @@ impl Chat {
         if user.is_empty() {
             return Err(Error::Module("user must not be empty".into()));
         }
-        self.require_channel(channel_id).await?;
+        let channel = self.require_channel(channel_id).await?;
+        Self::check_channel_admin(&channel, author)?;
         // idempotent: an unchanged membership stages nothing, so the qmdb op
         // log — and the root — is byte-identical to no write at all. the point
         // record is the policy read; the roster VIEW lives on the index tier.
@@ -1188,26 +1220,33 @@ impl Module for Chat {
                 channel_id,
                 module_id,
             } => {
-                // any non-empty origin may (un)register for now — admin gating
-                // is future work. the target must be a registered module other
-                // than chat itself, or every later post would poison the block.
+                // the target must be a registered module other than chat
+                // itself, or every later post would poison the block. WHO may
+                // attach it is `check_channel_admin`, inside the stage fn.
                 if module_id == self.id {
                     return Err(Error::Module("chat cannot hook itself".into()));
                 }
                 if ctx.module_root(&module_id).is_none() {
                     return Err(Error::Module(format!("unknown hook module: {module_id}")));
                 }
-                self.stage_register_hook(&channel_id, module_id).await
+                self.stage_register_hook(&author, &channel_id, module_id)
+                    .await
             }
             ChatMsg::UnregisterHook {
                 channel_id,
                 module_id,
-            } => self.stage_unregister_hook(&channel_id, &module_id).await,
+            } => {
+                self.stage_unregister_hook(&author, &channel_id, &module_id)
+                    .await
+            }
             ChatMsg::SetMembership {
                 channel_id,
                 user,
                 member,
-            } => self.stage_membership(&channel_id, user, member).await,
+            } => {
+                self.stage_membership(&author, &channel_id, user, member)
+                    .await
+            }
             ChatMsg::JoinHuddle { channel_id, node } => {
                 self.stage_join_huddle(author, &channel_id, node, now).await
             }

@@ -76,7 +76,8 @@ fn echo_work_spec() -> Vec<u8> {
 fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
-    sim.submit_ok("chat", create_channel("loop", "Loop"), None);
+    // the operator owns the channel — hook registration is the owner's call.
+    sim.submit_ok("chat", create_channel("loop", "Loop"), Some("operator"));
     sim.submit_ok(
         "chat",
         json!({ "register_hook": { "channel_id": "loop", "module_id": "automations" } }),

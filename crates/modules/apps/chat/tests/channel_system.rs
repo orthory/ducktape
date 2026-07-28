@@ -846,9 +846,12 @@ fn oversized_writes_are_rejected_before_staging_anything() {
 fn members_only_channels_gate_external_posts_and_reactions() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
+        // user(1) creates it, so user(1) is the owner and may write the roster
+        // (`SetMembership` is channel-admin authority). owning is not membership:
+        // the owner still cannot POST until the roster admits them.
         module
             .execute(
-                &mut ctx_at(10),
+                &mut ctx_with_origin(10, user(1)),
                 &module_msg(ChatMsg::CreateChannel {
                     channel_id: "core".into(),
                     name: "Core".into(),
@@ -880,8 +883,8 @@ fn members_only_channels_gate_external_posts_and_reactions() {
             .unwrap();
         module.commit_block().await.unwrap();
 
-        // ...and membership (any non-empty origin may set it, for now) admits
-        // the user for posts and reactions alike.
+        // ...and membership, written by the channel's OWNER, admits the user
+        // for posts and reactions alike.
         module
             .execute(
                 &mut ctx_with_origin(22, user(1)),
@@ -965,8 +968,13 @@ fn members_only_channels_gate_external_posts_and_reactions() {
 fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
+        // user(1) owns the channel — hook (un)registration is channel-admin
+        // authority, so every RegisterHook below is the owner's own.
         module
-            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
+            .execute(
+                &mut ctx_with_origin(10, user(1)),
+                &module_msg(create_channel("general")),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1269,7 +1277,9 @@ fn two_instances_replaying_the_same_ops_produce_identical_roots() {
         // one op sequence, grouped into the same blocks, driven through both
         // stores: every block boundary must land on byte-identical roots.
         let blocks: Vec<Vec<(u64, Origin, ChatMsg)>> = vec![
-            vec![(10, Origin::System, create_channel("general"))],
+            // user(1) owns "general", so the SetMembership block below is the
+            // owner's own write (channel-admin authority).
+            vec![(10, user(1), create_channel("general"))],
             vec![
                 (20, user(1), post("general", "m1", "hello", None)),
                 (20, user(2), post("general", "m2", "hi", None)),
@@ -1973,12 +1983,24 @@ fn archived_channels_reject_writes_until_unarchived() {
 }
 
 #[test]
-fn ownerless_channels_admit_any_user_for_rename_and_archive() {
+fn ownerless_channels_refuse_every_user_admin_op() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
-        // a system-minted channel has no owner (owner == None).
+        // a system-minted channel has no owner (owner == None). the live case
+        // is a MODULE-minted one (`forge:<repo>:<n>`); this one is reachable
+        // without a colon id so the ':' namespace gate cannot be what refuses.
         module
             .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut ctx_at(11).with_module_root("agent", StateRoot::ZERO),
+                &module_msg(ChatMsg::RegisterHook {
+                    channel_id: "general".into(),
+                    module_id: "agent".into(),
+                }),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1994,20 +2016,71 @@ fn ownerless_channels_admit_any_user_for_rename_and_archive() {
         };
         assert_eq!(channel.owner, None, "system-minted channels are unowned");
 
-        // any user may rename and archive an owner-less channel (mirrors the
-        // existing SetMembership permissiveness).
+        // NO user administers an unowned channel: there is no owner to be, and
+        // the minting principal is a module. every channel-admin op refuses.
+        for op in [
+            rename("general", "Hijacked"),
+            set_archived("general", true),
+            ChatMsg::SetMembership {
+                channel_id: "general".into(),
+                user: vec![7; 32],
+                member: true,
+            },
+            ChatMsg::RegisterHook {
+                channel_id: "general".into(),
+                module_id: "tasks".into(),
+            },
+            ChatMsg::UnregisterHook {
+                channel_id: "general".into(),
+                module_id: "agent".into(),
+            },
+        ] {
+            let err = module
+                .execute(
+                    &mut ctx_with_origin(20, user(7))
+                        .with_module_root("tasks", StateRoot::ZERO)
+                        .with_module_root("agent", StateRoot::ZERO),
+                    &module_msg(op),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:?}").contains("unowned"),
+                "unowned channel must refuse the user: {err:?}"
+            );
+            module.abort_block().await.unwrap();
+        }
+
+        // nothing landed: name, archived flag, hook list and roster untouched.
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.name, "GENERAL");
+        assert!(!channel.archived);
+        assert_eq!(channel.hooks, vec!["agent".to_string()]);
+
+        // the trusted principals still administer it — that is who an unowned
+        // channel belongs to.
         module
             .execute(
-                &mut ctx_with_origin(11, user(7)),
-                &module_msg(rename("general", "Renamed")),
+                &mut ctx_with_origin(30, Origin::Module("agent".into())),
+                &module_msg(ChatMsg::SetMembership {
+                    channel_id: "general".into(),
+                    user: vec![7; 32],
+                    member: true,
+                }),
             )
             .await
             .unwrap();
         module
-            .execute(
-                &mut ctx_with_origin(12, user(9)),
-                &module_msg(set_archived("general", true)),
-            )
+            .execute(&mut ctx_at(31), &module_msg(rename("general", "Renamed")))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -2022,7 +2095,145 @@ fn ownerless_channels_admit_any_user_for_rename_and_archive() {
             panic!("channel must exist");
         };
         assert_eq!(channel.name, "Renamed");
-        assert!(channel.archived);
+    });
+}
+
+#[test]
+fn membership_and_hooks_are_owner_gated_like_rename() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat");
+        // user(1) creates — and therefore owns — a members-only channel, and
+        // registers a hook on it.
+        module
+            .execute(
+                &mut ctx_with_origin(10, user(1)),
+                &module_msg(ChatMsg::CreateChannel {
+                    channel_id: "core".into(),
+                    name: "Core".into(),
+                    post_policy: PostPolicy::MembersOnly,
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut ctx_with_origin(11, user(1)).with_module_root("agent", StateRoot::ZERO),
+                &module_msg(ChatMsg::RegisterHook {
+                    channel_id: "core".into(),
+                    module_id: "agent".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // a stranger may not add THEMSELVES to the roster — the whole point:
+        // a self-service roster would make `MembersOnly` no admission rule.
+        // nor may they attach a hook, nor detach the owner's.
+        for op in [
+            ChatMsg::SetMembership {
+                channel_id: "core".into(),
+                user: vec![2; 32],
+                member: true,
+            },
+            ChatMsg::RegisterHook {
+                channel_id: "core".into(),
+                module_id: "tasks".into(),
+            },
+            ChatMsg::UnregisterHook {
+                channel_id: "core".into(),
+                module_id: "agent".into(),
+            },
+        ] {
+            let err = module
+                .execute(
+                    &mut ctx_with_origin(20, user(2)).with_module_root("tasks", StateRoot::ZERO),
+                    &module_msg(op),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:?}").contains("only the owner"),
+                "a non-owner must be refused: {err:?}"
+            );
+            module.abort_block().await.unwrap();
+        }
+
+        // the roster and the hook list are exactly as the owner left them, so
+        // the stranger is still locked out of the members-only channel.
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "core".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.hooks, vec!["agent".to_string()]);
+        let err = module
+            .execute(
+                &mut ctx_with_origin(21, user(2)),
+                &module_msg(post("core", "m1", "let me in", None)),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("members-only"));
+        module.abort_block().await.unwrap();
+
+        // the owner performs all three, and the admitted user can then post.
+        module
+            .execute(
+                &mut ctx_with_origin(30, user(1)),
+                &module_msg(ChatMsg::SetMembership {
+                    channel_id: "core".into(),
+                    user: vec![2; 32],
+                    member: true,
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut ctx_with_origin(31, user(1)).with_module_root("tasks", StateRoot::ZERO),
+                &module_msg(ChatMsg::RegisterHook {
+                    channel_id: "core".into(),
+                    module_id: "tasks".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut ctx_with_origin(32, user(1)),
+                &module_msg(ChatMsg::UnregisterHook {
+                    channel_id: "core".into(),
+                    module_id: "agent".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut ctx_with_origin(33, user(2)),
+                &module_msg(post("core", "m1", "admitted", None)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "core".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.hooks, vec!["tasks".to_string()]);
+        assert_eq!(channel.head_seq, 1);
     });
 }
 

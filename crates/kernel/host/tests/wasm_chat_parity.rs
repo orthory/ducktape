@@ -346,8 +346,10 @@ fn same_ops_identical_roots_block_by_block() {
                 },
                 true,
             ),
+            // alice, not bob: hook (un)registration is channel-admin authority
+            // and alice owns "general".
             (
-                bob.clone(),
+                alice.clone(),
                 ChatMsg::UnregisterHook {
                     channel_id: "general".into(),
                     module_id: "sink".into(),
