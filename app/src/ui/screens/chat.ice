@@ -15,10 +15,9 @@
 // this root deliberately carries NO `#root`: that would push every id down one
 // more segment for nothing.
 //
-// The two `sensor` seats are `slot`s, filled by the mount. A sensor's
-// show/resize route accepts only bare `_` payloads, so it cannot carry a
-// component event — the measurement has to stay in the caller's scope, and the
-// screen keeps only the seat so the sensor still measures the same box.
+// Both `sensor`s live here and report through the screen's own events. They
+// were briefly caller-filled slots: a sensor's show/resize route used to accept
+// only bare `_` payloads and could not carry a component event (ui-lang#239).
 
 component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], channels:[ChatChannel], dm_peers:[DmPeer], channel_reads:[ChannelRead], user_key:str, channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, messages:[ChatMessage], history_view:bool, history_loading:bool, unread_boundary:i64, selected_message_seq:i64, hovered_message_seq:i64, selected_message_rev:i64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_hovered_seq:i64, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
   emits
@@ -73,6 +72,8 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
     restore_failed_reply()
     dismiss_failed_reply()
     send_reply_submit()
+    chat_resized(f64, f64)
+    thread_resized(f64, f64)
   row w=fill h=fill
     box w=236.0 h=fill bg=sidebar clip=true
       col w=fill h=fill
@@ -247,7 +248,8 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
                     pressed bg=accent text=fg
             if connected && !empty(messages)
               stack w=fill h=fill
-                slot chat_sensor
+                sensor show=emit(chat_resized, _, _) resize=emit(chat_resized, _, _)
+                  space w=fill h=fill
                 mouse move=emit(chat_pointer_moved, _, _)
                   scroll dir=vertical w=fill h=fill
                     col w=fill gap=3.0
@@ -474,7 +476,8 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
             text ""
           box w=300.0 h=fill p=12.0 bg=muted_bg
             stack w=fill h=fill
-              slot thread_sensor
+              sensor show=emit(thread_resized, _, _) resize=emit(thread_resized, _, _)
+                space w=fill h=fill
               mouse move=emit(thread_pointer_moved, _, _)
                 col w=fill h=fill gap=8.0
                   row w=fill h=28.0 gap=6.0 align=center
