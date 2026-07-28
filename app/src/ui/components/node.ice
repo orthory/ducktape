@@ -1,5 +1,5 @@
 // `This node` — the screen the artifact gives no rail seat, so these mount
-// under Settings as the Overview / Permissions / Activity tabs.
+// under Settings as the Overview / Permissions / Activity / Modules tabs.
 //
 // The artifact's copy asserts two authority axes — a node tier this machine
 // picks, and an ADMIN grant quorum hands out on top of it. This product has
@@ -11,12 +11,29 @@
 // (validator / resident / guest) and never implies a local switch.
 //
 // Deliberately NOT here: Restart / Stop / Start (the app attaches to a node it
-// does not supervise — rpc-client carries no lifecycle verb), the build string
-// (only {height, public_key} is decoded off /v1/status), the RUN AS tier picker
-// (no chain action moves this node between standings from here, and the only
-// one it could submit is refused by the module — see the resident card), and
-// the validator accept/decline pair (the artifact binds handlers for it but
+// does not supervise — rpc-client carries no lifecycle verb), the RUN AS tier
+// picker (no chain action moves this node between standings from here, and the
+// only one it could submit is refused by the module — see the resident card),
+// and the validator accept/decline pair (the artifact binds handlers for it but
 // authored no geometry, so building it would be invention).
+
+// ------------------------------------------------------------------ THE BUILD
+
+// HALF of the artifact's build string, because half of it exists. `/v1/status`
+// publishes `version` — the daemon crate's package version (bin/noded) — and
+// nothing else about the build: there is no commit sha, no build timestamp and
+// no target triple anywhere on the status document, so the artifact's
+// `v0.4.2 · 8f3c2a1` ships as the version alone. Inventing the sha half would
+// be a fabricated identity for the code an operator is being asked to trust.
+//
+// An unanswered status leaves `version` empty, which reads `—`. A zero-ish
+// placeholder like `v0.0.0` would be a claim we cannot make.
+component NodeBuildRow(version:str, last:bool)
+  col #root w=fill
+    if empty(version)
+      KeyValueRow label="Node version" value="—" last=last
+    if !empty(version)
+      KeyValueRow label="Node version" value=version last=last
 
 // ---------------------------------------------------------------- YOUR ACCESS
 
@@ -251,6 +268,135 @@ component LogLine(parts:LogParts)
     box w=38.0
       LogLevel level=parts.level
     text parts.message w=fill size=12.0 line-h=1.55 font=code @text-chevron_idle
+
+// --------------------------------------------------------------------- MODULES
+
+// The fourth tab under `This node`, and only that: the artifact's Modules
+// screen has a rail seat, and the rail has eight seats none of which is this
+// one, so the module set lives beside the node's other facts.
+//
+// This is the INSTALLED half of the artifact's screen and nothing else. What is
+// built is what the chain publishes: `/v1/status` carries every registered
+// module's id and presentation category, and `LifecycleQuery::ModuleStatus`
+// carries the active code hash plus any scheduled swap with its activation
+// height and readiness signals.
+//
+// What is NOT built, because no value behind it exists anywhere in this
+// product: the store shell (search field, `Core / Community / Local` source
+// tabs), publisher and verified-publisher ticks, install counts, catalog
+// descriptions, per-module permission and emitted-event lists, and the
+// `Propose install` button. Those are seeded catalog fiction in the artifact —
+// there is no module registry off this network to install FROM, and a Propose
+// button with no catalog behind it could only open a proposal for a module the
+// app cannot name. The row is not a store listing; it is a registry reading.
+//
+// The artifact groups rows under per-category section headings. That needs a
+// per-category filter over the row list, which lives behind a backend seam this
+// file does not own, so the category rides each row as a word on its meta line
+// instead. Same fact, one less moving part.
+component ModulesPanel(rows:[ModuleRow])
+  col #root w=fill gap=13.0
+    box w=fill max-w=640.0
+      text "Every module the registry says is running here, with the code hash consensus is executing for it. A module is installed, swapped and removed by governance at a block boundary — never from this device — so this list is a reading, not a control." size=12.5 line-h=1.55 @text-muted
+    row w=fill gap=12.0 align=center
+      GroupLabel label="REGISTERED"
+      box w=fill h=1.0 bg=separator
+        space w=1.0 h=1.0
+      row gap=5.0 align=center
+        text len(rows) size=11.0 wrap=none font=code @text-label
+        text "registered" size=11.0 wrap=none font=code @text-label
+    if empty(rows)
+      EmptyPlate message="The node has not answered with its module set yet."
+    if !empty(rows)
+      col w=fill gap=9.0
+        for entry in rows
+          ModuleCard entry=entry
+
+// One registry row. The monogram plate is the artifact's 40px tile with the
+// module id's own initial in it; its colour is NOT adopted, because the
+// artifact's per-module colours come from its seed data, not from any fact this
+// product holds — a category-keyed palette would be a scheme the design never
+// authored.
+//
+// A pending swap is present exactly when `pending_hash` is non-empty; the row
+// carries no separate flag and none is invented. `code_hash` is likewise empty
+// on a network that runs no lifecycle module — every such row reads `—` for
+// code and still shows a true id, category and state root, because a hash
+// placeholder would name code we cannot prove is running.
+component ModuleCard(entry:ModuleRow)
+  box #root w=fill pl=15.0 pr=15.0 pt=13.0 pb=13.0 bg=surface border=card_line border-w=1.0 r=11.0
+    col w=fill gap=11.0
+      row w=fill gap=11.0 align=center
+        box w=40.0 h=40.0 align-x=center align-y=center bg=elevated r=10.0
+          text initial_of(entry.id) size=14.0 wrap=none font=code_semibold @text-caption
+        col w=fill gap=3.0
+          text entry.id size=13.5 wrap=none font=display @text-fg
+          row w=fill wrap wrap-gap=3.0 gap=8.0 align=center
+            text entry.category size=10.5 wrap=none font=code_medium @text-caption
+            ModuleHashField label="root" hash=entry.root
+            ModuleHashField label="code" hash=entry.code_hash
+        ModuleStateChip pending=(!empty(entry.pending_hash)) ready=entry.ready
+      if !empty(entry.pending_hash)
+        ModulePendingPlate entry=entry
+
+// A labelled digest. An absent one reads `—`: on a network with no lifecycle
+// module there is no active code hash to show, and printing a zeroed digest
+// would be a fabricated identity for the running code.
+component ModuleHashField(label:str, hash:str)
+  row #root gap=5.0 align=center
+    text label size=10.5 wrap=none font=code_medium @text-label
+    ModuleHash hash=hash
+
+component ModuleHash(hash:str)
+  col #root
+    if empty(hash)
+      text "—" size=12.0 wrap=none font=code @text-secondary_fg
+    if !empty(hash)
+      text hash size=12.0 wrap=none font=code @text-secondary_fg
+
+// What the registry says about this module's code right now. `pending` is the
+// discriminant; the readiness latch splits the pending face.
+component ModuleStateChip(pending:bool, ready:bool)
+  col #root
+    if !pending
+      box px=9.0 py=4.0 bg=success_bg border=success_line border-w=1.0 r=7.0
+        row gap=6.0 align=center
+          Dot plate=7.0
+          text "ACTIVE" size=9.0 wrap=none font=code_semibold @text-success
+    if pending
+      ModuleSwapChip ready=ready
+
+// A swap is ARMED only once readiness covers the whole boundary member set —
+// that latch, not the activation height alone, is what lets the boundary apply
+// it, so the chip names the latch and never the height.
+component ModuleSwapChip(ready:bool)
+  col #root
+    if ready
+      box px=9.0 py=4.0 bg=brand_bg border=brand_line border-w=1.0 r=7.0
+        text "SWAP ARMED" size=9.0 wrap=none font=code_semibold @text-brand
+    if !ready
+      box px=9.0 py=4.0 bg=warning_bg border=warning_line border-w=1.0 r=7.0
+        text "SWAP PENDING" size=9.0 wrap=none font=code_semibold @text-warning
+
+// The scheduled swap, when there is one. `readiness` is the count of validators
+// that verified the target bytes and signalled; it carries NO denominator,
+// because the boundary member set it is measured against is not on the
+// lifecycle projection — so the count is shown as a count and the `ready` latch
+// beside it is the answer to whether it is covered.
+component ModulePendingPlate(entry:ModuleRow)
+  box #root w=fill pl=13.0 pr=13.0 pt=11.0 pb=11.0 bg=brand_wash border=brand_line border-w=1.0 r=9.0
+    col w=fill gap=9.0
+      row w=fill gap=7.0 align=center
+        text "PENDING SWAP" size=9.0 wrap=none font=code_semibold @text-brand
+        space w=fill
+        ModuleHashField label="target" hash=entry.pending_hash
+      row w=fill gap=22.0 align=start
+        col gap=3.0
+          text "ACTIVATES AT" size=9.0 wrap=none font=code_semibold @text-label
+          text height_label_short(entry.activation_height) size=12.0 wrap=none font=code_medium @text-fg
+        col gap=3.0
+          text "READY SIGNALS" size=9.0 wrap=none font=code_semibold @text-label
+          text entry.readiness size=12.0 wrap=none font=code_medium @text-fg
 
 // Severity is the only colour in the panel, so it is the only thing the eye
 // catches while the ring scrolls.
