@@ -2758,11 +2758,16 @@ pub fn initial_of(name: impl AsRef<str>) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
-/// The local user's inbox member handle (`user:{hex}`), when a key exists.
+/// The local user's inbox queue, when a key exists.
+///
+/// An inbox member IS an origin's actor string (`sdk::Origin::actor_string`),
+/// and the module now refuses a MarkRead/Clear naming any queue but the
+/// submitter's own — so this is not a display handle, it is the identity the
+/// signed frame will carry. It must be derived, never spelled.
 async fn local_member() -> Option<String> {
     local_user_key()
         .await
-        .map(|key| format!("user:{}", hex_encode(&key)))
+        .map(|key| sdk::Origin::External(key).actor_string())
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -3194,8 +3199,9 @@ async fn folded_update(
             })
         }
         "inbox" => {
-            let current_user = local_user_key().await?;
-            let member = format!("user:{}", hex_encode(&current_user));
+            // the same derivation `local_member` uses: the bell folds only the
+            // ops naming THIS user's queue, and a queue is named for its owner.
+            let member = local_member().await?;
             let origin_kind = stream_origin_kind(&op.origin.kind);
             let folded = inbox::client::delta_from_op(
                 &payload,

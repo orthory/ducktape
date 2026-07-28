@@ -8,10 +8,17 @@
 //! with the event that caused it (platform promise P2), and no external push
 //! service is involved (the air-gap-native notification story).
 //!
-//! `member` is an OPAQUE member-identity string. authorship is NOT modeled here:
-//! origin-bound member identity is a platform-wide open item, so this crate does
-//! not invent an auth scheme. `source` records the DELIVERING origin and is
-//! derived by the module from `Env.origin` (never caller-supplied).
+//! `member` names a queue in the shared ACTOR-STRING domain
+//! ([`sdk::Origin::actor_string`]) — the same domain [`Notification::source`]
+//! already records the delivering origin in, and the one tasks' job board and
+//! files' owner use. it is the module's whole identity model: a queue whose
+//! name is `origin.actor_string()` is OWNED by that origin, which is what makes
+//! an ack authorizable at all.
+//!
+//! DELIVERING and ACKING are different authorities. any origin may `Deliver` to
+//! any member (a module follow-up is the primary writer, and an external
+//! submitter may self-deliver); only the queue's OWN member may `MarkRead` or
+//! `Clear` it, and only an authenticated external submitter owns a queue.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
@@ -39,7 +46,8 @@ pub const MAX_MEMBERS: usize = 65536;
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Notification {
     pub seq: u64,
-    /// the opaque member identity this notification belongs to.
+    /// the queue this notification belongs to, in the actor-string domain (see
+    /// the module header) — the principal that may ack it.
     pub member: String,
     pub kind: String,
     pub body: String,
@@ -52,6 +60,10 @@ pub struct Notification {
     pub read: bool,
 }
 
+/// the ack family (`MarkRead`, `Clear`) is MEMBER-BOUND: `member` must be the
+/// submitter's own [`sdk::Origin::actor_string`], so a submitter can only ever
+/// name their own queue. `Deliver` is deliberately outside that gate — writing
+/// INTO a queue is the module's whole purpose and every origin may do it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxMsg {
@@ -63,11 +75,13 @@ pub enum InboxMsg {
         kind: String,
         body: String,
     },
-    /// mark every item with `seq <= up_to_seq` as read. idempotent; an unknown
-    /// member or seq is a deterministic no-op (never an error).
+    /// mark every item with `seq <= up_to_seq` in the submitter's OWN queue as
+    /// read. idempotent; an unknown member or seq is a deterministic no-op
+    /// (never an error), but a member that is not the submitter is REFUSED.
     MarkRead { member: String, up_to_seq: u64 },
-    /// delete every item with `seq <= up_to_seq`. `next_seq` never rewinds. an
-    /// unknown member or seq is a deterministic no-op (never an error).
+    /// delete every item with `seq <= up_to_seq` from the submitter's OWN
+    /// queue. `next_seq` never rewinds. an unknown member or seq is a
+    /// deterministic no-op; a member that is not the submitter is REFUSED.
     Clear { member: String, up_to_seq: u64 },
 }
 

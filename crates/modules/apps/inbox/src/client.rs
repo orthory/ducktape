@@ -165,11 +165,11 @@ mod tests {
     fn bell_folds_only_this_members_traffic() {
         let stamp = serde_json::to_value(serde_json::json!({"delivered": {"seq": 3}})).unwrap();
         let mine = delta_from_op(
-            &deliver("user:ab", "ping"),
+            &deliver("ext:ab", "ping"),
             Some(&stamp),
             "module",
             Some("automations"),
-            "user:ab",
+            "ext:ab",
         )
         .unwrap()
         .expect("my delivery folds");
@@ -178,11 +178,11 @@ mod tests {
         assert_eq!(mine.item.source, "module:automations");
 
         let theirs = delta_from_op(
-            &deliver("user:cd", "ping"),
+            &deliver("ext:cd", "ping"),
             Some(&stamp),
             "module",
             Some("automations"),
-            "user:ab",
+            "ext:ab",
         )
         .unwrap();
         assert!(theirs.is_none());
@@ -204,6 +204,6 @@ mod tests {
 
     #[test]
     fn missing_stamp_is_an_error_not_a_guess() {
-        assert!(delta_from_op(&deliver("user:ab", "x"), None, "system", None, "user:ab").is_err());
+        assert!(delta_from_op(&deliver("ext:ab", "x"), None, "system", None, "ext:ab").is_err());
     }
 }

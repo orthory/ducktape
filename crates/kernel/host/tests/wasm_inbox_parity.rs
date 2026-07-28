@@ -10,6 +10,11 @@
 //! the op matrix includes a delivery emitted by a stub producer module — the
 //! cross-module path the native inbox tests exercise — asserting the wasm port
 //! derives the same Module-origin `source`.
+//!
+//! `rejections_inner` additionally pins the ACK OWNER GATE inside the compiled
+//! component. `env().origin` is the only authorization input that crosses the
+//! WIT boundary, so a gate keyed on it is exactly the kind that can be correct
+//! natively and inert in the guest: it has to be checked on both sides.
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
@@ -54,7 +59,7 @@ impl Module for Producer {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
         ctx.emit_msg(op(&InboxMsg::Deliver {
-            member: "alice".into(),
+            member: queue_of(&key(0xA1)),
             kind: "event".into(),
             body: "produced".into(),
         }));
@@ -81,6 +86,12 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
 /// ids; the parity claim only needs them distinct and non-empty).
 fn key(tag: u8) -> Vec<u8> {
     vec![tag; 32]
+}
+
+/// the queue a submitter key owns: a member IS that origin's actor string, and
+/// only that origin may ack it.
+fn queue_of(k: &[u8]) -> String {
+    Origin::External(k.to_vec()).actor_string()
 }
 
 fn op(m: &InboxMsg) -> Msg {
@@ -122,6 +133,10 @@ async fn same_ops_inner(context: &deterministic::Context) {
     let mut native = native_host(context).await;
     let mut wasm = wasm_host_(context).await;
     let (alice, bob) = (key(0xA1), key(0xB2));
+    let (alice_q, bob_q) = (queue_of(&alice), queue_of(&bob));
+    // a queue nobody has been delivered to, owned by a third key — the
+    // unknown-member no-op is the OWNER's own empty queue, not a stranger's.
+    let (ghost, ghost_q) = (key(0xE7), queue_of(&key(0xE7)));
 
     // ROOT-CONTINUITY from GENESIS: both roots are the (empty) store's merkle
     // root, identical across the runtimes — and they stay identical after
@@ -140,13 +155,13 @@ async fn same_ops_inner(context: &deterministic::Context) {
     let ops: Vec<(Origin, Msg, bool)> = vec![
         (
             Origin::External(alice.clone()),
-            deliver("alice", "mention", "hi"),
+            deliver(&alice_q, "mention", "hi"),
             true,
         ),
-        (Origin::System, deliver("alice", "reply", "yo"), true),
+        (Origin::System, deliver(&alice_q, "reply", "yo"), true),
         (
             Origin::External(bob.clone()),
-            deliver("bob", "mention", "sup"),
+            deliver(&bob_q, "mention", "sup"),
             true,
         ),
         // the sibling follow-up path: the producer's execute emits the inbox
@@ -162,47 +177,50 @@ async fn same_ops_inner(context: &deterministic::Context) {
         // an anonymous external self-delivery (inbox accepts any origin).
         (
             Origin::External(Vec::new()),
-            deliver("alice", "note", "self-note"),
+            deliver(&alice_q, "note", "self-note"),
             true,
         ),
+        // the ack family is MEMBER-BOUND: every one of these rides the queue
+        // owner's own submitter origin, the only origin the gate admits.
         (
-            Origin::System,
+            Origin::External(alice.clone()),
             op(&InboxMsg::MarkRead {
-                member: "alice".into(),
+                member: alice_q.clone(),
                 up_to_seq: 2,
             }),
             true,
         ),
         // idempotent re-ack: same MarkRead again changes nothing.
         (
-            Origin::System,
+            Origin::External(alice.clone()),
             op(&InboxMsg::MarkRead {
-                member: "alice".into(),
+                member: alice_q.clone(),
                 up_to_seq: 2,
             }),
             false,
         ),
-        // unknown member: deterministic no-op, never an error.
+        // unknown member: deterministic no-op, never an error — the owner
+        // acking their own queue before anything ever landed in it.
         (
-            Origin::System,
+            Origin::External(ghost.clone()),
             op(&InboxMsg::MarkRead {
-                member: "ghost".into(),
+                member: ghost_q.clone(),
                 up_to_seq: 99,
             }),
             false,
         ),
         (
-            Origin::System,
+            Origin::External(alice.clone()),
             op(&InboxMsg::Clear {
-                member: "alice".into(),
+                member: alice_q.clone(),
                 up_to_seq: 1,
             }),
             true,
         ),
         (
-            Origin::System,
+            Origin::External(ghost.clone()),
             op(&InboxMsg::Clear {
-                member: "ghost".into(),
+                member: ghost_q.clone(),
                 up_to_seq: 99,
             }),
             false,
@@ -210,7 +228,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
         // next_seq survived the clear: this lands as seq 5, not a reused seq.
         (
             Origin::System,
-            deliver("alice", "followup", "after clear"),
+            deliver(&alice_q, "followup", "after clear"),
             true,
         ),
     ];
@@ -276,12 +294,13 @@ fn rejections_match_and_leave_no_trace() {
 async fn rejections_inner(context: &deterministic::Context) {
     let mut native = native_host(context).await;
     let mut wasm = wasm_host_(context).await;
-    let alice = key(0xA1);
+    let (alice, stranger) = (key(0xA1), key(0xC3));
+    let alice_q = queue_of(&alice);
 
     for host in [&mut native, &mut wasm] {
         host.submit_at(
             block(1, Origin::External(alice.clone())),
-            deliver("alice", "k", "seed"),
+            deliver(&alice_q, "k", "seed"),
         )
         .await
         .expect("seed deliver");
@@ -289,24 +308,85 @@ async fn rejections_inner(context: &deterministic::Context) {
     assert_eq!(root_of(&native), root_of(&wasm));
 
     // the rejection matrix: every cap-violation family the native module
-    // rejects at execute, plus a malformed payload (the decode seam). each
-    // rejected block must leave BOTH roots byte-identical (the abort path:
-    // staged writes discarded, no trace).
-    let rejects: Vec<(Msg, &str)> = vec![
-        (deliver("", "k", "b"), "member must not be empty"),
+    // rejects at execute, a malformed payload (the decode seam), and the ACK
+    // OWNER GATE — which is the one rule here whose only input crosses the WIT
+    // boundary, so it is proven in the compiled component and not just
+    // natively. each rejected block must leave BOTH roots byte-identical (the
+    // abort path: staged writes discarded, no trace).
+    // (who submits, which queue they name, why it is refused). the STRANGER
+    // names alice's queue — the reported defect, an unattributed wipe of
+    // another member's whole notification history. the other three name the
+    // queue called after themselves, so their refusal is about the origin KIND
+    // and can never be mistaken for a mismatch.
+    let unowned: [(Origin, String, &str); 4] = [
         (
+            Origin::External(stranger.clone()),
+            alice_q.clone(),
+            "only the queue's own member may ack it",
+        ),
+        (
+            Origin::Module("chat".into()),
+            "chat".to_string(),
+            "a module origin owns no inbox queue",
+        ),
+        (
+            Origin::System,
+            "system".to_string(),
+            "a system origin owns no inbox queue",
+        ),
+        (
+            Origin::External(Vec::new()),
+            "ext:".to_string(),
+            "external origin must carry a non-empty submitter id",
+        ),
+    ];
+    let ack_gate: Vec<(Origin, Msg, &str)> = unowned
+        .into_iter()
+        .flat_map(|(origin, member, needle)| {
+            [
+                (
+                    origin.clone(),
+                    op(&InboxMsg::MarkRead {
+                        member: member.clone(),
+                        up_to_seq: 1,
+                    }),
+                    needle,
+                ),
+                (
+                    origin,
+                    op(&InboxMsg::Clear {
+                        member,
+                        up_to_seq: 1,
+                    }),
+                    needle,
+                ),
+            ]
+        })
+        .collect();
+
+    let mut rejects: Vec<(Origin, Msg, &str)> = vec![
+        (
+            Origin::System,
+            deliver("", "k", "b"),
+            "member must not be empty",
+        ),
+        (
+            Origin::System,
             deliver(&"m".repeat(MAX_MEMBER_BYTES + 1), "k", "b"),
             "member exceeds 256 bytes",
         ),
         (
-            deliver("alice", &"k".repeat(MAX_KIND_BYTES + 1), "b"),
+            Origin::System,
+            deliver(&alice_q, &"k".repeat(MAX_KIND_BYTES + 1), "b"),
             "kind exceeds 64 bytes",
         ),
         (
-            deliver("alice", "k", &"x".repeat(MAX_BODY_BYTES + 1)),
+            Origin::System,
+            deliver(&alice_q, "k", &"x".repeat(MAX_BODY_BYTES + 1)),
             "body exceeds 16384 bytes",
         ),
         (
+            Origin::System,
             Msg {
                 target: "inbox".into(),
                 payload: b"definitely-not-json".to_vec(),
@@ -314,17 +394,18 @@ async fn rejections_inner(context: &deterministic::Context) {
             "expected value",
         ),
     ];
+    rejects.extend(ack_gate);
 
-    for (height, (msg, needle)) in rejects.into_iter().enumerate() {
+    for (height, (origin, msg, needle)) in rejects.into_iter().enumerate() {
         let height = height as u64 + 2;
         let (n_before, w_before) = (root_of(&native), root_of(&wasm));
 
         let n_err = native
-            .submit_at(block(height, Origin::System), msg.clone())
+            .submit_at(block(height, origin.clone()), msg.clone())
             .await
             .expect_err("native must reject");
         let w_err = wasm
-            .submit_at(block(height, Origin::System), msg)
+            .submit_at(block(height, origin), msg)
             .await
             .expect_err("wasm must reject");
 
@@ -362,6 +443,7 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
     let mut native = native_host(context).await;
     let mut wasm = wasm_host_(context).await;
     let (alice, carol) = (key(0xA1), key(0xC3));
+    let (alice_q, bob_q) = (queue_of(&alice), queue_of(&key(0xB2)));
 
     // ONE block, three ops: the second delivery's seq assignment READS the
     // first op's staged write (next_seq only exists in this block's overlay),
@@ -371,16 +453,16 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
     let batch = vec![
         (
             Origin::External(alice.clone()),
-            deliver("alice", "k", "first"),
+            deliver(&alice_q, "k", "first"),
         ),
         (
             Origin::External(alice.clone()),
-            deliver("alice", "k", "second"),
+            deliver(&alice_q, "k", "second"),
         ),
         (
             Origin::External(alice.clone()),
             op(&InboxMsg::MarkRead {
-                member: "alice".into(),
+                member: alice_q.clone(),
                 up_to_seq: 1,
             }),
         ),
@@ -413,10 +495,10 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
     // accepted subset alone, on both runtimes.
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
     let batch = vec![
-        (Origin::External(alice.clone()), deliver("bob", "k", "ok")),
+        (Origin::External(alice.clone()), deliver(&bob_q, "k", "ok")),
         (
             Origin::External(carol.clone()),
-            deliver("bob", "k", &"x".repeat(MAX_BODY_BYTES + 1)),
+            deliver(&bob_q, "k", &"x".repeat(MAX_BODY_BYTES + 1)),
         ),
     ];
     let n_out = native

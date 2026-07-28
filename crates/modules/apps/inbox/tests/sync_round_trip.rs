@@ -16,11 +16,20 @@ use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
 
-fn sys(height: u64) -> TestCtx {
+/// alice's and bob's submitter keys. a member IS an origin's actor string, so
+/// only these origins may ack the queues named after them.
+const ALICE_KEY: [u8; 3] = [0xa1, 0xa1, 0xa1];
+const BOB_KEY: [u8; 3] = [0xb0, 0xb0, 0xb0];
+
+fn queue_of(key: [u8; 3]) -> String {
+    Origin::External(key.to_vec()).actor_string()
+}
+
+fn as_origin(origin: Origin, height: u64) -> TestCtx {
     TestCtx::with_env(Env {
         height,
         consensus_time: height,
-        origin: Origin::System,
+        origin,
         me: "inbox".into(),
     })
 }
@@ -56,10 +65,20 @@ fn clear(member: &str, up_to_seq: u64) -> Msg {
     }
 }
 
-async fn apply_commit(m: &mut Inbox, height: u64, op: Msg) {
-    let mut c = sys(height);
+/// deliveries ride a module follow-up (the primary writer); acks ride the
+/// member's own submitter origin, which is the only one the gate admits.
+async fn apply_commit(m: &mut Inbox, origin: Origin, height: u64, op: Msg) {
+    let mut c = as_origin(origin, height);
     m.execute(&mut c, &op).await.unwrap();
     m.commit_block().await.unwrap();
+}
+
+fn chat() -> Origin {
+    Origin::Module("chat".into())
+}
+
+fn member(key: [u8; 3]) -> Origin {
+    Origin::External(key.to_vec())
 }
 
 fn inbox_over(store: Box<dyn sdk::MerkleStore>) -> Inbox {
@@ -74,18 +93,19 @@ fn synced_store_reconstructs_source_root_queues_and_counters() {
         let genesis_root = src_store.root();
         let mut src = inbox_over(Box::new(src_store));
 
-        apply_commit(&mut src, 1, deliver("alice", "mention", "hi")).await;
-        apply_commit(&mut src, 2, deliver("alice", "reply", "yo")).await;
-        apply_commit(&mut src, 3, deliver("bob", "k", "solo")).await;
+        let (alice, bob) = (queue_of(ALICE_KEY), queue_of(BOB_KEY));
+        apply_commit(&mut src, chat(), 1, deliver(&alice, "mention", "hi")).await;
+        apply_commit(&mut src, chat(), 2, deliver(&alice, "reply", "yo")).await;
+        apply_commit(&mut src, chat(), 3, deliver(&bob, "k", "solo")).await;
         // a read flip (record overwrite) and a prefix clear (item deletes;
         // the meta keeps its never-rewinding counter).
-        apply_commit(&mut src, 4, mark_read("alice", 1)).await;
-        apply_commit(&mut src, 5, clear("bob", 1)).await;
+        apply_commit(&mut src, member(ALICE_KEY), 4, mark_read(&alice, 1)).await;
+        apply_commit(&mut src, member(BOB_KEY), 5, clear(&bob, 1)).await;
 
         let src_root: StateRoot = src.root();
         assert_ne!(src_root, genesis_root, "the ops moved the root");
-        let src_alice = src.queue_view("alice").await.unwrap();
-        let src_bob = src.queue_view("bob").await.unwrap();
+        let src_alice = src.queue_view(&alice).await.unwrap();
+        let src_bob = src.queue_view(&bob).await.unwrap();
 
         // the module consumed its store, so REOPEN the committed partitions
         // as a bare store for the handoff (drop first — one owner at a time).
@@ -118,14 +138,14 @@ fn synced_store_reconstructs_source_root_queues_and_counters() {
         );
 
         // queues, read flags, and the cleared prefix synced together.
-        assert_eq!(synced.queue_view("alice").await.unwrap(), src_alice);
-        assert_eq!(synced.queue_view("bob").await.unwrap(), src_bob);
+        assert_eq!(synced.queue_view(&alice).await.unwrap(), src_alice);
+        assert_eq!(synced.queue_view(&bob).await.unwrap(), src_bob);
 
         // the cleared member's counter survived the trip: the next delivery
         // resumes at the preserved next_seq (2), never a reused seq 1.
-        apply_commit(&mut synced, 6, deliver("bob", "k", "after clear")).await;
+        apply_commit(&mut synced, chat(), 6, deliver(&bob, "k", "after clear")).await;
         let (next, items) = synced
-            .queue_view("bob")
+            .queue_view(&bob)
             .await
             .unwrap()
             .expect("bob exists");
