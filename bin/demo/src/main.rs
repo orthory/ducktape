@@ -132,7 +132,9 @@ fn main() {
         // block 3: tracker state is consensus-owned; Git objects are built by
         // clients and enter through the node's PushRefs data-plane lane, which
         // this in-process Host demo deliberately does not emulate. a tracker
-        // item is a MEMBER action, so it rides the demo user's origin.
+        // item needs an authenticated author, so it rides the demo user's
+        // origin (the default `submit` context is the EMPTY external origin,
+        // which forge refuses).
         let out = host
             .submit_at(
                 as_demo_user(),

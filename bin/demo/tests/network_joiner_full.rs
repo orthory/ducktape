@@ -122,9 +122,9 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
         // the lanes are NOT interchangeable, so every source op carries its
         // own. SYSTEM is the trusted orchestration lane: valset membership is
         // governance-gated, and the saga id below is namespaced to the origin
-        // that triggers it. a forge tracker item is a MEMBER action — forge
-        // refuses a module/system author outright — so it rides an
-        // authenticated external origin instead.
+        // that triggers it. forge refuses a SYSTEM tracker author (nothing
+        // reaches it on that lane), so this issue — a member action here —
+        // rides an authenticated external origin instead.
         let system = sdk::Origin::System;
         let member = sdk::Origin::External(seeded_pubkey(5));
 

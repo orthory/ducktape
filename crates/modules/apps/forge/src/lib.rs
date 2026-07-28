@@ -2324,13 +2324,9 @@ mod tests {
             open: false,
         };
 
-        // an item is a MEMBER action: the pre-consensus probe, a module and
-        // the system are all refused.
-        for origin in [
-            sdk::Origin::External(Vec::new()),
-            sdk::Origin::Module("automations".into()),
-            sdk::Origin::System,
-        ] {
+        // the pre-consensus probe and the system origin are refused; a MODULE
+        // is an authenticated principal and is not (see `author_from_origin`).
+        for origin in [sdk::Origin::External(Vec::new()), sdk::Origin::System] {
             let mut probe = ctx_with_origin(2, origin.clone());
             assert!(
                 exec(&mut forge, &mut probe, &close).is_err(),
