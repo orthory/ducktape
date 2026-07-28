@@ -40,7 +40,12 @@ test connection_panel_contract
   preset ui_settings
   viewport 1120 720
   mount
-    WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 approvals=0 account="" #workspace-tabs
+    WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
+      events
+        select_shell_tab -> select_shell_tab _
+        toggle_bell -> toggle_bell
+      huddle:
+        space w=1.0 h=1.0
       notice:
         space w=1.0 h=1.0
       chat:
@@ -59,8 +64,6 @@ test connection_panel_contract
         space w=1.0 h=1.0
       settings:
         input "" #rpc label="RPC endpoint" <-> rpc hint="Node URL" w=fill @control
-      node:
-        space w=1.0 h=1.0
       explorer:
         space w=1.0 h=1.0
       palette:
@@ -82,10 +85,15 @@ test palette_escape_contract
   preset ui_palette_open
   viewport 1120 720
   mount
-    WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 approvals=0 account="" #workspace-tabs
+    WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
+      events
+        select_shell_tab -> select_shell_tab _
+        toggle_bell -> toggle_bell
 
 
 
+      huddle:
+        space w=1.0 h=1.0
       notice:
         space w=1.0 h=1.0
       chat:
@@ -103,8 +111,6 @@ test palette_escape_contract
       governance:
         space w=1.0 h=1.0
       settings:
-        space w=1.0 h=1.0
-      node:
         space w=1.0 h=1.0
       explorer:
         space w=1.0 h=1.0
@@ -174,10 +180,15 @@ test minimum_window_layout_contract
   preset ui_offline
   viewport 1280 800
   mount
-    WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 approvals=0 account="" #workspace-tabs
+    WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
+      events
+        select_shell_tab -> select_shell_tab _
+        toggle_bell -> toggle_bell
 
 
 
+      huddle:
+        space w=1.0 h=1.0
       notice:
         space w=1.0 h=1.0
       chat:
@@ -195,8 +206,6 @@ test minimum_window_layout_contract
       governance:
         space w=1.0 h=1.0
       settings:
-        space w=1.0 h=1.0
-      node:
         space w=1.0 h=1.0
       explorer:
         space w=1.0 h=1.0

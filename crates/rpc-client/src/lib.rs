@@ -198,6 +198,21 @@ impl Client {
         decode_json(response).await
     }
 
+    /// The whole `GET /v1/status` document, verbatim. [`Status`] is the stable
+    /// two-field contract every client can rely on; the operational projection
+    /// beside it (`root_hash`, `operations.consensus`, `operations.storage`) is
+    /// node-owned and evolves with the daemon, so it is served as JSON rather
+    /// than frozen into a type here.
+    pub async fn status_json(&self) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .get(self.url("v1/status")?)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC status failed: {error}")))?;
+        decode_json(response).await
+    }
+
     /// Submit one typed module query and decode its typed reply.
     pub async fn query<Q: Serialize, R: DeserializeOwned>(
         &self,

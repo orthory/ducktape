@@ -14,6 +14,7 @@
 //! shell.
 
 use index_guest::{OriginTag, user_handle};
+use sha2::{Digest, Sha256};
 
 use crate::index::{self, MsgRow};
 use crate::{AuthorRef, Block, ChatAssigned, ChatMsg, Mark, PostPolicy, Span, decode_msg};
@@ -68,6 +69,15 @@ pub struct ChatMessage {
     pub show_author: bool,
     pub initial: String,
     pub avatar_kind: String,
+    /// authored by the viewing device's own user key — the own-message bubble.
+    pub mine: bool,
+    /// the block this message settled in; 0 while pending.
+    pub height: i64,
+    /// that block's `consensus_time` — a block HEIGHT on a validator network
+    /// (bin/noded/src/index.rs stamps `consensus_time = height`) and unix
+    /// MILLIS on a single-writer noded (bin/noded/src/main.rs). NEVER unix
+    /// seconds: render it as a height, never as a wall clock. 0 while pending.
+    pub time: i64,
     pub reactions: Vec<ChatReaction>,
 }
 
@@ -89,6 +99,9 @@ impl Default for ChatMessage {
             show_author: true,
             initial: String::new(),
             avatar_kind: String::new(),
+            mine: false,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         }
     }
@@ -611,6 +624,11 @@ pub fn optimistic_message(
         show_author: true,
         initial: "Y".into(),
         avatar_kind: "human".into(),
+        // an optimistic row is this device's own post by construction; it has
+        // no block yet, so height/time stay unset until the canonical row lands.
+        mine: true,
+        height: 0,
+        time: 0,
         reactions: Vec::new(),
     });
     messages
@@ -716,6 +734,7 @@ pub fn thread_offset_after_reply(offset: i64, has_more: bool, committed: bool) -
 
 pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
     let edited = row.rev > 0;
+    let mine = authored_by_user(&row.author, current_user);
     let meta = if edited {
         format!("#{} · edited", row.seq)
     } else {
@@ -746,6 +765,9 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
         show_author: true,
         initial: avatar_initial(&row.author),
         avatar_kind: avatar_kind(&row.author).into(),
+        mine,
+        height: number_i64(row.height),
+        time: number_i64(row.time),
         reactions: row
             .reactions
             .into_iter()
@@ -769,6 +791,12 @@ fn reacted_by_user(reactors: &[String], current_user: Option<&[u8]>) -> bool {
         let handle = format!("user:{}", hex_encode(key));
         reactors.contains(&handle)
     })
+}
+
+/// True when the message's rendered author IS the local user — the same
+/// `user:{hex}` comparison the reaction check makes, against the same key.
+fn authored_by_user(author: &str, current_user: Option<&[u8]>) -> bool {
+    current_user.is_some_and(|key| author == format!("user:{}", hex_encode(key)))
 }
 
 /// Slack-style grouping: a message shows its avatar + author header only when it
@@ -1235,9 +1263,51 @@ fn fenced(chars: &[char], at: usize, marker: &str) -> Option<(String, usize)> {
     None
 }
 
+// ============================================================================
+// direct messages — the derived two-party channel id
+// ============================================================================
+
+/// The two-party channel id for a pair of member keys (lowercase hex), sorted
+/// so both ends of the pair derive the same id and re-opening is idempotent.
+///
+/// The id is BARE by construction, and that is the whole point:
+/// [`Chat::validate_channel_namespace`] refuses a user-authored id containing
+/// ':' (that namespace belongs to module origins) and refuses '/' from anyone,
+/// while a DM is created by one of the pair's own USER keys. Hashing also keeps
+/// the id at 67 characters instead of the 130 the two keys spell out.
+pub fn dm_channel_id(a: &str, b: &str) -> String {
+    let (low, high) = match a <= b {
+        true => (a, b),
+        false => (b, a),
+    };
+    let mut digest = Sha256::new();
+    digest.update(low.as_bytes());
+    digest.update([0x1f]);
+    digest.update(high.as_bytes());
+    let mut id = String::from("dm-");
+    for byte in digest.finalize() {
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dm_id_is_pair_symmetric_and_survives_the_namespace_rule() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let id = dm_channel_id(&a, &b);
+        assert_eq!(id, dm_channel_id(&b, &a));
+        assert_ne!(id, dm_channel_id(&a, &a));
+
+        // the round trip that matters: the DM is created by a USER author, and
+        // this is the rule that author faces. A ':' here would reject every DM.
+        crate::Chat::validate_channel_namespace(&AuthorRef::User(vec![0xab; 32]), &id)
+            .expect("a user-authored DM channel id must pass the namespace rule");
+    }
 
     #[test]
     fn parse_message_maps_markdown_onto_wire_blocks() {

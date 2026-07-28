@@ -57,6 +57,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
 
 on choose_channel(id)
   return if loading || mutation_phase != "idle"
+  active_dm_peer = ""
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   hydration_generation = hydration_generation + 1
@@ -85,6 +86,42 @@ on choose_channel(id)
   error = ""
   run load_chat(connected_rpc, id) -> chat_updated _ | failed _
 
+// A DM is not a second message plane: it is the two-party members-only channel
+// at `dm_channel_id(me, peer)`, resolved or created on the way in. Everything
+// downstream of `chat_updated` is the ordinary channel path.
+on choose_dm(peer_key)
+  return if loading || mutation_phase != "idle" || empty(peer_key)
+  active_dm_peer = peer_key
+  chat_search_generation = chat_search_generation + 1
+  chat_searching = false
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  loading = true
+  chat_search_hits = []
+  selected_message_seq = 0
+  hovered_message_seq = 0
+  selected_message_rev = 0
+  message_action = "toolbar"
+  message_edit_draft = ""
+  channel_settings_open = false
+  channel_name_draft = ""
+  member_key_draft = ""
+  active_thread_seq = 0
+  thread_target_seq = 0
+  thread_messages = []
+  thread_next_reply_offset = 0
+  thread_has_more = false
+  thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
+  thread_loading = false
+  reply_draft = ""
+  reply_editor = editor("")
+  pending_reply = ""
+  error = ""
+  // Reads the peer back from state: `active_dm_peer = peer_key` above already
+  // moved the payload, so passing `peer_key` here would be a use after move.
+  run open_dm(connected_rpc, password, active_dm_peer) -> chat_updated _ | failed _
+
 on create_channel_submit
   return if loading || mutation_phase != "idle" || empty(trim(channel_draft))
   hydration_generation = hydration_generation + 1
@@ -100,8 +137,10 @@ on toggle_channel_create_members_only
 
 on toggle_channel_create
   channel_create_open = !channel_create_open
-  return if !channel_create_open
-  task widget focus #workspace-tabs/content/new-channel
+  // No focus task: the artifact's create-channel input now lives inside the
+  // ModalShell component, and a widget target cannot reach into a nested
+  // component's slot fill — every working path in this app stops at the first
+  // component boundary. Restore the focus when the language can address it.
 
 on toggle_channel_settings
   return if empty(active_channel)
@@ -160,6 +199,16 @@ on remove_channel_member_submit(key)
   error = ""
   run remove_channel_member(connected_rpc, password, active_channel, key) -> chat_acked _ | mutation_failed _
 
+// JOINING IS A SIGNED CHAIN WRITE, SO IT NEEDS AN INVERSE THE UI CAN REACH.
+// `huddle_joined` is the discriminant that splits the header's "Huddle" start
+// control from the LIVE pill carrying ✕ Leave, and it had no writer at all —
+// every reply that carries a channel's state now answers it from that
+// channel's roster, which is the chain's answer and never a local flag.
+//
+// It answers for the channel ON SCREEN only: `ChatData` carries the roster of
+// the active channel, and nothing on the wire says whether she is in a huddle
+// in some OTHER channel. So the docked titlebar pill and the "live elsewhere"
+// affordance stay dark rather than guess (see the report).
 on join_huddle_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived
   hydration_generation = hydration_generation + 1
@@ -168,13 +217,10 @@ on join_huddle_submit
   error = ""
   run join_huddle(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
 
-on leave_huddle_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_huddle_count <= 0
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  mutation_phase = "huddle"
-  error = ""
-  run leave_huddle(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
+// Leaving is `leave_huddle_here` in handlers/huddle.ice, which leaves the
+// HUDDLE'S channel rather than the one on screen — the same button serves the
+// channel-header ✕ and the popped panel, so a second leave that targets
+// `active_channel` would be a way to leave the wrong huddle.
 
 on send_message_submit
   return if loading || empty(active_channel) || active_channel_archived || empty(trim(editor_text(message_editor)))
@@ -215,6 +261,14 @@ on chat_updated(next)
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
   active_channel_huddle_count = next.active_channel_huddle_count
+  // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
+  // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
+  // clock and one that finds her out re-takes it for the next join.
+  huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
+  huddle_joined = huddle_self(next.huddle_roster)
+  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  huddle_channel = keep_str(huddle_joined, active_channel, "")
+  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
   selected_message_seq = next.selected_message_seq
   selected_message_rev = next.selected_message_rev
@@ -242,6 +296,14 @@ on chat_hit_loaded(next)
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
   active_channel_huddle_count = next.active_channel_huddle_count
+  // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
+  // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
+  // clock and one that finds her out re-takes it for the next join.
+  huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
+  huddle_joined = huddle_self(next.huddle_roster)
+  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  huddle_channel = keep_str(huddle_joined, active_channel, "")
+  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
   selected_message_seq = next.selected_message_seq
   selected_message_rev = next.selected_message_rev
@@ -272,6 +334,14 @@ on channel_created(next)
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
   active_channel_huddle_count = next.active_channel_huddle_count
+  // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
+  // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
+  // clock and one that finds her out re-takes it for the next join.
+  huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
+  huddle_joined = huddle_self(next.huddle_roster)
+  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  huddle_channel = keep_str(huddle_joined, active_channel, "")
+  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
   selected_message_seq = next.selected_message_seq
   selected_message_rev = next.selected_message_rev
@@ -334,7 +404,7 @@ on open_thread_message_actions(seq, body, rev)
   thread_message_action = "more"
   thread_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/thread-action-focus
+    task widget focus #workspace-tabs/content/chat/thread-action-focus
     task widget focus-next
 
 on open_thread_message_reactions(seq, body, rev)
@@ -345,7 +415,7 @@ on open_thread_message_reactions(seq, body, rev)
   thread_message_action = "reactions"
   thread_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/thread-reaction-focus
+    task widget focus #workspace-tabs/content/chat/thread-reaction-focus
     task widget focus-next
 
 on arm_thread_message_delete(seq, body, rev)
@@ -355,7 +425,7 @@ on arm_thread_message_delete(seq, body, rev)
   thread_message_action = "delete"
   thread_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/thread-delete-focus
+    task widget focus #workspace-tabs/content/chat/thread-delete-focus
     task widget focus-next
 
 on begin_thread_message_edit(seq, body, rev)
@@ -364,7 +434,7 @@ on begin_thread_message_edit(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = "editing"
   thread_edit_draft = body
-  task widget focus #workspace-tabs/content/thread-edit
+  task widget focus #workspace-tabs/content/chat/thread-edit
 
 on clear_thread_message_selection
   thread_selected_seq = 0
@@ -398,7 +468,7 @@ on open_message_actions(seq, body, rev)
   message_action = "more"
   message_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/message-action-focus
+    task widget focus #workspace-tabs/content/chat/message-action-focus
     task widget focus-next
 
 on open_message_actions_accessibly(seq, body, rev)
@@ -409,7 +479,7 @@ on open_message_actions_accessibly(seq, body, rev)
   message_action = "more"
   message_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/message-action-focus
+    task widget focus #workspace-tabs/content/chat/message-action-focus
     task widget focus-next
 
 on open_message_reactions(seq, body, rev)
@@ -420,7 +490,7 @@ on open_message_reactions(seq, body, rev)
   message_action = "reactions"
   message_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/message-reaction-focus
+    task widget focus #workspace-tabs/content/chat/message-reaction-focus
     task widget focus-next
 
 on arm_message_delete(seq, body, rev)
@@ -430,7 +500,7 @@ on arm_message_delete(seq, body, rev)
   message_action = "delete"
   message_edit_draft = body
   sequential
-    task widget focus #workspace-tabs/content/message-delete-focus
+    task widget focus #workspace-tabs/content/chat/message-delete-focus
     task widget focus-next
 
 on begin_message_edit(seq, body, rev)
@@ -439,7 +509,12 @@ on begin_message_edit(seq, body, rev)
   selected_message_rev = rev
   message_action = "editing"
   message_edit_draft = body
-  task widget focus #workspace-tabs/content/message-edit
+  task widget focus #workspace-tabs/content/chat/message-edit
+
+// THE INSPECTOR IS THE FINALITY MARK'S TARGET. The shield in the hover bar and
+// the settled chip on my own bubble both land here, and both name the same
+// right rail — so opening one closes the other.
+
 
 on open_thread_for(seq)
   return if seq <= 0 || empty(active_channel)
@@ -466,10 +541,6 @@ on open_thread_for(seq)
   pending_reply = ""
   error = ""
   run load_thread(connected_rpc, active_channel, seq, 0, 0, thread_generation) -> thread_loaded _ | thread_failed _
-
-on cancel_message_action
-  return if selected_message_seq <= 0
-  message_action = "toolbar"
 
 on clear_message_selection
   selected_message_seq = 0

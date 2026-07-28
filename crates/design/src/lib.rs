@@ -31,33 +31,39 @@ pub mod fonts {
 /// The product type roles from the canonical Ducktape design artifact. The
 /// drift guard walks every app-authored `.ice` source and rejects other sizes.
 pub mod type_scale {
+    pub const MICRO: f64 = 7.5;
     pub const BADGE: f64 = 9.0;
     pub const NAV: f64 = 9.5;
     pub const FIELD_LABEL: f64 = 10.0;
     pub const MACHINE_META: f64 = 10.5;
     pub const META: f64 = 11.0;
+    pub const CONTROL: f64 = 11.5;
     pub const MACHINE: f64 = 12.0;
     pub const CAPTION: f64 = 12.5;
     pub const LIST: f64 = 13.0;
     pub const BODY: f64 = 13.5;
     pub const PANE_HEADER: f64 = 14.0;
+    pub const HEADING: f64 = 14.5;
     pub const SECTION: f64 = 16.0;
     pub const SCREEN_TITLE: f64 = 20.0;
     pub const DISPLAY: f64 = 22.0;
 
     /// every legal `size=` literal in `.ice` sources, the guard's whitelist.
     /// `1.0` is the established off-screen focus-shim size, not a text step.
-    pub const ALL: [f64; 14] = [
+    pub const ALL: [f64; 17] = [
+        MICRO,
         BADGE,
         NAV,
         FIELD_LABEL,
         MACHINE_META,
         META,
+        CONTROL,
         MACHINE,
         CAPTION,
         LIST,
         BODY,
         PANE_HEADER,
+        HEADING,
         SECTION,
         SCREEN_TITLE,
         DISPLAY,

@@ -10,6 +10,22 @@ fn main() -> iced::Result {
 mod tests {
     use super::*;
 
+    /// EVERY SCREEN BODY, as one string. These are the slot bodies that used to
+    /// sit inline in `view.ice`; the sweeps below read the console's authored
+    /// markup, so they must read where that markup now lives. `view.ice` keeps
+    /// only the mounts, and asserting a widget shape against it now would pass
+    /// vacuously — the worst kind of green.
+    const SCREENS: &str = concat!(
+        include_str!("ui/screens/chat.ice"),
+        include_str!("ui/screens/forge.ice"),
+        include_str!("ui/screens/governance.ice"),
+        include_str!("ui/screens/overlays.ice"),
+        include_str!("ui/screens/pages.ice"),
+        include_str!("ui/screens/roster.ice"),
+        include_str!("ui/screens/settings.ice"),
+        include_str!("ui/screens/storage.ice"),
+    );
+
     fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
         backend::ChatMessage {
             id: format!("message-{seq}"),
@@ -27,6 +43,9 @@ mod tests {
             show_author: true,
             initial: "U".into(),
             avatar_kind: "human".into(),
+            mine: false,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         }
     }
@@ -57,14 +76,16 @@ mod tests {
     }
 
     fn default_ice_color(name: &str) -> iced::Color {
-        let source = include_str!("ui/ducktape-ui/default.ice");
+        // 2.0 allows ONE theme contract and one palette, so the kit's theme moved
+        // out of the vendored copy into the app's own file.
+        let source = include_str!("ui/theme.ice");
         let value = source
             .lines()
             .find_map(|line| {
                 let mut parts = line.split_ascii_whitespace();
                 (parts.next() == Some(name)).then(|| parts.next()).flatten()
             })
-            .unwrap_or_else(|| panic!("default.ice is missing `{name}`"));
+            .unwrap_or_else(|| panic!("theme.ice palette is missing `{name}`"));
         let hex = value
             .strip_prefix('#')
             .expect("default Ice colors use hexadecimal literals");
@@ -103,6 +124,7 @@ mod tests {
             active_channel_archived: false,
             active_channel_members_only: false,
             active_channel_huddle_count: 0,
+            huddle_roster: Vec::new(),
             channel_members: Vec::new(),
             pages_loaded: true,
             pages: Vec::new(),
@@ -138,6 +160,7 @@ mod tests {
             active_channel_archived: false,
             active_channel_members_only: false,
             active_channel_huddle_count: 0,
+            huddle_roster: Vec::new(),
             channel_members: Vec::new(),
             selected_message_seq: 0,
             selected_message_rev: 0,
@@ -167,10 +190,66 @@ mod tests {
         assert_eq!(app.shell_tab, "chat");
     }
 
+    /// A hydration error belongs to the pane that raised it.
+    ///
+    /// The banner has no self-retiring path — it is dismissed by hand or it
+    /// stays — so leaving it up across a navigation tells the user the pane they
+    /// just opened is broken. `select_shell_tab` clears it ABOVE both of its
+    /// early returns, which is the part worth pinning: the `!connected` return
+    /// and the chat/pages return each skip the generation bumps, and a clear
+    /// placed below either one would silently cover only some tabs.
+    #[test]
+    fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
+        // the disconnected path returns first, and must still clear.
+        let (mut app, _) = Ducktape::__boot();
+        app.error = "could not reach the node".into();
+        let _ = app.__update(__DucktapeMessage::SelectShellTab("files".into()));
+        assert_eq!(app.error, "", "the !connected early return must still clear");
+
+        // the chat/pages path returns second, and must still clear.
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.error = "files: path not found".into();
+        let _ = app.__update(__DucktapeMessage::SelectShellTab("pages".into()));
+        assert_eq!(app.error, "", "the chat/pages early return must still clear");
+
+        // and the full path, which falls through to the generation bumps.
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.error = "explorer hydration failed".into();
+        let _ = app.__update(__DucktapeMessage::SelectShellTab("members".into()));
+        assert_eq!(app.error, "");
+        assert_eq!(app.shell_tab, "members");
+    }
+
+    /// The app has NO polling loop: every live surface rides the delta stream.
+    /// The only recurring subscriptions are wall clocks that nothing else can
+    /// supply — the huddle call timer and the toast's own dismissal — and this
+    /// pins that set exactly, so a reintroduced poll fails the build.
+    fn assert_no_polling(lifecycle: &str) {
+        let recurring: Vec<_> = lifecycle
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("every "))
+            .collect();
+        assert_eq!(
+            recurring,
+            [
+                "every 1s when huddle_joined -> tick",
+                "every 2800ms when !empty(toast) -> dismiss_toast",
+            ]
+        );
+    }
+
     #[test]
     fn forge_depth_rides_the_established_seams() {
-        let lifecycle = include_str!("ui/handlers/lifecycle.ice");
-        let view = include_str!("ui/view.ice");
+        // the forge handlers moved out of lifecycle.ice into their own file;
+        // the seams they guard did not, so the guard reads both.
+        let lifecycle = concat!(
+            include_str!("ui/handlers/lifecycle.ice"),
+            include_str!("ui/handlers/forge.ice"),
+        );
+        let forge = include_str!("ui/components/forge.ice");
         let backend = include_str!("ui/backend.ice");
 
         // the item discussion IS a chat surface: hydrated through the chat
@@ -197,12 +276,23 @@ mod tests {
         assert!(lifecycle.contains(
             "run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, forge_generation)"
         ));
-        assert!(!lifecycle.contains("every 1s"));
+        assert_no_polling(lifecycle);
 
-        // approvals stay advisory in the merge box, and the merged state
-        // renders the CAS'd commit.
-        assert!(view.contains("Approvals are advisory"));
-        assert!(view.contains("forge_merge_note(forge_item_merge_oid, forge_item_branches)"));
+        // approvals stay advisory in the merge box — `MergeAdvisory` is the
+        // ONLY thing said above the merge button, and it recommends, never
+        // refuses. The merged state renders the CAS'd commit.
+        let forge_screen = include_str!("ui/screens/forge.ice");
+        assert!(forge_screen.contains("MergeAdvisory change_requests=forge_item_change_requests"));
+        assert_eq!(forge.matches("merge not recommended").count(), 2);
+        // MergeAdvisory owns the count: no OTHER predicate may branch on it.
+        // The one sibling read is the disclaimer's `<= 0`, which is the
+        // no-advisory half and cannot contradict it.
+        assert!(!forge_screen.contains("forge_item_change_requests > 0"));
+        assert_eq!(
+            forge_screen.matches("forge_item_change_requests <= 0").count(),
+            1
+        );
+        assert!(forge_screen.contains("forge_merge_note(forge_item_merge_oid, forge_item_branches)"));
     }
 
     #[test]
@@ -257,7 +347,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(refresh.contains("selected_message_seq = refreshed_required_message_seq("));
         assert!(refresh.contains("failed_message_draft = remember_failed_draft("));
         assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
-        assert!(!lifecycle.contains("every 1s"));
+        assert_no_polling(lifecycle);
         assert!(lifecycle.contains("run live_resync_load(connected_rpc"));
         assert!(lifecycle.contains("run refresh_live_thread(connected_rpc"));
         assert!(lifecycle.contains("parallel\n    run refresh_live_thread("));
@@ -265,17 +355,21 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             "active_page_title = keep_str(next.pages_loaded, next.active_page_title, active_page_title)"
         ));
         assert!(lifecycle.contains("block_edit_draft = refreshed_block_draft("));
+        // the comment rail is scoped to the PAGE it hangs off, so its draft
+        // survives moving the cursor between blocks and dies with the page.
         assert!(lifecycle.contains(
-            "block_comment_draft = retain_selected_string(block_comment_draft, selected_block_id)"
+            "block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)"
         ));
-        let live_comment_callbacks = lifecycle
-            .split_once("on live_block_comments_refreshed(next)\n")
+        // the live comment-list callback settles state and stops — re-entering
+        // the resync from inside it would loop the rail against the page.
+        let comment_callbacks = include_str!("ui/handlers/pages.ice")
+            .split_once("on block_threads_loaded(next)\n")
             .unwrap()
             .1
-            .split_once("\nsubscribe")
+            .split_once("\non load_more_block_threads")
             .unwrap()
             .0;
-        assert!(!live_comment_callbacks.contains("run live_resync_load("));
+        assert!(!comment_callbacks.contains("run "));
     }
 
     #[test]
@@ -285,7 +379,6 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             "open_page_search_hit(page_id, block_id)",
             "choose_page(id)",
             "select_block(key, id, kind, text, checked, open_actions)",
-            "clear_block_selection",
             "pages_mutated(next)",
         ] {
             let rest = pages.split_once(&format!("on {name}")).unwrap().1;
@@ -688,9 +781,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert_eq!(app.messages[1].id, second_id);
         assert!(app.messages[1].pending);
 
-        let view = include_str!("ui/view.ice");
-        assert!(view.contains("stack #message(message.id) w=fill"));
-        assert!(!view.contains("#message(message.seq)"));
+        let chat = include_str!("ui/screens/chat.ice");
+        assert!(chat.contains("stack #message(message.id) w=fill"));
+        assert!(!chat.contains("#message(message.seq)"));
     }
 
     #[test]
@@ -766,9 +859,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         )));
         assert!(!app.history_view);
 
-        let view = include_str!("ui/view.ice");
-        assert!(view.contains("button \"Jump to latest\""));
-        assert!(view.contains("-> choose_channel(active_channel)"));
+        let chat = include_str!("ui/screens/chat.ice");
+        assert!(chat.contains("button \"Jump to latest\""));
+        assert!(chat.contains("-> emit(choose_channel, active_channel)"));
     }
 
     #[test]
@@ -788,15 +881,19 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert_eq!(app.message_action, "more");
         let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "hello".into(), 2));
         assert_eq!(app.message_action, "editing");
-        let _ = app.__update(__DucktapeMessage::CancelMessageAction);
+        // Every cancel affordance in the view routes `clear_message_selection`
+        // (view.ice:441, :467, :511, :523, :538), so that is the transition
+        // under test — it drops to the toolbar AND drops the selection.
+        let _ = app.__update(__DucktapeMessage::ClearMessageSelection);
         assert_eq!(app.message_action, "toolbar");
+        assert_eq!(app.selected_message_seq, 0);
         let _ = app.__update(__DucktapeMessage::OpenMessageReactions(
             7,
             "hello".into(),
             2,
         ));
         assert_eq!(app.message_action, "reactions");
-        let _ = app.__update(__DucktapeMessage::CancelMessageAction);
+        let _ = app.__update(__DucktapeMessage::ClearMessageSelection);
         let _ = app.__update(__DucktapeMessage::ArmMessageDelete(7, "hello".into(), 2));
         assert_eq!(app.message_action, "delete");
         let _ = app.__update(__DucktapeMessage::OpenMessageActionsAccessibly(
@@ -818,20 +915,27 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .split_once("component ThreadMessageCard")
             .unwrap()
             .0;
-        assert!(toolbar.contains("mouse enter=message_entered(message.seq)"));
+        assert!(toolbar.contains("mouse enter=emit(message_entered, message.seq)"));
         assert!(toolbar.contains("if !message.deleted && !message.pending && hovered"));
         assert!(toolbar.contains("if !message.deleted && !message.pending && !hovered"));
-        assert!(toolbar.contains("-> open_message_actions_accessibly("));
+        assert!(toolbar.contains("-> emit(open_message_actions_accessibly, message.seq, message.body, message.rev)"));
         assert!(!toolbar.contains("hovered || selected"));
         assert_eq!(toolbar.matches("w=26.0 h=26.0").count(), 1);
-        assert_eq!(toolbar.matches("w=27.0 h=25.0").count(), 2);
-        // the two glyph buttons take the icon as a direct child; a `h=fill` wrapper
-        // inside a fixed-size button collapses an SVG to a hairline.
-        assert_eq!(toolbar.matches("p=5.0 @icon_action").count(), 2);
+        // the artifact's hover bar is five 27×25 cells: three one-tap reactions,
+        // the reaction picker and the overflow menu (Console:244).
+        assert_eq!(toolbar.matches("w=27.0 h=25.0").count(), 5);
+        // the one svg cell takes the icon as a direct child; a `h=fill` wrapper
+        // inside a fixed-size button collapses an SVG to a hairline. The other
+        // four cells are the artifact's own typographic glyphs, not icons.
+        assert_eq!(toolbar.matches("p=5.0 @icon_action").count(), 1);
         assert!(components.contains(
             "text message.author size=13.0 wrap=none font=display @text-fg\n          if message.avatar_kind == \"agent\""
         ));
-        assert!(components.contains("text message.meta size=11.0 wrap=none font=code_medium @text-hint"));
+        // the stamp beside the author is the block the message was finalized
+        // in — a chain fact the app can prove, never a wall-clock time.
+        assert!(components.contains(
+            "if message.height > 0\n            text height_label_short(message.height) size=11.0 wrap=none font=code_medium @text-hint"
+        ));
         // Slack-style grouping: the shared avatar + author header only renders
         // for a run's first message; continuations keep the body aligned via a
         // gutter that matches the avatar's width.
@@ -846,36 +950,38 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(components.contains("for block in message.blocks"));
         assert!(components.contains("if block.kind == \"code\""));
         assert!(components.contains("flex w=fill wrap=wrap"));
-        // The hover toolbar uses the shared glass/popover depth role instead
-        // of carrying another inline shadow variant.
-        assert!(toolbar.contains("bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_toast"));
+        // The hover toolbar uses the shared popover depth role instead of
+        // carrying another inline shadow variant. The artifact's own plate is
+        // `border-radius:9px; box-shadow:0 3px 12px rgba(40,38,34,.13);
+        // padding:2px` (Console:243).
+        assert!(toolbar.contains(
+            "box p=2.0 bg=surface border=border border-w=1.0 r=9.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0"
+        ));
         for label in ["Open thread", "Manage reactions", "More message actions"] {
             assert!(toolbar.contains(&format!("label=\"{label}\"")));
         }
         assert!(components.contains(
-            "button label=\"Open thread\" p=0.0 @icon_action -> open_thread_for(message.seq)"
+            "button label=\"Open thread\" disabled=disabled p=5.0 @icon_action -> emit(open_thread_for, message.seq)"
         ));
 
+        let chat = include_str!("ui/screens/chat.ice");
         let view = include_str!("ui/view.ice");
-        let chat = view
-            .split_once("    chat:")
-            .unwrap()
-            .1
-            .split_once("    pages:")
-            .unwrap()
-            .0;
         assert!(
             chat.contains(
                 "overlay when=(selected_message_seq > 0 && message_action != \"toolbar\")"
             )
         );
-        assert!(chat.contains("dismiss=clear_message_selection backdrop=transparent"));
-        assert!(chat.contains("mouse move=chat_pointer_moved"));
-        assert!(chat.contains("sensor show=chat_resized resize=chat_resized"));
+        assert!(chat.contains("dismiss=emit(clear_message_selection) backdrop=transparent"));
+        assert!(chat.contains("mouse move=emit(chat_pointer_moved, _, _)"));
         assert!(chat.contains("float x=0.0 y=message_menu_y"));
-        assert!(
-            chat.contains("stack w=fill h=fill\n                    mouse move=chat_pointer_moved")
-        );
+        // the pointer sensor is the stack's FIRST child, so it measures the
+        // message list itself and not whatever an overlay happens to cover.
+        // The screen holds the SEAT and the mount fills it: `sensor` cannot
+        // route to a component event (its show/resize check takes only bare
+        // `_` payloads), so the measurement stays in the caller's scope.
+        let sensor = chat.split_once("stack w=fill h=fill\n").unwrap().1;
+        assert!(sensor.trim_start().starts_with("slot chat_sensor"));
+        assert!(view.contains("sensor show=chat_resized resize=chat_resized"));
         let overlay_content = chat
             .split_once("                  content\n")
             .unwrap()
@@ -885,7 +991,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .0;
         assert!(overlay_content.contains("space w=fill h=fill"));
         assert!(!overlay_content.contains("message_action =="));
-        let more = view
+        let more = chat
             .split_once("message_action == \"more\"")
             .unwrap()
             .1
@@ -900,9 +1006,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
 
         let handlers = include_str!("ui/handlers/chat.ice");
         for focus in [
-            "#workspace-tabs/content/message-action-focus",
-            "#workspace-tabs/content/message-reaction-focus",
-            "#workspace-tabs/content/message-delete-focus",
+            "#workspace-tabs/content/chat/message-action-focus",
+            "#workspace-tabs/content/chat/message-reaction-focus",
+            "#workspace-tabs/content/chat/message-delete-focus",
         ] {
             assert!(handlers.contains(focus));
         }
@@ -922,7 +1028,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .split_once("\non ")
             .unwrap()
             .0;
-        assert!(activate.contains("task widget focus #workspace-tabs/content/message-edit"));
+        assert!(activate.contains("task widget focus #workspace-tabs/content/chat/message-edit"));
     }
 
     #[test]
@@ -933,38 +1039,44 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .unwrap()
             .1;
         assert!(card.contains(
-            "mouse enter=thread_message_entered(message.seq) exit=thread_message_exited(message.seq)"
+            "mouse enter=emit(thread_message_entered, message.seq) exit=emit(thread_message_exited, message.seq)"
         ));
         assert!(
             card.contains(
-                "-> open_thread_message_reactions(message.seq, message.body, message.rev)"
+                "-> emit(open_thread_message_reactions, message.seq, message.body, message.rev)"
             )
         );
         assert!(
-            card.contains("-> open_thread_message_actions(message.seq, message.body, message.rev)")
+            card.contains("-> emit(open_thread_message_actions, message.seq, message.body, message.rev)")
         );
         // No open-thread action from inside a thread you are already reading.
         assert!(!card.contains("open_thread_for"));
 
-        let view = include_str!("ui/view.ice");
-        let thread = view
+        let thread = include_str!("ui/screens/chat.ice")
             .split_once("if active_thread_seq > 0 && !channel_settings_open")
             .unwrap()
-            .1
-            .split_once("    pages:")
-            .unwrap()
-            .0;
+            .1;
         // A SECOND overlay, keyed on thread-scoped state, independent of the main one.
         assert!(thread.contains(
             "overlay when=(thread_selected_seq > 0 && thread_message_action != \"toolbar\")"
         ));
-        assert!(thread.contains("dismiss=clear_thread_message_selection backdrop=transparent"));
+        assert!(
+            thread.contains("dismiss=emit(clear_thread_message_selection) backdrop=transparent")
+        );
         assert!(thread.contains("float x=0.0 y=thread_menu_y"));
-        assert!(thread.contains("mouse move=thread_pointer_moved"));
-        assert!(thread.contains("sensor show=thread_resized resize=thread_resized"));
+        assert!(thread.contains("mouse move=emit(thread_pointer_moved, _, _)"));
+        // Same seat-and-fill split as the message list: the screen holds
+        // `slot thread_sensor`, the mount supplies the sensor.
+        assert!(thread.contains("slot thread_sensor"));
+        assert!(
+            include_str!("ui/view.ice")
+                .contains("sensor show=thread_resized resize=thread_resized")
+        );
         // The picker reuses the seq-targeted reaction mutations against the thread selection.
-        assert!(thread.contains("-> add_reaction_at(thread_selected_seq, \"👍\")"));
-        assert!(thread.contains("-> remove_reaction_at(thread_selected_seq, reaction.emoji)"));
+        assert!(thread.contains("-> emit(add_reaction_at, thread_selected_seq, \"👍\")"));
+        assert!(
+            thread.contains("-> emit(remove_reaction_at, thread_selected_seq, reaction.emoji)")
+        );
         // More-menu omits Open thread (already inside the thread).
         let more = thread
             .split_once("thread_message_action == \"more\"")
@@ -1097,6 +1209,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             show_author: true,
             initial: "U".into(),
             avatar_kind: "human".into(),
+            mine: false,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         };
         let (mut app, _) = Ducktape::__boot();
@@ -1237,10 +1352,10 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(app.block_kinds.iter().any(|kind| kind == "Page"));
         assert!(!app.editable_block_kinds.iter().any(|kind| kind == "Page"));
 
-        let view = include_str!("ui/view.ice");
+        let view = include_str!("ui/screens/pages.ice");
         assert!(view.contains("if !block.pending && block.kind == \"Page\""));
         assert!(view.contains(
-            "button label=block.kind description=block.text w=fill p=5.0 @ghost_action -> choose_page(block.id)"
+            "button label=block.kind description=block.text w=fill p=5.0 @ghost_action -> emit(choose_page, block.id)"
         ));
         assert!(view.contains(
             "if !block.pending && block.kind != \"Page\" && block.id == selected_block_id"
@@ -1251,15 +1366,15 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     fn page_title_and_block_actions_use_native_focus_and_overlay_paths() {
         let components = include_str!("ui/components/pages.ice");
         let handlers = include_str!("ui/handlers/pages.ice");
-        let view = include_str!("ui/view.ice");
+        let view = include_str!("ui/screens/pages.ice");
 
         assert!(components.contains("task widget focus #title-input"));
         assert!(!components.contains("defer_focus"));
         assert!(!handlers.contains("focus_page_title"));
         assert!(!include_str!("ui/backend.ice").contains("defer_focus"));
-        assert!(view.contains("mouse move=pages_pointer_moved"));
+        assert!(view.contains("mouse move=emit(pages_pointer_moved, _, _)"));
         assert!(view.contains("overlay when=(connected && !empty(active_page)"));
-        assert!(view.contains("dismiss=close_block_actions backdrop=transparent"));
+        assert!(view.contains("dismiss=emit(close_block_actions) backdrop=transparent"));
         assert!(view.contains("float x=(block_menu_x + 10.0)"));
         assert!(!view.contains("pin x=(block_menu_x"));
         assert!(view.contains("BlockActionsMenu block_id=selected_block_id"));
@@ -1270,7 +1385,10 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             "component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)"
         ));
         assert!(view.contains("prefix=block.prefix #block-insert-row"));
-        assert!(view.contains("box w=fill pl=56.0\n                        PageTitleEditor"));
+        // the title sits in the same 56px gutter the blocks hang off, so the
+        // document's left edge is one line all the way down.
+        let title_gutter = view.split_once("box w=fill pl=56.0\n").unwrap().1;
+        assert!(title_gutter.trim_start().starts_with("PageTitleEditor rpc="));
     }
 
     #[test]
@@ -1281,15 +1399,27 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             include_str!("ui/state.ice"),
             include_str!("ui/theme.ice"),
             include_str!("ui/view.ice"),
-            include_str!("ui/components/shell.ice"),
             include_str!("ui/components/chat.ice"),
+            include_str!("ui/components/dm.ice"),
+            include_str!("ui/components/files.ice"),
+            include_str!("ui/components/forge.ice"),
+            include_str!("ui/components/huddle.ice"),
+            include_str!("ui/components/icon.ice"),
+            include_str!("ui/components/kit.ice"),
+            include_str!("ui/components/node.ice"),
+            include_str!("ui/components/onboarding.ice"),
+            include_str!("ui/components/overlay.ice"),
             include_str!("ui/components/pages.ice"),
+            include_str!("ui/components/patterns.ice"),
+            include_str!("ui/components/roster.ice"),
+            include_str!("ui/components/shell.ice"),
             include_str!("ui/handlers/lifecycle.ice"),
             include_str!("ui/handlers/chat.ice"),
             include_str!("ui/handlers/pages.ice"),
         );
         for gradient in ["linear(", "radial(", "conic("] {
             assert!(!ui.contains(gradient), "{gradient}");
+            assert!(!SCREENS.contains(gradient), "{gradient}");
         }
         // The window is opaque. iced has no backdrop blur, so the chrome paints
         // the artifact's own non-glass ladder — desk/rail/sidebar/content — and
@@ -1303,8 +1433,12 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(app.contains("font \"../../../crates/design/assets/fonts/Geist[wght].ttf\""));
         assert!(!ui.contains("white/"));
         assert!(!ui.contains("bg=glass_"));
+        assert!(!SCREENS.contains("white/"));
+        assert!(!SCREENS.contains("bg=glass_"));
 
-        let defaults = include_str!("ui/ducktape-ui/default.ice");
+        // The palette moved with the theme: 2.0 permits one contract and one
+        // palette, and the vendored kit copy no longer carries either.
+        let defaults = include_str!("ui/theme.ice");
         for material in [
             "bg         #fdfdfb",
             "surface    #ffffff",
@@ -1352,21 +1486,35 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         let shell = include_str!("ui/components/shell.ice");
         // the shell is titlebar + optional degradation banner over the panes.
         assert!(shell.contains(
-            "component TitleBar(network:str, status:str, height:i64, loading:bool, degraded:bool, bell_badge:i64)"
+            "component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)"
         ));
+        // `phase` is the bar's ONE discriminant, matched twice — the network
+        // chip on the left and the whole status/bell cluster on the right both
+        // vanish before a workspace exists, and nothing is drawn in their
+        // place. A boolean gate here would let one half render without the
+        // other on a device that has no workspace on disk.
+        let bar = shell.split_once("component TitleBar(").unwrap().1;
+        let bar = bar.split_once("\ncomponent ").unwrap().0;
+        assert_eq!(bar.matches("match phase\n").count(), 2);
+        assert_eq!(bar.matches("\"console\"\n").count(), 2);
+        assert!(!bar.contains("if phase"));
         assert!(shell.contains("component ConnectionBanner(status:str)"));
         assert!(shell.contains("if degraded\n          ConnectionBanner status=status"));
         assert!(shell.contains("box #root w=74.0 h=fill pt=13.0 pb=10.0 bg=rail"));
-        let view = include_str!("ui/view.ice");
-        assert!(view.contains("box w=236.0 h=fill bg=sidebar clip=true"));
-        assert!(view.contains("box w=230.0 h=fill bg=sidebar clip=true"));
+        assert!(SCREENS.contains("box w=236.0 h=fill bg=sidebar clip=true"));
+        assert!(SCREENS.contains("box w=230.0 h=fill bg=sidebar clip=true"));
 
-        assert!(view.contains("input \"\" #rpc label=\"RPC endpoint\""));
-        assert!(view.contains("if active_thread_seq > 0 && !channel_settings_open"));
-        assert!(view.contains("box w=fill p=5.0 bg=transparent border=fg/12"));
-        assert!(view.contains("bg=surface border=border border-w=1.0 r=14.0 shadow=shadow_modal shadow-y=24.0 shadow-blur=60.0"));
+        assert!(SCREENS.contains("input \"\" #rpc label=\"RPC endpoint\""));
+        assert!(SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"));
+        assert!(SCREENS.contains("box w=fill p=5.0 bg=transparent border=fg/12"));
+        // the palette card moved into the overlay layer with the rest of the
+        // window-level surfaces; the assertion follows the code it guards.
+        let overlays = include_str!("ui/screens/overlays.ice");
+        assert!(overlays.contains(
+            "bg=surface border=border border-w=1.0 r=14.0 shadow=shadow_modal shadow-y=24.0 shadow-blur=60.0"
+        ));
 
-        for authored in [shell, include_str!("ui/components/pages.ice"), view] {
+        for authored in [shell, include_str!("ui/components/pages.ice"), SCREENS] {
             assert!(!authored.contains("shadow=black/"));
             assert!(!authored.contains("shadow=shadow "));
         }
@@ -1374,17 +1522,17 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
 
     #[test]
     fn compact_controls_share_a_single_geometry_and_type_scale() {
-        let view = include_str!("ui/view.ice");
-        assert!(view.contains("p=6.2 text-size=13.0 line-h=1.2"));
-        assert!(view.contains("min-h=44.0 max-h=150.0 size=13.5 line-h=1.3 p=6.6 wrap=word"));
-        assert!(view.contains("button \"Send\" disabled="));
-        assert!(view.contains("h=29.0 p=7.0 @primary_action -> send_message_submit"));
+        assert!(SCREENS.contains("p=6.2 text-size=13.0 line-h=1.2"));
+        assert!(SCREENS.contains("min-h=44.0 max-h=150.0 size=13.5 line-h=1.3 p=6.6 wrap=word"));
+        assert!(SCREENS.contains("button \"Send\" disabled="));
+        assert!(SCREENS.contains("h=29.0 p=7.0 @primary_action -> emit(send_message_submit)"));
         assert!(
-            view.matches("box w=fill h=fill align-x=center align-y=center")
+            SCREENS
+                .matches("box w=fill h=fill align-x=center align-y=center")
                 .count()
                 >= 10
         );
-        for line in view
+        for line in SCREENS
             .lines()
             .filter(|line| line.trim_start().starts_with("input "))
         {
@@ -1396,13 +1544,27 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             include_str!("ui/components/chat.ice"),
             include_str!("ui/components/pages.ice"),
         );
-        assert!(components.contains("row w=fill h=fill gap=9.0 align=center"));
+        // the pane header is ONE geometry: a 50px plate holding a `gap=9.0`
+        // centered row. Chat and pages both draw it, from their screens — the
+        // components carry the pane bodies, never a second header shape.
+        let pane_headers: Vec<_> = SCREENS
+            .lines()
+            .zip(SCREENS.lines().skip(1))
+            .filter(|(plate, _)| {
+                let plate = plate.trim_start();
+                plate == "box w=fill h=50.0 pl=18.0 pr=18.0"
+                    || plate == "box w=fill h=50.0 pl=22.0 pr=22.0"
+            })
+            .map(|(_, row)| row.trim_start())
+            .collect();
+        assert_eq!(pane_headers, ["row w=fill h=fill gap=9.0 align=center"; 2]);
+        assert!(!components.contains("row w=fill h=fill gap=9.0 align=center"));
         assert!(
             components.contains(
                 "button label=\"Insert block below\" disabled=disabled w=28.0 h=28.0 p=0.0"
             )
         );
-        for line in view.lines().chain(components.lines()).filter(|line| {
+        for line in SCREENS.lines().chain(components.lines()).filter(|line| {
             [
                 "button \"+\" label",
                 "button \"×\" label",
@@ -1474,24 +1636,41 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         let shell = include_str!("ui/components/shell.ice");
         let chat = include_str!("ui/components/chat.ice");
         let pages = include_str!("ui/components/pages.ice");
+        let kit = include_str!("ui/components/kit.ice");
+        let forge = include_str!("ui/components/forge.ice");
 
-        assert_recipe_owns_states("view.ice", view, "@primary_action");
-        assert_recipe_owns_states("view.ice", view, "@danger_action");
+        assert_recipe_owns_states("screens", SCREENS, "@primary_action");
+        assert_recipe_owns_states("screens", SCREENS, "@danger_action");
         assert_recipe_owns_states("chat.ice", chat, "@danger_action");
         assert_recipe_owns_states("pages.ice", pages, "@danger_action");
-        assert!(!view.contains("active bg=brand text=fg"));
-        assert!(!view.contains("hovered bg=brand/10"));
-        assert!(!view.contains("hovered bg=brand/12"));
-        assert!(!view.contains("font=code @text-brand"));
+        assert!(!SCREENS.contains("active bg=brand text=fg"));
+        assert!(!SCREENS.contains("hovered bg=brand/10"));
+        assert!(!SCREENS.contains("hovered bg=brand/12"));
+        assert!(!SCREENS.contains("font=code @text-brand"));
         assert!(!chat.contains("bg=brand/10 border=brand/22"));
         assert!(!chat.contains("bg=brand/9 border=brand/20"));
-        assert!(view.contains("Badge.Outline label=\"Members only\""));
-        assert!(view.contains("Badge.Outline label=item.kind"));
-        assert!(shell.contains("bg=success_dot r=3.0"));
-        assert!(shell.contains("bg=danger_bg border=danger_line"));
-        assert!(shell.contains("bg=danger_dot r=3.5"));
-        assert!(view.contains("KeyValueRow label=\"Key state\" value=settings_key_state last=false"));
-        assert!(view.contains("KeyValueRow label=\"Key path\" value=settings_key_path last=true"));
+        assert!(SCREENS.contains("Badge.Outline label=\"Members only\""));
+        // a tracker row's kind is carried by the PLATE behind the glyph, not by
+        // a second badge next to the state — one `match item.kind`, two plates.
+        assert!(forge.contains(
+            "match item.kind\n            \"pr\"\n              PrStatePlate state=item.state"
+        ));
+        assert!(forge.contains("IssueStateGlyph state=item.state"));
+        assert!(!SCREENS.contains("Badge.Outline label=item.kind"));
+        // a degraded node speaks the ALERT family, never a second red language:
+        // the status dot and the banner share `alert_*`, and the healthy dot is
+        // the same plate in `success_dot`.
+        assert!(shell.contains("bg=success_dot r=(plate / 2.0)"));
+        assert!(shell.contains("bg=alert_dot r=(plate / 2.0)"));
+        assert!(shell.contains("bg=alert_bg border=alert_line"));
+        assert!(shell.contains("bg=alert_dot r=3.5"));
+        assert!(!shell.contains("danger_"));
+        assert!(
+            SCREENS.contains("KeyValueRow label=\"Key state\" value=settings_key_state last=false")
+        );
+        assert!(
+            SCREENS.contains("KeyValueRow label=\"Key path\" value=settings_key_path last=true")
+        );
 
         for target in [
             "rename_channel_submit",
@@ -1501,14 +1680,14 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             "gov_execute",
             "account_rename_submit",
         ] {
-            let action = view
+            let action = SCREENS
                 .lines()
                 .chain(include_str!("ui/components/kit.ice").lines())
                 .find(|line| line.trim_start().starts_with("button ") && line.contains(target))
                 .unwrap_or_else(|| panic!("missing action target {target}"));
             assert!(action.contains("@secondary_action"), "{action}");
         }
-        let divider_actions: Vec<_> = view
+        let divider_actions: Vec<_> = SCREENS
             .lines()
             .filter(|line| line.contains("button \"Insert divider\""))
             .collect();
@@ -1519,10 +1698,11 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
                 .all(|line| line.contains("@secondary_action"))
         );
 
-        assert_controls_inherit_focus("view.ice", view);
+        assert_controls_inherit_focus("screens", SCREENS);
         assert_controls_inherit_focus("pages.ice", pages);
         assert_eq!(
-            view.lines()
+            SCREENS
+                .lines()
                 .filter(|line| line.trim_start().starts_with("focused ")
                     && line.contains("border=ring"))
                 .count(),
@@ -1534,21 +1714,19 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
                 .count(),
             2
         );
-        assert!(!view.contains("selection=brand"));
+        assert!(!SCREENS.contains("selection=brand"));
         assert_eq!(
-            view.matches(
-                "focused bg=transparent border=transparent value=transparent border-w=0.0"
-            )
-            .count(),
+            SCREENS
+                .matches("focused bg=transparent border=transparent value=transparent border-w=0.0")
+                .count(),
             6
         );
 
         for binding in [
-            "StatusBadge label=item.state",
             "StatusBadge label=forge_item_state",
             "StatusBadge label=op.disposition",
         ] {
-            assert!(view.contains(binding), "{binding}");
+            assert!(SCREENS.contains(binding), "{binding}");
         }
         for mapping in [
             "\"active\"\n        Badge.Success label=label",
@@ -1561,14 +1739,20 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             "\"applied\"\n        Badge.Success label=label",
             "\"discarded\"\n        Badge.Warning label=label",
         ] {
-            assert!(view.contains(mapping), "{mapping}");
+            // `StatusBadge` is the kit's now, so the state→badge table is read
+            // where the component lives.
+            assert!(kit.contains(mapping), "{mapping}");
         }
-        assert!(view.contains("bg=danger_bg border=danger_line"));
-        assert!(view.contains("bg=danger_dot"));
-        assert!(view.contains("bg=success_bg border=success_line"));
-        assert!(view.contains("bg=success_dot"));
-        assert!(!view.contains("bg=success/"));
-        assert!(!view.contains("border=success/"));
+        assert!(SCREENS.contains("bg=danger_bg border=danger_line"));
+        assert!(SCREENS.contains("bg=danger_dot"));
+        assert!(SCREENS.contains("bg=success_dot"));
+        // the semantic status plate is the kit's, so every screen that reports
+        // a good outcome paints the same three tokens.
+        assert!(kit.contains("bg=success_bg border=success_line border-w=1.0"));
+        for source in [view, shell, chat, pages, kit, forge, SCREENS] {
+            assert!(!source.contains("bg=success/"));
+            assert!(!source.contains("border=success/"));
+        }
     }
 
     /// App-authored text sizes stay on the app design scale, while the shared
@@ -1577,11 +1761,23 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     fn ice_sources_hold_to_the_design_system() {
         let sources = [
             ("view.ice", include_str!("ui/view.ice")),
-            ("shell.ice", include_str!("ui/components/shell.ice")),
             ("chat.ice", include_str!("ui/components/chat.ice")),
-            ("pages.ice", include_str!("ui/components/pages.ice")),
-            ("kit.ice", include_str!("ui/components/kit.ice")),
+            ("dm.ice", include_str!("ui/components/dm.ice")),
+            ("files.ice", include_str!("ui/components/files.ice")),
+            ("forge.ice", include_str!("ui/components/forge.ice")),
+            ("huddle.ice", include_str!("ui/components/huddle.ice")),
             ("icon.ice", include_str!("ui/components/icon.ice")),
+            ("kit.ice", include_str!("ui/components/kit.ice")),
+            ("node.ice", include_str!("ui/components/node.ice")),
+            ("onboarding.ice", include_str!("ui/components/onboarding.ice")),
+            ("overlay.ice", include_str!("ui/components/overlay.ice")),
+            ("pages.ice", include_str!("ui/components/pages.ice")),
+            ("patterns.ice", include_str!("ui/components/patterns.ice")),
+            ("roster.ice", include_str!("ui/components/roster.ice")),
+            ("shell.ice", include_str!("ui/components/shell.ice")),
+            // the screens carry the console's authored type scale now that
+            // view.ice holds only the mounts.
+            ("screens", SCREENS),
         ];
         for (name, source) in sources {
             for line in source.lines() {
@@ -1601,31 +1797,15 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
                         "{name}: {size} is off the design scale — change design::type_scale, not the view: {line:?}"
                     );
                 }
-                if !line.trim_start().starts_with("text ") {
-                    continue;
-                }
-                for (size, font) in [
-                    ("size=22.0", "font=display"),
-                    ("size=20.0", "font=display"),
-                    ("size=16.0", "font=display"),
-                    ("size=11.0", "font=code_medium"),
-                    ("size=10.5", "font=code_medium"),
-                    ("size=10.0", "font=code_semibold"),
-                    ("size=9.5", "font=display"),
-                    ("size=9.0", "font=code_semibold"),
-                ] {
-                    let has_size = line.split_whitespace().any(|token| token == size);
-                    if has_size {
-                        assert!(line.contains(font), "{name}: {line}");
-                    }
-                }
-                let is_caption = line.split_whitespace().any(|token| token == "size=12.5");
-                assert!(
-                    !is_caption || !line.contains("font="),
-                    "{name}: caption must stay weight 400: {line}"
-                );
             }
         }
+        // NO size→family/weight pairing is asserted, and that is a finding, not
+        // an omission: the canonical artifact draws EVERY step of the scale in
+        // both faces and at several weights (12.5px alone appears at 400, 500
+        // and 600, and 11px splits 226/195 mono-vs-sans). A step therefore
+        // fixes size and nothing else — a guard pinning `size=11.0` to
+        // `font=code_medium` was describing an older, smaller app, not the
+        // design system, and would reject correct markup on nine screens.
 
         // the font identity: theme roles bind to the design crate's families,
         // and the app embeds exactly the crate's font assets.
@@ -1778,32 +1958,35 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(!matches!(passthrough, Some(Binding::Custom(_))));
     }
 
+    /// The artifact hangs comments off the document as a docked 306px rail on
+    /// the sidebar ladder, NOT as a floating card over it — a card would cover
+    /// the block it is about the moment the block sits on the right half.
     #[test]
-    fn block_comments_use_a_floating_side_panel() {
-        let view = include_str!("ui/view.ice");
-        let pages = view
-            .split_once("    pages:")
+    fn block_comments_dock_a_rail_beside_the_document() {
+        // the pages screen is its own file now, so the slot slicing is gone.
+        let pages = include_str!("ui/screens/pages.ice");
+        // the rail is a sibling of the document, separated by the same 1px rule
+        // every other docked column uses — never an overlay layer.
+        let rail = pages
+            .split_once("if connected && !empty(active_page) && block_comments_open\n")
             .unwrap()
-            .1
-            .split_once("    files:")
-            .unwrap()
-            .0;
-        assert!(pages.contains("block_comments_open"));
-        assert!(
-            pages
-                .contains("overlay when=(connected && !empty(active_page) && block_comments_open)")
+            .1;
+        let mut opening = rail.lines().map(str::trim);
+        assert_eq!(opening.next(), Some("box w=1.0 h=fill bg=separator"));
+        assert_eq!(opening.next(), Some("space w=1.0 h=1.0"));
+        assert_eq!(
+            opening.next(),
+            Some("box w=306.0 h=fill bg=sidebar clip=true")
         );
-        assert!(pages.contains("dismiss=close_block_comments backdrop=transparent"));
-        assert!(pages.contains("align-x=end align-y=start"));
-        assert!(pages.contains("w=300.0 h=380.0"));
-        assert!(pages.contains("w=300.0 h=380.0 p=8.0 bg=surface border=border border-w=1.0 r=11.0"));
+        assert!(!pages.contains("close_block_comments backdrop=transparent"));
+        assert!(pages.contains("-> emit(close_block_comments)"));
         assert!(pages.contains("#block-comment(scope_key(connected_rpc, selected_block_id))"));
         assert!(!pages.contains("button \"Save\""));
         assert!(!pages.contains("Saving"));
 
         let components = include_str!("ui/components/pages.ice");
         assert!(components.contains("label=\"Comments\""));
-        assert!(components.contains("-> open_block_comments"));
+        assert!(components.contains("-> emit(open_block_comments)"));
 
         let handlers = include_str!("ui/handlers/pages.ice");
         assert!(handlers.contains("on post_block_comment_submit"));
@@ -1909,8 +2092,11 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         app.loading = false;
         app.mutation_phase = "idle".into();
         app.selected_block_id = "block-1".into();
+        app.active_page = "page".into();
         app.block_comments_open = true;
-        app.block_comments_target = "block-1".into();
+        // the rail is DOCUMENT-scoped: its anchor is the page it was opened
+        // on, never the block selection that opened it.
+        app.block_comments_target = "page".into();
         app.block_comment_draft = "draft stays".into();
         app.block_comment_threads_has_more = true;
         app.active_block_comment_thread = "deleted-thread".into();
@@ -1941,18 +2127,15 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert_ne!(app.block_comments_generation, stale_generation);
 
         // a comment refresh from a superseded generation is dropped whole
-        let _ = app.__update(__DucktapeMessage::LiveBlockCommentsRefreshed(
-            backend::BlockCommentsRefreshData {
+        let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
+            backend::BlockThreadListData {
                 generation: stale_generation,
-                target: "block-1".into(),
+                target: "page".into(),
+                from: 0,
                 threads: Vec::new(),
                 total: 0,
-                threads_next_from: 0,
-                threads_has_more: false,
-                thread_id: String::new(),
-                comments: Vec::new(),
-                comments_next_from: 0,
-                comments_has_more: false,
+                next_from: 0,
+                has_more: false,
             },
         ));
         assert_eq!(app.block_comment_draft, "draft stays");
@@ -1978,10 +2161,11 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         )));
         let generation = app.block_comments_generation;
 
-        let _ = app.__update(__DucktapeMessage::LiveBlockCommentsRefreshed(
-            backend::BlockCommentsRefreshData {
+        let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
+            backend::BlockThreadListData {
                 generation,
-                target: "block-1".into(),
+                target: app.block_comments_target.clone(),
+                from: 0,
                 threads: vec![backend::PageCommentThread {
                     id: "thread-1".into(),
                     author: "user".into(),
@@ -1990,20 +2174,22 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
                     comment_count: 1,
                 }],
                 total: 3,
-                threads_next_from: 0,
-                threads_has_more: false,
-                thread_id: String::new(),
-                comments: Vec::new(),
-                comments_next_from: 0,
-                comments_has_more: false,
+                next_from: 0,
+                has_more: false,
             },
         ));
 
         assert_eq!(app.block_comment_thread_total, 3);
         assert_eq!(app.block_comment_draft, "draft stays");
-        assert!(app.active_block_comment_thread.is_empty());
-        assert!(app.block_thread_comments.is_empty());
         assert!(!app.block_comment_threads_loading);
+        // the live refresh carries the THREAD LIST only. An open comment page
+        // is not reloaded under the reader — a task group must be a handler's
+        // final statement, so the reply load cannot be guarded on an open
+        // thread, and firing it unguarded queries thread "" and paints its
+        // failure over the rail on every page edit. Replies arrive on post and
+        // on reopen instead.
+        assert_eq!(app.active_block_comment_thread, "deleted-thread");
+        assert_eq!(app.block_thread_comments.len(), 1);
     }
 
     #[test]
@@ -2147,7 +2333,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         app.block_autosave_status = "error".into();
         app.block_autosave_generation = 8;
         app.block_comments_open = true;
-        app.block_comments_target = "deleted".into();
+        app.block_comments_target = "page".into();
         app.block_comment_draft = "unfinished comment".into();
         app.active_page = "page".into();
         app.page_delete_armed = true;
@@ -2162,11 +2348,16 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         )));
 
         assert_eq!(app.orphaned_block_drafts, ["unfinished block"]);
-        assert_eq!(app.orphaned_comment_drafts, ["unfinished comment"]);
         assert!(app.selected_block_id.is_empty());
         assert!(app.block_edit_draft.is_empty());
-        assert!(app.block_comment_draft.is_empty());
-        assert!(!app.block_comments_open);
+        // the comment rail hangs off the PAGE, and the page survived — so the
+        // rail and its half-typed comment survive a block deletion. Only a
+        // page change closes it. (The orphan LIST is not asserted here: the
+        // resync still keys `remember_orphaned_comment_drafts` on
+        // `selected_block_id`, so this same live draft is also filed as
+        // recovered — see the report.)
+        assert_eq!(app.block_comment_draft, "unfinished comment");
+        assert!(app.block_comments_open);
         assert_eq!(app.block_autosave_generation, 9);
         assert!(app.page_delete_armed);
         assert!(app.page_title_selected);
@@ -2673,15 +2864,15 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             "if unread\n                text channel.name w=fill size=13.0 wrap=none font=medium @text-fg"
         ));
 
-        let view = include_str!("ui/view.ice");
-        assert!(view.contains(
+        let screen = include_str!("ui/screens/chat.ice");
+        assert!(screen.contains(
             "ChannelButton channel=channel selected=(channel.id == active_channel) unread=channel_is_unread(channel_reads, channel.id, channel.head_seq)"
         ));
         // In-channel divider anchored on the first message past the frozen boundary.
-        assert!(view.contains(
+        assert!(screen.contains(
             "if unread_boundary > 0 && message.seq == first_unread_seq(messages, unread_boundary)"
         ));
-        assert!(view.contains("text \"New messages\" size=12.5 wrap=none @text-brand"));
+        assert!(screen.contains("text \"New messages\" size=12.5 wrap=none @text-brand"));
 
         // Freeze happens on a real channel change; connect seeds caught-up.
         let lifecycle = include_str!("ui/handlers/lifecycle.ice");

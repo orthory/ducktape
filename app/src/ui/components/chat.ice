@@ -1,10 +1,12 @@
 // A sidebar channel row: 7px radius, 8px side inset, the hash in `label` ink
 // and the name in `list` weight. Selected is the same tint capsule the rail uses.
 component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
+  emits
+    choose_channel(str)
   box w=fill pl=8.0 pr=8.0
     col w=fill
       if selected
-        button label=channel.name w=fill p=0.0 @icon_action -> choose_channel(channel.id)
+        button label=channel.name w=fill p=0.0 @icon_action -> emit(choose_channel, channel.id)
           box w=fill pl=10.0 pr=10.0 pt=7.0 pb=7.0
             row w=fill gap=7.0 align=center
               if channel.members_only
@@ -21,7 +23,7 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
           hovered bg=subtle text=fg
           pressed bg=rail_hover text=fg
       if !selected
-        button label=channel.name w=fill p=0.0 @icon_action -> choose_channel(channel.id)
+        button label=channel.name w=fill p=0.0 @icon_action -> emit(choose_channel, channel.id)
           box w=fill pl=10.0 pr=10.0 pt=7.0 pb=7.0
             row w=fill gap=7.0 align=center
               if channel.members_only
@@ -45,9 +47,11 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
           pressed bg=subtle text=fg
 
 component ChatMemberRow(member:ChatMember, disabled:bool)
+  emits
+    remove_channel_member_submit(str)
   row w=fill gap=6.0 align=center
     text member.label w=fill size=12.0 font=code @text-muted
-    button "Remove" description=member.label disabled=disabled h=28.0 p=5.0 @danger_action -> remove_channel_member_submit(member.key)
+    button "Remove" description=member.label disabled=disabled h=28.0 p=5.0 @danger_action -> emit(remove_channel_member_submit, member.key)
 
 component RichLine(block:ChatBlock)
   flex w=fill wrap=wrap gap-x=0.0 gap-y=4.0 items=start
@@ -99,7 +103,42 @@ component MessageAvatar(initials:str, kind:str)
       _
         AgentAvatar initials=initials plate=30.0 ink=11.0
 
+// ONE reaction chip, on the artifact's warm pair. Mine is the tint plate the
+// tree already tokenises at the artifact's own #f0ece1; not-mine is the flat
+// wash with the card hairline. The count rides at the emoji's size, not one
+// step above it.
+// NOTE the two tokens theme.ice does not carry: the mine border (#e0d2bd) and
+// the mine ink (#8a6a4a). Until they land this chip wears `brand_line`/`brand`,
+// which is the same warm family one step hotter.
+component ReactionChip(reaction:ChatReaction, seq:i64)
+  emits
+    add_reaction_at(i64, str)
+    remove_reaction_at(i64, str)
+  col #root
+    if reaction.reacted_by_me
+      button label="Remove reaction" description=reaction.emoji p=0.0 @icon_action -> emit(remove_reaction_at, seq, reaction.emoji)
+        box pl=6.0 pr=8.0 pt=1.0 pb=1.0
+          row gap=4.0 align=center
+            text reaction.emoji size=11.0 wrap=none font=code_medium @text-fg
+            text reaction.count size=11.0 wrap=none font=code_medium @text-brand
+        active bg=tree_selected text=brand border=brand_line border-w=1.0 r=11.0
+        hovered bg=tree_selected text=brand border=brand
+        pressed bg=warning_plate text=brand border=brand
+    if !reaction.reacted_by_me
+      button label="Add reaction" description=reaction.emoji p=0.0 @icon_action -> emit(add_reaction_at, seq, reaction.emoji)
+        box pl=6.0 pr=8.0 pt=1.0 pb=1.0
+          row gap=4.0 align=center
+            text reaction.emoji size=11.0 wrap=none font=code_medium @text-fg
+            text reaction.count size=11.0 wrap=none font=code_medium @text-muted
+        active bg=muted_bg text=muted border=card_line border-w=1.0 r=11.0
+        hovered bg=elevated text=fg border=control_line
+        pressed bg=subtle text=fg
+
 component MessageContents(message:ChatMessage)
+  emits
+    add_reaction_at(i64, str)
+    remove_reaction_at(i64, str)
+    open_thread_for(i64)
   row w=fill gap=11.0 align=start
     if message.show_author
       MessageAvatar initials=message.initial kind=message.avatar_kind
@@ -112,136 +151,203 @@ component MessageContents(message:ChatMessage)
           if message.avatar_kind == "agent"
             box px=5.0 py=2.0 bg=primary r=4.0
               text "AGENT" size=9.0 wrap=none font=code_semibold @text-primary_fg
-          text message.meta size=11.0 wrap=none font=code_medium @text-hint
+          // The artifact stamps a wall clock here. This chain has none: the
+          // validator writes `consensus_time = height`, so the honest stamp is
+          // the block the message landed in. An unsettled row has no height
+          // yet and simply carries none.
+          if message.height > 0
+            text height_label_short(message.height) size=11.0 wrap=none font=code_medium @text-hint
+          if message.edited
+            text "· edited" size=11.0 wrap=none font=code_medium @text-hint
           if !message.pending
             text "✓" size=10.0 wrap=none font=code_semibold @text-success_tick
           space w=fill
       MessageBody message=message
-      if message.reply_count > 0 || !empty(message.reactions)
-        row w=fill gap=6.0 align=center
-          if message.reply_count > 0
-            button label="Open thread" p=0.0 @icon_action -> open_thread_for(message.seq)
-              box pl=7.0 pr=9.0 pt=3.0 pb=3.0
-                row gap=6.0 align=center
-                  Icon name="nav-chat" tone="accent" px=12.0
-                  text message.reply_count size=12.0 wrap=none font=code_medium @text-brand
-                  text "replies" size=12.0 wrap=none @text-brand
-              active bg=surface text=brand border=border border-w=1.0 r=8.0
-              hovered bg=muted_bg text=brand border=control_line
-              pressed bg=elevated text=brand
+      // A row still in flight carries no height and no tick, so without this it
+      // is indistinguishable from a settled one. The chip is the only send-state
+      // surface the timeline has — the right-aligned own-message bubble the
+      // artifact draws is not mounted.
+      if message.pending
+        row w=fill pt=5.0
+          FinalityChip phase="finalizing" height=0
+      // Reactions and the replies button STACK — the artifact gives each its
+      // own line under the body, never one shared row.
+      if !empty(message.reactions)
+        flex w=fill wrap=wrap gap-x=5.0 gap-y=5.0 items=start pt=6.0
           for reaction in message.reactions
-            if reaction.reacted_by_me
-              button label="Remove reaction" description=reaction.emoji p=0.0 @icon_action -> remove_reaction_at(message.seq, reaction.emoji)
-                box pl=6.0 pr=8.0 pt=1.0 pb=1.0
-                  row gap=4.0 align=center
-                    text reaction.emoji size=11.0 wrap=none font=code_medium @text-fg
-                    text reaction.count size=12.0 wrap=none font=code_medium @text-brand
-                active bg=brand_bg text=brand border=brand_line border-w=1.0 r=11.0
-                hovered bg=brand_bg text=brand border=brand
-                pressed bg=elevated text=brand border=brand
-            if !reaction.reacted_by_me
-              button label="Add reaction" description=reaction.emoji p=0.0 @icon_action -> add_reaction_at(message.seq, reaction.emoji)
-                box pl=6.0 pr=8.0 pt=1.0 pb=1.0
-                  row gap=4.0 align=center
-                    text reaction.emoji size=11.0 wrap=none font=code_medium @text-fg
-                    text reaction.count size=12.0 wrap=none font=code_medium @text-muted
-                active bg=surface text=muted border=border border-w=1.0 r=11.0
-                hovered bg=muted_bg text=fg border=control_line
-                pressed bg=elevated text=fg
+            ReactionChip reaction=reaction seq=message.seq
+              forward
+                add_reaction_at
+                remove_reaction_at
+      if message.reply_count > 0
+        row w=fill gap=6.0 align=center pt=6.0
+          button label="Open thread" p=0.0 @icon_action -> emit(open_thread_for, message.seq)
+            box pl=7.0 pr=9.0 pt=3.0 pb=3.0
+              row gap=6.0 align=center
+                Icon name="nav-chat" tone="accent" px=12.0
+                text message.reply_count size=11.0 wrap=none font=code_medium @text-brand
+                text "replies" size=11.0 wrap=none font=code_medium @text-brand
+            active bg=surface text=brand border=border border-w=1.0 r=8.0
+            hovered bg=muted_bg text=brand border=control_line
+            pressed bg=elevated text=brand
 
 component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled:bool)
-  mouse enter=message_entered(message.seq) exit=message_exited(message.seq)
+  emits
+    message_entered(i64)
+    message_exited(i64)
+    add_reaction_at(i64, str)
+    remove_reaction_at(i64, str)
+    open_thread_for(i64)
+    open_message_actions_accessibly(i64, str, i64)
+    open_message_reactions(i64, str, i64)
+    open_message_actions(i64, str, i64)
+  mouse enter=emit(message_entered, message.seq) exit=emit(message_exited, message.seq)
     stack w=fill
       if message.deleted
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=transparent border=transparent border-w=1.0 r=9.0
           MessageContents message=message
+            forward
+              add_reaction_at
+              remove_reaction_at
+              open_thread_for
       if !message.deleted && selected
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=brand_bg border=brand_line border-w=1.0 r=9.0
           MessageContents message=message
+            forward
+              add_reaction_at
+              remove_reaction_at
+              open_thread_for
       if !message.deleted && !selected && hovered
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=row_hover border=transparent border-w=1.0 r=9.0
           MessageContents message=message
+            forward
+              add_reaction_at
+              remove_reaction_at
+              open_thread_for
       if !message.deleted && !selected && !hovered
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=transparent border=transparent border-w=1.0 r=9.0
           MessageContents message=message
+            forward
+              add_reaction_at
+              remove_reaction_at
+              open_thread_for
       if !message.deleted && !message.pending && !hovered
         box w=fill align-x=end align-y=start pt=3.0 pr=9.0
-          button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> open_message_actions_accessibly(message.seq, message.body, message.rev)
+          button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> emit(open_message_actions_accessibly, message.seq, message.body, message.rev)
             active bg=transparent text=muted r=7.0
             hovered bg=fg/9 text=fg
             pressed bg=fg/13 text=fg
       if !message.deleted && !message.pending && hovered
         box w=fill align-x=end align-y=start pr=8.0
-          box p=2.0 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_toast shadow-y=6.0 shadow-blur=18.0
+          // The designer's own opaque answer for this bar: white card, 1px
+          // border, r9 over the 3/12 popover shadow. The glass file's r13 and
+          // its heavier drop are the blurred variant, which this app has no
+          // compositor for. The artifact hangs it 12px above the row's top
+          // edge; ice has no negative offset, so it sits inside the row.
+          box p=2.0 bg=surface border=border border-w=1.0 r=9.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
             row gap=1.0 align=center
-              button "♡" label="Manage reactions" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> open_message_reactions(message.seq, message.body, message.rev)
+              // Three one-tap reactions, exactly as the artifact wires them:
+              // one click, no intermediate surface. `♡` still opens the full
+              // picker for the emojis these three do not cover.
+              button "👍" label="React with 👍" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(add_reaction_at, message.seq, "👍")
                 active bg=transparent text=muted r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
-              button label="Open thread" disabled=disabled p=5.0 @icon_action -> open_thread_for(message.seq)
+              button "✅" label="React with ✅" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(add_reaction_at, message.seq, "✅")
+                active bg=transparent text=muted r=6.0
+                hovered bg=elevated text=fg
+                pressed bg=subtle text=fg
+              button "👀" label="React with 👀" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(add_reaction_at, message.seq, "👀")
+                active bg=transparent text=muted r=6.0
+                hovered bg=elevated text=fg
+                pressed bg=subtle text=fg
+              box w=1.0 h=16.0 bg=subtle
+                space w=1.0 h=1.0
+              button "♡" label="Manage reactions" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(open_message_reactions, message.seq, message.body, message.rev)
+                active bg=transparent text=muted r=6.0
+                hovered bg=elevated text=fg
+                pressed bg=subtle text=fg
+              button label="Open thread" disabled=disabled p=5.0 @icon_action -> emit(open_thread_for, message.seq)
                 Icon name="nav-chat" tone="muted" px=15.0
                 active bg=transparent text=muted r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
-              button label="Inspect event" disabled=disabled p=5.0 @icon_action -> open_message_actions(message.seq, message.body, message.rev)
-                Icon name="shield" tone="muted" px=15.0
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
-              button "⋯" label="More message actions" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> open_message_actions(message.seq, message.body, message.rev)
+              // The artifact's shield sits here and opens an Event Inspector
+              // rail. The rail is NOT built: mounting it belongs to view.ice
+              // and needs an op hash the app would have to resolve through
+              // /v1/blocks. A shield that opens nothing — and whose handler
+              // discards the open thread and the half-typed reply on the way —
+              // is worse than no shield, so the seat stays empty until the rail
+              // lands. The ⋯ menu below is the only real actions surface.
+              button "⋯" label="More message actions" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(open_message_actions, message.seq, message.body, message.rev)
                 active bg=transparent text=muted r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
 
+// A reply reads one notch SMALLER than the same message in the timeline: 26px
+// plate, 12px author, and the stamp a step down. The body keeps the shared
+// block renderer — `MessageBody` is also mounted by the forge discussion, so
+// its scale is not this component's to change.
 component ThreadMessageBody(message:ChatMessage)
+  emits
+    add_reaction_at(i64, str)
+    remove_reaction_at(i64, str)
   row w=fill gap=10.0 align=start
-    MessageAvatar initials=message.initial kind=message.avatar_kind
-    col w=fill gap=3.0
+    PrincipalAvatar initials=message.initial is_agent=(message.avatar_kind == "agent") plate=26.0 ink=9.0 ring=""
+    col w=fill gap=1.0
       row w=fill gap=6.0 align=center
-        text message.author size=14.0 wrap=none font=display @text-fg
-        text message.meta size=11.0 wrap=none font=code_medium @text-muted
+        text message.author size=12.0 wrap=none font=display @text-fg
+        if message.height > 0
+          text height_label_short(message.height) size=10.0 wrap=none font=code_semibold @text-hint
+        if message.edited
+          text "· edited" size=10.0 wrap=none font=code_semibold @text-hint
         space w=fill
       MessageBody message=message
       if !empty(message.reactions)
-        row w=fill gap=5.0 align=center
+        flex w=fill wrap=wrap gap-x=5.0 gap-y=5.0 items=start pt=5.0
           for reaction in message.reactions
-            if reaction.reacted_by_me
-              button label="Remove reaction" description=reaction.emoji p=0.0 @icon_action -> remove_reaction_at(message.seq, reaction.emoji)
-                box pl=6.0 pr=8.0 pt=1.0 pb=1.0
-                  row gap=4.0 align=center
-                    text reaction.emoji size=11.0 wrap=none font=code_medium @text-fg
-                    text reaction.count size=12.0 wrap=none font=code_medium @text-brand
-                active bg=brand_bg text=brand border=brand_line border-w=1.0 r=11.0
-                hovered bg=brand_bg text=brand border=brand
-                pressed bg=elevated text=brand border=brand
-            if !reaction.reacted_by_me
-              button label="Add reaction" description=reaction.emoji p=0.0 @icon_action -> add_reaction_at(message.seq, reaction.emoji)
-                box pl=6.0 pr=8.0 pt=1.0 pb=1.0
-                  row gap=4.0 align=center
-                    text reaction.emoji size=11.0 wrap=none font=code_medium @text-fg
-                    text reaction.count size=12.0 wrap=none font=code_medium @text-muted
-                active bg=surface text=muted border=border border-w=1.0 r=11.0
-                hovered bg=muted_bg text=fg border=control_line
-                pressed bg=elevated text=fg
+            ReactionChip reaction=reaction seq=message.seq
+              forward
+                add_reaction_at
+                remove_reaction_at
 
 component ThreadMessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled:bool)
-  mouse enter=thread_message_entered(message.seq) exit=thread_message_exited(message.seq)
+  emits
+    thread_message_entered(i64)
+    thread_message_exited(i64)
+    add_reaction_at(i64, str)
+    remove_reaction_at(i64, str)
+    open_thread_message_actions(i64, str, i64)
+    open_thread_message_reactions(i64, str, i64)
+  mouse enter=emit(thread_message_entered, message.seq) exit=emit(thread_message_exited, message.seq)
     stack w=fill
       if message.deleted
         box w=fill p=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
           ThreadMessageBody message=message
+            forward
+              add_reaction_at
+              remove_reaction_at
       if !message.deleted && selected
         box w=fill p=8.0 bg=accent border=border border-w=1.0 r=9.0
           ThreadMessageBody message=message
+            forward
+              add_reaction_at
+              remove_reaction_at
       if !message.deleted && !selected && hovered
         box w=fill p=8.0 bg=fg/4 border=fg/7 border-w=1.0 r=9.0
           ThreadMessageBody message=message
+            forward
+              add_reaction_at
+              remove_reaction_at
       if !message.deleted && !selected && !hovered
         box w=fill p=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
           ThreadMessageBody message=message
+            forward
+              add_reaction_at
+              remove_reaction_at
       if !message.deleted && !message.pending && !hovered
         box w=fill align-x=end align-y=start pt=3.0 pr=9.0
-          button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> open_thread_message_actions(message.seq, message.body, message.rev)
+          button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> emit(open_thread_message_actions, message.seq, message.body, message.rev)
             active bg=transparent text=muted r=7.0
             hovered bg=fg/9 text=fg
             pressed bg=fg/13 text=fg
@@ -249,17 +355,19 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, hovered:bool, di
         box w=fill align-x=end align-y=start pt=3.0 pr=9.0
           box p=2.0 style=raised_style()
             row gap=1.0 align=center
-              button "♡" label="Manage reactions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> open_thread_message_reactions(message.seq, message.body, message.rev)
+              button "♡" label="Manage reactions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> emit(open_thread_message_reactions, message.seq, message.body, message.rev)
                 active bg=transparent text=muted r=6.0
                 hovered bg=fg/10 text=fg
                 pressed bg=fg/14 text=fg
-              button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> open_thread_message_actions(message.seq, message.body, message.rev)
+              button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> emit(open_thread_message_actions, message.seq, message.body, message.rev)
                 active bg=transparent text=muted r=6.0
                 hovered bg=fg/10 text=fg
                 pressed bg=fg/14 text=fg
 
 component ChatSearchResult(hit:ChatSearchHit)
-  button label=hit.text w=fill p=8.0 @ghost_action -> open_chat_search_hit(hit.channel_id, hit.root_seq, hit.seq)
+  emits
+    open_chat_search_hit(str, i64, i64)
+  button label=hit.text w=fill p=8.0 @ghost_action -> emit(open_chat_search_hit, hit.channel_id, hit.root_seq, hit.seq)
     col w=fill gap=3.0
       row w=fill gap=7.0 align=center
         text hit.author w=fill size=13.0 font=medium @text-fg
@@ -268,3 +376,112 @@ component ChatSearchResult(hit:ChatSearchHit)
     active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
     hovered bg=fg/6 text=fg border=fg/9
     pressed bg=fg/10 text=fg border=fg/13
+
+// THE REFUSED COMPOSER. `post_gate` names the refusal; this turns the token
+// into the sentence, and every sentence names the move that clears it. An
+// empty reason renders nothing at all — the composer itself is the else arm.
+//
+// MOUNTED above the composer plate (view.ice), as the VIEW half of frozen
+// contract item `post_gate(archived, members_only, members, me) -> String`. The
+// composer used to grey the editor on `active_channel_archived` alone and say
+// NOTHING at all when a members-only channel refused the viewer's key.
+//
+// `post_gate` is CALLED at the mount, not mirrored into a state field: it is
+// pure over facts the view already holds, and `channel_members` lands in seven
+// handlers — a mirrored field would be seven assignments and six chances to
+// drift. Its reason is now the whole gate, so `active_channel_archived` no
+// longer appears in the editor's or Send's `disabled=`: the archived case IS
+// the `channel_archived` arm, and one discriminant beats two.
+//
+// `me` is `settings_user_key` — full-hex, from `SettingsFacts`, which is what a
+// `ChatMember.key` carries. There was no such fact when this component landed:
+// `account_id` is a short_label of the identity module's ACCOUNT id and cannot
+// be compared with a membership row, so the key was added to SettingsFacts
+// rather than guessed at from the account card.
+component ComposerGate(reason:str)
+  col #root w=fill
+    match reason
+      "channel_archived"
+        GateNote reason="This channel is archived — new messages are refused." next="Unarchive it from Channel details to post here again."
+      "members_only"
+        GateNote reason="This channel is members-only and your key is not on its roster." next="Ask a member to add your key from Channel details."
+      _
+        space w=1.0 h=1.0
+
+// ============================================================================
+// THREAD RAIL — the artifact opens the rail body with the root message in its
+// own divided block, at a type scale one notch under a reply.
+//
+// The rail's 50px HEADER BAR is not a component: it is drawn inline by view.ice
+// (view.ice:600), it is a pane header — which main.rs pins as a view.ice-only
+// shape, never a second header inside a component file — and closing its ledger
+// gap also moves the 300px plate to 330px `bg=sidebar` with a 16px body inset,
+// all attributes of the box in view.ice. The artifact's values for whoever owns
+// that edit: 50px plate, `pl=16 pr=16`, bottom 1px `separator` hairline,
+// `Thread` at 13.0 `font=display`, then `#<channel>` at 11.0 `@text-caption`,
+// then a right-aligned 24×24 r6 `×`. Note the artifact has NO reply count in
+// the header and no "Thread result" title — view.ice ships both today, and the
+// second one is the only signpost a chat-search hit has, so the port must keep
+// it rather than follow the artifact literally.
+// ============================================================================
+
+// MOUNTED — the view half of ledger gap "Thread rail gives the parent message
+// its own divided block", closed by splitting the rail's existing loop in
+// view.ice on `thread_message.seq == active_thread_seq`. No state field and no
+// backend fn: `active_thread_seq` IS the root's seq and `thread_messages`
+// carries the root.
+//
+// THE TRADE, TAKEN DELIBERATELY: the artifact's parent block is READ-ONLY, so
+// the root loses the hover bar, reactions and edit/delete that ThreadMessageCard
+// gave it in the rail. It does NOT lose them from the product — the rail is a
+// 300px pane BESIDE the stream, never over it, so the same message is on screen
+// in the stream at the same moment with its full MessageCard toolbar. The cost
+// is one extra glance, not a capability.
+//
+// NO `N replies` RULE between the block and the replies. It was built, deleted,
+// and stays deleted: its count wants `thread_messages` minus the root, which is
+// the loaded page and not the reply count whenever `thread_has_more` holds.
+component ThreadParentBlock(message:ChatMessage)
+  col #root w=fill
+    row w=fill gap=10.0 align=start pb=14.0
+      PrincipalAvatar initials=message.initial is_agent=(message.avatar_kind == "agent") plate=28.0 ink=10.0 ring=""
+      col w=fill gap=2.0
+        row w=fill gap=6.0 align=center
+          text message.author size=12.5 wrap=none font=display @text-fg
+          if message.height > 0
+            text height_label_short(message.height) size=10.0 wrap=none font=code_semibold @text-hint
+          space w=fill
+        MessageBody message=message
+    box w=fill h=1.0 bg=separator
+      space w=1.0 h=1.0
+
+// The artifact's `N replies` rule between the parent block and the replies was
+// built here and is deleted: two `text` widgets are markup, not a component, and
+// it could not have told the truth anyway. Its count wanted `thread_messages`
+// MINUS the root, and no fn returns that — `len(thread_messages)` (the count
+// view.ice already shows in the rail header) is one too many for a reply count.
+// Whoever mounts ThreadParentBlock gets the rule for free in the same view.ice
+// edit, from the loop's own arms; the artifact draws it at 10.5 `font=code_medium`
+// `@text-label` with `pt=13.0 pb=4.0`.
+
+// The EVENT INSPECTOR was built here and mounted nowhere, so it is deleted
+// rather than left as a panel no user can reach. What it needed was a lookup
+// from `inspector_seq` back to a `ChatMessage`, which no backend fn provides —
+// inventing one during an integration pass is how a surface ends up drawing a
+// record nobody fetched. `OwnMessageRow` went with it: its finality chip was
+// the panel's only remaining route and the row itself was never mounted either.
+// The stale `MY OWN POSTS` banner that survived that deletion is gone too — it
+// described a right-aligned own-message bubble no arm of MessageCard draws.
+
+// `MessageMenuItem` (a 14px icon + its label) was built here for the message ⋯
+// menu and is deleted. The menu it was shaped for is the ARTIFACT's — Inspect
+// event / Reply in thread / Copy link / Copy proof / Pin to channel — and this
+// app can honestly serve exactly one of those five: there is no inspector rail
+// (see the empty shield seat in MessageCard), no `ducktape://` link builder, no
+// op hash to copy as a proof, and no pin. A shared row component earns its keep
+// by repetition, and the repetition here was four surfaces that do not exist.
+// The menu the app actually ships is React / Edit / Delete / Close, inline in
+// view.ice:659, and its real gap is that those four rows carry no icon. That is
+// one `Icon name=… tone="muted" px=14.0` added to four buttons in view.ice, in
+// the file that owns them. The artifact's row metrics for that edit: `gap=9.0`,
+// label 12.5 `@text-accent_fg`, `p=8.0`/`pl=9.0`, `r=7.0`, on a 184px plate.

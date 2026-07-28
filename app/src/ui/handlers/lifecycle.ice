@@ -1,4 +1,32 @@
+// Two lists this file loads that state.ice has no field for. A handler file may
+// declare app state, and the loaders that fill these live here.
+state
+  // The DIRECT section of the chat sidebar: every principal you can open a
+  // two-party channel with.
+  dm_peers:[DmPeer] = []
+  // The duckfs path list behind the 206px tree, which is a different question
+  // from `fs_entries` (one directory) and comes from a different call. It is
+  // the find route's FIRST page — 256 paths (duckfs wire.rs MAX_PAGE) — so a
+  // workspace larger than that shows a tree that stops, until the tree itself
+  // learns to page on its `next` cursor.
+  files_tree:[FsEntry] = []
+  // The consensus trio off /v1/status, held as the TEXT the console prints.
+  // `NodeFacts` carries them as `i64?` on purpose — a resident has no consensus
+  // block at all — and `optional_number` renders `—` for absent. Storing the
+  // rendered label is what keeps an absent reading from arriving as a measured
+  // zero, which is what `view 0 · 0/0 certs` on a healthy chain was.
+  node_view_label = "—"
+  node_quorum_label = "—"
+  node_reachable_label = "—"
+
+// FIRST RUN ASKS DISK, NOT THE DEFAULT. `phase` used to initialize to
+// "console" and `mount` went straight to `connect`, so a device with no
+// workspace booted an empty shell over a connection error and the five
+// onboarding screens were reachable only by `Leave workspace`. The disk answer
+// is the discriminant: no registered, unforgotten workspace means "welcome".
 on mount
+  phase = onboarding_phase()
+  return if phase != "console"
   loading = true
   run connect(rpc) -> workspace_connected _ | failed _
 
@@ -137,8 +165,12 @@ on workspace_connected(next)
   forge_generation = forge_generation + 1
   settings_generation = settings_generation + 1
   node_peers_generation = node_peers_generation + 1
+  node_facts_generation = node_facts_generation + 1
+  dm_peers_generation = dm_peers_generation + 1
   parallel
     run load_doc_tabs(connected_rpc) -> doc_tabs_loaded _
+    run load_dm_peers(connected_rpc, dm_peers_generation) -> dm_peers_loaded _ | dm_peers_failed _
+    run load_node_facts(connected_rpc, node_facts_generation) -> node_facts_loaded _ | node_facts_failed _
     run load_bell(connected_rpc, bell_generation) -> bell_loaded _ | bell_failed _
     run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
     run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
@@ -222,20 +254,26 @@ on live_resynced(next)
   selected_block_id = refreshed_selected_block(blocks, selected_block_id)
   selected_block_kind = retain_selected_string(selected_block_kind, selected_block_id)
   selected_block_checked = selected_block_checked && !empty(selected_block_id)
-  block_comments_open = block_comments_open && !empty(selected_block_id)
-  block_comments_target = retain_selected_string(block_comments_target, selected_block_id)
-  block_comment_threads = retain_selected_comment_threads(block_comment_threads, selected_block_id)
-  block_comment_thread_total = retain_selected_i64(block_comment_thread_total, selected_block_id)
-  block_comment_threads_next_from = retain_selected_i64(block_comment_threads_next_from, selected_block_id)
-  block_comment_threads_has_more = block_comment_threads_has_more && !empty(selected_block_id)
-  block_comment_threads_loading = block_comment_threads_loading && !empty(selected_block_id)
-  active_block_comment_thread = retain_selected_string(active_block_comment_thread, selected_block_id)
-  block_thread_comments = retain_selected_comments(block_thread_comments, selected_block_id)
-  block_thread_comments_next_from = retain_selected_i64(block_thread_comments_next_from, selected_block_id)
-  block_thread_comments_has_more = block_thread_comments_has_more && !empty(selected_block_id)
-  block_thread_comments_loading = block_thread_comments_loading && !empty(selected_block_id)
-  block_comment_draft = retain_selected_string(block_comment_draft, selected_block_id)
-  pending_block_comment = retain_selected_string(pending_block_comment, selected_block_id)
+  // THE COMMENTS RAIL IS DOCUMENT-SCOPED (handlers/pages.ice:300). Its anchor is
+  // the PAGE it was opened on, never a block selection — keyed on
+  // `selected_block_id` it closed itself, and threw the half-typed comment away,
+  // the moment the user clicked off the block whose ⋮ menu opened it. So the
+  // target is the one thing reconciled against the page identity here, and every
+  // other rail field keys on the target: one line decides the whole rail.
+  block_comments_target = retain_for_endpoint(block_comments_target, active_page, keep_str(next.pages_loaded, next.active_page, active_page))
+  block_comments_open = block_comments_open && !empty(block_comments_target)
+  block_comment_threads = retain_selected_comment_threads(block_comment_threads, block_comments_target)
+  block_comment_thread_total = retain_selected_i64(block_comment_thread_total, block_comments_target)
+  block_comment_threads_next_from = retain_selected_i64(block_comment_threads_next_from, block_comments_target)
+  block_comment_threads_has_more = block_comment_threads_has_more && !empty(block_comments_target)
+  block_comment_threads_loading = block_comment_threads_loading && !empty(block_comments_target)
+  active_block_comment_thread = retain_selected_string(active_block_comment_thread, block_comments_target)
+  block_thread_comments = retain_selected_comments(block_thread_comments, block_comments_target)
+  block_thread_comments_next_from = retain_selected_i64(block_thread_comments_next_from, block_comments_target)
+  block_thread_comments_has_more = block_thread_comments_has_more && !empty(block_comments_target)
+  block_thread_comments_loading = block_thread_comments_loading && !empty(block_comments_target)
+  block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)
+  pending_block_comment = retain_selected_string(pending_block_comment, block_comments_target)
   block_edit_draft = retain_selected_string(block_edit_draft, selected_block_id)
   block_delete_armed = block_delete_armed && !empty(selected_block_id)
   block_actions_open = block_actions_open && !empty(selected_block_id)
@@ -249,9 +287,24 @@ on live_resynced(next)
   error = ""
   block_comments_generation = block_comments_generation + 1
   live_thread_generation = live_thread_generation + 1
+  // The rail's live refresh must ask the SAME question the rail was filled
+  // from. `refresh_block_comments` asks `ThreadsForTargets` for the target
+  // ALONE, so with a page target it found only page-anchored threads and wiped
+  // every block-anchored one out of the open rail on the next pages event.
+  // `load_page_threads` fans out over the page AND its blocks, and answers on
+  // the handler pages.ice already routes its own loads through. Both routes
+  // ignore a closed rail, so a page event with no rail open costs one refused
+  // query and never touches the banner.
+  //
+  // The list is all that refreshes live. An OPEN thread's replies do not: a task
+  // group must be the final statement in a handler, so the comment-page load
+  // cannot be guarded on `active_block_comment_thread`, and firing it unguarded
+  // asks the node for thread "" — whose failure paints `block_comment_page_failed`
+  // over the rail every time anyone edits the page. Replies still arrive on post
+  // and on reopen; a page-scoped comment refresh in backend.rs closes the gap.
   parallel
     run refresh_live_thread(connected_rpc, active_channel, active_thread_seq, thread_target_seq, thread_next_reply_offset, live_thread_generation) -> live_thread_refreshed _ | live_thread_refresh_failed _
-    run refresh_block_comments(connected_rpc, block_comments_target, active_block_comment_thread, block_comments_generation) -> live_block_comments_refreshed _ | live_block_comments_failed _
+    run load_page_threads(connected_rpc, block_comments_target, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on live_resync_failed(cause)
   return if cause.generation != hydration_generation
@@ -272,27 +325,15 @@ on live_thread_refreshed(next)
 on live_thread_refresh_failed(cause)
   return if cause.generation != live_thread_generation
 
-on live_block_comments_refreshed(next)
-  return if next.generation != block_comments_generation || next.target != block_comments_target
-  block_comment_threads_loading = false
-  block_thread_comments_loading = false
-  block_comment_threads = next.threads
-  block_comment_thread_total = next.total
-  block_comment_threads_next_from = next.threads_next_from
-  block_comment_threads_has_more = next.threads_has_more
-  active_block_comment_thread = next.thread_id
-  block_thread_comments = next.comments
-  block_thread_comments_next_from = next.comments_next_from
-  block_thread_comments_has_more = next.comments_has_more
-
-on live_block_comments_failed(cause)
-  return if cause.generation != block_comments_generation
-  block_comment_threads_loading = false
-  block_thread_comments_loading = false
-  error = cause.message
-
 on select_shell_tab(next)
   shell_tab = next
+  // A hydration error belongs to the pane that raised it. Leaving it up after
+  // a navigation tells the user the pane they just opened is broken, which is
+  // a lie the banner has no way to walk back — it is dismissed by hand or not
+  // at all. Clearing here, ABOVE both early returns, is what makes that true
+  // for every tab: the `!connected` return and the chat/pages return each skip
+  // the generation bumps below, but neither should keep a stale banner alive.
+  error = ""
   return if !connected
   return if shell_tab == "chat" || shell_tab == "pages"
   explorer_generation = explorer_generation + 1
@@ -304,9 +345,16 @@ on select_shell_tab(next)
   forge_generation = forge_generation + 1
   settings_generation = settings_generation + 1
   node_peers_generation = node_peers_generation + 1
+  node_facts_generation = node_facts_generation + 1
   explorer_loading = shell_tab == "explorer"
   fs_loading = shell_tab == "files"
+  // No `files_find` here. This block runs for EVERY tab but chat and pages, so
+  // a whole-workspace prefix walk was issued on the way into Settings, Forge,
+  // Members and Agents — for a `files_tree` no view reads, on a route whose
+  // failure paints the GLOBAL error banner over a screen with no file operation
+  // in sight. `fs_wrote` still refreshes the tree from inside the files tab.
   parallel
+    run load_node_facts(connected_rpc, node_facts_generation) -> node_facts_loaded _ | node_facts_failed _
     run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
     run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
     run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
@@ -318,482 +366,25 @@ on select_shell_tab(next)
     run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     run load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_failed _
 
-on forge_loaded(next)
-  return if next.generation != forge_generation
-  forge_repos = next.repos
-
-on forge_failed(cause)
-  return if cause.generation != forge_generation
-
-on forge_open_repo(name)
-  return if !connected
-  forge_repo = name
-  forge_item_number = 0
-  forge_item_diff = ""
-  forge_generation = forge_generation + 1
-  run load_forge_repo(connected_rpc, forge_repo, forge_generation) -> forge_repo_loaded _ | forge_failed _
-
-on forge_repo_loaded(next)
-  return if next.generation != forge_generation
-  forge_repo = next.repo
-  forge_branches = next.branches
-  forge_items = next.items
-
-on forge_open_item(number)
-  return if !connected || empty(forge_repo)
-  forge_item_number = number
-  forge_review_verdict = "comment"
-  forge_review_draft = ""
-  forge_merge_conflicts = []
-  forge_discussion = []
-  forge_discussion_members = []
-  forge_discussion_pending = ""
-  forge_discussion_editor = editor("")
-  forge_generation = forge_generation + 1
-  run load_forge_item(connected_rpc, forge_repo, forge_item_number, forge_generation) -> forge_item_loaded _ | forge_failed _
-
-on forge_item_loaded(next)
-  return if next.generation != forge_generation
-  forge_item_number = next.number
-  forge_item_title = next.title
-  forge_item_state = next.state
-  forge_item_kind = next.kind
-  forge_item_body = next.body
-  forge_item_author = next.author_name
-  forge_item_branches = next.branches
-  forge_item_channel = next.channel_id
-  forge_item_source_branch = next.source_branch
-  forge_item_source_oid = next.source_oid
-  forge_item_target_oid = next.target_oid
-  forge_item_merge_oid = next.merge_oid
-  forge_item_diff = next.diff
-  forge_item_diff_truncated = next.diff_truncated
-  forge_item_files_changed = next.files_changed
-  forge_item_additions = next.additions
-  forge_item_deletions = next.deletions
-  forge_item_reviews = next.reviews
-  forge_item_approvals = next.approvals
-  forge_item_change_requests = next.change_requests
-  forge_discussion_generation = forge_discussion_generation + 1
-  return if empty(forge_item_channel)
-  run load_forge_discussion(connected_rpc, forge_item_channel, forge_discussion_generation) -> forge_discussion_loaded _ | forge_discussion_failed _
-
-on forge_discussion_loaded(next)
-  return if next.generation != forge_discussion_generation || next.channel_id != forge_item_channel
-  forge_discussion = next.messages
-  forge_discussion_members = next.members
-
-on forge_discussion_failed(cause)
-  return if cause.generation != forge_discussion_generation
-  error = cause.message
-
-on forge_review_pick(verdict)
-  forge_review_verdict = verdict
-
-on forge_review_submit
-  return if !connected || forge_review_busy || empty(forge_repo) || forge_item_number <= 0
-  forge_review_busy = true
-  run submit_forge_review(connected_rpc, password, forge_repo, forge_item_number, forge_review_verdict, forge_review_draft, forge_item_source_oid) -> forge_review_submitted _ | forge_review_failed _
-
-on forge_review_submitted(_result)
-  forge_review_busy = false
-  forge_review_draft = ""
-  forge_review_verdict = "comment"
-  error = ""
-
-on forge_review_failed(cause)
-  forge_review_busy = false
-  error = cause.message
-
-on forge_merge_submit
-  return if !connected || forge_merge_busy || empty(forge_repo) || forge_item_number <= 0
-  forge_merge_busy = true
-  forge_merge_conflicts = []
-  run merge_forge_pr(connected_rpc, password, forge_repo, forge_item_number, forge_item_source_branch, forge_item_source_oid, forge_item_target_oid) -> forge_merged _ | forge_merge_failed _
-
-on forge_merged(next)
-  return if next.repo != forge_repo || next.number != forge_item_number
-  forge_merge_busy = false
-  forge_merge_conflicts = next.conflicts
-  error = ""
-
-on forge_merge_failed(cause)
-  forge_merge_busy = false
-  error = cause.message
-
-on forge_note_submit
-  return if loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending) || empty(trim(editor_text(forge_discussion_editor)))
-  forge_discussion_pending = fresh_operation_id("forge-note")
-  run send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending, trim(editor_text(forge_discussion_editor)), forge_discussion_members) -> forge_note_sent _ | forge_note_failed _
-
-on forge_note_sent(next)
-  return if next.channel_id != forge_item_channel
-  forge_discussion_pending = ""
-  forge_discussion_editor = editor("")
-  error = ""
-
-on forge_note_failed(cause)
-  return if cause.scope_id != forge_item_channel
-  forge_discussion_pending = ""
-  error = cause.message
-
-on forge_refreshed(next)
-  return if next.generation != forge_generation
-  forge_repos = keep_forge_repos(next.repos_loaded, next.repos, forge_repos)
-  forge_branches = keep_branches(next.repo_loaded, next.branches, forge_branches)
-  forge_items = keep_forge_items(next.repo_loaded, next.items, forge_items)
-  forge_item_title = keep_str(next.item_loaded, next.item.title, forge_item_title)
-  forge_item_state = keep_str(next.item_loaded, next.item.state, forge_item_state)
-  forge_item_kind = keep_str(next.item_loaded, next.item.kind, forge_item_kind)
-  forge_item_body = keep_str(next.item_loaded, next.item.body, forge_item_body)
-  forge_item_author = keep_str(next.item_loaded, next.item.author_name, forge_item_author)
-  forge_item_branches = keep_str(next.item_loaded, next.item.branches, forge_item_branches)
-  forge_item_channel = keep_str(next.item_loaded, next.item.channel_id, forge_item_channel)
-  forge_item_source_branch = keep_str(next.item_loaded, next.item.source_branch, forge_item_source_branch)
-  forge_item_source_oid = keep_str(next.item_loaded, next.item.source_oid, forge_item_source_oid)
-  forge_item_target_oid = keep_str(next.item_loaded, next.item.target_oid, forge_item_target_oid)
-  forge_item_merge_oid = keep_str(next.item_loaded, next.item.merge_oid, forge_item_merge_oid)
-  forge_item_diff = keep_str(next.item_loaded, next.item.diff, forge_item_diff)
-  forge_item_diff_truncated = keep_bool(next.item_loaded, next.item.diff_truncated, forge_item_diff_truncated)
-  forge_item_files_changed = keep_i64(next.item_loaded, next.item.files_changed, forge_item_files_changed)
-  forge_item_additions = keep_i64(next.item_loaded, next.item.additions, forge_item_additions)
-  forge_item_deletions = keep_i64(next.item_loaded, next.item.deletions, forge_item_deletions)
-  forge_item_reviews = keep_forge_reviews(next.item_loaded, next.item.reviews, forge_item_reviews)
-  forge_item_approvals = keep_i64(next.item_loaded, next.item.approvals, forge_item_approvals)
-  forge_item_change_requests = keep_i64(next.item_loaded, next.item.change_requests, forge_item_change_requests)
-
-on forge_close_item
-  forge_item_number = 0
-  forge_item_diff = ""
-  forge_item_channel = ""
-  forge_discussion = []
-  forge_discussion_members = []
-  forge_discussion_pending = ""
-  forge_merge_conflicts = []
-
-on account_loaded(next)
-  return if next.generation != account_generation
-  account_bound = next.bound
-  account_id = next.account_id
-  account_name = next.display_name
-  account_bio = next.bio
-  account_members = next.members
-  account_nodes = next.nodes
-
-on account_failed(cause)
-  return if cause.generation != account_generation
-
-on account_name_draft_changed(next)
-  account_name_draft = next
-
-on account_rename_submit
-  return if !connected || !account_bound || account_renaming || empty(trim(account_name_draft))
-  account_renaming = true
-  error = ""
-  run set_account_name(connected_rpc, password, trim(account_name_draft)) -> account_renamed _ | account_rename_failed _
-
-on account_renamed(_result)
-  account_renaming = false
-  account_name_draft = ""
-  account_generation = account_generation + 1
-  run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
-
-on account_rename_failed(cause)
-  account_renaming = false
-  error = cause.message
-
-on agents_loaded(next)
-  return if next.generation != agents_generation
-  agents_rows = next.agents
-
-on agents_failed(cause)
-  return if cause.generation != agents_generation
-
-on node_log_line(line)
-  node_log_lines = push_log_line(node_log_lines, line)
-
-on node_log_filter_changed(next)
-  node_log_filter = next
-
-on peers_loaded(next)
-  return if next.generation != node_peers_generation
-  node_peers = next.peers
-
-on peers_failed(cause)
-  return if cause.generation != node_peers_generation
-
-on settings_loaded(next)
-  return if next.generation != settings_generation
-  settings_endpoint = next.endpoint
-  settings_node_key = next.node_key
-  settings_height = next.height
-  settings_key_path = next.key_path
-  settings_key_state = next.key_state
-  settings_open_tabs = next.open_tabs
-
-on settings_failed(cause)
-  return if cause.generation != settings_generation
-
-on settings_clear_tabs
-  doc_tabs = []
-  run clear_doc_tabs(connected_rpc) -> doc_tabs_saved _
-
-on governance_loaded(next)
-  return if next.generation != gov_generation
-  gov_rows = next.proposals
-
-on governance_failed(cause)
-  return if cause.generation != gov_generation
-
-on gov_vote(proposal_id, approve)
-  return if !connected || !empty(gov_voting)
-  gov_voting = proposal_id
-  run governance_vote(connected_rpc, password, gov_voting, approve) -> gov_acted _ | gov_act_failed _
-
-on gov_execute(proposal_id)
-  return if !connected || !empty(gov_voting)
-  gov_voting = proposal_id
-  run governance_execute(connected_rpc, password, gov_voting) -> gov_acted _ | gov_act_failed _
-
-on gov_acted(_result)
-  gov_voting = ""
-  gov_generation = gov_generation + 1
-  run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
-
-on gov_act_failed(cause)
-  gov_voting = ""
-  error = cause.message
-
-on members_loaded(next)
-  return if next.generation != members_generation
-  members_rows = next.members
-  members_validators = next.validators
-  members_residents = next.residents
-
-on members_failed(cause)
-  return if cause.generation != members_generation
-
-on fs_open_dir(path)
-  return if fs_loading || !connected
-  fs_path = path
-  fs_generation = fs_generation + 1
-  fs_loading = true
-  fs_preview_path = ""
-  fs_preview_text = ""
-  run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
-
-on fs_open_parent
-  return if fs_loading || !connected || empty(fs_path)
-  fs_path = fs_parent(fs_path)
-  fs_generation = fs_generation + 1
-  fs_loading = true
-  fs_preview_path = ""
-  fs_preview_text = ""
-  run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
-
-on fs_open_file(path)
-  return if fs_loading || !connected
-  fs_preview_path = path
-  fs_generation = fs_generation + 1
-  run files_preview(connected_rpc, fs_preview_path, fs_generation) -> fs_previewed _ | fs_failed _
-
-on fs_toggle_history
-  fs_history_open = !fs_history_open
-
-on fs_listed(next)
-  return if next.generation != fs_generation
-  fs_loading = false
-  fs_path = next.path
-  fs_entries = next.entries
-
-on fs_previewed(next)
-  return if next.generation != fs_generation
-  fs_preview_path = next.path
-  fs_preview_text = next.text
-  fs_preview_truncated = next.truncated
-  fs_preview_binary = next.binary
-
-on fs_history_loaded(next)
-  return if next.generation != fs_generation
-  fs_history = next.snapshots
-
-on fs_failed(cause)
-  return if cause.generation != fs_generation
-  fs_loading = false
-  error = cause.message
-
-on fs_new_name_changed(next)
-  fs_new_name = next
-
-on fs_mkdir_submit
-  return if fs_loading || !connected || empty(trim(fs_new_name))
-  fs_loading = true
-  error = ""
-  run files_mkdir(connected_rpc, fs_child(fs_path, trim(fs_new_name))) -> fs_wrote _ | fs_write_failed _
-
-on fs_new_file_submit
-  return if fs_loading || !connected || empty(trim(fs_new_name))
-  fs_loading = true
-  error = ""
-  run files_write_text(connected_rpc, fs_child(fs_path, trim(fs_new_name)), "") -> fs_wrote _ | fs_write_failed _
-
-on fs_arm_delete(path)
-  fs_delete_target = path
-
-on fs_delete_submit
-  return if fs_loading || !connected || empty(fs_delete_target)
-  fs_loading = true
-  error = ""
-  run files_remove(connected_rpc, fs_delete_target) -> fs_wrote _ | fs_write_failed _
-
-on fs_begin_edit
-  return if fs_preview_binary || empty(fs_preview_path)
-  fs_editing = true
-  fs_editor = editor(fs_preview_text)
-
-on fs_cancel_edit
-  fs_editing = false
-
-on fs_save_edit
-  return if fs_loading || !connected || !fs_editing || empty(fs_preview_path)
-  fs_loading = true
-  fs_editing = false
-  fs_preview_text = editor_text(fs_editor)
-  error = ""
-  run files_write_text(connected_rpc, fs_preview_path, editor_text(fs_editor)) -> fs_wrote _ | fs_write_failed _
-
-on fs_wrote(_result)
-  fs_new_name = ""
-  fs_delete_target = ""
-  fs_generation = fs_generation + 1
-  fs_loading = true
-  parallel
-    run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
-    run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
-
-on fs_write_failed(cause)
-  fs_loading = false
-  error = cause.message
-
-on fs_file_dropped(path)
-  return if shell_tab != "files" || fs_loading || !connected
-  fs_loading = true
-  error = ""
-  run files_upload(connected_rpc, fs_path, path) -> fs_wrote _ | fs_write_failed _
-
-on fs_show_diff(from)
-  return if fs_loading || !connected
-  fs_diff_from = from
-  fs_generation = fs_generation + 1
-  run files_diff(connected_rpc, fs_diff_from, fs_generation) -> fs_diffed _ | fs_failed _
-
-on fs_close_diff
-  fs_diff_from = ""
-  fs_diff = []
-
-on fs_diffed(next)
-  return if next.generation != fs_generation
-  fs_diff = next.entries
-
-on refresh_explorer
-  return if !connected || explorer_loading
-  explorer_generation = explorer_generation + 1
-  explorer_loading = true
-  run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
-
-on explorer_loaded(next)
-  return if next.generation != explorer_generation
-  explorer_loading = false
-  explorer_blocks = next.blocks
-  explorer_ops = next.ops
-
-on explorer_failed(cause)
-  return if cause.generation != explorer_generation
-  explorer_loading = false
-  error = cause.message
-
-on select_explorer_block(height)
-  explorer_selected = height
-
-on toggle_palette
-  return if !connected
-  palette_open = !palette_open
-  palette_draft = ""
-  palette_chat_hits = []
-  palette_page_hits = []
-  palette_generation = palette_generation + 1
-  palette_searching = false
-  return if !palette_open
-  task widget focus #workspace-tabs/palette-input
-
-on close_palette
-  palette_open = false
-
-on toggle_bell
-  bell_open = !bell_open
-  return if !bell_open || bell_unread <= 0
-  run mark_bell_read(connected_rpc, password, bell_head(bell_items)) -> bell_marked _ | mutation_failed _
-
-on close_bell
-  bell_open = false
-
-on mark_bell_read_submit
-  return if bell_unread <= 0
-  run mark_bell_read(connected_rpc, password, bell_head(bell_items)) -> bell_marked _ | mutation_failed _
-
-on bell_loaded(next)
-  return if next.generation != bell_generation
-  bell_unread = next.unread
-  bell_items = next.items
-
-on bell_failed(cause)
-  return if cause.generation != bell_generation
-
-on bell_marked(_result)
-  error = error
-
-on global_key_pressed(event)
-  palette_key = palette_key_action(event.key, event.physical_key, event.modifiers, palette_open)
-  return if palette_key == "none"
-  return if palette_key == "open" && !connected
-  palette_open = palette_key == "open"
-  palette_key = ""
-  palette_draft = ""
-  palette_chat_hits = []
-  palette_page_hits = []
-  palette_generation = palette_generation + 1
-  palette_searching = false
-  return if !palette_open
-  task widget focus #workspace-tabs/palette-input
-
-on palette_changed(next)
-  palette_draft = next
-  palette_generation = palette_generation + 1
-  palette_searching = !empty(trim(palette_draft))
-  return if empty(trim(palette_draft))
-  parallel
-    run search_chat(connected_rpc, "", trim(palette_draft), palette_generation) -> palette_chat_loaded _ | palette_search_failed _
-    run search_pages(connected_rpc, "", trim(palette_draft), palette_generation) -> palette_page_loaded _ | palette_search_failed _
-
-on palette_chat_loaded(next)
-  return if next.generation != palette_generation
-  palette_chat_hits = next.hits
-  palette_searching = false
-
-on palette_page_loaded(next)
-  return if next.generation != palette_generation
-  palette_page_hits = next.hits
-  palette_searching = false
-
-on palette_search_failed(cause)
-  return if cause.generation != palette_generation
-  palette_searching = false
-
+// The huddle's elapsed clock is a LOCAL session fact: one tick per second for
+// as long as SHE is in the huddle, never a chain value. `huddle_joined_at` is
+// stamped from `huddle_now` when she joins, so mm:ss is their difference.
+on tick
+  huddle_now = huddle_now + 1
+
+// The app has exactly ONE subscribe block. Component handler files may not
+// declare another, so every new subscription lands here.
+//
+// The node log stream follows the node body into Settings — the rail seat it
+// used to key on is gone, and a predicate that can never be true again would
+// have taken the log console dark without a word.
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
   keyboard press when (connected || palette_open) -> global_key_pressed _
   window file-dropped -> fs_file_dropped _
-  run node_logs(connected_rpc) when (connected && shell_tab == "node") -> node_log_line _
+  run node_logs(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "activity") -> node_log_line _
+  every 1s when huddle_joined -> tick
+  every 2800ms when !empty(toast) -> dismiss_toast
 
 on mutation_failed(cause)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, cause.committed)
@@ -833,7 +424,7 @@ on restore_failed_reply
   reply_draft = failed_reply_draft
   reply_editor = editor(reply_draft)
   failed_reply_draft = ""
-  task widget focus #workspace-tabs/content/reply
+  task widget focus #workspace-tabs/content/chat/reply
 
 on dismiss_failed_reply
   failed_reply_draft = ""

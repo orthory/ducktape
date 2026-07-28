@@ -120,7 +120,7 @@ on create_page_submit
 on toggle_page_create
   page_create_open = !page_create_open
   return if !page_create_open
-  task widget focus #workspace-tabs/content/new-page
+  task widget focus #workspace-tabs/content/pages/new-page
 
 on arm_page_delete
   return if loading || mutation_phase != "idle" || empty(active_page)
@@ -141,7 +141,7 @@ on new_block_kind_changed(next)
 on pick_slash_kind(kind)
   new_block_kind = kind
   block_draft = ""
-  task widget focus #workspace-tabs/content/block-insert-row(block_insert_after_id)/block-insert
+  task widget focus #workspace-tabs/content/pages/block-insert-row(block_insert_after_id)/block-insert
 
 on block_entered(id)
   hovered_block_id = id
@@ -161,13 +161,13 @@ on open_block_insert(key, after_id)
   return if loading || empty(active_page)
   block_insert_after_id = after_id
   block_insert_open = true
-  task widget focus #workspace-tabs/content/key(key)/block-insert-row(block_insert_after_id)/block-insert
+  task widget focus #workspace-tabs/content/pages/key(key)/block-insert-row(block_insert_after_id)/block-insert
 
 on open_root_block_insert
   return if loading || empty(active_page)
   block_insert_after_id = ""
   block_insert_open = true
-  task widget focus #workspace-tabs/content/block-insert-row(block_insert_after_id)/block-insert
+  task widget focus #workspace-tabs/content/pages/block-insert-row(block_insert_after_id)/block-insert
 
 on close_block_insert
   block_insert_open = false
@@ -256,7 +256,7 @@ on select_block(key, id, kind, text, checked, open_actions)
   block_autosave_status = "idle"
   block_delete_armed = false
   return if open_actions
-  task widget focus #workspace-tabs/content/key(key)/block(selected_block_id)/line/block-edit
+  task widget focus #workspace-tabs/content/pages/key(key)/block(selected_block_id)/line/block-edit
 
 on close_block_actions
   block_actions_open = false
@@ -270,39 +270,24 @@ on selected_block_kind_changed(next)
   error = ""
   run save_block(connected_rpc, password, active_page, selected_block_id, selected_block_kind, block_edit_draft) -> pages_mutated _ | mutation_failed _
 
-on clear_block_selection
-  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
-  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
-  block_autosave_generation = block_autosave_generation + 1
-  selected_block_id = ""
-  selected_block_kind = ""
-  selected_block_checked = false
-  block_comments_generation = block_comments_generation + 1
-  block_comments_open = false
-  block_comments_target = ""
-  block_comment_threads = []
-  block_comment_thread_total = 0
-  block_comment_threads_next_from = 0
-  block_comment_threads_has_more = false
-  block_comment_threads_loading = false
-  active_block_comment_thread = ""
-  block_thread_comments = []
-  block_thread_comments_next_from = 0
-  block_thread_comments_has_more = false
-  block_thread_comments_loading = false
-  block_comment_draft = ""
-  pending_block_comment = ""
-  block_edit_draft = ""
-  block_autosave_status = "idle"
-  block_delete_armed = false
-  block_actions_open = false
-
+// THE COMMENTS RAIL IS DOCUMENT-SCOPED. The artifact lists every comment on the
+// page under one `N comments` label and never involves a block selection
+// (Liquid Glass:940-941). `load_page_threads` asks the node's own plural
+// `ThreadsForTargets` query for the page AND all of its blocks at once, so the
+// rail opens on a page, not on a block.
+//
+// The comment TARGET is therefore the page: a thread opened from here anchors
+// on the document, which the module explicitly allows ("a block or page id",
+// pages/src/interface.rs:278). A thread that some earlier build anchored on a
+// block still LISTS here, but its comment page cannot be opened — the node
+// validates the thread's own target against the one asked for, and `ThreadRow`
+// reaches the app without it.
 on open_block_comments
-  return if loading || mutation_phase != "idle" || empty(selected_block_id)
+  return if loading || mutation_phase != "idle" || empty(active_page)
   block_comments_generation = block_comments_generation + 1
   block_actions_open = false
   block_comments_open = true
-  block_comments_target = selected_block_id
+  block_comments_target = active_page
   block_comment_threads = []
   block_comment_thread_total = 0
   block_comment_threads_next_from = 0
@@ -314,7 +299,7 @@ on open_block_comments
   block_thread_comments_has_more = false
   block_thread_comments_loading = false
   error = ""
-  run load_block_threads(connected_rpc, block_comments_target, 0, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
+  run load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on close_block_comments
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
@@ -335,7 +320,7 @@ on close_block_comments
   pending_block_comment = ""
 
 on block_threads_loaded(next)
-  return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || !block_comments_open
+  return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = next.threads
   block_comment_thread_total = next.total
   block_comment_threads_next_from = next.next_from
@@ -343,15 +328,17 @@ on block_threads_loaded(next)
   block_comment_threads_loading = false
   error = ""
 
+// The pagination machinery stays wired, and the document query answers in one
+// page (`has_more` false), so this only fires if that ever changes.
 on load_more_block_threads
   return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || !block_comment_threads_has_more
   block_comments_generation = block_comments_generation + 1
   block_comment_threads_loading = true
   error = ""
-  run load_block_threads(connected_rpc, block_comments_target, block_comment_threads_next_from, block_comments_generation) -> block_threads_page_loaded _ | block_threads_failed _
+  run load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_page_loaded _ | block_threads_failed _
 
 on block_threads_page_loaded(next)
-  return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || !block_comments_open
+  return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = append_page_comment_threads(block_comment_threads, next.threads)
   block_comment_thread_total = next.total
   block_comment_threads_next_from = next.next_from
@@ -376,7 +363,7 @@ on open_block_comment_thread(id)
   run load_block_comment_page(connected_rpc, block_comments_target, active_block_comment_thread, 0, block_comments_generation) -> block_comment_page_loaded _ | block_comment_page_failed _
 
 on block_comment_page_loaded(next)
-  return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || next.thread_id != active_block_comment_thread || !block_comments_open
+  return if next.generation != block_comments_generation || next.target != block_comments_target || next.thread_id != active_block_comment_thread || !block_comments_open
   block_thread_comments = next.comments
   block_thread_comments_next_from = next.next_from
   block_thread_comments_has_more = next.has_more
@@ -391,7 +378,7 @@ on load_more_block_comments
   run load_block_comment_page(connected_rpc, block_comments_target, active_block_comment_thread, block_thread_comments_next_from, block_comments_generation) -> block_comment_page_appended _ | block_comment_page_failed _
 
 on block_comment_page_appended(next)
-  return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || next.thread_id != active_block_comment_thread || !block_comments_open
+  return if next.generation != block_comments_generation || next.target != block_comments_target || next.thread_id != active_block_comment_thread || !block_comments_open
   block_thread_comments = append_page_comments(block_thread_comments, next.comments)
   block_thread_comments_next_from = next.next_from
   block_thread_comments_has_more = next.has_more
@@ -412,7 +399,7 @@ on close_block_comment_thread
   block_thread_comments_loading = false
 
 on post_block_comment_submit
-  return if loading || block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || block_comments_target != selected_block_id || empty(trim(block_comment_draft))
+  return if loading || block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || block_comments_target != active_page || empty(trim(block_comment_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = "block-comment"
@@ -424,7 +411,7 @@ on post_block_comment_submit
   run post_block_comment(connected_rpc, password, block_comments_target, active_block_comment_thread, pending_block_comment, block_comments_generation) -> block_comment_posted _ | block_comment_post_failed _
 
 on block_comment_posted(next)
-  return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || !block_comments_open
+  return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   active_block_comment_thread = next.thread_id
   block_thread_comments = next.comments
   block_thread_comments_next_from = next.next_from
@@ -435,7 +422,7 @@ on block_comment_posted(next)
   error = ""
   block_comments_generation = block_comments_generation + 1
   block_comment_threads_loading = true
-  run load_block_threads(connected_rpc, block_comments_target, 0, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
+  run load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on block_comment_post_failed(cause)
   block_comment_draft = restore_draft(block_comment_draft, pending_block_comment, cause.committed)
@@ -445,10 +432,10 @@ on block_comment_post_failed(cause)
   error = cause.message
   block_comments_generation = block_comments_generation + 1
   block_comment_threads_loading = true
-  run load_block_threads(connected_rpc, block_comments_target, 0, block_comments_generation) -> block_threads_recovered _ | block_threads_recovery_failed _
+  run load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_recovered _ | block_threads_recovery_failed _
 
 on block_threads_recovered(next)
-  return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || !block_comments_open
+  return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = next.threads
   block_comment_thread_total = next.total
   block_comment_threads_next_from = next.next_from
@@ -483,13 +470,17 @@ on block_text_save_failed(cause)
   block_autosave_status = "error"
   error = cause.message
 
-on toggle_block_checked
-  return if loading || mutation_phase != "idle" || selected_block_kind != "Todo" || empty(selected_block_id)
+// ONE CLICK FINALIZES THE TICK. The artifact's todo box is the control itself
+// (Liquid Glass:920-921), so the tick carries the block it belongs to and needs
+// no selection round-trip; `checked` is the value being written, not the one
+// being read back.
+on set_todo_checked(id, checked)
+  return if loading || mutation_phase != "idle" || empty(active_page) || empty(id)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = "block-check"
   error = ""
-  run set_block_checked(connected_rpc, password, active_page, selected_block_id, !selected_block_checked) -> pages_mutated _ | mutation_failed _
+  run set_block_checked(connected_rpc, password, active_page, id, checked) -> pages_mutated _ | mutation_failed _
 
 on move_block_submit(direction)
   return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id)

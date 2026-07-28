@@ -2962,7 +2962,7 @@ dependencies = [
 [[package]]
 name = "ducktape-ui"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=17e8383f8c2791cb644e150c7b6e01b3a85c9e4f#17e8383f8c2791cb644e150c7b6e01b3a85c9e4f"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=f8a7ee3#f8a7ee30a092b109270bb1ed7130bb97b559bd77"
 dependencies = [
  "iced",
 ]
@@ -4417,6 +4417,7 @@ dependencies = [
  "iced_renderer",
  "log",
  "num-traits",
+ "qrcode 0.13.0",
  "rustc-hash 2.1.2",
  "thiserror 2.0.18",
  "unicode-segmentation",
@@ -6804,6 +6805,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "166f136dfdb199f98186f3649cf7a0536534a61417a1a30221b492b4fb60ce3f"
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quanta"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9012,7 +9019,7 @@ dependencies = [
 [[package]]
 name = "ui-lang"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=17e8383f8c2791cb644e150c7b6e01b3a85c9e4f#17e8383f8c2791cb644e150c7b6e01b3a85c9e4f"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=f8a7ee3#f8a7ee30a092b109270bb1ed7130bb97b559bd77"
 dependencies = [
  "ui-lang-core",
 ]
@@ -9020,15 +9027,15 @@ dependencies = [
 [[package]]
 name = "ui-lang-core"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=17e8383f8c2791cb644e150c7b6e01b3a85c9e4f#17e8383f8c2791cb644e150c7b6e01b3a85c9e4f"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=f8a7ee3#f8a7ee30a092b109270bb1ed7130bb97b559bd77"
 dependencies = [
- "qrcode",
+ "qrcode 0.14.1",
 ]
 
 [[package]]
 name = "ui-lang-runtime"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=17e8383f8c2791cb644e150c7b6e01b3a85c9e4f#17e8383f8c2791cb644e150c7b6e01b3a85c9e4f"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=f8a7ee3#f8a7ee30a092b109270bb1ed7130bb97b559bd77"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -9036,6 +9043,7 @@ dependencies = [
  "iced",
  "iced_test",
  "iced_tiny_skia",
+ "unicode-segmentation",
 ]
 
 [[package]]

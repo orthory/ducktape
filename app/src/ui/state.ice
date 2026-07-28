@@ -125,8 +125,13 @@ state
   settings_endpoint = ""
   settings_node_key = ""
   settings_height:i64 = 0
+  settings_data_dir = ""
   settings_key_path = ""
   settings_key_state = ""
+  // THIS DEVICE'S OWN USER KEY, full hex — the `me` the post gate tests against
+  // `channel_members`. `account_id` cannot serve: it is a short_label of the
+  // identity module's account id, not the key a membership row carries.
+  settings_user_key = ""
   settings_open_tabs:i64 = 0
   settings_generation:i64 = 0
   account_bound = false
@@ -224,3 +229,77 @@ state
   page_search_hits:[PageSearchHit] = []
   page_searching = false
   page_search_generation:i64 = 0
+  // ONBOARDING — the phase gate in front of the console. "console" is the only
+  // phase that renders the shell; the rest are the pre-workspace column.
+  phase = "console"
+  onboarding_name = ""
+  onboarding_invite = ""
+  onboarding_error = ""
+  invite_link = ""
+  workspace_slug = ""
+  provision_settled = false
+  // NODE FACTS — everything /v1/status already publishes that the app dropped.
+  // Backs the status-pill hover card, the FINALITY/ROUND cards and the gc line.
+  node_facts_generation:i64 = 0
+  node_version = ""
+  node_root_hash = ""
+  // The consensus trio is NOT here: it lives in handlers/lifecycle.ice as the
+  // already-rendered `node_view_label` / `node_quorum_label` /
+  // `node_reachable_label`, because /v1/status reports each as optional and an
+  // absent reading must print `—`, never a measured `0`.
+  node_last_finalized:i64 = 0
+  node_checkpoint:i64 = 0
+  node_tab = "overview"
+  status_card_open = false
+  // ROSTER — members and agents share one screen, so they share one filter.
+  members_filter = "all"
+  members_selected = ""
+  agents_selected = ""
+  // FORGE — which tracker list, which repo menu, which half of an item.
+  // Code is the artifact's first seat, and opening a repo to its file tree is
+  // what "open a repo" means; landing on Pull requests answered a question the
+  // reader had not asked yet.
+  forge_tab = "code"
+  forge_repo_menu = false
+  // DIRECT — a DM is a two-party members-only channel; `active_dm_peer` names
+  // the peer and `dm_peers` carries the rest of him, so the header plate is a
+  // filter over that list. There is deliberately no `active_dm_name` /
+  // `active_dm_is_agent` pair: nothing ever wrote them, and a header fed from
+  // two fields no handler fills renders a blank name.
+  dm_peers_generation:i64 = 0
+  active_dm_peer = ""
+  // HUDDLE — whether SHE is in it, where, since when, the tick that drives the
+  // elapsed clock, whether the panel is popped, and who else is on the call.
+  huddle_joined = false
+  huddle_channel = ""
+  huddle_channel_name = ""
+  huddle_joined_at:i64 = 0
+  huddle_now:i64 = 0
+  huddle_popped = false
+  huddle_roster:[HuddleParticipant] = []
+  // The event inspector every finality mark opens.
+  // EXPLORER — one query across every module, filtered by result kind.
+  explorer_query = ""
+  explorer_kind = "all"
+  files_selected = ""
+  // Overlays: the mention popup, the invite modal, the toast, the arm-then-act
+  // guard on destructive buttons.
+  invite_role = "resident"
+  invite_ttl:i64 = 7
+  toast = ""
+  toast_tone = "info"
+  leave_armed = false
+  // MOTION — the artifact's vocabulary, and all of it: a spinner, a status
+  // pulse, and the rise an overlay enters on. Nothing decorative.
+  spin:animation[f64] = 0.0
+    easing linear
+    duration 800ms
+    repeat forever
+  pulse:animation[f64] = 0.0
+    easing ease-in-out
+    duration 1700ms
+    repeat forever
+    auto-reverse true
+  overlay_in:animation[bool] = false
+    easing ease-out
+    duration 180ms

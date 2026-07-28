@@ -24,9 +24,13 @@ pub use chat::client::{
     append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
     apply_chat_thread, author_name, chat_message, contains_pending_message, mark_message_groups,
     merge_message_send_result, merge_pending_messages, merge_thread_reply, optimistic_message,
-    paragraph_blocks, parse_message_with_members, rollback_pending_message, short_label,
+    parse_message_with_members, rollback_pending_message, short_label,
     thread_offset_after_reply,
 };
+// the composer's block splitter is not called by the shipping binary — only by
+// the app's own test helpers, which build message rows the way a send does.
+#[cfg(test)]
+pub use chat::client::paragraph_blocks;
 // forge's client view model, same arrangement: the tracker rows, the item
 // pane (reviews + merge-box tallies), and the op-refresh classification.
 pub use forge::client::{
@@ -43,6 +47,16 @@ const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
 const MAX_FRAME_HEX_BYTES: usize = 3 * 1024 * 1024;
 const ENCRYPTED_KEY_PREFIX: &str = "ducktape-user-key-v1:";
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// `node init` mints a key and writes a workspace; `node join` fetches an
+/// invite's fronts. Both are slower than an rpc round-trip and both are
+/// interactive-blocking, so they get their own ceiling.
+const CLI_TIMEOUT: Duration = Duration::from_secs(120);
+/// How many one-second polls the provisioning screen waits before it says the
+/// node is not running and names the command that starts it.
+const PROVISION_PATIENCE: u32 = 8;
+/// The voting window a membership proposal opens with, in consensus seconds —
+/// the same value the CLI's membership ceremony uses.
+const GOVERNANCE_VOTING_PERIOD: u64 = 1_000_000;
 const CHAT_TIMELINE_ROOT_LIMIT: usize = 128;
 /// The chat view clamps one message page to 256 rows (default 50, max 256), so
 /// the timeline walk steps in 256-row pages.
@@ -66,6 +80,8 @@ pub struct ChatData {
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
     pub active_channel_huddle_count: i64,
+    /// the huddle's roster, not just its length — the faces and the tiles.
+    pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
     pub selected_message_seq: i64,
     pub selected_message_rev: i64,
@@ -271,6 +287,7 @@ pub struct WorkspaceData {
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
     pub active_channel_huddle_count: i64,
+    pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
     pub pages: Vec<PageItem>,
     pub blocks: Vec<PageBlock>,
@@ -998,6 +1015,22 @@ pub struct FsEntry {
     pub name: String,
     pub kind: String,
     pub size: i64,
+    /// the entry's content address — already on the ls/find wire.
+    pub object: String,
+}
+
+/// What is under this crumb, counted. Ice cannot filter a list by field, so the
+/// crumb bar's two counts are pure folds over the listing it is already drawn
+/// beside — never a second `files_ls`.
+pub fn fs_dir_count(entries: Vec<FsEntry>) -> i64 {
+    count_i64(entries.iter().filter(|entry| entry.kind == "dir").count())
+}
+
+/// Everything that is not a directory. `files_ls` publishes one `kind` per row
+/// and the browser draws exactly two shapes, so the complement IS the file
+/// count — no third bucket can hide here.
+pub fn fs_file_count(entries: Vec<FsEntry>) -> i64 {
+    count_i64(entries.iter().filter(|entry| entry.kind != "dir").count())
 }
 
 /// One committed duckfs snapshot.
@@ -1041,30 +1074,10 @@ pub async fn files_ls(
     async {
         let rpc = rpc_client(&rpc)?;
         let reply = rpc.files_get("ls", &[("path", path.as_str())]).await?;
-        let entries = reply["entries"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|entry| {
-                let entry_path = entry["path"].as_str().unwrap_or_default().to_string();
-                let name = entry_path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(entry_path.as_str())
-                    .to_string();
-                FsEntry {
-                    name,
-                    kind: entry["kind"].as_str().unwrap_or_default().to_string(),
-                    size: entry["size"].as_i64().unwrap_or(0),
-                    path: entry_path,
-                }
-            })
-            .collect();
         Ok(FsListing {
             generation,
+            entries: fs_entries(&reply),
             path,
-            entries,
         })
     }
     .await
@@ -1072,6 +1085,67 @@ pub async fn files_ls(
         generation,
         message,
     })
+}
+
+/// Every path under one prefix, in full-path order — the duckfs tree sidebar
+/// and Explorer's FILE results read the same wire.
+pub async fn files_find(
+    rpc: String,
+    prefix: String,
+    generation: i64,
+) -> Result<FsListing, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply = rpc.files_get("find", &[("prefix", prefix.as_str())]).await?;
+        Ok(FsListing {
+            generation,
+            entries: fs_entries(&reply),
+            path: prefix,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The `entries` array of an ls/find reply as rows (both serve `EntryInfo`).
+fn fs_entries(reply: &serde_json::Value) -> Vec<FsEntry> {
+    reply["entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| {
+            let entry_path = entry["path"].as_str().unwrap_or_default().to_string();
+            let name = entry_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(entry_path.as_str())
+                .to_string();
+            FsEntry {
+                name,
+                kind: entry["kind"].as_str().unwrap_or_default().to_string(),
+                size: entry["size"].as_i64().unwrap_or(0),
+                object: entry["object"].as_str().unwrap_or_default().to_string(),
+                path: entry_path,
+            }
+        })
+        .collect()
+}
+
+/// `412 KB` — a byte count in the unit a person reads.
+pub fn size_label(bytes: i64) -> String {
+    const KB: i64 = 1_024;
+    const MB: i64 = 1_024 * KB;
+    const GB: i64 = 1_024 * MB;
+    match bytes {
+        size if size < KB => format!("{size} B"),
+        size if size < MB => format!("{} KB", size / KB),
+        size if size < GB => format!("{:.1} MB", size as f64 / MB as f64),
+        size => format!("{:.1} GB", size as f64 / GB as f64),
+    }
 }
 
 /// Read a file's head bytes for the preview pane (64 KiB window).
@@ -1327,6 +1401,89 @@ pub async fn files_diff(
     })
 }
 
+/// Who last changed one duckfs PATH, and at which block.
+///
+/// This is the path's last COMMIT — never blob authorship. duckfs stores
+/// content-addressed objects with no per-blob author, so the honest label is
+/// "last changed at this path", which is exactly what walking the snapshot
+/// window answers.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChangeStamp {
+    pub generation: i64,
+    pub path: String,
+    /// The committing member, short form; empty when no commit in the window
+    /// touched this path.
+    pub author: String,
+    /// The committing block height; 0 with an empty author.
+    pub height: i64,
+}
+
+/// How far back a last-changed walk looks. A path untouched in this many
+/// commits reads as unknown rather than wrong.
+//
+// ponytail: one diff round-trip per snapshot until the first hit — recent
+// paths answer in one or two. Bound it lower, or ask the module for a
+// per-path log, if a cold path ever makes this walk visible.
+const CHANGE_STAMP_WINDOW: usize = 50;
+
+/// Walk the committed snapshots newest-first and stop at the first one whose
+/// diff against its parent touches `path`.
+pub async fn last_changed_at_path(
+    rpc: String,
+    path: String,
+    generation: i64,
+) -> Result<ChangeStamp, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let limit = CHANGE_STAMP_WINDOW.to_string();
+        let history = client
+            .files_get("history", &[("limit", limit.as_str())])
+            .await?;
+        // `history` is newest-first, which is the order this walk wants.
+        let snapshots = history["snapshots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for snapshot in &snapshots {
+            let id = snapshot["id"].as_str().unwrap_or_default();
+            let stamp = ChangeStamp {
+                generation,
+                path: path.clone(),
+                author: short_digest(snapshot["author"].as_str().unwrap_or_default()),
+                height: snapshot["height"].as_i64().unwrap_or(0),
+            };
+            // The root snapshot has no parent to diff against: everything the
+            // window still holds was introduced there.
+            let Some(parent) = snapshot["parent"].as_str() else {
+                return Ok(stamp);
+            };
+            let diff = client
+                .files_get(
+                    "diff",
+                    &[("from", parent), ("to", id), ("prefix", path.as_str())],
+                )
+                .await?;
+            let touched = diff["entries"]
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty());
+            if touched {
+                return Ok(stamp);
+            }
+        }
+        Ok(ChangeStamp {
+            generation,
+            path,
+            author: String::new(),
+            height: 0,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -1387,14 +1544,22 @@ pub fn fs_parent(path: String) -> String {
     }
 }
 
-/// One member of the network: a validator (quorum seat) or resident
-/// (mesh + statesync standing).
+/// One member of the network: a validator (quorum seat), a resident
+/// (mesh + statesync standing), or a registered agent.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct MemberRow {
     pub key: String,
     pub label: String,
     pub role: String,
     pub is_this_node: bool,
+    pub is_agent: bool,
+    /// an agent's capability tag; empty for a human member.
+    pub model: String,
+    /// a HUMAN row: the mesh reports this key as a live peer (this node is
+    /// live by definition). An AGENT row: the registry says active rather than
+    /// paused — `MemberPresence` renders the two vocabularies apart on
+    /// `is_agent`. Neither is "working right now"; that is `AgentRow.live`.
+    pub live: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -1405,15 +1570,17 @@ pub struct MembersData {
     pub members: Vec<MemberRow>,
 }
 
-/// Load the valset directory: validators then residents, this node marked.
+/// Load the roster: validators, then residents, then the registered agents —
+/// one list, this node marked, liveness folded in from the mesh sample.
 pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, HydrationError> {
     async {
-        let rpc = rpc_client(&rpc)?;
-        let node_key = rpc.status().await?.public_key;
+        let client = rpc_client(&rpc)?;
+        let node_key = client.status().await?.public_key;
+        let live_keys = live_peer_keys(&client).await;
         let mut members = Vec::new();
         let mut counts = (0i64, 0i64);
         for (query, role) in [("validators", "validator"), ("residents", "resident")] {
-            let reply: serde_json::Value = rpc
+            let reply: serde_json::Value = client
                 .query("valset", &serde_json::json!(query))
                 .await?;
             let keys = reply[query].as_array().cloned().unwrap_or_default();
@@ -1422,23 +1589,37 @@ pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, H
                 _ => counts.1 = count_i64(keys.len()),
             }
             for key in keys {
-                let bytes: Vec<u8> = key
-                    .as_array()
-                    .map(|bytes| {
-                        bytes
-                            .iter()
-                            .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let hex = hex_encode(&bytes);
+                let hex = hex_encode(&json_bytes(&key));
+                let is_this_node = hex == node_key;
                 members.push(MemberRow {
                     label: short_label(&hex),
-                    is_this_node: hex == node_key,
+                    live: is_this_node || live_keys.contains(&hex),
+                    is_this_node,
+                    is_agent: false,
+                    model: String::new(),
                     role: role.into(),
                     key: hex,
                 });
             }
+        }
+        // registered agents are members of the workspace too — the roster shows
+        // people AND machines, keyed on the agent id (agents hold no node key;
+        // the roster labels that cell "agent id", not "public key").
+        let agents = load_agents(rpc, generation).await.map(|data| data.agents);
+        for agent in agents.unwrap_or_default() {
+            members.push(MemberRow {
+                key: agent.id,
+                label: agent.name,
+                role: "agent".into(),
+                is_this_node: false,
+                is_agent: true,
+                model: agent.capability,
+                // for an agent row this is REGISTRATION state (active vs
+                // paused), which is what `MemberPresence` renders for a
+                // machine — not "working now". The run-in-flight fact is
+                // `AgentRow.live`, and only that one may pulse the rail.
+                live: agent.status == "active",
+            });
         }
         Ok(MembersData {
             generation,
@@ -1454,18 +1635,80 @@ pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, H
     })
 }
 
+/// The peer sample's live keys, full hex — the join key for member liveness.
+/// A node that cannot answer `/v1/peers` simply reports nobody live.
+async fn live_peer_keys(rpc: &RpcClient) -> BTreeSet<String> {
+    let Ok(reply) = rpc.peers().await else {
+        return BTreeSet::new();
+    };
+    reply["peers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        // `connected` and `peer`, NOT `live`/`key`: those are the names
+        // `PeerView` serializes (bin/noded/src/peers.rs). Reading the wrong
+        // ones made every lookup return null, so this set came back empty on
+        // every call and every member rendered offline.
+        .filter(|peer| peer["connected"].as_bool().unwrap_or(false))
+        .filter_map(|peer| peer["peer"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// This node holds a quorum seat — the ONE authority predicate behind the
+/// approvals gate, the members Invite button and the forge write gate.
+pub fn members_is_admin(rows: Vec<MemberRow>) -> bool {
+    rows.iter()
+        .any(|row| row.is_this_node && row.role == "validator")
+}
+
+/// This node's standing: `validator` | `resident` | `guest`.
+pub fn member_tier(rows: Vec<MemberRow>) -> String {
+    rows.iter()
+        .find(|row| row.is_this_node)
+        .map_or_else(|| "guest".into(), |row| row.role.clone())
+}
+
+/// The All / Humans / Agents / Validators strip.
+pub fn filter_members(rows: Vec<MemberRow>, filter: String) -> Vec<MemberRow> {
+    rows.into_iter()
+        .filter(|row| match filter.as_str() {
+            "humans" => !row.is_agent,
+            "agents" => row.is_agent,
+            "validators" => row.role == "validator",
+            _ => true,
+        })
+        .collect()
+}
+
 /// One governance proposal, rendered.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ProposalRow {
     pub id: String,
     pub action: String,
+    /// what the action actually does — the `GovAction` payload, rendered.
+    pub detail: String,
     pub proposer: String,
     pub status: String,
     pub deadline: i64,
     pub approvals: i64,
     pub rejections: i64,
+    /// the frozen rule's discriminant: `threshold` | `participating_majority`.
+    /// The two bars are NOT interchangeable — a threshold counts YES power, a
+    /// participating majority counts TURNOUT and then compares yes against no.
+    pub rule: String,
+    /// how many YES votes would pass this proposal AT ITS CURRENT TALLY, in
+    /// `approvals`' own unit — the one number the dots, the `3 / 4` reading and
+    /// the note may compare `approvals` against. Under
+    /// `ParticipatingMajority{quorum}` that is `max(quorum − no, no + 1)`, which
+    /// is exactly `turnout >= quorum && yes > no` restated as a yes count.
+    pub required_yes: i64,
     pub electorate: i64,
     pub open: bool,
+    /// The block a settled proposal was EXECUTED at, derived from the op feed
+    /// (see [`settle_heights`]). 0 when the proposal is still open, or when it
+    /// settled further back than the op window reaches.
+    pub settled_height: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -1495,48 +1738,35 @@ pub async fn load_governance(
                     .iter()
                     .filter(|vote| vote[1].as_bool().unwrap_or(false))
                     .count();
-                let status = view["status"]
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| {
-                        view["status"]
-                            .as_object()
-                            .and_then(|tagged| tagged.keys().next().cloned())
-                            .unwrap_or_default()
-                    });
-                let action = view["action"]
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| {
-                        view["action"]
-                            .as_object()
-                            .and_then(|tagged| tagged.keys().next().cloned())
-                            .unwrap_or_default()
-                    });
-                let proposer_bytes: Vec<u8> = view["proposer"]
-                    .as_array()
-                    .map(|bytes| {
-                        bytes
-                            .iter()
-                            .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let status = tagged_name(&view["status"]);
+                let action = tagged_name(&view["action"]);
+                let rejections = count_i64(votes.len() - approvals);
                 ProposalRow {
                     id: view["proposal_id"].as_str().unwrap_or_default().to_string(),
                     open: status == "open",
-                    proposer: short_label(&hex_encode(&proposer_bytes)),
+                    detail: gov_action_detail(&view["action"]),
+                    proposer: short_label(&hex_encode(&json_bytes(&view["proposer"]))),
                     deadline: view["deadline"].as_i64().unwrap_or(0),
                     approvals: count_i64(approvals),
-                    rejections: count_i64(votes.len() - approvals),
+                    rule: tagged_name(&view["voting_rule"]),
+                    required_yes: yes_needed(&view["voting_rule"], rejections),
+                    rejections,
                     electorate: count_i64(
                         view["electorate"].as_array().map_or(0, |members| members.len()),
                     ),
+                    settled_height: 0,
                     action,
                     status,
                 }
             })
             .collect();
+        let any_settled = proposals.iter().any(|proposal| !proposal.open);
+        if any_settled {
+            let settled = settle_heights(&rpc).await;
+            for proposal in &mut proposals {
+                proposal.settled_height = settled.get(&proposal.id).copied().unwrap_or(0);
+            }
+        }
         proposals.sort_by(|left, right| {
             right
                 .open
@@ -1553,6 +1783,135 @@ pub async fn load_governance(
         generation,
         message,
     })
+}
+
+/// How far back the settle-height derivation reads the op feed.
+const SETTLE_SCAN_BLOCKS: usize = 400;
+
+/// Proposal id -> the height it SETTLED at.
+///
+/// `ProposalView` omits the settle height, but settling is an ordinary op:
+/// `GovMsg::Execute { proposal_id }` applied against the governance module. So
+/// the height is recoverable from the block feed every explorer row already
+/// reads — no module change, and no invented number: a proposal that settled
+/// before the window simply has no entry, and its row prints no height.
+async fn settle_heights(client: &RpcClient) -> BTreeMap<String, i64> {
+    let Ok(blocks) = client.blocks(SETTLE_SCAN_BLOCKS).await else {
+        return BTreeMap::new();
+    };
+    let mut heights = BTreeMap::new();
+    for block in &blocks {
+        let height = block["height"].as_i64().unwrap_or(0);
+        for op in block["ops"].as_array().cloned().unwrap_or_default() {
+            let governance_op = op["target"].as_str() == Some("governance");
+            let applied = op["disposition"].as_str() == Some("applied");
+            if !governance_op || !applied {
+                continue;
+            }
+            // The feed carries the payload as its json TEXT preview, so the
+            // execute variant is read back out of that text.
+            let Some(payload) = op["payload"].as_str() else {
+                continue;
+            };
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(payload) else {
+                continue;
+            };
+            let Some(id) = message["execute"]["proposal_id"].as_str() else {
+                continue;
+            };
+            heights.insert(id.to_string(), height);
+        }
+    }
+    heights
+}
+
+/// The `GovAction` payload as one readable clause — what the op DOES, which
+/// the bare variant tag never says.
+fn gov_action_detail(action: &serde_json::Value) -> String {
+    let Some(tagged) = action.as_object() else {
+        return String::new();
+    };
+    let Some((variant, payload)) = tagged.iter().next() else {
+        return String::new();
+    };
+    let key = payload.get("key").map(json_bytes).unwrap_or_default();
+    if !key.is_empty() {
+        return format!("key {}", short_label(&hex_encode(&key)));
+    }
+    if let Some(text) = payload.get("text").and_then(|text| text.as_str()) {
+        return text.to_string();
+    }
+    match variant.as_str() {
+        "update_module" => format!(
+            "{} → h {}",
+            payload["name"].as_str().unwrap_or_default(),
+            payload["activation_height"].as_i64().unwrap_or(0)
+        ),
+        "set_share_mode" => match payload["enabled"].as_bool().unwrap_or(false) {
+            true => "account shares".into(),
+            false => "one ballot per validator".into(),
+        },
+        _ => String::new(),
+    }
+}
+
+/// How many YES votes pass this proposal at its current tally.
+///
+/// `Threshold{required_yes}` is already that number. `ParticipatingMajority`
+/// is NOT: its `quorum` is a TURNOUT bar, and passing also needs `yes > no`
+/// (crates/modules/system/governance/src/lib.rs, `settle`). Reading `quorum`
+/// into a yes counter renders "quorum met" on a Signal vote that will not
+/// settle, so restate the whole rule as the yes count it implies —
+/// `yes >= quorum − no` IS `yes + no >= quorum`, and `yes >= no + 1` IS
+/// `yes > no`.
+fn yes_needed(rule: &serde_json::Value, rejections: i64) -> i64 {
+    let Some(tagged) = rule.as_object() else {
+        return 0;
+    };
+    let Some((variant, payload)) = tagged.iter().next() else {
+        return 0;
+    };
+    match variant.as_str() {
+        "participating_majority" => {
+            let quorum = payload["quorum"].as_i64().unwrap_or(0);
+            quorum.saturating_sub(rejections).max(rejections + 1)
+        }
+        _ => payload["required_yes"].as_i64().unwrap_or(0),
+    }
+}
+
+/// Open a membership proposal. The app could vote and settle but never OPEN
+/// one; `action` is `add_validator` | `add_resident` | `remove_validator`.
+pub async fn governance_propose(
+    rpc: String,
+    password: String,
+    action: String,
+    target_key: String,
+) -> Result<bool, AppError> {
+    async {
+        let key = public_key(&target_key, "member public key")?;
+        let action = match action.as_str() {
+            "add_validator" => governance::GovAction::AddValidator { key },
+            "add_resident" => governance::GovAction::AddResident { key },
+            "remove_validator" => governance::GovAction::RemoveValidator { key },
+            other => return Err(format!("unknown membership action `{other}`")),
+        };
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "governance",
+            governance::encode_msg(&governance::GovMsg::Propose {
+                proposal_id: fresh_id("proposal"),
+                action,
+                voting_period: GOVERNANCE_VOTING_PERIOD,
+            }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
 }
 
 /// Cast (or change) this node's ballot.
@@ -1611,9 +1970,19 @@ pub struct SettingsFacts {
     pub height: i64,
     pub key_path: String,
     pub key_state: String,
+    /// this workspace's directory on this device — the NETWORK card's Data dir.
+    pub data_dir: String,
     pub open_tabs: i64,
+    /// THE VIEWER'S OWN KEY, full hex — the `me` every membership test needs.
+    /// `ChatMember.key` is `member_id(..)` at full width, and `account_id` is a
+    /// `short_label` of the identity module's ACCOUNT id, so neither the account
+    /// card nor the node key can answer "is this row me". Empty on a device with
+    /// no user key, which `post_gate` reads as "not seated" — the honest answer
+    /// when there is no identity to seat.
+    pub user_key: String,
 }
 
+/// The NETWORK card's Data dir row.
 /// Load the settings facts: node identity from /v1/status, the local user
 /// key's location and state, and the persisted tab count.
 pub async fn load_settings_facts(
@@ -1635,6 +2004,10 @@ pub async fn load_settings_facts(
             }
         };
         let tabs = load_doc_tabs(rpc.clone()).await;
+        let data_dir = workspace_at(&rpc)
+            .map(|(_, dir)| dir.display().to_string())
+            .or_else(|| ducktape_home().map(|home| home.display().to_string()))
+            .unwrap_or_default();
         Ok(SettingsFacts {
             generation,
             endpoint: rpc,
@@ -1642,7 +2015,12 @@ pub async fn load_settings_facts(
             height: i64::try_from(status.height).unwrap_or(i64::MAX),
             key_path,
             key_state,
+            data_dir,
             open_tabs: count_i64(tabs.len()),
+            user_key: local_user_key()
+                .await
+                .map(|key| hex_encode(&key))
+                .unwrap_or_default(),
         })
     }
     .await
@@ -1745,6 +2123,118 @@ pub fn filter_log_lines(lines: Vec<NodeLogLine>, filter: String) -> Vec<NodeLogL
         .collect()
 }
 
+/// One tracing line, split for the dark log console's three columns.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct LogParts {
+    pub time: String,
+    pub level: String,
+    pub message: String,
+}
+
+/// Split `2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted` into its
+/// three columns. A line that does not carry a level is all message.
+pub fn split_log_line(line: String) -> LogParts {
+    const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+    let mut fields = line.split_whitespace();
+    let Some(first) = fields.next() else {
+        return LogParts {
+            time: String::new(),
+            level: String::new(),
+            message: line,
+        };
+    };
+    let timestamped = first.contains(':') && first.chars().next().is_some_and(|c| c.is_ascii_digit());
+    let (time, level_field) = match timestamped {
+        true => (first.to_string(), fields.next().unwrap_or_default()),
+        false => (String::new(), first),
+    };
+    if !LEVELS.contains(&level_field) {
+        return LogParts {
+            time,
+            level: String::new(),
+            message: line,
+        };
+    }
+    let cut = line
+        .find(level_field)
+        .map_or(line.len(), |at| at + level_field.len());
+    LogParts {
+        time,
+        level: level_field.to_string(),
+        message: line[cut..].trim_start().to_string(),
+    }
+}
+
+/// The node's consensus/storage facts — everything `/v1/status` publishes that
+/// the two-field `Status` type drops, plus the mesh sample's live/total.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct NodeFacts {
+    pub generation: i64,
+    /// The daemon's build version, verbatim off `/v1/status` (its own
+    /// `CARGO_PKG_VERSION`). A build/commit SHA is NOT published anywhere, so
+    /// the version line carries the version alone.
+    pub version: String,
+    pub root_hash: String,
+    /// The three consensus facts are OPTION on purpose: `operations.consensus`
+    /// is absent on a resident, a joiner and the embedded local daemon
+    /// "rather than being filled with misleading zeroes", so a plain i64 would
+    /// print a hard 0 as if it were measured.
+    pub view: Option<i64>,
+    pub quorum: Option<i64>,
+    pub reachable_validators: Option<i64>,
+    pub last_finalized_at: i64,
+    pub checkpoint_height: i64,
+    pub peers_live: i64,
+    pub peers_total: i64,
+}
+
+/// Load the node facts from the raw status document plus the peer sample.
+/// A section the node omits for its role stays `None` — the status projection
+/// leaves it out rather than filling it with misleading numbers, and so do we.
+pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let status = client.status_json().await?;
+        let operations = &status["operations"];
+        let consensus = &operations["consensus"];
+        let peers = client.peers().await.unwrap_or_default();
+        let peers = peers["peers"].as_array().cloned().unwrap_or_default();
+        Ok(NodeFacts {
+            generation,
+            version: status["version"].as_str().unwrap_or_default().to_string(),
+            root_hash: status["root_hash"].as_str().unwrap_or_default().to_string(),
+            view: consensus["view"].as_i64(),
+            quorum: consensus["quorum"].as_i64(),
+            reachable_validators: consensus["reachable_validators"].as_i64(),
+            last_finalized_at: operations["last_finalized_at"].as_i64().unwrap_or(0),
+            checkpoint_height: operations["storage"]["checkpoint_height"]
+                .as_i64()
+                .unwrap_or(0),
+            peers_live: count_i64(
+                peers
+                    .iter()
+                    .filter(|peer| peer["live"].as_bool().unwrap_or(false))
+                    .count(),
+            ),
+            peers_total: count_i64(peers.len()),
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// A consensus fact the node did not publish for this role reads `—`, never a
+/// zero. The view has no way to branch on an absent value itself.
+pub fn optional_number(value: Option<i64>) -> String {
+    match value {
+        Some(number) => grouped_digits(number),
+        None => "—".into(),
+    }
+}
+
 /// One peer row.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PeerRow {
@@ -1784,15 +2274,148 @@ pub async fn load_peers(rpc: String, generation: i64) -> Result<PeersData, Hydra
     })
 }
 
-/// One registered agent, rendered.
+/// One registered module, as the node itself reports it.
+///
+/// There is no MARKETPLACE behind this row and there cannot be: a publisher, a
+/// verification badge, an install count and a catalog description exist in no
+/// module, no index and no manifest. This is the INSTALLED/RUNTIME truth —
+/// what is registered, at which code, with which swap pending.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ModuleRow {
+    pub id: String,
+    /// `workspace` | `developer` | `automation` | `system` — the presentation
+    /// category the status projection attaches by id. Never consensus state.
+    pub category: String,
+    /// The module's own state root, short form.
+    pub root: String,
+    /// The active component's sha256, short form. Empty when this network runs
+    /// no lifecycle module (the daemon's default set does not).
+    pub code_hash: String,
+    /// The scheduled swap's target hash, short form; empty when none is armed.
+    pub pending_hash: String,
+    /// The pending swap's activation height (0 when none is armed).
+    pub activation_height: i64,
+    /// Validators that have verified the pending bytes locally.
+    pub readiness: i64,
+    /// The pending swap has full coverage and will activate at its height.
+    pub ready: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ModulesData {
+    pub generation: i64,
+    pub rows: Vec<ModuleRow>,
+}
+
+/// The registered module set: `/v1/status` publishes id, root and category for
+/// every module, and the lifecycle module (where a network runs one) adds the
+/// active code hash and any armed swap.
+///
+/// The lifecycle half is BEST EFFORT on purpose — the daemon's default module
+/// set has no `lifecycle`, and a network without one still has a real,
+/// complete registered set to show.
+pub async fn load_modules(rpc: String, generation: i64) -> Result<ModulesData, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let status = client.status_json().await?;
+        let code = module_code_by_id(&client).await;
+        let rows = status["modules"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|module| {
+                let id = module["id"].as_str().unwrap_or_default().to_string();
+                let lifecycle = code.get(&id);
+                let pending =
+                    lifecycle.map_or(serde_json::Value::Null, |entry| entry["pending"].clone());
+                ModuleRow {
+                    category: module["category"].as_str().unwrap_or_default().to_string(),
+                    root: short_digest(module["root"].as_str().unwrap_or_default()),
+                    code_hash: lifecycle
+                        .map(|entry| short_digest(&hex_encode(&json_bytes(&entry["active_code_hash"]))))
+                        .unwrap_or_default(),
+                    pending_hash: short_digest(&hex_encode(&json_bytes(&pending["code_hash"]))),
+                    activation_height: pending["activation_height"].as_i64().unwrap_or(0),
+                    readiness: count_i64(
+                        pending["readiness"].as_array().map_or(0, |signals| signals.len()),
+                    ),
+                    ready: pending["ready"].as_bool().unwrap_or(false),
+                    id,
+                }
+            })
+            .collect();
+        Ok(ModulesData { generation, rows })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// `LifecycleQuery::ModuleStatus` keyed by module id, empty when this network
+/// runs no lifecycle module.
+async fn module_code_by_id(client: &RpcClient) -> BTreeMap<String, serde_json::Value> {
+    let Ok(reply) = client
+        .query::<_, serde_json::Value>("lifecycle", &serde_json::json!("module_status"))
+        .await
+    else {
+        return BTreeMap::new();
+    };
+    reply["module_status"]["modules"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| {
+            let id = entry["module_id"].as_str()?.to_string();
+            Some((id, entry))
+        })
+        .collect()
+}
+
+/// One curated skill of an agent: the ref's name and whether it loads as
+/// persona (`LoadMode::Always`) or on demand.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentSkill {
+    pub name: String,
+    pub always: bool,
+}
+
+/// One granted capability, in the `CapRequest` vocabulary: the request name
+/// and the resource it names (empty for the argument-less grants).
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentCap {
+    pub label: String,
+    pub arg: String,
+}
+
+/// One registered agent, rendered. Everything here already rides
+/// `AgentRecord` — the registry reply carries the whole record.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AgentRow {
     pub id: String,
     pub name: String,
+    pub initials: String,
     pub capability: String,
     pub status: String,
-    pub actions: String,
-    pub owner: String,
+    /// the decoded `SagaOrigin::External` key hex, empty for module/system owners.
+    pub owner_key: String,
+    /// that key resolved against the member roster, else the origin's variant tag.
+    pub owner_handle: String,
+    pub created_at: i64,
+    pub is_mine: bool,
+    /// this agent holds a RUN in flight right now — the runs module's pending
+    /// register, NOT `status`. `AgentStatus` is only Active|Paused and Active
+    /// is the registration default, so it says "not paused", never "working".
+    pub live: bool,
+    pub tools: i64,
+    pub secrets: i64,
+    pub subagent_budget: i64,
+    pub allowed_actions: Vec<String>,
+    pub skills: Vec<AgentSkill>,
+    pub caps: Vec<AgentCap>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -1801,47 +2424,105 @@ pub struct AgentsData {
     pub agents: Vec<AgentRow>,
 }
 
-/// Load the agent roster from the canonical registry.
+/// The owner origin, decoded: `("<key hex>", "<handle>")`. An external origin
+/// carries raw key bytes; a module/system origin has no key at all and reads
+/// as its own name.
+fn agent_owner(owner: &serde_json::Value) -> (String, String) {
+    let Some(tagged) = owner.as_object() else {
+        let name = owner.as_str().unwrap_or_default().to_string();
+        return (String::new(), name);
+    };
+    let Some((variant, payload)) = tagged.iter().next() else {
+        return (String::new(), String::new());
+    };
+    if variant != "external" {
+        let name = payload.as_str().unwrap_or(variant.as_str()).to_string();
+        return (String::new(), name);
+    }
+    let key = hex_encode(&json_bytes(payload));
+    let handle = short_label(&key);
+    (key, handle)
+}
+
+/// `ResourceCaps` flattened into the `CapRequest` names the console chips.
+fn agent_caps(caps: &serde_json::Value) -> Vec<AgentCap> {
+    let mut chips = Vec::new();
+    for (field, label) in [
+        ("forge_read", "ForgeRead"),
+        ("forge_push", "ForgePush"),
+        ("duckfs_read", "DuckfsRead"),
+        ("duckfs_write", "DuckfsWrite"),
+        ("tools", "Tool"),
+        ("secrets", "Secret"),
+        ("pages_write", "PagesWrite"),
+    ] {
+        for value in caps[field].as_array().cloned().unwrap_or_default() {
+            chips.push(AgentCap {
+                label: label.into(),
+                arg: value.as_str().unwrap_or_default().to_string(),
+            });
+        }
+    }
+    if caps["subagent_budget"].as_i64().unwrap_or(0) > 0 {
+        chips.push(AgentCap {
+            label: "SpawnSubagent".into(),
+            arg: String::new(),
+        });
+    }
+    chips
+}
+
+/// Load the agent roster from the canonical registry, each row marked with
+/// whether THIS device's user key is its owner.
 pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, HydrationError> {
     async {
-        let rpc = rpc_client(&rpc)?;
-        let reply: serde_json::Value = rpc.query("agent", &serde_json::json!("agents")).await?;
+        let client = rpc_client(&rpc)?;
+        let local = local_user_key().await.map(|key| hex_encode(&key));
+        let reply: serde_json::Value = client.query("agent", &serde_json::json!("agents")).await?;
+        let working = agents_with_a_run_in_flight(&client).await;
         let agents = reply["agents"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
             .map(|record| {
-                let status = record["status"]
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| {
-                        record["status"]
-                            .as_object()
-                            .and_then(|tagged| tagged.keys().next().cloned())
-                            .unwrap_or_default()
-                    });
-                let owner = record["owner"]
-                    .as_object()
-                    .and_then(|tagged| tagged.keys().next().cloned())
-                    .or_else(|| record["owner"].as_str().map(str::to_string))
-                    .unwrap_or_default();
+                let status = tagged_name(&record["status"]);
+                let (owner_key, owner_handle) = agent_owner(&record["owner"]);
+                let name = record["display_name"].as_str().unwrap_or_default().to_string();
+                let caps = &record["caps"];
+                let id = record["agent_id"].as_str().unwrap_or_default().to_string();
                 AgentRow {
-                    id: record["agent_id"].as_str().unwrap_or_default().to_string(),
-                    name: record["display_name"].as_str().unwrap_or_default().to_string(),
+                    live: working.contains(&id),
+                    initials: initials_of(&name),
                     capability: record["capability"].as_str().unwrap_or_default().to_string(),
-                    actions: record["allowed_actions"]
+                    created_at: record["created_at"].as_i64().unwrap_or(0),
+                    is_mine: local.as_deref().is_some_and(|key| key == owner_key),
+                    tools: count_i64(caps["tools"].as_array().map_or(0, Vec::len)),
+                    secrets: count_i64(caps["secrets"].as_array().map_or(0, Vec::len)),
+                    subagent_budget: caps["subagent_budget"].as_i64().unwrap_or(0),
+                    allowed_actions: record["allowed_actions"]
                         .as_array()
-                        .map(|actions| {
-                            actions
-                                .iter()
-                                .filter_map(|action| action.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|action| action.as_str().map(str::to_string))
+                        .collect(),
+                    skills: record["skills"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|skill| AgentSkill {
+                            name: skill["name"].as_str().unwrap_or_default().to_string(),
+                            always: skill["load"].as_str() == Some("always"),
                         })
-                        .unwrap_or_default(),
+                        .collect(),
+                    caps: agent_caps(caps),
+                    id,
+                    name,
                     status,
-                    owner,
+                    owner_key,
+                    owner_handle,
                 }
             })
             .collect();
@@ -1852,6 +2533,152 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
         generation,
         message,
     })
+}
+
+/// The agents holding a run in flight, from the runs module's pending
+/// register — the ONLY place in the product that knows an agent is working.
+/// A node that cannot answer the query reports nobody working, never everybody.
+async fn agents_with_a_run_in_flight(rpc: &RpcClient) -> BTreeSet<String> {
+    let Ok(reply) = rpc
+        .query::<_, serde_json::Value>("runs", &serde_json::json!("pending_runs"))
+        .await
+    else {
+        return BTreeSet::new();
+    };
+    let Some(pending) = reply["pending_runs"].as_array() else {
+        return BTreeSet::new();
+    };
+    pending
+        .iter()
+        .filter_map(|run| run["agent_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Whether any agent is engaging work right now — the rail's Forge pulse dot.
+pub fn any_agent_active(rows: Vec<AgentRow>) -> bool {
+    rows.iter().any(|row| row.live)
+}
+
+/// One run of one agent: the RECENT RUNS card, the agent live chip and the
+/// Explorer RUN hit all read this row.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct RunRow {
+    pub run_id: String,
+    pub agent_id: String,
+    pub outcome: String,
+    pub running: bool,
+    /// A consensus counter (the creation block), NOT a unix stamp — render it
+    /// with `height_ago`/`height_label_short`, never with `relative_time`.
+    pub created_at: i64,
+    /// what the run PRODUCED, in one line: `RunRecord` carries `pr_number` and
+    /// `output_ref` and this is the only surface that reads them.
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentRunsData {
+    pub generation: i64,
+    pub runs: Vec<RunRow>,
+}
+
+/// What a settled run produced, in one line: the forge PR it moved, else the
+/// output ref it wrote, else how it ended. Both fields ride `RunRecord`
+/// (crates/modules/apps/runs/src/interface.rs) — nothing here is invented.
+fn run_summary(record: &serde_json::Value, outcome: &str) -> String {
+    if let Some(number) = record["pr_number"].as_u64() {
+        return format!("pr #{number}");
+    }
+    match record["output_ref"].as_str() {
+        Some(output) if !output.is_empty() => output.to_string(),
+        _ => outcome.to_string(),
+    }
+}
+
+/// This agent's runs: the pending (RUNNING) entries first, then the delivered
+/// ring newest-first. Two queries because the runs module keeps in-flight
+/// correlation and settled history in two separate projections.
+pub async fn load_agent_runs(
+    rpc: String,
+    agent_id: String,
+    generation: i64,
+) -> Result<AgentRunsData, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let pending: serde_json::Value = client
+            .query("runs", &serde_json::json!("pending_runs"))
+            .await?;
+        let recent: serde_json::Value = client
+            .query("runs", &serde_json::json!("recent_runs"))
+            .await?;
+        let wanted = |record: &serde_json::Value| {
+            agent_id.is_empty() || record["agent_id"].as_str() == Some(agent_id.as_str())
+        };
+        let mut runs: Vec<RunRow> = pending["pending_runs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(wanted)
+            .map(|record| RunRow {
+                run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
+                agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
+                outcome: "running".into(),
+                running: true,
+                created_at: record["created_at"].as_i64().unwrap_or(0),
+                summary: record["channel_id"].as_str().unwrap_or_default().to_string(),
+            })
+            .collect();
+        runs.extend(
+            recent["recent_runs"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(wanted)
+                .map(|record| {
+                    let outcome = tagged_name(&record["outcome"]);
+                    RunRow {
+                        run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
+                        agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
+                        running: false,
+                        created_at: record["created_at"].as_i64().unwrap_or(0),
+                        summary: run_summary(&record, &outcome),
+                        outcome,
+                    }
+                }),
+        );
+        Ok(AgentRunsData { generation, runs })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Pause or resume one agent — owner-gated at the module, not quorum-gated.
+pub async fn set_agent_status(
+    rpc: String,
+    password: String,
+    agent_id: String,
+    paused: bool,
+) -> Result<bool, AppError> {
+    async {
+        let agent_id = required_id(agent_id, "agent")?;
+        let rpc = rpc_client(&rpc)?;
+        // `AgentMsg` is snake_case-tagged serde over `sdk::wire` (plain JSON);
+        // the app does not depend on the agent crate, so the two owner-gated
+        // verbs are written as their wire form.
+        let verb = match paused {
+            true => "pause_agent",
+            false => "resume_agent",
+        };
+        let payload = serde_json::json!({ verb: { "agent_id": agent_id } });
+        signed_write(&rpc, "agent", encode_wire(&payload), password).await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
 }
 
 /// The local account picture: whether THIS NODE is bound, and the account's
@@ -1943,11 +2770,22 @@ pub async fn set_account_name(
     Ok(true)
 }
 
-/// One forge repo row.
-#[derive(Clone, Debug, Hash, PartialEq)]
+/// One forge repo row: the module's committed head, plus the card facts
+/// derived from the local mirror at that head.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct ForgeRepo {
     pub name: String,
     pub head: String,
+    /// The README's opening prose. Empty when the repo has none — the card
+    /// keeps its min-height rather than inventing a description.
+    pub about: String,
+    /// The extension that owns the most files at the head revision.
+    pub language: String,
+    /// The head commit's committer time in UNIX SECONDS — a real wall clock,
+    /// because a forge commit is stamped by a git client, not by consensus.
+    /// Render it with `relative_time`, NOT with `height_label_short`. 0 when
+    /// the repo has no born head.
+    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -1991,21 +2829,38 @@ pub struct ForgeItemData {
     pub change_requests: i64,
 }
 
-/// The repo namespace with committed heads.
+/// The repo namespace with committed heads, each row carrying the about line,
+/// language and last-moved stamp the repo card renders.
 pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
     async {
-        let rpc = rpc_client(&rpc)?;
-        let reply: serde_json::Value = rpc.query("forge", &serde_json::json!("list_repos")).await?;
-        let repos = reply["repos"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|repo| ForgeRepo {
-                name: repo["name"].as_str().unwrap_or_default().to_string(),
-                head: short_digest(repo["head"].as_str().unwrap_or("(unborn)")),
-            })
-            .collect();
+        let client = rpc_client(&rpc)?;
+        let reply: serde_json::Value = client
+            .query("forge", &serde_json::json!("list_repos"))
+            .await?;
+        let listed = reply["repos"].as_array().cloned().unwrap_or_default();
+        let mut deriving = Vec::with_capacity(listed.len());
+        for repo in listed {
+            let name = repo["name"].as_str().unwrap_or_default().to_string();
+            let head = repo["head"].as_str().unwrap_or("(unborn)").to_string();
+            let endpoint = rpc.clone();
+            deriving.push(tokio::task::spawn_blocking(move || {
+                let (about, language, updated_at) = repo_card_facts(&endpoint, &name, &head);
+                ForgeRepo {
+                    head: short_digest(&head),
+                    name,
+                    about,
+                    language,
+                    updated_at,
+                }
+            }));
+        }
+        let mut repos = Vec::with_capacity(deriving.len());
+        for task in deriving {
+            let row = task
+                .await
+                .map_err(|error| format!("forge about task failed: {error}"))?;
+            repos.push(row);
+        }
         Ok(ForgeData { generation, repos })
     }
     .await
@@ -2465,6 +3320,364 @@ impl Drop for ScratchDir {
     }
 }
 
+/// One entry of a repo's tree at one revision. `kind` is `dir` | `file`; a
+/// directory has no size on the wire and reads 0.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct TreeEntry {
+    pub name: String,
+    /// The full path from the repo root, so a row navigates without the view
+    /// having to re-join it against the current directory.
+    pub path: String,
+    pub kind: String,
+    pub size: i64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeTreeData {
+    pub generation: i64,
+    pub repo: String,
+    pub rev: String,
+    pub path: String,
+    pub entries: Vec<TreeEntry>,
+}
+
+/// One file's contents at one revision, in the shape the preview pane reads.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BlobView {
+    pub generation: i64,
+    pub repo: String,
+    pub rev: String,
+    pub path: String,
+    pub text: String,
+    pub truncated: bool,
+    pub binary: bool,
+    pub lines: i64,
+}
+
+/// The default revision a repo browse opens at: the integration branch the
+/// module itself prefers (`dev`, else `main`), else whatever is born.
+fn default_rev(mirror: &git2::Repository) -> Result<String, String> {
+    for preferred in ["dev", "main"] {
+        if mirror.find_branch(preferred, git2::BranchType::Local).is_ok() {
+            return Ok(preferred.to_string());
+        }
+    }
+    let branches = mirror.branches(Some(git2::BranchType::Local)).map_err(git_err)?;
+    for branch in branches {
+        let (branch, _) = branch.map_err(git_err)?;
+        if let Some(name) = branch.name().map_err(git_err)? {
+            return Ok(name.to_string());
+        }
+    }
+    Err("this repo has no born branch yet".into())
+}
+
+/// Resolve `rev` (a branch name, or empty for the default) to its commit.
+fn mirror_commit_at<'repo>(
+    mirror: &'repo git2::Repository,
+    rev: &str,
+) -> Result<git2::Commit<'repo>, String> {
+    let rev = match rev.is_empty() {
+        true => default_rev(mirror)?,
+        false => rev.to_string(),
+    };
+    let object = mirror
+        .revparse_single(&rev)
+        .map_err(|_| format!("no such revision {rev:?} in this repo"))?;
+    object.peel_to_commit().map_err(git_err)
+}
+
+/// The tree at `path` under `rev`, directories first then files, name order.
+fn read_tree(
+    mirror: &git2::Repository,
+    rev: &str,
+    path: &str,
+) -> Result<Vec<TreeEntry>, String> {
+    let commit = mirror_commit_at(mirror, rev)?;
+    let root = commit.tree().map_err(git_err)?;
+    let path = path.trim_matches('/');
+    let tree = match path.is_empty() {
+        true => root,
+        false => {
+            let entry = root
+                .get_path(Path::new(path))
+                .map_err(|_| format!("no such path {path:?} at this revision"))?;
+            entry
+                .to_object(mirror)
+                .map_err(git_err)?
+                .peel_to_tree()
+                .map_err(|_| format!("{path:?} is a file, not a directory"))?
+        }
+    };
+    let mut entries = Vec::with_capacity(tree.len());
+    for entry in tree.iter() {
+        let name = entry.name().unwrap_or_default().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let is_dir = entry.kind() == Some(git2::ObjectType::Tree);
+        let size = match is_dir {
+            true => 0,
+            false => entry
+                .to_object(mirror)
+                .ok()
+                .and_then(|object| object.into_blob().ok())
+                .map_or(0, |blob| count_i64(blob.size())),
+        };
+        entries.push(TreeEntry {
+            path: match path.is_empty() {
+                true => name.clone(),
+                false => format!("{path}/{name}"),
+            },
+            kind: match is_dir {
+                true => "dir".into(),
+                false => "file".into(),
+            },
+            name,
+            size,
+        });
+    }
+    entries.sort_by(|left, right| {
+        let dirs_lead = (right.kind == "dir").cmp(&(left.kind == "dir"));
+        dirs_lead.then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(entries)
+}
+
+/// List one repo directory at one revision. No new module wire: the app
+/// already keeps a bare mirror of every branch for the client-computed merge,
+/// so the whole tree is readable locally.
+pub async fn forge_tree(
+    rpc: String,
+    repo: String,
+    rev: String,
+    path: String,
+    generation: i64,
+) -> Result<ForgeTreeData, HydrationError> {
+    async {
+        tokio::task::spawn_blocking(move || {
+            let mirror = sync_forge_mirror(&rpc, &repo)?;
+            let entries = read_tree(&mirror, &rev, &path)?;
+            Ok::<_, String>(ForgeTreeData {
+                generation,
+                repo,
+                rev,
+                path,
+                entries,
+            })
+        })
+        .await
+        .map_err(|error| format!("forge tree task failed: {error}"))?
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The preview window one blob read returns, matching duckfs's 64 KiB cap.
+const MAX_BLOB_PREVIEW: usize = 64 * 1024;
+
+/// One blob's decoded head, its truncation flag and its line count.
+fn read_blob(
+    mirror: &git2::Repository,
+    repo: String,
+    rev: String,
+    path: String,
+    generation: i64,
+) -> Result<BlobView, String> {
+    let commit = mirror_commit_at(mirror, &rev)?;
+    let tree = commit.tree().map_err(git_err)?;
+    let entry = tree
+        .get_path(Path::new(path.trim_matches('/')))
+        .map_err(|_| format!("no such path {path:?} at this revision"))?;
+    let blob = entry
+        .to_object(mirror)
+        .map_err(git_err)?
+        .into_blob()
+        .map_err(|_| format!("{path:?} is a directory, not a file"))?;
+    let content = blob.content();
+    let truncated = content.len() > MAX_BLOB_PREVIEW;
+    let window = &content[..content.len().min(MAX_BLOB_PREVIEW)];
+    let readable = std::str::from_utf8(window)
+        .ok()
+        .filter(|text| !text.contains('\0'));
+    let Some(text) = readable else {
+        return Ok(BlobView {
+            generation,
+            repo,
+            rev,
+            path,
+            text: format!("{} binary bytes", content.len()),
+            truncated: false,
+            binary: true,
+            lines: 0,
+        });
+    };
+    Ok(BlobView {
+        generation,
+        repo,
+        rev,
+        path,
+        lines: count_i64(text.lines().count()),
+        text: text.to_string(),
+        truncated,
+        binary: false,
+    })
+}
+
+/// Read one file at one revision out of the local mirror.
+pub async fn forge_blob(
+    rpc: String,
+    repo: String,
+    rev: String,
+    path: String,
+    generation: i64,
+) -> Result<BlobView, HydrationError> {
+    async {
+        tokio::task::spawn_blocking(move || {
+            let mirror = sync_forge_mirror(&rpc, &repo)?;
+            read_blob(&mirror, repo, rev, path, generation)
+        })
+        .await
+        .map_err(|error| format!("forge blob task failed: {error}"))?
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The README names a repo browse recognizes, in preference order.
+const README_NAMES: &[&str] = &["README.md", "README", "readme.md", "README.txt"];
+
+/// The repo "about" line: the README's first prose paragraph, headings and
+/// badges skipped. Empty when there is no README — the card keeps its
+/// min-height rather than inventing a description.
+fn readme_about(mirror: &git2::Repository, commit: &git2::Commit) -> String {
+    let Ok(tree) = commit.tree() else {
+        return String::new();
+    };
+    let found = README_NAMES.iter().find_map(|name| {
+        let entry = tree.get_name(name)?;
+        let blob = entry.to_object(mirror).ok()?.into_blob().ok()?;
+        String::from_utf8(blob.content().to_vec()).ok()
+    });
+    let Some(text) = found else {
+        return String::new();
+    };
+    let prose = text.lines().map(str::trim).find(|line| {
+        let empty = line.is_empty();
+        let heading = line.starts_with('#');
+        let badge = line.starts_with('[') || line.starts_with('!');
+        !empty && !heading && !badge
+    });
+    let prose = prose.unwrap_or_default();
+    match prose.char_indices().nth(200) {
+        Some((cut, _)) => format!("{}…", &prose[..cut]),
+        None => prose.to_string(),
+    }
+}
+
+/// The repo's language, by which source extension owns the most files at the
+/// head revision.
+//
+// ponytail: a file-count heuristic over a bounded walk, not linguist's
+// byte-weighted classifier — upgrade to bytes-per-extension if a repo of
+// generated files starts reading wrong.
+fn dominant_language(commit: &git2::Commit) -> String {
+    const MAX_WALKED_ENTRIES: usize = 4096;
+    const LANGUAGES: &[(&str, &str)] = &[
+        ("rs", "Rust"),
+        ("ts", "TypeScript"),
+        ("tsx", "TypeScript"),
+        ("js", "JavaScript"),
+        ("py", "Python"),
+        ("go", "Go"),
+        ("swift", "Swift"),
+        ("kt", "Kotlin"),
+        ("java", "Java"),
+        ("c", "C"),
+        ("h", "C"),
+        ("cpp", "C++"),
+        ("rb", "Ruby"),
+        ("sh", "Shell"),
+        ("ice", "Ice"),
+        ("md", "Markdown"),
+    ];
+    let Ok(tree) = commit.tree() else {
+        return String::new();
+    };
+    let mut walked = 0usize;
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
+        walked += 1;
+        if walked > MAX_WALKED_ENTRIES {
+            return git2::TreeWalkResult::Abort;
+        }
+        let name = entry.name().unwrap_or_default();
+        let extension = name.rsplit_once('.').map(|(_, tail)| tail).unwrap_or("");
+        if let Some((_, language)) = LANGUAGES.iter().find(|(suffix, _)| *suffix == extension) {
+            *counts.entry(*language).or_default() += 1;
+        }
+        git2::TreeWalkResult::Ok
+    });
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(language, _)| language.to_string())
+        .unwrap_or_default()
+}
+
+/// One repo's card facts — about line, language, head committer time — read
+/// off the local mirror at the module's committed head. A repo whose head the
+/// mirror cannot produce renders blank rather than a guess.
+///
+/// BLOCKING: git2 walks a tree and may fetch. Callers run it on the blocking
+/// pool.
+fn repo_card_facts(endpoint: &str, repo: &str, head_oid: &str) -> (String, String, i64) {
+    const BLANK: (String, String, i64) = (String::new(), String::new(), 0);
+    let Ok(head) = git2::Oid::from_str(head_oid) else {
+        return BLANK;
+    };
+    let Ok(mirror) = mirror_holding(endpoint, repo, head) else {
+        return BLANK;
+    };
+    let Ok(commit) = mirror.find_commit(head) else {
+        return BLANK;
+    };
+    (
+        readme_about(&mirror, &commit),
+        dominant_language(&commit),
+        commit.time().seconds(),
+    )
+}
+
+/// The mirror holding `head`. The mirror IS the cache: a head the resident
+/// clone already carries costs no network, so re-listing the repos after every
+/// forge event never refetches a repo whose head has not moved.
+fn mirror_holding(endpoint: &str, repo: &str, head: git2::Oid) -> Result<git2::Repository, String> {
+    let dir = forge_mirror_dir(endpoint, repo)?;
+    let resident = git2::Repository::open_bare(&dir).ok();
+    let already_holds_head = resident.filter(|mirror| mirror.find_commit(head).is_ok());
+    match already_holds_head {
+        Some(mirror) => Ok(mirror),
+        None => sync_forge_mirror(endpoint, repo),
+    }
+}
+
+/// The listed row for `name`, so the open repo's body reads its about line,
+/// language and updated stamp out of the resident list instead of re-deriving
+/// them. An unknown name yields a blank row.
+pub fn forge_repo_row(repos: Vec<ForgeRepo>, name: String) -> ForgeRepo {
+    repos
+        .into_iter()
+        .find(|repo| repo.name == name)
+        .unwrap_or_default()
+}
+
 /// True when one live update invalidates forge state: a folded forge op, a
 /// forge replay the stream could not fold (`resync`), or the stream (re)
 /// subscribing (`ready` — anything may have landed while it was down).
@@ -2548,6 +3761,133 @@ pub async fn forge_live_refresh(
 }
 
 /// The PR stats line: `3 files · +12 −4`.
+/// One rendered line of a unified patch. `kind` is `file` | `hunk` | `add` |
+/// `del` | `ctx` — the gutters, the sign column and the row tint all key on it.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct DiffLine {
+    pub kind: String,
+    pub old_no: String,
+    pub new_no: String,
+    pub sign: String,
+    pub text: String,
+}
+
+/// One numbered source line of a blob. `number` is a string for the same reason
+/// `DiffLine.old_no` is: the gutter is a rendered column, not an integer, and
+/// the splitter owns the numbering.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct SourceLine {
+    pub number: String,
+    pub text: String,
+}
+
+/// Split a blob into numbered rows. `BlobView.text` arrives as ONE string and
+/// Ice has no string ops, so the viewer cannot walk it — this is the exact
+/// counterpart `diff_lines` already is for a patch.
+///
+/// An empty blob has no lines, not one blank line: `"".lines()` is empty and
+/// that is the reading the empty plate is drawn for.
+pub fn source_lines(text: String) -> Vec<SourceLine> {
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| SourceLine {
+            number: (index + 1).to_string(),
+            text: line.to_string(),
+        })
+        .collect()
+}
+
+/// Split a unified patch into painted rows, tracking both line counters
+/// across hunk headers.
+pub fn diff_lines(diff: String) -> Vec<DiffLine> {
+    let mut rows = Vec::new();
+    let mut old_no = 0i64;
+    let mut new_no = 0i64;
+    for line in diff.lines() {
+        let is_file_header = line.starts_with("diff ")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+            || line.starts_with("index ")
+            || line.starts_with("new file")
+            || line.starts_with("deleted file");
+        if is_file_header {
+            rows.push(diff_row("file", String::new(), String::new(), "", line));
+            continue;
+        }
+        if let Some((old_start, new_start)) = hunk_starts(line) {
+            old_no = old_start;
+            new_no = new_start;
+            rows.push(diff_row("hunk", String::new(), String::new(), "", line));
+            continue;
+        }
+        match line.chars().next() {
+            Some('+') => {
+                rows.push(diff_row("add", String::new(), new_no.to_string(), "+", &line[1..]));
+                new_no += 1;
+            }
+            Some('-') => {
+                rows.push(diff_row("del", old_no.to_string(), String::new(), "-", &line[1..]));
+                old_no += 1;
+            }
+            _ => {
+                let text = line.strip_prefix(' ').unwrap_or(line);
+                rows.push(diff_row("ctx", old_no.to_string(), new_no.to_string(), "", text));
+                old_no += 1;
+                new_no += 1;
+            }
+        }
+    }
+    rows
+}
+
+fn diff_row(kind: &str, old_no: String, new_no: String, sign: &str, text: &str) -> DiffLine {
+    DiffLine {
+        kind: kind.into(),
+        old_no,
+        new_no,
+        sign: sign.into(),
+        text: text.to_string(),
+    }
+}
+
+/// `@@ -138,9 +138,12 @@ …` → the two start line numbers.
+fn hunk_starts(line: &str) -> Option<(i64, i64)> {
+    let body = line.strip_prefix("@@ ")?;
+    let (ranges, _) = body.split_once(" @@")?;
+    let (old, new) = ranges.split_once(' ')?;
+    let start = |range: &str| -> Option<i64> {
+        let digits = range.trim_start_matches(['-', '+']);
+        digits.split(',').next()?.parse().ok()
+    };
+    Some((start(old)?, start(new)?))
+}
+
+/// The tracker's Pull requests / Issues split.
+pub fn filter_forge_items(items: Vec<ForgeItem>, kind: String) -> Vec<ForgeItem> {
+    items.into_iter().filter(|item| item.kind == kind).collect()
+}
+
+/// The tab count chips — open work only: a PR counts until it merges, an
+/// issue until it closes.
+pub fn forge_open_count(items: Vec<ForgeItem>, kind: String) -> i64 {
+    count_i64(
+        items
+            .iter()
+            .filter(|item| item.kind == kind)
+            .filter(|item| match kind.as_str() {
+                "pr" => item.state != "merged",
+                _ => item.state == "open",
+            })
+            .count(),
+    )
+}
+
+// There is NO forge write gate, and this file used to invent one. `MergePr`,
+// `SubmitReview` and the tracker verbs each check only `author_from_origin`
+// (crates/modules/apps/forge/src/lib.rs) — any user key may merge, and this
+// node's valset seat is not even the axis the write is signed on. A refusal
+// plate over an action the chain accepts is worse than no plate.
+
 pub fn forge_stats(files: i64, additions: i64, deletions: i64) -> String {
     format!("{files} files · +{additions} −{deletions}")
 }
@@ -2606,7 +3946,7 @@ pub fn keep_forge_reviews(
     if loaded { next } else { current }
 }
 
-/// One shell navigation entry.
+/// One shell navigation entry. `live` is the capsule's pulse dot.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NavItem {
     pub id: String,
@@ -2614,6 +3954,7 @@ pub struct NavItem {
     pub icon: String,
     pub badge: i64,
     pub active: bool,
+    pub live: bool,
 }
 
 /// `3 validators · 2 residents` — the machine subtitle beside the Members title.
@@ -2621,10 +3962,12 @@ pub fn members_summary(validators: i64, residents: i64) -> String {
     format!("{validators} validators · {residents} residents")
 }
 
-/// `4 agents · 2 active` — the Agents title's machine subtitle.
+/// `4 agents · 2 working` — the Agents title's machine subtitle. `working` is
+/// runs in flight, not `AgentStatus::Active`: Active is the registration
+/// default and would report every registered agent as busy forever.
 pub fn agents_summary(rows: Vec<AgentRow>) -> String {
-    let active = rows.iter().filter(|row| row.status == "active").count();
-    format!("{} agents · {active} active", rows.len())
+    let working = rows.iter().filter(|row| row.live).count();
+    format!("{} agents · {working} working", rows.len())
 }
 
 /// `12 open · 3 settled` — the Approvals title's machine subtitle.
@@ -2633,15 +3976,25 @@ pub fn proposals_summary(rows: Vec<ProposalRow>) -> String {
     format!("{open} open · {} settled", rows.len() - open)
 }
 
-/// One seat per elector, filled for each approval already in — the quorum dots.
-/// Capped so a large electorate does not overflow the card.
+/// `N pending` — the header count, open proposals only.
+pub fn pending_label(rows: Vec<ProposalRow>) -> String {
+    format!("{} pending", rows.iter().filter(|row| row.open).count())
+}
+
+/// The settled half of the register — the RECENTLY FINALIZED column.
+pub fn settled_proposals(rows: Vec<ProposalRow>) -> Vec<ProposalRow> {
+    rows.into_iter().filter(|row| !row.open).collect()
+}
+
+/// One seat per REQUIRED signature, filled for each approval already in —
+/// the quorum dots. Capped so a large threshold does not overflow the card.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct QuorumSeat {
     pub filled: bool,
 }
 
-pub fn quorum_dots(approvals: i64, electorate: i64) -> Vec<QuorumSeat> {
-    let seats = electorate.clamp(0, 12) as usize;
+pub fn quorum_dots(approvals: i64, required: i64) -> Vec<QuorumSeat> {
+    let seats = required.clamp(0, 12) as usize;
     (0..seats)
         .map(|seat| QuorumSeat {
             filled: (seat as i64) < approvals,
@@ -2649,15 +4002,67 @@ pub fn quorum_dots(approvals: i64, electorate: i64) -> Vec<QuorumSeat> {
         .collect()
 }
 
+/// `3 / 4` — the tally, one mono run.
+pub fn tally_label(approvals: i64, required: i64) -> String {
+    format!("{approvals} / {required}")
+}
+
+/// `tally_label` for two readings that are ALREADY rendered — the consensus
+/// trio off `/v1/status` is optional per field, so each arrives as its own
+/// `optional_number` string (`—` when the node reports nothing). Joining the
+/// numbers instead would mean carrying them as `i64` and printing a measured
+/// `0` for "not reported".
+pub fn reading_pair(left: impl AsRef<str>, right: impl AsRef<str>) -> String {
+    format!("{} / {}", left.as_ref(), right.as_ref())
+}
+
+/// `near` one vote from quorum (or past it), else `far` — success vs meta ink.
+pub fn tally_tone(approvals: i64, required: i64) -> String {
+    match approvals >= required.saturating_sub(1) {
+        true => "near".into(),
+        false => "far".into(),
+    }
+}
+
+/// `3 approvals · 1 more for quorum`, or `quorum met`.
+pub fn tally_note(approvals: i64, required: i64) -> String {
+    let remaining = required.saturating_sub(approvals);
+    if remaining <= 0 {
+        return "quorum met".into();
+    }
+    format!("{approvals} approvals · {remaining} more for quorum")
+}
+
+/// The approve button leans forward at the last vote: `Approve →`.
+pub fn approve_label(approvals: i64, required: i64) -> String {
+    match approvals + 1 >= required {
+        true => "Approve →".into(),
+        false => "Approve".into(),
+    }
+}
+
+/// The kind pill's two tones: an access-class action reads `access`.
+pub fn proposal_kind_tone(action: String) -> String {
+    let access = matches!(
+        action.as_str(),
+        "add_validator" | "add_resident" | "remove_validator" | "remove_resident" | "grant_client"
+    );
+    match access {
+        true => "access".into(),
+        false => "neutral".into(),
+    }
+}
+
 /// How many proposals are still open — the count the rail pins to Approvals.
 pub fn open_proposals(rows: Vec<ProposalRow>) -> i64 {
     rows.iter().filter(|row| row.open).count() as i64
 }
 
-/// The rail's module navigation, in the artifact's order, the active pane
-/// flagged. Modules join the shell by joining this list. `settings` is not
-/// here: the rail pins it to its own footer beside the account avatar.
-pub fn shell_nav(tab: String, approvals: i64) -> Vec<NavItem> {
+/// The rail's module navigation: EIGHT seats, in the artifact's order, the
+/// active pane flagged. Modules join the shell by joining this list. `settings`
+/// is not here (the rail pins it to its own footer beside the account avatar),
+/// and neither is `node` — the node surface lives under Settings.
+pub fn shell_nav(tab: String, approvals: i64, agent_live: bool) -> Vec<NavItem> {
     [
         ("chat", "Chat", "nav-chat"),
         ("pages", "Pages", "nav-pages"),
@@ -2667,7 +4072,6 @@ pub fn shell_nav(tab: String, approvals: i64) -> Vec<NavItem> {
         ("explorer", "Explorer", "nav-explorer"),
         ("members", "Members", "nav-members"),
         ("governance", "Approvals", "shield-check"),
-        ("node", "Node", "node"),
     ]
     .into_iter()
     .map(|(id, title, icon)| NavItem {
@@ -2676,6 +4080,7 @@ pub fn shell_nav(tab: String, approvals: i64) -> Vec<NavItem> {
         icon: icon.into(),
         badge: if id == "governance" { approvals } else { 0 },
         active: id == tab,
+        live: id == "forge" && agent_live,
     })
     .collect()
 }
@@ -2708,6 +4113,391 @@ fn ducktape_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".ducktape"))
 }
 
+/// The CLI's workspace registry: `<ducktape home>/workspaces`. `node init` and
+/// `node join` materialize one directory per network in here, so the directory
+/// listing IS the registry — there is no index file to keep in sync.
+fn workspaces_root() -> Option<PathBuf> {
+    ducktape_home().map(|home| home.join("workspaces"))
+}
+
+/// Every registered workspace as `(chain id, directory)`: a directory holding
+/// a `node.toml` is a workspace, whatever else it contains.
+fn registered_workspaces() -> Vec<(String, PathBuf)> {
+    let Some(root) = workspaces_root() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut workspaces: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|dir| dir.join("node.toml").is_file())
+        .filter_map(|dir| {
+            let name = dir.file_name()?.to_str()?.to_string();
+            Some((name, dir))
+        })
+        .collect();
+    workspaces.sort();
+    workspaces
+}
+
+/// One value out of a workspace's `node.toml` (`key = "value"`). The file is
+/// written key-per-line by `write_node_toml`, so this reads it without a toml
+/// parser the app would otherwise not need.
+fn node_toml_value(dir: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("node.toml")).ok()?;
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(name, _)| name.trim() == key)
+        .map(|(_, value)| {
+            value
+                .split('#')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .trim_matches(['"', '\''])
+                .to_string()
+        })
+}
+
+/// This workspace's app endpoint, from its `http_listen`.
+fn workspace_endpoint(dir: &Path) -> Option<String> {
+    node_toml_value(dir, "http_listen").map(|listen| format!("http://{listen}"))
+}
+
+/// The registered workspace this app is pointed at, matched on the endpoint it
+/// is actually connected to.
+fn workspace_at(rpc: &str) -> Option<(String, PathBuf)> {
+    let endpoint = canonical_endpoint(rpc.to_string());
+    registered_workspaces()
+        .into_iter()
+        .find(|(_, dir)| workspace_endpoint(dir).as_deref() == Some(endpoint.as_str()))
+}
+
+/// Workspaces this device has been told to forget — device-local, never wire
+/// state. The directories stay on disk; the console simply stops offering them.
+fn forgotten_workspaces() -> Vec<String> {
+    read_prefs()["forgotten_workspaces"]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Which shell to mount: `console` once this device holds a workspace it has
+/// not forgotten, else `welcome`.
+pub fn onboarding_phase() -> String {
+    let forgotten = forgotten_workspaces();
+    let has_workspace = registered_workspaces()
+        .into_iter()
+        .any(|(chain_id, _)| !forgotten.contains(&chain_id));
+    match has_workspace {
+        true => "console".into(),
+        false => "welcome".into(),
+    }
+}
+
+/// What `node init` / `node join` hand back: the network's id, where it
+/// materialized, and the endpoint this app should connect to.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct WorkspaceInit {
+    pub chain_id: String,
+    pub workspace: String,
+    pub rpc: String,
+}
+
+/// A workspace name as its directory slug: lowercase, anything outside
+/// `[a-z0-9-]` folded to `-`, trimmed.
+pub fn network_slug(name: String) -> String {
+    let folded: String = name
+        .to_lowercase()
+        .chars()
+        .map(|character| match character.is_ascii_alphanumeric() {
+            true => character,
+            false => '-',
+        })
+        .collect();
+    folded.trim_matches('-').to_string()
+}
+
+/// Found a network on this device: `ducktape node init --name <name>` mints
+/// the chain id, the identity and the workspace directory.
+pub async fn create_network(name: String) -> Result<WorkspaceInit, AppError> {
+    async {
+        let name = bounded_text(name, "network name", 128)?;
+        let chain_id = ducktape_cli(&["node", "init", "--name", &name]).await?;
+        workspace_init(&chain_id)
+    }
+    .await
+    .map_err(app_error)
+}
+
+/// Materialize this device's workspace from an invite blob:
+/// `ducktape node join <blob>`.
+pub async fn join_network(blob: String) -> Result<WorkspaceInit, AppError> {
+    async {
+        let blob = bounded_text(blob, "invite", 64 * 1024)?;
+        // `join` reports progress on stderr, so the workspace it materialized
+        // is identified by diffing the registry around the call.
+        let before: BTreeSet<String> = registered_workspaces()
+            .into_iter()
+            .map(|(chain_id, _)| chain_id)
+            .collect();
+        ducktape_cli(&["node", "join", &blob]).await?;
+        let chain_id = registered_workspaces()
+            .into_iter()
+            .map(|(chain_id, _)| chain_id)
+            .find(|chain_id| !before.contains(chain_id))
+            .ok_or_else(|| "the invite did not materialize a workspace".to_string())?;
+        workspace_init(&chain_id)
+    }
+    .await
+    .map_err(app_error)
+}
+
+/// Mint a single-use bearer invite for a workspace: `ducktape node invite`
+/// prints the `🦆…` blob on stdout. This WRITES (it folds this member's dial
+/// hint into the descriptor), so it is not a read-only probe.
+pub async fn mint_invite(workspace: String, role: String, ttl_days: i64) -> Result<String, AppError> {
+    async {
+        let role = match role.as_str() {
+            "client" => "client",
+            "resident" => "resident",
+            other => return Err(format!("unknown invite role `{other}`")),
+        };
+        let ttl = ttl_days.clamp(1, 365).to_string();
+        ducktape_cli(&[
+            "node",
+            "invite",
+            "-n",
+            &workspace,
+            "--role",
+            role,
+            "--ttl-days",
+            &ttl,
+        ])
+        .await
+    }
+    .await
+    .map_err(app_error)
+}
+
+/// The workspace facts of a freshly registered chain id.
+fn workspace_init(chain_id: &str) -> Result<WorkspaceInit, String> {
+    let (chain_id, dir) = registered_workspaces()
+        .into_iter()
+        .find(|(id, _)| id == chain_id)
+        .ok_or_else(|| format!("{chain_id} is not in the workspace registry"))?;
+    let rpc = workspace_endpoint(&dir)
+        .ok_or_else(|| "the new workspace has no node.toml http_listen".to_string())?;
+    Ok(WorkspaceInit {
+        chain_id,
+        workspace: dir.display().to_string(),
+        rpc,
+    })
+}
+
+/// Run one `ducktape` verb and return its stdout's last non-empty line — the
+/// CLI's machine value (diagnostics ride stderr).
+async fn ducktape_cli(args: &[&str]) -> Result<String, String> {
+    let mut command = tokio::process::Command::new(ducktape_binary());
+    command.args(args).kill_on_drop(true);
+    let output = tokio::time::timeout(CLI_TIMEOUT, command.output())
+        .await
+        .map_err(|_| format!("ducktape {} timed out", args.join(" ")))?
+        .map_err(|error| {
+            format!("could not start the ducktape CLI ({error}); build node-bin or set DUCKTAPE_BIN")
+        })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ducktape {} refused: {}",
+            args.join(" "),
+            bounded_detail(&detail)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .ok_or_else(|| format!("ducktape {} returned nothing", args.join(" ")))
+}
+
+/// One provisioning step. `state` is `done` | `running` | `pending` | `blocked`.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ProvisionStep {
+    pub index: i64,
+    pub label: String,
+    pub state: String,
+    /// `state == "done"`, as a Copy field. The onboarding handler has to decide
+    /// whether the phase advances BEFORE it moves the step into the reading,
+    /// and reading `state` there would move the String out from under it.
+    pub settled: bool,
+}
+
+/// The five provisioning steps. Steps 1-3 are facts of the materialized
+/// workspace; steps 4-5 are a REAL `/v1/status` poll, because the app attaches
+/// to a node it does not supervise — when nothing answers, the step goes
+/// `blocked` and its label says which command starts it.
+pub fn provision_progress(
+    workspace: String,
+    rpc: String,
+) -> iced::futures::stream::BoxStream<'static, ProvisionStep> {
+    struct State {
+        dir: Option<PathBuf>,
+        chain_id: String,
+        rpc: String,
+        step: usize,
+        attempts: u32,
+    }
+    let found = registered_workspaces()
+        .into_iter()
+        .find(|(chain_id, dir)| *chain_id == workspace || dir.display().to_string() == workspace);
+    let (chain_id, dir) = match found {
+        Some((chain_id, dir)) => (chain_id, Some(dir)),
+        None => (workspace, None),
+    };
+    Box::pin(iced::futures::stream::unfold(
+        State {
+            dir,
+            chain_id,
+            rpc,
+            step: 0,
+            attempts: 0,
+        },
+        |mut state| async move {
+            // the workspace's own facts, then the node's own answer.
+            match state.step {
+                0 => {
+                    state.step = 1;
+                    let home = ducktape_home()
+                        .map(|home| home.display().to_string())
+                        .unwrap_or_else(|| "~/.ducktape".into());
+                    Some((registered_step(1, &format!("Workspace registered · {home}"), state.dir.is_some()), state))
+                }
+                1 => {
+                    state.step = 2;
+                    let key = state
+                        .dir
+                        .as_deref()
+                        .and_then(workspace_identity)
+                        .unwrap_or_default();
+                    let known = !key.is_empty();
+                    Some((registered_step(2, &format!("Admin keypair · {key}"), known), state))
+                }
+                2 => {
+                    state.step = 3;
+                    let ready = state
+                        .dir
+                        .as_ref()
+                        .is_some_and(|dir| dir.join("network.toml").is_file());
+                    // the artifact writes this step's tail in Korean; the shell
+                    // is English, so it ships as what that clause says.
+                    Some((registered_step(3, "Workspace ready · invite links available", ready), state))
+                }
+                3 => {
+                    // the app attaches to a node it does not supervise: the
+                    // only honest readiness signal is the node answering.
+                    let up = match rpc_client(&state.rpc) {
+                        Ok(client) => client.status().await.is_ok(),
+                        Err(_) => false,
+                    };
+                    if up {
+                        state.step = 4;
+                        return Some((registered_step(4, "Local node starting", true), state));
+                    }
+                    state.attempts += 1;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let stalled = state.attempts >= PROVISION_PATIENCE;
+                    let step = match stalled {
+                        false => ProvisionStep {
+                            index: 4,
+                            label: "Local node starting".into(),
+                            state: "running".into(),
+                            settled: false,
+                        },
+                        true => ProvisionStep {
+                            index: 4,
+                            label: format!("Start the node · ducktape node run -n {}", state.chain_id),
+                            state: "blocked".into(),
+                            settled: false,
+                        },
+                    };
+                    Some((step, state))
+                }
+                4 => {
+                    let listen = state
+                        .dir
+                        .as_deref()
+                        .and_then(|dir| node_toml_value(dir, "http_listen"))
+                        .unwrap_or_else(|| state.rpc.clone());
+                    state.step = 5;
+                    Some((
+                        ProvisionStep {
+                            index: 5,
+                            label: format!("Node API listening · {listen}"),
+                            state: "done".into(),
+                            settled: true,
+                        },
+                        state,
+                    ))
+                }
+                // every step has reported; the console takes over.
+                _ => None,
+            }
+        },
+    ))
+}
+
+/// A step whose fact is either established or missing.
+fn registered_step(index: i64, label: &str, established: bool) -> ProvisionStep {
+    ProvisionStep {
+        index,
+        label: label.to_string(),
+        state: match established {
+            true => "done".into(),
+            false => "blocked".into(),
+        },
+        settled: established,
+    }
+}
+
+/// The workspace's own node identity, short — `network.toml` seats it as the
+/// founding validator, so a fresh network's admin key is readable there.
+fn workspace_identity(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("network.toml")).ok()?;
+    let line = text.lines().find(|line| line.trim_start().starts_with("validators"))?;
+    let key = line.split('"').nth(1)?;
+    Some(short_label(key))
+}
+
+/// Forget this workspace on THIS DEVICE: it stops being offered by the shell
+/// and its view prefs are dropped. The directory, the identity and the chain
+/// are untouched — this is not a leave-the-network op.
+pub async fn forget_workspace(rpc: String) -> Result<bool, AppError> {
+    let Some((chain_id, _)) = workspace_at(&rpc) else {
+        return Err(app_error(
+            "this endpoint is not one of this device's registered workspaces".into(),
+        ));
+    };
+    let mut prefs = read_prefs();
+    let mut forgotten = forgotten_workspaces();
+    if !forgotten.contains(&chain_id) {
+        forgotten.push(chain_id);
+    }
+    prefs["forgotten_workspaces"] = serde_json::json!(forgotten);
+    if let Some(tabs) = prefs["doc_tabs"].as_object_mut() {
+        tabs.remove(&canonical_endpoint(rpc));
+    }
+    Ok(write_prefs(&prefs))
+}
+
 /// The titlebar's chain label: the workspace this app is pointed at, then the
 /// bound account, then the endpoint's host, then the product name.
 pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
@@ -2730,13 +4520,65 @@ pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> Str
     host.to_string()
 }
 
+/// A consensus stamp at or above this is unix MILLIS, not a block height.
+///
+/// `consensus_time` is stamped `= height` by the validator lane
+/// (bin/noded/src/index.rs) and `= unix_millis()` by a single-writer noded
+/// (bin/noded/src/main.rs), and every module record time is that value. No
+/// chain reaches 10^12 blocks and no unix-millis clock has ever been below it,
+/// so the two lanes are told apart by the magnitude alone. Rendering the millis
+/// lane as a height is how `h 1,753,622,400,000` reaches the screen.
+const MILLIS_LANE_FLOOR: i64 = 1_000_000_000_000;
+
+/// The wall clock a stamp carries when it came off the unix-millis lane.
+fn wall_clock_seconds(stamp: i64) -> Option<i64> {
+    match stamp >= MILLIS_LANE_FLOOR {
+        true => Some(stamp / 1_000),
+        false => None,
+    }
+}
+
 /// The titlebar's machine value: `h 84,912`, grouped the way the artifact
-/// writes heights. A height the node has not reported yet reads `h —`.
+/// writes heights. A height the node has not reported yet reads `h —`; a
+/// unix-millis stamp reads as the wall clock it actually is.
 pub fn height_label(height: i64) -> String {
     if height < 0 {
         return "h —".into();
     }
-    let digits = height.to_string();
+    if let Some(seconds) = wall_clock_seconds(height) {
+        return relative_time(seconds);
+    }
+    format!("h {}", grouped_digits(height))
+}
+
+/// The same `h 84,912` run under the name the record-meta call sites use, where
+/// the artifact printed a wall clock the validator lane cannot supply. One
+/// renderer on purpose — the two names mark the two slots, not two formats.
+pub fn height_label_short(height: i64) -> String {
+    height_label(height)
+}
+
+/// The honest renderer for a consensus-stamped record time: `412 blocks ago`,
+/// `1 block ago`, `this block` — or, on the unix-millis lane, the real elapsed
+/// wall clock. A record with no stamp prints nothing.
+pub fn height_ago(then_height: i64, now_height: i64) -> String {
+    if then_height <= 0 {
+        return String::new();
+    }
+    if let Some(seconds) = wall_clock_seconds(then_height) {
+        return relative_time(seconds);
+    }
+    let elapsed = now_height.saturating_sub(then_height);
+    match elapsed {
+        blocks if blocks <= 0 => "this block".into(),
+        1 => "1 block ago".into(),
+        blocks => format!("{} blocks ago", grouped_digits(blocks)),
+    }
+}
+
+/// A non-negative count with thousands separators: `84,912`.
+fn grouped_digits(value: i64) -> String {
+    let digits = value.max(0).to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
         let boundary = index > 0 && (digits.len() - index).is_multiple_of(3);
@@ -2745,7 +4587,134 @@ pub fn height_label(height: i64) -> String {
         }
         grouped.push(digit);
     }
-    format!("h {grouped}")
+    grouped
+}
+
+/// TWO uppercase letters for a 28px+ avatar plate: the initials of the first
+/// two words, else the first two alphanumerics of one word.
+pub fn initials_of(name: impl AsRef<str>) -> String {
+    let name = name.as_ref();
+    let words: Vec<&str> = name.split_whitespace().take(2).collect();
+    if words.len() == 2 {
+        let letters: String = words
+            .iter()
+            .filter_map(|word| word.chars().find(char::is_ascii_alphanumeric))
+            .collect();
+        if letters.chars().count() == 2 {
+            return letters.to_uppercase();
+        }
+    }
+    let letters: String = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(2)
+        .collect();
+    match letters.is_empty() {
+        true => "?".into(),
+        false => letters.to_uppercase(),
+    }
+}
+
+/// `2h ago` / `40m ago` / `just now`, for a genuine UNIX-SECONDS stamp.
+///
+/// In this app exactly two values qualify, both off `/v1/status`:
+/// `NodeFacts.last_finalized_at` and `operations.phase_since`. NEVER call it on
+/// a module record's time — the consensus validator stamps `consensus_time =
+/// height` (bin/noded/src/index.rs) and a single-writer noded stamps unix
+/// MILLIS, so a record time is a block height, not seconds. Render those with
+/// [`height_ago`] / [`height_label_short`].
+pub fn relative_time(unix_seconds: i64) -> String {
+    if unix_seconds <= 0 {
+        return String::new();
+    }
+    let elapsed = now_seconds().saturating_sub(unix_seconds);
+    if elapsed < 60 {
+        return "just now".into();
+    }
+    let (value, unit) = duration_parts(elapsed);
+    format!("{value}{unit} ago")
+}
+
+/// `expires in 412 blocks`; a passed deadline reads `expired`. A governance
+/// deadline is `consensus_time + voting_period`, so on the validator lane it is
+/// a HEIGHT and the remaining span is counted in blocks — never in hours. On
+/// the unix-millis lane the same field genuinely is a clock, and `height` is
+/// not comparable to it at all, so that lane is counted against the wall.
+pub fn expires_in_blocks(deadline_height: i64, height: i64) -> String {
+    if let Some(seconds) = wall_clock_seconds(deadline_height) {
+        let remaining = seconds.saturating_sub(now_seconds());
+        if remaining <= 0 {
+            return "expired".into();
+        }
+        let (value, unit) = duration_parts(remaining);
+        return format!("expires in {value}{unit}");
+    }
+    let remaining = deadline_height.saturating_sub(height);
+    match remaining {
+        blocks if blocks <= 0 => "expired".into(),
+        1 => "expires in 1 block".into(),
+        blocks => format!("expires in {} blocks", grouped_digits(blocks)),
+    }
+}
+
+/// A span in seconds as its largest whole unit: `(45, "m")`, `(23, "h")`.
+fn duration_parts(seconds: i64) -> (i64, &'static str) {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    match seconds {
+        span if span < HOUR => (span / MINUTE, "m"),
+        span if span < DAY => (span / HOUR, "h"),
+        span => (span / DAY, "d"),
+    }
+}
+
+// A wall clock (`14:32`) and a day divider (`Today`) are DELIBERATELY absent:
+// a module record's stamp is a block height on a validator network and unix
+// millis on a single-writer node, so neither could be rendered honestly. The
+// artifact's clock is divergence, not a gap — see height_ago/height_label_short.
+
+/// Elapsed `mm:ss` for the huddle pills and panel.
+pub fn mmss(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// The wall clock, unix seconds.
+fn now_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// A serde-tagged enum's variant name, whether it rode as a bare string
+/// (unit variant) or as a single-key object (payload variant).
+fn tagged_name(value: &serde_json::Value) -> String {
+    value.as_str().map(str::to_string).unwrap_or_else(|| {
+        value
+            .as_object()
+            .and_then(|tagged| tagged.keys().next().cloned())
+            .unwrap_or_default()
+    })
+}
+
+/// A serde `Vec<u8>` as it arrives over JSON: an array of numbers.
+fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
+    value
+        .as_array()
+        .map(|bytes| {
+            bytes
+                .iter()
+                .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A module payload in its wire form — `sdk::wire` is serde_json bytes.
+fn encode_wire(payload: &serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(payload).unwrap_or_default()
 }
 
 /// The first grapheme of a display name, upper-cased, for an avatar plate.
@@ -2870,6 +4839,55 @@ pub fn bell_unread_after(unread: i64, items: Vec<BellItem>, delta: BellDelta) ->
 /// The mark-read watermark of the current list.
 pub fn bell_head(items: Vec<BellItem>) -> i64 {
     inbox::client::bell_head_seq(&items)
+}
+
+/// One notification's severity — `info` | `warn` | `error` — for the row dot,
+/// the INFO/WARN/ALERT chip and the badge tint.
+///
+/// THE WIRE CARRIES NO SEVERITY. `Notification` is seq/member/kind/body/source/
+/// created_at/read (crates/modules/apps/inbox/src/interface.rs), so this is a
+/// PROJECTION of the delivering module's `kind` token, not a field anything
+/// signed. A kind this mapping does not name reads `info`: an unclassified
+/// notice is a notice, never an alarm.
+pub fn bell_severity(kind: String) -> String {
+    const WARN: &[&str] = &[
+        "review_requested",
+        "changes_requested",
+        "proposal_opened",
+        "vote_needed",
+        "run_cancelled",
+        "quota",
+    ];
+    const ERROR: &[&str] = &["failed", "error", "rejected", "conflict", "revoked"];
+    let kind = kind.to_lowercase();
+    let names_error = ERROR.iter().any(|token| kind.contains(token));
+    let names_warning = WARN.iter().any(|token| kind.contains(token));
+    // These three strings ARE the tone vocabulary `PulseDot`, `StillDot` and
+    // `BellBadge` match on. They used to be `error`/`warn`, which no arm of
+    // `BellBadge` carried, so a failed run painted the badge info-blue through
+    // the fallthrough. One name per severity, spoken everywhere.
+    match (names_error, names_warning) {
+        (true, _) => "danger".into(),
+        (false, true) => "warning".into(),
+        (false, false) => "info".into(),
+    }
+}
+
+/// The worst severity among the UNREAD rows, for the bell badge's tint —
+/// `info` when nothing is unread.
+pub fn bell_worst_severity(items: Vec<BellItem>) -> String {
+    let severities: Vec<String> = items
+        .iter()
+        .filter(|item| !item.read)
+        .map(|item| bell_severity(item.kind.clone()))
+        .collect();
+    let any_error = severities.iter().any(|severity| severity == "danger");
+    let any_warning = severities.iter().any(|severity| severity == "warning");
+    match (any_error, any_warning) {
+        (true, _) => "danger".into(),
+        (false, true) => "warning".into(),
+        (false, false) => "info".into(),
+    }
 }
 
 /// One explorer block row.
@@ -3316,6 +5334,7 @@ pub struct LiveRefresh {
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
     pub active_channel_huddle_count: i64,
+    pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
     pub pages_loaded: bool,
     pub pages: Vec<PageItem>,
@@ -3354,6 +5373,7 @@ pub async fn live_resync_load(
             active_channel_archived: false,
             active_channel_members_only: false,
             active_channel_huddle_count: 0,
+            huddle_roster: Vec::new(),
             channel_members: Vec::new(),
             pages_loaded: false,
             pages: Vec::new(),
@@ -3376,6 +5396,7 @@ pub async fn live_resync_load(
             refresh.active_channel_archived = chat.active_channel_archived;
             refresh.active_channel_members_only = chat.active_channel_members_only;
             refresh.active_channel_huddle_count = chat.active_channel_huddle_count;
+            refresh.huddle_roster = chat.huddle_roster;
             refresh.channel_members = chat.channel_members;
         }
         if load_pages {
@@ -3432,6 +5453,14 @@ pub fn keep_members(
     current: Vec<ChatMember>,
 ) -> Vec<ChatMember> {
     if loaded { next } else { current }
+}
+
+/// The huddle roster, kept only while this device is IN the huddle. Every chat
+/// load carries the roster of the channel it loaded, so a load of any other
+/// channel must not leave the popped panel painting strangers — dropping it is
+/// the same guard `huddle_channel` itself carries.
+pub fn keep_roster(joined: bool, next: Vec<HuddleParticipant>) -> Vec<HuddleParticipant> {
+    if joined { next } else { Vec::new() }
 }
 
 pub fn keep_pages(loaded: bool, next: Vec<PageItem>, current: Vec<PageItem>) -> Vec<PageItem> {
@@ -3531,6 +5560,187 @@ pub async fn create_channel(
             .map_err(committed_error)
     }
     .await
+}
+
+/// One peer of the DM directory. There is no `status`: presence has no source
+/// anywhere in the product, and a dot that always reads "offline" is a lie.
+///
+/// `is_agent` is always false today — see [`load_dm_peers`].
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct DmPeer {
+    pub key: String,
+    pub name: String,
+    pub initials: String,
+    pub is_agent: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct DmPeersData {
+    pub generation: i64,
+    pub peers: Vec<DmPeer>,
+}
+
+/// The people this device can open a DM with, one row per identity account.
+///
+/// Registered agents are NOT here: a DM is a chat channel seated on public
+/// KEYS, and an agent id is an arbitrary string that [`open_dm`]'s
+/// `public_key()` would reject outright. Until an agent is addressable as a
+/// channel member, an agent row in this directory would be a button that
+/// cannot work.
+///
+/// ponytail: the row is keyed on `account_id`, the account's FOUNDING member
+/// key, so a multi-device account is reachable only at that key. Pair-wide DMs
+/// need account-keyed membership in the chat module itself.
+pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let me = local_user_key().await.map(|key| hex_encode(&key));
+        let reply: serde_json::Value = client
+            .query(
+                "identity",
+                &serde_json::json!({ "all": { "from": 0, "limit": 256 } }),
+            )
+            .await?;
+        let mut peers: Vec<DmPeer> = Vec::new();
+        for account in reply["accounts"].as_array().cloned().unwrap_or_default() {
+            // self is any account THIS key is a member of — comparing against
+            // `account_id` alone puts a second device in its own directory.
+            let mine = account["member_keys"].as_array().is_some_and(|keys| {
+                keys.iter().any(|member| {
+                    me.as_deref() == Some(hex_encode(&json_bytes(&member["pubkey"])).as_str())
+                })
+            });
+            if mine {
+                continue;
+            }
+            let key = hex_encode(&json_bytes(&account["account_id"]));
+            let name = match account["display_name"].as_str() {
+                Some(name) if !name.is_empty() => name.to_string(),
+                _ => short_label(&key),
+            };
+            peers.push(DmPeer {
+                initials: initials_of(&name),
+                is_agent: false,
+                key,
+                name,
+            });
+        }
+        Ok(DmPeersData { generation, peers })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The two-party channel id of a pair of member keys, derived by the chat
+/// module's own client so the app and the module agree on one id.
+///
+/// It carries NO ':' deliberately: chat refuses a user-authored channel id in
+/// the module namespace (`crates/modules/apps/chat/src/lib.rs`,
+/// `validate_channel_namespace`), and a DM is created by the pair's own user
+/// key. `chat::client`'s test round-trips the minted id against that rule.
+pub fn dm_channel_id(a: String, b: String) -> String {
+    chat::client::dm_channel_id(&a, &b)
+}
+
+/// The channel list MINUS this viewer's DMs. A DM *is* an ordinary chat
+/// channel, so it arrives in the same listing as the rooms and used to appear
+/// twice over — once under CHANNELS wearing its derived id as a name, and once
+/// under DIRECT wearing the peer's. The id is DERIVED, so this needs no
+/// per-channel membership (which the list projection does not carry): a
+/// channel is this viewer's DM exactly when its id is `dm_channel_id(me, peer)`
+/// for some peer in the directory. A user-created channel cannot fake the id —
+/// the module's namespace rule reserves it for the pair's own keys.
+pub fn rooms_only(
+    channels: Vec<ChatChannel>,
+    peers: Vec<DmPeer>,
+    me: String,
+) -> Vec<ChatChannel> {
+    if me.is_empty() {
+        return channels;
+    }
+    let dm_ids: BTreeSet<String> = peers
+        .iter()
+        .map(|peer| dm_channel_id(me.clone(), peer.key.clone()))
+        .collect();
+    channels
+        .into_iter()
+        .filter(|channel| !dm_ids.contains(&channel.id))
+        .collect()
+}
+
+/// Open the DM with one peer: resolve the deterministic channel when it
+/// exists, else create it members-only and seat both keys, then load it.
+///
+/// NOT confidential. `MembersOnly` gates who may POST; every node replicates
+/// the channel's plaintext, so a DM is a two-person room, not a private one.
+/// Any copy on this surface that promises secrecy is a lie about the wire.
+pub async fn open_dm(
+    rpc: String,
+    password: String,
+    peer_key: String,
+) -> Result<ChatData, AppError> {
+    async {
+        let peer = public_key(&peer_key, "peer public key")?;
+        let me = local_user_key()
+            .await
+            .ok_or_else(|| "this device has no user key — a DM needs one".to_string())?;
+        let channel_id = dm_channel_id(hex_encode(&me), hex_encode(&peer));
+        let client = rpc_client(&rpc)?;
+        let existing = load_chat_data(&client, Some(&channel_id)).await?;
+        if existing.active_channel == channel_id {
+            return Ok(existing);
+        }
+        signed_write(
+            &client,
+            "chat",
+            chat::encode_msg(&ChatMsg::CreateChannel {
+                channel_id: channel_id.clone(),
+                name: short_label(&hex_encode(&peer)),
+                post_policy: PostPolicy::MembersOnly,
+            }),
+            password.clone(),
+        )
+        .await?;
+        for member in [me, peer] {
+            signed_write(
+                &client,
+                "chat",
+                chat::encode_msg(&ChatMsg::SetMembership {
+                    channel_id: channel_id.clone(),
+                    user: member,
+                    member: true,
+                }),
+                password.clone(),
+            )
+            .await
+            .map_err(committed_error)?;
+        }
+        load_chat_data(&client, Some(&channel_id))
+            .await
+            .map_err(committed_error)
+    }
+    .await
+}
+
+/// Why the viewer may not post here, as a stable reason token — empty when
+/// she may. A members-only channel she is not seated in refuses her post.
+pub fn post_gate(
+    archived: bool,
+    members_only: bool,
+    members: Vec<ChatMember>,
+    me: String,
+) -> String {
+    if archived {
+        return "channel_archived".into();
+    }
+    let seated = members.iter().any(|member| member.key == me);
+    if members_only && !seated {
+        return "members_only".into();
+    }
+    String::new()
 }
 
 pub async fn rename_channel(
@@ -3655,6 +5865,50 @@ pub async fn remove_channel_member(
     }
     .await
 }
+
+/// One participant of a channel's live huddle — the roster is consensus state
+/// (`HuddleMember{user, node, joined_at}`), not a count.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct HuddleParticipant {
+    pub key: String,
+    pub label: String,
+    pub initials: String,
+    pub is_agent: bool,
+    pub is_you: bool,
+    pub joined_at: i64,
+}
+
+/// Render the on-chain huddle roster, marking the row this device holds — the
+/// same `user:{hex}` handle `signed_write` authors with.
+fn huddle_roster(
+    members: &[chat::index::HuddleEntry],
+    me: Option<&[u8]>,
+) -> Vec<HuddleParticipant> {
+    let mine = me.map(|key| format!("user:{}", hex_encode(key)));
+    members
+        .iter()
+        .map(|member| {
+            let label = author_name(&member.user);
+            HuddleParticipant {
+                initials: initials_of(&label),
+                is_agent: !member.user.starts_with("user:"),
+                is_you: mine.as_deref() == Some(member.user.as_str()),
+                joined_at: number_i64(member.joined_at),
+                key: member_id(&member.user).to_string(),
+                label,
+            }
+        })
+        .collect()
+}
+
+/// Am *I* in this huddle — the discriminant that splits the `Huddle` start
+/// button from the LIVE pill with its ✕ Leave.
+pub fn huddle_self(roster: Vec<HuddleParticipant>) -> bool {
+    roster.iter().any(|participant| participant.is_you)
+}
+
+// The huddle's elapsed clock is a LOCAL session fact on a NATIVE `every 1s`
+// subscription — ui-lang ships one, so this app has no tick stream of its own.
 
 pub async fn join_huddle(
     rpc: String,
@@ -4112,6 +6366,49 @@ pub async fn load_block_threads(
         let from = u32::try_from(from).map_err(|_| "invalid comment offset".to_string())?;
         let rpc = rpc_client(&rpc)?;
         query_block_threads(&rpc, &target, from, generation).await
+    }
+    .await;
+    result.map_err(|message| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Every comment thread on a PAGE, not on one block: the same
+/// `ThreadsForTargets` query, asked for the page and all of its blocks at once.
+/// `target` comes back as the page id — the rail is document-scoped.
+pub async fn load_page_threads(
+    rpc: String,
+    page_id: String,
+    generation: i64,
+) -> Result<BlockThreadListData, HydrationError> {
+    let result = async {
+        let page_id = required_id(page_id, "page")?;
+        let rpc = rpc_client(&rpc)?;
+        let blocks = load_page_blocks(&rpc, &page_id).await?;
+        let mut targets = vec![page_id.clone()];
+        targets.extend(blocks.into_iter().map(|block| block.id));
+        let reply: PagesViewReply = rpc
+            .view("pages", &PagesViewQuery::ThreadsForTargets { targets })
+            .await?;
+        let PagesViewReply::Threads(groups) = reply else {
+            return Err("node returned an invalid comment thread page".to_string());
+        };
+        let threads: Vec<PageCommentThread> = groups
+            .into_iter()
+            .flat_map(|group| group.threads)
+            .map(page_comment_thread)
+            .collect();
+        let total = count_i64(threads.len());
+        Ok(BlockThreadListData {
+            generation,
+            target: page_id,
+            from: 0,
+            threads,
+            total,
+            next_from: 0,
+            has_more: false,
+        })
     }
     .await;
     result.map_err(|message| HydrationError {
@@ -4605,6 +6902,228 @@ pub async fn search_pages(
     })
 }
 
+/// One workspace-search result row, whatever plane it came from.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ExplorerHit {
+    /// `message` | `page` | `code` | `file` | `run`.
+    pub kind: String,
+    /// the 2-letter mono plate: `ms` / `pg` / `fg` / `fl` / `ag`.
+    pub code: String,
+    pub title: String,
+    pub snippet: String,
+    pub meta: String,
+    /// where the row navigates: the channel id, page id, `repo#number`, path
+    /// or run id of the hit.
+    pub target: String,
+}
+
+/// One filter chip. Only kinds with a real loader are emitted — a chip that
+/// always reads zero is a fake surface.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct KindCount {
+    pub kind: String,
+    pub label: String,
+    pub count: i64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ExplorerResults {
+    pub generation: i64,
+    pub hits: Vec<ExplorerHit>,
+    pub kinds: Vec<KindCount>,
+}
+
+/// Search the whole workspace: chat, pages, the forge trackers, duckfs paths
+/// and agent runs. Tasks are not searched — that module has no app loader.
+pub async fn search_workspace(
+    rpc: String,
+    text: String,
+    generation: i64,
+) -> Result<ExplorerResults, HydrationError> {
+    let needle = text.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(ExplorerResults {
+            generation,
+            hits: Vec::new(),
+            kinds: Vec::new(),
+        });
+    }
+    let mut hits = Vec::new();
+    if let Ok(chat) = search_chat(rpc.clone(), String::new(), text.clone(), generation).await {
+        hits.extend(chat.hits.into_iter().map(|hit| ExplorerHit {
+            kind: "message".into(),
+            code: "ms".into(),
+            title: author_name(&hit.author),
+            snippet: hit.text,
+            meta: format!("{} · {}", hit.channel_id, hit.meta),
+            target: hit.channel_id,
+        }));
+    }
+    if let Ok(pages) = search_pages(rpc.clone(), String::new(), text.clone(), generation).await {
+        hits.extend(pages.hits.into_iter().map(|hit| ExplorerHit {
+            kind: "page".into(),
+            code: "pg".into(),
+            title: hit.text.clone(),
+            snippet: hit.text,
+            meta: format!("pages · {}", hit.kind),
+            target: hit.page_id,
+        }));
+    }
+    hits.extend(search_forge_items(&rpc, &needle, generation).await);
+    hits.extend(search_files(&rpc, text.trim()).await);
+    hits.extend(search_tasks(&rpc, &needle).await);
+    if let Ok(runs) = load_agent_runs(rpc, String::new(), generation).await {
+        hits.extend(
+            runs.runs
+                .into_iter()
+                .filter(|run| {
+                    run.run_id.to_lowercase().contains(&needle)
+                        || run.agent_id.to_lowercase().contains(&needle)
+                })
+                .map(|run| ExplorerHit {
+                    kind: "run".into(),
+                    code: "ag".into(),
+                    title: format!("{} · {}", run.run_id, run.agent_id),
+                    snippet: run.outcome,
+                    // `created_at` is the creation BLOCK, so it prints as a
+                    // height — this search has no tip to count back from.
+                    meta: format!("agent · {}", height_label_short(run.created_at)),
+                    target: run.run_id,
+                }),
+        );
+    }
+    let kinds = [
+        ("message", "Messages"),
+        ("page", "Pages"),
+        ("code", "Code"),
+        ("file", "Files"),
+        ("task", "Tasks"),
+        ("run", "Runs"),
+    ]
+    .into_iter()
+    .map(|(kind, label)| KindCount {
+        count: count_i64(hits.iter().filter(|hit| hit.kind == kind).count()),
+        kind: kind.into(),
+        label: label.into(),
+    })
+    .collect();
+    Ok(ExplorerResults {
+        generation,
+        hits,
+        kinds,
+    })
+}
+
+/// The duckfs half of the workspace search: `GET /v1/files/grep`, the node's
+/// only CONTENT search. `find`'s prefix is a raw path prefix in full-path
+/// order, so it answers "what is under this directory", never "who mentions
+/// this word" — a content query would come back empty through it.
+async fn search_files(rpc: &str, pattern: &str) -> Vec<ExplorerHit> {
+    let Ok(client) = rpc_client(rpc) else {
+        return Vec::new();
+    };
+    let Ok(reply) = client.files_get("grep", &[("pattern", pattern)]).await else {
+        return Vec::new();
+    };
+    reply["hits"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|hit| {
+            let path = hit["path"].as_str().unwrap_or_default().to_string();
+            let line = hit["line"].as_i64().unwrap_or(0);
+            ExplorerHit {
+                kind: "file".into(),
+                code: "fl".into(),
+                title: path.rsplit('/').next().unwrap_or(&path).to_string(),
+                snippet: hit["text"].as_str().unwrap_or_default().trim().to_string(),
+                meta: format!("{path}:{line}"),
+                target: path,
+            }
+        })
+        .collect()
+}
+
+/// The tasks half of the workspace search: the three bounded status pages of
+/// the tasks index, filtered on title and id client-side (that index has no
+/// text query either). A workspace with no tasks yet contributes no hits and
+/// its chip reads 0 — empty is not the same as absent.
+async fn search_tasks(rpc: &str, needle: &str) -> Vec<ExplorerHit> {
+    const STATUS_PAGES: &[(&str, &str)] = &[
+        ("open", "open"),
+        ("in_progress", "in progress"),
+        ("done", "done"),
+    ];
+    const PAGE_LIMIT: usize = 256;
+    let Ok(client) = rpc_client(rpc) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for (status, label) in STATUS_PAGES {
+        let query = serde_json::json!({
+            "by_status": { "status": status, "limit": PAGE_LIMIT }
+        });
+        let Ok(reply) = client.view::<_, serde_json::Value>("tasks", &query).await else {
+            return hits;
+        };
+        for row in reply["tasks"]["tasks"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            let title = row["title"].as_str().unwrap_or_default().to_string();
+            let id = row["task_id"].as_str().unwrap_or_default().to_string();
+            let matched =
+                title.to_lowercase().contains(needle) || id.to_lowercase().contains(needle);
+            if !matched {
+                continue;
+            }
+            let author = short_label(row["created_by"].as_str().unwrap_or_default());
+            // `updated_height` is a BLOCK, so it prints as a height — this
+            // search has no tip to count back from.
+            let updated = height_label_short(row["updated_height"].as_i64().unwrap_or(0));
+            hits.push(ExplorerHit {
+                kind: "task".into(),
+                code: "tk".into(),
+                title,
+                snippet: (*label).to_string(),
+                meta: format!("{author} · tasks · {updated}"),
+                target: id,
+            });
+        }
+    }
+    hits
+}
+
+/// The forge half of the workspace search: every repo's tracker, filtered on
+/// the title client-side (the module has no text query).
+async fn search_forge_items(rpc: &str, needle: &str, generation: i64) -> Vec<ExplorerHit> {
+    let Ok(forge) = load_forge(rpc.to_string(), generation).await else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for repo in forge.repos {
+        let Ok(data) = load_forge_repo(rpc.to_string(), repo.name.clone(), generation).await else {
+            continue;
+        };
+        hits.extend(
+            data.items
+                .into_iter()
+                .filter(|item| item.title.to_lowercase().contains(needle))
+                .map(|item| ExplorerHit {
+                    kind: "code".into(),
+                    code: "fg".into(),
+                    title: format!("#{} {}", item.number, item.title),
+                    snippet: format!("{} · {}", item.kind, item.state),
+                    meta: format!("{} · {}", item.author_name, repo.name),
+                    target: format!("{}#{}", repo.name, item.number),
+                }),
+        );
+    }
+    hits
+}
+
 async fn load_workspace(
     rpc: &RpcClient,
     channel_id: Option<&str>,
@@ -4626,6 +7145,7 @@ async fn load_workspace(
         active_channel_archived: chat.active_channel_archived,
         active_channel_members_only: chat.active_channel_members_only,
         active_channel_huddle_count: chat.active_channel_huddle_count,
+        huddle_roster: chat.huddle_roster,
         channel_members: chat.channel_members,
         pages: pages.pages,
         blocks: pages.blocks,
@@ -4702,6 +7222,10 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
         .is_some_and(|info| info.channel.post_policy == PostPolicy::MembersOnly);
     let active_channel_huddle_count =
         active_wire_channel.map_or(0, |info| count_i64(info.channel.huddle.len()));
+    let me = local_user_key().await;
+    let huddle_roster = active_wire_channel.map_or_else(Vec::new, |info| {
+        huddle_roster(&info.channel.huddle, me.as_deref())
+    });
     let active_channel_head_seq = active_wire_channel.map_or(0, |info| info.head_seq);
     let channel_members = if active_channel.is_empty() {
         Vec::new()
@@ -4721,6 +7245,7 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
         active_channel_archived,
         active_channel_members_only,
         active_channel_huddle_count,
+        huddle_roster,
         channel_members,
         selected_message_seq: 0,
         selected_message_rev: 0,
@@ -6197,6 +8722,367 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_rail_seats_exactly_the_eight_module_screens() {
+        let nav = shell_nav("chat".into(), 3, true);
+        let ids: Vec<&str> = nav.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "chat",
+                "pages",
+                "forge",
+                "agents",
+                "files",
+                "explorer",
+                "members",
+                "governance"
+            ]
+        );
+        let forge = nav.iter().find(|item| item.id == "forge").unwrap();
+        assert!(forge.live, "an engaged agent pulses the forge seat");
+        assert!(!nav.iter().any(|item| item.id == "node"));
+        assert_eq!(
+            nav.iter().find(|item| item.id == "governance").unwrap().badge,
+            3
+        );
+    }
+
+    #[test]
+    fn quorum_dots_count_the_frozen_rule_not_the_electorate() {
+        // three of the four REQUIRED signatures are in, inside a six-node pool.
+        let dots = quorum_dots(3, 4);
+        assert_eq!(dots.len(), 4);
+        assert_eq!(dots.iter().filter(|seat| seat.filled).count(), 3);
+        assert_eq!(tally_label(3, 4), "3 / 4");
+        assert_eq!(tally_tone(3, 4), "near");
+        assert_eq!(tally_tone(1, 4), "far");
+        assert_eq!(tally_note(3, 4), "3 approvals · 1 more for quorum");
+        assert_eq!(tally_note(4, 4), "quorum met");
+        assert_eq!(approve_label(3, 4), "Approve →");
+        assert_eq!(approve_label(1, 4), "Approve");
+    }
+
+    #[test]
+    fn a_diff_paints_gutters_signs_and_kinds() {
+        let rows = diff_lines(
+            "diff --git a/round.rs b/round.rs\n@@ -138,3 +138,4 @@ impl RoundState {\n ctx\n-gone\n+added\n"
+                .into(),
+        );
+        let kinds: Vec<&str> = rows.iter().map(|row| row.kind.as_str()).collect();
+        assert_eq!(kinds, ["file", "hunk", "ctx", "del", "add"]);
+        let context = &rows[2];
+        assert_eq!((context.old_no.as_str(), context.new_no.as_str()), ("138", "138"));
+        assert_eq!(rows[3].sign, "-");
+        assert_eq!(rows[3].old_no, "139");
+        assert_eq!(rows[4].sign, "+");
+        assert_eq!(rows[4].new_no, "139");
+        assert_eq!(rows[4].text, "added");
+    }
+
+    #[test]
+    fn a_log_line_splits_into_time_level_and_message() {
+        let parts = split_log_line(
+            "2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted resident".into(),
+        );
+        assert_eq!(parts.time, "2026-07-27T09:12:44.918Z");
+        assert_eq!(parts.level, "INFO");
+        assert_eq!(parts.message, "ducktape::join: admitted resident");
+
+        let prose = split_log_line("no level here".into());
+        assert_eq!(prose.level, "");
+        assert_eq!(prose.message, "no level here");
+    }
+
+    #[test]
+    fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        assert_eq!(
+            dm_channel_id(a.clone(), b.clone()),
+            dm_channel_id(b.clone(), a.clone()),
+            "both sides derive the same channel"
+        );
+        // the sidebar's own filter: the pair's derived channel drops out of
+        // CHANNELS, an ordinary room stays, and an unknown viewer filters
+        // nothing rather than guessing.
+        let channel = |id: &str| ChatChannel {
+            id: id.into(),
+            name: id.into(),
+            archived: false,
+            members_only: false,
+            huddle_count: 0,
+            head_seq: 0,
+        };
+        let peers = vec![DmPeer {
+            key: b.clone(),
+            name: "b".into(),
+            initials: "B".into(),
+            is_agent: false,
+        }];
+        let listing = vec![channel(&dm_channel_id(a.clone(), b.clone())), channel("general")];
+        let rooms = rooms_only(listing.clone(), peers.clone(), a.clone());
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].id, "general");
+        assert_eq!(rooms_only(listing, peers, String::new()).len(), 2);
+
+        // the id the app mints is the id chat will accept from a USER author:
+        // ':' is reserved for module origins and '/' is refused outright, so a
+        // minted id carrying either is a DM that can never be created.
+        // `chat::client`'s own test runs the id through that rule directly.
+        let id = dm_channel_id(a, b);
+        assert!(!id.contains(':'), "a user-authored channel id may not carry ':'");
+        assert!(!id.contains('/'), "a channel id may not carry '/'");
+        assert!(id.starts_with("dm-") && id.len() == 67);
+    }
+
+    #[test]
+    fn the_post_gate_names_why_a_viewer_cannot_post() {
+        let members = vec![ChatMember {
+            key: "beef".into(),
+            label: "b".into(),
+        }];
+        assert_eq!(post_gate(false, false, Vec::new(), "cafe".into()), "");
+        assert_eq!(
+            post_gate(true, false, members.clone(), "beef".into()),
+            "channel_archived"
+        );
+        assert_eq!(
+            post_gate(false, true, members.clone(), "cafe".into()),
+            "members_only"
+        );
+        assert_eq!(post_gate(false, true, members, "beef".into()), "");
+    }
+
+    /// The three folds the mounted surfaces are drawn from — the crumb bar's
+    /// counts, the blob gutter, and the roster the popped panel keeps.
+    #[test]
+    fn the_crumb_counts_split_the_listing_in_two() {
+        let entries = ["dir", "file", "file"]
+            .into_iter()
+            .map(|kind| FsEntry {
+                path: format!("/shared/{kind}"),
+                name: kind.into(),
+                kind: kind.into(),
+                size: 0,
+                object: String::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fs_dir_count(entries.clone()), 1);
+        assert_eq!(fs_file_count(entries.clone()), 2);
+        assert_eq!(
+            fs_dir_count(entries.clone()) + fs_file_count(entries),
+            3,
+            "every row lands in exactly one bucket"
+        );
+        assert_eq!(fs_dir_count(Vec::new()), 0);
+        assert_eq!(fs_file_count(Vec::new()), 0);
+    }
+
+    #[test]
+    fn source_lines_number_from_one_and_an_empty_blob_has_none() {
+        let rows = source_lines("alpha\nbeta\n".into());
+        assert_eq!(rows.len(), 2, "a trailing newline is not a third line");
+        assert_eq!(rows[0].number, "1");
+        assert_eq!(rows[0].text, "alpha");
+        assert_eq!(rows[1].number, "2");
+        assert_eq!(rows[1].text, "beta");
+        assert!(source_lines(String::new()).is_empty());
+    }
+
+    #[test]
+    fn a_roster_survives_only_while_this_device_is_in_the_huddle() {
+        let roster = vec![HuddleParticipant {
+            key: "aa".into(),
+            label: "aa".into(),
+            initials: "A".into(),
+            is_agent: false,
+            is_you: true,
+            joined_at: 0,
+        }];
+        assert_eq!(keep_roster(true, roster.clone()).len(), 1);
+        assert!(
+            keep_roster(false, roster).is_empty(),
+            "another channel's roster never reaches the panel"
+        );
+    }
+
+    #[test]
+    fn the_roster_answers_admin_tier_and_filters() {
+        let rows = vec![
+            MemberRow {
+                key: "aa".into(),
+                label: "aa".into(),
+                role: "validator".into(),
+                is_this_node: true,
+                is_agent: false,
+                model: String::new(),
+                live: true,
+            },
+            MemberRow {
+                key: "bb".into(),
+                label: "bb".into(),
+                role: "resident".into(),
+                is_this_node: false,
+                is_agent: false,
+                model: String::new(),
+                live: false,
+            },
+            MemberRow {
+                key: "triage".into(),
+                label: "triage".into(),
+                role: "agent".into(),
+                is_this_node: false,
+                is_agent: true,
+                model: "codex".into(),
+                live: true,
+            },
+        ];
+        assert!(members_is_admin(rows.clone()));
+        assert_eq!(member_tier(rows.clone()), "validator");
+        assert_eq!(member_tier(Vec::new()), "guest");
+        assert_eq!(filter_members(rows.clone(), "agents".into()).len(), 1);
+        assert_eq!(filter_members(rows.clone(), "humans".into()).len(), 2);
+        assert_eq!(filter_members(rows.clone(), "validators".into()).len(), 1);
+        assert_eq!(filter_members(rows, "all".into()).len(), 3);
+    }
+
+    #[test]
+    fn the_tracker_splits_into_open_prs_and_open_issues() {
+        let item = |number: i64, kind: &str, state: &str| ForgeItem {
+            number,
+            kind: kind.into(),
+            state: state.into(),
+            title: format!("item {number}"),
+            author: "user:aa".into(),
+            author_name: "aa".into(),
+        };
+        let items = vec![
+            item(1, "pr", "open"),
+            item(2, "pr", "merged"),
+            item(3, "issue", "open"),
+            item(4, "issue", "closed"),
+        ];
+        assert_eq!(filter_forge_items(items.clone(), "pr".into()).len(), 2);
+        assert_eq!(forge_open_count(items.clone(), "pr".into()), 1);
+        assert_eq!(forge_open_count(items, "issue".into()), 1);
+    }
+
+    #[test]
+    fn machine_values_read_as_a_person_reads_them() {
+        assert_eq!(size_label(421_888), "412 KB");
+        assert_eq!(size_label(900), "900 B");
+        assert_eq!(size_label(3 * 1024 * 1024), "3.0 MB");
+        assert_eq!(mmss(0), "00:00");
+        assert_eq!(mmss(4 * 60 + 7), "04:07");
+        assert_eq!(initials_of("Kestrel Song"), "KS");
+        assert_eq!(initials_of("triage"), "TR");
+        assert_eq!(initials_of(""), "?");
+        assert_eq!(network_slug("Acme Research!".into()), "acme-research");
+        assert_eq!(height_label(84_912), "h 84,912");
+        assert_eq!(height_label_short(84_912), "h 84,912");
+        assert_eq!(height_label(-1), "h —");
+        assert_eq!(optional_number(Some(4)), "4");
+        // absent, not zero: a resident's status carries no consensus section.
+        assert_eq!(optional_number(None), "—");
+    }
+
+    /// A record stamp is a BLOCK HEIGHT on this chain, so every record-time
+    /// string counts blocks. Only `/v1/status` supplies unix seconds.
+    #[test]
+    fn record_stamps_count_blocks_and_status_stamps_count_seconds() {
+        assert_eq!(height_ago(84_500, 84_912), "412 blocks ago");
+        assert_eq!(height_ago(84_911, 84_912), "1 block ago");
+        assert_eq!(height_ago(84_912, 84_912), "this block");
+        // a follower behind the record it is rendering still reads as now.
+        assert_eq!(height_ago(84_913, 84_912), "this block");
+        assert_eq!(height_ago(0, 84_912), "");
+        assert_eq!(expires_in_blocks(85_324, 84_912), "expires in 412 blocks");
+        assert_eq!(expires_in_blocks(84_913, 84_912), "expires in 1 block");
+        assert_eq!(expires_in_blocks(84_912, 84_912), "expired");
+        let now = now_seconds();
+        assert_eq!(relative_time(now - 30), "just now");
+        assert_eq!(relative_time(now - 40 * 60), "40m ago");
+        assert_eq!(relative_time(now - 2 * 60 * 60), "2h ago");
+        assert_eq!(relative_time(0), "");
+    }
+
+    /// The OTHER lane: a single-writer noded stamps `consensus_time` in unix
+    /// MILLIS, so the very same fields arrive thirteen digits wide. Rendering
+    /// them as heights printed `h 1,753,622,400,000` on every record.
+    #[test]
+    fn a_unix_millis_stamp_is_a_clock_not_a_thirteen_digit_height() {
+        let two_hours_ago = (now_seconds() - 2 * 60 * 60) * 1_000;
+        assert_eq!(height_label(two_hours_ago), "2h ago");
+        assert_eq!(height_label_short(two_hours_ago), "2h ago");
+        assert_eq!(height_ago(two_hours_ago, 84_912), "2h ago");
+        assert_eq!(
+            expires_in_blocks((now_seconds() + 3 * 60 * 60) * 1_000, 84_912),
+            "expires in 3h"
+        );
+        assert_eq!(
+            expires_in_blocks((now_seconds() - 60) * 1_000, 84_912),
+            "expired"
+        );
+        // a real height is nowhere near the floor and still reads as one.
+        assert_eq!(height_label(84_912), "h 84,912");
+    }
+
+    #[test]
+    fn a_proposal_renders_its_payload_and_its_frozen_bar() {
+        let view = serde_json::json!({
+            "action": { "add_validator": { "key": [0x8c, 0x4f, 0xa2, 0x11] } },
+            "voting_rule": { "threshold": { "required_yes": 4 } }
+        });
+        assert_eq!(gov_action_detail(&view["action"]), "key 8c4fa211");
+        // a threshold's bar does not move with the no votes.
+        assert_eq!(yes_needed(&view["voting_rule"], 0), 4);
+        assert_eq!(yes_needed(&view["voting_rule"], 2), 4);
+
+        // a participating majority's quorum is TURNOUT, and passing also needs
+        // yes > no — reading `quorum` straight into a yes counter says "quorum
+        // met" at 3/3 on a vote of 3 yes / 3 no, which does not settle.
+        let majority = serde_json::json!({ "participating_majority": { "quorum": 6 } });
+        assert_eq!(yes_needed(&majority, 0), 6);
+        assert_eq!(yes_needed(&majority, 2), 4, "two no votes count toward turnout");
+        assert_eq!(yes_needed(&majority, 3), 4, "…but yes must still exceed no");
+        assert_eq!(tally_note(3, yes_needed(&majority, 3)), "3 approvals · 1 more for quorum");
+
+        assert_eq!(tagged_name(&view["action"]), "add_validator");
+        assert_eq!(proposal_kind_tone("add_validator".into()), "access");
+        assert_eq!(proposal_kind_tone("signal".into()), "neutral");
+        assert_eq!(
+            gov_action_detail(&serde_json::json!({ "signal": { "text": "ship it" } })),
+            "ship it"
+        );
+    }
+
+    #[test]
+    fn the_huddle_roster_marks_the_row_this_device_holds() {
+        let me = [0xaau8; 32];
+        let mine = format!("user:{}", hex_encode(&me));
+        let roster = huddle_roster(
+            &[
+                chat::index::HuddleEntry {
+                    user: mine,
+                    node: String::new(),
+                    joined_at: 10,
+                },
+                chat::index::HuddleEntry {
+                    user: "agent:runs/triage".into(),
+                    node: String::new(),
+                    joined_at: 20,
+                },
+            ],
+            Some(&me),
+        );
+        assert_eq!(roster.len(), 2);
+        assert!(roster[0].is_you && !roster[0].is_agent);
+        assert!(!roster[1].is_you && roster[1].is_agent);
+        assert!(huddle_self(roster.clone()));
+        assert!(!huddle_self(vec![roster[1].clone()]));
+    }
+
+    #[test]
     fn container_depth_uses_only_shared_design_roles() {
         let tokens = ducktape_ui::ui::theme::LIGHT;
         let theme = iced::Theme::Light;
@@ -6339,6 +9225,9 @@ mod tests {
             show_author: true,
             initial: "Y".into(),
             avatar_kind: "human".into(),
+            mine: true,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         };
         let after_second = merge_message_send_result(
@@ -6406,6 +9295,9 @@ mod tests {
             show_author: false,
             initial: "A".into(),
             avatar_kind: "human".into(),
+            mine: false,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         };
         let mut messages = vec![
@@ -6440,6 +9332,9 @@ mod tests {
             show_author: false,
             initial: "A".into(),
             avatar_kind: "human".into(),
+            mine: false,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         };
         // oldest loaded root is seq 3 -> older history exists.
@@ -7220,6 +10115,9 @@ mod tests {
             show_author: true,
             initial: "U".into(),
             avatar_kind: "human".into(),
+            mine: false,
+            height: 0,
+            time: 0,
             reactions: Vec::new(),
         };
 
@@ -7398,5 +10296,185 @@ mod tests {
             panic!("competing edits must conflict");
         };
         assert_eq!(paths, vec!["a.txt".to_string()]);
+    }
+
+    /// A bare mirror carrying one `main` commit, in the shape the browse
+    /// readers take it: a born branch they can resolve by default. A path with
+    /// one slash lands in a real subtree, which `mirror_commit`'s flat
+    /// treebuilder cannot express.
+    fn browsable_mirror(dir: &tempfile::TempDir, files: &[(&str, &str)]) -> git2::Repository {
+        let mirror = git2::Repository::init_bare(dir.path()).unwrap();
+        let mut root_files: Vec<(String, git2::Oid)> = Vec::new();
+        let mut subtrees: BTreeMap<String, Vec<(String, git2::Oid)>> = BTreeMap::new();
+        for (path, contents) in files {
+            let blob = mirror.blob(contents.as_bytes()).unwrap();
+            match path.split_once('/') {
+                Some((directory, name)) => subtrees
+                    .entry(directory.to_string())
+                    .or_default()
+                    .push((name.to_string(), blob)),
+                None => root_files.push(((*path).to_string(), blob)),
+            }
+        }
+        // Every git2 handle below borrows `mirror`, so they live in a block:
+        // the TreeBuilder is still alive at the end of the expression otherwise,
+        // and the repository cannot be moved out to the caller.
+        {
+            let mut root = mirror.treebuilder(None).unwrap();
+            for (name, blob) in root_files {
+                root.insert(&name, blob, 0o100644).unwrap();
+            }
+            for (directory, entries) in subtrees {
+                let mut sub = mirror.treebuilder(None).unwrap();
+                for (name, blob) in entries {
+                    sub.insert(&name, blob, 0o100644).unwrap();
+                }
+                let oid = sub.write().unwrap();
+                root.insert(&directory, oid, 0o040000).unwrap();
+            }
+            let tree = mirror.find_tree(root.write().unwrap()).unwrap();
+            let signature = git2::Signature::now("mule", "mule@localhost").unwrap();
+            let head = mirror
+                .commit(None, &signature, &signature, "seed", &tree, &[])
+                .unwrap();
+            let commit = mirror.find_commit(head).unwrap();
+            mirror.branch("main", &commit, true).unwrap();
+        }
+        mirror
+    }
+
+    #[test]
+    fn tree_listing_puts_directories_first_and_sizes_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = browsable_mirror(
+            &dir,
+            &[
+                ("zebra.rs", "fn main() {}\n"),
+                ("src/lib.rs", "pub fn one() {}\n"),
+                ("alpha.md", "# title\n"),
+            ],
+        );
+
+        let root = read_tree(&mirror, "main", "").unwrap();
+        let names: Vec<&str> = root.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["src", "alpha.md", "zebra.rs"]);
+        assert_eq!(root[0].kind, "dir");
+        assert_eq!(root[0].size, 0);
+        assert_eq!(root[1].size, "# title\n".len() as i64);
+
+        // an empty rev resolves to the default branch, and a nested path lists
+        // that subtree with full paths.
+        let nested = read_tree(&mirror, "", "src").unwrap();
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].path, "src/lib.rs");
+        assert_eq!(nested[0].kind, "file");
+    }
+
+    #[test]
+    fn blob_read_counts_lines_and_names_binary_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = browsable_mirror(
+            &dir,
+            &[("a.txt", "one\ntwo\n"), ("bin.dat", "head\0tail")],
+        );
+
+        let text = read_blob(
+            &mirror,
+            "repo".into(),
+            "main".into(),
+            "a.txt".into(),
+            7,
+        )
+        .unwrap();
+        assert_eq!(text.generation, 7);
+        assert_eq!(text.lines, 2);
+        assert!(!text.binary && !text.truncated);
+
+        let binary = read_blob(
+            &mirror,
+            "repo".into(),
+            "main".into(),
+            "bin.dat".into(),
+            7,
+        )
+        .unwrap();
+        assert!(binary.binary, "a NUL byte marks the blob binary");
+        assert_eq!(binary.lines, 0);
+
+        let missing = read_blob(&mirror, "repo".into(), "main".into(), "nope".into(), 7);
+        assert!(missing.is_err(), "a path that is not there must not read empty");
+    }
+
+    #[test]
+    fn about_skips_headings_and_badges_and_names_the_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = browsable_mirror(
+            &dir,
+            &[
+                (
+                    "README.md",
+                    "# ducktape\n\n[![badge](x)](y)\n\nThe consensus core.\nMore prose.\n",
+                ),
+                ("a.rs", "fn a() {}\n"),
+                ("b.rs", "fn b() {}\n"),
+                ("c.rs", "fn c() {}\n"),
+            ],
+        );
+        let commit = mirror_commit_at(&mirror, "").unwrap();
+
+        assert_eq!(readme_about(&mirror, &commit), "The consensus core.");
+        assert_eq!(dominant_language(&commit), "Rust");
+    }
+
+    // An unborn repo has no head oid to resolve, so the card gets nothing —
+    // never a fabricated about line, language or stamp. The guard fires before
+    // any mirror is opened, so the unreachable endpoint below is never dialled.
+    #[test]
+    fn an_unborn_head_derives_no_card_facts() {
+        assert_eq!(
+            repo_card_facts("http://127.0.0.1:1", "core", "(unborn)"),
+            (String::new(), String::new(), 0)
+        );
+    }
+
+    #[test]
+    fn about_is_empty_without_a_readme_rather_than_invented() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = browsable_mirror(&dir, &[("a.rs", "fn a() {}\n")]);
+        let commit = mirror_commit_at(&mirror, "").unwrap();
+
+        assert!(readme_about(&mirror, &commit).is_empty());
+    }
+
+    #[test]
+    fn bell_severity_projects_the_kind_and_defaults_to_info() {
+        assert_eq!(bell_severity("run_failed".into()), "danger");
+        assert_eq!(bell_severity("review_requested".into()), "warning");
+        assert_eq!(bell_severity("mentioned".into()), "info");
+        // an unnamed kind is a notice, never an alarm.
+        assert_eq!(bell_severity("brand_new_kind".into()), "info");
+    }
+
+    #[test]
+    fn bell_badge_takes_the_worst_unread_severity() {
+        let item = |seq: i64, kind: &str, read: bool| BellItem {
+            seq,
+            kind: kind.into(),
+            body: String::new(),
+            source: String::new(),
+            height: 0,
+            read,
+        };
+
+        assert_eq!(
+            bell_worst_severity(vec![item(1, "mentioned", false), item(2, "run_failed", false)]),
+            "danger"
+        );
+        // a READ error does not keep the badge red.
+        assert_eq!(
+            bell_worst_severity(vec![item(1, "run_failed", true), item(2, "review_requested", false)]),
+            "warning"
+        );
+        assert_eq!(bell_worst_severity(Vec::new()), "info");
     }
 }
