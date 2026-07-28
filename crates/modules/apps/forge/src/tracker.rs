@@ -118,18 +118,34 @@ pub struct Tracker {
 }
 
 /// derive the item author from the dispatch origin — the same posture as
-/// chat: authorship is NEVER a payload field. an empty external id is the
-/// pre-consensus probe and is rejected, and so are module/system origins: a
-/// tracker item is a MEMBER action, and no module in the tree opens or edits
-/// one (the same refusal chat, pages, automations and inbox landed).
+/// chat: authorship is NEVER a payload field.
+///
+/// a MODULE is a FIRST-CLASS author, not a second-class one. `runs` opens the
+/// pull request that publishes a finished agent run (`runs/src/sink.rs`
+/// `emit_sink`), and the host stamps that follow-up `Origin::Module("runs")`
+/// — refusing it does not "keep items member-only", it errors the emitted op
+/// and aborts the whole delivery block. the module id is trustworthy because
+/// the host synthesizes `Origin::Module` in exactly ONE place, from the
+/// module that just ran, and a frame cannot express a second op that picks
+/// its own id (the deleted continuation lane). both halves are pinned by
+/// `node/tests/no_continuation_lane.rs`.
+///
+/// two origins are refused, for two different reasons:
+/// - an EMPTY external id is the pre-consensus probe, never an authenticated
+///   submitter.
+/// - `Origin::System` has no producer that can reach here: the host stamps it
+///   only on its two once-per-block injections (`lifecycle::Advance` and
+///   `dispatch::DeliverPending`), neither of which targets forge. an
+///   unreachable arm stays refused rather than minting an unowned item.
 pub fn author_from_origin(origin: &Origin) -> Result<AuthorRef, Error> {
     match origin {
         Origin::External(id) if id.is_empty() => Err(Error::Module(
             "forge: tracker ops require an authenticated origin".into(),
         )),
         Origin::External(id) => Ok(AuthorRef::User(id.clone())),
-        Origin::Module(_) | Origin::System => Err(Error::Module(
-            "forge: tracker ops require an authenticated external origin".into(),
+        Origin::Module(m) => Ok(AuthorRef::Module(m.clone())),
+        Origin::System => Err(Error::Module(
+            "forge: tracker ops require an authenticated origin".into(),
         )),
     }
 }

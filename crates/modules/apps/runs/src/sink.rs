@@ -591,6 +591,85 @@ mod tests {
         assert_eq!(FORGE_BODY_BYTE_CAP, forge::MAX_BODY_BYTES);
     }
 
+    /// THE REAL PATH. `emit_sink` hands the host a `Msg` targeting forge, and
+    /// the host stamps every module-emitted follow-up
+    /// `Origin::Module(<emitter>)` (`host/src/lib.rs`, the one construction
+    /// site). So the bytes this sink emits arrive at forge under
+    /// `Origin::Module("runs")` — never under a user origin. A forge that
+    /// refuses that origin errors the emitted op and ABORTS the whole delivery
+    /// block, which is exactly what #860 did.
+    ///
+    /// The dogfood e2e (`bin/node/tests/dogfood_loop_e2e.rs`) asserts this PR
+    /// too, but skips wherever podman/pasta is absent — which is why the break
+    /// shipped. This runs anywhere `cargo test -p runs` runs.
+    #[test]
+    fn the_emitted_open_pr_is_accepted_by_a_real_forge_under_a_module_origin() {
+        use sdk::Module as _;
+
+        let mut base = std::env::temp_dir();
+        base.push(format!("ducktape-runs-forge-sink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut forge = forge::Forge::init("forge", base.clone()).unwrap();
+
+        let exec = |forge: &mut forge::Forge, t: u64, origin: sdk::Origin, payload: Vec<u8>| {
+            let mut ctx = sdk_testkit::TestCtx::with_env(sdk::Env {
+                height: 0,
+                consensus_time: t,
+                origin,
+                me: "forge".into(),
+            });
+            let msg = Msg {
+                target: "forge".into(),
+                payload,
+            };
+            let out = futures::executor::block_on(forge.execute(&mut ctx, &msg));
+            futures::executor::block_on(forge.commit_block()).unwrap();
+            out
+        };
+
+        // birth the repo and both branches: a member pushes (a ref-moving op
+        // still requires an external principal — #860's owner gate, untouched).
+        let member = sdk::Origin::External(vec![1u8; 32]);
+        for (t, branch) in [(1u64, "main"), (2, "agent/run-1")] {
+            let push = forge::encode_msg(&forge::ForgeMsg::PushRefs {
+                repo: "app".into(),
+                updates: vec![forge::RefUpdate {
+                    ref_name: branch.into(),
+                    prev_oid: None,
+                    new_oid: Some(vec![0xab; 20]),
+                }],
+                pack_digest: Some(vec![7u8; 32]),
+            });
+            exec(&mut forge, t, member.clone(), push).expect("push");
+        }
+
+        // the sink's own bytes, at the origin the host stamps on them.
+        exec(
+            &mut forge,
+            3,
+            sdk::Origin::Module("runs".into()),
+            forge_open_pr_bytes("app", "T", "B", "agent/run-1", "main"),
+        )
+        .expect("a module-emitted OpenPr must not error — it aborts the block");
+
+        let reply = futures::executor::block_on(forge.query(&forge::encode_query(
+            &forge::ForgeQuery::GetItem {
+                repo: "app".into(),
+                number: 1,
+            },
+        )))
+        .unwrap();
+        let forge::ForgeReply::Item(Some(item)) = forge::decode_reply(&reply).unwrap() else {
+            panic!("the PR must exist")
+        };
+        assert_eq!(
+            item.summary.author,
+            chat::AuthorRef::Module("runs".into()),
+            "the PR is authored by the emitting MODULE, not a forged user"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn forge_sink_mirror_matches_forge_decode_msg() {
         // pin the local ForgeSinkMsg mirror against the real forge decoder so the
