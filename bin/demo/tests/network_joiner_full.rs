@@ -74,7 +74,9 @@ impl SyncClient for ChannelClient {
     }
 }
 
-fn validator_key(seed_byte: u8) -> Vec<u8> {
+/// a deterministic ed25519 public key — a validator key for valset, a member
+/// id for an authenticated external origin.
+fn seeded_pubkey(seed_byte: u8) -> Vec<u8> {
     let seed = [seed_byte; 32];
     PrivateKey::decode(&seed[..])
         .expect("any 32 bytes is a valid ed25519 seed")
@@ -116,97 +118,131 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
         ])
         .expect("genesis");
 
+        // authorship is derived from the dispatch origin across the tree, and
+        // the lanes are NOT interchangeable, so every source op carries its
+        // own. SYSTEM is the trusted orchestration lane: valset membership is
+        // governance-gated, and the saga id below is namespaced to the origin
+        // that triggers it. a forge tracker item is a MEMBER action — forge
+        // refuses a module/system author outright — so it rides an
+        // authenticated external origin instead.
+        let system = sdk::Origin::System;
+        let member = sdk::Origin::External(seeded_pubkey(5));
+
         // content through every module, including overwrites (op-log order).
-        let ops: Vec<Msg> = vec![
-            Msg {
-                target: "kv".into(),
-                payload: kv_encode(&KvMsg::Set {
-                    key: b"motd".to_vec(),
-                    value: b"draft".to_vec(),
-                }),
-            },
-            Msg {
-                target: "kv".into(),
-                payload: kv_encode(&KvMsg::Set {
-                    key: b"motd".to_vec(),
-                    value: b"final".to_vec(),
-                }),
-            },
-            Msg {
-                target: "chat".into(),
-                payload: chat_encode_msg(&ChatMsg::CreateChannel {
-                    channel_id: "general".into(),
-                    name: "General".into(),
-                    post_policy: PostPolicy::Open,
-                }),
-            },
-            Msg {
-                target: "chat".into(),
-                payload: chat_encode_msg(&ChatMsg::PostMessage {
-                    channel_id: "general".into(),
-                    message_id: "u1".into(),
-                    blocks: vec![ChatBlock::paragraph("hello")],
-                    thread: None,
-                    as_agent: None,
-                }),
-            },
-            Msg {
-                target: "chat".into(),
-                payload: chat_encode_msg(&ChatMsg::PostMessage {
-                    channel_id: "general".into(),
-                    message_id: "a1".into(),
-                    blocks: vec![ChatBlock::paragraph("synced over the wire")],
-                    thread: None,
-                    as_agent: None,
-                }),
-            },
-            Msg {
-                target: "forge".into(),
-                payload: forge::encode_msg(&forge::ForgeMsg::OpenIssue {
-                    repo: "demo".into(),
-                    title: "State-sync the Forge tracker".into(),
-                    body: "Git objects use the separate PushRefs data plane".into(),
-                }),
-            },
-            Msg {
-                target: "directory".into(),
-                payload: dir_encode_msg(&DirMsg::Set {
-                    key: "name".into(),
-                    value: "world".into(),
-                }),
-            },
-            Msg {
-                target: "valset".into(),
-                payload: valset_encode_msg(&ValsetMsg::Join {
-                    key: validator_key(7),
-                }),
-            },
-            Msg {
-                target: "saga".into(),
-                payload: saga_encode_msg(&SagaMsg::Trigger {
-                    pinned_assignee: None,
-                    saga_id: saga::namespaced_id(&sdk::Origin::System, "greet"),
-                    spec: b"reverse hello".to_vec(),
-                    reply_to: None,
-                    reply_payload: Vec::new(),
-                    deadline: None,
-                    max_attempts: 1,
-                    lease_views: None,
-                    capability: None,
-                    demands: Default::default(),
-                }),
-            },
+        let ops: Vec<(sdk::Origin, Msg)> = vec![
+            (
+                system.clone(),
+                Msg {
+                    target: "kv".into(),
+                    payload: kv_encode(&KvMsg::Set {
+                        key: b"motd".to_vec(),
+                        value: b"draft".to_vec(),
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "kv".into(),
+                    payload: kv_encode(&KvMsg::Set {
+                        key: b"motd".to_vec(),
+                        value: b"final".to_vec(),
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "chat".into(),
+                    payload: chat_encode_msg(&ChatMsg::CreateChannel {
+                        channel_id: "general".into(),
+                        name: "General".into(),
+                        post_policy: PostPolicy::Open,
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "chat".into(),
+                    payload: chat_encode_msg(&ChatMsg::PostMessage {
+                        channel_id: "general".into(),
+                        message_id: "u1".into(),
+                        blocks: vec![ChatBlock::paragraph("hello")],
+                        thread: None,
+                        as_agent: None,
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "chat".into(),
+                    payload: chat_encode_msg(&ChatMsg::PostMessage {
+                        channel_id: "general".into(),
+                        message_id: "a1".into(),
+                        blocks: vec![ChatBlock::paragraph("synced over the wire")],
+                        thread: None,
+                        as_agent: None,
+                    }),
+                },
+            ),
+            (
+                member,
+                Msg {
+                    target: "forge".into(),
+                    payload: forge::encode_msg(&forge::ForgeMsg::OpenIssue {
+                        repo: "demo".into(),
+                        title: "State-sync the Forge tracker".into(),
+                        body: "Git objects use the separate PushRefs data plane".into(),
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "directory".into(),
+                    payload: dir_encode_msg(&DirMsg::Set {
+                        key: "name".into(),
+                        value: "world".into(),
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "valset".into(),
+                    payload: valset_encode_msg(&ValsetMsg::Join {
+                        key: seeded_pubkey(7),
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "saga".into(),
+                    payload: saga_encode_msg(&SagaMsg::Trigger {
+                        pinned_assignee: None,
+                        saga_id: saga::namespaced_id(&system, "greet"),
+                        spec: b"reverse hello".to_vec(),
+                        reply_to: None,
+                        reply_payload: Vec::new(),
+                        deadline: None,
+                        max_attempts: 1,
+                        lease_views: None,
+                        capability: None,
+                        demands: Default::default(),
+                    }),
+                },
+            ),
         ];
         let mut height = 0u64;
-        for op in ops {
-            // membership ops are governance-gated: drive every source op on the
-            // SYSTEM origin lane (trusted test orchestration), which valset and
-            // every product module accept alike.
+        for (origin, op) in ops {
             host.submit_at(
                 host::BlockContext {
                     height: height + 1,
                     consensus_time: height + 1,
-                    origin: sdk::Origin::System,
+                    origin,
                 },
                 op,
             )

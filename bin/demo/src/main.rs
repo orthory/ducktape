@@ -113,18 +113,38 @@ fn main() {
         println!("\n[block 2] greeter(name): query directory -> write greeting to directory + kv");
         println!("  root-hash       : {:?}", out.root_hash);
 
+        // forge, chat and the app modules below derive authorship from the
+        // dispatch origin (no author field in any payload) and each refuses an
+        // unauthenticated one, so the demo submits with an explicit external
+        // origin — a seed-derived ed25519 pubkey standing in for a real
+        // submitter id. the default empty external origin would be rejected.
+        let demo_user = PrivateKey::decode(&[5u8; 32][..])
+            .expect("32-byte seed is a valid ed25519 private key")
+            .public_key()
+            .as_ref()
+            .to_vec();
+        let as_demo_user = || BlockContext {
+            height: 0,
+            consensus_time: 0,
+            origin: Origin::External(demo_user.clone()),
+        };
+
         // block 3: tracker state is consensus-owned; Git objects are built by
         // clients and enter through the node's PushRefs data-plane lane, which
-        // this in-process Host demo deliberately does not emulate.
+        // this in-process Host demo deliberately does not emulate. a tracker
+        // item is a MEMBER action, so it rides the demo user's origin.
         let out = host
-            .submit(Msg {
-                target: "forge".into(),
-                payload: forge_encode_msg(&ForgeMsg::OpenIssue {
-                    repo: "demo".into(),
-                    title: "Ship the first pushed commit".into(),
-                    body: "Git objects travel through the data plane".into(),
-                }),
-            })
+            .submit_at(
+                as_demo_user(),
+                Msg {
+                    target: "forge".into(),
+                    payload: forge_encode_msg(&ForgeMsg::OpenIssue {
+                        repo: "demo".into(),
+                        title: "Ship the first pushed commit".into(),
+                        body: "Git objects travel through the data plane".into(),
+                    }),
+                },
+            )
             .await
             .expect("submit block 3");
         println!("\n[block 3] forge <- OpenIssue — consensus-owned tracker state");
@@ -179,21 +199,8 @@ fn main() {
             );
         }
 
-        // block 4: create a chat channel. chat derives authorship from the
-        // dispatch origin (no author field in any payload), so the demo submits
-        // with an explicit external origin — a seed-derived ed25519 pubkey
-        // standing in for a real submitter id. the default empty external
-        // origin would be rejected.
-        let demo_user = PrivateKey::decode(&[5u8; 32][..])
-            .expect("32-byte seed is a valid ed25519 private key")
-            .public_key()
-            .as_ref()
-            .to_vec();
-        let as_demo_user = || BlockContext {
-            height: 0,
-            consensus_time: 0,
-            origin: Origin::External(demo_user.clone()),
-        };
+        // block 4: create a chat channel — same origin-derived authorship as
+        // the forge item above, so the same demo user submits it.
         let out = host
             .submit_at(
                 as_demo_user(),
