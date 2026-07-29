@@ -221,6 +221,11 @@ fn proxy_request(
                 "path_and_query": path,
                 "headers": headers,
                 "body_len": body.len(),
+                // `ProxyRequestHead` is `deny_unknown_fields` AND has no
+                // `serde(default)` on `upgrade`, so omitting it is not a
+                // permissive miss — the whole head fails to deserialize and the
+                // handler answers 422 with an empty body.
+                "upgrade": false,
             },
             "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
         })),
