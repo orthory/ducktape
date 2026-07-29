@@ -165,7 +165,7 @@ view
         agents:
           AgentsScreen rows=agents_rows
         forge:
-          ForgeScreen org=network_label(account_name, connected_rpc) about=account_bio tier=member_tier(members_rows) repos=forge_repos open_repo=forge_repo repo_menu=forge_repo_menu branches=forge_branches tab=forge_tab items=forge_items tree_repo=forge_tree_repo tree_path=forge_tree_path tree_entries=forge_tree_entries file_path=forge_file_path file_text=forge_file_text file_binary=forge_file_binary file_truncated=forge_file_truncated forge_item_number=forge_item_number forge_item_kind=forge_item_kind forge_item_title=forge_item_title forge_item_state=forge_item_state forge_item_author=forge_item_author forge_item_branches=forge_item_branches forge_item_body=forge_item_body forge_item_files_changed=forge_item_files_changed forge_item_additions=forge_item_additions forge_item_deletions=forge_item_deletions forge_item_diff=forge_item_diff forge_item_diff_truncated=forge_item_diff_truncated forge_item_merge_oid=forge_item_merge_oid forge_item_source_oid=forge_item_source_oid forge_item_channel=forge_item_channel forge_item_approvals=forge_item_approvals forge_item_change_requests=forge_item_change_requests forge_item_reviews=forge_item_reviews merge_conflicts=forge_merge_conflicts merge_busy=forge_merge_busy review_verdict=forge_review_verdict review_draft<->forge_review_draft review_busy=forge_review_busy discussion=forge_discussion discussion_editor<->forge_discussion_editor discussion_pending=forge_discussion_pending connected=connected loading=loading
+          ForgeScreen org=network_label(account_name, connected_rpc) about=account_bio tier=member_tier(members_rows) repos=forge_repos open_repo=forge_repo repo_menu=forge_repo_menu branches=forge_branches tab=forge_tab items=forge_items tree_repo=forge_tree_repo tree_path=forge_tree_path tree_entries=forge_tree_entries file_path=forge_file_path file_text=forge_file_text file_binary=forge_file_binary file_truncated=forge_file_truncated forge_item_number=forge_item_number forge_item_kind=forge_item_kind forge_item_title=forge_item_title forge_item_state=forge_item_state forge_item_author=forge_item_author forge_item_branches=forge_item_branches forge_item_body=forge_item_body forge_item_files_changed=forge_item_files_changed forge_item_additions=forge_item_additions forge_item_deletions=forge_item_deletions forge_item_diff=forge_item_diff forge_item_diff_truncated=forge_item_diff_truncated forge_item_merge_oid=forge_item_merge_oid forge_item_source_oid=forge_item_source_oid forge_item_channel=forge_item_channel forge_item_approvals=forge_item_approvals forge_item_change_requests=forge_item_change_requests forge_item_reviews=forge_item_reviews merge_conflicts=forge_merge_conflicts merge_busy=forge_merge_busy review_verdict=forge_review_verdict review_draft<->forge_review_draft review_busy=forge_review_busy comment_target=forge_comment_target(forge_comment_path, forge_comment_line, forge_comment_side) comment_draft<->forge_comment_draft staged_comments=forge_comment_staged discussion=forge_discussion discussion_editor<->forge_discussion_editor discussion_pending=forge_discussion_pending connected=connected loading=loading
             events
               forge_open_repo -> forge_open_repo _
               forge_close_repo -> forge_close_repo
@@ -178,6 +178,10 @@ view
               forge_merge_submit -> forge_merge_submit
               forge_review_pick -> forge_review_pick _
               forge_review_submit -> forge_review_submit
+              forge_comment_open -> forge_comment_open _ _ _
+              forge_comment_stage -> forge_comment_stage
+              forge_comment_cancel -> forge_comment_cancel
+              forge_comment_drop -> forge_comment_drop _
               forge_note_submit -> forge_note_submit
         governance:
           GovernanceScreen rows=gov_rows voting=gov_voting admin=members_is_admin(members_rows)

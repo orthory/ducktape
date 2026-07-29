@@ -3038,6 +3038,10 @@ pub async fn load_forge_discussion(
 
 /// Submit a batched review on a PR, pinned to the source head the reviewer
 /// saw. Approvals stay advisory — the wire never gates the merge.
+// The eighth argument is the staged comments, and they cannot be split off into
+// their own call: a review and its line comments are ONE transaction on the
+// wire. `Tracker::submit_review` carries the same allow for the same reason.
+#[allow(clippy::too_many_arguments)]
 pub async fn submit_forge_review(
     rpc: String,
     password: String,
@@ -3046,6 +3050,7 @@ pub async fn submit_forge_review(
     verdict: String,
     body: String,
     commit_oid: String,
+    comments: Vec<ForgeDraftComment>,
 ) -> Result<bool, AppError> {
     async {
         let number = u64::try_from(number).map_err(|_| "invalid item number".to_string())?;
@@ -3056,6 +3061,7 @@ pub async fn submit_forge_review(
             other => return Err(format!("unknown review verdict {other:?}")),
         };
         let body = bounded_exact_text(body, "review body", forge::MAX_BODY_BYTES)?;
+        let comments = review_comments(comments)?;
         if commit_oid.is_empty() {
             return Err("the pull request diff has not loaded yet".to_string());
         }
@@ -3069,7 +3075,7 @@ pub async fn submit_forge_review(
                 verdict,
                 body,
                 commit_oid,
-                comments: Vec::new(),
+                comments,
             }),
             password,
         )
@@ -3078,6 +3084,38 @@ pub async fn submit_forge_review(
     .await
     .map_err(app_error)?;
     Ok(true)
+}
+
+/// The staged drafts, re-checked at the wire and turned into the module's own
+/// `ReviewComment`. `stage_forge_comment` already refuses an unusable draft, so
+/// nothing here should ever fire — but this is the boundary where a bad anchor
+/// would become a committed record, and a rejection with a reason beats a
+/// comment silently landing on line 0 of nothing.
+fn review_comments(comments: Vec<ForgeDraftComment>) -> Result<Vec<forge::ReviewComment>, String> {
+    comments
+        .into_iter()
+        .map(|draft| {
+            let line = draft
+                .line
+                .parse::<u32>()
+                .map_err(|_| format!("comment anchor {:?} has no line number", draft.anchor))?;
+            let side = match draft.side.as_str() {
+                "new" => forge::DiffSide::New,
+                "old" => forge::DiffSide::Old,
+                other => return Err(format!("unknown diff side {other:?}")),
+            };
+            Ok(forge::ReviewComment {
+                path: bounded_exact_text(draft.path, "comment path", forge::MAX_PATH_BYTES)?,
+                line,
+                side,
+                body: bounded_exact_text(
+                    draft.body,
+                    "comment body",
+                    forge::MAX_REVIEW_COMMENT_BYTES,
+                )?,
+            })
+        })
+        .collect()
 }
 
 /// The merge box's outcome: either the CAS'd merge landed, or the merge
@@ -3788,6 +3826,19 @@ pub struct DiffLine {
     pub new_no: String,
     pub sign: String,
     pub text: String,
+    /// The file this row belongs to, carried from the patch's own `+++ b/…`
+    /// header. `forge_item_diff` is the WHOLE multi-file patch as one string,
+    /// so a row cannot say which file it is from without this — and
+    /// `ReviewComment` anchors on `(path, line, side)`, so a comment cannot be
+    /// authored from a row that does not know its own path.
+    ///
+    /// Empty on `file` and `hunk` rows, and on a deletion's `/dev/null` side:
+    /// those are not commentable positions.
+    pub path: String,
+    /// Which side of the diff this row addresses — `new` for an addition or a
+    /// context line, `old` for a deletion, empty for a non-code row. Mirrors
+    /// `forge::DiffSide`, as a string because that is what crosses into `.ice`.
+    pub side: String,
 }
 
 /// One numbered source line of a blob. `number` is a string for the same reason
@@ -3821,35 +3872,92 @@ pub fn diff_lines(diff: String) -> Vec<DiffLine> {
     let mut rows = Vec::new();
     let mut old_no = 0i64;
     let mut new_no = 0i64;
+    // The path every following code row is anchored to, taken from the patch's
+    // own `+++ b/…` header. A comment cannot be authored from a row that does
+    // not know its file, and `forge_item_diff` is the whole multi-file patch as
+    // one string, so this is the only place the association exists.
+    let mut path = String::new();
     for line in diff.lines() {
+        if let Some(target) = added_side_path(line) {
+            path = target;
+            rows.push(diff_row(
+                "file",
+                String::new(),
+                String::new(),
+                "",
+                line,
+                "",
+                "",
+            ));
+            continue;
+        }
         let is_file_header = line.starts_with("diff ")
             || line.starts_with("--- ")
-            || line.starts_with("+++ ")
             || line.starts_with("index ")
             || line.starts_with("new file")
             || line.starts_with("deleted file");
         if is_file_header {
-            rows.push(diff_row("file", String::new(), String::new(), "", line));
+            rows.push(diff_row(
+                "file",
+                String::new(),
+                String::new(),
+                "",
+                line,
+                "",
+                "",
+            ));
             continue;
         }
         if let Some((old_start, new_start)) = hunk_starts(line) {
             old_no = old_start;
             new_no = new_start;
-            rows.push(diff_row("hunk", String::new(), String::new(), "", line));
+            rows.push(diff_row(
+                "hunk",
+                String::new(),
+                String::new(),
+                "",
+                line,
+                "",
+                "",
+            ));
             continue;
         }
         match line.chars().next() {
             Some('+') => {
-                rows.push(diff_row("add", String::new(), new_no.to_string(), "+", &line[1..]));
+                rows.push(diff_row(
+                    "add",
+                    String::new(),
+                    new_no.to_string(),
+                    "+",
+                    &line[1..],
+                    &path,
+                    "new",
+                ));
                 new_no += 1;
             }
             Some('-') => {
-                rows.push(diff_row("del", old_no.to_string(), String::new(), "-", &line[1..]));
+                rows.push(diff_row(
+                    "del",
+                    old_no.to_string(),
+                    String::new(),
+                    "-",
+                    &line[1..],
+                    &path,
+                    "old",
+                ));
                 old_no += 1;
             }
             _ => {
                 let text = line.strip_prefix(' ').unwrap_or(line);
-                rows.push(diff_row("ctx", old_no.to_string(), new_no.to_string(), "", text));
+                rows.push(diff_row(
+                    "ctx",
+                    old_no.to_string(),
+                    new_no.to_string(),
+                    "",
+                    text,
+                    &path,
+                    "new",
+                ));
                 old_no += 1;
                 new_no += 1;
             }
@@ -3858,14 +3966,184 @@ pub fn diff_lines(diff: String) -> Vec<DiffLine> {
     rows
 }
 
-fn diff_row(kind: &str, old_no: String, new_no: String, sign: &str, text: &str) -> DiffLine {
+/// The head-side path a `+++ b/<path>` header names, or `None` for any other
+/// line. A pure deletion writes `+++ /dev/null`, which names no file on the
+/// head side and yields an empty path — its rows are then uncommentable, which
+/// is correct: there is no head line to anchor to.
+fn added_side_path(line: &str) -> Option<String> {
+    let target = line.strip_prefix("+++ ")?;
+    if target == "/dev/null" {
+        return Some(String::new());
+    }
+    // git writes `b/<path>`; a patch produced without prefixes writes the path
+    // bare, so strip the marker only when it is there.
+    Some(target.strip_prefix("b/").unwrap_or(target).to_string())
+}
+
+fn diff_row(
+    kind: &str,
+    old_no: String,
+    new_no: String,
+    sign: &str,
+    text: &str,
+    path: &str,
+    side: &str,
+) -> DiffLine {
     DiffLine {
         kind: kind.into(),
         old_no,
         new_no,
+        path: path.into(),
+        side: side.into(),
         sign: sign.into(),
         text: text.to_string(),
     }
+}
+
+/// One line comment staged for a review that has not been submitted yet.
+///
+/// `anchor` is display-ready (`src/main.rs:14 (new)`) exactly as
+/// `ReviewCommentRow.anchor` is on the read side, so the view never re-derives
+/// diff vocabulary — and it doubles as the row's IDENTITY. Restaging a line
+/// replaces the comment there instead of stacking a second one on one position,
+/// which is the only sane reading of clicking the same gutter twice.
+#[derive(Clone, Debug, Hash, PartialEq, Default)]
+pub struct ForgeDraftComment {
+    pub anchor: String,
+    pub path: String,
+    /// The anchored line number, as the string the gutter already renders.
+    /// Parsed back to `u32` at the wire.
+    pub line: String,
+    /// `new` | `old` — mirrors `forge::DiffSide`.
+    pub side: String,
+    pub body: String,
+}
+
+/// Stage one line comment, or replace the one already on that line.
+///
+/// Returns `staged` UNCHANGED when the anchor or body is not usable — an empty
+/// path (a deleted file's rows), a blank body, a line number that is not a
+/// positive `u32`, or a full list. The composer disables its own submit at the
+/// cap via `forge_comment_cap_reached`, so a user never reaches the silent
+/// arm; this is the invariant behind that, not the message that carries it.
+pub fn stage_forge_comment(
+    staged: Vec<ForgeDraftComment>,
+    path: String,
+    line: String,
+    side: String,
+    body: String,
+) -> Vec<ForgeDraftComment> {
+    let anchored = !path.is_empty() && line.parse::<u32>().is_ok_and(|no| no > 0);
+    let sided = side == "new" || side == "old";
+    let usable_body = !body.trim().is_empty() && body.len() <= forge::MAX_REVIEW_COMMENT_BYTES;
+    if !anchored || !sided || !usable_body || path.len() > forge::MAX_PATH_BYTES {
+        return staged;
+    }
+    let comment = ForgeDraftComment {
+        anchor: comment_anchor(&path, &line, &side),
+        path,
+        line,
+        side,
+        body,
+    };
+    let mut staged = staged;
+    match staged.iter().position(|row| row.anchor == comment.anchor) {
+        Some(at) => staged[at] = comment,
+        None if staged.len() < forge::MAX_REVIEW_COMMENTS => staged.push(comment),
+        None => {}
+    }
+    staged
+}
+
+/// Drop the comment staged at one anchor. A miss leaves the list alone.
+pub fn drop_forge_comment(
+    staged: Vec<ForgeDraftComment>,
+    anchor: String,
+) -> Vec<ForgeDraftComment> {
+    let mut staged = staged;
+    staged.retain(|row| row.anchor != anchor);
+    staged
+}
+
+/// The staged list is at the module's per-review cap, so the composer must
+/// refuse to take another. The literal lives HERE and nowhere in `.ice`, so the
+/// gate and the module's own limit cannot drift apart.
+pub fn forge_comment_cap_reached(staged: Vec<ForgeDraftComment>) -> bool {
+    staged.len() >= forge::MAX_REVIEW_COMMENTS
+}
+
+/// The label a picked-but-unstaged line wears above the composer, empty when no
+/// line is picked — the composer keys its whole visibility on this.
+pub fn forge_comment_target(path: String, line: String, side: String) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    comment_anchor(&path, &line, &side)
+}
+
+/// `src/main.rs:14 (new)` — the one place the anchor string is spelled, shared
+/// by the staged rows and the composer header so they can never disagree.
+fn comment_anchor(path: &str, line: &str, side: &str) -> String {
+    format!("{path}:{line} ({side})")
+}
+
+/// A staged comment outlives the diff it was written against when a live
+/// refresh moves the PR's source head.
+///
+/// It CANNOT be carried across: the anchor is `(path, line, side)` into a
+/// specific patch, and the review would be submitted pinning the NEW head — so
+/// a comment about a line the author read would land on whatever now occupies
+/// that number, and `outdated` would read false because the pin matches. The
+/// module has no position tracking across a moved branch by design; dropping is
+/// the only reading that cannot publish a false claim.
+fn staged_comments_outlived_their_diff(loaded: bool, next_oid: &str, current_oid: &str) -> bool {
+    let moved = !next_oid.is_empty() && !current_oid.is_empty() && next_oid != current_oid;
+    loaded && moved
+}
+
+/// The staged comments, or none once the branch has moved under them.
+pub fn keep_staged_comments(
+    loaded: bool,
+    next_oid: String,
+    current_oid: String,
+    staged: Vec<ForgeDraftComment>,
+) -> Vec<ForgeDraftComment> {
+    if staged_comments_outlived_their_diff(loaded, &next_oid, &current_oid) {
+        return Vec::new();
+    }
+    staged
+}
+
+/// One in-composer string (the picked path, the body being typed) held only
+/// while the diff it belongs to is still on screen.
+pub fn keep_comment_text(
+    loaded: bool,
+    next_oid: String,
+    current_oid: String,
+    value: String,
+) -> String {
+    if staged_comments_outlived_their_diff(loaded, &next_oid, &current_oid) {
+        return String::new();
+    }
+    value
+}
+
+/// Discarded work is never silent. This says WHY the staged comments vanished,
+/// and only when there were some to lose — a refresh that moved the branch
+/// while nothing was staged is not an error and reports none.
+pub fn staged_comment_drop_note(
+    loaded: bool,
+    next_oid: String,
+    current_oid: String,
+    staged: Vec<ForgeDraftComment>,
+    error: String,
+) -> String {
+    let lost =
+        !staged.is_empty() && staged_comments_outlived_their_diff(loaded, &next_oid, &current_oid);
+    if !lost {
+        return error;
+    }
+    "The branch moved while comments were staged. They anchored to lines in the old diff, so they were discarded rather than posted against the new one.".into()
 }
 
 /// `@@ -138,9 +138,12 @@ …` → the two start line numbers.
@@ -8802,6 +9080,326 @@ mod tests {
         assert_eq!(rows[4].sign, "+");
         assert_eq!(rows[4].new_no, "139");
         assert_eq!(rows[4].text, "added");
+    }
+
+    /// Every code row knows which FILE it is in, across a multi-file patch.
+    ///
+    /// `forge_item_diff` is the whole patch as one string, so without this a row
+    /// cannot say what it belongs to — and `ReviewComment` anchors on
+    /// `(path, line, side)`, so an unanchored row cannot carry a comment.
+    #[test]
+    fn every_code_row_carries_its_file_and_side() {
+        let rows = diff_lines(
+            concat!(
+                "diff --git a/one.rs b/one.rs\n",
+                "--- a/one.rs\n",
+                "+++ b/one.rs\n",
+                "@@ -1,2 +1,2 @@\n",
+                " ctx\n",
+                "-gone\n",
+                "+added\n",
+                "diff --git a/two.rs b/two.rs\n",
+                "--- a/two.rs\n",
+                "+++ b/two.rs\n",
+                "@@ -10,1 +10,1 @@\n",
+                "+second\n",
+            )
+            .into(),
+        );
+        let coded: Vec<(&str, &str, &str)> = rows
+            .iter()
+            .filter(|row| row.kind != "file" && row.kind != "hunk")
+            .map(|row| (row.path.as_str(), row.side.as_str(), row.text.as_str()))
+            .collect();
+        assert_eq!(
+            coded,
+            [
+                ("one.rs", "new", "ctx"),
+                ("one.rs", "old", "gone"),
+                ("one.rs", "new", "added"),
+                // the second header re-points the anchor; a row after it must
+                // not still claim the first file.
+                ("two.rs", "new", "second"),
+            ]
+        );
+
+        // headers and hunks are not commentable positions and say so.
+        assert!(
+            rows.iter()
+                .filter(|row| row.kind == "file" || row.kind == "hunk")
+                .all(|row| row.path.is_empty() && row.side.is_empty())
+        );
+    }
+
+    /// A pure deletion writes `+++ /dev/null` — no head-side file exists, so
+    /// its rows are deliberately unanchorable rather than being attributed to
+    /// whichever file happened to come before them in the patch.
+    #[test]
+    fn a_deleted_files_rows_anchor_to_nothing() {
+        let rows = diff_lines(
+            concat!(
+                "diff --git a/kept.rs b/kept.rs\n",
+                "+++ b/kept.rs\n",
+                "@@ -1,1 +1,1 @@\n",
+                "+kept\n",
+                "diff --git a/dropped.rs b/dropped.rs\n",
+                "+++ /dev/null\n",
+                "@@ -1,1 +0,0 @@\n",
+                "-dropped\n",
+            )
+            .into(),
+        );
+        let dropped = rows
+            .iter()
+            .find(|row| row.text == "dropped")
+            .expect("del row");
+        assert_eq!(dropped.path, "", "a /dev/null head side anchors nothing");
+        let kept = rows.iter().find(|row| row.text == "kept").expect("add row");
+        assert_eq!(kept.path, "kept.rs");
+    }
+
+    fn stage(staged: Vec<ForgeDraftComment>, line: &str, body: &str) -> Vec<ForgeDraftComment> {
+        stage_forge_comment(
+            staged,
+            "src/main.rs".into(),
+            line.into(),
+            "new".into(),
+            body.into(),
+        )
+    }
+
+    /// Clicking one gutter twice REPLACES that line's comment. Two comments on
+    /// one position is not a thing the author can have meant, and the anchor is
+    /// the row's identity precisely so this cannot stack.
+    #[test]
+    fn restaging_a_line_replaces_the_comment_already_on_it() {
+        let staged = stage(Vec::new(), "14", "first");
+        let staged = stage(staged, "14", "second");
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].body, "second");
+        assert_eq!(staged[0].anchor, "src/main.rs:14 (new)");
+
+        // a DIFFERENT line is a different anchor, so it lands beside it.
+        let staged = stage(staged, "15", "third");
+        assert_eq!(staged.len(), 2);
+        // and the same line on the OTHER side is its own position too.
+        let staged = stage_forge_comment(
+            staged,
+            "src/main.rs".into(),
+            "14".into(),
+            "old".into(),
+            "base side".into(),
+        );
+        assert_eq!(staged.len(), 3);
+        assert_eq!(staged[2].anchor, "src/main.rs:14 (old)");
+    }
+
+    /// A draft the wire could not carry never enters the list. Each of these
+    /// would otherwise reach `submit_forge_review` and be rejected there — or
+    /// worse, land as a comment anchored to nothing.
+    #[test]
+    fn a_draft_the_wire_cannot_anchor_never_stages() {
+        let unusable = [
+            // a deleted file's rows carry no head-side path
+            ("", "14", "new", "body"),
+            // gutters are blank on the side a row does not touch
+            ("src/main.rs", "", "new", "body"),
+            ("src/main.rs", "0", "new", "body"),
+            ("src/main.rs", "-3", "new", "body"),
+            // only the two diff sides exist
+            ("src/main.rs", "14", "both", "body"),
+            // the module refuses an empty comment body
+            ("src/main.rs", "14", "new", "   "),
+        ];
+        for (path, line, side, body) in unusable {
+            assert!(
+                stage_forge_comment(
+                    Vec::new(),
+                    path.into(),
+                    line.into(),
+                    side.into(),
+                    body.into()
+                )
+                .is_empty(),
+                "staged an unusable draft: {path:?} {line:?} {side:?} {body:?}"
+            );
+        }
+        assert!(
+            !stage(Vec::new(), "14", "real").is_empty(),
+            "a usable draft stages"
+        );
+    }
+
+    /// The staged list stops at the module's OWN per-review cap, and the gate
+    /// the composer disables on agrees with it — both read the one constant, so
+    /// the button greys out on exactly the draft the list would have dropped.
+    #[test]
+    fn staging_stops_at_the_modules_own_cap() {
+        let mut staged = Vec::new();
+        for line in 1..=forge::MAX_REVIEW_COMMENTS {
+            staged = stage(staged, &line.to_string(), "body");
+        }
+        assert_eq!(staged.len(), forge::MAX_REVIEW_COMMENTS);
+        assert!(forge_comment_cap_reached(staged.clone()));
+
+        let past_cap = stage(staged.clone(), "9999", "one too many");
+        assert_eq!(past_cap.len(), forge::MAX_REVIEW_COMMENTS, "the cap holds");
+
+        // replacing an EXISTING anchor is not a new row, so it still works at
+        // the cap — otherwise a full list could never be corrected.
+        let edited = stage(staged, "1", "edited at the cap");
+        assert_eq!(edited.len(), forge::MAX_REVIEW_COMMENTS);
+        assert_eq!(edited[0].body, "edited at the cap");
+    }
+
+    #[test]
+    fn dropping_one_staged_comment_leaves_the_others() {
+        let staged = stage(stage(Vec::new(), "14", "a"), "15", "b");
+        let kept = drop_forge_comment(staged.clone(), "src/main.rs:14 (new)".into());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].body, "b");
+        assert_eq!(
+            drop_forge_comment(staged.clone(), "nothing/here.rs:1 (new)".into()).len(),
+            2,
+            "a miss leaves the list alone"
+        );
+        assert!(drop_forge_comment(staged, "src/main.rs:15 (new)".into())[0].body == "a");
+    }
+
+    /// The composer's visibility IS this string, and it is spelled by the same
+    /// helper the staged rows wear — so the header over the draft and the chip
+    /// it becomes can never disagree.
+    #[test]
+    fn the_composer_opens_only_on_a_picked_line() {
+        assert_eq!(
+            forge_comment_target("src/main.rs".into(), "14".into(), "new".into()),
+            "src/main.rs:14 (new)"
+        );
+        assert_eq!(
+            forge_comment_target(String::new(), "14".into(), "new".into()),
+            "",
+            "no line picked, no composer"
+        );
+        assert_eq!(
+            forge_comment_target("src/main.rs".into(), "14".into(), "new".into()),
+            stage(Vec::new(), "14", "body")[0].anchor,
+            "the composer header and the staged chip are the same anchor"
+        );
+    }
+
+    /// A branch that moves under an open composer takes the staged comments
+    /// with it, and says so. The alternative is a review pinning the NEW head
+    /// while carrying comments written about the OLD one — which `outdated`
+    /// would then report as current, because the pin matches.
+    #[test]
+    fn a_moved_branch_discards_the_comments_staged_against_the_old_diff() {
+        let staged = stage(Vec::new(), "14", "about the old line 14");
+        let held = ("aaa".to_string(), "aaa".to_string());
+        let moved = ("bbb".to_string(), "aaa".to_string());
+
+        // the same head: nothing is disturbed, and no note is raised.
+        assert_eq!(
+            keep_staged_comments(true, held.0.clone(), held.1.clone(), staged.clone()).len(),
+            1
+        );
+        assert_eq!(
+            keep_comment_text(true, held.0.clone(), held.1.clone(), "draft".into()),
+            "draft"
+        );
+        assert_eq!(
+            staged_comment_drop_note(
+                true,
+                held.0.clone(),
+                held.1.clone(),
+                staged.clone(),
+                String::new()
+            ),
+            ""
+        );
+
+        // a moved head: the drafts go, and the reason is reported.
+        assert!(
+            keep_staged_comments(true, moved.0.clone(), moved.1.clone(), staged.clone()).is_empty()
+        );
+        assert_eq!(
+            keep_comment_text(true, moved.0.clone(), moved.1.clone(), "draft".into()),
+            ""
+        );
+        assert!(
+            staged_comment_drop_note(
+                true,
+                moved.0.clone(),
+                moved.1.clone(),
+                staged.clone(),
+                String::new()
+            )
+            .contains("discarded")
+        );
+
+        // a refresh that carried no item, or that resolved no head, is not a
+        // move — a miss must never be read as a force-push.
+        for (loaded, next, current) in [(false, "bbb", "aaa"), (true, "", "aaa"), (true, "bbb", "")]
+        {
+            assert_eq!(
+                keep_staged_comments(loaded, next.into(), current.into(), staged.clone()).len(),
+                1,
+                "an unresolved head dropped staged comments: {loaded} {next:?} {current:?}"
+            );
+        }
+
+        // nothing staged is nothing lost: a real move raises no note.
+        assert_eq!(
+            staged_comment_drop_note(true, moved.0, moved.1, Vec::new(), "prior banner".into()),
+            "prior banner",
+            "an empty composer neither loses work nor clears a standing error"
+        );
+    }
+
+    /// The staged drafts become the module's own `ReviewComment`s — the string
+    /// line number parsed back to `u32` and the side back to `DiffSide`.
+    #[test]
+    fn staged_drafts_cross_the_wire_as_review_comments() {
+        let staged = stage_forge_comment(
+            stage(Vec::new(), "14", "on the head"),
+            "old.rs".into(),
+            "3".into(),
+            "old".into(),
+            "on the base".into(),
+        );
+        let wire = review_comments(staged).expect("staged drafts are wire-valid by construction");
+        assert_eq!(
+            wire,
+            [
+                forge::ReviewComment {
+                    path: "src/main.rs".into(),
+                    line: 14,
+                    side: forge::DiffSide::New,
+                    body: "on the head".into(),
+                },
+                forge::ReviewComment {
+                    path: "old.rs".into(),
+                    line: 3,
+                    side: forge::DiffSide::Old,
+                    body: "on the base".into(),
+                },
+            ]
+        );
+        assert!(
+            review_comments(Vec::new())
+                .expect("no comments is fine")
+                .is_empty()
+        );
+
+        // the boundary refuses rather than posting a comment anchored to
+        // nothing, even though staging should never produce one.
+        let forged = vec![ForgeDraftComment {
+            anchor: "src/main.rs:x (new)".into(),
+            path: "src/main.rs".into(),
+            line: "x".into(),
+            side: "new".into(),
+            body: "body".into(),
+        }];
+        assert!(review_comments(forged).is_err());
     }
 
     #[test]

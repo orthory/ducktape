@@ -170,15 +170,10 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
 // name/path/kind/size only, so nothing resolves it. A grey plate that says AI
 // on every file would be a lie about who wrote it.
 //
-// The inline annotation is a DIFFERENT case and it is NOT blocked by the wire:
-// `ReviewComment` (crates/modules/apps/forge/src/tracker_iface.rs) is
-// `{ path: String, line: u32, side: DiffSide, body: String }` — a real
-// (path, line, side) anchor, with `ReviewView.commit_oid` carrying the
-// outdated-detection anchor beside it. `diff_lines()` (backend.rs) already
-// splits a patch into numbered rows. What is missing is only the authoring
-// affordance: a hover on `DiffRow` emitting (path, old_no|new_no parsed back to
-// u32, side), and `submit_forge_review` taking those instead of its hardcoded
-// `comments: Vec::new()`. Tracked in #804.
+// The DIFF annotation is a different case and it is now BUILT: `DiffLine`
+// carries the `+++ b/…` path and the side of each code row, `DiffRow` makes the
+// anchoring gutter number the button, and `submit_forge_review` sends the
+// staged drafts as the review's `ReviewComment`s. See `DiffRow` below.
 
 // The two-pane frame. 258px of `sidebar` under the FILES eyebrow, the
 // `separator` rule, then the reader's header over its own scroll region.
@@ -284,9 +279,9 @@ component ForgeCodeHeader(path:str, message:str, author:str, stamp:str)
 //
 // The code is ONE ink. The design system is explicit that this viewer uses no
 // syntax colour ("코드는 구문 색을 쓰지 않고 단색") — emphasis is carried by the
-// signed annotation card, so nothing here tints a token. (The annotation is
-// unbuilt, not unanchorable: see the DiffRow note above for why the wire
-// already supports it.)
+// signed annotation card, so nothing here tints a token. (A BLOB has no
+// annotation affordance — `ReviewComment` anchors into a PR's diff, not into a
+// file read at a rev; `DiffRow` below is where a line comment is authored.)
 component ForgeCodeLine(number:str, code:str)
   row #root w=fill gap=0.0 align=center
     box w=44.0 h=20.0 pr=12.0 align-y=center bg=rail
@@ -531,6 +526,8 @@ component MergeButton(busy:bool, disabled:bool)
 // its contract name and wears the branch glyph, because a document icon beside
 // `feat/x → main` says the string is a path and it is not.
 component DiffPane(file:str, additions:i64, deletions:i64, lines:[DiffLine])
+  emits
+    forge_comment_open(str, str, str)
   box #root w=fill max-w=720.0 bg=surface border=card_line border-w=1.0 r=11.0 clip=true
     col w=fill
       box w=fill pl=14.0 pr=14.0 pt=10.0 pb=10.0 bg=card_wash
@@ -544,10 +541,22 @@ component DiffPane(file:str, additions:i64, deletions:i64, lines:[DiffLine])
       col w=fill
         for line in lines
           DiffRow line=line
+            forward
+              forge_comment_open
 
 // One patch line. The kind is the whole discriminant: a file header, a hunk
 // header, or a code row whose gutter, sign and ink are its tint.
+//
+// THE ANCHORING GUTTER IS THE COMMENT AFFORDANCE. Its own line number is the
+// button — the number a comment anchors to is the thing you click, so nothing
+// new is added to the row and no hover state has to be tracked per line (a
+// patch is hundreds of rows; a hover-revealed control would round-trip through
+// app state on every mouse move across it). A row whose `path` is empty — a
+// header, a hunk, or a deleted file's `/dev/null` side — keeps the plain box,
+// because there is no head-side position for a comment to anchor to.
 component DiffRow(line:DiffLine)
+  emits
+    forge_comment_open(str, str, str)
   col #root w=fill
     match line.kind
       "file"
@@ -561,8 +570,16 @@ component DiffRow(line:DiffLine)
           row w=fill gap=0.0 align=center
             box w=34.0 h=20.0 pr=8.0 align-y=center bg=diff_add_gutter
               text line.old_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
-            box w=34.0 h=20.0 pr=8.0 align-y=center bg=diff_add_gutter
-              text line.new_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
+            if empty(line.path)
+              box w=34.0 h=20.0 pr=8.0 align-y=center bg=diff_add_gutter
+                text line.new_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
+            if !empty(line.path)
+              button label="Comment on this line" w=34.0 h=20.0 p=0.0 @ghost_action -> emit(forge_comment_open, line.path, line.new_no, "new")
+                box w=fill h=20.0 pr=8.0 align-y=center
+                  text line.new_no w=fill size=12.0 wrap=none align-x=right font=code
+                active bg=diff_add_gutter text=gutter_ink
+                hovered bg=brand_bg text=brand
+                pressed bg=brand_wash text=brand
             box w=14.0 h=20.0 align-x=center align-y=center
               text line.sign size=12.0 wrap=none font=code @text-diff_add_fg
             box w=fill h=20.0 pr=12.0 align-y=center
@@ -570,8 +587,16 @@ component DiffRow(line:DiffLine)
       "del"
         box w=fill bg=diff_del_bg
           row w=fill gap=0.0 align=center
-            box w=34.0 h=20.0 pr=8.0 align-y=center bg=diff_del_gutter
-              text line.old_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
+            if empty(line.path)
+              box w=34.0 h=20.0 pr=8.0 align-y=center bg=diff_del_gutter
+                text line.old_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
+            if !empty(line.path)
+              button label="Comment on this deleted line" w=34.0 h=20.0 p=0.0 @ghost_action -> emit(forge_comment_open, line.path, line.old_no, "old")
+                box w=fill h=20.0 pr=8.0 align-y=center
+                  text line.old_no w=fill size=12.0 wrap=none align-x=right font=code
+                active bg=diff_del_gutter text=gutter_ink
+                hovered bg=brand_bg text=brand
+                pressed bg=brand_wash text=brand
             box w=34.0 h=20.0 pr=8.0 align-y=center bg=diff_del_gutter
               text line.new_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
             box w=14.0 h=20.0 align-x=center align-y=center
@@ -583,8 +608,16 @@ component DiffRow(line:DiffLine)
           row w=fill gap=0.0 align=center
             box w=34.0 h=20.0 pr=8.0 align-y=center bg=card_wash
               text line.old_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
-            box w=34.0 h=20.0 pr=8.0 align-y=center bg=card_wash
-              text line.new_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
+            if empty(line.path)
+              box w=34.0 h=20.0 pr=8.0 align-y=center bg=card_wash
+                text line.new_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
+            if !empty(line.path)
+              button label="Comment on this line" w=34.0 h=20.0 p=0.0 @ghost_action -> emit(forge_comment_open, line.path, line.new_no, "new")
+                box w=fill h=20.0 pr=8.0 align-y=center
+                  text line.new_no w=fill size=12.0 wrap=none align-x=right font=code
+                active bg=card_wash text=gutter_ink
+                hovered bg=brand_bg text=brand
+                pressed bg=brand_wash text=brand
             box w=14.0 h=20.0 align-x=center align-y=center
               text line.sign size=12.0 wrap=none font=code @text-panel_tile
             box w=fill h=20.0 pr=12.0 align-y=center

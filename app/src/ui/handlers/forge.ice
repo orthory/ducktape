@@ -37,6 +37,13 @@ on forge_open_item(number)
   forge_item_number = number
   forge_review_verdict = "comment"
   forge_review_draft = ""
+  // A staged comment anchors to THIS item's diff. Carrying one across items
+  // would post it against a patch it was never written about.
+  forge_comment_staged = []
+  forge_comment_path = ""
+  forge_comment_line = ""
+  forge_comment_side = ""
+  forge_comment_draft = ""
   forge_merge_conflicts = []
   forge_discussion = []
   forge_discussion_members = []
@@ -83,15 +90,52 @@ on forge_discussion_failed(cause)
 on forge_review_pick(verdict)
   forge_review_verdict = verdict
 
+// Clicking a diff gutter PICKS the line — it does not stage anything yet. The
+// picked anchor is what the composer writes against, and picking a second line
+// simply moves it, so a mis-click costs nothing.
+on forge_comment_open(path, line, side)
+  return if empty(path)
+  forge_comment_path = path
+  forge_comment_line = line
+  forge_comment_side = side
+
+on forge_comment_cancel
+  forge_comment_path = ""
+  forge_comment_line = ""
+  forge_comment_side = ""
+  forge_comment_draft = ""
+
+// `stage_forge_comment` is the authority on what is stageable and on replacing
+// the comment already at this anchor; the guard here only keeps the obviously
+// empty case off the call.
+on forge_comment_stage
+  return if empty(forge_comment_path) || empty(forge_comment_draft)
+  forge_comment_staged = stage_forge_comment(forge_comment_staged, forge_comment_path, forge_comment_line, forge_comment_side, forge_comment_draft)
+  forge_comment_path = ""
+  forge_comment_line = ""
+  forge_comment_side = ""
+  forge_comment_draft = ""
+
+on forge_comment_drop(anchor)
+  forge_comment_staged = drop_forge_comment(forge_comment_staged, anchor)
+
 on forge_review_submit
   return if !connected || forge_review_busy || empty(forge_repo) || forge_item_number <= 0
   forge_review_busy = true
-  run submit_forge_review(connected_rpc, password, forge_repo, forge_item_number, forge_review_verdict, forge_review_draft, forge_item_source_oid) -> forge_review_submitted _ | forge_review_failed _
+  run submit_forge_review(connected_rpc, password, forge_repo, forge_item_number, forge_review_verdict, forge_review_draft, forge_item_source_oid, forge_comment_staged) -> forge_review_submitted _ | forge_review_failed _
 
+// The staged comments went out INSIDE this review, so they are cleared with the
+// body. A failure keeps them — the whole submit is one transaction, and losing
+// a page of written comments to a transient RPC error is not recoverable.
 on forge_review_submitted(_result)
   forge_review_busy = false
   forge_review_draft = ""
   forge_review_verdict = "comment"
+  forge_comment_staged = []
+  forge_comment_path = ""
+  forge_comment_line = ""
+  forge_comment_side = ""
+  forge_comment_draft = ""
   error = ""
 
 on forge_review_failed(cause)
@@ -143,6 +187,14 @@ on forge_refreshed(next)
   forge_item_branches = keep_str(next.item_loaded, next.item.branches, forge_item_branches)
   forge_item_channel = keep_str(next.item_loaded, next.item.channel_id, forge_item_channel)
   forge_item_source_branch = keep_str(next.item_loaded, next.item.source_branch, forge_item_source_branch)
+  // A staged comment anchors into ONE patch. These read the source head BEFORE
+  // it is reassigned below, so a branch that moved under an open composer takes
+  // its comments with it instead of being submitted as if they were written
+  // against the new diff.
+  error = staged_comment_drop_note(next.item_loaded, next.item.source_oid, forge_item_source_oid, forge_comment_staged, error)
+  forge_comment_staged = keep_staged_comments(next.item_loaded, next.item.source_oid, forge_item_source_oid, forge_comment_staged)
+  forge_comment_path = keep_comment_text(next.item_loaded, next.item.source_oid, forge_item_source_oid, forge_comment_path)
+  forge_comment_draft = keep_comment_text(next.item_loaded, next.item.source_oid, forge_item_source_oid, forge_comment_draft)
   forge_item_source_oid = keep_str(next.item_loaded, next.item.source_oid, forge_item_source_oid)
   forge_item_target_oid = keep_str(next.item_loaded, next.item.target_oid, forge_item_target_oid)
   forge_item_merge_oid = keep_str(next.item_loaded, next.item.merge_oid, forge_item_merge_oid)

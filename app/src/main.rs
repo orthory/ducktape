@@ -264,8 +264,13 @@ mod tests {
 
         // a review pins the source head the reviewer saw; the merge CASes
         // BOTH heads (recompute on a moved branch, never a blind retry).
+        //
+        // the line comments ride INSIDE the review's own transaction — there is
+        // no standalone comment op, so a comment cannot land without the
+        // verdict it was written under, and it cannot outlive the diff it
+        // anchors to (`keep_staged_comments` drops them when the head moves).
         assert!(backend.contains(
-            "submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str)"
+            "submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str, comments:[ForgeDraftComment])"
         ));
         assert!(backend.contains(
             "merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str)"
