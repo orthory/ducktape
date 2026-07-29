@@ -179,13 +179,21 @@ extern crate::backend
   BlobView(generation:i64, repo:str, rev:str, path:str, text:str, truncated:bool, binary:bool, lines:i64)
   forge_tree(rpc:str, repo:str, rev:str, path:str, generation:i64) -> ForgeTreeData ! HydrationError
   forge_blob(rpc:str, repo:str, rev:str, path:str, generation:i64) -> BlobView ! HydrationError
-  submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str) -> bool ! AppError
+  ForgeDraftComment(anchor:str, path:str, line:str, side:str, body:str)
+  sync stage_forge_comment(staged:[ForgeDraftComment], path:str, line:str, side:str, body:str) -> [ForgeDraftComment]
+  sync drop_forge_comment(staged:[ForgeDraftComment], anchor:str) -> [ForgeDraftComment]
+  sync forge_comment_cap_reached(staged:[ForgeDraftComment]) -> bool
+  sync keep_staged_comments(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment]) -> [ForgeDraftComment]
+  sync keep_comment_text(loaded:bool, next_oid:str, current_oid:str, value:str) -> str
+  sync staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
+  sync forge_comment_target(path:str, line:str, side:str) -> str
+  submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
   merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
   forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:str, module:str, scope:ForgeRefresh, generation:i64) -> ForgeLiveData ! HydrationError
   sync forge_live_hit(kind:str, module:str) -> bool
   sync forge_repo_row(repos:[ForgeRepo], name:str) -> ForgeRepo
   sync forge_stats(files:i64, additions:i64, deletions:i64) -> str
-  DiffLine(kind:str, old_no:str, new_no:str, sign:str, text:str)
+  DiffLine(kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
   sync diff_lines(diff:str) -> [DiffLine]
   SourceLine(number:str, text:str)
   sync source_lines(text:str) -> [SourceLine]

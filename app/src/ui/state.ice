@@ -114,6 +114,16 @@ state
   forge_review_verdict = "comment"
   forge_review_draft = ""
   forge_review_busy:bool = false
+  // The line the diff gutter last picked, and the comment being written for it.
+  // A picked line is the composer's whole visibility condition — an empty
+  // `forge_comment_path` means no line is open, so there is no separate flag.
+  forge_comment_path = ""
+  forge_comment_line = ""
+  forge_comment_side = ""
+  forge_comment_draft = ""
+  // Staged and NOT yet on the wire: a review carries its line comments in the
+  // same transaction as its body, so these ride along at submit.
+  forge_comment_staged:[ForgeDraftComment] = []
   forge_merge_busy:bool = false
   forge_merge_conflicts:[str] = []
   forge_discussion:[ChatMessage] = []
