@@ -171,8 +171,9 @@ fn joiner_enters_through_a_sentry() {
     // handshake + state-sync crossed the sentry pipe.
     cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
     cluster.wait_marker(joiner, "synced root_hash=", CONVERGE);
+    // in-process seating: no reboot, so no `recovered root_hash=` — that line
+    // belongs to the validator boot path, which a warm promotion skips.
     cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
-    cluster.wait_marker(joiner, "recovered root_hash=", CONVERGE);
 
     // sanity check that node 0 was reachable through the forwarder at all — a
     // corroboration, not the proof. the real proof is structural + functional:
