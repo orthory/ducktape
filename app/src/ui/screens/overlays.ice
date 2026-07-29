@@ -87,8 +87,17 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
           active bg=transparent text=fg border=transparent border-w=1.0 r=10.0
           hovered bg=transparent text=fg
           pressed bg=transparent text=fg
-    if open
-      box w=fill h=fill align-x=center pt=72.0 bg=scrim
+    // THE COMMAND PALETTE, on the same footing as the modal above. It used to
+    // be a `box bg=scrim` wrapping a card, which is exactly what the note on
+    // the modal warns against: the tint captured no pointer, so the rail and
+    // the composer behind it stayed live and clicking the dim did nothing.
+    // `overlay` takes the pointer and closes on the backdrop, and Esc keeps
+    // working through `palette_key_action` — the hint in the field is now true
+    // of one of two ways out rather than the only one.
+    overlay when=open dismiss=emit(close_palette) backdrop=scrim p=72.0 align-x=center align-y=start
+      content
+        space w=fill h=fill
+      layer
         box w=540.0 p=10.0 bg=surface border=border border-w=1.0 r=14.0 shadow=shadow_modal shadow-y=24.0 shadow-blur=60.0
           col w=fill gap=8.0
             input "" #palette-input label="Search everything" <-> query change=emit(palette_changed, _) hint="Search messages and pages… (Esc closes)" submit=emit(close_palette) w=fill p=8.0 text-size=13.0 line-h=1.2 @control

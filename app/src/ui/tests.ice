@@ -227,3 +227,34 @@ test minimum_window_layout_contract
   expect rail.width ~= 74.0
   expect content.x ~= rail.right + 1.0
   expect content.width > 730.0
+
+preset ui_palette_overlay
+  state
+    palette_open = true
+    palette_draft = ""
+
+// The palette is an `overlay`, not a tinted box, so the backdrop takes the
+// pointer instead of letting clicks through to the console behind it. This
+// guards the half that a compile cannot: that the field is still REACHABLE
+// inside the layer, so the widget swap cannot silently hide the palette.
+test palette_overlay_contract
+  preset ui_palette_overlay
+  viewport 1120 720
+  mount
+    OverlayLayer create_open=false members_only=false draft<->channel_draft busy=false connected=true loading=false toast="" tone="info" open=palette_open query<->palette_draft searching=palette_searching chat_hits=palette_chat_hits page_hits=palette_page_hits #overlays
+      events
+        toggle_channel_create -> toggle_channel_create
+        toggle_channel_create_members_only -> toggle_channel_create_members_only
+        create_channel_submit -> create_channel_submit
+        dismiss_toast -> dismiss_toast
+        close_palette -> close_palette
+        palette_changed -> palette_changed _
+        open_chat_search_hit -> open_chat_search_hit _ _ _
+        open_page_search_hit -> open_page_search_hit _ _
+  target field = #overlays/palette-input
+  expect exists field
+  click field
+  type "duck"
+  expect palette_draft == "duck"
+  key escape
+  expect !palette_open
