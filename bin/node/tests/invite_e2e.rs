@@ -89,12 +89,18 @@ fn solo_founder_invites_a_friend() {
     // the epoch's genesis floor.
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
 
-    // the parked node notices its admission, syncs the boundary, fabricates
-    // its recovery checkpoint, and reboots into the restore path.
+    // the parked node notices its admission, syncs the boundary, and SEATS
+    // ITSELF IN-PROCESS from its own folded state — it does not reboot.
+    //
+    // So there is no `recovered root_hash=` to wait for: that line is emitted
+    // only by the validator BOOT path (`bin/node/src/validator/boot.rs`), and a
+    // warm promotion returns a `PromotionBaton` already carrying the recovery
+    // and the root hash (`replica/park.rs`). Waiting for it here could only
+    // ever hang — it did, for 600 s. `restart_e2e` still waits on that marker,
+    // correctly, because a real process restart does go through boot.
     cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
     cluster.wait_marker(joiner, "synced root_hash=", CONVERGE);
     cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
-    cluster.wait_marker(joiner, "recovered root_hash=", CONVERGE);
 
     // THE property: consensus is live again, and only because the friend
     // votes — a 2-validator simplex finalizes nothing without both. an op
@@ -171,10 +177,10 @@ fn live_quorum_admits_a_fourth_validator() {
         });
     }
 
+    // in-process seating again — no reboot, so no `recovered root_hash=`.
     cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
     cluster.wait_marker(joiner, "synced root_hash=", CONVERGE);
     cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
-    cluster.wait_marker(joiner, "recovered root_hash=", CONVERGE);
 
     // the promoted validator's own op finalizes and reads on an incumbent —
     // its frame bytes start out ONLY in its store, so this proves the joiner
