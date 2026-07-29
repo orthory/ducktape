@@ -3877,49 +3877,52 @@ pub fn diff_lines(diff: String) -> Vec<DiffLine> {
     // not know its file, and `forge_item_diff` is the whole multi-file patch as
     // one string, so this is the only place the association exists.
     let mut path = String::new();
+    // What the open hunk still owes on each side.
+    //
+    // A hunk header DECLARES how many lines its body covers, and while either
+    // side is still owed one, every line is body content — never a header.
+    // That budget is the ONLY thing separating a real `+++ b/<path>` header
+    // from a source line reading `++ x`, which a patch writes as `+++ x`.
+    // Without it, adding such a line silently re-anchored every row after it
+    // to a path that does not exist, and a comment written below it would be
+    // submitted against that path.
+    let mut old_left = 0i64;
+    let mut new_left = 0i64;
     for line in diff.lines() {
-        if let Some(target) = added_side_path(line) {
-            path = target;
-            rows.push(diff_row(
-                "file",
-                String::new(),
-                String::new(),
-                "",
-                line,
-                "",
-                "",
-            ));
-            continue;
+        let inside_hunk_body = old_left > 0 || new_left > 0;
+        if !inside_hunk_body {
+            if let Some(target) = added_side_path(line) {
+                path = target;
+                rows.push(marker_row(line));
+                continue;
+            }
+            if is_file_header(line) {
+                rows.push(marker_row(line));
+                continue;
+            }
+            if let Some(span) = hunk_span(line) {
+                old_no = span.old_start;
+                new_no = span.new_start;
+                old_left = span.old_len;
+                new_left = span.new_len;
+                rows.push(diff_row(
+                    "hunk",
+                    String::new(),
+                    String::new(),
+                    "",
+                    line,
+                    "",
+                    "",
+                ));
+                continue;
+            }
         }
-        let is_file_header = line.starts_with("diff ")
-            || line.starts_with("--- ")
-            || line.starts_with("index ")
-            || line.starts_with("new file")
-            || line.starts_with("deleted file");
-        if is_file_header {
-            rows.push(diff_row(
-                "file",
-                String::new(),
-                String::new(),
-                "",
-                line,
-                "",
-                "",
-            ));
-            continue;
-        }
-        if let Some((old_start, new_start)) = hunk_starts(line) {
-            old_no = old_start;
-            new_no = new_start;
-            rows.push(diff_row(
-                "hunk",
-                String::new(),
-                String::new(),
-                "",
-                line,
-                "",
-                "",
-            ));
+        // `\ No newline at end of file` is a note ABOUT the previous line. It
+        // holds no position on either side, so it consumes neither a line
+        // number nor the hunk's budget — counting it would end the hunk one
+        // line early and re-open header detection inside the body.
+        if line.starts_with('\\') {
+            rows.push(marker_row(line));
             continue;
         }
         match line.chars().next() {
@@ -3934,6 +3937,7 @@ pub fn diff_lines(diff: String) -> Vec<DiffLine> {
                     "new",
                 ));
                 new_no += 1;
+                new_left -= 1;
             }
             Some('-') => {
                 rows.push(diff_row(
@@ -3946,6 +3950,7 @@ pub fn diff_lines(diff: String) -> Vec<DiffLine> {
                     "old",
                 ));
                 old_no += 1;
+                old_left -= 1;
             }
             _ => {
                 let text = line.strip_prefix(' ').unwrap_or(line);
@@ -3960,10 +3965,26 @@ pub fn diff_lines(diff: String) -> Vec<DiffLine> {
                 ));
                 old_no += 1;
                 new_no += 1;
+                old_left -= 1;
+                new_left -= 1;
             }
         }
     }
     rows
+}
+
+/// The non-code rows: a file header, and the `\ No newline` note. Neither is a
+/// commentable position, so both carry an empty path and side.
+fn marker_row(line: &str) -> DiffLine {
+    diff_row("file", String::new(), String::new(), "", line, "", "")
+}
+
+fn is_file_header(line: &str) -> bool {
+    line.starts_with("diff ")
+        || line.starts_with("--- ")
+        || line.starts_with("index ")
+        || line.starts_with("new file")
+        || line.starts_with("deleted file")
 }
 
 /// The head-side path a `+++ b/<path>` header names, or `None` for any other
@@ -4146,16 +4167,37 @@ pub fn staged_comment_drop_note(
     "The branch moved while comments were staged. They anchored to lines in the old diff, so they were discarded rather than posted against the new one.".into()
 }
 
-/// `@@ -138,9 +138,12 @@ …` → the two start line numbers.
-fn hunk_starts(line: &str) -> Option<(i64, i64)> {
+/// A hunk header's two starting line numbers and the two line counts its body
+/// covers. The counts are what bound the body — see `diff_lines`.
+struct HunkSpan {
+    old_start: i64,
+    new_start: i64,
+    old_len: i64,
+    new_len: i64,
+}
+
+/// `@@ -138,9 +138,12 @@ …` → the starts and the lengths. A range written
+/// without a comma covers exactly one line (`@@ -1 +1 @@`).
+fn hunk_span(line: &str) -> Option<HunkSpan> {
     let body = line.strip_prefix("@@ ")?;
     let (ranges, _) = body.split_once(" @@")?;
     let (old, new) = ranges.split_once(' ')?;
-    let start = |range: &str| -> Option<i64> {
+    let range = |range: &str| -> Option<(i64, i64)> {
         let digits = range.trim_start_matches(['-', '+']);
-        digits.split(',').next()?.parse().ok()
+        let (start, len) = match digits.split_once(',') {
+            Some((start, len)) => (start, len.parse().ok()?),
+            None => (digits, 1),
+        };
+        Some((start.parse().ok()?, len))
     };
-    Some((start(old)?, start(new)?))
+    let (old_start, old_len) = range(old)?;
+    let (new_start, new_len) = range(new)?;
+    Some(HunkSpan {
+        old_start,
+        new_start,
+        old_len,
+        new_len,
+    })
 }
 
 /// The tracker's Pull requests / Issues split.
@@ -9156,6 +9198,89 @@ mod tests {
         assert_eq!(dropped.path, "", "a /dev/null head side anchors nothing");
         let kept = rows.iter().find(|row| row.text == "kept").expect("add row");
         assert_eq!(kept.path, "kept.rs");
+    }
+
+    /// A hunk BODY is bounded by the counts its header declares, so content is
+    /// never re-read as a header.
+    ///
+    /// This is not hypothetical prettiness: a source line reading `++ x` is
+    /// written `+++ x` in a patch, and adding one used to be taken for the
+    /// `+++ b/<path>` header — which silently re-anchored every row after it to
+    /// a path that does not exist, and would have submitted a comment against
+    /// it. Any file that contains a diff, a changelog, or C++ increments can
+    /// produce that line.
+    #[test]
+    fn a_hunk_body_is_bounded_so_content_is_never_read_as_a_header() {
+        let rows = diff_lines(
+            concat!(
+                "diff --git a/notes.md b/notes.md\n",
+                "--- a/notes.md\n",
+                "+++ b/notes.md\n",
+                "@@ -1,2 +1,4 @@\n",
+                " intro\n",
+                // the patch's rendering of a source line `++ counter`
+                "+++ counter\n",
+                // and of a source line `-- dashes`
+                "--- dashes\n",
+                " outro\n",
+            )
+            .into(),
+        );
+        let coded: Vec<(&str, &str, &str)> = rows
+            .iter()
+            .filter(|row| row.kind != "file" && row.kind != "hunk")
+            .map(|row| (row.kind.as_str(), row.path.as_str(), row.text.as_str()))
+            .collect();
+        assert_eq!(
+            coded,
+            [
+                ("ctx", "notes.md", "intro"),
+                ("add", "notes.md", "++ counter"),
+                ("del", "notes.md", "-- dashes"),
+                ("ctx", "notes.md", "outro"),
+            ],
+            "a body line was re-read as a file header"
+        );
+    }
+
+    /// The `\ No newline at end of file` note holds no position on either side.
+    /// Counting it would spend the hunk's budget a line early and re-open
+    /// header detection inside the body.
+    #[test]
+    fn the_no_newline_note_consumes_no_line_and_no_budget() {
+        let rows = diff_lines(
+            concat!(
+                "+++ b/tail.rs\n",
+                "@@ -1,1 +1,2 @@\n",
+                " kept\n",
+                "+added\n",
+                "\\ No newline at end of file\n",
+            )
+            .into(),
+        );
+        let added = rows
+            .iter()
+            .find(|row| row.text == "added")
+            .expect("add row");
+        assert_eq!(added.new_no, "2");
+        assert_eq!(added.path, "tail.rs");
+        let note = rows.last().expect("the note is a row");
+        assert_eq!(note.kind, "file", "the note is not a commentable position");
+        assert!(note.path.is_empty() && note.new_no.is_empty());
+    }
+
+    /// A range written without a comma covers exactly one line, so the body
+    /// budget must read `@@ -1 +1 @@` as 1 and 1 rather than 0.
+    #[test]
+    fn a_comma_less_hunk_range_covers_one_line() {
+        let rows =
+            diff_lines(concat!("+++ b/one.rs\n", "@@ -7 +7 @@\n", "+++ still content\n").into());
+        let code: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|row| row.kind == "add")
+            .map(|row| (row.new_no.as_str(), row.text.as_str()))
+            .collect();
+        assert_eq!(code, [("7", "++ still content")]);
     }
 
     fn stage(staged: Vec<ForgeDraftComment>, line: &str, body: &str) -> Vec<ForgeDraftComment> {
