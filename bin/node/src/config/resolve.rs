@@ -1029,8 +1029,27 @@ mod tests {
         assert!(default.service.storage_dir.is_absolute());
     }
 
+    /// ISOLATED FROM THE PARALLEL SUITE ON PURPOSE — `make test` runs it, but
+    /// in its own serial pass (`-- --ignored --test-threads=1`).
+    ///
+    /// This test re-execs the ~450 MB test binary as a subprocess. Doing that
+    /// while 32 libtest threads are live made the WHOLE suite fail ~4 runs in
+    /// 11, on a different test each time and always with an integrity verdict
+    /// (`corrupt or wrong password` out of argon2+AEAD, `rejected the bytes as
+    /// corrupt` out of a digest check). Bisection pinned it here: skip this one
+    /// test and the suite goes 0/11; serialize the suite and it goes 0/4.
+    ///
+    /// The SPAWN is what matters, not the cwd trick — removing only the
+    /// `set_current_dir`+`remove_dir` still left 1/6. So this test is the
+    /// trigger for a load sensitivity, not the corruption itself; the
+    /// underlying cause is unresolved and tracked in #887. Isolating it keeps
+    /// its coverage while stopping it from poisoning unrelated tests.
+    ///
+    /// It cannot simply move to `bin/node/tests/`: `node-bin` has no lib
+    /// target, so an integration test cannot reach `resolve()` at all.
     #[cfg(unix)]
     #[test]
+    #[ignore = "re-execs the test binary; run serially — see #887"]
     fn absolute_configs_resolve_after_launch_cwd_is_deleted() {
         if let Ok(paths) = std::env::var(DELETED_CWD_CONFIGS) {
             let mut paths = paths.lines();

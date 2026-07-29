@@ -81,6 +81,12 @@ install-coordinator:
 ## harnesses stage.
 test: wasm-modules-check
 	$(CARGO) test --workspace
+# the #[ignore]d tests are ignored ONLY because they must not share a process
+# with the parallel suite — they still have to run. `absolute_configs_resolve_
+# after_launch_cwd_is_deleted` re-execs the test binary, and doing that under 32
+# live libtest threads made unrelated tests fail ~4 runs in 11 with integrity
+# errors. Serial + its own invocation is the isolation. See #887.
+	$(CARGO) test -p node-bin --bin ducktape -- --ignored --test-threads=1
 	$(CARGO) test -p consensus --features sim
 # ducktape-app rides this line for a reason: `cargo test` builds the TEST
 # target, which links dev-dependencies, so a product path reaching for a
