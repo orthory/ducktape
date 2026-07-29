@@ -79,15 +79,31 @@ install-coordinator:
 ## TCP, bin/noded drives a real spawned daemon over http/ws), the consensus
 ## sim-feature suite, and a build of the noded + simnode binaries the test
 ## harnesses stage.
+# WHERE THE E2E SUITES PUT NODE STORAGE — pinned to disk, on purpose.
+#
+# Every spawned cluster writes `storage=$TMPDIR/.tmpXXXX/storage-N`, and a test
+# that panics (or a node killed with it) leaves the whole tree behind. On a host
+# where /tmp is tmpfs — the default on this dev box — those leaks are RAM. One
+# session left 11 dirs totalling 22 GB, two of them 7.2 GB each, and since
+# tmpfs has no swap the box lost that memory for good: each gate run started
+# with less than the last, until rustc and ld began dying mid-compile. The runs
+# measuring the box were degrading it.
+#
+# Pinning TMPDIR under target/ makes a leak cost disk instead of memory, and the
+# rm -rf reclaims the previous run's leftovers before each pass. The leak itself
+# is still a bug worth fixing in the harnesses — see #887.
+TEST_TMPDIR := $(CURDIR)/target/test-tmp
+
 test: wasm-modules-check
-	$(CARGO) test --workspace
+	rm -rf "$(TEST_TMPDIR)" && mkdir -p "$(TEST_TMPDIR)"
+	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test --workspace
 # the #[ignore]d tests are ignored ONLY because they must not share a process
 # with the parallel suite — they still have to run. `absolute_configs_resolve_
 # after_launch_cwd_is_deleted` re-execs the test binary, and doing that under 32
 # live libtest threads made unrelated tests fail ~4 runs in 11 with integrity
 # errors. Serial + its own invocation is the isolation. See #887.
-	$(CARGO) test -p node-bin --bin ducktape -- --ignored --test-threads=1
-	$(CARGO) test -p consensus --features sim
+	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test -p node-bin --bin ducktape -- --ignored --test-threads=1
+	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test -p consensus --features sim
 # ducktape-app rides this line for a reason: `cargo test` builds the TEST
 # target, which links dev-dependencies, so a product path reaching for a
 # dev-only crate compiles under every test lane and breaks only the BINARY.
