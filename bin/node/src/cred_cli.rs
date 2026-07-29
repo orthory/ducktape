@@ -867,14 +867,14 @@ mod tests {
 
     #[test]
     fn default_name_is_display_provider_counter() {
-        let existing = ["eddy-claude-1", "eddy-claude-2", "eddy-codex-1"];
+        let existing = ["alice-claude-1", "alice-claude-2", "alice-codex-1"];
         assert_eq!(
-            derive_default_name("eddy", ProviderArg::Claude, &existing),
-            "eddy-claude-3"
+            derive_default_name("alice", ProviderArg::Claude, &existing),
+            "alice-claude-3"
         );
         assert_eq!(
-            derive_default_name("eddy", ProviderArg::Codex, &existing),
-            "eddy-codex-2"
+            derive_default_name("alice", ProviderArg::Codex, &existing),
+            "alice-codex-2"
         );
         assert_eq!(
             derive_default_name("jess", ProviderArg::Claude, &[]),

@@ -40,7 +40,7 @@ test connection_panel_contract
   preset ui_settings
   viewport 1120 720
   mount
-    WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
+    WorkspaceTabs network="testnet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
@@ -85,7 +85,7 @@ test palette_escape_contract
   preset ui_palette_open
   viewport 1120 720
   mount
-    WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
+    WorkspaceTabs network="testnet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
@@ -180,7 +180,7 @@ test minimum_window_layout_contract
   preset ui_offline
   viewport 1280 800
   mount
-    WorkspaceTabs network="dukenet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
+    WorkspaceTabs network="testnet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell

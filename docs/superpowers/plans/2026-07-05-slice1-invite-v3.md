@@ -2,7 +2,7 @@
 
 Status: implementation plan of record for **Slice 1** of the
 `epic/p3-private-cutover` epic. Worktree
-`/home/eddy/dev/ducktape/.claude/worktrees/epic+p3-private-cutover`, branch
+`<repo>/.claude/worktrees/epic+p3-private-cutover`, branch
 `slice/1-invite-v3`.
 
 Design of record:

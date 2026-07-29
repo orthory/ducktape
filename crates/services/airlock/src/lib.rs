@@ -374,24 +374,24 @@ mod tests {
     fn claude_dir_loads_a_refresh_seed() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cred_store_root(tmp.path());
-        seed_claude(&root, "eddy-claude-1", "rt-eddy");
+        seed_claude(&root, "alice-claude-1", "rt-alice");
         let seeds = load_seeds(&root).unwrap();
         assert_eq!(seeds.len(), 1);
         let (name, kind, payload) = &seeds[0];
-        assert_eq!(name, "eddy-claude-1");
+        assert_eq!(name, "alice-claude-1");
         assert_eq!(*kind, CredentialKind::Claude);
-        assert_eq!(refresh_of(payload), "rt-eddy");
+        assert_eq!(refresh_of(payload), "rt-alice");
     }
 
     #[test]
     fn codex_dir_loads_a_bearer_seed() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cred_store_root(tmp.path());
-        seed_codex(&root, "eddy-codex-1", "tok-codex");
+        seed_codex(&root, "alice-codex-1", "tok-codex");
         let seeds = load_seeds(&root).unwrap();
         assert_eq!(seeds.len(), 1);
         let (name, kind, payload) = &seeds[0];
-        assert_eq!(name, "eddy-codex-1");
+        assert_eq!(name, "alice-codex-1");
         assert_eq!(*kind, CredentialKind::Codex);
         assert!(matches!(payload, CredentialPayload::Bearer { access_token } if access_token == "tok-codex"));
     }
@@ -408,8 +408,8 @@ mod tests {
         assert_eq!(count_credentials(&root), 0, "a store that does not exist lends nothing");
 
         load_or_create_seal_keypair(&root).unwrap(); // writes seal.key beside them
-        seed_claude(&root, "eddy-claude-1", "rt-eddy");
-        seed_codex(&root, "eddy-codex-1", "tok-codex");
+        seed_claude(&root, "alice-claude-1", "rt-alice");
+        seed_codex(&root, "alice-codex-1", "tok-codex");
         write(&root.join("registered-but-broken").join("kind"), "claude\n");
 
         assert_eq!(count_credentials(&root), 3, "seal.key is not a credential; a broken one is");
@@ -448,10 +448,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = cred_store_root(tmp.path());
         let _kp = load_or_create_seal_keypair(&root).unwrap(); // writes seal.key
-        seed_claude(&root, "eddy-claude-1", "rt-eddy");
+        seed_claude(&root, "alice-claude-1", "rt-alice");
         let seeds = load_seeds(&root).unwrap();
         assert_eq!(seeds.len(), 1);
-        assert_eq!(seeds[0].0, "eddy-claude-1");
+        assert_eq!(seeds[0].0, "alice-claude-1");
     }
 
     #[test]
@@ -492,14 +492,14 @@ mod tests {
     fn the_loader_answers_once_per_change_and_stays_quiet_otherwise() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cred_store_root(tmp.path());
-        seed_claude(&root, "eddy-claude-1", "rt-first");
+        seed_claude(&root, "alice-claude-1", "rt-first");
         let reload = reload_from_store(&root);
 
         // first sight: a credential the gateway has never loaded.
-        let (_, first) = reload("eddy-claude-1").expect("a credential is loaded on first sight");
+        let (_, first) = reload("alice-claude-1").expect("a credential is loaded on first sight");
         assert_eq!(refresh_of(&first), "rt-first");
         // unchanged on disk: no reload, so a session costs one stat and no parse.
-        assert!(reload("eddy-claude-1").is_none(), "an unchanged credential must not reload");
+        assert!(reload("alice-claude-1").is_none(), "an unchanged credential must not reload");
 
         // a re-login ROTATES the artifact. Without this the gateway would serve
         // the dead token until the daemon was restarted.
@@ -507,12 +507,12 @@ mod tests {
         // The mtime is stamped explicitly rather than left to the clock: a
         // rewrite inside one filesystem timestamp tick would otherwise decide
         // the assertion, which is a test waiting on time.
-        let dir = root.join("eddy-claude-1");
-        seed_claude(&root, "eddy-claude-1", "rt-rotated");
+        let dir = root.join("alice-claude-1");
+        seed_claude(&root, "alice-claude-1", "rt-rotated");
         stamp_forward(&dir.join(".credentials.json"));
-        let (_, rotated) = reload("eddy-claude-1").expect("a rotated artifact reloads");
+        let (_, rotated) = reload("alice-claude-1").expect("a rotated artifact reloads");
         assert_eq!(refresh_of(&rotated), "rt-rotated");
-        assert!(reload("eddy-claude-1").is_none(), "and then goes quiet again");
+        assert!(reload("alice-claude-1").is_none(), "and then goes quiet again");
     }
 
     #[test]
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn a_credential_name_is_one_plain_directory() {
-        assert!(is_store_dir_name("eddy-claude-1"));
+        assert!(is_store_dir_name("alice-claude-1"));
         // the loader runs on a caller-supplied `sub`, BEFORE the grant gate.
         for escape in ["..", ".", "", "/etc", "../../etc", "a/b", "./a"] {
             assert!(!is_store_dir_name(escape), "{escape:?} must not address the store");

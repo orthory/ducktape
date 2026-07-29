@@ -359,9 +359,12 @@ pub enum Coordination {
     Private,
 }
 
-/// Shared public rendezvous coordinator used when a network is created without
-/// an explicit direct-only override.
-pub const DEFAULT_PRIMARY_COORDINATOR: &str = "p2p.ducktape.byeongsu.dev:3478";
+/// The compiled-in coordinator default: NONE. ducktape ships no shared
+/// rendezvous host — a network that wants ambient coordination names its own
+/// with `init --primary-coordinator host:port`, and one that does not stays
+/// direct-only. Baking a hostname here would point every fresh node on earth
+/// at whichever box happened to build the binary.
+pub const DEFAULT_PRIMARY_COORDINATOR: &str = "none";
 
 /// The typed invite format still carries a coordinator key, but the deployed
 /// coordinator is intentionally keyless. Keep one stable valid key in the
@@ -935,34 +938,45 @@ mod tests {
     }
 
     #[test]
-    fn primary_coordinator_defaults_to_deployed_public_rendezvous() {
-        let coord = primary_coordinator_or_default(None).expect("default coordinator");
-        assert_eq!(coord.as_deref(), Some("p2p.ducktape.byeongsu.dev:3478"));
+    fn primary_coordinator_defaults_to_no_coordination() {
+        let defaulted = primary_coordinator_or_default(None).expect("default coordinator");
+        assert_eq!(
+            defaulted, None,
+            "no host is compiled in — an unconfigured network is direct-only"
+        );
+
+        let explicit = primary_coordinator_or_default(Some("p2p.example.org:3478"))
+            .expect("explicit coordinator");
+        assert_eq!(explicit.as_deref(), Some("p2p.example.org:3478"));
 
         let disabled = primary_coordinator_or_default(Some("none")).expect("disabled");
         assert_eq!(disabled, None);
     }
 
-    /// `coordinator_ingress` — the AMBIENT source change (1) threads into
-    /// both runtime call sites (main.rs:954 joiner, main.rs:3201 member) —
-    /// resolves an explicit override, honors the disable sentinel, and
-    /// falls back to the compiled default exactly like `coordinator_ingress
-    /// (None)` did before change (1) existed (bit-identical absent case).
+    /// `coordinator_ingress` — the AMBIENT source the joiner and member call
+    /// sites bind — resolves an explicit override as either a concrete socket
+    /// or a deferred hostname, honors the disable sentinel, and yields nothing
+    /// at all when nothing is configured.
     #[test]
     fn coordinator_ingress_resolves_an_explicit_override() {
         match coordinator_ingress(Some("203.0.113.9:3478")).expect("dialable override") {
             Some(Ingress::Socket(addr)) => assert_eq!(addr, "203.0.113.9:3478".parse().unwrap()),
             other => panic!("expected a concrete socket ingress, got {other:?}"),
         }
+        match coordinator_ingress(Some("p2p.example.org:3478")).expect("hostname override") {
+            Some(Ingress::Dns { port, .. }) => assert_eq!(port, 3478),
+            other => panic!("expected a deferred hostname ingress, got {other:?}"),
+        }
         assert_eq!(
             coordinator_ingress(Some("none")).expect("disabled"),
             None,
             "the sentinel disables coordination outright — no ingress to bind"
         );
-        match coordinator_ingress(None).expect("compiled default") {
-            Some(Ingress::Dns { port, .. }) => assert_eq!(port, 3478),
-            other => panic!("expected the compiled default's hostname ingress, got {other:?}"),
-        }
+        assert_eq!(
+            coordinator_ingress(None).expect("unconfigured"),
+            None,
+            "no compiled-in host: an unconfigured node coordinates with nobody"
+        );
     }
 
     #[test]
@@ -977,7 +991,7 @@ mod tests {
             coordination: None,
         };
 
-        d.apply_primary_coordinator(&me, "p2p.ducktape.byeongsu.dev:3478")
+        d.apply_primary_coordinator(&me, "p2p.example.org:3478")
             .expect("coordinator hint");
 
         assert_eq!(d.coordination(), Coordination::Public);
@@ -986,7 +1000,7 @@ mod tests {
         assert_eq!(hints[0].expected_key, me);
         match &hints[0].reach {
             Reach::Coordinated(coord) => {
-                assert_eq!(coord.coord_addr, "p2p.ducktape.byeongsu.dev:3478");
+                assert_eq!(coord.coord_addr, "p2p.example.org:3478");
                 assert_eq!(coord.coord_key, keyless_coordinator_placeholder_key());
             }
             other => panic!("expected coordinated reach hint, got {other:?}"),

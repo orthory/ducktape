@@ -281,7 +281,7 @@ df -h "$TMPDIR" | tail -1                  # MUST NOT say tmpfs
 **`pasta` and `nft` are not on `PATH`, and they are not missing.**
 
 ```
-pasta   /home/eddy/.local/opt/podman-debian13/root/usr/bin/pasta   (off PATH)
+pasta   ~/.local/opt/podman-debian13/root/usr/bin/pasta   (off PATH)
 nft     /sbin/nft                                                  (off PATH)
 ```
 
@@ -619,7 +619,7 @@ df -h "$TMPDIR" | tail -1     # MUST NOT say tmpfs
 There is no integration branch. Everything wave-2 is in `dev`.
 
 ```bash
-cd /home/eddy/dev/ducktape
+cd <repo>
 git worktree add .worktree/wave2-qa -b qa/wave2-integration origin/dev
 cd .worktree/wave2-qa
 git rev-parse HEAD                       # MUST be fc6334d8f (or later dev)
@@ -1107,7 +1107,7 @@ T1-7 → T1-8.
 export DUCKTAPE_HOME="$HOME/.ducktape-wave2qa"
 export PATH="$HOME/.local/opt/podman-debian13/root/usr/bin:$PATH"
 export TMPDIR="$HOME/wave2qa-tmp"
-D=/home/eddy/dev/ducktape/.worktree/wave2-qa/target/release/ducktape
+D=<repo>/.worktree/wave2-qa/target/release/ducktape
 
 "$D" node init --name w2qa \
   --listen 127.0.0.1:59300 --advertised 127.0.0.1:59300 \

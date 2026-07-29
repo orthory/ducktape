@@ -527,7 +527,7 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
         ),
         (
             "gateway",
-            serde_json::json!({ "set_handle": { "handle": "eddy" } }),
+            serde_json::json!({ "set_handle": { "handle": "bob" } }),
             node.clone(),
         ),
         ("kv", kv_set(b"k1", b"v1"), "peer".into()),
@@ -536,8 +536,8 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
         ("pages", create_page("p2"), "peer".into()),
         ("tasks", create_task("t1"), "peer".into()),
         ("tasks", create_task("t2"), "peer".into()),
-        ("inbox", deliver("eddy", "hi"), "courier".into()),
-        ("inbox", deliver("eddy", "yo"), "courier".into()),
+        ("inbox", deliver("bob", "hi"), "courier".into()),
+        ("inbox", deliver("bob", "yo"), "courier".into()),
     ];
     let n = script.len() as u64;
 

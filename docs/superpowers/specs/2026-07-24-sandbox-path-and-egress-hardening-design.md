@@ -7,7 +7,7 @@ Status: foundation landed + unit-tested; integration UNVERIFIED (no live podman 
 ## Problem
 
 A remote account in a lent-credential Claude Code PTY session on this node
-sees real host paths — cwd `/home/eddy/.ducktape/provider-runs/<run>/workspace`,
+sees real host paths — cwd `~/.ducktape/provider-runs/<run>/workspace`,
 PATH/skills mounted at their identical host paths, `$HOME` a host layout —
 leaking the operator's username, directory structure, and node layout. And the
 container's `--network=slirp4netns` NAT reaches every routable destination the

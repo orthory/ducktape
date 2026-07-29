@@ -461,7 +461,7 @@ fn query_credential(module: &Gateway, name: &str) -> Option<CredentialRecord> {
 #[test]
 fn credential_wire_round_trips() {
     let signer = ed25519::PrivateKey::from_seed(31);
-    let record = credential("eddy-claude-1", vec![5; 32], vec![1; 32]);
+    let record = credential("alice-claude-1", vec![5; 32], vec![1; 32]);
     let msg = signed_set_credential(&signer, record);
     let decoded = decode_msg(&encode_msg(&msg)).expect("decode");
     assert_eq!(msg, decoded);
@@ -476,7 +476,7 @@ fn credential_names_are_validated() {
             "{bad:?} must be rejected"
         );
     }
-    assert!(validate_credential_name("eddy-claude-1").is_ok());
+    assert!(validate_credential_name("alice-claude-1").is_ok());
 }
 
 #[test]

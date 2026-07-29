@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Worktree `/home/eddy/dev/ducktape/.worktree/sse-overlay-streaming`, branch `feat-sse-overlay-streaming`, PR1 vs `dev`; PR2 stacked (`feat-airlock-body-aead` off PR1's branch, retarget to dev after PR1 merges — remember the `--delete-branch` auto-close trap: never delete PR1's branch while PR2 is open on it).
+- Worktree `<repo>/.worktree/sse-overlay-streaming`, branch `feat-sse-overlay-streaming`, PR1 vs `dev`; PR2 stacked (`feat-airlock-body-aead` off PR1's branch, retarget to dev after PR1 merges — remember the `--delete-branch` auto-close trap: never delete PR1's branch while PR2 is open on it).
 - Every cargo invocation: `CARGO_INCREMENTAL=0 RUSTC_WRAPPER="" RUST_MIN_STACK=134217728` (this box's rustc-segfault recipe; retry once on SIGSEGV).
 - Lint gate per touched crate: `cargo clippy -p <crate> --tests --no-deps`. Workspace FORBIDS clap. Logging via `tracing` in node code; `eprintln!` only in standalone bins. Never log URI paths or key material.
 - Wire/protocol changes are IN-PLACE (no-backcompat mandate); both nodes of a network ship together.

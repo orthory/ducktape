@@ -20,7 +20,7 @@
 - Determinism: no wall clock, no randomness inside the module; ed25519 verify in `execute` is allowed (pure).
 - Rust style: match the repo's lowercase doc-comment voice; JSON wire via serde `snake_case` enums like profiles.
 - Run Rust tests with `cargo test -p <crate>`; app tests with `cd app && bun run test -- --run <file>` (vitest); clippy gate only on touched crates (`cargo clippy -p identity` must be clean; node-bin baseline-diff only).
-- Commit after every task with the shown message; all work in worktree `/home/eddy/dev/ducktape/.claude/worktrees/feat+identity-split` on branch `feat/identity-split`.
+- Commit after every task with the shown message; all work in worktree `<repo>/.claude/worktrees/feat+identity-split` on branch `feat/identity-split`.
 
 ---
 

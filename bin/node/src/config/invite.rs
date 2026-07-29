@@ -812,7 +812,7 @@ mod tests {
             reach: vec![],
             coordination: None,
         };
-        d.apply_primary_coordinator(&issuer.public_key(), "p2p.ducktape.byeongsu.dev:3478")
+        d.apply_primary_coordinator(&issuer.public_key(), "p2p.example.org:3478")
             .expect("coordinator hint");
         let invite = decode_invite(&encode_test_invite(&d, &issuer, None)).expect("decode");
 
