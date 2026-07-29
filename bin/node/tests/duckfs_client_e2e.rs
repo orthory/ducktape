@@ -191,15 +191,24 @@ fn duckfs_workspace_rpc_over_the_cluster() {
     let cluster = two_validators();
 
     // create a managed workspace on node 0.
+    //
+    // `/workspace` is this RPC's OWN vocabulary, not a duckfs namespace:
+    // `checkout_prefix` maps it to an id-scoped managed prefix so a job can
+    // edit the disk dir it gets back without knowing the module's writable
+    // roots. Naming a real namespace (`/shared/...`) is refused by design.
     let (code, ws) = cluster.http(
         0,
         "POST",
         "/v1/fs/workspaces",
-        Some(&serde_json::json!({ "prefix": "/shared/wsjob" })),
+        Some(&serde_json::json!({ "prefix": "/workspace/wsjob" })),
     );
     assert_eq!(code, 200, "create workspace: {ws}");
     let id = ws["id"].as_str().expect("id").to_string();
     let path = ws["path"].as_str().expect("path").to_string();
+    // the committed duckfs prefix, as the RPC itself reports it. Reconstructing
+    // it here would re-spell the managed-root layout in a second place and go
+    // stale the moment that layout moves — which is exactly how this test broke.
+    let prefix = ws["prefix"].as_str().expect("prefix").to_string();
 
     // edit on disk, then commit over rpc.
     std::fs::write(
@@ -213,19 +222,39 @@ fn duckfs_workspace_rpc_over_the_cluster() {
         &format!("/v1/fs/workspaces/{id}/commit"),
         Some(&serde_json::json!({ "message": "workspace commit over consensus" })),
     );
-    assert_eq!(code, 200, "workspace commit: {done}");
+    // A finalization timeout is NOT a failed commit. The drain loop says so in
+    // its own words — "the op may still land later — clients re-query on block
+    // events" — so the submit stands and only the WAIT expired. Re-issuing the
+    // commit would double-submit; re-querying is the contract, and the poll on
+    // node 1 below already is that re-query.
+    //
+    // Demanding a 200 here was asserting on the timing of a distributed system,
+    // which is how this went 1-in-6 flaky under load on a busy box.
+    let awaiting_finalization = done["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("timed out awaiting finalization"));
     assert!(
-        done["snapshot"].is_string(),
-        "commit returns a snapshot: {done}"
+        code == 200 || awaiting_finalization,
+        "workspace commit: {done}"
     );
+    if code == 200 {
+        assert!(
+            done["snapshot"].is_string(),
+            "commit returns a snapshot: {done}"
+        );
+    }
 
     // node 1 reads the committed file (poll until it finalizes there).
     let bytes = poll_until(
         "node 1 reads the workspace file",
         Duration::from_secs(60),
         || {
-            let (code, body) =
-                cluster.http(1, "GET", "/v1/files/read?path=/shared/wsjob/data.txt", None);
+            let (code, body) = cluster.http(
+                1,
+                "GET",
+                &format!("/v1/files/read?path={prefix}/data.txt"),
+                None,
+            );
             if code != 200 {
                 return None;
             }
