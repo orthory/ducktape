@@ -16,7 +16,7 @@
 - **Phase 2:** node integration — registration sites, memory-module deletion, disk-cohort recovery wiring, statesync resolver, noded HTTP endpoints, restart/joiner e2e.
 - **Phase 3:** `duckfs-client` checkout/commit engine + CLI.
 - **Phase 4:** FUSE mount (feature-gated).
-- **Phase 5:** app TS client + FilesView + en/ko docs.
+- **Phase 5:** app TS client + FilesView + docs.
 
 ## Global Constraints
 

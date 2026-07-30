@@ -389,7 +389,7 @@ mod tests {
         }
         for bad in [
             "", "/x", "x/", "a//b", "-x", ".x", "a/.hidden", "a/-b", "x.lock", "a/b.lock",
-            "a b", "a:b", "a~b", "한글",
+            "a b", "a:b", "a~b", "café",
         ] {
             assert!(norm_branch(bad).is_err(), "{bad:?} must be rejected");
         }

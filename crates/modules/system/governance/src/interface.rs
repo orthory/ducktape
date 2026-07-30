@@ -138,7 +138,7 @@ pub enum GovMsg {
         /// the invite role byte (`Resident = 0`, `Client = 1`). a `Resident`
         /// redeem grants valset resident standing; a `Client` redeem grants
         /// submit-only client standing in the identity module. EVERY invite
-        /// is bearer (기명 dropped — see the join ADR): no `target` — the
+        /// is bearer (the targeted form was dropped — see the join ADR): no `target` — the
         /// `proof` binds the redemption to whichever key presents it and the
         /// nonce set makes that exactly-once.
         role: u8,

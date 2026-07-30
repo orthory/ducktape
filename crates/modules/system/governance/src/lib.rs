@@ -1155,7 +1155,7 @@ impl Governance {
         let proof_sig = ed25519::Signature::decode(proof.as_slice())
             .map_err(|e| Error::Module(format!("join proof: {e}")))?;
         let role = invite::InviteRole::from_u8(role).map_err(Error::Module)?;
-        // EVERY invite is bearer (기명 dropped — see the join ADR): there is
+        // EVERY invite is bearer (the targeted form was dropped — see the join ADR): there is
         // no target lock. The join proof below binds the redemption to
         // whichever key presents it, and the nonce set makes that
         // exactly-once — that is the whole containment story.

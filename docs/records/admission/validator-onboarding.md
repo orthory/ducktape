@@ -14,10 +14,6 @@ How a new node joins a running Ducktape network, what the invite token does
 (and deliberately does not do), and the consensus constraints every operator
 should know before growing the validator set.
 
-For the historical analysis of the pre-token flow see
-[invitation-protocol-deep-dive.md](invitation-protocol-deep-dive.md); this
-document describes the pre-redemption protocol.
-
 ## The flow at a glance
 
 ```

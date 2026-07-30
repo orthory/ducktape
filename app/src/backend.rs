@@ -4735,8 +4735,8 @@ pub fn provision_progress(
                         .dir
                         .as_ref()
                         .is_some_and(|dir| dir.join("network.toml").is_file());
-                    // the artifact writes this step's tail in Korean; the shell
-                    // is English, so it ships as what that clause says.
+                    // The artifact's step tail is "invite links available",
+                    // rendered in English to match the shell.
                     Some((registered_step(3, "Workspace ready · invite links available", ready), state))
                 }
                 3 => {

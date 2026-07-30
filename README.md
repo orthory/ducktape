@@ -40,7 +40,7 @@ The tree groups by function into three layers — module / kernel / networking:
 | `crates/labs/` | Quarantined experimental modules (`evm`, `multisig`): in-tree and tested but registered by NO genesis set, kept as a standalone crate EXCLUDED from the workspace so its heavy deps (revm, alloy) never tax the shipping build — gated via `make labs-gate` |
 | `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (validator), `noded` (app-facing daemon), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous), `fs` (duckfs CLI), `mcp` (MCP tool server), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool) |
 | `app/` | `ducktape-app`, the native Iced desktop client (Chat + Pages), UI declared in `src/ui/*.ice`; `crates/design` is its design system |
-| `docs/` | Nimbus documentation site (human/agent tracks, English/Korean) |
+| `docs/` | Nimbus documentation site (human and agent tracks) |
 
 Each module publishes its wire surface — types-only payload/query/reply shapes
 and codecs — at its own crate root; those wire types plus host-routed queries
@@ -226,8 +226,8 @@ bun run docs:check   # docs gate
 bun run dev          # local preview
 ```
 
-Pages are split by reader (human vs. coding agent) and language (English,
-Korean) under `docs/src/content/docs`.
+Pages are split by reader (human vs. coding agent) under
+`docs/src/content/docs/en`.
 
 ## Status
 

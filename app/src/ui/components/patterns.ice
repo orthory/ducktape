@@ -11,7 +11,7 @@
 // THE DASH IS NO LONGER A SUBSTITUTION. It used to be: iced's Border is colour
 // + width + radius only, so the ring shipped SOLID at 1.5px in `pending_line`.
 // ui-lang 2.0 lowers `border-dash=` to a canvas stroke over the surface, so the
-// artifact's rule — "아직 확정되지 않은 것은 모두 점선 테두리입니다" — is now drawn
+// artifact's rule — "anything not yet finalized has a dashed border" — is now drawn
 // as the dashes it always said, and this component is the ONLY place that
 // spells them.
 
@@ -141,7 +141,7 @@ component AgentSquare(initials:str, plate:f64, ink:f64, radius:f64)
 //
 // `AgentChip` (a pulse dot + the run's own summary, on the agent row) was built
 // here and is DELETED. It was waiting on a join the product does not have: the
-// label is the artifact's `#142 재분석 중`, which names a RUN, and `AgentRow`
+// label is the artifact's `#142 reanalyzing`, which names a RUN, and `AgentRow`
 // carries no run. `load_agent_runs` -> `[RunRow{agent_id, running, summary}]` is
 // declared in backend.ice and is `run` from nowhere; the Agents screen loops
 // `agents_rows` straight into `AgentCard` with no selection and no detail pane,

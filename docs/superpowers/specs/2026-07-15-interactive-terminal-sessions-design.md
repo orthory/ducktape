@@ -172,7 +172,7 @@ not just terminals.
   a private netns alone still NATs outbound. Do **not** use the
   reference-devcontainer `NET_ADMIN` in-container firewall — an adversarial
   container must not hold `NET_ADMIN`; enforce egress from outside.
-- **PR 4: full-shell mode — DROPPED** (user call: "full shell은 별로"). A member
+- **PR 4: full-shell mode — DROPPED** (user call: "full shell is not appealing"). A member
   drives the CLI TUI, not a bare shell.
 
 ## Tart (macOS host) — added, UNVERIFIED

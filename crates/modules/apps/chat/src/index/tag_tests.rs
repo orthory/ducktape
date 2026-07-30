@@ -164,16 +164,16 @@ fn tag_search_matches_exact_label_not_prefix() {
 }
 
 #[test]
-fn hangul_tags_round_trip() {
+fn non_ascii_tags_round_trip() {
     let mut map = Map::new();
-    fold(&mut map, 1, &post("g", "m1", "이번 주 #한글-지원 작업"));
+    fold(&mut map, 1, &post("g", "m1", "ship #naïve-café today"));
 
     let rows = tag_rows(&map, serde_json::json!({"tags": {"channel_id": "g"}}));
-    assert_eq!(rows[0].tag, "한글-지원");
+    assert_eq!(rows[0].tag, "naïve-café");
     assert_eq!(
         ids(&hits(
             &map,
-            serde_json::json!({"tag_search": {"tag": "#한글-지원"}})
+            serde_json::json!({"tag_search": {"tag": "#naïve-café"}})
         )),
         ["m1"]
     );

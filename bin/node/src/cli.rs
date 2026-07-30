@@ -569,7 +569,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// invite — single-use, 1-day default TTL, first valid redeemer wins. the
 /// resident role always requires a target.
 fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // every invite is BEARER (기명 dropped — see the join ADR): `--role`
+    // every invite is BEARER (the targeted form was dropped — see the join ADR): `--role`
     // (default resident) selects the standing plane, and there is no `--target`
     // — whoever redeems the single-use token first wins. A resident invite is
     // the admission credential itself, kept off the wire by the sealed

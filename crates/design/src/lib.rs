@@ -12,19 +12,11 @@ pub mod fonts {
     pub const FAMILY_UI: &str = "Geist";
     /// the data face — hashes, seqs, diffs, code, the log ring.
     pub const FAMILY_MONO: &str = "Geist Mono";
-    /// the CJK fallback face. never named by a role: cosmic-text falls back
-    /// to it per glyph whenever the UI face lacks coverage (hangul, kana,
-    /// ideographs), so CJK text renders without any view opting in.
-    pub const FAMILY_CJK: &str = "IBM Plex Sans KR";
-
     /// the embedded files, relative to this crate's root — what `app.ice`
     /// points its `font` settings at.
-    pub const ASSETS: [&str; 5] = [
+    pub const ASSETS: [&str; 2] = [
         "assets/fonts/Geist[wght].ttf",
         "assets/fonts/GeistMono[wght].ttf",
-        "assets/fonts/IBMPlexSansKR-Regular.ttf",
-        "assets/fonts/IBMPlexSansKR-Medium.ttf",
-        "assets/fonts/IBMPlexSansKR-SemiBold.ttf",
     ];
 }
 

@@ -681,15 +681,10 @@ React webview; `:73-74,756,801` the nonexistent `bin/mcp`/`bin/fs`; `:340,359`
 README layout table is stale — is itself stale, naming five names the README no
 longer contains.
 
-### C10. `docs/records/admission/invitation-protocol-deep-dive.md` — six dead paths
+### C10. Obsolete invitation protocol deep dive — removed
 
-`:12,36,280` `app/src-tauri…`; `:32` `bin/node/src/config.rs` (now a directory);
-`:203,278` `crates/modules/system/valset-mesh-interface` (never existed).
-`:240-241` still documents a live 3-rung `DUCKTAPE_ADVERTISE_ADDR`/`_HOST`
-precedence that no longer exists, and `:149,230` name a `ducktape-node` binary
-(it is `ducktape`). Self-marks as as-of-analysis-time at `:13`, so lowest priority.
-*(`validator-onboarding.md:3` carries an explicit SUPERSEDED banner — correctly
-self-labelled, not a finding.)*
+The stale analysis was removed with the language-specific docs cleanup. Its
+maintained replacement is `docs/adr/2026-07-17-join-protocol.mdx`.
 
 ### C11. Nine crate doc comments naming dead paths
 
