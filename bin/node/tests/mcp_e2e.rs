@@ -231,39 +231,51 @@ fn a_cap_gated_read_refuses_when_the_caps_do_not_cover_it() {
 #[test]
 fn a_forge_scoped_read_only_agent_can_review_a_real_pr_diff() {
     let h = Harness::start_with_forge_read(&[], &["app"]);
-    let commit = |path: &str, content: &str, message: &str| {
-        h.submit(
-            "forge",
-            json!({"commit": {
-                "repo": "app", "path": path, "content": content, "message": message
-            }}),
-            OWNER,
-        );
-        h.query("forge", json!({"head_of": {"repo": "app"}}))["head"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    };
     let oid_bytes = |hex: &str| {
         hex.as_bytes()
             .chunks_exact(2)
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect::<Vec<_>>()
     };
-    let target = commit("base.txt", "base\n", "base");
-    let source = commit("review.txt", "reviewable\n", "feature");
-    h.submit(
-        "forge",
-        json!({"push_refs": {
-            "repo": "app",
-            "updates": [
-                {"ref_name": "dev", "prev_oid": null, "new_oid": oid_bytes(&target)},
-                {"ref_name": "feature", "prev_oid": null, "new_oid": oid_bytes(&source)}
-            ],
-            "pack_digest": vec![7u8; 32]
-        }}),
-        OWNER,
+    let oid_hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+    // REAL git history, built outside forge exactly as a stock `git push`
+    // produces it. This used to be a `commit` op on the module; there is no
+    // such op — a commit is a `PushRefs` naming a packfile — and consensus
+    // deliberately has no commit-building API, because it records `ref -> oid`
+    // and nothing about objects.
+    //
+    // The diff assertion below needs the OBJECTS, not just the oids: the tip
+    // pack carries the whole closure, so one upload covers both refs.
+    let commits = forge::testkit::history(
+        "mcp-pr-diff",
+        &[
+            (1, "base.txt", "base\n", "base"),
+            (2, "review.txt", "reviewable\n", "feature"),
+        ],
     );
+    let target = oid_hex(&commits[0].head);
+    let source = oid_hex(&commits[1].head);
+
+    // one push per branch, each naming the pack that carries ITS head's
+    // closure — the shape a real client produces, and it keeps every ref's
+    // objects provably present rather than relying on one pack covering both.
+    let push = |branch: &str, head: &str, pack: &[u8]| {
+        let digest = h.put_blob(pack);
+        h.submit(
+            "forge",
+            json!({"push_refs": {
+                "repo": "app",
+                "updates": [
+                    {"ref_name": branch, "prev_oid": null, "new_oid": oid_bytes(head)}
+                ],
+                "pack_digest": oid_bytes(&digest)
+            }}),
+            OWNER,
+        );
+    };
+    push("dev", &target, &commits[0].pack);
+    push("feature", &source, &commits[1].pack);
     h.submit(
         "forge",
         json!({"open_pr": {

@@ -127,6 +127,16 @@ mod git;
 pub use git::{pack_closure_many, pack_delta};
 pub mod refs;
 mod snapshot;
+/// Build ordinary git history OUTSIDE forge and hand back each head's object
+/// closure as a packfile — what production gets from a stock `git push`.
+///
+/// Feature-gated so it never rides into the shipped binary, the same shape
+/// `identity::testkit` and `noded::testkit` already use. It lives here rather
+/// than in a per-suite copy because the node e2e suites need it too: a test
+/// that wants a reviewable PR diff has to put REAL objects in the node's store,
+/// and consensus deliberately has no commit-building op to do it with.
+#[cfg(feature = "testkit")]
+pub mod testkit;
 pub mod tracker;
 
 use std::collections::{BTreeMap, BTreeSet};

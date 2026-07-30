@@ -14,7 +14,6 @@
 //! these tests drive the SINGLE default repo (`repo: ""` is its canonical
 //! address); the multi-repo container is exercised end-to-end in `multi_repo.rs`.
 
-mod support;
 
 use std::path::{Path, PathBuf};
 
@@ -79,7 +78,7 @@ fn push(forge: &mut Forge, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) {
 /// closure, not just the tip).
 fn source(tag: &str) -> (PathBuf, Forge) {
     let base = tmp_base(tag);
-    let commits = support::history(tag, &[(1, "a.txt", "one", "c1"), (2, "b.txt", "two", "c2")]);
+    let commits = forge::testkit::history(tag, &[(1, "a.txt", "one", "c1"), (2, "b.txt", "two", "c2")]);
     let blobs = blobstore::BlobHandle::default();
     let digests = commits
         .iter()
@@ -317,7 +316,7 @@ fn install_replaces_a_divergent_head() {
 
     let dst_base = tmp_base("replace-dst");
     let mut divergent =
-        support::history("replace-divergent", &[(9, "z.txt", "other", "unrelated")]);
+        forge::testkit::history("replace-divergent", &[(9, "z.txt", "other", "unrelated")]);
     let divergent = divergent.remove(0);
     let blobs = blobstore::BlobHandle::default();
     let digest = blobs.put_chunk(divergent.pack).to_vec();
