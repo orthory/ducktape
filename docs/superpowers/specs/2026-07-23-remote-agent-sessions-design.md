@@ -9,24 +9,24 @@ member's node**, with **their own credential**, from **their own terminal** —
 real pty streaming, like ssh.
 
 ```
-jess$ ducktape agent pty --node eddy --cred jess-fable-1 --cpu 1 --mem 2g
+jess$ ducktape agent pty --node alice --cred jess-fable-1 --cpu 1 --mem 2g
 ```
 
 - jess's terminal drives the native TUI keystroke-by-keystroke.
-- The sandbox runs on eddy's node, fenced by the existing Podman interactive
+- The sandbox runs on alice's node, fenced by the existing Podman interactive
   path (`capability_host::InteractiveSession` — Direct backend refused).
-- jess's Anthropic/OpenAI credential never touches eddy's box: eddy's broker
+- jess's Anthropic/OpenAI credential never touches alice's box: alice's broker
   holds no credential and forwards API traffic to the gateway co-hosted with
   jess's node (existing airlock execution/auth separation, body AEAD #702).
 
 Compute and credential compose freely — the broker forwards to the owner's
-gateway from wherever it runs, so every mix works: the inverse (eddy
-**grants** his credential to jess, who runs on her own node with eddy's
-subscription: `ducktape agent pty --cred eddy-fable-1`, no `--node`); host's
-compute with the host's own granted credential (jess types, eddy's box and
-eddy's subscription: `agent pty --node eddy --cred eddy-claude-1` — the
+gateway from wherever it runs, so every mix works: the inverse (alice
+**grants** their credential to jess, who runs on her own node with alice's
+subscription: `ducktape agent pty --cred alice-fable-1`, no `--node`); host's
+compute with the host's own granted credential (jess types, alice's box and
+alice's subscription: `agent pty --node alice --cred alice-claude-1` — the
 transport-trivial case, the broker hits its own node's loopback gateway); or
-any third-party mix (jess on eddy's compute with bob's granted credential).
+any third-party mix (jess on alice's compute with bob's granted credential).
 
 ## Non-goals
 
@@ -87,7 +87,7 @@ actually needs:
 ### Data plane — real pty streaming (peer mesh, no consensus, no polling)
 
 ```
-jess CLI ◀─local ws─▶ jess node ◀─peer stream─▶ eddy node ◀─pty master─▶ sandbox TUI
+jess CLI ◀─local ws─▶ jess node ◀─peer stream─▶ alice node ◀─pty master─▶ sandbox TUI
    raw mode            existing               new input lane;
    + resize            client surface         output fan-out already exists
 ```

@@ -209,7 +209,7 @@ mod tests {
         for m in [
             IdentityMsg::BindNode { user_key: vec![7; 32], user_sig: vec![9; 64] },
             IdentityMsg::UnbindNode { node_key: vec![1; 32], user_sig: vec![2; 64] },
-            IdentityMsg::SetUserName { display_name: "eddy".into() },
+            IdentityMsg::SetUserName { display_name: "alice".into() },
         ] {
             assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);
         }

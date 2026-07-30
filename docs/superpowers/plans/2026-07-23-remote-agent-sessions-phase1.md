@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Named, grantable, owner-hosted API credentials: `ducktape user cred add claude` registers `eddy-claude-1` on-chain, `cred grant` lends it, and any node's broker can resolve the name and complete an Anthropic round-trip through the owner's co-hosted gateway without ever holding the secret.
+**Goal:** Named, grantable, owner-hosted API credentials: `ducktape user cred add claude` registers `alice-claude-1` on-chain, `cred grant` lends it, and any node's broker can resolve the name and complete an Anthropic round-trip through the owner's co-hosted gateway without ever holding the secret.
 
 **Architecture:** Consensus registry = credential records on the EXISTING gateway module (name → owner account, publisher node, kind, seal_pk, grants) — an app-hash flag day handled with the module-dev flow. Serving = the existing in-process airlock gateway grown from one in-memory credential slot to a named, disk-backed store with a no-TEE self-host mode whose trust anchor is the on-chain seal_pk. Transport = the existing `Service::Gateway` overlay plane via `Gateway::remote(handle, via)` — nothing new. CLI = a `user cred` subfamily; `cred add` wraps the vendor's own login CLI on a local pty writing directly into the gateway store.
 
@@ -48,7 +48,7 @@
 ```rust
 #[test]
 fn credential_wire_round_trips() {
-    let record = sample_credential_record("eddy-claude-1");
+    let record = sample_credential_record("alice-claude-1");
     let msg = signed_set_credential(&owner_key(), &record);
     let decoded = crate::decode(&crate::encode(&msg)).expect("decode");
     assert_eq!(msg, decoded);
@@ -59,7 +59,7 @@ fn credential_names_are_validated() {
     for bad in ["", "UPPER", "has space", "x".repeat(65).as_str()] {
         assert!(validate_credential_name(bad).is_err(), "{bad:?} must be rejected");
     }
-    assert!(validate_credential_name("eddy-claude-1").is_ok());
+    assert!(validate_credential_name("alice-claude-1").is_ok());
 }
 
 #[test]
@@ -354,9 +354,9 @@ git commit -m "feat(capability-host): per-run airlock config with pinned-seal-pk
 ```rust
 #[test]
 fn default_name_is_display_provider_counter() {
-    let existing = ["eddy-claude-1", "eddy-claude-2", "eddy-codex-1"];
-    assert_eq!(derive_default_name("eddy", ProviderArg::Claude, &existing), "eddy-claude-3");
-    assert_eq!(derive_default_name("eddy", ProviderArg::Codex, &existing), "eddy-codex-2");
+    let existing = ["alice-claude-1", "alice-claude-2", "alice-codex-1"];
+    assert_eq!(derive_default_name("alice", ProviderArg::Claude, &existing), "alice-claude-3");
+    assert_eq!(derive_default_name("alice", ProviderArg::Codex, &existing), "alice-codex-2");
     assert_eq!(derive_default_name("jess", ProviderArg::Claude, &[]), "jess-claude-1");
 }
 
