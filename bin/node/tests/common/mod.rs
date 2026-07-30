@@ -28,6 +28,66 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// A cluster's storage root, named so an ABANDONED one can be found and swept.
+///
+/// `tempfile::TempDir` removes itself on Drop, which covers a normal finish AND
+/// a panicking test — the unwind still runs Drop, and a clean `cluster_e2e` run
+/// measurably leaks nothing. What it does not cover is the process being KILLED:
+/// a CI timeout, a Ctrl-C, an OOM. Then nothing unwinds and the whole storage
+/// subtree survives.
+///
+/// That is not a nuisance where `TMPDIR` is tmpfs — it is RAM, and this box has
+/// no swap. One session left **22 GB across 11 dirs**, two of them 7.2 GB, and
+/// the machine only got slower until the compiler started dying mid-build.
+///
+/// Worse, `tempfile`'s names are random (`.tmpXXXXXX`), so a ducktape leak was
+/// indistinguishable from any other program's temp dir — reclaiming it meant
+/// `rm -rf /tmp/.tmp*`, a blunt instrument pointed at everyone's data.
+///
+/// Naming them `ducktape-e2e-<pid>-…` fixes both halves: the leak is
+/// identifiable, and each new cluster first sweeps the ones whose owning
+/// process is gone. A LIVE pid is never touched (sibling test binaries run
+/// concurrently), and pid reuse only makes the sweep skip a directory — it can
+/// never make it delete a live one.
+fn e2e_tempdir(tag: &str) -> tempfile::TempDir {
+    sweep_abandoned_e2e_dirs();
+    tempfile::Builder::new()
+        .prefix(&format!("ducktape-e2e-{}-{tag}-", std::process::id()))
+        .tempdir()
+        .expect("e2e tempdir")
+}
+
+/// Remove `ducktape-e2e-<pid>-*` roots whose owning process is gone.
+fn sweep_abandoned_e2e_dirs() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("ducktape-e2e-")) else {
+            continue;
+        };
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<i32>().ok()) else {
+            continue;
+        };
+        if pid_is_alive(pid) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+/// Signal 0 asks "may I signal this pid" WITHOUT delivering anything — the
+/// portable liveness probe. Anything other than "no such process" is treated as
+/// ALIVE, so an unreadable pid is skipped rather than swept.
+fn pid_is_alive(pid: i32) -> bool {
+    // SAFETY: `kill` with signal 0 delivers nothing and touches no memory.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 use commonware_cryptography::{Signer as _, ed25519};
 
 /// the socket suite is heavyweight (4 OS processes each): serialize the tests
@@ -204,7 +264,7 @@ impl NetworkShapeCluster {
     }
 
     pub fn new() -> Self {
-        let dir = tempfile::TempDir::new().expect("network-shape tempdir");
+        let dir = e2e_tempdir("shape");
         let ports = alloc_ports(6);
         let (p2p_ports, rest) = ports.split_at(2);
         let (rpc_ports, http_ports) = rest.split_at(2);
@@ -697,7 +757,7 @@ impl Cluster {
     pub fn new(peer_ids: &[u64], validator_ids: &[u64]) -> Self {
         let seq = CLUSTER_SEQ.fetch_add(1, Ordering::Relaxed);
         let namespace = format!("ducktape-e2e-{}-{seq}", std::process::id());
-        let dir = tempfile::TempDir::new().expect("cluster tempdir");
+        let dir = e2e_tempdir("cluster");
         let ports = alloc_ports(peer_ids.len() * 3);
         let (p2p_ports, rest) = ports.split_at(peer_ids.len());
         let (rpc_ports, http_ports) = rest.split_at(peer_ids.len());
