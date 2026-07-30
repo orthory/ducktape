@@ -429,7 +429,7 @@ fn full_surface_blocks_authorship_and_ws() {
     let (code, block) = daemon.submit(
         "chat",
         post_message("general", "m1", "hello from e2e"),
-        Some("eddy"),
+        Some("alice"),
     );
     assert_eq!(code, 200, "post failed: {block}");
     assert_eq!(block["height"], 2);
@@ -491,7 +491,7 @@ fn full_surface_blocks_authorship_and_ws() {
         .map(|v| v.as_u64().expect("byte") as u8)
         .collect();
     assert_eq!(
-        author_bytes, b"eddy",
+        author_bytes, b"alice",
         "authorship must come from the submit origin"
     );
 
@@ -601,7 +601,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     let (code, block) = daemon.submit(
         "chat",
         post_mention("general", "m1", "quackbot"),
-        Some("eddy"),
+        Some("alice"),
     );
     assert_eq!(code, 200, "mention post failed: {block}");
     // the receipt reports the block that INCLUDED the post, not the drain tail…
@@ -681,7 +681,7 @@ fn state_persists_across_restart() {
         let (code, _) = daemon.submit(
             "chat",
             post_message("durable", "m1", "written before restart"),
-            Some("eddy"),
+            Some("alice"),
         );
         assert_eq!(code, 200);
 
@@ -736,9 +736,9 @@ fn state_persists_across_restart() {
     assert_eq!(op["target"], "chat");
     assert_eq!(op["disposition"], "applied");
     // this lane frames and signs nothing: the block hash is honestly empty, and
-    // the op's proposer is the SUBMITTER's origin bytes as hex ("eddy").
+    // the op's proposer is the SUBMITTER's origin bytes as hex ("alice").
     assert_eq!(post["hash"], "");
-    assert_eq!(op["proposer"], "65646479");
+    assert_eq!(op["proposer"], "616c696365");
     assert!(
         op["operations"]
             .as_array()
@@ -797,7 +797,7 @@ fn per_module_index_serves_ops_and_views() {
         let (code, _) = daemon.submit(
             "chat",
             post_message("eng", "m1", "fluent index demo"),
-            Some("eddy"),
+            Some("alice"),
         );
         assert_eq!(code, 200);
         // tasks owns TWO boards behind one module: the write wire is the
@@ -833,7 +833,7 @@ fn per_module_index_serves_ops_and_views() {
         let hits = hits_of(&reply);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["message_id"], "m1");
-        assert_eq!(hits[0]["author"], "user:eddy");
+        assert_eq!(hits[0]["author"], "user:alice");
 
         // tasks' endpoint: the by-status partition.
         await_view_folded(&daemon, "tasks");
@@ -895,7 +895,7 @@ fn per_module_index_serves_ops_and_views() {
     let (code, _) = daemon.submit(
         "chat",
         post_message("eng", "m2", "fresh after restart"),
-        Some("eddy"),
+        Some("alice"),
     );
     assert_eq!(code, 200);
     await_view_folded(&daemon, "chat");

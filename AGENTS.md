@@ -49,18 +49,11 @@
 - **A worktree's life ends when its PR merges.** Once merged, remove the
   worktree and delete its branch. Leaving it costs ~20 GB of Cargo target each
   and nothing else; twelve of them once ate 250 GB and had to be swept by hand.
-- **Reap retired QA state BEFORE removing the worktree — this order is not
-  optional.** The current Iced workflow has no Fleet instance manager, but old
-  external instance homes can still contain a pidfile and detached
-  `ducktape`. Deleting their worktree first used to delete the teardown
-  hook and leave the node running forever. `ops/worktree-clean.sh` retains a
-  self-contained, identity-verified reaper for that historical state.
-- **`ops/worktree-clean.sh` does the whole sequence safely.** Dry-run by
-  default; `--yes` to act. It reaps orphaned retired-QA instances (killing only a pid
-  it has verified is that workspace's own `ducktape`, by exe and
-  `--config` — never `pkill -f`), then removes worktrees whose branch is fully
-  merged into `origin/dev`. It REFUSES a worktree that is dirty or carries a
-  commit not in `dev`; unmerged work is never its to throw away.
+- **`ops/worktree-clean.sh` does it safely.** Dry-run by default; `--yes` to
+  act. It removes worktrees whose branch is fully merged into `origin/dev`, and
+  REFUSES one that is dirty, carries a commit not in `dev`, or has live
+  processes under it (`--force` overrides only the last). Unmerged work is
+  never its to throw away.
 - Never stop desktop/QA processes with `pkill -f` — a pattern match will
   cheerfully kill an editor, a grep, or this script. Find them by process cwd,
   executable, and workspace config or let the native app shut them down.

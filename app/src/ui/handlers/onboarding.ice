@@ -1,11 +1,13 @@
 // ONBOARDING HANDLERS. The phase machine in front of the console: welcome ->
-// create|join -> provisioning -> live -> console.
+// join -> provisioning -> live -> console.
 //
-// The app is a strict CLIENT. `create_network` / `join_network` shell out to
-// `ducktape node init` / `node join`, which materialize a workspace on disk and
-// then EXIT. Nothing here starts a daemon, so `provision_progress` steps 4-5
-// are a real `/v1/status` poll and a stalled node reports `blocked` carrying
-// the command that starts it, instead of a spinner on an 850ms fake clock.
+// The app is a strict CLIENT, and there is no create route: founding a network
+// is `ducktape node init` on the node, where the coordinator and the rest of the
+// network shape are chosen. `join_network` shells out to `ducktape node join`,
+// which materializes a workspace on disk and then EXITS. Nothing here starts a
+// daemon, so `provision_progress` steps 4-5 are a real `/v1/status` poll and a
+// stalled node reports `blocked` carrying the command that starts it, instead
+// of a spinner on an 850ms fake clock.
 
 state
   // The steps the provisioning stream has actually reported. Ice has no list
@@ -13,7 +15,7 @@ state
   // step rather than the artifact's five-row history — see the report.
   provision_steps:[ProvisionStep] = []
   provision_index:i64 = 0
-  // The chain id `node init` / `node join` minted, which is also the `-n`
+  // The chain id `node join` minted, which is also the `-n`
   // workspace selector every later CLI call needs.
   onboarding_chain = ""
 
@@ -22,23 +24,10 @@ on go_welcome
   phase = "welcome"
   onboarding_error = ""
 
-on go_create
-  return if mutation_phase != "idle"
-  phase = "create"
-  onboarding_error = ""
-
 on go_join
   return if mutation_phase != "idle"
   phase = "join"
   onboarding_error = ""
-
-on create_network_submit(name)
-  return if mutation_phase != "idle" || empty(trim(name))
-  onboarding_name = trim(name)
-  workspace_slug = network_slug(onboarding_name)
-  onboarding_error = ""
-  mutation_phase = "onboarding"
-  run create_network(onboarding_name) -> workspace_materialized _ | onboarding_failed _
 
 on join_network_submit(blob)
   return if mutation_phase != "idle" || empty(trim(blob))

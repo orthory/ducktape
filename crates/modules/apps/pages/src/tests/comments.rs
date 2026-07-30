@@ -85,7 +85,7 @@ fn add_comment_reports_structured_agent_mentions_to_tagging() {
             module: "runs".into(),
             agent_id: "qa-luna".into(),
         });
-        let mut ctx = ctx_as(user("eddy"));
+        let mut ctx = ctx_as(user("carol"));
         p.execute(&mut ctx, &msg(&op)).await.unwrap();
         assert_eq!(ctx.msgs().len(), 1);
         assert_eq!(ctx.msgs()[0].target, "tagging");
@@ -95,7 +95,7 @@ fn add_comment_reports_structured_agent_mentions_to_tagging() {
         };
         assert_eq!(event.container, "t1");
         assert_eq!(event.content_seq, 1);
-        assert_eq!(event.author, tagging::Author::User(b"eddy".to_vec()));
+        assert_eq!(event.author, tagging::Author::User(b"carol".to_vec()));
         assert_eq!(
             event.tags,
             vec![tagging::EntityRef {
@@ -110,7 +110,7 @@ fn add_comment_reports_structured_agent_mentions_to_tagging() {
 fn edit_comment_reports_only_supplied_new_agent_mentions_to_tagging() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages").with_tagging("tagging");
-        apply_commit_as(&mut p, &add("t1", "c1", "page-1", "draft"), user("eddy")).await;
+        apply_commit_as(&mut p, &add("t1", "c1", "page-1", "draft"), user("carol")).await;
         let edit = PageMsg::EditComment {
             comment_id: "c1".into(),
             text: "@qa-luna please review".into(),
@@ -119,7 +119,7 @@ fn edit_comment_reports_only_supplied_new_agent_mentions_to_tagging() {
                 agent_id: "qa-luna".into(),
             }],
         };
-        let mut ctx = ctx_as(user("eddy"));
+        let mut ctx = ctx_as(user("carol"));
         p.execute(&mut ctx, &msg(&edit)).await.unwrap();
 
         let tagging::TaggingMsg::Tag(event) = tagging::decode_msg(&ctx.msgs()[0].payload).unwrap()

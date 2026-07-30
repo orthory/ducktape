@@ -20,7 +20,7 @@
 - New Rust deps (`bip39`, `argon2`, `chacha20poly1305`, `zeroize`) go in bin/node's Cargo.toml (workspace-deps entries fine); NOTHING new in `app/src-tauri`.
 - Password minimum 8 chars, enforced app-side AND in the `init`/`restore`/`encrypt` verbs.
 - Web build (no Tauri): identity gate never renders; behavior identical to today.
-- Commit per task; all work in worktree `/home/eddy/dev/ducktape/.claude/worktrees/feat+identity-onboarding` on branch `feat/identity-onboarding`. Run Rust tests `cargo test -p node-bin userkey` (module-scoped; the full node-bin suite only in the final sweep), app tests `cd app && bun run test -- --run`.
+- Commit per task; all work in worktree `<repo>/.claude/worktrees/feat+identity-onboarding` on branch `feat/identity-onboarding`. Run Rust tests `cargo test -p node-bin userkey` (module-scoped; the full node-bin suite only in the final sweep), app tests `cd app && bun run test -- --run`.
 
 ---
 

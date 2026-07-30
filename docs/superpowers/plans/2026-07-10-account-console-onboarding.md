@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Worktree: `/home/eddy/dev/ducktape/.claude/worktrees/account-console`, branch `feat/account-console`, PR target `dev`.
+- Worktree: `<repo>/.claude/worktrees/account-console`, branch `feat/account-console`, PR target `dev`.
 - Run tests: `cd app && bun run test` · typecheck: `cd app && bun run typecheck`.
 - Vocabulary (spec-locked): **Account** (person / recovery phrase), **Device** (machine member key), **Node** (per-workspace daemon key), **Workspace**. The strings "user key" and bare "identity" leave the UI.
 - Mono-file mandate: new files split by responsibility, ~600-line soft cap.

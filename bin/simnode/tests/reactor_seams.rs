@@ -335,7 +335,7 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
         // inbox
         (
             "inbox",
-            json!({ "deliver": { "member": "eddy", "kind": "note", "body": "hi" } }),
+            json!({ "deliver": { "member": "alice", "kind": "note", "body": "hi" } }),
             Some("courier".into()),
         ),
         // the job board (the merged tasks module's `job` arm)
@@ -410,7 +410,7 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
         // duckdns — claim a handle on the just-bound account (32-byte origin).
         (
             "gateway",
-            json!({ "set_handle": { "handle": "eddy" } }),
+            json!({ "set_handle": { "handle": "alice" } }),
             Some(node.clone()),
         ),
         // gateway — the account's founding key signs a route from the just-bound

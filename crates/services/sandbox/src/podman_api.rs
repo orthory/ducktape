@@ -1445,6 +1445,15 @@ pub async fn reap_by_label(socket: &Path, label: &str) -> Result<usize, String> 
 mod tests {
     use super::*;
 
+    /// The synthetic host layout the path tests translate away from. It is
+    /// deliberately not this machine's `$HOME`: the leak assertions below key
+    /// on `HOST_USER` rather than on a literal username, so a guest path that
+    /// echoed the host side still fails the check on any developer's box.
+    const HOST_USER: &str = "operator";
+    const HOST_HOME: &str = "/home/operator";
+    const HOST_WORKSPACE: &str = "/home/operator/.ducktape/provider-runs/7/workspace";
+    const HOST_AUTH_DIR: &str = "/home/operator/.claude";
+
     /// One service root admits ONE daemon, and the refusal does not depend on
     /// what binary either of them runs.
     ///
@@ -1482,12 +1491,12 @@ mod tests {
 
     #[test]
     fn plan_hides_every_host_path_behind_ducktape() {
-        let home = Path::new("/home/eddy");
+        let home = Path::new(HOST_HOME);
         let plan = plan_mounts(
-            Path::new("/home/eddy/.ducktape/provider-runs/7/workspace"),
+            Path::new(HOST_WORKSPACE),
             Path::new("/usr/bin/claude"),
             &[PathBuf::from("/opt/skills")],
-            &[PathBuf::from("/home/eddy/.claude")],
+            &[PathBuf::from(HOST_AUTH_DIR)],
             home,
         );
         assert_eq!(plan.guest_workdir, Path::new("/ducktape/workspace"));
@@ -1497,7 +1506,7 @@ mod tests {
         let claude = plan
             .mounts
             .iter()
-            .find(|m| m.host == Path::new("/home/eddy/.claude"))
+            .find(|m| m.host == Path::new(HOST_AUTH_DIR))
             .unwrap();
         assert_eq!(claude.guest, Path::new("/ducktape/home/.claude"));
         assert!(!claude.read_only);
@@ -1505,28 +1514,31 @@ mod tests {
         for m in &plan.mounts {
             let g = m.guest.to_string_lossy();
             assert!(g.starts_with("/ducktape/"), "guest not neutral: {g}");
-            assert!(!g.contains("eddy") && !g.contains("provider-runs"), "leak: {g}");
+            assert!(
+                !g.contains(HOST_USER) && !g.contains("provider-runs"),
+                "leak: {g}"
+            );
         }
     }
 
     #[test]
     fn translate_rewrites_workdir_inside_a_codex_arg_and_sanitizes_home() {
-        let home = Path::new("/home/eddy");
+        let home = Path::new(HOST_HOME);
         let guest_home = Path::new("/ducktape/home");
         let mounts = vec![Mount {
-            host: PathBuf::from("/home/eddy/.ducktape/provider-runs/7/workspace"),
+            host: PathBuf::from(HOST_WORKSPACE),
             guest: PathBuf::from("/ducktape/workspace"),
             read_only: false,
         }];
-        let arg = "projects.\"/home/eddy/.ducktape/provider-runs/7/workspace\".trust_level=\"untrusted\"";
-        let out = translate(arg, &mounts, home, guest_home);
+        let arg = format!("projects.\"{HOST_WORKSPACE}\".trust_level=\"untrusted\"");
+        let out = translate(&arg, &mounts, home, guest_home);
         assert_eq!(
             out,
             "projects.\"/ducktape/workspace\".trust_level=\"untrusted\""
         );
         // a bare $HOME-prefixed value with no explicit mount is still sanitized.
         assert_eq!(
-            translate("/home/eddy/.config/x", &mounts, home, guest_home),
+            translate(&format!("{HOST_HOME}/.config/x"), &mounts, home, guest_home),
             "/ducktape/home/.config/x"
         );
     }
@@ -1568,12 +1580,12 @@ mod tests {
 
     #[test]
     fn spec_json_has_neutral_paths_private_netns_and_dropped_caps() {
-        let home = Path::new("/home/eddy");
+        let home = Path::new(HOST_HOME);
         let plan = plan_mounts(
-            Path::new("/home/eddy/.ducktape/provider-runs/7/workspace"),
+            Path::new(HOST_WORKSPACE),
             Path::new("/usr/bin/claude"),
             &[],
-            &[PathBuf::from("/home/eddy/.claude")],
+            &[PathBuf::from(HOST_AUTH_DIR)],
             home,
         );
         let mut spec = SpecGenerator::build(SpecInputs {
@@ -1612,7 +1624,7 @@ mod tests {
             spec.mounts.iter().map(|m| &m.destination).collect::<Vec<_>>()
         );
         assert!(
-            !guest_view.contains("eddy") && !guest_view.contains("provider-runs"),
+            !guest_view.contains(HOST_USER) && !guest_view.contains("provider-runs"),
             "guest-visible leak: {guest_view}"
         );
     }

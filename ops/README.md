@@ -41,8 +41,7 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 
 ## Worktree cleanup
 
-Current native QA has no Fleet configuration or external instance manager.
-`ops/worktree-clean.sh` intentionally retains a self-contained, identity-
-verified reaper for homes left by the retired Fleet workflow. Always dry-run it
-before removing merged worktrees, then pass `--yes`; it refuses dirty or
-unmerged work and never uses `pkill -f`.
+Always dry-run `ops/worktree-clean.sh` before removing merged worktrees, then
+pass `--yes`. It refuses a worktree that is dirty, carries a commit not in
+`dev`, or has live processes under it, and it finds those processes by cwd —
+never `pkill -f`.

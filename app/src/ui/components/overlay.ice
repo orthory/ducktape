@@ -12,7 +12,7 @@
 //     content
 //       space w=fill h=fill
 //     layer
-//       ModalShell title="Invite to dukenet" width=418.0
+//       ModalShell title="Invite to testnet" width=418.0
 //         close:
 //           button label="Close" ... -> close_invite_modal
 //         body:

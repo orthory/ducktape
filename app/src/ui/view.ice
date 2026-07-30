@@ -11,12 +11,10 @@ view
     // props are fed 0 and LiveStatusStrip drops the segment rather than
     // printing a count nobody measured.
     if phase != "console"
-      OnboardingPhase phase=phase name=onboarding_name node_api=canonical_endpoint(rpc) invite=invite_link steps=provision_steps step_index=provision_index height=block_height peers_live=0 peers_total=0 tier=member_tier(members_rows) error=onboarding_error busy=(mutation_phase != "idle")
+      OnboardingPhase phase=phase name=onboarding_name invite=invite_link steps=provision_steps step_index=provision_index height=block_height peers_live=0 peers_total=0 tier=member_tier(members_rows) error=onboarding_error busy=(mutation_phase != "idle")
         events
           go_welcome -> go_welcome
-          go_create -> go_create
           go_join -> go_join
-          create_network_submit -> create_network_submit _
           copy_onboarding_invite -> copy_onboarding_invite
           enter_console -> enter_console
           join_network_submit -> join_network_submit _

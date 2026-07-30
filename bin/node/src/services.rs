@@ -2942,7 +2942,7 @@ mod tests {
         let offered = signaling("compute");
         let plan = EnablePlan {
             kind: "compute".into(),
-            chain_id: "dukenet#03f6df3d".into(),
+            chain_id: "ducktape#a1b2c3d4".into(),
             node_id: NODE_A,
             grant: mint_grant("compute", NODE_A, &offered),
             capacity: Default::default(),
@@ -2971,7 +2971,7 @@ mod tests {
         );
         assert!(
             through_anstream(&rendered[2], anstream::ColorChoice::Never)
-                .contains("dukenet#03f6df3d")
+                .contains("ducktape#a1b2c3d4")
         );
     }
 

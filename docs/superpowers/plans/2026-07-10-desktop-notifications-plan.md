@@ -1,7 +1,7 @@
 # Desktop Notifications — Implementation Plan
 
-**Design spec:** `/home/eddy/.claude/plans/notification-system-for-the-foamy-pancake.md` (approved — this plan converts it into tasks, it does not redesign it).
-**Worktree:** `/home/eddy/dev/ducktape/.claude/worktrees/desktop-notifications` (branch `feat/desktop-notifications`, based on `origin/dev`). All paths below are relative to the worktree root.
+**Design spec:** `~/.claude/plans/notification-system-for-the-foamy-pancake.md` (approved — this plan converts it into tasks, it does not redesign it).
+**Worktree:** `<repo>/.claude/worktrees/desktop-notifications` (branch `feat/desktop-notifications`, based on `origin/dev`). All paths below are relative to the worktree root.
 
 ## 1. Context
 

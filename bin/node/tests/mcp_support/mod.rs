@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 /// that a run's writes are attributed to the person who owns the agent, not to
 /// the daemon that happened to execute it.
 pub const AGENT_ID: &str = "quackbot";
-pub const OWNER: &str = "eddy";
+pub const OWNER: &str = "alice";
 
 pub struct Harness {
     // dropped BEFORE `dir` (fields drop in declaration order): the daemon's Drop
@@ -113,7 +113,7 @@ impl Harness {
 
     /// register the agent under `OWNER` with the given grant. submitted with the
     /// owner as the external origin, which is what makes `AgentRecord.owner`
-    /// `SagaOrigin::External(b"eddy")` — the value the tool plane reads back and
+    /// `SagaOrigin::External(b"alice")` — the value the tool plane reads back and
     /// submits its writes as.
     fn register_agent(&self, allowed_actions: &[&str], forge_read: &[&str]) {
         let mut actions: Vec<&str> = allowed_actions.to_vec();

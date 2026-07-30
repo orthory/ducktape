@@ -83,7 +83,6 @@ extern crate::backend
   sync onboarding_phase() -> str
   sync network_slug(name:str) -> str
   WorkspaceInit(chain_id:str, workspace:str, rpc:str)
-  create_network(name:str) -> WorkspaceInit ! AppError
   join_network(blob:str) -> WorkspaceInit ! AppError
   mint_invite(workspace:str, role:str, ttl_days:i64) -> str ! AppError
   ProvisionStep(index:i64, label:str, state:str, settled:bool)
