@@ -713,12 +713,10 @@ pub(super) async fn wire(
         match wireguard_listen {
             Some(wg_addr) => {
                 // rendezvous coordinators = every coordinated-reach hint's
-                // coordinator ingress, PLUS the node-local ambient one
-                // (deduped). An invite-joined member's descriptor carries no
-                // `coordinated:` hints (stripped at mint time), so WITHOUT a
-                // configured `primary_coordinator` it binds zero coordinators
-                // and never registers — that is the direct-only posture, and
-                // it is why rendezvous needs an explicit node.toml value.
+                // coordinator ingress, PLUS the ambient override/default
+                // (deduped) — without it an invite-joined member (whose
+                // descriptor carries no `coordinated:` hints, stripped at
+                // mint time) binds zero coordinators and never registers.
                 let mut coordinators: Vec<Ingress> =
                     coordinated.iter().map(|(_, c, _)| c.clone()).collect();
                 match config::coordinator_ingress(primary_coordinator.as_deref()) {

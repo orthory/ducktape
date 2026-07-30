@@ -1,7 +1,6 @@
-# Coordinator Deployment Recipe
+# Coordinator Deployment Recipe (`p2p.ducktape.byeongsu.dev`)
 
-How to run `bin/coordinator` under a hostname you control (`p2p.example.org`
-throughout — substitute your own): an **untrusted,
+How to run `bin/coordinator` as `p2p.ducktape.byeongsu.dev`: an **untrusted,
 non-validator reachability helper** that lets two NAT'd validators find each
 other and hole-punch a direct path. Its optional TCP lane carries only sealed
 first-contact admission datagrams when UDP setup is exhausted; it never carries
@@ -292,7 +291,7 @@ the standard port without granting the container a privileged bind.
 
 ## DNS + firewall
 
-- Point an `A` record `p2p.example.org` → the VPS IP.
+- Point an `A` record `p2p.ducktape.byeongsu.dev` → the VPS IP.
 - Open **inbound UDP 3478**. When the sealed-intro fallback is enabled, also
   open its externally mapped TCP port (normally 443).
 

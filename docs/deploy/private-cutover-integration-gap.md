@@ -84,8 +84,7 @@ exhaustion is an HONEST terminal (a distinct non-zero exit with a mode-naming
 FATAL — never a silent success). So a fully-NATed (incl. symmetric) inviter
 still onboards as long as ONE offered path — itself via its coordinator, or any
 reachable front — comes up. The coordinator is AMBIENT: the joiner's resolver
-binds `config::primary_coordinator_or_default` (node-local config; no
-compiled-in default), never an
+binds `config::primary_coordinator_or_default` (public default), never an
 address baked into the blob; `invite` embeds no coordinator address at all.
 `fronts` live OUTSIDE the genesis fingerprint (advisory reachability, not
 validator identity — proven by a fingerprint-exclusion test), so this is ZERO

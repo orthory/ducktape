@@ -112,8 +112,8 @@ pub struct Resolved {
     /// the AMBIENT coordinator override (`NodeToml::primary_coordinator`),
     /// raw and unvalidated — resolved through `coordinator_ingress` at the
     /// point of use so a bad value DEGRADES (coordinated paths dark, loud
-    /// log) rather than aborting boot. `None` = no ambient coordinator: this
-    /// node runs direct-only unless a descriptor hint supplies one.
+    /// log) rather than aborting boot. `None` = re-derive the compiled
+    /// default, exactly like today.
     pub primary_coordinator: Option<String>,
     /// the TCP relay override (`NodeToml::coordinator_relay`), raw and
     /// unvalidated — consumed at the join-race wiring site so a bad value
@@ -1353,9 +1353,9 @@ mod tests {
         }
     }
 
-    /// `primary_coordinator` (issue #331): the key ABSENT resolves to `None`,
-    /// which `coordinator_ingress` turns into no ambient coordinator at all
-    /// (there is no compiled-in host to re-derive); the
+    /// `primary_coordinator` (change 1, issue #331): the key ABSENT resolves
+    /// to `None` — bit-identical to today, since `main.rs` re-derives the
+    /// compiled default from `coordinator_ingress(None)` either way; the
     /// disable sentinel and an explicit override both ride the raw string
     /// through, unvalidated at resolve time (validated lazily at the point
     /// of use so a bad value degrades rather than aborting boot — inv 12).
@@ -1370,7 +1370,7 @@ mod tests {
         let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
         assert_eq!(
             resolved.primary_coordinator, None,
-            "absent key: no ambient coordinator at the point of use"
+            "absent key: re-derive the compiled default at the point of use"
         );
 
         std::fs::write(

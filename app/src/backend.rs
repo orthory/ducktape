@@ -4562,18 +4562,6 @@ pub fn network_slug(name: String) -> String {
     folded.trim_matches('-').to_string()
 }
 
-/// Found a network on this device: `ducktape node init --name <name>` mints
-/// the chain id, the identity and the workspace directory.
-pub async fn create_network(name: String) -> Result<WorkspaceInit, AppError> {
-    async {
-        let name = bounded_text(name, "network name", 128)?;
-        let chain_id = ducktape_cli(&["node", "init", "--name", &name]).await?;
-        workspace_init(&chain_id)
-    }
-    .await
-    .map_err(app_error)
-}
-
 /// Materialize this device's workspace from an invite blob:
 /// `ducktape node join <blob>`.
 pub async fn join_network(blob: String) -> Result<WorkspaceInit, AppError> {

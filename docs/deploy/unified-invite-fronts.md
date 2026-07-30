@@ -22,8 +22,7 @@ adverts) and carries only:
 
 No WireGuard **private** key is ever transported. No coordinator address is
 embedded anywhere in the invite — the joiner uses its **own ambient
-coordinator** (`primary_coordinator_or_default`, from its own node.toml —
-there is no product default; unconfigured means direct-only),
+coordinator** (`primary_coordinator_or_default`, the public product default),
 never one baked into the blob.
 
 ## Exposure to weigh before minting

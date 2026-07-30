@@ -18,7 +18,7 @@
 //! underlay bound as a real IPv4 socket, the two IPs must match again.
 //!
 //!   cargo run -p node-bin --example shared_underlay_reflexive -- \
-//!     --coord p2p.example.org:3478 --seed 11
+//!     --coord p2p.ducktape.byeongsu.dev:3478 --seed 11
 //!
 //! Exit 0 iff both reflexives resolved AND their public IPs match.
 

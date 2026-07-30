@@ -1,19 +1,22 @@
-// THE PRE-CONSOLE PHASE FLOW. Five screens in front of the shell: welcome,
-// create, provisioning, live, join. `phase` is the single discriminant and
-// "console" is the only value that renders the console instead of this column.
+// THE PRE-CONSOLE PHASE FLOW. Four screens in front of the shell: welcome,
+// join, provisioning, live. `phase` is the single discriminant and "console"
+// is the only value that renders the console instead of this column.
+//
+// THERE IS NO CREATE ROUTE. Founding a network is an operator act on the node
+// (`ducktape node init`, which is where `--primary-coordinator` and the rest of
+// the network shape get decided). This app attaches to a node somebody already
+// runs; the only way in from here is an invite.
 //
 // MOUNT (view.ice owns the branch):
 //
 //   if phase != "console"
-//     OnboardingPhase phase=phase name=onboarding_name node_api=canonical_endpoint(rpc)
+//     OnboardingPhase phase=phase name=onboarding_name
 //       invite=invite_link steps=provision_steps step_index=provision_index
 //       height=block_height peers_live=… peers_total=… tier=member_tier(members_rows)
 //       error=onboarding_error busy=(mutation_phase != "idle")
 //       events
 //         go_welcome -> go_welcome
-//         go_create -> go_create
 //         go_join -> go_join
-//         create_network_submit -> create_network_submit _
 //         copy_onboarding_invite -> copy_onboarding_invite
 //         enter_console -> enter_console
 //         join_network_submit -> join_network_submit _
@@ -42,12 +45,10 @@
 // The centred column on the flat second surface. iced has no radial gradient,
 // so the artifact's `radial-gradient(#fdfdfb -> #f7f6f2)` lands as the flat
 // `bg_wash` step — the sanctioned substitution, same as every other plate.
-component OnboardingPhase(phase:str, name:str, node_api:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, peers_live:i64, peers_total:i64, tier:str, error:str, busy:bool)
+component OnboardingPhase(phase:str, name:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, peers_live:i64, peers_total:i64, tier:str, error:str, busy:bool)
   emits
     go_welcome
-    go_create
     go_join
-    create_network_submit(str)
     copy_onboarding_invite
     enter_console
     join_network_submit(str)
@@ -57,13 +58,7 @@ component OnboardingPhase(phase:str, name:str, node_api:str, invite:str, steps:[
         "welcome"
           WelcomeScreen
             forward
-              go_create
               go_join
-        "create"
-          CreateScreen node_api=node_api busy=busy error=error
-            forward
-              go_welcome
-              create_network_submit
         "provisioning"
           ProvisioningScreen name=name steps=steps step_index=step_index error=error
             forward
@@ -99,7 +94,7 @@ component OnboardingShell(phase:str, title:str, step:str)
         text title w=fill size=20.0 wrap=none font=display @text-primary
     slot
 
-// On Create and Join the step label IS the way back. On Provisioning there is
+// On Join the step label IS the way back. On Provisioning there is
 // no way back — the workspace already exists on disk — so it is plain text.
 component OnboardingStepLabel(phase:str, step:str)
   emits
@@ -114,12 +109,12 @@ component OnboardingStepLabel(phase:str, step:str)
           text "‹" size=14.0 wrap=none @text-meta
           text step size=11.0 wrap=none font=code_medium @text-meta
 
-// WELCOME. The brand plate, what this is, and the only two ways in. The footer
-// says where the key lives — and it does NOT repeat the artifact's `node boots
-// locally`, because this app never boots one.
+// WELCOME. The brand plate, what this is, and the ONE way in. There is no
+// create route: this app is a client, and founding a network is an operator act
+// on the node. The footer says where the key lives — and it does NOT repeat the
+// artifact's `node boots locally`, because this app never boots one.
 component WelcomeScreen()
   emits
-    go_create
     go_join
   col #root w=430.0 gap=0.0 align=center
     box w=50.0 h=50.0 align-x=center align-y=center bg=primary r=13.0
@@ -131,15 +126,13 @@ component WelcomeScreen()
         text "People and agents work on one shared record." size=13.5 line-h=1.55 @text-caption
         text "Chat, docs, code and approvals in one place." size=13.5 line-h=1.55 @text-caption
     box w=fill pt=28.0
-      button label="Create a workspace" w=fill @primary_action px-17px py-15px rounded-11px -> emit(go_create)
-        RouteCardBody title="Create a workspace" note="Registers a workspace on this device and generates your admin keypair." primary=true
-    box w=fill pt=11.0
-      button label="Join with an invite" w=fill @outline_action px-17px py-15px rounded-11px border-control_line -> emit(go_join)
-        RouteCardBody title="Join with an invite" note="Materializes this device's node from an invite blob." primary=false
+      button label="Join with an invite" w=fill @primary_action px-17px py-15px rounded-11px -> emit(go_join)
+        RouteCardBody title="Join with an invite" note="Materializes this device's node from an invite blob." primary=true
     box w=fill pt=24.0
       col w=fill gap=0.0 align=center
-        text "workspace and admin key are created on-device" size=10.5 wrap=none font=code_medium @text-icon_idle
+        text "this device's key is generated on-device" size=10.5 wrap=none font=code_medium @text-icon_idle
         text "nothing leaves this machine without your signature" size=10.5 wrap=none font=code_medium @text-icon_idle
+        text "founding a network is `ducktape node init` on the node" size=10.5 wrap=none font=code_medium @text-icon_idle
 
 // One route card's interior: the label, its trailing chevron, and the line
 // that says what the route actually does. `primary` is the ink-filled card.
@@ -159,63 +152,6 @@ component RouteCardBody(title:str, note:str, primary:bool)
       text note w=fill size=12.0 line-h=1.4 @text-ink_soft
     if !primary
       text note w=fill size=12.0 line-h=1.4 @text-meta
-
-// CREATE. One field and three facts about what the field will produce. The
-// facts are the Console file's set — the Onboarding file's `p2p port 7420` and
-// `quorum 4 of 6 validators` are both false against this code.
-component CreateScreen(node_api:str, busy:bool, error:str)
-  emits
-    go_welcome
-    create_network_submit(str)
-  state
-    draft = ""
-  col #root w=430.0 gap=0.0
-    OnboardingShell phase="create" title="Create a workspace" step="STEP 1 / 3"
-      forward
-        go_welcome
-      col w=fill gap=0.0
-        box w=fill pt=5.0
-          text "A workspace is registered under ~/.ducktape and an admin keypair is generated on this device." w=fill size=13.0 line-h=1.5 @text-caption
-        box w=fill pt=22.0
-          text "WORKSPACE NAME" size=10.0 wrap=none font=code_semibold @text-label
-        box w=fill pt=8.0
-          box w=fill px=14.0 py=12.0 bg=surface border=primary border-w=1.5 r=10.0
-            row w=fill gap=6.0 align=center
-              text "#" size=14.0 wrap=none font=code_medium @text-label
-              input "" #create-name label="Workspace name" <-> draft hint="acme-research" disabled=busy submit=emit(create_network_submit, draft) w=fill p=0.0 text-size=14.0 line-h=1.2 font=code_medium @control
-                active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
-                disabled value=hint
-        box w=fill pt=18.0
-          text "ADVANCED" size=10.0 wrap=none font=code_semibold @text-label
-        box w=fill pt=8.0
-          col w=fill gap=7.0
-            WorkspaceDirRow slug=network_slug(draft)
-            AdvancedRow label="node api" value=node_api
-            AdvancedRow label="join policy" value="invite + approval"
-        box w=fill pt=22.0
-          button label="Create network" disabled=(busy || empty(trim(draft))) w=fill @primary_action px-0px py-13px rounded-10px -> emit(create_network_submit, draft)
-            text "Create network →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
-        OnboardingError message=error
-
-// One ADVANCED row: the fact's name on the left, the value the node will
-// actually use on the right. Values are READ, never retyped.
-component AdvancedRow(label:str, value:str)
-  box #root w=fill px=13.0 py=10.0 bg=surface border=border border-w=1.0 r=9.0
-    row w=fill gap=10.0 align=center
-      text label size=12.0 wrap=none font=code @text-meta
-      space w=fill
-      text value size=12.0 wrap=none font=code @text-secondary_fg
-
-// The workspace-dir row is the one ADVANCED value assembled from two runs —
-// Ice has no string concatenation, so the home prefix and the live slug are
-// two text nodes rather than one fabricated string.
-component WorkspaceDirRow(slug:str)
-  box #root w=fill px=13.0 py=10.0 bg=surface border=border border-w=1.0 r=9.0
-    row w=fill gap=10.0 align=center
-      text "workspace dir" size=12.0 wrap=none font=code @text-meta
-      space w=fill
-      text "~/.ducktape/" size=12.0 wrap=none font=code @text-secondary_fg
-      text slug size=12.0 wrap=none font=code @text-secondary_fg
 
 // PROVISIONING. Five segments of bar and the step the node is actually on.
 // The app does NOT supervise the daemon, so this screen never claims progress

@@ -13,9 +13,8 @@ the two real NATs being punchable.
 > **Status update (2026-07-08).** The node-side reachability plane is wired
 > behind `wireguard_listen`: `bin/node` constructs a `NatResolver` (reflexive
 > discovery, `register`, hole-punch), consumes v3 `Coordinated` hints as
-> reachability routes, and a workspace created with
-> `--primary-coordinator <host:port>` binds that coordinator (there is no
-> compiled-in default — unconfigured is direct-only). The DERP-style relay remains
+> reachability routes, and desktop-created workspaces default to the public
+> coordinator at `p2p.ducktape.byeongsu.dev:3478`. The DERP-style relay remains
 > removed; the coordinator is rendezvous-only (step 8 below).
 >
 > **This runbook can still fail on specific NAT pairs.** The coordinator only
@@ -26,7 +25,7 @@ the two real NATs being punchable.
 
 Three hosts:
 
-- **Coordinator** — a public VPS, `p2p.example.org`, deployed per
+- **Coordinator** — a public VPS, `p2p.ducktape.byeongsu.dev`, deployed per
   [`coordinator.md`](coordinator.md). Untrusted; no key; UDP `:3478`.
 - **Validator A** — behind its own NAT, no inbound port-forward.
 - **Validator B** — behind a *different* NAT, no inbound port-forward.
@@ -34,7 +33,7 @@ Three hosts:
 ```
    Validator A ──┐                          ┌── Validator B
    (NAT, no      │      Coordinator         │   (NAT, no
-    inbound)     └────▶ p2p.example.org ◀──────┘    inbound)
+    inbound)     └────▶ p2p.ducktape.byeongsu.dev ◀──────┘    inbound)
                         (public VPS)
      A and B dial OUT to the coordinator; ideally they then hole-punch a
      direct A<->B WireGuard tunnel and drop the coordinator out of the path.
@@ -54,9 +53,9 @@ gotcha, the 2-validator-quorum teardown caveat).
 ## The tagged procedure
 
 1. **Deploy the coordinator on the VPS.** `[WORKS TODAY]` — follow [`coordinator.md`](coordinator.md); confirm it binds UDP `:3478` (`ss -lunp 'sport = :3478'`) and answers a live `BindRequest` (the `deploy_smoke.rs` subprocess proof exercises exactly this).
-2. **Mint a v3 invite carrying a `Coordinated` reach hint.** `[WORKS TODAY]` — `init --primary-coordinator p2p.example.org:3478` records `coordinated:<ek>@p2p.example.org:3478#<coord_key>` and public coordination in `network.toml`; the invite round-trips through `bin/node/src/config.rs` `pack`/`unpack`/`parse`. Without the flag no coordinator is recorded and the network stays direct-only.
+2. **Mint a v3 invite carrying a `Coordinated` reach hint.** `[WORKS TODAY]` — default `init` records `coordinated:<ek>@p2p.ducktape.byeongsu.dev:3478#<coord_key>` and public coordination in `network.toml`; the invite round-trips through `bin/node/src/config.rs` `pack`/`unpack`/`parse`.
 3. **A and B each generate an identity and get admitted.** `[WORKS TODAY]` — the founder runs `invite-accept`; this is the unchanged admission path, independent of reachability.
-4. **A and B boot dial-out-only against the coordinator's reflexive/rendezvous service.** `[WORKS TODAY]` — the coordinator is node-local ambient plumbing and is never carried in the invite, so A and B must EACH set `primary_coordinator` (via `init`/`join --primary-coordinator`, or in `node.toml`); there is no compiled-in default to inherit. With that and `wireguard_listen` configured, the node constructs a `NatResolver`, sends `BindRequest`, registers, and keeps the mapping warm.
+4. **A and B boot dial-out-only against the coordinator's reflexive/rendezvous service.** `[WORKS TODAY]` — with `wireguard_listen` configured, the node constructs a `NatResolver`, sends `BindRequest`, registers, and keeps the mapping warm.
 5. **A `Coordinated` hint is consumed as a reachability path.** `[WORKS TODAY]` — `NetworkDescriptor::reach_entries()` returns `ReachDial::Coordinated`, and `bin/node` routes those entries into the reachability resolver instead of dialing the coordinator as a TCP mesh peer.
 6. **A and B publish their reflexive endpoints and rendezvous.** `[NAT-DEPENDENT]` — the node drives lookup and punch through `NatResolver`; success depends on the observed NAT mappings being punchable.
 7. **A and B hole-punch a direct WireGuard tunnel (coordinator-timed simultaneous open).** `[NAT-DEPENDENT]` — the library path is CI-proven and the node drives it, but a NAT pair that cannot punch fails honestly because there is no relay fallback.
@@ -72,7 +71,7 @@ gotcha, the 2-validator-quorum teardown caveat).
 - Mint and parse a v3 `Coordinated` invite, and have the node consume that hint
   as coordinated reach (steps 2 and 5).
 - Admit A and B (step 3).
-- Register with their configured coordinator and discover a coordinator-observed
+- Register with the public coordinator and discover a coordinator-observed
   reflexive mapping (step 4).
 
 **What still needs real infra proof:** an end-to-end tunnel across two distinct,
