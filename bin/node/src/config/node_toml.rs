@@ -499,16 +499,44 @@ mod tests {
         assert_eq!(raw.wireguard_listen, DEFAULT_WIREGUARD_LISTEN);
         assert_eq!(raw.invite_listen, "0.0.0.0:51821");
         assert_eq!(raw.wireguard_advertised, "auto");
-        assert_eq!(raw.primary_coordinator, DEFAULT_PRIMARY_COORDINATOR);
-        assert_eq!(
-            raw.coordinator_relay,
-            derive_coordinator_relay(DEFAULT_PRIMARY_COORDINATOR)
-        );
+        // both sentinels by default — nothing is compiled in. Asserting the
+        // relay against `derive_coordinator_relay(DEFAULT_PRIMARY_COORDINATOR)`
+        // would only prove `"none" == "none"`, so the derivation's real branch
+        // is wired up separately below.
+        assert_eq!(raw.primary_coordinator, "none");
+        assert_eq!(raw.coordinator_relay, "none");
         assert_eq!(raw.checkpoint_blocks, DEFAULT_CHECKPOINT_BLOCKS);
         assert!(raw.sync_index);
         // no [sandbox] table by default: a fresh node is consensus-only, and
         // the commented example in the file must not parse as a live table.
         assert_eq!(raw.sandbox, None);
+    }
+
+    /// an explicit coordinator threads through `merged_plumbing` into BOTH
+    /// keys: the value itself, and the relay derived from it at generation
+    /// time. The default case cannot prove this — with no host compiled in,
+    /// both sides of that assertion are the `"none"` sentinel.
+    #[test]
+    fn an_explicit_coordinator_derives_the_relay_at_generation_time() {
+        let dir = tmp("explicit-coordinator");
+        let p = merged_plumbing(
+            &dir,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("p2p.example.org:3478"),
+            None,
+        )
+        .expect("merge with an explicit coordinator");
+        assert_eq!(p.primary_coordinator, "p2p.example.org:3478");
+        assert_eq!(
+            p.coordinator_relay, "p2p.example.org:443",
+            "the relay is the coordinator's host on TCP/443"
+        );
     }
 
     /// nothing optional: a file missing ANY key refuses to parse, and the

@@ -76,7 +76,7 @@ pub(super) async fn wire(
     mesh_state_file: std::path::PathBuf,
     advertised_reach: Ingress,
     // the AMBIENT coordinator override (node.toml `primary_coordinator`);
-    // `None` = the compiled-in default, exactly as before the key existed.
+    // `None` = no ambient coordinator — direct-only unless a hint supplies one.
     primary_coordinator: Option<String>,
     // the TCP relay override (node.toml `coordinator_relay`); `None` = derive
     // the relay from the ambient coordinator set (host at TCP/443).

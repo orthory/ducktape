@@ -105,5 +105,5 @@ removes the routes entirely — 404, and no token is minted at all.
 
 Never paste either credential (or a token file's contents) into a report. For
 merged-worktree cleanup, dry-run
-`ops/worktree-clean.sh` and then use `--yes`; its retired-workflow reaper is
-intentionally preserved for old external homes and never uses `pkill -f`.
+`ops/worktree-clean.sh` and then use `--yes`; it finds live processes by cwd and
+never uses `pkill -f`.

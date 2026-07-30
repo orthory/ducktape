@@ -86,7 +86,7 @@ and an operator that wants rendezvous names its own host with
   the direct announcer; else **coordinated** → `BootstrapCoordinatedInvitePeer{peer:key,…}`
   resolved through the node's **ambient coordinator** (`primary_coordinator_or_default`),
   not any invite-carried address.
-- The resolver's coordinator list is bound from config/default, so first contact needs no
+- The resolver's coordinator list is bound from node-local config, so first contact needs no
   coordinator address in the invite. (Removes #260's `main.rs:5870-5871` invite→coordinator
   extraction.)
 - Race with bounded fan-out; first `IntroAck.installed` wins, cancel the rest; inject the

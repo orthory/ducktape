@@ -493,10 +493,10 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let net = &args.plumbing;
     let primary_coordinator =
         config::primary_coordinator_or_default(net.primary_coordinator.as_deref())?;
-    // node.toml is COMPLETE: merged_plumbing pins the same compiled
-    // coordinator default `apply_primary_coordinator` bakes into the
-    // descriptor, so the two never silently disagree (see `docs`:
-    // coordinator is ambient, node-local).
+    // node.toml is COMPLETE: merged_plumbing records the same coordinator
+    // value `apply_primary_coordinator` bakes into the descriptor, so the
+    // two never silently disagree. With none configured, neither records
+    // one (see `docs`: coordinator is ambient, node-local).
     let fresh_workspace = !dir.join("node.toml").exists();
     let mut plumbing = config::merged_plumbing(
         &dir,

@@ -366,15 +366,17 @@ pub enum Coordination {
 /// at whichever box happened to build the binary.
 pub const DEFAULT_PRIMARY_COORDINATOR: &str = "none";
 
-/// The typed invite format still carries a coordinator key, but the deployed
+/// The typed invite format still carries a coordinator key, but a ducktape
 /// coordinator is intentionally keyless. Keep one stable valid key in the
 /// signed envelope until coordinator response signing exists.
 pub fn keyless_coordinator_placeholder_key() -> ed25519::PublicKey {
     ed25519::PrivateKey::from_seed(0).public_key()
 }
 
-/// Resolve the primary coordinator option. `None` means "use the product
-/// default"; `"none"`/`"off"` keeps the old direct-only posture.
+/// Resolve the primary coordinator option. `None` (nothing configured) and the
+/// sentinels `"none"`/`"off"`/`"direct"` both mean the same thing — no ambient
+/// coordinator — because the compiled default IS `"none"`. Anything else must
+/// parse as a dialable `host:port`.
 pub fn primary_coordinator_or_default(raw: Option<&str>) -> Result<Option<String>, String> {
     let coord = raw
         .map(str::trim)
@@ -390,8 +392,9 @@ pub fn primary_coordinator_or_default(raw: Option<&str>) -> Result<Option<String
 }
 
 /// Resolve the ambient coordinator to a dial [`Ingress`] — the AMBIENT source
-/// a joiner's NAT resolver binds (config/default), never one carried in an
-/// invite. `None` when coordination is disabled (`"none"`/`"off"`/`"direct"`).
+/// a joiner's NAT resolver binds (node-local config), never one carried in an
+/// invite. `None` both when nothing is configured and when coordination is
+/// disabled outright (`"none"`/`"off"`/`"direct"`).
 pub fn coordinator_ingress(raw: Option<&str>) -> Result<Option<Ingress>, String> {
     match primary_coordinator_or_default(raw)? {
         Some(addr) => ingress_of(&addr),
