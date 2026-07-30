@@ -52,8 +52,18 @@ impl Harness {
             .tempdir()
             .expect("harness tempdir");
         let forge_base = dir.path().join("forge");
+        // ONE blob store, shared by the http surface and the forge module.
+        //
+        // Forge materializes a pushed packfile out of the blob store, so a test
+        // that pushes real git objects must upload them where the module will
+        // look. With the in-memory default these are two disconnected stores and
+        // the objects are simply absent — the PR-diff read then fails with
+        // "objects ... are not fully materialized", which reads like a forge bug
+        // and is really a harness one.
+        let blob_root = dir.path().join("blobs");
+        let blobs = noded::blobs::BlobHandle::persistent(&blob_root).expect("harness blob store");
 
-        let daemon = InProcDaemon::start(
+        let daemon = InProcDaemon::start_with_blob_root(
             move || {
                 Host::genesis(vec![
                     // no commonware context in this sync closure, so the
@@ -71,7 +81,10 @@ impl Harness {
             "tagging",
             Box::new(sdk_testkit::MemStore::new()),
         )),
-                    Box::new(forge::Forge::init("forge", forge_base).expect("forge module")),
+                    Box::new(
+                        forge::Forge::with_blobs("forge", forge_base, blobs)
+                            .expect("forge module"),
+                    ),
                     Box::new(runs::RunsModule::new(
                         "runs",
                         "chat",
@@ -86,6 +99,7 @@ impl Harness {
                 .expect("genesis")
             },
             vec!["agent".into()],
+            Some(blob_root),
         );
 
         let harness = Harness { daemon, dir };
@@ -269,6 +283,34 @@ impl Harness {
     /// it.
     pub fn query(&self, target: &str, query: Value) -> Value {
         self.post("/v1/query", &json!({"target": target, "query": query}))
+    }
+
+    /// Land raw bytes in the node's blob store; returns the digest hex.
+    ///
+    /// This is the production path too: the smart-HTTP bridge uploads a
+    /// packfile and `PushRefs` then names its digest. Consensus records only
+    /// `ref -> oid` — the OBJECTS stay node-local — which is why a test that
+    /// wants a computable PR diff has to put real ones here rather than
+    /// fabricating an oid.
+    pub fn put_blob(&self, bytes: &[u8]) -> String {
+        let (status, body) = nettest::http_bytes(
+            self.daemon.port(),
+            "POST",
+            "/v1/files/blob",
+            "application/octet-stream",
+            bytes,
+        );
+        assert_eq!(
+            status,
+            200,
+            "blob upload failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let receipt: Value = serde_json::from_slice(&body).expect("blob receipt json");
+        receipt["digest"]
+            .as_str()
+            .expect("blob receipt names a digest")
+            .to_string()
     }
 
     fn post(&self, path: &str, body: &Value) -> Value {

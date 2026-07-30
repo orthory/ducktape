@@ -12,7 +12,6 @@
 //! blob store LACKS the pack reaches the SAME root as one that has it. that is
 //! the fork-safety invariant — pack possession is per-node, root is not.
 
-mod support;
 
 use std::path::{Path, PathBuf};
 
@@ -142,7 +141,7 @@ fn source_history(
     tag: &str,
     changes: &[(u64, &str, &str, &str)],
 ) -> (PathBuf, Forge, Vec<Captured>) {
-    let commits = support::history(tag, changes);
+    let commits = forge::testkit::history(tag, changes);
     let blobs = blobstore::BlobHandle::default();
     let digests = commits
         .iter()

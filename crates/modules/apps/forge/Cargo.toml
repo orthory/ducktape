@@ -33,7 +33,17 @@ tracing = { workspace = true }
 # ssh/https transport (openssl/libssh2) — forge only touches local repos.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 
+[features]
+# the git-history/packfile builder (`forge::testkit`). no extra deps — git2 is
+# already a production dependency — but gating keeps it out of the shipped
+# binary, exactly as identity/noded do with theirs.
+testkit = []
+
 [dev-dependencies]
+# forge's OWN integration tests need `forge::testkit`, and a crate does not
+# enable its own features for its test targets. This self dev-dependency is how
+# cargo lets them opt in, and it never reaches the production build.
+forge = { path = ".", features = ["testkit"] }
 # dev-only: prove forge's root composes into the global root-hash. not a
 # production dep — a module still depends on sdk + its interface only.
 host = { workspace = true }

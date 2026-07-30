@@ -13,7 +13,6 @@
 //!     to an identical composed root, and a node WITHOUT a push's pack still
 //!     composes the SAME root (the phase-1 determinism invariant, now per-repo).
 
-mod support;
 
 use std::path::{Path, PathBuf};
 
@@ -119,7 +118,7 @@ fn on_disk_head(base: &Path, repo: &str) -> Option<git2::Oid> {
 /// source forge's default repo. a pushed head is just an oid + a pack of git
 /// objects, so the source repo NAME is irrelevant to the closure.
 fn make_closure(tag: &str, t: u64, path: &str, content: &str, message: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut commits = support::history(tag, &[(t, path, content, message)]);
+    let mut commits = forge::testkit::history(tag, &[(t, path, content, message)]);
     let commit = commits.remove(0);
     (commit.head, commit.pack)
 }

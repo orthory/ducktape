@@ -3399,6 +3399,7 @@ dependencies = [
  "async-trait",
  "blobstore",
  "chat",
+ "forge",
  "futures",
  "git2",
  "host",

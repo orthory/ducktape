@@ -48,6 +48,23 @@ impl InProcDaemon {
         build_host: impl FnOnce() -> Host + Send + 'static,
         status_modules: Vec<String>,
     ) -> Self {
+        Self::start_with_blob_root(build_host, status_modules, None)
+    }
+
+    /// [`Self::start`] with the node-local blob store rooted on disk.
+    ///
+    /// Needed whenever a test must put bytes where a MODULE will later look for
+    /// them. Forge materializes a pushed packfile OUT of the blob store, so a
+    /// test that pushes real git objects has to hand the module the same store
+    /// the http surface writes to — with the in-memory default they are two
+    /// disconnected stores and the objects are simply not there.
+    ///
+    /// `None` keeps the in-memory default.
+    pub fn start_with_blob_root(
+        build_host: impl FnOnce() -> Host + Send + 'static,
+        status_modules: Vec<String>,
+        blob_root: Option<std::path::PathBuf>,
+    ) -> Self {
         // Bind FIRST, and hand the bound socket to the server thread.
         //
         // The harness used to reserve a port with `nettest::free_port()`, drop
@@ -64,6 +81,12 @@ impl InProcDaemon {
             .set_nonblocking(true)
             .expect("harness listener is nonblocking for tokio");
         let (handle, cmd_rx, _events) = NodeHandle::channel();
+        // chained right after `channel()`, before any `blob_handle()` clone is
+        // handed out — the ordering `with_blob_root` documents.
+        let handle = match blob_root {
+            Some(root) => handle.with_blob_root(root).expect("harness blob root"),
+            None => handle,
+        };
         let status = handle.status_cell();
         // the testkit has no mesh and no registry: an empty exposition
         // parses to the honest empty peers sample and an empty scrape.

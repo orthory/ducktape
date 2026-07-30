@@ -168,6 +168,10 @@ noded = { path = "../noded", features = ["testkit"] }
 # the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
 # dev-only feature keeps it out of the production binary build.
 identity = { workspace = true, features = ["testkit"] }
+# the git-history/packfile builder. the forge e2e needs REAL objects in the
+# node's store for a PR diff to be computable, and consensus has no
+# commit-building op — this is how production gets them too (a stock git push).
+forge = { workspace = true, features = ["testkit"] }
 async-trait = { workspace = true }
 # the mcp harness genesis has no commonware runtime context, so the agent
 # registry rides the in-memory MerkleStore test double.
