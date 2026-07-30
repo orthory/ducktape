@@ -255,8 +255,17 @@ mod tests {
             "a timeout is not a stopped node"
         );
 
+        // THE MISSING SCHEME IS THE WHOLE TEST, and it is also the only thing
+        // keeping this offline: reqwest rejects a relative url at parse, so no
+        // name is resolved and nothing is dialed. Do NOT "fix" this into
+        // `http://…` — a bare word is not guaranteed to be unresolvable
+        // (a search domain or an NXDOMAIN-hijacking resolver will happily hand
+        // back an address for any label), so a scheme here turns a pure parse
+        // test into a live request against whatever the run's DNS invents.
+        // The word itself carries no meaning; it just has to not look like a
+        // host somebody would try to reach.
         let malformed = reqwest::blocking::Client::new()
-            .get("duke/v1/status")
+            .get("not-a-url/v1/status")
             .send()
             .expect_err("a bare word is not a url");
         assert!(

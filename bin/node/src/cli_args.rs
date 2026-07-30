@@ -223,9 +223,9 @@ fn trim_base(url: &str) -> String {
 /// at the boundary that named it — instead of letting it travel to whichever
 /// verb dials first and die inside reqwest's url parser as `builder error`.
 ///
-/// A chain id is the mistake this actually catches: `--node duke` parses,
-/// outranks `-n`, and then silently misdirects, so the message names the flag
-/// that WOULD have taken it.
+/// A chain id is the mistake this actually catches: `--node mynet#d0cdf950`
+/// parses, outranks `-n`, and then silently misdirects, so the message names
+/// the flag that WOULD have taken it.
 fn checked_base(source: &str, url: &str) -> Result<String, String> {
     let is_http = url.starts_with("http://") || url.starts_with("https://");
     if is_http {
@@ -711,8 +711,8 @@ mod tests {
         assert!(why.contains("-n"), "{why}");
     }
 
-    /// `--node duke` parses, OUTRANKS `-n`, and then dies inside reqwest's url
-    /// parser as `POST duke/v1/query: builder error` — a silent misdirection
+    /// `--node mynet#d0cdf950` parses, OUTRANKS `-n`, and then dies inside
+    /// reqwest's url parser as `builder error` — a silent misdirection
     /// reported by the wrong layer. Refuse it here, where the flag was named,
     /// and point at the flag that would have taken it.
     #[test]
@@ -728,7 +728,8 @@ mod tests {
         );
 
         // the env rung is the same input by another name, and says so.
-        let Err(why) = rung_base(addr(None, None).ladder_rung(Some("duke".into()), || None)) else {
+        let Err(why) = rung_base(addr(None, None).ladder_rung(Some("mynet#d0cdf950".into()), || None))
+        else {
             panic!("an env chain id is not an http base either");
         };
         assert!(why.contains("DUCKTAPE_NODE"), "{why}");
