@@ -477,7 +477,7 @@ also admits the owner implicitly and everyone else explicitly.
 **What it breaks, honestly:**
 
 1. **Cross-account placement stops working until admitted.** Two boxes owned by
-   two accounts (the dukenet/QA topology: `eddy` on the dev box, `duke` on the
+   two accounts (the dukenet/QA topology: `alice` on the dev box, `duke` on the
    macmini) can no longer run each other's work. Fix is one verb on the
    *executing* node: `ducktape node work admit <account>`. See §6.
 2. **Rendezvous placement onto a stranger's node goes silent.** An unpinned
@@ -740,7 +740,7 @@ than carve an exception into it, the fixture moved to
 
 `2026-07-26-wave2-integration-qa.md` is edited here, not just described. Under
 the new default the two boxes have **different owner accounts** (T1-6 runs
-`user account-init --name eddy`, T2-1 `--name duke`), so the default bites on
+`user account-init --name alice`, T2-1 `--name duke`), so the default bites on
 every cross-box step.
 
 - **New step T2-4b — admit the submitter on the executor.** Right after T2-4's

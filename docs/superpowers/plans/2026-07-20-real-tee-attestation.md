@@ -21,7 +21,7 @@
 - No `--attest` / `DUCKTAPE_AIRLOCK_ATTEST` value may default; after Task 7 the accepted values are `tdx | snp` (server config also accepts `auto`).
 - Commit trailer: `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
 - Worktree: `<repo>/.worktree/real-tee-attest`, branch `feat-airlock-real-attest`, PR against `dev`.
-- Crate API references live in the scratchpad: `sev-8.0.0/` and `dcap-qvl-0.3.12/` under `/tmp/claude-1000/-home-eddy-dev-ducktape/eeec504e-b8d1-429b-8895-935b2bf3362d/scratchpad/` — consult before guessing any sev/dcap API.
+- Crate API references live in the scratchpad: `sev-8.0.0/` and `dcap-qvl-0.3.12/` under `<your scratchpad dir>/` — consult before guessing any sev/dcap API.
 
 ---
 
@@ -543,7 +543,7 @@ git commit -m "feat(airlock): real SEV-SNP chain verification + minted-chain tes
 
 ```bash
 mkdir -p crates/system/airlock/tests/fixtures
-SCRATCH=/tmp/claude-1000/-home-eddy-dev-ducktape/eeec504e-b8d1-429b-8895-935b2bf3362d/scratchpad
+SCRATCH=<your scratchpad dir>
 cp $SCRATCH/dcap-qvl-0.3.12/sample/tdx_quote crates/system/airlock/tests/fixtures/
 cp $SCRATCH/dcap-qvl-0.3.12/sample/tdx_quote_collateral.json crates/system/airlock/tests/fixtures/
 ```

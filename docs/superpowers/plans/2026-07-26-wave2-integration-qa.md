@@ -1391,7 +1391,7 @@ see the correction at the head of T1-7 before running either step.**
 > here without one. It is the only manual gate in the document.
 
 ```bash
-"$D" user account-init --name eddy -n "$CHAIN"     # password on stdin
+"$D" user account-init --name alice -n "$CHAIN"     # password on stdin
 "$D" user cred add claude -n "$CHAIN"              # browser OAuth, on the throwaway
 ```
 Headless alternative, **pointed at the user-supplied artifact only**:
@@ -1466,7 +1466,7 @@ thing T1-7's runs will dial — read T1-7's head note now, not after a red run.
 step. Then:
 
 ```bash
-RUN=$("$D" agent sched claude --cred eddy-claude-1 -n "$CHAIN" --cpu 1 --mem 2 -- "reply with exactly: PONG")
+RUN=$("$D" agent sched claude --cred alice-claude-1 -n "$CHAIN" --cpu 1 --mem 2 -- "reply with exactly: PONG")
 echo "$RUN"        # -> sched<0x1F><32 hex>   NOTE: literal ASCII unit separator
 DISPATCH=${RUN#*$'\x1f'}
 SAGA="$RUN"        # the saga id IS the whole string, separator included
@@ -1609,7 +1609,7 @@ contradicts the design claim. Report it as the headline finding.
 **Retitled: "airlock-free" was the same wrong premise as T1-7's.**
 
 ```bash
-"$D" agent pty claude --cred eddy-claude-1 -n "$CHAIN" --cpu 1 --mem 2
+"$D" agent pty claude --cred alice-claude-1 -n "$CHAIN" --cpu 1 --mem 2
 ```
 
 > **`--cred` is now explicit here, and that is the change.** `agent pty`'s
@@ -1842,7 +1842,7 @@ list`/`status` read the *local* catalog, never the committed registry.
 # borrower box — [#846] this MINTS user.key when absent; no `user key init` first
 "$D" user account-init --name duke -n "$CHAIN"
 # dev box (lender)
-"$D" user cred grant eddy-claude-1 <borrower-account-hex> -n "$CHAIN"
+"$D" user cred grant alice-claude-1 <borrower-account-hex> -n "$CHAIN"
 ```
 
 > **[#846] `account-init` on a fresh workspace now prints a 24-word mnemonic
@@ -1888,7 +1888,7 @@ ITSELF that names the lender's credential:
 
 ```bash
 # borrower box, BEFORE `user cred grant`
-"$D" agent sched claude --cred eddy-claude-1 -n "$CHAIN" -- "reply with exactly: PONG"
+"$D" agent sched claude --cred alice-claude-1 -n "$CHAIN" -- "reply with exactly: PONG"
 ```
 
 Origin, pin and vouched caller are all the borrower, so there is no submitter to
@@ -1913,7 +1913,7 @@ EXECUTOR saying *whose work I will run at all*. A cross-node run needs both, on
 different boxes — the grant on the dev box, the admission on the borrower.
 
 Since #838 a node runs only its OWNER's work and its own by default, and these
-two boxes are two accounts (`eddy` on the dev box from T1-6, `duke` on the
+two boxes are two accounts (`alice` on the dev box from T1-6, `duke` on the
 borrower from T2-4). So without this step T2-5, T2-6 and X-1 all fail —
 deliberately, and each has a deliberate-failure half below that proves it.
 
@@ -1937,7 +1937,7 @@ deliberately, and each has a deliberate-failure half below that proves it.
 ```bash
 # from the dev box, pinned to the borrower.
 # NOTE: --host-node, NOT --node.  #832 renamed it; see the trap below.
-"$D" agent sched claude --cred eddy-claude-1 --host-node duke -n "$CHAIN" -- "reply with exactly: PONG"
+"$D" agent sched claude --cred alice-claude-1 --host-node duke -n "$CHAIN" -- "reply with exactly: PONG"
 ```
 
 > **[#832] THE FLAG TRAP — and [#846] it now fails cleanly.** `agent --node`
@@ -1980,7 +1980,7 @@ deliberately, and each has a deliberate-failure half below that proves it.
   and the delegated lane re-asks it (§0.4a). Six of them ending in a `warn` is.
 - **[#847] the lender's `airlock.log` carries the DRAW, at `info`:**
   ```
-  airlock session opened credential=eddy-claude-1 caller=<8 hex> work=delegated("sched\u{1f}<id>")
+  airlock session opened credential=alice-claude-1 caller=<8 hex> work=delegated("sched\u{1f}<id>")
   ```
   target `ducktape::gateway`. `work=delegated(..)` — **not** `work=direct` — is
   the assertion: it is the one field that separates a caller spending its own
@@ -2029,7 +2029,7 @@ is the whole point of the step.
 **The borrower for this leg is LINUX. The macOS case is filed separately.**
 
 ```bash
-"$D" agent pty claude --cred eddy-claude-1 --host-node duke -n "$CHAIN"
+"$D" agent pty claude --cred alice-claude-1 --host-node duke -n "$CHAIN"
 ```
 
 > **Why not the macmini — and [#844] the reason this box used to give is
@@ -2091,7 +2091,7 @@ workspace.
 
 - **PASS** = the console renders, the session is interactive, and the provider
   answers on the **lent** credential (not a local one — confirm the lender's
-  `airlock.log` carries `airlock session opened credential=eddy-claude-1
+  `airlock.log` carries `airlock session opened credential=alice-claude-1
   caller=<8 hex> work=direct` at `info` for this session). **`work=direct` is
   the expected value here and `delegated(..)` would be the bug**: a pty has no
   committed record of who asked for it, so it sends `WorkRef::Direct` and draws
@@ -2191,7 +2191,7 @@ tag disappears. If it does not reconcile, that is the finding.
 
 ### I-1 — disable compute while an agent pty is live
 **Needs T1-6's credential** (see the section head). Start a pty session on it
-(`"$D" agent pty claude --cred eddy-claude-1 -n "$CHAIN"`, T1-8). With it live,
+(`"$D" agent pty claude --cred alice-claude-1 -n "$CHAIN"`, T1-8). With it live,
 `service disable compute`.
 **Pass:** the pty session **keeps running** — proved by typing into it and
 seeing the echo *after* the disable returned, not by the absence of a
