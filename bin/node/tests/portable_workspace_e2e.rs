@@ -80,6 +80,94 @@ struct PortableProvider {
     prompt_log: PathBuf,
 }
 
+/// Records every per-run directory the provisioner creates under `runs_root`,
+/// sampled from the HOST while the runs are in flight.
+///
+/// The child cannot report these. A sandboxed run's workdir is mounted at the
+/// SAME guest path for every run (`/ducktape/workspace`) — that normalization is
+/// the isolation working as designed, and it makes two attempts literally
+/// indistinguishable from inside the container. So the properties that are about
+/// the HOST layout (distinct per attempt, under the operator root, cleaned up
+/// afterwards) have to be observed on the host.
+///
+/// This also makes W5 checkable at all. The old code asserted
+/// `!PathBuf::from(guest_cwd).exists()` on the host, which is vacuously true for
+/// a path that only ever existed inside a container: the cleanup poll passed
+/// without ever witnessing a cleanup.
+struct RunDirs {
+    seen: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RunDirs {
+    /// sample every 20 ms — a run dir lives for seconds, so this cannot miss one
+    /// without the run itself being instantaneous.
+    fn watch(runs_root: PathBuf) -> Self {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (s, st) = (seen.clone(), stop.clone());
+        let handle = std::thread::spawn(move || {
+            while !st.load(std::sync::atomic::Ordering::Relaxed) {
+                // `<runs_root>/<per-node salt>/<slug>` — the run dirs and their
+                // `-ro` skill siblings both sit at this depth.
+                if let Ok(salts) = std::fs::read_dir(&runs_root) {
+                    for salt in salts.flatten() {
+                        if let Ok(entries) = std::fs::read_dir(salt.path()) {
+                            for e in entries.flatten() {
+                                if e.path().is_dir() {
+                                    s.lock().expect("run dir set").insert(e.path());
+                                }
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Self { seen, stop, handle: Some(handle) }
+    }
+
+    /// the rw run dirs (the `-ro` skill siblings excluded), sorted.
+    fn workdirs(&self) -> Vec<PathBuf> {
+        self.all().into_iter().filter(|p| !Self::is_ro(p)).collect()
+    }
+
+    /// the read-only skill roots the provisioner materialized beside them.
+    fn skill_roots(&self) -> Vec<PathBuf> {
+        self.all().into_iter().filter(|p| Self::is_ro(p)).collect()
+    }
+
+    fn all(&self) -> Vec<PathBuf> {
+        self.seen.lock().expect("run dir set").iter().cloned().collect()
+    }
+
+    fn is_ro(path: &std::path::Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with("-ro"))
+    }
+}
+
+impl Drop for RunDirs {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// a log path as the CHILD must name it: `$HOME`-relative, never the host
+/// absolute path. Only the file name is shared between the two sides.
+fn guest_log(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .expect("log path has a file name")
+        .to_string_lossy();
+    format!("$HOME/portable-logs/{name}")
+}
+
 impl PortableProvider {
     fn stage(root: &std::path::Path) -> Self {
         let dir = root.join("portable-provider");
@@ -115,10 +203,25 @@ impl PortableProvider {
                  fi\n\
                  printf '%s' '{body}' > {artifact}\n\
                  printf '%s\\n' 'portable run done'\n",
-                cwd = cwd_log.display(),
-                chain = chain_log.display(),
-                skills = skills_log.display(),
-                prompt = prompt_log.display(),
+                // $HOME-RELATIVE, not the host absolute path.
+                //
+                // The spec declares `rw_dirs = ["portable-logs"]`, which the
+                // sandbox mounts under the GUEST home — a different absolute
+                // path than the host's. `translate()` rewrites host paths in
+                // argv and env, but never inside a script FILE, so a host
+                // absolute path baked in here simply does not exist in the
+                // container: every write lands in the container's ephemeral
+                // layer and the host-side assertions read nothing. The run
+                // still answers on stdout, so it looks like a healthy run that
+                // merely "saw no skill mount".
+                //
+                // `$HOME` is the one name that means the same directory on both
+                // sides, so the seam the doc comment above promises actually
+                // holds under podman.
+                cwd = guest_log(&cwd_log),
+                chain = guest_log(&chain_log),
+                skills = guest_log(&skills_log),
+                prompt = guest_log(&prompt_log),
                 artifact = ARTIFACT,
                 body = ARTIFACT_BODY,
                 skill_name = SKILL_NAME,
@@ -359,6 +462,10 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // the operator-facing root override: one shared base, per-node storage
     // salt keeps the co-located validators' run trees disjoint.
     let runs_root = fixtures.path().join("agent-runs");
+    // start watching BEFORE any run: the per-run dirs are created and removed
+    // inside a run, so a post-hoc look would find nothing either way.
+    std::fs::create_dir_all(&runs_root).expect("runs root");
+    let run_dirs = RunDirs::watch(runs_root.clone());
     let runs_root_env = (
         "DUCKTAPE_AGENT_RUNS_ROOT".to_string(),
         runs_root.display().to_string(),
@@ -555,14 +662,25 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // fixtures tempdir, DISJOINT from every node's storage tree (D7; the
     // root's boot validation refuses a storage-resident override) — and both
     // cleaned up after their run (W5).
+    // GUEST-side evidence: the child ran once per run and reported a cwd. Under
+    // a sandbox that cwd is the normalized guest path, identical for both runs —
+    // so it proves execution happened, and nothing about the host layout.
     let cwds = provider.cwds();
     assert_eq!(cwds.len(), 2, "exactly one provider execution per run: {cwds:?}");
-    assert_ne!(cwds[0], cwds[1], "per-attempt dirs never collide");
-    for cwd in &cwds {
-        let dir = PathBuf::from(cwd);
+
+    // HOST-side evidence: the layout properties, observed where they are true.
+    let workdirs = run_dirs.workdirs();
+    assert_eq!(
+        workdirs.len(),
+        2,
+        "one per-run dir per run, under DUCKTAPE_AGENT_RUNS_ROOT: {workdirs:?}"
+    );
+    assert_ne!(workdirs[0], workdirs[1], "per-attempt dirs never collide");
+    for dir in &workdirs {
         assert!(
             dir.starts_with(&runs_root),
-            "the mount honors DUCKTAPE_AGENT_RUNS_ROOT: {cwd}"
+            "the mount honors DUCKTAPE_AGENT_RUNS_ROOT: {}",
+            dir.display()
         );
         poll_until("the run dir to be cleaned up (W5)", FINALIZE, || {
             (!dir.exists()).then_some(())
@@ -572,18 +690,36 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // ---- the skill ro mounts: one content-checked root per run, each under
     // the operator root, each a SIBLING of its run's rw mount (never inside
     // it — that is the no-leak mechanism), and each cleaned up (W5).
+    // GUEST side: each run actually READ the skill through its ro mount and the
+    // bytes matched — the one thing only the child can attest, and the whole
+    // point of the mount. (This is what silently regressed: with the evidence
+    // channel broken it logged nothing, and the run still answered, which is
+    // exactly the "silently unsouled agent" this feature must never ship.)
     let roots = provider.skill_roots();
-    assert_eq!(roots.len(), 2, "both runs saw the skill ro mount: {roots:?}");
-    assert_ne!(roots[0], roots[1], "per-run skill roots never collide");
-    for (root, cwd) in roots.iter().zip(&cwds) {
-        let dir = PathBuf::from(root);
+    assert_eq!(roots.len(), 2, "both runs content-checked the skill: {roots:?}");
+
+    // HOST side: one ro root per run, each a SIBLING of its rw mount (never
+    // inside it — that is the no-leak mechanism), each cleaned up.
+    let skill_roots = run_dirs.skill_roots();
+    assert_eq!(
+        skill_roots.len(),
+        2,
+        "one skill ro root per run: {skill_roots:?}"
+    );
+    assert_ne!(
+        skill_roots[0], skill_roots[1],
+        "per-run skill roots never collide"
+    );
+    for dir in &skill_roots {
         assert!(
             dir.starts_with(&runs_root),
-            "the skill root lives under the runs root: {root}"
+            "the skill root lives under the runs root: {}",
+            dir.display()
         );
         assert!(
-            !dir.starts_with(cwd),
-            "the skill root is a sibling of the rw mount, never inside it: {root} vs {cwd}"
+            !workdirs.iter().any(|w| dir.starts_with(w)),
+            "the skill root is a sibling of the rw mount, never inside it: {}",
+            dir.display()
         );
         poll_until("the skill ro root to be cleaned up (W5)", FINALIZE, || {
             (!dir.exists()).then_some(())
