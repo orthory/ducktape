@@ -2814,6 +2814,7 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
     app.active_channel = "general".into();
+    app.channels = vec![channel("general", 100), channel("random", 50)];
     // I last read #random at seq 30; it has since grown to head 50.
     app.channel_reads = vec![backend::ChannelRead {
         channel: "random".into(),
@@ -2822,6 +2823,14 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
 
     // Switching INTO #random freezes the divider above the first unread
     // (>30) and marks #random read up to head so its sidebar badge clears.
+    // The freeze must survive the REAL click path: `choose_channel` takes the
+    // header and highlight optimistically, so by `chat_updated` current ==
+    // next and the load-time freeze self-defers to the click-time one.
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("random".into()));
+    assert_eq!(app.active_channel, "random");
+    assert_eq!(app.unread_boundary, 30);
+    assert!(app.messages.is_empty());
+    app.loading = false;
     let mut switched = chat_data(
         "random",
         vec![
