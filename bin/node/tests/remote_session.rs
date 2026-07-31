@@ -250,6 +250,20 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
         cluster.wait_marker(index, "term_session_plane_bound", READY);
     }
 
+    // THE HOST NEEDS AN AGENT DAEMON, not just a `[sandbox]` table.
+    //
+    // `has_sandbox()` is `link().is_some()` — whether an agent service has
+    // ATTACHED — so a node with a perfectly good sandbox config refuses every
+    // create until one runs beside it. The refusal says "no configured sandbox
+    // image", which is NOT the condition it tested; the sibling arm words the
+    // same fact correctly ("no agent service attached"). That wording is what
+    // made this look like a config problem.
+    //
+    // AFTER the readiness markers: the daemon reads the node's identity out of
+    // the running node, so starting it beside a node that has not bound yet
+    // dies with `could not read this node's identity`.
+    cluster.spawn_service(1, "agent");
+
     let guest = ed25519::PrivateKey::from_seed(42);
     let guest_node = Cluster::identity(0);
     let host_node = Cluster::identity(1);
@@ -308,6 +322,25 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
         credential_present(&cluster, 1, "guest-fable-1")
     });
 
+    // THE HOST DECIDES WHOSE WORK IT RUNS — the other half of the handshake.
+    //
+    // The credential grant above is the GUEST saying who may draw on it. This is
+    // node 1 saying it will run node 0's work at all. Work admission landed in
+    // "a host decides whose work it runs" (2026-07-26), which taught
+    // `sched_pinned_run` to write this policy but not this suite — and this
+    // suite could not notice, because it was skipped for want of the podman
+    // sandbox tools and libtest counts a skip as `ok`. Without it the host
+    // answers 502 `work_not_admitted`.
+    //
+    // Written as the FILE the operator (and `ducktape node work admit`)
+    // produces, not through the writer, and re-read on every decision — so it
+    // lands with no restart.
+    std::fs::write(
+        cluster.workspace(1).join("work-admit.toml"),
+        format!("admit = [\"{}\"]\n", hex(guest.public_key().as_ref())),
+    )
+    .expect("write work-admit.toml");
+
     // the guest creates a session ON the host, naming its owned credential.
     let (status, body) = cluster.http(
         0,
@@ -365,7 +398,11 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
         None,
     );
     assert_eq!(status, 204, "close is a 204 no-op");
-    let ended = cluster.wait_marker(1, "session_ended", READY);
+    // `session_ended` is the AGENT DAEMON's line, not the node's: the plane
+    // lives in the service process, and the node's `TermEnded` handler logs
+    // nothing. Waiting on the node's log here would time out after a fully
+    // successful close.
+    let ended = cluster.wait_service_marker(1, "agent", "session_ended", READY);
     assert!(
         ended.contains(&session_id),
         "the host reaps the closed session {session_id}: {ended:?}"
