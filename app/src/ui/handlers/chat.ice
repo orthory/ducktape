@@ -58,12 +58,17 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
 on choose_channel(id)
   return if loading || mutation_phase != "idle"
   active_dm_peer = ""
+  // FREEZE THE DIVIDER HERE, while the previous room is still `active_channel`
+  // — the optimistic assignment below makes current == next by the time
+  // `chat_updated` runs its own freeze, which then correctly keeps this value.
+  unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, id, unread_boundary)
   // The switch is visible NOW: the clicked room takes the header and the
   // sidebar highlight, and the previous room's messages leave the pane before
   // the round-trip — a click that repaints nothing reads as a dead app.
   active_channel = id
   active_channel_name = channel_display_name(channels, active_channel, active_channel_name)
   messages = []
+  unread_marker_seq = 0
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   hydration_generation = hydration_generation + 1
