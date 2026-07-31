@@ -699,9 +699,14 @@ fn admit_create(
     sandbox_present: bool,
 ) -> Result<AdmitOk, (&'static str, String)> {
     if !sandbox_present {
+        // `sandbox_present` is `has_sandbox()` = "is an agent service attached",
+        // NOT "is a sandbox image configured" — word it as the fact it tested
+        // (and as `refused_from_term_error` already does). The old "no
+        // configured sandbox image" text sent an operator with a perfectly
+        // good `[sandbox]` table hunting the wrong config.
         return Err((
             "no_sandbox",
-            "this node has no configured sandbox image".into(),
+            "this node has no agent service attached".into(),
         ));
     }
     let Some(record) = record else {
