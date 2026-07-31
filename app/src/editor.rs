@@ -15,8 +15,9 @@ use iced::advanced::text::{self, Highlighter};
 use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text_editor::{self, Content};
 use iced::{Border, Color, Element, Font};
+use std::hash::{Hash as _, Hasher as _};
 use std::ops::Range;
-use ui_lang_runtime::rich_text_editor::{Format, RichTextEditor};
+use ui_lang_runtime::rich_text_editor::{ContentVersion, Format, RichTextEditor};
 
 pub use ui_lang_runtime::rich_text_editor::Action as RichAction;
 
@@ -75,7 +76,7 @@ pub fn rich_composer(
     max_h: f64,
     pad: f64,
 ) -> Element<'_, ComposerEvent> {
-    let editor = RichTextEditor::new(document)
+    let editor = RichTextEditor::new(document, content_version(document))
         .placeholder(hint)
         .width(iced::Length::Fill)
         .min_height(min_h as f32)
@@ -94,6 +95,17 @@ pub fn rich_composer(
     editor
         .on_action(move |action| classify(action, shift))
         .into()
+}
+
+/// The widget's change-detection key: equal versions promise equal text
+/// (cursor and selection moves keep the version, per the widget's contract).
+/// The Ice `editor` state is a bare `Content` with no revision counter, so
+/// the version is the text's own hash — the composer drafts are small, and
+/// the widget skips its internal resync whenever the text is unchanged.
+fn content_version(document: &Content) -> ContentVersion {
+    let mut hasher = std::hash::DefaultHasher::new();
+    document.text().hash(&mut hasher);
+    ContentVersion::new(0, hasher.finish())
 }
 
 fn classify(action: RichAction, shift: bool) -> ComposerEvent {
