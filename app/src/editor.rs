@@ -12,7 +12,7 @@
 //! composer is not worth a roster prop while the plain-ink fallback reads fine.
 
 use iced::advanced::text::{self, Highlighter};
-use iced::font::{Family, Style as FontStyle, Weight};
+use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text_editor::{self, Content};
 use iced::{Border, Color, Element, Font};
 use std::ops::Range;
@@ -127,12 +127,13 @@ fn composer_style(_theme: &iced::Theme, status: text_editor::Status) -> text_edi
     }
 }
 
+// The generated app exposes the `default=true` font declaration, so the
+// adapter follows `theme.ice` instead of duplicating the family name.
 fn composer_font(weight: Weight, style: FontStyle) -> Font {
     Font {
-        family: Family::Name("Geist"),
         weight,
         style,
-        ..Font::DEFAULT
+        ..crate::Ducktape::default_font()
     }
 }
 

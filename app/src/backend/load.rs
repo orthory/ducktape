@@ -1,0 +1,888 @@
+use super::*;
+use ::chat;
+
+pub(crate) async fn load_workspace(
+    rpc: &RpcClient,
+    channel_id: Option<&str>,
+    page_id: Option<&str>,
+    generation: i64,
+) -> Result<WorkspaceData, String> {
+    let tip = tip_from_status(rpc.status().await?)?;
+    let chat = load_chat_data(rpc, channel_id).await?;
+    let pages = load_pages_data(rpc, page_id).await?;
+    Ok(WorkspaceData {
+        generation,
+        rpc: rpc.origin().to_string(),
+        status: tip.status,
+        height: tip.height,
+        channels: chat.channels,
+        messages: chat.messages,
+        active_channel: chat.active_channel,
+        active_channel_name: chat.active_channel_name,
+        active_channel_archived: chat.active_channel_archived,
+        active_channel_members_only: chat.active_channel_members_only,
+        active_channel_huddle_count: chat.active_channel_huddle_count,
+        huddle_roster: chat.huddle_roster,
+        channel_members: chat.channel_members,
+        pages: pages.pages,
+        blocks: pages.blocks,
+        active_page: pages.active_page,
+        active_page_title: pages.active_page_title,
+        active_page_parent: pages.active_page_parent,
+    })
+}
+
+fn tip_from_status(status: NodeStatus) -> Result<Tip, String> {
+    let height = i64::try_from(status.height).map_err(|_| "node height exceeds i64")?;
+    Ok(Tip {
+        height,
+        status: format!("Connected · block {height}"),
+    })
+}
+
+pub(crate) async fn load_chat_data(
+    rpc: &RpcClient,
+    requested: Option<&str>,
+) -> Result<ChatData, String> {
+    let mut wire_channels = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let reply: ChatViewReply = rpc
+            .view(
+                "chat",
+                &ChatViewQuery::Channels {
+                    after: after.clone(),
+                    limit: None,
+                },
+            )
+            .await?;
+        let ChatViewReply::Channels {
+            channels: page,
+            has_more,
+            next_after,
+        } = reply
+        else {
+            return Err("node returned an invalid channel list".into());
+        };
+        wire_channels.extend(page);
+        if !has_more {
+            break;
+        }
+        after = next_after;
+        if after.is_none() {
+            break;
+        }
+    }
+    let channels = wire_channels
+        .iter()
+        .map(|info| ChatChannel {
+            id: info.channel.id.clone(),
+            name: info.channel.name.clone(),
+            archived: info.channel.archived,
+            members_only: info.channel.post_policy == PostPolicy::MembersOnly,
+            huddle_count: count_i64(info.channel.huddle.len()),
+            head_seq: number_i64(info.head_seq),
+        })
+        .collect::<Vec<_>>();
+    let active_channel = requested
+        .filter(|id| channels.iter().any(|channel| channel.id == *id))
+        .map(str::to_string)
+        .or_else(|| channels.first().map(|channel| channel.id.clone()))
+        .unwrap_or_default();
+    let active_channel_name = channels
+        .iter()
+        .find(|channel| channel.id == active_channel)
+        .map(|channel| channel.name.clone())
+        .unwrap_or_default();
+    let active_wire_channel = wire_channels
+        .iter()
+        .find(|info| info.channel.id == active_channel);
+    let active_channel_archived = active_wire_channel.is_some_and(|info| info.channel.archived);
+    let active_channel_members_only =
+        active_wire_channel.is_some_and(|info| info.channel.post_policy == PostPolicy::MembersOnly);
+    let active_channel_huddle_count =
+        active_wire_channel.map_or(0, |info| count_i64(info.channel.huddle.len()));
+    let me = local_user_key().await;
+    let huddle_roster = active_wire_channel.map_or_else(Vec::new, |info| {
+        huddle_roster(&info.channel.huddle, me.as_deref())
+    });
+    let active_channel_head_seq = active_wire_channel.map_or(0, |info| info.head_seq);
+    let channel_members = if active_channel.is_empty() {
+        Vec::new()
+    } else {
+        load_channel_members(rpc, &active_channel).await?
+    };
+    let messages = if active_channel.is_empty() {
+        Vec::new()
+    } else {
+        load_messages(rpc, &active_channel, active_channel_head_seq).await?
+    };
+    Ok(ChatData {
+        channels,
+        messages,
+        active_channel,
+        active_channel_name,
+        active_channel_archived,
+        active_channel_members_only,
+        active_channel_huddle_count,
+        huddle_roster,
+        channel_members,
+        selected_message_seq: 0,
+        selected_message_rev: 0,
+        selected_message_body: String::new(),
+        active_thread_seq: 0,
+        thread_target_seq: 0,
+        thread_messages: Vec::new(),
+        thread_next_reply_offset: 0,
+        thread_has_more: false,
+    })
+}
+
+pub(crate) async fn load_channel_members(
+    rpc: &RpcClient,
+    channel_id: &str,
+) -> Result<Vec<ChatMember>, String> {
+    let mut members = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let reply: ChatViewReply = rpc
+            .view(
+                "chat",
+                &ChatViewQuery::Members {
+                    channel_id: channel_id.to_string(),
+                    after: after.clone(),
+                    limit: None,
+                },
+            )
+            .await?;
+        let ChatViewReply::Members {
+            members: page,
+            has_more,
+            next_after,
+        } = reply
+        else {
+            return Err("node returned an invalid channel member list".into());
+        };
+        members.extend(page);
+        if !has_more {
+            break;
+        }
+        after = next_after;
+        if after.is_none() {
+            break;
+        }
+    }
+    Ok(members
+        .into_iter()
+        .map(|member| {
+            let id = member_id(&member.user);
+            ChatMember {
+                label: short_label(id),
+                key: id.to_string(),
+            }
+        })
+        .collect())
+}
+
+/// The member's key id: the part after `user:` in a rendered member handle,
+/// or the whole handle when it carries no such prefix.
+pub(crate) fn member_id(user: &str) -> &str {
+    user.strip_prefix("user:").unwrap_or(user)
+}
+
+pub async fn load_older_messages(
+    rpc: String,
+    channel_id: String,
+    before_seq: i64,
+    generation: i64,
+) -> Result<HistoryPageData, HydrationError> {
+    let result = async {
+        let rpc = rpc_client(&rpc)?;
+        let before = u64::try_from(before_seq).unwrap_or(0);
+        let mut cursor = before.saturating_sub(1);
+        let mut roots = Vec::new();
+        while cursor > 0 && roots.len() < CHAT_TIMELINE_ROOT_LIMIT {
+            let limit = cursor.min(CHAT_VIEW_PAGE_LIMIT);
+            let from_seq = cursor - limit + 1;
+            let reply: ChatViewReply = rpc
+                .view(
+                    "chat",
+                    &ChatViewQuery::MessagesRange {
+                        channel_id: channel_id.clone(),
+                        from_seq,
+                        limit: Some(limit as usize),
+                    },
+                )
+                .await?;
+            let ChatViewReply::Messages(rows) = reply else {
+                return Err("node returned an invalid message list".to_string());
+            };
+            roots.extend(rows.into_iter().filter(|row| row.thread.is_none()));
+            if from_seq == 1 {
+                break;
+            }
+            cursor = from_seq - 1;
+        }
+        roots.sort_by_key(|row| row.seq);
+        let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
+        roots.drain(..excess);
+        let current_user = local_user_key().await;
+        let messages: Vec<ChatMessage> = roots
+            .into_iter()
+            .map(|row| chat_message(row, current_user.as_deref()))
+            .collect();
+        Ok(messages)
+    }
+    .await;
+    result
+        .map(|messages| HistoryPageData {
+            generation,
+            messages,
+        })
+        .map_err(|message| HydrationError {
+            generation,
+            message,
+        })
+}
+
+pub(crate) async fn load_messages_around(
+    rpc: &RpcClient,
+    channel_id: &str,
+    seq: u64,
+) -> Result<Vec<ChatMessage>, String> {
+    let reply: ChatViewReply = rpc
+        .view(
+            "chat",
+            &ChatViewQuery::MessagesAround {
+                channel_id: channel_id.to_string(),
+                seq,
+                limit: Some(CHAT_VIEW_PAGE_LIMIT as usize),
+            },
+        )
+        .await?;
+    let ChatViewReply::Messages(rows) = reply else {
+        return Err("node returned an invalid message window".into());
+    };
+    let current_user = local_user_key().await;
+    Ok(rows
+        .into_iter()
+        .filter(|row| row.thread.is_none())
+        .map(|row| chat_message(row, current_user.as_deref()))
+        .collect())
+}
+
+pub(crate) async fn load_message_at(
+    rpc: &RpcClient,
+    channel_id: &str,
+    seq: u64,
+) -> Result<MsgRow, String> {
+    let reply: ChatViewReply = rpc
+        .view(
+            "chat",
+            &ChatViewQuery::MessagesAround {
+                channel_id: channel_id.to_string(),
+                seq,
+                limit: Some(1),
+            },
+        )
+        .await?;
+    let ChatViewReply::Messages(rows) = reply else {
+        return Err("node returned an invalid message window".into());
+    };
+    rows.into_iter()
+        .find(|row| row.seq == seq)
+        .ok_or_else(|| "message was not found".into())
+}
+
+pub(crate) async fn load_messages(
+    rpc: &RpcClient,
+    channel_id: &str,
+    head_seq: u64,
+) -> Result<Vec<ChatMessage>, String> {
+    let mut cursor = head_seq;
+    let mut roots = Vec::new();
+    while cursor > 0 && roots.len() < CHAT_TIMELINE_ROOT_LIMIT {
+        let limit = cursor.min(CHAT_VIEW_PAGE_LIMIT);
+        let from_seq = cursor - limit + 1;
+        let reply: ChatViewReply = rpc
+            .view(
+                "chat",
+                &ChatViewQuery::MessagesRange {
+                    channel_id: channel_id.to_string(),
+                    from_seq,
+                    limit: Some(limit as usize),
+                },
+            )
+            .await?;
+        let ChatViewReply::Messages(rows) = reply else {
+            return Err("node returned an invalid message list".into());
+        };
+        roots.extend(rows.into_iter().filter(|row| row.thread.is_none()));
+        if from_seq == 1 {
+            break;
+        }
+        cursor = from_seq - 1;
+    }
+    roots.sort_by_key(|row| row.seq);
+    let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
+    roots.drain(..excess);
+    let current_user = local_user_key().await;
+    let mut messages: Vec<ChatMessage> = roots
+        .into_iter()
+        .map(|row| chat_message(row, current_user.as_deref()))
+        .collect();
+    mark_message_groups(&mut messages);
+    Ok(messages)
+}
+
+/// One page of older history, returned to the reducer with the generation that
+/// requested it so a stale load can be discarded.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct HistoryPageData {
+    pub generation: i64,
+    pub messages: Vec<ChatMessage>,
+}
+
+/// True when the oldest loaded root is not the channel's first message, i.e.
+/// there is older history to page in.
+pub fn history_has_older(messages: Vec<ChatMessage>) -> bool {
+    messages.first().is_some_and(|message| message.seq > 1)
+}
+
+/// The seq of the oldest loaded root (the ceiling for the next older page).
+pub fn oldest_message_seq(messages: Vec<ChatMessage>) -> i64 {
+    messages.first().map_or(0, |message| message.seq)
+}
+
+/// Prepend an older page ahead of the current timeline, de-duped by seq, sorted
+/// oldest-first, and re-grouped so the seam between pages regroups correctly.
+pub fn prepend_history(messages: Vec<ChatMessage>, older: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let known: BTreeSet<i64> = messages.iter().map(|message| message.seq).collect();
+    let mut merged: Vec<ChatMessage> = older
+        .into_iter()
+        .filter(|message| !known.contains(&message.seq))
+        .chain(messages)
+        .collect();
+    merged.sort_by_key(|message| message.seq);
+    mark_message_groups(&mut merged);
+    merged
+}
+
+/// One thread's root plus its complete reply run, walked over the view's reply
+/// cursor to exhaustion.
+pub(crate) struct ThreadPage {
+    pub(crate) root: MsgRow,
+    pub(crate) replies: Vec<MsgRow>,
+}
+
+pub(crate) async fn query_thread_page(
+    rpc: &RpcClient,
+    channel_id: &str,
+    root_seq: u64,
+) -> Result<ThreadPage, String> {
+    let mut root = None;
+    let mut replies = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let reply: ChatViewReply = rpc
+            .view(
+                "chat",
+                &ChatViewQuery::Thread {
+                    channel_id: channel_id.to_string(),
+                    root_seq,
+                    after: after.clone(),
+                    limit: None,
+                },
+            )
+            .await?;
+        let ChatViewReply::Thread {
+            root: page_root,
+            replies: page_replies,
+            has_more,
+            next_after,
+        } = reply
+        else {
+            return Err("thread was not found".into());
+        };
+        if root.is_none() {
+            let Some(page_root) = page_root else {
+                return Err("thread was not found".into());
+            };
+            root = Some(page_root);
+        }
+        replies.extend(page_replies);
+        if !has_more {
+            break;
+        }
+        after = next_after;
+        if after.is_none() {
+            break;
+        }
+    }
+    let root = root.ok_or_else(|| "thread was not found".to_string())?;
+    Ok(ThreadPage { root, replies })
+}
+
+pub(crate) async fn load_sparse_thread_data(
+    rpc: &RpcClient,
+    channel_id: &str,
+    root_seq: u64,
+    target_seq: u64,
+) -> Result<ThreadData, String> {
+    let root = load_message_at(rpc, channel_id, root_seq).await?;
+    let target = load_message_at(rpc, channel_id, target_seq).await?;
+    if target.thread != Some(root_seq) {
+        return Err("search result does not belong to the selected thread".into());
+    }
+    let current_user = local_user_key().await;
+    Ok(ThreadData {
+        root_seq: number_i64(root_seq),
+        target_seq: number_i64(target_seq),
+        messages: vec![
+            chat_message(root, current_user.as_deref()),
+            chat_message(target, current_user.as_deref()),
+        ],
+        next_reply_offset: -1,
+        has_more: false,
+    })
+}
+
+pub(crate) async fn load_thread_data(
+    rpc: &RpcClient,
+    channel_id: &str,
+    root_seq: u64,
+    through_reply_offset: u64,
+) -> Result<ThreadData, String> {
+    if channel_id.is_empty() || root_seq == 0 {
+        return Ok(ThreadData {
+            root_seq: 0,
+            target_seq: 0,
+            messages: Vec::new(),
+            next_reply_offset: 0,
+            has_more: false,
+        });
+    }
+
+    // the view walks the reply cursor to exhaustion, so the whole thread (up to
+    // the module's reply cap) arrives in one call; re-page it into the UI's
+    // MAX_QUERY_LIMIT windows so the reducer's cursor contract is unchanged.
+    let thread = query_thread_page(rpc, channel_id, root_seq).await?;
+    let (loaded, has_more) = thread_page_bound(thread.replies.len() as u64, through_reply_offset);
+    let current_user = local_user_key().await;
+    let messages = std::iter::once(thread.root)
+        .chain(thread.replies.into_iter().take(loaded as usize))
+        .map(|row| chat_message(row, current_user.as_deref()))
+        .collect();
+    Ok(ThreadData {
+        root_seq: number_i64(root_seq),
+        target_seq: 0,
+        messages,
+        next_reply_offset: number_i64(loaded),
+        has_more,
+    })
+}
+
+/// Re-page a fully-loaded thread into the branch's MAX_QUERY_LIMIT windows:
+/// how many replies to surface for `through_reply_offset`, and whether more
+/// remain. Mirrors the old page-walk (has_more keys on a full page, capped at
+/// MAX_THREAD_REPLIES).
+fn thread_page_bound(total: u64, through_reply_offset: u64) -> (u64, bool) {
+    let cap = chat::MAX_THREAD_REPLIES as u64;
+    let mut from = 0;
+    loop {
+        let page_len = CHAT_VIEW_PAGE_LIMIT.min(total - from);
+        from += page_len;
+        let page_is_full = page_len == CHAT_VIEW_PAGE_LIMIT;
+        let thread_cap_reached = from >= cap;
+        let has_more = page_is_full && !thread_cap_reached;
+        let first_page_is_enough = through_reply_offset == 0;
+        let requested_offset_is_loaded = from >= through_reply_offset;
+        if !has_more || first_page_is_enough || requested_offset_is_loaded {
+            return (from, has_more);
+        }
+    }
+}
+
+pub(crate) async fn query_block_threads(
+    rpc: &RpcClient,
+    target: &str,
+    from: u32,
+    generation: i64,
+) -> Result<BlockThreadListData, String> {
+    let reply: PagesViewReply = rpc
+        .view(
+            "pages",
+            &PagesViewQuery::ThreadsForTargets {
+                targets: vec![target.to_string()],
+            },
+        )
+        .await?;
+    let PagesViewReply::Threads(groups) = reply else {
+        return Err("node returned an invalid comment thread page".into());
+    };
+    // threads-per-target is consensus-capped, so the whole list arrives in one
+    // grouped reply — there is no offset paging to resume.
+    let threads = groups
+        .into_iter()
+        .find(|group| group.target == target)
+        .map(|group| group.threads)
+        .unwrap_or_default();
+    let total = count_i64(threads.len());
+    Ok(BlockThreadListData {
+        generation,
+        target: target.to_string(),
+        from: i64::from(from),
+        threads: threads.into_iter().map(page_comment_thread).collect(),
+        total,
+        next_from: 0,
+        has_more: false,
+    })
+}
+
+pub(crate) async fn query_block_comment_page(
+    rpc: &RpcClient,
+    target: &str,
+    thread_id: &str,
+    from: u32,
+    generation: i64,
+) -> Result<Option<BlockCommentData>, String> {
+    let reply: PageReply = rpc
+        .query(
+            "pages",
+            &PageQuery::CommentThread {
+                thread_id: thread_id.to_string(),
+            },
+        )
+        .await?;
+    let PageReply::CommentThread(thread) = reply else {
+        return Err("node returned an invalid comment page".into());
+    };
+    let Some(view) = thread else {
+        return Ok(None);
+    };
+    let is_expected_thread = view.thread.id == thread_id && view.thread.target == target;
+    if !is_expected_thread {
+        return Err("node returned comments for another block".into());
+    }
+    // the committed read returns the whole live comment list; the UI's page
+    // ordinals are 1-based positions in it, sliced from `from`.
+    let comments = view
+        .comments
+        .into_iter()
+        .enumerate()
+        .skip(from as usize)
+        .map(|(index, comment)| page_comment(index + 1, comment))
+        .collect();
+    Ok(Some(BlockCommentData {
+        generation,
+        target: view.thread.target,
+        thread_id: view.thread.id,
+        from: i64::from(from),
+        comments,
+        next_from: 0,
+        has_more: false,
+    }))
+}
+
+pub(crate) fn page_comment_thread(thread: ThreadRow) -> PageCommentThread {
+    let comment_count = count_i64(thread.comments.iter().filter(|c| !c.deleted).count());
+    let count_label = if comment_count == 1 {
+        "1 comment".to_string()
+    } else {
+        format!("{comment_count} comments")
+    };
+    PageCommentThread {
+        id: thread.id,
+        author: author_name(&thread.opener),
+        meta: if thread.resolved {
+            format!("{count_label} · resolved")
+        } else {
+            count_label
+        },
+        resolved: thread.resolved,
+        comment_count,
+    }
+}
+
+fn page_comment(ordinal: usize, comment: pages::Comment) -> PageComment {
+    let edited = comment.edited_at.is_some();
+    let ordinal = count_i64(ordinal);
+    PageComment {
+        id: comment.id,
+        ordinal,
+        author: page_author_name(&comment.author),
+        meta: if edited {
+            format!("#{ordinal} · edited")
+        } else {
+            format!("#{ordinal}")
+        },
+        text: comment.text,
+    }
+}
+
+fn page_author_name(author: &pages::AuthorRef) -> String {
+    match author {
+        pages::AuthorRef::User(key) => format!("user {}", short_hex(key)),
+        pages::AuthorRef::Agent { agent_id, .. } => format!("@{agent_id}"),
+        pages::AuthorRef::Module(module) => module.clone(),
+        pages::AuthorRef::System => "system".into(),
+    }
+}
+
+pub(crate) async fn load_pages_data(
+    rpc: &RpcClient,
+    requested: Option<&str>,
+) -> Result<PagesData, String> {
+    let wire_pages = load_page_index(rpc).await?;
+    let pages = page_items(wire_pages);
+    let active_page = requested
+        .filter(|id| pages.iter().any(|page| page.id == *id))
+        .map(str::to_string)
+        .or_else(|| pages.first().map(|page| page.id.clone()))
+        .unwrap_or_default();
+    let active_page_parent = pages
+        .iter()
+        .find(|page| page.id == active_page)
+        .map(|page| page.parent.clone())
+        .unwrap_or_default();
+    if active_page.is_empty() {
+        return Ok(PagesData {
+            pages,
+            blocks: Vec::new(),
+            active_page,
+            active_page_title: String::new(),
+            active_page_parent,
+            selected_block_id: String::new(),
+            selected_block_kind: String::new(),
+            selected_block_text: String::new(),
+            selected_block_checked: false,
+            page_title_selected: false,
+        });
+    }
+    let wire_blocks = load_page_blocks(rpc, &active_page).await?;
+    let active_page_title = wire_blocks
+        .first()
+        .map(|block| block.text.clone())
+        .unwrap_or_default();
+    let blocks = page_blocks(wire_blocks, &active_page);
+    Ok(PagesData {
+        pages,
+        blocks,
+        active_page,
+        active_page_title,
+        active_page_parent,
+        selected_block_id: String::new(),
+        selected_block_kind: String::new(),
+        selected_block_text: String::new(),
+        selected_block_checked: false,
+        page_title_selected: false,
+    })
+}
+
+pub(crate) fn page_blocks(wire_blocks: Vec<pages::Block>, active_page: &str) -> Vec<PageBlock> {
+    let parents = wire_blocks
+        .iter()
+        .map(|block| (block.id.clone(), block.parent.clone()))
+        .collect::<BTreeMap<_, _>>();
+    wire_blocks
+        .into_iter()
+        .skip(1)
+        .map(|block| PageBlock {
+            key: page_block_key(&block.id),
+            prefix: block_prefix(&block, active_page, &parents),
+            id: block.id,
+            parent: block.parent.unwrap_or_default(),
+            kind: block_kind_name(block.kind).into(),
+            text: block.text,
+            pending: false,
+            checked: block.checked,
+            child_count: count_i64(block.children.len()),
+            mark_count: count_i64(block.marks.len()),
+        })
+        .collect()
+}
+
+pub(crate) fn page_block_key(id: &str) -> i64 {
+    // ponytail: session-wide interning is collision-free; scope it per workspace
+    // only if retaining every visited block id becomes measurable.
+    static KEYS: OnceLock<Mutex<BTreeMap<String, i64>>> = OnceLock::new();
+    let mut keys = KEYS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(key) = keys.get(id) {
+        return *key;
+    }
+    let key = count_i64(keys.len());
+    keys.insert(id.to_owned(), key);
+    key
+}
+
+pub(crate) fn with_selected_block(mut pages: PagesData, selected_block_id: &str) -> PagesData {
+    if !selected_block_id.is_empty() && selected_block_id == pages.active_page {
+        pages.page_title_selected = true;
+        return pages;
+    }
+    let Some(block) = pages
+        .blocks
+        .iter()
+        .find(|block| block.id == selected_block_id)
+    else {
+        return pages;
+    };
+    pages.selected_block_id.clone_from(&block.id);
+    pages.selected_block_kind.clone_from(&block.kind);
+    pages.selected_block_text.clone_from(&block.text);
+    pages.selected_block_checked = block.checked;
+    pages
+}
+
+pub(crate) async fn load_selected_page_data(
+    rpc: &RpcClient,
+    page_id: &str,
+    block_id: &str,
+) -> Result<PagesData, String> {
+    load_pages_data(rpc, Some(page_id))
+        .await
+        .map(|pages| with_selected_block(pages, block_id))
+}
+
+pub(crate) async fn load_page_blocks(
+    rpc: &RpcClient,
+    page_id: &str,
+) -> Result<Vec<pages::Block>, String> {
+    let mut blocks = Vec::new();
+    let mut after = None;
+    loop {
+        let reply: PageReply = rpc
+            .query(
+                "pages",
+                &PageQuery::GetPage {
+                    page_id: page_id.to_string(),
+                    after: after.clone(),
+                    limit: 0,
+                },
+            )
+            .await?;
+        let page = match reply {
+            PageReply::Page(Some(page)) => page,
+            _ => return Err("page was not found".into()),
+        };
+        blocks.extend(page.blocks);
+        let Some(next) = page.next_after else {
+            return Ok(blocks);
+        };
+        if after.as_ref() == Some(&next) {
+            return Err("node repeated the page cursor".into());
+        }
+        after = Some(next);
+    }
+}
+
+async fn load_page_index(rpc: &RpcClient) -> Result<Vec<PageRow>, String> {
+    let mut pages = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let reply: PagesViewReply = rpc
+            .view(
+                "pages",
+                &PagesViewQuery::ListPages {
+                    after: after.clone(),
+                    limit: None,
+                },
+            )
+            .await?;
+        let PagesViewReply::Pages {
+            pages: page,
+            has_more,
+            next_after,
+        } = reply
+        else {
+            return Err("node returned an invalid page list".into());
+        };
+        pages.extend(page);
+        if !has_more {
+            return Ok(pages);
+        }
+        let Some(next) = next_after else {
+            return Ok(pages);
+        };
+        if after.as_ref() == Some(&next) {
+            return Err("node repeated the page-list cursor".into());
+        }
+        after = Some(next);
+    }
+}
+
+fn page_items(wire_pages: Vec<PageRow>) -> Vec<PageItem> {
+    let known = wire_pages
+        .iter()
+        .map(|page| page.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut children = BTreeMap::<Option<&str>, Vec<usize>>::new();
+    for (index, page) in wire_pages.iter().enumerate() {
+        let parent = page
+            .parent
+            .as_deref()
+            .filter(|parent| known.contains(parent));
+        children.entry(parent).or_default().push(index);
+    }
+    let mut stack = children
+        .get(&None)
+        .into_iter()
+        .flatten()
+        .rev()
+        .map(|index| (*index, 0_usize))
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    let mut pages = Vec::with_capacity(wire_pages.len());
+    while pages.len() < wire_pages.len() {
+        let Some((index, depth)) = stack.pop() else {
+            let Some(index) = wire_pages
+                .iter()
+                .position(|page| !visited.contains(page.id.as_str()))
+            else {
+                break;
+            };
+            stack.push((index, 0));
+            continue;
+        };
+        let page = &wire_pages[index];
+        if !visited.insert(page.id.as_str()) {
+            continue;
+        }
+        let page_children = children.get(&Some(page.id.as_str()));
+        pages.push(PageItem {
+            id: page.id.clone(),
+            title: if page.title.is_empty() {
+                "Untitled".into()
+            } else {
+                page.title.clone()
+            },
+            parent: page.parent.clone().unwrap_or_default(),
+            prefix: "  ".repeat(depth),
+            child_count: page_children.map_or(0, |children| count_i64(children.len())),
+        });
+        if let Some(page_children) = page_children {
+            stack.extend(page_children.iter().rev().map(|index| (*index, depth + 1)));
+        }
+    }
+    pages
+}
+
+fn block_prefix(
+    block: &pages::Block,
+    page_id: &str,
+    parents: &BTreeMap<String, Option<String>>,
+) -> String {
+    let mut depth = 0;
+    let mut parent = block.parent.as_deref();
+    while let Some(parent_id) = parent {
+        if parent_id == page_id || depth >= parents.len() {
+            break;
+        }
+        depth += 1;
+        parent = parents.get(parent_id).and_then(Option::as_deref);
+    }
+    "  ".repeat(depth)
+}
