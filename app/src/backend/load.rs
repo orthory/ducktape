@@ -241,7 +241,7 @@ pub async fn load_older_messages(
         })
         .map_err(|message| HydrationError {
             generation,
-            message,
+            message: user_error(message),
         })
 }
 

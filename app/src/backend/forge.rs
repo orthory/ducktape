@@ -97,7 +97,7 @@ pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, Hydra
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -140,7 +140,7 @@ pub async fn load_forge_repo(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -213,7 +213,7 @@ pub async fn load_forge_item(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -251,7 +251,7 @@ pub async fn load_forge_discussion(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -754,7 +754,7 @@ pub async fn forge_tree(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -828,7 +828,7 @@ pub async fn forge_blob(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 

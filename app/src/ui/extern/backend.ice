@@ -38,6 +38,7 @@ extern crate::backend
   sync bell_unread_after(unread:i64, items:[BellItem], delta:BellDelta) -> i64
   sync bell_head(items:[BellItem]) -> i64
   sync bell_severity(kind:str) -> str
+  sync bell_title(kind:str) -> str
   sync bell_worst_severity(items:[BellItem]) -> str
   load_bell(rpc:str, generation:i64) -> BellData ! HydrationError
   mark_bell_read(rpc:str, password:str, up_to_seq:i64) -> bool ! AppError

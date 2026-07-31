@@ -184,8 +184,8 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
             sensor show=emit(pages_resized, _, _) resize=emit(pages_resized, _, _)
               space w=fill h=fill
             if !connected
-              EmptyState title="Connect to a node" description="Set the RPC endpoint in the sidebar."
-            if connected && empty(active_page)
+              EmptyState title="Connect to a node" description="Open Settings from the rail below and set the node endpoint."
+            if connected && !loading && empty(active_page)
               EmptyState title="No page selected" description="Create a page from the sidebar."
             if connected && !empty(active_page)
               scroll dir=vertical w=fill h=fill bar=hidden

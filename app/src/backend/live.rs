@@ -354,7 +354,7 @@ pub async fn live_resync_load(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -570,7 +570,7 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 

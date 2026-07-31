@@ -286,13 +286,12 @@ component BellBody(item:BellItem)
       PulseDot plate=7.0 tone=bell_severity(item.kind)
     col w=fill gap=3.0
       row w=fill gap=7.0 align=center
-        text item.kind w=fill size=12.0 wrap=none @text-primary
+        text bell_title(item.kind) w=fill size=12.0 wrap=none @text-primary
         if item.height > 0
           text height_label_short(item.height) size=9.5 wrap=none font=code_medium @text-hint
         box px=4.0 py=1.0 bg=info_bg border=info_line border-w=1.0 r=4.0
           text item.source size=9.0 wrap=none font=code_semibold @text-info
       text item.body w=fill size=12.0 line-h=1.45 @text-input
-    text item.height size=10.5 wrap=none font=code_medium @text-label
 
 component StatusBadge(label:str)
   row align=center

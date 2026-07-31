@@ -331,13 +331,40 @@ pub(crate) fn positive_sequence(value: i64) -> Result<u64, String> {
         .ok_or_else(|| "message sequence must be positive".into())
 }
 
+/// One voice at the surface. The global banner prints whatever reaches an
+/// `AppError`/`HydrationError`, so the known developer diagnostics — signer
+/// spawn chatter, key paths, argv timeouts, serde parse positions — translate
+/// to a user sentence here. A module's own sentence flows through untouched.
+pub(crate) fn user_error(message: String) -> String {
+    let signer_broken = message.contains("signer") || message.contains("DUCKTAPE_BIN");
+    if signer_broken {
+        return "The signing helper failed to run. Check the ducktape install in Settings.".into();
+    }
+    let key_unreadable = message.contains("local user key");
+    if key_unreadable {
+        return "This device's user key is missing or unreadable. Check Settings.".into();
+    }
+    let node_slow = message.contains("timed out");
+    if node_slow {
+        return "The node did not answer in time. Retry in a moment.".into();
+    }
+    let reply_garbled = message.contains("invalid type")
+        || message.contains("while parsing")
+        || message.contains("at line ")
+        || message.contains("non-UTF-8");
+    if reply_garbled {
+        return "The node sent a reply this app could not read. Reload and retry.".into();
+    }
+    message
+}
+
 pub(crate) fn app_error(message: String) -> AppError {
     message.into()
 }
 
 pub(crate) fn committed_error(message: String) -> AppError {
     AppError {
-        message,
+        message: user_error(message),
         committed: true,
     }
 }

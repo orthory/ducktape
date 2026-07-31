@@ -311,7 +311,7 @@ pub struct OptimisticMutationError {
 impl From<String> for AppError {
     fn from(message: String) -> Self {
         Self {
-            message,
+            message: user_error(message),
             committed: false,
         }
     }
