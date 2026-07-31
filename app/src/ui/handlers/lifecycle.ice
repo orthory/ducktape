@@ -139,6 +139,7 @@ on workspace_connected(next)
   channel_reads = initial_channel_reads(next.channels, channel_reads)
   unread_boundary = 0
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  unread_marker_seq = first_unread_seq(messages, unread_boundary)
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -188,6 +189,7 @@ on live_updated(next)
   block_height = keep_i64(next.height >= 0, next.height, block_height)
   channels = apply_chat_channels(channels, next.chat)
   messages = apply_chat_messages(messages, next.chat, active_channel)
+  unread_marker_seq = first_unread_seq(messages, unread_boundary)
   thread_messages = apply_chat_thread(thread_messages, next.chat, active_channel, active_thread_seq)
   channel_members = apply_chat_members(channel_members, next.chat, active_channel)
   thread_next_reply_offset = thread_offset_after_live(thread_next_reply_offset, thread_has_more, next.chat, active_channel, active_thread_seq)
@@ -244,6 +246,7 @@ on live_resynced(next)
   active_channel_huddle_count = keep_i64(next.chat_loaded, next.active_channel_huddle_count, active_channel_huddle_count)
   channel_members = keep_members(next.chat_loaded, next.channel_members, channel_members)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)
+  unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
   pages = keep_pages(next.pages_loaded, next.pages, pages)
   blocks = keep_blocks(next.pages_loaded, merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, ""), blocks)
@@ -353,18 +356,26 @@ on select_shell_tab(next)
   // Members and Agents — for a `files_tree` no view reads, on a route whose
   // failure paints the GLOBAL error banner over a screen with no file operation
   // in sight. `fs_wrote` still refreshes the tree from inside the files tab.
+  //
+  // The HEAVY loaders load only for their own tab: forge walks a git mirror
+  // per repo, explorer flattens the ops of 100 blocks, files walks the tree —
+  // all three used to run on the way into Settings or Members. A `keep_i64`
+  // sends the off-screen ones generation -1; the backend refuses it and the
+  // failed arm's generation guard drops the refusal unread. The light loaders
+  // stay unconditional: members/governance/agents feed the always-visible
+  // titlebar chips and have no other refresh path.
   parallel
     run load_node_facts(connected_rpc, node_facts_generation) -> node_facts_loaded _ | node_facts_failed _
-    run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
-    run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
-    run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
+    run load_explorer(connected_rpc, keep_i64(shell_tab == "explorer", explorer_generation, -1)) -> explorer_loaded _ | explorer_failed _
+    run files_ls(connected_rpc, fs_path, keep_i64(shell_tab == "files", fs_generation, -1)) -> fs_listed _ | fs_failed _
+    run files_history(connected_rpc, keep_i64(shell_tab == "files", fs_generation, -1)) -> fs_history_loaded _ | fs_failed _
     run load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
     run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
     run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
     run load_peers(connected_rpc, node_peers_generation) -> peers_loaded _ | peers_failed _
     run load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
     run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
-    run load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_failed _
+    run load_forge(connected_rpc, keep_i64(shell_tab == "forge", forge_generation, -1)) -> forge_loaded _ | forge_failed _
 
 // The huddle's elapsed clock is a LOCAL session fact: one tick per second for
 // as long as SHE is in the huddle, never a chain value. `huddle_joined_at` is

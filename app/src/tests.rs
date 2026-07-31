@@ -2883,10 +2883,13 @@ fn unread_indicators_are_wired_client_local_only() {
     assert!(screen.contains(
         "ChannelButton channel=channel selected=(channel.id == active_channel) unread=channel_is_unread(channel_reads, channel.id, channel.head_seq)"
     ));
-    // In-channel divider anchored on the first message past the frozen boundary.
-    assert!(screen.contains(
-        "if unread_boundary > 0 && message.seq == first_unread_seq(messages, unread_boundary)"
-    ));
+    // In-channel divider anchored on the first message past the frozen
+    // boundary. The seq is a STATE FIELD recomputed where messages or the
+    // boundary change — `first_unread_seq(messages, …)` in the view sat
+    // inside `for message in messages`, and the extern's by-value ABI deep-
+    // cloned the whole timeline once per row per frame.
+    assert!(screen.contains("if unread_boundary > 0 && message.seq == unread_marker_seq"));
+    assert!(!screen.contains("first_unread_seq("));
     assert!(screen.contains("text \"New messages\" size=12.5 wrap=none @text-brand"));
 
     // Freeze happens on a real channel change; connect seeds caught-up.

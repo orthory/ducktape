@@ -30,6 +30,7 @@ pub struct ExplorerData {
 
 /// Load the recent block window for the explorer pane, newest first.
 pub async fn load_explorer(rpc: String, generation: i64) -> Result<ExplorerData, HydrationError> {
+    offscreen_guard(generation)?;
     async {
         let rpc = rpc_client(&rpc)?;
         let rows = rpc.blocks(100).await?;

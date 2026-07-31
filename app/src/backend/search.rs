@@ -25,6 +25,56 @@ pub struct KindCount {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
+pub struct PaletteSearchData {
+    pub generation: i64,
+    pub chat_hits: Vec<ChatSearchHit>,
+    pub page_hits: Vec<PageSearchHit>,
+}
+
+/// The ticket the palette's keystroke lane supersedes itself with. The
+/// handler's generation guard already discards a stale REPLY; this is what
+/// stops the superseded REQUEST from ever reaching the node.
+static PALETTE_TICKET: AtomicU64 = AtomicU64::new(0);
+
+/// The command palette's per-keystroke search: one debounced call covering
+/// chat and pages together. Typing a word used to issue two RPC round trips
+/// per keystroke with nothing coalescing them.
+pub async fn palette_search(
+    rpc: String,
+    text: String,
+    generation: i64,
+) -> Result<PaletteSearchData, HydrationError> {
+    let ticket = PALETTE_TICKET.fetch_add(1, Ordering::SeqCst) + 1;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let superseded = PALETTE_TICKET.load(Ordering::SeqCst) != ticket;
+    if superseded {
+        // A newer keystroke owns the palette; this reply's stale generation
+        // makes the handler drop it unread.
+        return Ok(PaletteSearchData {
+            generation: -1,
+            chat_hits: Vec::new(),
+            page_hits: Vec::new(),
+        });
+    }
+    let (chat, pages) = tokio::join!(
+        search_chat(rpc.clone(), String::new(), text.clone(), generation),
+        search_pages(rpc, String::new(), text, generation)
+    );
+    let both_failed = chat.is_err() && pages.is_err();
+    if both_failed {
+        return Err(HydrationError {
+            generation,
+            message: "Search did not reach the node. Retry in a moment.".into(),
+        });
+    }
+    Ok(PaletteSearchData {
+        generation,
+        chat_hits: chat.map(|data| data.hits).unwrap_or_default(),
+        page_hits: pages.map(|data| data.hits).unwrap_or_default(),
+    })
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ExplorerResults {
     pub generation: i64,
     pub hits: Vec<ExplorerHit>,

@@ -67,18 +67,12 @@ on palette_changed(next)
   palette_generation = palette_generation + 1
   palette_searching = !empty(trim(palette_draft))
   return if empty(trim(palette_draft))
-  parallel
-    run search_chat(connected_rpc, "", trim(palette_draft), palette_generation) -> palette_chat_loaded _ | palette_search_failed _
-    run search_pages(connected_rpc, "", trim(palette_draft), palette_generation) -> palette_page_loaded _ | palette_search_failed _
+  run palette_search(connected_rpc, trim(palette_draft), palette_generation) -> palette_results _ | palette_search_failed _
 
-on palette_chat_loaded(next)
+on palette_results(next)
   return if next.generation != palette_generation
-  palette_chat_hits = next.hits
-  palette_searching = false
-
-on palette_page_loaded(next)
-  return if next.generation != palette_generation
-  palette_page_hits = next.hits
+  palette_chat_hits = next.chat_hits
+  palette_page_hits = next.page_hits
   palette_searching = false
 
 on palette_search_failed(cause)

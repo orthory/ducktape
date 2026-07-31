@@ -63,6 +63,7 @@ pub async fn files_ls(
     path: String,
     generation: i64,
 ) -> Result<FsListing, HydrationError> {
+    offscreen_guard(generation)?;
     async {
         let rpc = rpc_client(&rpc)?;
         let reply = rpc.files_get("ls", &[("path", path.as_str())]).await?;
@@ -183,6 +184,7 @@ pub async fn files_preview(
 
 /// The committed snapshot window, newest first.
 pub async fn files_history(rpc: String, generation: i64) -> Result<FsHistory, HydrationError> {
+    offscreen_guard(generation)?;
     async {
         let rpc = rpc_client(&rpc)?;
         let reply = rpc.files_get("history", &[("limit", "50")]).await?;
