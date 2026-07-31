@@ -8,11 +8,18 @@
 CARGO ?= cargo
 BIN_DEST ?= $(HOME)/.cargo/bin
 
-.PHONY: all demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-node install-coordinator test clean wasm-modules wasm-modules-check labs-gate
+.PHONY: all dev demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-node install-coordinator test clean wasm-modules wasm-modules-check labs-gate
 
 ## build every workspace crate (the default target)
 all:
 	$(CARGO) build --workspace
+
+## the app dev loop: seed the "demo" localnet if it does not exist yet
+## (DEV_RESEED=1 forces a fresh seed), start its node when it is not already
+## serving, then run the desktop app against it in the foreground. Ctrl-C
+## quits the app and leaves the node running; `make demo-clear` tears down.
+dev:
+	@bash ops/dev.sh
 
 ## seed a local "demo" network preloaded with sample data — chat channels +
 ## messages, a tasks board, pages, a registered agent (with a live @mention run),
