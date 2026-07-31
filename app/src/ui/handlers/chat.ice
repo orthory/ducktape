@@ -222,7 +222,13 @@ on join_huddle_submit
 // channel-header ✕ and the popped panel, so a second leave that targets
 // `active_channel` would be a way to leave the wrong huddle.
 
-on send_message_submit
+// One handler carries the whole composer: every rich-editor event lands here,
+// the apply is a no-op on Submit, and the single guard below is the send/edit
+// fork. The Send button emits a synthetic Submit through the same route, so
+// there is exactly ONE send path.
+on chat_composer_event(event)
+  message_editor = apply_composer_event(message_editor, event)
+  return if !composer_submits(event)
   return if loading || empty(active_channel) || active_channel_archived || empty(trim(editor_text(message_editor)))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -676,7 +682,9 @@ on remove_reaction_at(seq, emoji)
   error = ""
   run remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> chat_acked _ | mutation_failed _
 
-on send_reply_submit
+on reply_composer_event(event)
+  reply_editor = apply_composer_event(reply_editor, event)
+  return if !composer_submits(event)
   return if loading || thread_loading || empty(active_channel) || active_channel_archived || active_thread_seq <= 0 || empty(trim(editor_text(reply_editor)))
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1

@@ -8,7 +8,7 @@ font code family="Geist Mono" weight=normal stretch=normal style=normal
 font code_medium family="Geist Mono" weight=medium stretch=normal style=normal
 font code_semibold family="Geist Mono" weight=semibold stretch=normal style=normal
 
-// ONE contract, ONE palette: 2.0 allows exactly one of each, so the kit's 46
+// ONE contract, ONE palette: 2.0 allows exactly one of each, so the kit's 49
 // semantic roles and the 74 steps the canonical artifact names live together
 // here, in the app's own theme file. `ducktape-ui/default.ice` stays a verbatim
 // vendor copy with its own theme deleted — a UI kit has no business naming
@@ -20,7 +20,10 @@ theme contract AppTheme
   muted
   muted_bg
   primary
+  primary_hover
   primary_fg
+  disabled
+  disabled_fg
   secondary
   secondary_fg
   accent
@@ -146,7 +149,10 @@ palette app for AppTheme
   muted      #6b6962
   muted_bg   #f6f5f2
   primary    #26251f
+  primary_hover #322f28
   primary_fg #ffffff
+  disabled   #ecebe6
+  disabled_fg #b3b1a8
   secondary  #ffffff
   secondary_fg #5e5c55
   accent     #f3f2ef

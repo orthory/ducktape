@@ -327,16 +327,6 @@ governor = "0.10.2"
 rand_core = "0.6.4"
 
 [patch.crates-io]
-# ui-lang's codegen emits `text_editor::Binding::Indent`/`Unindent`, which exist
-# only in the iced it vendors. Cargo ignores a DEPENDENCY's `[patch]` section —
-# only the root workspace's applies — so a consumer that does not repeat these
-# six lines gets stock iced and a generated file that will not compile.
-iced_core = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "9a5e6e0" }
-iced_graphics = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "9a5e6e0" }
-iced_widget = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "9a5e6e0" }
-iced_wgpu = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "9a5e6e0" }
-iced_winit = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "9a5e6e0" }
-
 # `block` 0.1.6 is still required transitively by Metal and AVFoundation, but
 # its uninhabited extern-static type is future-incompatible with Rust. Keep the
 # API/ABI identical and patch only that declaration locally.
