@@ -46,11 +46,12 @@ fi
 # ── 2. fresh demo workspace (idempotent) ───────────────────────
 log "creating a fresh '$ID' workspace at $WSDIR"
 rm -rf "$WSDIR"; mkdir -p "$WSDIR"
-read -r P1 P2 P3 < <(bun -e 'const l=Array.from({length:3},()=>Bun.listen({hostname:"127.0.0.1",port:0,socket:{data(){}}}));console.log(l.map(x=>x.port).join(" "));l.forEach(x=>x.stop())')
+read -r P1 P2 P3 < <(bun -e 'const l=Array.from({length:3},()=>Bun.listen({hostname:"127.0.0.1",port:0,socket:{data(){}}}));process.stdout.write(l.map(x=>x.port).join(" ")+"\n");l.forEach(x=>x.stop())')
 # A free UDP port for the overlay's WireGuard socket. This MUST be concrete: the
 # reachability plane refuses to start on port 0 ("wireguard_listen needs a
 # concrete UDP port — plane not started"), which leaves the overlay down.
-WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});console.log(s.port);s.close()')"
+WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});process.stdout.write(String(s.port));s.close()')"
+[[ "$WGP" =~ ^[0-9]+$ ]] || die "UDP port allocation produced non-numeric output"
 # Gateway serving needs the app's workspace_create posture:
 #   --gateway            binds the isolated browser plane that serves the routes
 #   --wireguard-listen   a CONCRETE UDP port (0.0.0.0 = endpoint-less/roaming,
@@ -59,11 +60,17 @@ WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});console.log(s.port);s.close
 #   --primary-coordinator a self-contained local demo does NOT phone home to the
 #     none               public rendezvous coordinator; keeps network.toml (which
 #                        the app reboots from) fully local.
-CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
+INIT_ERR="$(mktemp)"
+if ! CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
   --listen "127.0.0.1:$P1" --advertised "127.0.0.1:$P1" \
   --http "127.0.0.1:$P2" --rpc "127.0.0.1:$P3" --gateway 127.0.0.1:0 \
   --primary-coordinator none \
-  --wireguard-listen "0.0.0.0:$WGP" 2>/dev/null | tail -1)"
+  --wireguard-listen "0.0.0.0:$WGP" 2>"$INIT_ERR" | tail -1)"; then
+  sed -n '1,120p' "$INIT_ERR" >&2
+  rm -f "$INIT_ERR"
+  die "node init failed"
+fi
+rm -f "$INIT_ERR"
 [ -n "$CHAIN" ] || die "init produced no chain-id"
 PUB="$("$NODE_BIN" node key --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
 

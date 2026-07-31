@@ -15,7 +15,7 @@ WSDIR="$HOME/.ducktape/workspaces/$ID"
 log(){ printf '\033[36m[dev]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[dev] %s\033[0m\n' "$*" >&2; exit 1; }
 
-if [ ! -d "$WSDIR" ] || [ -n "${DEV_RESEED:-}" ]; then
+if [ ! -f "$WSDIR/node.toml" ] || [ ! -f "$WSDIR/network.toml" ] || [ -n "${DEV_RESEED:-}" ]; then
   bash "$SCRIPT_DIR/demo-seed.sh" || die "seeding the '$ID' localnet failed"
 fi
 
