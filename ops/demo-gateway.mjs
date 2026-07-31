@@ -102,7 +102,7 @@ async function main() {
 
   let handle = requestedHandle;
   if (/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(handle) && !RESERVED_ROOT_LABELS.includes(handle)) {
-    await submit("duckdns", { set_handle: { handle } });
+    await submit("gateway", { set_handle: { handle } });
   } else {
     handle = null;
     console.log("[gateway] skipped .duck handle (workspace id is not a legal DNS label)");
