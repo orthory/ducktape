@@ -199,10 +199,15 @@ component Breadcrumb(current:str)
       gap=7.0
       align=center
     slot
-    text "/" @machine text-muted
-    text current
+    text "/" #separator
       with
-        @machine
+        size=12.0
+        line-h=1.5
+        @text-muted
+    text current #current
+      with
+        size=12.0
+        line-h=1.5
         @font-semibold
         @text-fg
 
@@ -273,7 +278,11 @@ component Attachment(name:str, meta:str)
     col w=fill gap=2.0
       text name @list text-fg
       text meta @meta
-    text "•••" @machine text-muted
+    text "•••" #menu
+      with
+        size=12.0
+        line-h=1.5
+        @text-muted
 
 component Marker(label:str, active:bool)
   stack #root
@@ -501,7 +510,11 @@ component Tooltip(label:str)
       r=7.0
     slot
     box px=4.0
-      text label @machine text-primary_fg
+      text label
+        with
+          size=12.0
+          line-h=1.5
+          @text-primary_fg
 
 component InputGroup()
   box #root

@@ -350,30 +350,6 @@ pub struct LiveUpdate {
     pub forge: ForgeRefresh,
 }
 
-
-/// Custom command the multiline composer's key bindings raise. It carries no
-/// data: the only Custom binding is "send", routed straight to
-/// `send_message_submit`, which reads the editor text itself.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ComposerCmd;
-
-/// Editor key bindings for the message composer: plain Enter sends (raised as a
-/// Custom command), every other key press — Shift+Enter included, which iced
-/// maps to a newline insertion — keeps its native binding.
-pub fn composer_keys(
-    event: iced::widget::text_editor::KeyPress,
-) -> Option<iced::widget::text_editor::Binding<ComposerCmd>> {
-    let enter_pressed = matches!(
-        event.key,
-        iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
-    );
-    let sends = enter_pressed && !event.modifiers.shift();
-    if sends {
-        return Some(iced::widget::text_editor::Binding::Custom(ComposerCmd));
-    }
-    iced::widget::text_editor::Binding::from_key_press(event)
-}
-
 pub fn fresh_operation_id(prefix: String) -> String {
     fresh_id(&prefix)
 }
@@ -10497,6 +10473,73 @@ mod tests {
         assert!(refreshed.chat_loaded && refreshed.pages_loaded);
         assert_eq!(refreshed.messages[1].body, "arrived on the next block");
         assert_eq!(refreshed.active_page, "welcome");
+        sim.shutdown();
+    }
+
+    /// The composer's grammar loop, closed over a real node: the SAME parser
+    /// the rich composer previews (`parse_message_with_members`) builds the
+    /// committed blocks, and the spans read back off the node still carry the
+    /// marks. If the preview grammar and the renderer grammar ever drift, one
+    /// of the two ends of this test moves.
+    #[tokio::test(flavor = "current_thread")]
+    async fn composer_markdown_round_trips_rich_spans() {
+        let storage = tempfile::tempdir().unwrap();
+        let sim = simnode::boot(
+            storage.path(),
+            "127.0.0.1:0".parse().unwrap(),
+            simnode::SimOpts {
+                auto: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let origin = format!("http://{}", sim.addr());
+        let rpc = RpcClient::new(&origin).unwrap();
+        let signer = ed25519::PrivateKey::from_seed(11);
+
+        submit_test(
+            &rpc,
+            &signer,
+            1,
+            "chat",
+            chat::encode_msg(&ChatMsg::CreateChannel {
+                channel_id: "general".into(),
+                name: "General".into(),
+                post_policy: PostPolicy::Open,
+            }),
+        )
+        .await;
+        submit_test(
+            &rpc,
+            &signer,
+            2,
+            "chat",
+            chat::encode_msg(&ChatMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: "styled-1".into(),
+                blocks: parse_message_with_members("say **hi** to _all_", &[]),
+                thread: None,
+                as_agent: None,
+            }),
+        )
+        .await;
+
+        let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
+        let message = &chat.messages[0];
+        let block = &message.blocks[0];
+        assert!(block.rich, "marked text lands as a rich paragraph");
+        let bold = block
+            .spans
+            .iter()
+            .find(|span| span.text.contains("hi"))
+            .expect("the bold run survives the round trip");
+        assert!(bold.bold && !bold.italic);
+        let italic = block
+            .spans
+            .iter()
+            .find(|span| span.text.contains("all"))
+            .expect("the italic run survives the round trip");
+        assert!(italic.italic && !italic.bold);
         sim.shutdown();
     }
 

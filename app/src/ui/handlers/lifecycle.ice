@@ -381,10 +381,14 @@ on tick
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
   keyboard press when (connected || palette_open) -> global_key_pressed _
+  keyboard modifiers -> modifiers_changed _
   window file-dropped -> fs_file_dropped _
   run node_logs(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "activity") -> node_log_line _
   every 1s when huddle_joined -> tick
   every 2800ms when !empty(toast) -> dismiss_toast
+
+on modifiers_changed(value)
+  shift_held = value.shift
 
 on mutation_failed(cause)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, cause.committed)
@@ -424,7 +428,9 @@ on restore_failed_reply
   reply_draft = failed_reply_draft
   reply_editor = editor(reply_draft)
   failed_reply_draft = ""
-  task widget focus #workspace-tabs/content/chat/reply
+  // The reply composer is an extern `rich_composer` mount now, and `task
+  // widget focus` cannot target an extern component — restoring no longer
+  // auto-focuses. Re-add when ui-lang grows extern focus targets.
 
 on dismiss_failed_reply
   failed_reply_draft = ""

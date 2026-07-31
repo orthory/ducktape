@@ -158,7 +158,9 @@ on forge_merge_failed(cause)
   forge_merge_busy = false
   error = cause.message
 
-on forge_note_submit
+on forge_composer_event(event)
+  forge_discussion_editor = apply_composer_event(forge_discussion_editor, event)
+  return if !composer_submits(event)
   return if loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending) || empty(trim(editor_text(forge_discussion_editor)))
   forge_discussion_pending = fresh_operation_id("forge-note")
   run send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending, trim(editor_text(forge_discussion_editor)), forge_discussion_members) -> forge_note_sent _ | forge_note_failed _

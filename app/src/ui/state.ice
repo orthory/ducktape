@@ -8,6 +8,9 @@ state
   status = "Connecting…"
   connected = false
   loading = false
+  // Live shift state from the `keyboard modifiers` subscription — the rich
+  // composer classifies Enter with it (plain Enter sends, ⇧↵ breaks a line).
+  shift_held = false
   block_height:i64 = -1
   hydration_generation:i64 = 0
   hydration_retry_attempt:i64 = 0

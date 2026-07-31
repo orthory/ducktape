@@ -19,7 +19,7 @@
 // were briefly caller-filled slots: a sensor's show/resize route used to accept
 // only bare `_` payloads and could not carry a component event (ui-lang#239).
 
-component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], channels:[ChatChannel], dm_peers:[DmPeer], channel_reads:[ChannelRead], user_key:str, channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, messages:[ChatMessage], history_view:bool, history_loading:bool, unread_boundary:i64, selected_message_seq:i64, hovered_message_seq:i64, selected_message_rev:i64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_hovered_seq:i64, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
+component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], channels:[ChatChannel], dm_peers:[DmPeer], channel_reads:[ChannelRead], user_key:str, channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, messages:[ChatMessage], history_view:bool, history_loading:bool, unread_boundary:i64, selected_message_seq:i64, hovered_message_seq:i64, selected_message_rev:i64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_hovered_seq:i64, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
   emits
     search_chat_submit()
     clear_chat_search()
@@ -51,7 +51,7 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
     delete_message_submit()
     restore_failed_message()
     dismiss_failed_message()
-    send_message_submit()
+    composer_event(ComposerEvent)
     rename_channel_submit()
     archive_channel_submit()
     unarchive_channel_submit()
@@ -71,7 +71,7 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
     load_more_thread()
     restore_failed_reply()
     dismiss_failed_reply()
-    send_reply_submit()
+    reply_composer_event(ComposerEvent)
     chat_resized(f64, f64)
     thread_resized(f64, f64)
   row w=fill h=fill
@@ -418,16 +418,12 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
           box w=fill pl=16.0 pr=16.0 pt=12.0 pb=14.0
             box w=fill bg=surface border=control_line border-w=1.0 r=12.0 clip=true shadow=shadow_popover shadow-y=1.0 shadow-blur=2.0
               col w=fill
-                editor #message <-> message_editor hint="Message the channel…" disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key))) min-h=44.0 max-h=150.0 size=13.5 line-h=1.3 p=6.6 wrap=word key-binding=composer_keys() -> emit(send_message_submit)
-                  active bg=transparent border=transparent value=fg placeholder=hint selection=fg/18 border-w=0.0 r=0.0
-                  hovered bg=transparent border=transparent
-                  focused bg=transparent border=ring border-w=1.0
-                  disabled value=muted
+                extern rich_composer(message_editor, "Message the channel…", (loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key))), shift_held, 44.0, 150.0, 6.6) #message -> emit(composer_event, _)
                 box w=fill pl=10.0 pr=8.0 pb=8.0
                   row w=fill gap=10.0 align=center
                     space w=fill
                     text "↵ send · ⇧↵ newline" size=10.5 wrap=none font=code_medium @text-label
-                    button "Send" disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)) || empty(trim(editor_text(message_editor)))) h=29.0 p=7.0 @primary_action -> emit(send_message_submit)
+                    button "Send" disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)) || empty(trim(editor_text(message_editor)))) h=29.0 p=7.0 @primary_action -> emit(composer_event, composer_submit_event())
         if channel_settings_open && !empty(active_channel)
           box w=1.0 h=fill bg=fg/8
             text ""
@@ -535,12 +531,8 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
                         pressed bg=fg/15
                   box w=fill p=5.0 bg=transparent border=fg/12 border-w=1.0 r=7.0
                     row w=fill gap=5.0 align=end
-                      editor #reply <-> reply_editor hint="Reply…" disabled=(thread_loading || active_channel_archived) min-h=44.0 max-h=150.0 size=13.5 line-h=1.3 p=6.6 wrap=word key-binding=composer_keys() -> emit(send_reply_submit)
-                        active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=0.0 r=9.0
-                        hovered bg=fg/4 border=fg/8 border-w=1.0
-                        focused bg=fg/6 border=ring border-w=1.0
-                        disabled value=muted
-                      button "Send" label="Send reply" disabled=(thread_loading || active_channel_archived || empty(trim(editor_text(reply_editor)))) h=28.0 p=6.0 @primary_action -> emit(send_reply_submit)
+                      extern rich_composer(reply_editor, "Reply…", (thread_loading || active_channel_archived), shift_held, 44.0, 150.0, 6.6) #reply -> emit(reply_composer_event, _)
+                      button "Send" label="Send reply" disabled=(thread_loading || active_channel_archived || empty(trim(editor_text(reply_editor)))) h=28.0 p=6.0 @primary_action -> emit(reply_composer_event, composer_submit_event())
               overlay when=(thread_selected_seq > 0 && thread_message_action != "toolbar") dismiss=emit(clear_thread_message_selection) backdrop=transparent p=8.0 align-x=end align-y=start
                 content
                   space w=fill h=fill

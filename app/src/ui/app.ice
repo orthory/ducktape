@@ -17,7 +17,8 @@ app Ducktape
       titlebar-transparent true
       fullsize-content-view true
 
-use "backend.ice"
+use "extern/backend.ice"
+use "extern/editor.ice"
 use "ducktape-ui/default.ice"
 use "theme.ice"
 use "state.ice"
@@ -54,4 +55,4 @@ use "handlers/pages.ice"
 use "handlers/onboarding.ice"
 use "handlers/huddle.ice"
 use "view.ice"
-use "tests.ice"
+use "tests/app.ice"

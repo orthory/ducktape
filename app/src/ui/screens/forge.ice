@@ -6,7 +6,7 @@
 // one family, and the guards in main.rs name several of its members verbatim.
 // Everything outside that family drops the redundant `forge_` prefix.
 
-component ForgeScreen(org:str, about:str, tier:str, repos:[ForgeRepo], open_repo:str, repo_menu:bool, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_entries:[TreeEntry], file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool)
+component ForgeScreen(org:str, about:str, tier:str, repos:[ForgeRepo], open_repo:str, repo_menu:bool, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_entries:[TreeEntry], file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, shift_held:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -23,7 +23,7 @@ component ForgeScreen(org:str, about:str, tier:str, repos:[ForgeRepo], open_repo
     forge_comment_stage()
     forge_comment_cancel()
     forge_comment_drop(str)
-    forge_note_submit()
+    note_composer_event(ComposerEvent)
   col w=fill h=fill
     // THE REPO OVERVIEW. Reachable again: `forge_close_repo` clears the open
     // repo, which nothing did before — once a repo was opened the grid was
@@ -327,9 +327,6 @@ component ForgeScreen(org:str, about:str, tier:str, repos:[ForgeRepo], open_repo
                         space w=fill
                       MessageBody message=message
                 flex w=fill gap=8.0 items=end
-                  editor #forge-note <-> discussion_editor hint="Write a note…" disabled=(loading || !connected || empty(forge_item_channel)) min-h=38.0 max-h=120.0 size=13.5 line-h=1.3 p=6.0 wrap=word key-binding=composer_keys() -> emit(forge_note_submit)
-                    active bg=surface border=card_line value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
-                    hovered bg=muted_bg border=control_line
-                    focused bg=muted_bg border=ring border-w=1.0
-                    disabled value=muted
-                  button "Send" disabled=(loading || !connected || empty(forge_item_channel) || !empty(discussion_pending) || empty(trim(editor_text(discussion_editor)))) w=60.0 h=28.0 p=6.0 @primary_action -> emit(forge_note_submit)
+                  box w=fill bg=surface border=card_line border-w=1.0 r=8.0 clip=true
+                    extern rich_composer(discussion_editor, "Write a note…", (loading || !connected || empty(forge_item_channel)), shift_held, 38.0, 120.0, 6.0) #forge-note -> emit(note_composer_event, _)
+                  button "Send" disabled=(loading || !connected || empty(forge_item_channel) || !empty(discussion_pending) || empty(trim(editor_text(discussion_editor)))) w=60.0 h=28.0 p=6.0 @primary_action -> emit(note_composer_event, composer_submit_event())

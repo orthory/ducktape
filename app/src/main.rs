@@ -1,6 +1,7 @@
 ui_lang::include_app!("src/ui/app.ice");
 
 mod backend;
+mod editor;
 
 fn main() -> iced::Result {
     Ducktape::run()
@@ -250,7 +251,7 @@ mod tests {
             include_str!("ui/handlers/forge.ice"),
         );
         let forge = include_str!("ui/components/forge.ice");
-        let backend = include_str!("ui/backend.ice");
+        let backend = include_str!("ui/extern/backend.ice");
 
         // the item discussion IS a chat surface: hydrated through the chat
         // lanes and spliced by the SAME fold the chat pane uses, scoped to
@@ -747,9 +748,23 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         app.connected = true;
         app.loading = false;
         app.active_channel = "general".into();
-        app.message_editor = compose("first");
+        // The first draft arrives as typed composer events — the same route a
+        // real keystroke takes through the rich composer — so this also pins
+        // the apply half of `chat_composer_event`, not just the submit half.
+        for character in "first".chars() {
+            let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+                editor::ComposerEvent::Apply(editor::RichAction::Edit(
+                    iced::widget::text_editor::Action::Edit(
+                        iced::widget::text_editor::Edit::Insert(character),
+                    ),
+                )),
+            ));
+        }
+        assert_eq!(composer(&app), "first");
 
-        let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+            editor::composer_submit_event(),
+        ));
         let first_id = app.messages[0].id.clone();
         assert_eq!(app.mutation_phase, "idle");
         assert!(app.message_draft.is_empty());
@@ -758,7 +773,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(app.messages[0].pending);
 
         app.message_editor = compose("second");
-        let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+            editor::composer_submit_event(),
+        ));
         let second_id = app.messages[1].id.clone();
         assert_ne!(first_id, second_id);
         assert_eq!(app.messages.len(), 2);
@@ -1027,7 +1044,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             assert!(chat.contains(&format!("input \"\" {focus}")));
         }
         assert_eq!(handlers.matches("task widget focus-next").count(), 7);
-        assert!(!include_str!("ui/backend.ice").contains("task focus_next()"));
+        assert!(!include_str!("ui/extern/backend.ice").contains("task focus_next()"));
         let activate = handlers
             .split_once("on begin_message_edit(seq, body, rev)\n")
             .unwrap()
@@ -1375,7 +1392,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(components.contains("task widget focus #title-input"));
         assert!(!components.contains("defer_focus"));
         assert!(!handlers.contains("focus_page_title"));
-        assert!(!include_str!("ui/backend.ice").contains("defer_focus"));
+        assert!(!include_str!("ui/extern/backend.ice").contains("defer_focus"));
         assert!(view.contains("mouse move=emit(pages_pointer_moved, _, _)"));
         assert!(view.contains("overlay when=(connected && !empty(active_page)"));
         assert!(view.contains("dismiss=emit(close_block_actions) backdrop=transparent"));
@@ -1399,7 +1416,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     fn shell_uses_canonical_glass_and_opaque_content() {
         let ui = concat!(
             include_str!("ui/app.ice"),
-            include_str!("ui/backend.ice"),
+            include_str!("ui/extern/backend.ice"),
             include_str!("ui/state.ice"),
             include_str!("ui/theme.ice"),
             include_str!("ui/view.ice"),
@@ -1527,9 +1544,18 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     #[test]
     fn compact_controls_share_a_single_geometry_and_type_scale() {
         assert!(SCREENS.contains("p=6.2 text-size=13.0 line-h=1.2"));
-        assert!(SCREENS.contains("min-h=44.0 max-h=150.0 size=13.5 line-h=1.3 p=6.6 wrap=word"));
+        // The composer geometry moved into the `rich_composer` extern args
+        // (min_h, max_h, pad); type scale (13.5/1.3) is owned by the adapter.
+        // Both chat composers share one plate; the forge note runs compact.
+        assert_eq!(
+            SCREENS.matches(", shift_held, 44.0, 150.0, 6.6) #").count(),
+            2
+        );
+        assert!(SCREENS.contains(", shift_held, 38.0, 120.0, 6.0) #forge-note"));
         assert!(SCREENS.contains("button \"Send\" disabled="));
-        assert!(SCREENS.contains("h=29.0 p=7.0 @primary_action -> emit(send_message_submit)"));
+        assert!(SCREENS.contains(
+            "h=29.0 p=7.0 @primary_action -> emit(composer_event, composer_submit_event())"
+        ));
         assert!(
             SCREENS
                 .matches("box w=fill h=fill align-x=center align-y=center")
@@ -1704,13 +1730,16 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
 
         assert_controls_inherit_focus("screens", SCREENS);
         assert_controls_inherit_focus("pages.ice", pages);
+        // The three composer editors carried ad-hoc `focused border=ring`
+        // status blocks; their focus ring now lives in the rich composer
+        // adapter (`editor::composer_style`). One authored site remains.
         assert_eq!(
             SCREENS
                 .lines()
                 .filter(|line| line.trim_start().starts_with("focused ")
                     && line.contains("border=ring"))
                 .count(),
-            4
+            1
         );
         assert_eq!(
             pages
@@ -1928,39 +1957,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         }
     }
 
-    #[test]
-    fn composer_enter_sends_and_shift_enter_inserts_a_newline() {
-        use iced::keyboard::key::{Named, NativeCode, Physical};
-        use iced::keyboard::{Key, Modifiers};
-        use iced::widget::text_editor::{Binding, KeyPress, Status};
-
-        fn press(key: Key, modifiers: Modifiers) -> KeyPress {
-            KeyPress {
-                key: key.clone(),
-                modified_key: key,
-                physical_key: Physical::Unidentified(NativeCode::Unidentified),
-                modifiers,
-                text: None,
-                status: Status::Focused { is_hovered: false },
-            }
-        }
-
-        let enter = Key::Named(Named::Enter);
-        // Plain Enter raises the custom send command routed to send_message_submit.
-        assert_eq!(
-            backend::composer_keys(press(enter.clone(), Modifiers::empty())),
-            Some(Binding::Custom(backend::ComposerCmd)),
-        );
-        // Shift+Enter keeps iced's native newline insertion — never a send.
-        assert_eq!(
-            backend::composer_keys(press(enter, Modifiers::SHIFT)),
-            Some(Binding::Enter),
-        );
-        // Any other key passes through to its native binding, not a send.
-        let passthrough =
-            backend::composer_keys(press(Key::Named(Named::ArrowLeft), Modifiers::empty()));
-        assert!(!matches!(passthrough, Some(Binding::Custom(_))));
-    }
+    // The Enter/Shift+Enter send contract moved with the binding: it lives in
+    // `editor::tests::plain_enter_submits_and_shift_enter_edits`, against the
+    // classify seam the rich composer actually routes through.
 
     /// The artifact hangs comments off the document as a docked 306px rail on
     /// the sidebar ladder, NOT as a floating card over it — a card would cover
@@ -2502,7 +2501,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         app.active_channel = "general".into();
         app.message_editor = compose("retry me");
 
-        let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+            editor::composer_submit_event(),
+        ));
         let operation_id = app.messages[0].id.clone();
         let _ = app.__update(__DucktapeMessage::MessageSendFailed(
             backend::OptimisticMutationError {
@@ -2530,7 +2531,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         app.active_channel = "general".into();
         app.message_editor = compose("first");
 
-        let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+            editor::composer_submit_event(),
+        ));
         let operation_id = app.messages[0].id.clone();
         app.message_editor = compose("second");
         let _ = app.__update(__DucktapeMessage::MessageSendFailed(
@@ -2561,7 +2564,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         app.active_channel = "general".into();
         app.message_editor = compose("committed once");
 
-        let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+            editor::composer_submit_event(),
+        ));
         let operation_id = app.messages[0].id.clone();
         let _ = app.__update(__DucktapeMessage::MessageSendFailed(
             backend::OptimisticMutationError {
@@ -2579,7 +2584,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert_eq!(app.mutation_phase, "idle");
 
         app.message_editor = compose("still available");
-        let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+            editor::composer_submit_event(),
+        ));
         assert_eq!(app.messages.len(), 2);
         assert_eq!(app.mutation_phase, "idle");
     }
@@ -2616,14 +2623,18 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         app.active_thread_seq = 1;
         app.reply_editor = compose("first");
 
-        let _ = app.__update(__DucktapeMessage::SendReplySubmit);
+        let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+            editor::composer_submit_event(),
+        ));
         let first_id = app.thread_messages[0].id.clone();
         assert_eq!(app.mutation_phase, "idle");
         assert!(reply_composer(&app).is_empty());
         assert!(app.thread_messages[0].pending);
 
         app.reply_editor = compose("second");
-        let _ = app.__update(__DucktapeMessage::SendReplySubmit);
+        let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+            editor::composer_submit_event(),
+        ));
         let second_id = app.thread_messages[1].id.clone();
         assert_ne!(first_id, second_id);
         assert_eq!(app.thread_messages.len(), 2);
@@ -2690,10 +2701,14 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         app.active_thread_seq = 1;
         app.reply_editor = compose("first");
 
-        let _ = app.__update(__DucktapeMessage::SendReplySubmit);
+        let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+            editor::composer_submit_event(),
+        ));
         let first_id = app.thread_messages[0].id.clone();
         app.reply_editor = compose("second");
-        let _ = app.__update(__DucktapeMessage::SendReplySubmit);
+        let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+            editor::composer_submit_event(),
+        ));
         let second_id = app.thread_messages[1].id.clone();
         app.reply_editor = compose("newer draft");
 
@@ -2733,7 +2748,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         app.active_thread_seq = 1;
         app.reply_editor = compose("committed");
 
-        let _ = app.__update(__DucktapeMessage::SendReplySubmit);
+        let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+            editor::composer_submit_event(),
+        ));
         let operation_id = app.thread_messages[0].id.clone();
         let _ = app.__update(__DucktapeMessage::ThreadReplySendFailed(
             backend::OptimisticMutationError {
@@ -2752,7 +2769,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         assert!(!app.thread_loading);
 
         app.reply_editor = compose("still available");
-        let _ = app.__update(__DucktapeMessage::SendReplySubmit);
+        let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+            editor::composer_submit_event(),
+        ));
         assert_eq!(app.thread_messages.len(), 2);
         assert!(app.thread_messages.iter().all(|message| message.pending));
         assert!(reply_composer(&app).is_empty());
@@ -2901,7 +2920,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         ));
 
         // Client-local only: no wire read-cursor leaked into the module surface.
-        let backend_ice = include_str!("ui/backend.ice");
+        let backend_ice = include_str!("ui/extern/backend.ice");
         assert!(!backend_ice.contains("read_cursor"));
         assert!(!backend_ice.contains("mark_read(rpc"));
     }
