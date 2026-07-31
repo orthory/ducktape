@@ -29,6 +29,7 @@ extern crate::backend
   BlockCommentsRefreshData(generation:i64, target:str, threads:[PageCommentThread], total:i64, threads_next_from:i64, threads_has_more:bool, thread_id:str, comments:[PageComment], comments_next_from:i64, comments_has_more:bool)
   PageSearchHit(page_id:str, block_id:str, kind:str, text:str)
   PageSearchData(generation:i64, hits:[PageSearchHit])
+  PaletteSearchData(generation:i64, chat_hits:[ChatSearchHit], page_hits:[PageSearchHit])
   AutosaveResult(generation:i64, written:bool)
   WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
   BellItem(seq:i64, kind:str, body:str, source:str, height:i64, read:bool)
@@ -338,3 +339,4 @@ extern crate::backend
   move_block(rpc:str, password:str, page_id:str, block_id:str, direction:str) -> PagesData ! AppError
   remove_block(rpc:str, password:str, page_id:str, block_id:str) -> PagesData ! AppError
   search_pages(rpc:str, page_id:str, text:str, generation:i64) -> PageSearchData ! HydrationError
+  palette_search(rpc:str, text:str, generation:i64) -> PaletteSearchData ! HydrationError

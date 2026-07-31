@@ -63,6 +63,7 @@ pub struct ForgeItemData {
 /// The repo namespace with committed heads, each row carrying the about line,
 /// language and last-moved stamp the repo card renders.
 pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
+    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let reply: serde_json::Value = client

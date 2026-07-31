@@ -20,6 +20,11 @@ state
   messages:[ChatMessage] = []
   channel_reads:[ChannelRead] = []
   unread_boundary:i64 = 0
+  // The seq wearing the "New" divider — first_unread_seq(messages,
+  // unread_boundary), recomputed WHERE those two change, never in the view:
+  // called inside `for message in messages` the extern's by-value ABI deep-
+  // cloned the whole timeline once per row, per frame (O(n²) allocations).
+  unread_marker_seq:i64 = 0
   active_channel = ""
   active_channel_name = ""
   active_channel_archived = false
@@ -302,17 +307,10 @@ state
   toast = ""
   toast_tone = "info"
   leave_armed = false
-  // MOTION — the artifact's vocabulary, and all of it: a spinner, a status
-  // pulse, and the rise an overlay enters on. Nothing decorative.
-  spin:animation[f64] = 0.0
-    easing linear
-    duration 800ms
-    repeat forever
-  pulse:animation[f64] = 0.0
-    easing ease-in-out
-    duration 1700ms
-    repeat forever
-    auto-reverse true
-  overlay_in:animation[bool] = false
-    easing ease-out
-    duration 180ms
+  // MOTION — deliberately none. A `repeat forever` animation is a one-way
+  // ratchet in the runtime: lilt reports it animating from its first
+  // transition until process exit, which holds the window-frames subscription
+  // open and rebuilds the ENTIRE view at display refresh rate — here for
+  // pixels no view read (`spin`/`overlay_in` were never written, `pulse` was
+  // never rendered). Motion returns when the runtime gates frames on
+  // animations a view actually consumes.

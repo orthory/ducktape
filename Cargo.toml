@@ -344,6 +344,139 @@ block = { path = "patches/block" }
 [profile.dev.package.ducktape-app]
 debug = 0
 
+# `make dev` runs the desktop app under the dev profile, and an unoptimized
+# GUI stack is a lag machine on its own: cosmic-text shapes every glyph run
+# ~10x slower and iced re-lays the whole tree per frame. Optimizing ONLY the
+# render/text/gpu dependency stack keeps workspace crates fast to compile
+# (a `package."*"` wildcard would drag the node's wasmtime universe to O2,
+# which this box cannot compile reliably — #887).
+[profile.dev.package.iced]
+opt-level = 2
+
+[profile.dev.package.iced_core]
+opt-level = 2
+
+[profile.dev.package.iced_debug]
+opt-level = 2
+
+[profile.dev.package.iced_futures]
+opt-level = 2
+
+[profile.dev.package.iced_graphics]
+opt-level = 2
+
+[profile.dev.package.iced_program]
+opt-level = 2
+
+[profile.dev.package.iced_renderer]
+opt-level = 2
+
+[profile.dev.package.iced_runtime]
+opt-level = 2
+
+[profile.dev.package.iced_selector]
+opt-level = 2
+
+[profile.dev.package.iced_tiny_skia]
+opt-level = 2
+
+[profile.dev.package.iced_wgpu]
+opt-level = 2
+
+[profile.dev.package.iced_widget]
+opt-level = 2
+
+[profile.dev.package.iced_winit]
+opt-level = 2
+
+[profile.dev.package.winit]
+opt-level = 2
+
+[profile.dev.package.lilt]
+opt-level = 2
+
+[profile.dev.package.cosmic-text]
+opt-level = 2
+
+[profile.dev.package.cryoglyph]
+opt-level = 2
+
+[profile.dev.package.fontdb]
+opt-level = 2
+
+[profile.dev.package.rustybuzz]
+opt-level = 2
+
+[profile.dev.package.ttf-parser]
+opt-level = 2
+
+[profile.dev.package.swash]
+opt-level = 2
+
+[profile.dev.package.zeno]
+opt-level = 2
+
+[profile.dev.package.yazi]
+opt-level = 2
+
+[profile.dev.package.unicode-bidi]
+opt-level = 2
+
+[profile.dev.package.unicode-script]
+opt-level = 2
+
+[profile.dev.package.unicode-segmentation]
+opt-level = 2
+
+[profile.dev.package.wgpu]
+opt-level = 2
+
+[profile.dev.package.wgpu-core]
+opt-level = 2
+
+[profile.dev.package.wgpu-hal]
+opt-level = 2
+
+[profile.dev.package.wgpu-types]
+opt-level = 2
+
+[profile.dev.package.naga]
+opt-level = 2
+
+[profile.dev.package.tiny-skia]
+opt-level = 2
+
+[profile.dev.package.tiny-skia-path]
+opt-level = 2
+
+[profile.dev.package.lyon]
+opt-level = 2
+
+[profile.dev.package.lyon_algorithms]
+opt-level = 2
+
+[profile.dev.package.lyon_geom]
+opt-level = 2
+
+[profile.dev.package.lyon_path]
+opt-level = 2
+
+[profile.dev.package.lyon_tessellation]
+opt-level = 2
+
+[profile.dev.package.kurbo]
+opt-level = 2
+
+[profile.dev.package.resvg]
+opt-level = 2
+
+[profile.dev.package.usvg]
+opt-level = 2
+
+[profile.dev.package.softbuffer]
+opt-level = 2
+
+
 [profile.dev.package.cranelift-codegen]
 opt-level = 3
 

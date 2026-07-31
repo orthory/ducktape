@@ -35,13 +35,6 @@ on account_rename_failed(cause)
 on agents_loaded(next)
   return if next.generation != agents_generation
   agents_rows = next.agents
-  // `pulse` is the console's only breathing dot and it repeats forever, so a
-  // live agent is the one fact that starts it — and the ABSENCE of one is the
-  // fact that has to stop it. Written on both edges: an early return here would
-  // leave the dot lit for the rest of the session after the last agent pauses.
-  pulse = 0.0
-  return if !any_agent_active(next.agents)
-  pulse = 1.0
 
 on agents_failed(cause)
   return if cause.generation != agents_generation

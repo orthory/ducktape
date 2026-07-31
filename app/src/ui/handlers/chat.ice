@@ -246,6 +246,7 @@ on chat_composer_event(event)
   message_draft = ""
   message_editor = editor("")
   messages = optimistic_message(messages, pending_message, pending_message_id)
+  unread_marker_seq = first_unread_seq(messages, unread_boundary)
   error = ""
   run send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _
 
@@ -256,6 +257,7 @@ on message_sent(next)
 on message_send_failed(cause)
   return if active_channel != cause.scope_id
   messages = rollback_pending_message(messages, cause.operation_id, cause.committed)
+  unread_marker_seq = first_unread_seq(messages, unread_boundary)
   failed_message_draft = remember_failed_draft(failed_message_draft, trim(editor_text(message_editor)), cause.body, cause.committed)
   message_draft = restore_draft(trim(editor_text(message_editor)), cause.body, cause.committed)
   message_editor = editor(message_draft)
@@ -270,6 +272,7 @@ on chat_updated(next)
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
+  unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
@@ -305,6 +308,7 @@ on chat_hit_loaded(next)
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
+  unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
@@ -343,6 +347,7 @@ on channel_created(next)
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
+  unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
@@ -604,6 +609,7 @@ on load_more_history
 on history_loaded(next)
   return if next.generation != history_generation || !history_loading
   messages = prepend_history(messages, next.messages)
+  unread_marker_seq = first_unread_seq(messages, unread_boundary)
   history_loading = false
   error = ""
 
