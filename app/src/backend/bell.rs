@@ -55,7 +55,7 @@ pub async fn load_bell(rpc: String, generation: i64) -> Result<BellData, Hydrati
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -110,6 +110,18 @@ pub fn bell_head(items: Vec<BellItem>) -> i64 {
 /// PROJECTION of the delivering module's `kind` token, not a field anything
 /// signed. A kind this mapping does not name reads `info`: an unclassified
 /// notice is a notice, never an alarm.
+/// The row's title: the wire `kind` token said as words. The vocabulary is
+/// open — any module mints tokens — so this is a rendering, not a registry:
+/// `review_requested` reads "Review requested".
+pub fn bell_title(kind: String) -> String {
+    let words = kind.replace('_', " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => words,
+    }
+}
+
 pub fn bell_severity(kind: String) -> String {
     const WARN: &[&str] = &[
         "review_requested",

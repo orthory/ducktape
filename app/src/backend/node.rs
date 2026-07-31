@@ -66,7 +66,7 @@ pub async fn load_settings_facts(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -276,7 +276,7 @@ pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, 
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -337,7 +337,7 @@ pub async fn load_peers(rpc: String, generation: i64) -> Result<PeersData, Hydra
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -421,7 +421,7 @@ pub async fn load_modules(rpc: String, generation: i64) -> Result<ModulesData, H
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -608,7 +608,7 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -732,7 +732,7 @@ pub async fn load_agent_runs(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -826,7 +826,7 @@ pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, H
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 

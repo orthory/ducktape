@@ -260,7 +260,7 @@ component NodeLogConsole(source:str)
         text "NODE LOG" size=9.0 wrap=none font=code_semibold @text-toast_fg
         space w=fill
         text source size=10.5 wrap=none font=code_medium @text-input
-      scroll dir=vertical w=fill h=fill bar=hidden
+      scroll dir=vertical w=fill h=fill bar=hidden anchor-y=end auto=true
         col w=fill gap=5.0
           slot
 

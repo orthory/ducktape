@@ -235,9 +235,12 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
                         forward
                           open_chat_search_hit
             if !connected
-              EmptyState title="Connect to a node" description="Set the RPC endpoint in the sidebar."
-            if connected && empty(messages)
+              EmptyState title="Connect to a node" description="Open Settings from the rail below and set the node endpoint."
+            if connected && !loading && empty(messages)
               EmptyState title="No messages yet" description="Create a channel or start the conversation."
+            if connected && loading && empty(messages)
+              box w=fill h=fill align-x=center align-y=center
+                text "Loading messages…" size=12.5 @text-meta
             if connected && !empty(messages) && history_view
               box w=fill h=32.0 pl=10.0 pr=6.0 bg=warning_bg border=warning_line border-w=1.0 r=9.0
                 row w=fill h=fill gap=8.0 align=center
@@ -251,7 +254,7 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
                 sensor show=emit(chat_resized, _, _) resize=emit(chat_resized, _, _)
                   space w=fill h=fill
                 mouse move=emit(chat_pointer_moved, _, _)
-                  scroll dir=vertical w=fill h=fill
+                  scroll dir=vertical w=fill h=fill anchor-y=end auto=true
                     col w=fill gap=3.0
                       if history_has_older(messages)
                         box w=fill align-x=center pt=4.0 pb=8.0
@@ -489,7 +492,7 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
                       hovered bg=fg/11 text=fg
                       pressed bg=brand_bg
                   Separator
-                  scroll dir=vertical w=fill h=fill
+                  scroll dir=vertical w=fill h=fill anchor-y=end auto=true
                     col w=fill gap=1.0
                       for thread_message in thread_messages
                         // THE ROOT GETS ITS OWN DIVIDED BLOCK. One

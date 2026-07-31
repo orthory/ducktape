@@ -58,6 +58,12 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
 on choose_channel(id)
   return if loading || mutation_phase != "idle"
   active_dm_peer = ""
+  // The switch is visible NOW: the clicked room takes the header and the
+  // sidebar highlight, and the previous room's messages leave the pane before
+  // the round-trip — a click that repaints nothing reads as a dead app.
+  active_channel = id
+  active_channel_name = channel_display_name(channels, active_channel, active_channel_name)
+  messages = []
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   hydration_generation = hydration_generation + 1
@@ -84,7 +90,7 @@ on choose_channel(id)
   reply_editor = editor("")
   pending_reply = ""
   error = ""
-  run load_chat(connected_rpc, id) -> chat_updated _ | failed _
+  run load_chat(connected_rpc, active_channel) -> chat_updated _ | failed _
 
 // A DM is not a second message plane: it is the two-party members-only channel
 // at `dm_channel_id(me, peer)`, resolved or created on the way in. Everything
@@ -92,6 +98,9 @@ on choose_channel(id)
 on choose_dm(peer_key)
   return if loading || mutation_phase != "idle" || empty(peer_key)
   active_dm_peer = peer_key
+  // Same visible switch as `choose_channel`: the stale room leaves the pane
+  // immediately; the DM header already derives from `dm_peers`.
+  messages = []
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   hydration_generation = hydration_generation + 1

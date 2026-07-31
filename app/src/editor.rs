@@ -116,7 +116,10 @@ fn composer_style(_theme: &iced::Theme, status: text_editor::Status) -> text_edi
             Border {
                 color: RING,
                 width: 1.0,
-                radius: 0.0.into(),
+                // The composer mounts inside rounded plates (r=12 cards in
+                // chat, thread and forge) — a square ring visibly pokes their
+                // corners.
+                radius: 9.0.into(),
             }
         } else {
             Border::default()

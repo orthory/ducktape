@@ -75,7 +75,7 @@ pub async fn files_ls(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -100,7 +100,7 @@ pub async fn files_find(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -177,7 +177,7 @@ pub async fn files_preview(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -210,7 +210,7 @@ pub async fn files_history(rpc: String, generation: i64) -> Result<FsHistory, Hy
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -380,7 +380,7 @@ pub async fn files_diff(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -460,7 +460,7 @@ pub async fn last_changed_at_path(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 

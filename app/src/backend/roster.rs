@@ -86,7 +86,7 @@ pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, H
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -238,7 +238,7 @@ pub async fn load_governance(
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 

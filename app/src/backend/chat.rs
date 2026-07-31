@@ -305,7 +305,7 @@ pub async fn load_thread(
         })
         .map_err(|message| HydrationError {
             generation,
-            message,
+            message: user_error(message),
         })
 }
 
@@ -346,7 +346,7 @@ pub async fn load_thread_page(
     .await;
     result.map_err(|message| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -595,7 +595,7 @@ pub async fn search_chat(
     .await;
     result.map_err(|message| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -628,7 +628,7 @@ pub async fn load_block_threads(
     .await;
     result.map_err(|message| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -671,7 +671,7 @@ pub async fn load_page_threads(
     .await;
     result.map_err(|message| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -694,7 +694,7 @@ pub async fn load_block_comment_page(
     .await;
     result.map_err(|message| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -762,7 +762,7 @@ pub async fn refresh_block_comments(
     .await;
     result.map_err(|message| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
@@ -874,7 +874,7 @@ pub async fn autosave_block_text(
         })
         .map_err(|message| HydrationError {
             generation,
-            message,
+            message: user_error(message),
         })
 }
 
@@ -1156,6 +1156,6 @@ pub async fn search_pages(
     .await;
     result.map_err(|message| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }

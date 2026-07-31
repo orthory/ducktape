@@ -67,7 +67,7 @@ pub async fn load_explorer(rpc: String, generation: i64) -> Result<ExplorerData,
     .await
     .map_err(|message: String| HydrationError {
         generation,
-        message,
+        message: user_error(message),
     })
 }
 
