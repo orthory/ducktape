@@ -329,8 +329,11 @@ fn install_nft_in_netns(pid: i32, ruleset: &str) -> Result<(), String> {
 }
 
 /// resolve a system tool by PATH, then the standard sbin/bin dirs a non-root
-/// PATH usually omits — `nft` ships in `/usr/sbin`. Shared with the sandbox boot
-/// probe ([`crate::SandboxBackend::probe`]).
+/// PATH usually omits — `nft` ships in `/usr/sbin`, and `conmon` is commonly
+/// ONLY in `/usr/libexec/podman` (podman's own first candidate for it). Missing
+/// that last dir would make the boot probe refuse a host podman would have run
+/// on, so the list mirrors where podman itself looks. Shared with the sandbox
+/// boot probe ([`crate::SandboxBackend::probe`]).
 pub fn find_system_tool(bin: &str) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -340,7 +343,7 @@ pub fn find_system_tool(bin: &str) -> Option<PathBuf> {
             }
         }
     }
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
+    ["/usr/sbin", "/sbin", "/usr/bin", "/bin", "/usr/libexec/podman"]
         .into_iter()
         .map(|dir| Path::new(dir).join(bin))
         .find(|cand| cand.is_file())

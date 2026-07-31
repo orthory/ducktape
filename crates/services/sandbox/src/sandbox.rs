@@ -77,22 +77,34 @@ impl SandboxBackend {
     /// unusable runtime is a loud boot error — there is no bare fallback.
     /// Podman additionally requires `pasta` (the netns backend — podman 6's only
     /// one; the run uses `nsmode = "pasta"` for deterministic host + DNS
-    /// addresses) plus `nft` + `nsenter` (the egress firewall the createRuntime
-    /// hook installs in each run's netns). All are hard dependencies, so a
-    /// missing one fails at boot, never as a silently unsandboxed / unfirewalled
-    /// run.
+    /// addresses), `nft` + `nsenter` (the egress firewall the createRuntime
+    /// hook installs in each run's netns), and `conmon` (the per-container
+    /// monitor podman spawns; without it podman answers
+    /// `could not find a working conmon binary` and serves nothing).
+    ///
+    /// `conmon` is checked HERE rather than left to podman because this probe
+    /// is what the e2e skip guards key on. While it was missing from the list,
+    /// a host with the other three passed the guard, ran the suite, and failed
+    /// 156 s later as `timed out waiting for the agent reply to post` — a
+    /// message that names neither podman nor conmon, and reads like a product
+    /// defect. A guard that reports "ready" while the runtime cannot start a
+    /// container is worse than no guard: it converts a missing package into a
+    /// phantom bug hunt.
+    ///
+    /// All are hard dependencies, so a missing one fails at boot, never as a
+    /// silently unsandboxed / unfirewalled run.
     pub fn probe(&self) -> Result<PathBuf, String> {
         let bin = self.runtime_bin();
         let found = find_on_path(bin).ok_or_else(|| {
             format!("sandbox runtime {bin:?} is not executable on PATH; install it or pick a runtime this host provides")
         })?;
         if matches!(self, SandboxBackend::Podman { .. }) {
-            for dep in ["pasta", "nft", "nsenter"] {
+            for dep in ["pasta", "nft", "nsenter", "conmon"] {
                 if crate::podman_api::find_system_tool(dep).is_none() {
                     return Err(format!(
                         "{dep} is not executable on PATH or a standard sbin dir; the Podman \
-                         sandbox requires it (pasta = netns, nft + nsenter = egress firewall) \
-                         — install it"
+                         sandbox requires it (pasta = netns, nft + nsenter = egress firewall, \
+                         conmon = the container monitor podman spawns per run) — install it"
                     ));
                 }
             }
