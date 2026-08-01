@@ -141,6 +141,56 @@ pub fn palette_key_action(
     "none".into()
 }
 
+/// The surface Escape dismisses — the TOPMOST transient layer only, and the
+/// ladder's order IS the z-order. Menus, popovers, the create modal and the
+/// bell close; persistent rails (thread, comments, the channel drawer) keep
+/// their explicit × — closing one from a global key would also have to
+/// adjudicate its half-typed drafts. The palette is absent on purpose:
+/// `palette_key_action` owns its keys, and an open palette swallows Escape.
+//
+// One argument per closable surface: the Ice extern surface is flat, and the
+// ladder must see every layer at once to name the topmost.
+#[allow(clippy::too_many_arguments)]
+pub fn escape_target(
+    logical: iced::keyboard::Key,
+    palette_open: bool,
+    bell_open: bool,
+    channel_create_open: bool,
+    thread_message_action: String,
+    message_action: String,
+    block_actions_open: bool,
+    block_insert_open: bool,
+    forge_repo_menu: bool,
+) -> String {
+    use iced::keyboard::{Key, key::Named};
+    let not_escape = logical != Key::Named(Named::Escape);
+    if not_escape || palette_open {
+        return String::new();
+    }
+    if bell_open {
+        return "bell".into();
+    }
+    if channel_create_open {
+        return "channel_create".into();
+    }
+    if thread_message_action != "toolbar" {
+        return "thread_menu".into();
+    }
+    if message_action != "toolbar" {
+        return "message_menu".into();
+    }
+    if block_actions_open {
+        return "block_actions".into();
+    }
+    if block_insert_open {
+        return "block_insert".into();
+    }
+    if forge_repo_menu {
+        return "repo_menu".into();
+    }
+    String::new()
+}
+
 /// The slash menu: a draft starting with `/` filters the insertable block
 /// kinds by case-insensitive prefix (`/h` -> the headings). Empty when the
 /// draft is not a slash command.

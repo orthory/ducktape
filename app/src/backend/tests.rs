@@ -876,6 +876,86 @@ fn palette_keys_use_logical_escape_and_physical_shortcut() {
 }
 
 #[test]
+fn escape_ladder_names_the_topmost_transient_layer_only() {
+    use iced::keyboard::{Key, key::Named};
+
+    let escape = Key::Named(Named::Escape);
+    let target = |palette: bool,
+                  bell: bool,
+                  create: bool,
+                  thread_action: &str,
+                  action: &str,
+                  blocks: bool,
+                  insert: bool,
+                  repo_menu: bool| {
+        escape_target(
+            escape.clone(),
+            palette,
+            bell,
+            create,
+            thread_action.into(),
+            action.into(),
+            blocks,
+            insert,
+            repo_menu,
+        )
+    };
+
+    // Not Escape → nothing, whatever is open.
+    assert_eq!(
+        escape_target(
+            Key::Character("x".into()),
+            false,
+            true,
+            true,
+            "more".into(),
+            "more".into(),
+            true,
+            true,
+            true,
+        ),
+        ""
+    );
+    // An open palette swallows Escape — palette_key_action owns it.
+    assert_eq!(target(true, true, true, "more", "more", true, true, true), "");
+    // The ladder order is the z-order: bell over the create modal, menus
+    // after both, thread menu over the stream's, popovers last.
+    assert_eq!(
+        target(false, true, true, "more", "more", true, true, true),
+        "bell"
+    );
+    assert_eq!(
+        target(false, false, true, "more", "more", true, true, true),
+        "channel_create"
+    );
+    assert_eq!(
+        target(false, false, false, "more", "more", true, true, true),
+        "thread_menu"
+    );
+    assert_eq!(
+        target(false, false, false, "toolbar", "editing", true, true, true),
+        "message_menu"
+    );
+    assert_eq!(
+        target(false, false, false, "toolbar", "toolbar", true, true, true),
+        "block_actions"
+    );
+    assert_eq!(
+        target(false, false, false, "toolbar", "toolbar", false, true, true),
+        "block_insert"
+    );
+    assert_eq!(
+        target(false, false, false, "toolbar", "toolbar", false, false, true),
+        "repo_menu"
+    );
+    // Nothing transient open → Escape is a no-op.
+    assert_eq!(
+        target(false, false, false, "toolbar", "toolbar", false, false, false),
+        ""
+    );
+}
+
+#[test]
 fn files_base64_round_trips() {
     for sample in [
         b"".as_slice(),

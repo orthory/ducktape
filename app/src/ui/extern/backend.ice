@@ -89,6 +89,7 @@ extern crate::backend
   stream provision_progress(workspace:str, rpc:str) -> ProvisionStep
   sync connection_degraded(status:str) -> bool
   sync palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
+  sync escape_target(logical:key, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, block_actions_open:bool, block_insert_open:bool, forge_repo_menu:bool) -> str
   NavItem(id:str, title:str, icon:str, badge:i64, active:bool, live:bool)
   FsEntry(path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
