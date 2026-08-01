@@ -50,7 +50,7 @@ component HuddleLivePill(name:str, elapsed:str)
         pressed bg=ink_hover text=toast_fg
       box w=1.0 h=14.0 bg=panel_tile
         space w=1.0 h=1.0
-      button label="Leave the huddle" w=20.0 h=20.0 @icon_action px-0px py-0px -> emit(leave_huddle_here)
+      button label="Leave the huddle" w=24.0 h=24.0 @icon_action px-0px py-0px -> emit(leave_huddle_here)
         box w=fill h=fill align-x=center align-y=center
           text "✕" size=10.5 wrap=none font=code_medium @text-danger_soft
         active bg=transparent text=danger_soft border=transparent border-w=1.0 r=5.0
