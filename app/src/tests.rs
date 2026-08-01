@@ -987,12 +987,15 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     assert!(chat.contains("dismiss=emit(clear_message_selection) backdrop=transparent"));
     assert!(chat.contains("mouse move=emit(chat_pointer_moved, _, _)"));
     assert!(chat.contains("float x=0.0 y=message_menu_y"));
-    // the pointer sensor is the stack's FIRST child, so it measures the
-    // message list itself and not whatever an overlay happens to cover.
-    // The screen holds the SEAT and the mount fills it: `sensor` cannot
-    // the sensor is the stack's FIRST child, so it measures the message
-    // list and not the pane around it.
-    let sensor = chat.split_once("stack w=fill h=fill\n").unwrap().1;
+    // the pointer sensor is the MESSAGE-LIST stack's first child, so it
+    // measures the message list itself and not whatever an overlay happens
+    // to cover. The anchor names that stack by its exact indentation: the
+    // outer content stack (which floats the search-results card) sits
+    // shallower and must not satisfy this pin.
+    let sensor = chat
+        .split_once("                stack w=fill h=fill\n")
+        .unwrap()
+        .1;
     assert!(
         sensor
             .trim_start()
