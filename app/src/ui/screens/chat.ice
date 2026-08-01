@@ -264,27 +264,51 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
                                 text "New messages" size=12.5 wrap=none @text-brand
                                 box w=fill h=1.0 bg=brand/40
                                   text ""
-                            stack #message(message.id) w=fill
-                              // THE ONE DASHED BORDER IN THE CONSOLE.
-                              // `message.pending` is this app's only
-                              // optimistic write — seeded by
-                              // `optimistic_message`, cleared by
-                              // `merge_message_send_result` — so the
-                              // design system's "not yet settled is
-                              // dashed" rule is drawn here and nowhere
-                              // else. The ring is over the card, so the
-                              // card keeps its own plate.
-                              UnfinalizedFrame pending=message.pending
-                                MessageCard message=message selected=(message.seq == selected_message_seq) hovered=(message.seq == hovered_message_seq) disabled=loading
-                                  forward
-                                    message_entered
-                                    message_exited
-                                    add_reaction_at
-                                    remove_reaction_at
-                                    open_thread_for
-                                    open_message_actions_accessibly
-                                    open_message_reactions
-                                    open_message_actions
+                            // LAZY OFF THE HOT PATH. A quiet row rebuilds
+                            // only when its MESSAGE changes; the row under
+                            // the pointer or selection is built live, because
+                            // its toolbar reads `loading` and the selection.
+                            // Inside `lazy` ONLY the cached alias is visible
+                            // (the Element<'static> contract), so the cached
+                            // arm passes disabled=false — every reaction
+                            // handler guards on loading anyway, and the cost
+                            // is a brief cosmetic un-grey during a load.
+                            //
+                            // THE ONE DASHED BORDER IN THE CONSOLE.
+                            // `message.pending` is this app's only optimistic
+                            // write — seeded by `optimistic_message`, cleared
+                            // by `merge_message_send_result` — so the design
+                            // system's "not yet settled is dashed" rule is
+                            // drawn here (both arms) and nowhere else. The
+                            // ring is over the card, so the card keeps its
+                            // own plate.
+                            if message.seq == selected_message_seq || message.seq == hovered_message_seq
+                              stack #message(message.id) w=fill
+                                UnfinalizedFrame pending=message.pending
+                                  MessageCard message=message selected=(message.seq == selected_message_seq) hovered=(message.seq == hovered_message_seq) disabled=loading
+                                    forward
+                                      message_entered
+                                      message_exited
+                                      add_reaction_at
+                                      remove_reaction_at
+                                      open_thread_for
+                                      open_message_actions_accessibly
+                                      open_message_reactions
+                                      open_message_actions
+                            if message.seq != selected_message_seq && message.seq != hovered_message_seq
+                              lazy message as cached_message
+                                stack #message(cached_message.id) w=fill
+                                  UnfinalizedFrame pending=cached_message.pending
+                                    MessageCard message=cached_message selected=false hovered=false disabled=false
+                                      events
+                                        message_entered -> message_entered _
+                                        message_exited -> message_exited _
+                                        add_reaction_at -> add_reaction_at _ _
+                                        remove_reaction_at -> remove_reaction_at _ _
+                                        open_thread_for -> open_thread_for _
+                                        open_message_actions_accessibly -> open_message_actions_accessibly _ _ _
+                                        open_message_reactions -> open_message_reactions _ _ _
+                                        open_message_actions -> open_message_actions _ _ _
                   overlay when=(selected_message_seq > 0 && message_action != "toolbar") dismiss=emit(clear_message_selection) backdrop=transparent p=8.0 align-x=end align-y=start
                     content
                       space w=fill h=fill
