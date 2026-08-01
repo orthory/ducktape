@@ -71,8 +71,7 @@ on reconnect
   block_autosave_generation = cancel_autosaves(connected_rpc, block_autosave_generation)
   message_draft = trim(editor_text(message_editor))
   message_editor = editor(message_draft)
-  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, trim(editor_text(block_editor)), selected_block_saved_text, block_autosave_status)
-  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = "idle"
@@ -118,14 +117,6 @@ on reconnect
   active_page_title = ""
   active_page_parent = ""
   pending_page = ""
-  pending_block = ""
-  block_insert_after_id = ""
-  block_insert_open = !empty(block_draft)
-  selected_block_id = ""
-  hovered_block_id = ""
-  selected_block_kind = ""
-  selected_block_checked = false
-  block_actions_open = false
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -142,11 +133,11 @@ on reconnect
   block_comment_draft = ""
   pending_block_comment = ""
   page_title_selected = false
-  block_editor = editor("")
-  selected_block_saved_text = ""
+  page_editor = editor("")
+  page_saved_text = ""
+  page_refusal = ""
   block_autosave_status = "idle"
   page_delete_armed = false
-  block_delete_armed = false
   page_search_hits = []
   page_search_generation = page_search_generation + 1
   page_searching = false
@@ -302,18 +293,13 @@ on live_resynced(next)
   channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
   pages = keep_pages(next.pages_loaded, next.pages, pages)
   blocks = keep_blocks(next.pages_loaded, merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, ""), blocks)
-  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, blocks, selected_block_id, trim(editor_text(block_editor)), selected_block_saved_text, block_autosave_status)
-  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, blocks, selected_block_id, block_comment_draft)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, blocks, active_page, block_comment_draft)
   // The canonical text only replaces the buffer when the editor is CLEAN and
   // the text actually differs — a rebuilt `Content` throws the cursor to the
   // origin, so the saved baseline and the buffer move on one shared decision.
-  let resynced_saved = refreshed_block_saved(trim(editor_text(block_editor)), blocks, selected_block_id, selected_block_saved_text, block_autosave_status)
-  block_editor = refreshed_block_editor(block_editor, blocks, selected_block_id, selected_block_saved_text, block_autosave_status)
-  selected_block_saved_text = resynced_saved
-  block_autosave_generation = cancel_missing_block_autosave(connected_rpc, block_autosave_generation, blocks, selected_block_id)
-  selected_block_id = refreshed_selected_block(blocks, selected_block_id)
-  selected_block_kind = retain_selected_string(selected_block_kind, selected_block_id)
-  selected_block_checked = selected_block_checked && !empty(selected_block_id)
+  let resynced_saved = refreshed_page_saved(page_editor, blocks, page_saved_text)
+  page_editor = refreshed_page_editor(page_editor, blocks, page_saved_text)
+  page_saved_text = resynced_saved
   // THE COMMENTS RAIL IS DOCUMENT-SCOPED (handlers/pages.ice:300). Its anchor is
   // the PAGE it was opened on, never a block selection — keyed on
   // `selected_block_id` it closed itself, and threw the half-typed comment away,
@@ -334,12 +320,6 @@ on live_resynced(next)
   block_thread_comments_loading = block_thread_comments_loading && !empty(block_comments_target)
   block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)
   pending_block_comment = retain_selected_string(pending_block_comment, block_comments_target)
-  block_editor = retained_block_editor(block_editor, selected_block_id)
-  selected_block_saved_text = retain_selected_string(selected_block_saved_text, selected_block_id)
-  block_delete_armed = block_delete_armed && !empty(selected_block_id)
-  block_actions_open = block_actions_open && !empty(selected_block_id)
-  block_insert_open = block_insert_open && active_page == keep_str(next.pages_loaded, next.active_page, active_page)
-  block_insert_after_id = refreshed_selected_block(blocks, block_insert_after_id)
   page_delete_armed = page_delete_armed && active_page == keep_str(next.pages_loaded, next.active_page, active_page)
   page_title_selected = page_title_selected && active_page == keep_str(next.pages_loaded, next.active_page, active_page)
   active_page = keep_str(next.pages_loaded, next.active_page, active_page)
@@ -479,10 +459,10 @@ subscribe
   // nothing outside the seconds after a send settles. A live delta may start
   // the fade earlier; this clock is the floor a quiet network needs.
   every 1200ms when (!empty(send_flash_id)) || (!empty(thread_send_flash_id)) -> send_flash_tick
-  // The block editor's autosave: the stock editor's edits never pass through
-  // a handler, so the gate IS the dirty test — the tick only exists while
-  // the buffer has drifted from the last text known saved.
-  every 900ms when (connected && !empty(selected_block_id) && trim(editor_text(block_editor)) != selected_block_saved_text) -> block_autosave_tick
+  // The page document's autosave: the editor's edits never pass through a
+  // handler, so the gate IS the dirty test — the tick only exists while the
+  // buffer has drifted from the last text known written.
+  every 900ms when (connected && !empty(active_page) && page_text(page_editor) != page_saved_text) -> page_autosave_tick
 
 on modifiers_changed(value)
   shift_held = value.shift

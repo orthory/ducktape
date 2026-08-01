@@ -225,24 +225,6 @@ state
   page_draft = ""
   page_create_open = false
   pending_page = ""
-  block_kinds = ["Text", "Page", "Heading 1", "Heading 2", "Heading 3", "Bullet", "Number", "Todo", "Toggle", "Quote", "Code", "Callout", "Divider"]
-  editable_block_kinds = ["Text", "Heading 1", "Heading 2", "Heading 3", "Bullet", "Number", "Todo", "Toggle", "Quote", "Code", "Callout", "Divider"]
-  new_block_kind = "Text"
-  block_draft = ""
-  pending_block = ""
-  pending_block_id = ""
-  block_insert_open = false
-  block_insert_after_id = ""
-  selected_block_id = ""
-  hovered_block_id = ""
-  pages_pointer_x = 0.0
-  pages_pointer_y = 0.0
-  pages_height = 720.0
-  block_menu_x = 0.0
-  block_menu_y = 0.0
-  selected_block_kind = ""
-  selected_block_checked = false
-  block_actions_open = false
   block_comments_open = false
   block_comments_target = ""
   block_comments_generation:i64 = 0
@@ -259,22 +241,20 @@ state
   block_comment_draft = ""
   pending_block_comment = ""
   page_title_selected = false
-  // The selected block edits in place through this document; dirtiness is
-  // the text's drift from `selected_block_saved_text` (the last text known
-  // saved), because the stock editor's edits never pass through a handler.
-  block_editor:editor = ""
-  selected_block_saved_text = ""
-  block_autosave_inflight_text = ""
-  block_focus_key:i64 = -1
-  // Scratch seat for a block-key payload field (the palette_key precedent:
-  // a route payload's field does not type inside a `let` or a call).
-  block_key_action = ""
+  // THE PAGE IS ONE BUFFER. `page_editor` holds the whole document; its drift
+  // from `page_saved_text` (the last text known written) IS the dirty signal,
+  // because the editor's own edits never pass through a handler. The save tick
+  // only exists while that drift does.
+  page_editor:editor = ""
+  page_saved_text = ""
+  page_inflight_text = ""
+  // Why a write was NOT attempted — see DocumentSaveResult. Cleared by the
+  // next edit, because it describes an edit that has already been undone.
+  page_refusal = ""
   block_autosave_status = "idle"
   block_autosave_generation:i64 = 0
-  orphaned_block_drafts:[str] = []
   orphaned_comment_drafts:[str] = []
   page_delete_armed = false
-  block_delete_armed = false
   page_search_draft = ""
   page_search_hits:[PageSearchHit] = []
   page_searching = false

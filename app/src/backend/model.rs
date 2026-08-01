@@ -1,50 +1,7 @@
-use iced::widget::text_editor::Content;
-
 use super::*;
 
 pub fn fresh_operation_id(prefix: String) -> String {
     fresh_id(&prefix)
-}
-
-pub fn optimistic_block(
-    mut blocks: Vec<PageBlock>,
-    after_id: String,
-    kind: String,
-    text: String,
-    id: String,
-) -> Vec<PageBlock> {
-    let selected_index = blocks.iter().position(|block| block.id == after_id);
-    let (insert_at, parent, prefix) = match selected_index {
-        Some(index) => {
-            let selected = &blocks[index];
-            let selected_depth = selected.prefix.len();
-            let insert_at = blocks
-                .iter()
-                .enumerate()
-                .skip(index + 1)
-                .find(|(_, block)| block.prefix.len() <= selected_depth)
-                .map_or(blocks.len(), |(index, _)| index);
-            (insert_at, selected.parent.clone(), selected.prefix.clone())
-        }
-        None => (blocks.len(), String::new(), String::new()),
-    };
-    blocks.insert(
-        insert_at,
-        PageBlock {
-            key: page_block_key(&id),
-            id,
-            parent,
-            kind,
-            spans: plain_rich_spans(&text),
-            text,
-            pending: true,
-            checked: false,
-            prefix,
-            child_count: 0,
-            mark_count: 0,
-        },
-    );
-    blocks
 }
 
 pub fn merge_pending_blocks(
@@ -84,68 +41,6 @@ pub fn merge_pending_blocks(
     }
     merged.extend(pending_by_anchor.into_values().flatten());
     merged
-}
-
-pub fn merge_block_insert_result(
-    canonical: Vec<PageBlock>,
-    current: Vec<PageBlock>,
-    current_page: String,
-    next_page: String,
-    settled_id: String,
-) -> Vec<PageBlock> {
-    if current_page != next_page {
-        return canonical;
-    }
-    let canonical_ids = canonical
-        .iter()
-        .map(|block| block.id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut extras_by_anchor = BTreeMap::<String, Vec<PageBlock>>::new();
-    let mut anchor = String::new();
-    for block in current {
-        if canonical_ids.contains(&block.id) {
-            anchor = block.id;
-        } else if block.id != settled_id {
-            extras_by_anchor
-                .entry(anchor.clone())
-                .or_default()
-                .push(block);
-        }
-    }
-    if extras_by_anchor.is_empty() {
-        return canonical;
-    }
-    let mut merged = extras_by_anchor.remove("").unwrap_or_default();
-    for block in canonical {
-        let id = block.id.clone();
-        merged.push(block);
-        merged.extend(extras_by_anchor.remove(&id).unwrap_or_default());
-    }
-    merged.extend(extras_by_anchor.into_values().flatten());
-    merged
-}
-
-pub fn rollback_pending_block(
-    mut blocks: Vec<PageBlock>,
-    pending_id: String,
-    committed: bool,
-) -> Vec<PageBlock> {
-    if !committed {
-        blocks.retain(|block| !block.pending || block.id != pending_id);
-    }
-    blocks
-}
-
-pub fn remember_failed_block(
-    mut drafts: Vec<String>,
-    current: String,
-    pending: String,
-    committed: bool,
-) -> Vec<String> {
-    if !committed && !current.is_empty() {
-        append_recovered_draft(&mut drafts, pending);
-    }
-    drafts
 }
 
 pub fn rollback_blocks(mut blocks: Vec<PageBlock>, keep_pending: bool) -> Vec<PageBlock> {
@@ -482,100 +377,6 @@ pub fn retain_thread_messages(messages: Vec<ChatMessage>, root_seq: i64) -> Vec<
     if root_seq > 0 { messages } else { Vec::new() }
 }
 
-/// Whether the block editor holds work the node does not: a save in flight or
-/// refused, or text that has drifted from the last text known saved. The tick
-/// autosave means an edit is invisible to handlers until it fires, so the
-/// text comparison — not the status — is what catches a fresh keystroke.
-fn block_edit_unsaved(current: &str, saved: &str, autosave_status: &str) -> bool {
-    let save_in_flight_or_refused = matches!(autosave_status, "saving" | "error");
-    save_in_flight_or_refused || current != saved
-}
-
-/// The canonical replacement for the live-resync refresh: the block's
-/// canonical text when the editor is clean, or `None` to keep the local
-/// buffer (and its cursor) untouched.
-fn refreshed_block_text(
-    blocks: &[PageBlock],
-    selected_id: &str,
-    current: &str,
-    saved: &str,
-    autosave_status: &str,
-) -> Option<String> {
-    if selected_id.is_empty() || block_edit_unsaved(current, saved, autosave_status) {
-        return None;
-    }
-    blocks
-        .iter()
-        .find(|block| block.id == selected_id)
-        .map(|block| block.text.clone())
-        .filter(|canonical| canonical != current)
-}
-
-/// The live-resync refresh of the block editor itself. The buffer is only
-/// rebuilt when the canonical text actually differs — replacing an equal
-/// `Content` would still throw the cursor to the origin mid-typing.
-pub fn refreshed_block_editor(
-    document: Content,
-    blocks: Vec<PageBlock>,
-    selected_id: String,
-    saved: String,
-    autosave_status: String,
-) -> Content {
-    let current = editor_block_text(&document);
-    match refreshed_block_text(&blocks, &selected_id, &current, &saved, &autosave_status) {
-        Some(canonical) => Content::with_text(&canonical),
-        None => document,
-    }
-}
-
-/// The saved-text mirror of [`refreshed_block_editor`] — the SAME decision on
-/// the SAME inputs, so the editor and its dirty baseline move together.
-pub fn refreshed_block_saved(
-    current: String,
-    blocks: Vec<PageBlock>,
-    selected_id: String,
-    saved: String,
-    autosave_status: String,
-) -> String {
-    refreshed_block_text(&blocks, &selected_id, &current, &saved, &autosave_status).unwrap_or(saved)
-}
-
-/// [`retain_selected_string`] for the editor buffer: deselection empties it
-/// without touching a live selection's buffer (identity pass-through keeps
-/// the cursor).
-pub fn retained_block_editor(document: Content, selected_id: String) -> Content {
-    if selected_id.is_empty() {
-        return Content::new();
-    }
-    document
-}
-
-/// One block's text as the wire sees it: `Content::text()` always appends a
-/// trailing newline that was never typed, so it is stripped — and ONLY it, a
-/// deliberate trailing space mid-edit must stay dirty-visible.
-fn editor_block_text(document: &Content) -> String {
-    let mut text = document.text();
-    if text.ends_with('\n') {
-        text.pop();
-    }
-    text
-}
-
-pub fn remember_orphaned_block_drafts(
-    mut drafts: Vec<String>,
-    blocks: Vec<PageBlock>,
-    selected_id: String,
-    current: String,
-    saved: String,
-    autosave_status: String,
-) -> Vec<String> {
-    let unsaved = block_edit_unsaved(&current, &saved, &autosave_status);
-    if unsaved && selected_block_missing(&blocks, &selected_id) {
-        append_recovered_draft(&mut drafts, current);
-    }
-    drafts
-}
-
 pub fn remember_orphaned_comment_drafts(
     mut drafts: Vec<String>,
     blocks: Vec<PageBlock>,
@@ -595,36 +396,12 @@ pub fn remove_recovered_draft(mut drafts: Vec<String>, recovered: String) -> Vec
     drafts
 }
 
-pub fn refreshed_selected_block(blocks: Vec<PageBlock>, selected_id: String) -> String {
-    if selected_block_missing(&blocks, &selected_id) {
-        String::new()
-    } else {
-        selected_id
-    }
-}
-
-/// The nearest committed block ABOVE `id` in document order — where the
-/// selection lands after a Backspace delete, so the typing flow walks up the
-/// page instead of dropping to nothing.
-pub fn previous_block_id(blocks: Vec<PageBlock>, id: String) -> String {
-    let Some(index) = blocks.iter().position(|block| block.id == id) else {
-        return String::new();
-    };
-    blocks[..index]
-        .iter()
-        .rev()
-        .find(|block| !block.pending)
-        .map(|block| block.id.clone())
-        .unwrap_or_default()
-}
-
-/// The keyed-row key of one block, or -1 — a widget-target key that matches
-/// no row, so a focus task built from it is a safe no-op.
-pub fn block_key_of(blocks: Vec<PageBlock>, id: String) -> i64 {
-    blocks
-        .iter()
-        .find(|block| block.id == id)
-        .map_or(-1, |block| block.key)
+pub fn retain_drafts_for_endpoint(
+    drafts: Vec<String>,
+    current: String,
+    next: String,
+) -> Vec<String> {
+    if current == next { drafts } else { Vec::new() }
 }
 
 /// The kind a fresh block continues with after Enter: list-like kinds repeat
@@ -634,100 +411,6 @@ pub fn follow_kind(kind: String) -> String {
     match kind.as_str() {
         "Bullet" | "Number" | "Todo" | "Toggle" => kind,
         _ => "Text".into(),
-    }
-}
-
-/// The pure step behind the block editor's state-only keys. "split" opens the
-/// insert row under the selected block with the continuing kind and names the
-/// row to focus; "escape" drops the selection and orphans an unsaved draft.
-/// Decide-fn only — the handler applies each field (decide-fns never write).
-#[allow(clippy::too_many_arguments)]
-pub fn block_key_step(
-    action: String,
-    blocks: Vec<PageBlock>,
-    selected_id: String,
-    selected_kind: String,
-    selected_checked: bool,
-    insert_open: bool,
-    insert_after_id: String,
-    insert_kind: String,
-    current: String,
-    saved: String,
-    autosave_status: String,
-    orphaned: Vec<String>,
-) -> BlockKeyStep {
-    let keep = BlockKeyStep {
-        selected_id: selected_id.clone(),
-        selected_kind: selected_kind.clone(),
-        selected_checked,
-        insert_open,
-        insert_after_id: insert_after_id.clone(),
-        insert_kind: insert_kind.clone(),
-        focus_key: -1,
-        orphaned: orphaned.clone(),
-        autosave_bump: 0,
-    };
-    match action.as_str() {
-        "split" => BlockKeyStep {
-            insert_open: true,
-            insert_after_id: selected_id.clone(),
-            insert_kind: follow_kind(selected_kind),
-            focus_key: block_key_of(blocks, selected_id),
-            ..keep
-        },
-        "escape" => BlockKeyStep {
-            selected_id: String::new(),
-            selected_kind: String::new(),
-            selected_checked: false,
-            orphaned: remember_orphaned_block_drafts(
-                orphaned,
-                Vec::new(),
-                selected_id,
-                current,
-                saved,
-                autosave_status,
-            ),
-            autosave_bump: 1,
-            ..keep
-        },
-        // classify_block_key routes only "split" and "escape" here.
-        _ => keep,
-    }
-}
-
-/// The insert draft's markdown-prefix pass, ordered longest-first so `### `
-/// wins over `## ` over `# `.
-const BLOCK_AUTOFORMATS: [(&str, &str); 11] = [
-    ("### ", "Heading 3"),
-    ("## ", "Heading 2"),
-    ("# ", "Heading 1"),
-    ("- ", "Bullet"),
-    ("* ", "Bullet"),
-    ("1. ", "Number"),
-    ("[] ", "Todo"),
-    ("[ ] ", "Todo"),
-    ("> ", "Quote"),
-    ("```", "Code"),
-    ("---", "Divider"),
-];
-
-/// Converts a fresh insert draft's leading markdown shorthand into the block
-/// kind it names, with the shorthand stripped from the draft.
-pub fn autoformat_block_draft(draft: String, kind: String) -> BlockAutoformat {
-    // Only the default kind converts — a "# " typed into a chosen Code or
-    // Quote block is content, not a command.
-    if kind != "Text" {
-        return BlockAutoformat { kind, draft };
-    }
-    let matched = BLOCK_AUTOFORMATS
-        .iter()
-        .find_map(|(prefix, next)| draft.strip_prefix(prefix).map(|rest| (rest, *next)));
-    let Some((rest, next)) = matched else {
-        return BlockAutoformat { kind, draft };
-    };
-    BlockAutoformat {
-        kind: next.into(),
-        draft: rest.into(),
     }
 }
 
@@ -763,23 +446,6 @@ pub fn retain_selected_comments(
     } else {
         comments
     }
-}
-
-pub fn cancel_missing_block_autosave(
-    rpc: String,
-    generation: i64,
-    blocks: Vec<PageBlock>,
-    selected_id: String,
-) -> i64 {
-    if selected_block_missing(&blocks, &selected_id) {
-        let key = scope_key(rpc.trim().to_string(), selected_id);
-        autosaves()
-            .lock()
-            .expect("autosave lock poisoned")
-            .remove(&key);
-        return generation.saturating_add(1);
-    }
-    generation
 }
 
 fn selected_block_missing(blocks: &[PageBlock], selected_id: &str) -> bool {

@@ -55,8 +55,9 @@ fn reply_composer(app: &Ducktape) -> String {
     app.reply_editor.text().trim().to_string()
 }
 
-fn block_editor_text(app: &Ducktape) -> String {
-    app.block_editor.text().trim_end().to_string()
+/// The page document's text, the way the save tick reads it.
+fn page_document_text(app: &Ducktape) -> String {
+    crate::pages::page_text(app.page_editor.clone())
 }
 
 #[test]
@@ -95,8 +96,8 @@ fn default_ice_color(name: &str) -> iced::Color {
     let hex = value
         .strip_prefix('#')
         .expect("default Ice colors use hexadecimal literals");
-    let value = u32::from_str_radix(hex, 16)
-        .expect("default Ice colors are valid hexadecimal literals");
+    let value =
+        u32::from_str_radix(hex, 16).expect("default Ice colors are valid hexadecimal literals");
     match hex.len() {
         6 => iced::Color::from_rgb8(
             ((value >> 16) & 0xff) as u8,
@@ -210,14 +211,20 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
     let (mut app, _) = Ducktape::__boot();
     app.error = "could not reach the node".into();
     let _ = app.__update(__DucktapeMessage::SelectShellTab("files".into()));
-    assert_eq!(app.error, "", "the !connected early return must still clear");
+    assert_eq!(
+        app.error, "",
+        "the !connected early return must still clear"
+    );
 
     // the chat/pages path returns second, and must still clear.
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.error = "files: path not found".into();
     let _ = app.__update(__DucktapeMessage::SelectShellTab("pages".into()));
-    assert_eq!(app.error, "", "the chat/pages early return must still clear");
+    assert_eq!(
+        app.error, "",
+        "the chat/pages early return must still clear"
+    );
 
     // and the full path, which falls through to the generation bumps.
     let (mut app, _) = Ducktape::__boot();
@@ -260,7 +267,10 @@ fn assert_no_polling(lifecycle: &str) {
             // signal there is — and the gate IS the dirty test, so the tick
             // exists solely while unsaved text needs the node. It costs
             // nothing at rest and dies the moment the save lands.
-            "every 900ms when (connected && !empty(selected_block_id) && trim(editor_text(block_editor)) != selected_block_saved_text) -> block_autosave_tick",
+            // the page document's write gate: dirty IS the condition, so the
+            // tick exists only while the buffer has drifted from the node's
+            // text — not a poll, an edit-driven flush.
+            "every 900ms when (connected && !empty(active_page) && page_text(page_editor) != page_saved_text) -> page_autosave_tick",
         ]
     );
 }
@@ -318,7 +328,9 @@ fn forge_depth_rides_the_established_seams() {
     // no-advisory half and cannot contradict it.
     assert!(!forge_screen.contains("forge_item_change_requests > 0"));
     assert_eq!(
-        forge_screen.matches("forge_item_change_requests <= 0").count(),
+        forge_screen
+            .matches("forge_item_change_requests <= 0")
+            .count(),
         1
     );
     assert!(forge_screen.contains("forge_merge_note(forge_item_merge_oid, forge_item_branches)"));
@@ -383,8 +395,10 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     assert!(lifecycle.contains(
         "active_page_title = keep_str(next.pages_loaded, next.active_page_title, active_page_title)"
     ));
-    assert!(lifecycle.contains("block_editor = refreshed_block_editor("));
-    assert!(lifecycle.contains("selected_block_saved_text = resynced_saved"));
+    // A live resync must never install remote text over a buffer the user is
+    // still typing in; the buffer and its dirty baseline move on ONE decision.
+    assert!(lifecycle.contains("page_editor = refreshed_page_editor("));
+    assert!(lifecycle.contains("page_saved_text = resynced_saved"));
     // the comment rail is scoped to the PAGE it hangs off, so its draft
     // survives moving the cursor between blocks and dies with the page.
     assert!(lifecycle.contains(
@@ -405,15 +419,18 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
 #[test]
 fn context_destroying_page_handlers_recover_drafts() {
     let pages = include_str!("ui/handlers/pages.ice");
+    // The page BODY is no longer among the drafts to rescue: it is one buffer
+    // that flushes to the node on its own tick and is reinstalled from the
+    // node's text on the next load. A half-typed COMMENT still has nowhere
+    // else to live, so every context-destroying handler still guards it.
     for name in [
         "open_page_search_hit(page_id, block_id)",
         "choose_page(id)",
-        "select_block(key, id, kind, text, checked, open_actions)",
+        "toggle_block_comments",
         "pages_mutated(next)",
     ] {
         let rest = pages.split_once(&format!("on {name}")).unwrap().1;
         let body = rest.split_once("\non ").map_or(rest, |(body, _)| body);
-        assert!(body.contains("remember_orphaned_block_drafts("), "{name}");
         assert!(body.contains("remember_orphaned_comment_drafts("), "{name}");
     }
     let close_comments = pages
@@ -517,9 +534,6 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     app.reply_draft = "thread reply".into();
     app.pending_reply = "pending thread reply".into();
     app.active_page = "deleted-page".into();
-    app.block_insert_open = true;
-    app.block_insert_after_id = "deleted-block".into();
-    app.block_draft = "new block draft".into();
 
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
         7,
@@ -548,8 +562,6 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     assert!(app.pending_reply.is_empty());
     assert!(app.message_draft.is_empty());
     assert_eq!(app.active_page, "fallback-page");
-    assert!(!app.block_insert_open);
-    assert!(app.block_insert_after_id.is_empty());
 }
 
 #[test]
@@ -660,49 +672,6 @@ fn unrelated_resyncs_keep_an_initial_thread_load_alive() {
 }
 
 #[test]
-fn pages_mutation_keeps_the_canonical_selected_block() {
-    let (mut app, _) = Ducktape::__boot();
-    app.mutation_phase = "block-kind".into();
-    app.selected_block_id = "block-1".into();
-    app.selected_block_kind = "Text".into();
-    app.block_editor = compose("local");
-    app.block_actions_open = true;
-
-    let block = backend::PageBlock {
-        key: 1,
-        id: "block-1".into(),
-        parent: "page-1".into(),
-        kind: "Todo".into(),
-        text: "canonical".into(),
-        pending: false,
-        checked: true,
-        prefix: String::new(),
-        child_count: 0,
-        mark_count: 0,
-        spans: Vec::new(),
-    };
-    let _ = app.__update(__DucktapeMessage::PagesMutated(backend::PagesData {
-        pages: Vec::new(),
-        blocks: vec![block],
-        active_page: "page-1".into(),
-        active_page_title: "Page".into(),
-        active_page_parent: String::new(),
-        selected_block_id: "block-1".into(),
-        selected_block_kind: "Todo".into(),
-        selected_block_text: "canonical".into(),
-        selected_block_checked: true,
-        page_title_selected: false,
-    }));
-
-    assert_eq!(app.selected_block_id, "block-1");
-    assert_eq!(app.selected_block_kind, "Todo");
-    assert_eq!(block_editor_text(&app), "canonical");
-    assert!(app.selected_block_checked);
-    assert!(!app.block_actions_open);
-    assert_eq!(app.mutation_phase, "idle");
-}
-
-#[test]
 fn ready_events_and_stale_searches_do_not_rehydrate_navigation() {
     let (mut chat, _) = Ducktape::__boot();
     chat.loading = false;
@@ -777,9 +746,9 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
     for character in "first".chars() {
         let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
             editor::ComposerEvent::Apply(editor::RichAction::Edit(
-                iced::widget::text_editor::Action::Edit(
-                    iced::widget::text_editor::Edit::Insert(character),
-                ),
+                iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert(
+                    character,
+                )),
             )),
         ));
     }
@@ -829,60 +798,6 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
     let chat = include_str!("ui/screens/chat.ice");
     assert!(chat.contains("stack #message(message.id) w=fill"));
     assert!(!chat.contains("#message(message.seq)"));
-}
-
-#[test]
-fn flow_typing_inserts_blocks_in_order() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.loading = false;
-    app.active_page = "welcome".into();
-    app.block_insert_open = true;
-    app.block_insert_after_id = String::new();
-
-    app.block_draft = "first".into();
-    let _ = app.__update(__DucktapeMessage::AddBlockSubmit);
-    let first_id = app.blocks[0].id.clone();
-    let _ = app.__update(__DucktapeMessage::BlockAdded(backend::BlockInsertResult {
-        data: backend::PagesData {
-            pages: Vec::new(),
-            blocks: vec![backend::PageBlock {
-                key: 1,
-                id: first_id.clone(),
-                parent: "welcome".into(),
-                kind: "Text".into(),
-                text: "first".into(),
-                pending: false,
-                checked: false,
-                prefix: String::new(),
-                child_count: 0,
-                mark_count: 0,
-                spans: Vec::new(),
-            }],
-            active_page: "welcome".into(),
-            active_page_title: "Welcome".into(),
-            active_page_parent: String::new(),
-            selected_block_id: String::new(),
-            selected_block_kind: String::new(),
-            selected_block_text: String::new(),
-            selected_block_checked: false,
-            page_title_selected: false,
-        },
-        operation_id: first_id.clone(),
-        page_id: "welcome".into(),
-    }));
-    assert_eq!(
-        app.block_insert_after_id, first_id,
-        "the insert anchor advances so Enter-typing appends in order"
-    );
-
-    // the next flow-typed block lands AFTER the first, not before it
-    app.block_draft = "second".into();
-    let _ = app.__update(__DucktapeMessage::AddBlockSubmit);
-    assert_eq!(app.blocks.len(), 2);
-    assert_eq!(app.blocks[0].text, "first");
-    assert_eq!(app.blocks[1].text, "second");
-    assert!(app.blocks[1].pending);
 }
 
 #[test]
@@ -1002,9 +917,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
 
     let chat = include_str!("ui/screens/chat.ice");
     assert!(
-        chat.contains(
-            "overlay when=(selected_message_seq > 0 && message_action != \"toolbar\")"
-        )
+        chat.contains("overlay when=(selected_message_seq > 0 && message_action != \"toolbar\")")
     );
     assert!(chat.contains("dismiss=emit(clear_message_selection) backdrop=transparent"));
     assert!(chat.contains("mouse press-at=emit(chat_pointer_pressed, _, _)"));
@@ -1105,7 +1018,7 @@ fn thread_messages_mirror_the_main_action_system() {
     assert!(card.contains("hover tint=row_hover r=9.0"));
     assert!(
         card.contains(
-            "-> emit(open_thread_message_reactions, message.seq, message.body, message.rev)"
+            "-> emit(open_thread_message_actions, message.seq, message.body, message.rev)"
         )
     );
     assert!(
@@ -1133,9 +1046,7 @@ fn thread_messages_mirror_the_main_action_system() {
     assert!(thread.contains(
         "overlay when=(thread_selected_seq > 0 && thread_message_action != \"toolbar\")"
     ));
-    assert!(
-        thread.contains("dismiss=emit(clear_thread_message_selection) backdrop=transparent")
-    );
+    assert!(thread.contains("dismiss=emit(clear_thread_message_selection) backdrop=transparent"));
     assert!(thread.contains("float x=0.0 y=thread_menu_y"));
     assert!(thread.contains("mouse press-at=emit(thread_pointer_pressed, _, _)"));
     // same seat as the message list — the rail measures itself
@@ -1194,9 +1105,11 @@ fn thread_messages_mirror_the_main_action_system() {
         .split_once("\non ")
         .unwrap()
         .0;
-    assert!(delete.contains(
-        "delete_message(connected_rpc, password, active_channel, thread_selected_seq)"
-    ));
+    assert!(
+        delete.contains(
+            "delete_message(connected_rpc, password, active_channel, thread_selected_seq)"
+        )
+    );
 }
 
 #[test]
@@ -1341,8 +1254,8 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.message_edit_draft = "node a edit".into();
     app.active_thread_seq = 1;
     app.reply_editor = compose("node a reply");
-    app.selected_block_id = "same-id".into();
-    app.block_editor = compose("node a block");
+    app.page_editor = compose("node a page body");
+    app.page_saved_text = "node a page body".into();
     app.block_comments_open = true;
     app.block_comments_target = "same-id".into();
     app.block_comment_draft = "node a comment".into();
@@ -1362,8 +1275,8 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert!(app.message_edit_draft.is_empty());
     assert_eq!(app.active_thread_seq, 0);
     assert!(reply_composer(&app).is_empty());
-    assert!(app.selected_block_id.is_empty());
-    assert!(block_editor_text(&app).is_empty());
+    assert!(page_document_text(&app).is_empty());
+    assert!(app.page_saved_text.is_empty());
     assert!(!app.block_comments_open);
     assert!(app.block_comments_target.is_empty());
     assert!(app.block_comment_draft.is_empty());
@@ -1398,56 +1311,6 @@ fn same_endpoint_reconnect_preserves_unsent_drafts() {
 }
 
 #[test]
-fn page_search_load_selects_the_canonical_block() {
-    let (mut app, _) = Ducktape::__boot();
-    let _ = app.__update(__DucktapeMessage::PagesUpdated(backend::PagesData {
-        pages: Vec::new(),
-        blocks: vec![backend::PageBlock {
-            key: 0,
-            id: "block-1".into(),
-            parent: "page-1".into(),
-            kind: "Todo".into(),
-            text: "Canonical text".into(),
-            pending: false,
-            checked: true,
-            prefix: String::new(),
-            child_count: 0,
-            mark_count: 0,
-            spans: Vec::new(),
-        }],
-        active_page: "page-1".into(),
-        active_page_title: "Page".into(),
-        active_page_parent: String::new(),
-        selected_block_id: "block-1".into(),
-        selected_block_kind: "Todo".into(),
-        selected_block_text: "Canonical text".into(),
-        selected_block_checked: true,
-        page_title_selected: false,
-    }));
-
-    assert_eq!(app.selected_block_id, "block-1");
-    assert_eq!(app.selected_block_kind, "Todo");
-    assert_eq!(block_editor_text(&app), "Canonical text");
-    assert!(app.selected_block_checked);
-}
-
-#[test]
-fn page_blocks_can_be_created_but_not_converted_to_subpages() {
-    let (app, _) = Ducktape::__boot();
-    assert!(app.block_kinds.iter().any(|kind| kind == "Page"));
-    assert!(!app.editable_block_kinds.iter().any(|kind| kind == "Page"));
-
-    let view = include_str!("ui/screens/pages.ice");
-    assert!(view.contains("if !block.pending && block.kind == \"Page\""));
-    assert!(view.contains(
-        "button label=block.kind description=block.text w=fill p=5.0 @ghost_action -> emit(choose_page, block.id)"
-    ));
-    assert!(view.contains(
-        "if !block.pending && block.kind != \"Page\" && block.id == selected_block_id"
-    ));
-}
-
-#[test]
 fn page_title_and_block_actions_use_native_focus_and_overlay_paths() {
     let components = include_str!("ui/components/pages.ice");
     let handlers = include_str!("ui/handlers/pages.ice");
@@ -1457,24 +1320,22 @@ fn page_title_and_block_actions_use_native_focus_and_overlay_paths() {
     assert!(!components.contains("defer_focus"));
     assert!(!handlers.contains("focus_page_title"));
     assert!(!include_str!("ui/extern/backend.ice").contains("defer_focus"));
-    assert!(view.contains("mouse press-at=emit(pages_pointer_pressed, _, _)"));
-    assert!(!view.contains("mouse move="));
-    assert!(view.contains("overlay when=(connected && !empty(active_page)"));
-    assert!(view.contains("dismiss=emit(close_block_actions) backdrop=transparent"));
-    assert!(view.contains("float x=(block_menu_x + 10.0)"));
-    assert!(!view.contains("pin x=(block_menu_x"));
-    assert!(view.contains("BlockActionsMenu block_id=selected_block_id"));
-    assert!(view.matches("button \"Insert divider\"").count() == 2);
-
-    assert!(components.contains("text block.prefix size=12.0"));
-    assert!(components.contains(
-        "component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)"
-    ));
-    assert!(view.contains("prefix=block.prefix #block-insert-row"));
-    // the title sits in the same 56px gutter the blocks hang off, so the
-    // document's left edge is one line all the way down.
-    let title_gutter = view.split_once("box w=fill pl=56.0\n").unwrap().1;
-    assert!(title_gutter.trim_start().starts_with("PageTitleEditor rpc="));
+    // THE CANVAS HAS NO MENUS LEFT TO PLACE. The block-actions popover, its
+    // pointer tracking and the insert row's type dropdown are gone with the
+    // click-to-edit model — a page is one editor, and `# ` is the block-type
+    // menu. These stay as refusals so none of it creeps back.
+    assert!(!view.contains("pages_pointer_moved"));
+    assert!(!view.contains("BlockActionsMenu"));
+    assert!(!view.contains("block_menu_x"));
+    assert!(!view.contains("InlineBlockInsert"));
+    assert!(!view.contains("slash_kind_matches"));
+    assert!(!components.contains("component DocumentBlock"));
+    // The one overlay the surface still raises is the page-delete confirm.
+    assert!(view.contains("overlay when=page_delete_armed"));
+    assert!(view.contains("extern page_document(page_editor, dark,"));
+    // The title opens the document column, with the body directly under it.
+    let column = view.split_once("col w=fill gap=8.0\n").unwrap().1;
+    assert!(column.trim_start().starts_with("PageTitleEditor rpc="));
 }
 
 #[test]
@@ -1628,9 +1489,11 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     );
     assert!(SCREENS.contains(", shift_held, 38.0, 120.0, 6.0) #forge-note"));
     assert!(SCREENS.contains("button \"Send\" disabled="));
-    assert!(SCREENS.contains(
-        "h=29.0 p=7.0 @primary_action -> emit(composer_event, composer_submit_event())"
-    ));
+    assert!(
+        SCREENS.contains(
+            "h=29.0 p=7.0 @primary_action -> emit(composer_event, composer_submit_event())"
+        )
+    );
     assert!(
         SCREENS
             .matches("box w=fill h=fill align-x=center align-y=center")
@@ -1664,11 +1527,8 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
         .collect();
     assert_eq!(pane_headers, ["row w=fill h=fill gap=9.0 align=center"; 2]);
     assert!(!components.contains("row w=fill h=fill gap=9.0 align=center"));
-    assert!(
-        components.contains(
-            "button label=\"Insert block below\" disabled=disabled w=28.0 h=28.0 p=0.0"
-        )
-    );
+    // The `+`/`⋮⋮` gutter cluster went with the block canvas.
+    assert!(!components.contains("Insert block below"));
     for line in SCREENS.lines().chain(components.lines()).filter(|line| {
         [
             "button \"+\" label",
@@ -1792,16 +1652,8 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
             .unwrap_or_else(|| panic!("missing action target {target}"));
         assert!(action.contains("@secondary_action"), "{action}");
     }
-    let divider_actions: Vec<_> = SCREENS
-        .lines()
-        .filter(|line| line.contains("button \"Insert divider\""))
-        .collect();
-    assert_eq!(divider_actions.len(), 2);
-    assert!(
-        divider_actions
-            .iter()
-            .all(|line| line.contains("@secondary_action"))
-    );
+    // A divider is `---` typed into the document now, not a button.
+    assert!(!SCREENS.contains("Insert divider"));
 
     assert_controls_inherit_focus("screens", SCREENS);
     assert_controls_inherit_focus("pages.ice", pages);
@@ -1816,11 +1668,15 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
             .count(),
         1
     );
+    // ZERO, and it must stay zero: those two `opened` blocks styled the
+    // block-type dropdowns — the one parked at the right of every insert row
+    // and the one inside the `⋮⋮` menu. Pages has no block-type picker at all
+    // now; the markdown prefix is the picker.
     assert_eq!(
         pages
             .matches("opened text=fg placeholder=muted handle=fg bg=fg/11 border=ring")
             .count(),
-        2
+        0
     );
     assert!(!SCREENS.contains("selection=brand"));
     assert_eq!(
@@ -1877,7 +1733,10 @@ fn ice_sources_hold_to_the_design_system() {
         ("icon.ice", include_str!("ui/components/icon.ice")),
         ("kit.ice", include_str!("ui/components/kit.ice")),
         ("node.ice", include_str!("ui/components/node.ice")),
-        ("onboarding.ice", include_str!("ui/components/onboarding.ice")),
+        (
+            "onboarding.ice",
+            include_str!("ui/components/onboarding.ice"),
+        ),
         ("overlay.ice", include_str!("ui/components/overlay.ice")),
         ("pages.ice", include_str!("ui/components/pages.ice")),
         ("patterns.ice", include_str!("ui/components/patterns.ice")),
@@ -2058,65 +1917,22 @@ fn block_comments_dock_a_rail_beside_the_document() {
     );
     assert!(!pages.contains("close_block_comments backdrop=transparent"));
     assert!(pages.contains("-> emit(close_block_comments)"));
-    assert!(pages.contains("#block-comment(scope_key(connected_rpc, selected_block_id))"));
+    assert!(pages.contains("#page-comment(scope_key(connected_rpc, active_page))"));
     assert!(!pages.contains("button \"Save\""));
     assert!(!pages.contains("Saving"));
 
+    // The control is a DOCUMENT ACTION in the header now, not a row buried in
+    // a per-block menu — the rail was always page-scoped.
+    assert!(pages.contains("button label=\"Comments\""));
+    assert!(pages.contains("-> emit(toggle_block_comments)"));
     let components = include_str!("ui/components/pages.ice");
-    assert!(components.contains("label=\"Comments\""));
-    assert!(components.contains("-> emit(open_block_comments)"));
+    assert!(!components.contains("component BlockActionsMenu"));
 
     let handlers = include_str!("ui/handlers/pages.ice");
     assert!(handlers.contains("on post_block_comment_submit"));
     assert!(handlers.contains(
         "run post_block_comment(connected_rpc, password, block_comments_target, active_block_comment_thread"
     ));
-}
-
-#[test]
-fn selecting_another_block_discards_a_stale_comment_page() {
-    let (mut app, _) = Ducktape::__boot();
-    app.mutation_phase = "idle".into();
-    let _ = app.__update(__DucktapeMessage::SelectBlock(
-        0,
-        "block-a".into(),
-        "Text".into(),
-        "A".into(),
-        false,
-        false,
-    ));
-    let _ = app.__update(__DucktapeMessage::OpenBlockComments);
-    let stale_generation = app.block_comments_generation;
-
-    let _ = app.__update(__DucktapeMessage::SelectBlock(
-        1,
-        "block-b".into(),
-        "Text".into(),
-        "B".into(),
-        false,
-        false,
-    ));
-    let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
-        backend::BlockThreadListData {
-            generation: stale_generation,
-            target: "block-a".into(),
-            from: 0,
-            threads: vec![backend::PageCommentThread {
-                id: "thread-a".into(),
-                author: "Alice".into(),
-                meta: "1".into(),
-                resolved: false,
-                comment_count: 1,
-            }],
-            total: 1,
-            next_from: 0,
-            has_more: false,
-        },
-    ));
-
-    assert_eq!(app.selected_block_id, "block-b");
-    assert!(!app.block_comments_open);
-    assert!(app.block_comment_threads.is_empty());
 }
 
 #[test]
@@ -2169,7 +1985,6 @@ fn live_comment_refresh_updates_threads_without_touching_the_draft() {
     app.connected = true;
     app.loading = false;
     app.mutation_phase = "idle".into();
-    app.selected_block_id = "block-1".into();
     app.active_page = "page".into();
     app.block_comments_open = true;
     // the rail is DOCUMENT-scoped: its anchor is the page it was opened
@@ -2326,7 +2141,6 @@ fn block_comment_recovery_always_unlocks_mutations() {
     let (mut recovered, _) = Ducktape::__boot();
     recovered.block_comments_open = true;
     recovered.block_comments_target = "block-1".into();
-    recovered.selected_block_id = "block-1".into();
     recovered.block_comments_generation = 8;
     recovered.block_comment_threads_loading = true;
     recovered.mutation_phase = "recovering".into();
@@ -2344,110 +2158,6 @@ fn block_comment_recovery_always_unlocks_mutations() {
     ));
     assert_eq!(recovered.mutation_phase, "idle");
     assert!(recovered.error.is_empty());
-}
-
-#[test]
-fn page_navigation_ignores_the_previous_block_autosave_callback() {
-    let (mut app, _) = Ducktape::__boot();
-    app.loading = false;
-    app.active_page = "old-page".into();
-    app.block_autosave_generation = 4;
-
-    let _ = app.__update(__DucktapeMessage::ChoosePage("next-page".into()));
-    let navigation_generation = app.hydration_generation;
-    assert_eq!(app.block_autosave_generation, 5);
-
-    let _ = app.__update(__DucktapeMessage::BlockTextSaved(backend::AutosaveResult {
-        generation: 4,
-        written: true,
-    }));
-    assert_eq!(app.hydration_generation, navigation_generation);
-    assert!(app.loading);
-}
-
-#[test]
-fn block_edits_invalidate_an_older_resync() {
-    let (mut app, _) = Ducktape::__boot();
-    app.loading = false;
-    app.connected_rpc = "http://node".into();
-    app.selected_block_id = "block-1".into();
-    app.selected_block_kind = "Text".into();
-    app.block_editor = compose("new");
-    app.selected_block_saved_text = "old".into();
-    app.hydration_generation = 3;
-
-    let _ = app.__update(__DucktapeMessage::BlockAutosaveTick);
-    assert_eq!(app.hydration_generation, 4);
-
-    // a stale resync from before the edit cannot roll the draft back
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
-        3,
-        "",
-        Vec::new(),
-        "page",
-        vec![backend::PageBlock {
-            key: 0,
-            id: "block-1".into(),
-            parent: "page".into(),
-            kind: "Text".into(),
-            text: "old".into(),
-            pending: false,
-            checked: false,
-            prefix: String::new(),
-            child_count: 0,
-            mark_count: 0,
-            spans: Vec::new(),
-        }],
-    )));
-    assert_eq!(block_editor_text(&app), "new");
-}
-
-#[test]
-fn remote_block_deletion_recovers_local_drafts_and_closes_the_editor() {
-    let (mut app, _) = Ducktape::__boot();
-    app.loading = false;
-    app.connected_rpc = "http://node".into();
-    app.hydration_generation = 4;
-    app.selected_block_id = "deleted".into();
-    app.selected_block_kind = "Text".into();
-    app.block_editor = compose("unfinished block");
-    app.block_autosave_status = "error".into();
-    app.block_autosave_generation = 8;
-    app.block_comments_open = true;
-    app.block_comments_target = "page".into();
-    app.block_comment_draft = "unfinished comment".into();
-    app.active_page = "page".into();
-    app.page_delete_armed = true;
-    app.page_title_selected = true;
-
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
-        4,
-        "",
-        Vec::new(),
-        "page",
-        Vec::new(),
-    )));
-
-    assert_eq!(app.orphaned_block_drafts, ["unfinished block"]);
-    assert!(app.selected_block_id.is_empty());
-    assert!(block_editor_text(&app).is_empty());
-    // the comment rail hangs off the PAGE, and the page survived — so the
-    // rail and its half-typed comment survive a block deletion. Only a
-    // page change closes it. (The orphan LIST is not asserted here: the
-    // resync still keys `remember_orphaned_comment_drafts` on
-    // `selected_block_id`, so this same live draft is also filed as
-    // recovered — see the report.)
-    assert_eq!(app.block_comment_draft, "unfinished comment");
-    assert!(app.block_comments_open);
-    assert_eq!(app.block_autosave_generation, 9);
-    assert!(app.page_delete_armed);
-    assert!(app.page_title_selected);
-
-    let _ = app.__update(__DucktapeMessage::UseOrphanedBlockDraft(
-        "unfinished block".into(),
-    ));
-    assert_eq!(app.block_draft, "unfinished block");
-    assert!(app.orphaned_block_drafts.is_empty());
 }
 
 #[test]
@@ -2525,50 +2235,16 @@ fn reconnect_recovers_active_drafts_for_the_same_endpoint() {
     app.loading = false;
     app.rpc = "http://node".into();
     app.connected_rpc = "http://node".into();
-    app.selected_block_id = "block".into();
-    app.block_editor = compose("unfinished block");
-    app.block_autosave_status = "saving".into();
+    app.active_page = "page".into();
     app.block_comment_draft = "unfinished comment".into();
 
     let _ = app.__update(__DucktapeMessage::Reconnect);
 
-    assert_eq!(app.orphaned_block_drafts, ["unfinished block"]);
+    // A half-typed COMMENT still survives a reconnect. The page body does not
+    // need the same rescue: it is one buffer whose every keystroke is already
+    // heading for the node on the save tick, and it is reinstalled from the
+    // node's own text on the next load.
     assert_eq!(app.orphaned_comment_drafts, ["unfinished comment"]);
-}
-
-#[test]
-fn page_and_block_context_changes_recover_local_drafts() {
-    let (mut app, _) = Ducktape::__boot();
-    app.loading = false;
-    app.connected_rpc = "http://draft-context-test".into();
-    app.selected_block_id = "block-a".into();
-    app.selected_block_kind = "Text".into();
-    app.block_editor = compose("failed edit");
-    app.block_autosave_status = "error".into();
-    app.block_comment_draft = "comment a".into();
-
-    let _ = app.__update(__DucktapeMessage::SelectBlock(
-        0,
-        "block-b".into(),
-        "Text".into(),
-        "canonical b".into(),
-        false,
-        false,
-    ));
-    assert_eq!(app.orphaned_block_drafts, ["failed edit"]);
-    assert_eq!(app.orphaned_comment_drafts, ["comment a"]);
-    assert_eq!(block_editor_text(&app), "canonical b");
-
-    app.block_comment_draft = "comment b".into();
-    let _ = app.__update(__DucktapeMessage::CloseBlockComments);
-    assert_eq!(app.orphaned_comment_drafts, ["comment a", "comment b"]);
-
-    app.block_editor = compose("saving b");
-    app.block_autosave_status = "saving".into();
-    let _ = app.__update(__DucktapeMessage::ChoosePage("next".into()));
-    assert_eq!(app.orphaned_block_drafts, ["failed edit", "saving b"]);
-    assert!(block_editor_text(&app).is_empty());
-    assert!(app.selected_block_id.is_empty());
 }
 
 #[test]
@@ -2856,37 +2532,6 @@ fn committed_thread_reply_refreshes_without_blocking_the_composer() {
 }
 
 #[test]
-fn failed_block_insert_rolls_back_and_restores_the_draft() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.loading = false;
-    app.active_page = "welcome".into();
-    app.new_block_kind = "Heading 2".into();
-    app.block_draft = "retry heading".into();
-
-    let _ = app.__update(__DucktapeMessage::AddBlockSubmit);
-    let operation_id = app.blocks[0].id.clone();
-    assert_eq!(app.mutation_phase, "idle");
-    assert!(app.block_draft.is_empty());
-    assert_eq!(app.blocks[0].kind, "Heading 2");
-    assert!(app.blocks[0].pending);
-
-    let _ = app.__update(__DucktapeMessage::BlockAddFailed(
-        backend::OptimisticMutationError {
-            message: "rejected".into(),
-            committed: false,
-            operation_id,
-            scope_id: "welcome".into(),
-            body: "retry heading".into(),
-        },
-    ));
-    assert_eq!(app.block_draft, "retry heading");
-    assert!(app.orphaned_block_drafts.is_empty());
-    assert!(app.blocks.is_empty());
-    assert_eq!(app.mutation_phase, "idle");
-}
-
-#[test]
 fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does_not() {
     let channel = |id: &str, head: i64| backend::ChatChannel {
         id: id.into(),
@@ -2965,9 +2610,8 @@ fn unread_indicators_are_wired_client_local_only() {
     // brand treatment + dot when set.
     let components = include_str!("ui/components/chat.ice");
     assert!(
-        components.contains(
-            "component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)"
-        )
+        components
+            .contains("component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)")
     );
     assert!(components.contains("if unread\n                box w=7.0 h=7.0 bg=brand r=3.5"));
     assert!(components.contains(
@@ -2990,8 +2634,7 @@ fn unread_indicators_are_wired_client_local_only() {
     // Freeze happens on a real channel change; connect seeds caught-up.
     let lifecycle = include_str!("ui/handlers/lifecycle.ice");
     assert!(
-        lifecycle
-            .contains("channel_reads = initial_channel_reads(next.channels, channel_reads)")
+        lifecycle.contains("channel_reads = initial_channel_reads(next.channels, channel_reads)")
     );
     // navigation loads freeze on the real channel change (chat.ice);
     // the resync path freezes against the possibly-unchanged channel.

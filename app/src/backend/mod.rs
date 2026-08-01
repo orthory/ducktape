@@ -195,45 +195,6 @@ pub struct PageBlock {
     pub spans: Vec<ChatSpan>,
 }
 
-/// One structural key pressed inside the block editor, already past the
-/// classify hop: `action` is "delete", "indent", or "outdent". Carried on the
-/// error route of [`classify_block_key`] so the flat handlers can dispatch
-/// without branching.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct BlockKeyOp {
-    pub action: String,
-}
-
-/// The state-only block-editor keys ("split", "escape"), the Ok route of
-/// [`classify_block_key`].
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct BlockKeyLocal {
-    pub action: String,
-}
-
-/// The decided next selection/insert state after a local block key — a pure
-/// step the handler applies field by field (decide-fns never write).
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct BlockKeyStep {
-    pub selected_id: String,
-    pub selected_kind: String,
-    pub selected_checked: bool,
-    pub insert_open: bool,
-    pub insert_after_id: String,
-    pub insert_kind: String,
-    pub focus_key: i64,
-    pub orphaned: Vec<String>,
-    pub autosave_bump: i64,
-}
-
-/// The insert draft after the markdown-prefix pass: `# `→Heading 1, `- `→
-/// Bullet, and friends, with the matched prefix stripped from the draft.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct BlockAutoformat {
-    pub kind: String,
-    pub draft: String,
-}
-
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PagesData {
     pub pages: Vec<PageItem>,
@@ -407,6 +368,7 @@ pub struct LiveUpdate {
 
 mod bell;
 mod chat;
+mod document;
 mod explorer;
 mod forge;
 mod hub;
@@ -423,6 +385,7 @@ mod style;
 
 pub use bell::*;
 pub use chat::*;
+pub use document::*;
 pub use explorer::*;
 pub use forge::*;
 pub use hub::*;

@@ -54,7 +54,7 @@ on global_key_pressed(event)
   // every closable flag self-selects against the verdict: the handler
   // grammar has no branches, so the keepers ARE the routing. Sits before
   // the palette block, whose open path must end in its focus task.
-  escape_key = escape_target(event.key, palette_open, bell_open, channel_create_open, thread_message_action, message_action, block_actions_open, block_insert_open, forge_repo_menu)
+  escape_key = escape_target(event.key, palette_open, bell_open, channel_create_open, thread_message_action, message_action, forge_repo_menu)
   bell_open = bell_open && escape_key != "bell"
   channel_create_open = channel_create_open && escape_key != "channel_create"
   thread_selected_seq = keep_i64(escape_key == "thread_menu", 0, thread_selected_seq)
@@ -65,9 +65,6 @@ on global_key_pressed(event)
   selected_message_rev = keep_i64(escape_key == "message_menu", 0, selected_message_rev)
   message_action = keep_str(escape_key == "message_menu", "toolbar", message_action)
   message_edit_draft = keep_str(escape_key == "message_menu", "", message_edit_draft)
-  block_actions_open = block_actions_open && escape_key != "block_actions"
-  block_insert_open = block_insert_open && escape_key != "block_insert"
-  block_insert_after_id = keep_str(escape_key == "block_insert", "", block_insert_after_id)
   forge_repo_menu = forge_repo_menu && escape_key != "repo_menu"
   // The composer's formatting chords (Cmd/Ctrl+B/I, +Shift+C, +Shift+9). The
   // editor lets command-letter presses bubble on purpose, so its focus is
