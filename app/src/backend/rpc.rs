@@ -164,6 +164,27 @@ pub(crate) fn write_prefs(prefs: &serde_json::Value) -> bool {
     std::fs::write(&path, bytes).is_ok()
 }
 
+/// The persisted appearance override — `"light"` / `"dark"`, or empty when
+/// this device follows the OS. DEVICE-global, not per-endpoint: appearance is
+/// a property of the person's eyes and room, not of a workspace.
+pub async fn load_appearance() -> String {
+    match read_prefs()["appearance"].as_str() {
+        Some("light") => "light".into(),
+        Some("dark") => "dark".into(),
+        _ => String::new(),
+    }
+}
+
+pub async fn save_appearance(mode: String) -> bool {
+    let known = mode == "light" || mode == "dark";
+    if !known {
+        return false;
+    }
+    let mut prefs = read_prefs();
+    prefs["appearance"] = serde_json::json!(mode);
+    write_prefs(&prefs)
+}
+
 /// This endpoint's persisted doc tabs (open page ids, in open order).
 pub async fn load_doc_tabs(rpc: String) -> Vec<String> {
     let prefs = read_prefs();

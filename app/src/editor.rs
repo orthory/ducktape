@@ -35,11 +35,42 @@ const fn rgb8(r: u8, g: u8, b: u8) -> Color {
         a: 1.0,
     }
 }
-const INK: Color = rgb8(0x2c, 0x2b, 0x27);
-const MUTED: Color = rgb8(0x6b, 0x69, 0x62);
-const HINT: Color = rgb8(0xb3, 0xb1, 0xa8);
-const RING: Color = rgb8(0x26, 0x25, 0x1f);
-const INFO: Color = rgb8(0x5f, 0x7a, 0x9e);
+/// The composer's ink set, one per palette reading of `theme.ice`.
+struct ComposerInk {
+    ink: Color,
+    muted: Color,
+    hint: Color,
+    ring: Color,
+}
+
+const LIGHT_INK: ComposerInk = ComposerInk {
+    ink: rgb8(0x2c, 0x2b, 0x27),
+    muted: rgb8(0x6b, 0x69, 0x62),
+    hint: rgb8(0xb3, 0xb1, 0xa8),
+    ring: rgb8(0x26, 0x25, 0x1f),
+};
+
+const DARK_INK: ComposerInk = ComposerInk {
+    ink: rgb8(0xe8, 0xe6, 0xdf),
+    muted: rgb8(0xa8, 0xa6, 0x9c),
+    hint: rgb8(0x6b, 0x6a, 0x61),
+    ring: rgb8(0xe8, 0xe6, 0xdf),
+};
+
+fn composer_ink(theme: &iced::Theme) -> &'static ComposerInk {
+    if crate::backend::theme_is_dark(theme) {
+        &DARK_INK
+    } else {
+        &LIGHT_INK
+    }
+}
+
+// ponytail: the inline-mark formatter has no theme input (`format_key` is a
+// static 0), so the marker/link inks are single values chosen to read on both
+// palettes. Thread the appearance into the composer externs and bump
+// `format_key` per palette if these ever need per-theme tuning.
+const MARK_DIM: Color = rgb8(0x8a, 0x88, 0x7e);
+const MARK_LINK: Color = rgb8(0x6f, 0x8a, 0xab);
 
 /// One composer interaction, classified where the modifiers are still known.
 /// `Submit` is plain Enter (and the Send button, via
@@ -119,14 +150,15 @@ fn classify(action: RichAction, shift: bool) -> ComposerEvent {
     ComposerEvent::Apply(action)
 }
 
-fn composer_style(_theme: &iced::Theme, status: text_editor::Status) -> text_editor::Style {
+fn composer_style(theme: &iced::Theme, status: text_editor::Status) -> text_editor::Style {
+    let ink = composer_ink(theme);
     let focused = matches!(status, text_editor::Status::Focused { .. });
     let disabled = matches!(status, text_editor::Status::Disabled);
     text_editor::Style {
         background: Color::TRANSPARENT.into(),
         border: if focused {
             Border {
-                color: RING,
+                color: ink.ring,
                 width: 1.0,
                 // The composer mounts inside rounded plates (r=12 cards in
                 // chat, thread and forge) — a square ring visibly pokes their
@@ -136,9 +168,9 @@ fn composer_style(_theme: &iced::Theme, status: text_editor::Status) -> text_edi
         } else {
             Border::default()
         },
-        placeholder: HINT,
-        value: if disabled { MUTED } else { INK },
-        selection: Color { a: 0.18, ..INK },
+        placeholder: ink.hint,
+        value: if disabled { ink.muted } else { ink.ink },
+        selection: Color { a: 0.18, ..ink.ink },
     }
 }
 
@@ -164,7 +196,7 @@ enum Inline {
 fn inline_format(kind: &Inline) -> Format {
     match kind {
         Inline::Marker => Format {
-            color: Some(HINT),
+            color: Some(MARK_DIM),
             ..Format::default()
         },
         Inline::Bold => Format {
@@ -176,7 +208,7 @@ fn inline_format(kind: &Inline) -> Format {
             ..Format::default()
         },
         Inline::Link => Format {
-            color: Some(INFO),
+            color: Some(MARK_LINK),
             ..Format::default()
         },
     }

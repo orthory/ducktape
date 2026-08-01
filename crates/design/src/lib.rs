@@ -175,6 +175,35 @@ pub mod ink {
     /// Paper, for ink drawn on a dark plate.
     pub const PAPER: u32 = 0xf3f1ea;
 
+    /// The dark reading of the same ramp — the ink order mirrors (body copy
+    /// forward, each step fades toward the dark surface) and the semantic
+    /// hues lift one step so they carry on ink-dark plates. `paper` flips to
+    /// the dark plate ink for the same reason it existed at all.
+    pub fn tone_dark(name: &str) -> u32 {
+        match name {
+            "ink" => 0xe8e6df,
+            "ink-hover" => 0xf4f2ea,
+            "body" => 0xdcdad2,
+            "strong" => 0xcfcdc4,
+            "mono" => 0xb5b3a9,
+            "muted" => 0xa8a69c,
+            "caption" => 0x8f8d84,
+            "meta" => 0x7c7a71,
+            "hint" => 0x6b6a61,
+            "label" => 0x605f56,
+            "avatar" => 0x3a3931,
+            "idle" => 0x55544c,
+            "strong-ink" => 0xdcdad2,
+            "accent" => 0xc98a63,
+            "success" => 0x7fb894,
+            "success-tick" => 0x7ba78c,
+            "warning" => 0xd4a94e,
+            "danger" => 0xd97b72,
+            "paper" => 0x26251f,
+            _ => 0xa8a69c,
+        }
+    }
+
     /// The ramp keyed by the artifact's own name for each step. An unknown
     /// tone falls back to `MUTED` so a view never renders an invisible icon.
     pub fn tone(name: &str) -> u32 {

@@ -9,7 +9,7 @@
 // fact families, and the prefix is what says which loader a reading came from.
 // `settings_height` (the facts reading) and `block_height` (the live head) are
 // two different numbers and would collide as one word.
-component SettingsScreen(account_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_height:i64, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_validators:i64, members_residents:i64, account_id:str, bind account_name_draft:str, account_renaming:bool, account_members:i64, account_nodes:i64, bind rpc:str, bind password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], block_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
+component SettingsScreen(account_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_height:i64, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_validators:i64, members_residents:i64, account_id:str, bind account_name_draft:str, account_renaming:bool, account_members:i64, account_nodes:i64, appearance:str, bind rpc:str, bind password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], block_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
   emits
     select_shell_tab(str)
     reconnect()
@@ -21,6 +21,8 @@ component SettingsScreen(account_name:str, connected_rpc:str, settings_endpoint:
     select_node_tab(str)
     open_node_modules()
     node_log_filter_changed(str)
+    set_appearance_light()
+    set_appearance_dark()
   scroll dir=vertical w=fill h=fill
     col w=fill p=22.0 gap=18.0
       text "Settings" size=16.0 wrap=none font=display @text-primary
@@ -64,6 +66,25 @@ component SettingsScreen(account_name:str, connected_rpc:str, settings_endpoint:
                   Badge.Success label=status
                 space w=fill
                 button "Connect" disabled=(loading || (mutation_phase != "idle" && mutation_phase != "recovering")) h=32.0 p=7.0 @primary_action -> emit(reconnect)
+        col w=fill gap=9.0
+          GroupLabel label="APPEARANCE"
+          box w=fill p=15.0 bg=surface border=card_line border-w=1.0 r=11.0
+            row w=fill gap=9.0 align=center
+              col w=fill gap=3.0
+                text "Theme" size=12.5 wrap=none @text-fg
+                if empty(appearance)
+                  text "Following the system appearance." size=11.0 @text-caption
+                if !empty(appearance)
+                  text "Pinned for this device." size=11.0 @text-caption
+              space w=fill
+              if appearance == "light"
+                button "Light" h=28.0 p=6.0 @primary_action -> emit(set_appearance_light)
+              if appearance != "light"
+                button "Light" h=28.0 p=6.0 @secondary_action -> emit(set_appearance_light)
+              if appearance == "dark"
+                button "Dark" h=28.0 p=6.0 @primary_action -> emit(set_appearance_dark)
+              if appearance != "dark"
+                button "Dark" h=28.0 p=6.0 @secondary_action -> emit(set_appearance_dark)
         col w=fill gap=9.0
           GroupLabel label="YOUR IDENTITY"
           box w=fill p=15.0 bg=surface border=card_line border-w=1.0 r=11.0

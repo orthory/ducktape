@@ -241,6 +241,8 @@ extern crate::backend
   sync doc_tab_rows(tabs:[str], pages:[PageItem], active:str) -> [DocTab]
   sync next_doc_tab(tabs:[str], closed:str, active:str) -> str
   load_doc_tabs(rpc:str) -> [str]
+  load_appearance() -> str
+  save_appearance(mode:str) -> bool
   save_doc_tabs(rpc:str, tabs:[str]) -> bool
   sync retain_for_endpoint(value:str, current:str, next:str) -> str
   sync mutation_failure_phase(committed:bool) -> str

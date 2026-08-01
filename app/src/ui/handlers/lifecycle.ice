@@ -25,10 +25,52 @@ state
 // onboarding screens were reachable only by `Leave workspace`. The disk answer
 // is the discriminant: no registered, unforgotten workspace means "welcome".
 on mount
+  // ponytail: no OS-appearance follow, and no dark PRE-console. Effects must
+  // be a handler's final statement (E141) and the grammar has no branches, so
+  // the appearance load rides the console path's one parallel group; the
+  // onboarding column boots light, and "ask the OS when nothing is pinned"
+  // waits for a runtime system-theme subscription.
   phase = onboarding_phase()
   return if phase != "console"
   loading = true
-  run connect(rpc) -> workspace_connected _ | failed _
+  parallel
+    run load_appearance() -> appearance_loaded _
+    run connect(rpc) -> workspace_connected _ | failed _
+
+// The persisted reading, applied on boot. The light block runs first and the
+// dark block reverses it — the handler grammar has no branches, so the
+// terminal-case return IS the branch.
+on appearance_loaded(mode)
+  return if empty(mode)
+  appearance = mode
+  app_palette = AppTheme.app
+  app_background = "#fdfdfb"
+  app_text = "#2c2b27"
+  return if appearance != "dark"
+  app_palette = AppTheme.app_dark
+  app_background = "#1b1a16"
+  app_text = "#e8e6df"
+
+// The Settings toggle: pin a reading and persist it — one event per button,
+// so each handler is linear and its persistence run sits last (E141).
+// `save_appearance` is fire-and-forget: a failed write costs the NEXT boot's
+// default, nothing this session shows.
+on set_appearance_light
+  appearance = "light"
+  app_palette = AppTheme.app
+  app_background = "#fdfdfb"
+  app_text = "#2c2b27"
+  run save_appearance(appearance) -> appearance_saved _
+
+on set_appearance_dark
+  appearance = "dark"
+  app_palette = AppTheme.app_dark
+  app_background = "#1b1a16"
+  app_text = "#e8e6df"
+  run save_appearance(appearance) -> appearance_saved _
+
+on appearance_saved(_written)
+  error = error
 
 on reconnect
   return if loading || (mutation_phase != "idle" && mutation_phase != "recovering")

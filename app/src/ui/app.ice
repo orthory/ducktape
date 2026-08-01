@@ -1,6 +1,7 @@
 app Ducktape
   title "Ducktape"
   theme app_theme
+  palette app_palette
   bg app_background
   fg app_text
   id "dev.ducktape.app"

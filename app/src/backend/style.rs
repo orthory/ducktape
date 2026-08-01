@@ -40,13 +40,25 @@ pub fn icon(name: impl AsRef<str>) -> String {
 /// drawn on `currentColor`, so the tone — not a second asset — is what makes a
 /// muted rail icon and an accent action icon different.
 pub fn icon_tint(
-    _theme: &iced::Theme,
+    theme: &iced::Theme,
     _status: iced::widget::svg::Status,
     tone: impl AsRef<str>,
 ) -> iced::widget::svg::Style {
+    let ramp = if theme_is_dark(theme) {
+        design::ink::tone_dark
+    } else {
+        design::ink::tone
+    };
     iced::widget::svg::Style {
-        color: Some(rgb(design::ink::tone(tone.as_ref()))),
+        color: Some(rgb(ramp(tone.as_ref()))),
     }
+}
+
+/// Whether the live palette is the dark reading. The generated theme's base
+/// text color IS `app_text`, so light text means a dark surface — no theme
+/// name string to allocate and compare per style call.
+pub(crate) fn theme_is_dark(theme: &iced::Theme) -> bool {
+    theme.palette().text.r > 0.5
 }
 
 /// An artifact hex literal as an opaque iced color.
@@ -58,9 +70,18 @@ fn rgb(hex: u32) -> iced::Color {
     )
 }
 
+/// The token set matching the live palette reading.
+fn app_tokens(theme: &iced::Theme) -> ducktape_ui::ui::theme::Theme {
+    if theme_is_dark(theme) {
+        ducktape_ui::ui::theme::DARK
+    } else {
+        ducktape_ui::ui::theme::LIGHT
+    }
+}
+
 /// Flat paper card derived from the shared design tokens.
-pub fn card_style(_theme: &iced::Theme) -> iced::widget::container::Style {
-    let tokens = ducktape_ui::ui::theme::LIGHT;
+pub fn card_style(theme: &iced::Theme) -> iced::widget::container::Style {
+    let tokens = app_tokens(theme);
     iced::widget::container::Style {
         background: Some(iced::Background::Color(tokens.palette.card)),
         border: iced::Border {
@@ -73,8 +94,8 @@ pub fn card_style(_theme: &iced::Theme) -> iced::widget::container::Style {
 }
 
 /// Floating menu/popover surface, derived from the shared design tokens.
-pub fn raised_style(_theme: &iced::Theme) -> iced::widget::container::Style {
-    let tokens = ducktape_ui::ui::theme::LIGHT;
+pub fn raised_style(theme: &iced::Theme) -> iced::widget::container::Style {
+    let tokens = app_tokens(theme);
     iced::widget::container::Style {
         background: Some(iced::Background::Color(tokens.glass.regular)),
         border: iced::Border {
