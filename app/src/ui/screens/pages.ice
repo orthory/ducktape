@@ -188,135 +188,141 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
             if connected && !loading && empty(active_page)
               EmptyState title="No page selected" description="Create a page from the sidebar."
             if connected && !empty(active_page)
-              scroll dir=vertical w=fill h=fill bar=hidden
-                box w=fill max-w=720.0 mx=auto pl=22.0 pr=22.0 pt=26.0 pb=40.0
-                  col w=fill gap=8.0
-                    box w=fill pl=56.0
-                      PageTitleEditor rpc=connected_rpc password=password page_id=active_page title=active_page_title disabled=(loading || !connected || mutation_phase != "idle") #page-title(scope_key(connected_rpc, active_page))
-                    if !empty(page_search_hits)
-                      box w=fill h=148.0 p=5.0 bg=elevated border=fg/8 border-w=1.0 r=9.0
+              stack w=fill h=fill
+                scroll dir=vertical w=fill h=fill bar=hidden
+                  box w=fill max-w=720.0 mx=auto pl=22.0 pr=22.0 pt=26.0 pb=40.0
+                    col w=fill gap=8.0
+                      box w=fill pl=56.0
+                        PageTitleEditor rpc=connected_rpc password=password page_id=active_page title=active_page_title disabled=(loading || !connected || mutation_phase != "idle") #page-title(scope_key(connected_rpc, active_page))
+                      if !empty(orphaned_block_drafts) || !empty(orphaned_comment_drafts)
+                        box w=fill p=7.0 bg=elevated border=fg/9 border-w=1.0 r=9.0
+                          col w=fill gap=5.0
+                            text "Recovered drafts" size=13.0 font=medium @text-fg
+                            for recovered_block in orphaned_block_drafts
+                              row w=fill gap=5.0 align=center
+                                text recovered_block w=fill size=13.5 @text-muted
+                                button "Use" label="Use as block" disabled=(loading || mutation_phase != "idle" || !empty(block_draft)) h=26.0 p=5.0 @ghost_action -> emit(use_orphaned_block_draft, recovered_block)
+                                  active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
+                                  hovered bg=fg/14
+                                  pressed bg=fg/18
+                                button "Discard" disabled=(loading || mutation_phase != "idle") h=26.0 p=5.0 @danger_action -> emit(discard_orphaned_block_draft, recovered_block)
+                            for recovered_comment in orphaned_comment_drafts
+                              row w=fill gap=5.0 align=center
+                                text recovered_comment w=fill size=13.5 @text-muted
+                                button "Use" label="Use as block" disabled=(loading || mutation_phase != "idle" || !empty(block_draft)) h=26.0 p=5.0 @ghost_action -> emit(use_orphaned_comment_draft, recovered_comment)
+                                  active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
+                                  hovered bg=fg/14
+                                  pressed bg=fg/18
+                                button "Discard" disabled=(loading || mutation_phase != "idle") h=26.0 p=5.0 @danger_action -> emit(discard_orphaned_comment_draft, recovered_comment)
+                      if empty(blocks) && !block_insert_open
+                        box w=fill pl=56.0
+                          button "Write something…" label="Start writing" disabled=loading w=fill p=6.0 @ghost_action -> emit(open_root_block_insert)
+                            active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+                            hovered bg=fg/4 text=fg border=fg/7
+                            pressed bg=fg/8
+                      if block_insert_open && empty(block_insert_after_id)
+                        InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix="" #block-insert-row(block_insert_after_id)
+                          forward
+                            new_block_kind_changed
+                            close_block_insert
+                          stack w=fill
+                            if new_block_kind != "Divider"
+                              col w=fill gap=2.0
+                                input "" #block-insert label="New block" <-> block_draft hint="Type, or / for a block kind…" disabled=loading submit=emit(add_block_submit) w=fill p=5.0 text-size=13.5 line-h=1.3 @control
+                                  active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
+                                  hovered bg=fg/2 border=fg/5
+                                  disabled value=muted
+                                if !empty(slash_kind_matches(block_draft, editable_block_kinds))
+                                  box w=fill p=3.0 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+                                    col w=fill gap=1.0
+                                      for kind in slash_kind_matches(block_draft, editable_block_kinds)
+                                        button label="Set block kind" w=fill h=24.0 p=4.0 @ghost_action -> emit(pick_slash_kind, kind)
+                                          row w=fill h=fill gap=6.0 align=center
+                                            text kind w=fill size=13.0 wrap=none @text-fg
+                                          active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
+                                          hovered bg=brand/14 text=fg
+                                          pressed bg=brand/20
+                            if new_block_kind == "Divider"
+                              button "Insert divider" disabled=loading w=fill h=28.0 p=5.0 @secondary_action -> emit(add_block_submit)
+                      keyed block in blocks by=block.key
+                        col w=fill gap=1.0
+                          DocumentBlock block=block selected=(block.id == selected_block_id) hovered=(block.id == hovered_block_id) disabled=loading #block(block.id)
+                            forward
+                              block_entered
+                              block_exited
+                              open_block_insert
+                              select_block
+                            col w=fill
+                              if block.pending
+                                box w=fill p=5.0 bg=fg/3 r=6.0
+                                  BlockContents block=block
+                                    forward
+                                      set_todo_checked
+                              if !block.pending && block.kind == "Page"
+                                button label=block.kind description=block.text w=fill p=5.0 @ghost_action -> emit(choose_page, block.id)
+                                  BlockContents block=block
+                                    forward
+                                      set_todo_checked
+                                  active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
+                                  hovered bg=fg/3 text=fg border=transparent
+                                  pressed bg=fg/6 text=fg
+                              if !block.pending && block.kind != "Page" && block.id != selected_block_id
+                                button label=block.kind description=block.text w=fill p=5.0 @ghost_action -> emit(select_block, block.key, block.id, block.kind, block.text, block.checked, false)
+                                  BlockContents block=block
+                                    forward
+                                      set_todo_checked
+                                  active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
+                                  hovered bg=fg/3 text=fg border=transparent
+                                  pressed bg=fg/6 text=fg
+                              if !block.pending && block.kind != "Page" && block.id == selected_block_id
+                                BlockLine block=block #line
+                                  forward
+                                    set_todo_checked
+                                  col w=fill
+                                    if block.kind == "Divider"
+                                      Separator
+                                    if block.kind != "Divider"
+                                      input "" #block-edit label="Edit block" <-> block_edit_draft change=emit(block_text_changed, _) hint="Type something…" disabled=(mutation_phase != "idle") w=fill p=4.0 text-size=13.5 line-h=1.3 @control
+                                        active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=5.0
+                                        hovered bg=fg/2 border=fg/5
+                                        disabled value=muted
+                          if block_insert_open && block.id == block_insert_after_id
+                            InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix=block.prefix #block-insert-row(block_insert_after_id)
+                              forward
+                                new_block_kind_changed
+                                close_block_insert
+                              stack w=fill
+                                if new_block_kind != "Divider"
+                                  col w=fill gap=2.0
+                                    input "" #block-insert label="New block" <-> block_draft hint="Type, or / for a block kind…" disabled=loading submit=emit(add_block_submit) w=fill p=5.0 text-size=13.5 line-h=1.3 @control
+                                      active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
+                                      hovered bg=fg/2 border=fg/5
+                                      disabled value=muted
+                                    if !empty(slash_kind_matches(block_draft, editable_block_kinds))
+                                      box w=fill p=3.0 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+                                        col w=fill gap=1.0
+                                          for kind in slash_kind_matches(block_draft, editable_block_kinds)
+                                            button label="Set block kind" w=fill h=24.0 p=4.0 @ghost_action -> emit(pick_slash_kind, kind)
+                                              row w=fill h=fill gap=6.0 align=center
+                                                text kind w=fill size=13.0 wrap=none @text-fg
+                                              active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
+                                              hovered bg=brand/14 text=fg
+                                              pressed bg=brand/20
+                                if new_block_kind == "Divider"
+                                  button "Insert divider" disabled=loading w=fill h=28.0 p=5.0 @secondary_action -> emit(add_block_submit)
+                // THE RESULTS FLOAT — the same fix as the chat stream:
+                // inline under the title this card reflowed the whole
+                // document down by 148px per search.
+                if !empty(page_search_hits)
+                  box w=fill h=fill align-y=start
+                    box w=fill max-w=720.0 mx=auto pl=22.0 pr=22.0 pt=26.0
+                      box w=fill h=148.0 p=5.0 bg=elevated border=fg/8 border-w=1.0 r=9.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
                         scroll dir=vertical w=fill h=fill
                           col w=fill gap=1.0
                             for hit in page_search_hits
                               PageSearchResult hit=hit
                                 forward
                                   open_page_search_hit
-                    if !empty(orphaned_block_drafts) || !empty(orphaned_comment_drafts)
-                      box w=fill p=7.0 bg=elevated border=fg/9 border-w=1.0 r=9.0
-                        col w=fill gap=5.0
-                          text "Recovered drafts" size=13.0 font=medium @text-fg
-                          for recovered_block in orphaned_block_drafts
-                            row w=fill gap=5.0 align=center
-                              text recovered_block w=fill size=13.5 @text-muted
-                              button "Use" label="Use as block" disabled=(loading || mutation_phase != "idle" || !empty(block_draft)) h=26.0 p=5.0 @ghost_action -> emit(use_orphaned_block_draft, recovered_block)
-                                active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
-                                hovered bg=fg/14
-                                pressed bg=fg/18
-                              button "Discard" disabled=(loading || mutation_phase != "idle") h=26.0 p=5.0 @danger_action -> emit(discard_orphaned_block_draft, recovered_block)
-                          for recovered_comment in orphaned_comment_drafts
-                            row w=fill gap=5.0 align=center
-                              text recovered_comment w=fill size=13.5 @text-muted
-                              button "Use" label="Use as block" disabled=(loading || mutation_phase != "idle" || !empty(block_draft)) h=26.0 p=5.0 @ghost_action -> emit(use_orphaned_comment_draft, recovered_comment)
-                                active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
-                                hovered bg=fg/14
-                                pressed bg=fg/18
-                              button "Discard" disabled=(loading || mutation_phase != "idle") h=26.0 p=5.0 @danger_action -> emit(discard_orphaned_comment_draft, recovered_comment)
-                    if empty(blocks) && !block_insert_open
-                      box w=fill pl=56.0
-                        button "Write something…" label="Start writing" disabled=loading w=fill p=6.0 @ghost_action -> emit(open_root_block_insert)
-                          active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-                          hovered bg=fg/4 text=fg border=fg/7
-                          pressed bg=fg/8
-                    if block_insert_open && empty(block_insert_after_id)
-                      InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix="" #block-insert-row(block_insert_after_id)
-                        forward
-                          new_block_kind_changed
-                          close_block_insert
-                        stack w=fill
-                          if new_block_kind != "Divider"
-                            col w=fill gap=2.0
-                              input "" #block-insert label="New block" <-> block_draft hint="Type, or / for a block kind…" disabled=loading submit=emit(add_block_submit) w=fill p=5.0 text-size=13.5 line-h=1.3 @control
-                                active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
-                                hovered bg=fg/2 border=fg/5
-                                disabled value=muted
-                              if !empty(slash_kind_matches(block_draft, editable_block_kinds))
-                                box w=fill p=3.0 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
-                                  col w=fill gap=1.0
-                                    for kind in slash_kind_matches(block_draft, editable_block_kinds)
-                                      button label="Set block kind" w=fill h=24.0 p=4.0 @ghost_action -> emit(pick_slash_kind, kind)
-                                        row w=fill h=fill gap=6.0 align=center
-                                          text kind w=fill size=13.0 wrap=none @text-fg
-                                        active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
-                                        hovered bg=brand/14 text=fg
-                                        pressed bg=brand/20
-                          if new_block_kind == "Divider"
-                            button "Insert divider" disabled=loading w=fill h=28.0 p=5.0 @secondary_action -> emit(add_block_submit)
-                    keyed block in blocks by=block.key
-                      col w=fill gap=1.0
-                        DocumentBlock block=block selected=(block.id == selected_block_id) hovered=(block.id == hovered_block_id) disabled=loading #block(block.id)
-                          forward
-                            block_entered
-                            block_exited
-                            open_block_insert
-                            select_block
-                          col w=fill
-                            if block.pending
-                              box w=fill p=5.0 bg=fg/3 r=6.0
-                                BlockContents block=block
-                                  forward
-                                    set_todo_checked
-                            if !block.pending && block.kind == "Page"
-                              button label=block.kind description=block.text w=fill p=5.0 @ghost_action -> emit(choose_page, block.id)
-                                BlockContents block=block
-                                  forward
-                                    set_todo_checked
-                                active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
-                                hovered bg=fg/3 text=fg border=transparent
-                                pressed bg=fg/6 text=fg
-                            if !block.pending && block.kind != "Page" && block.id != selected_block_id
-                              button label=block.kind description=block.text w=fill p=5.0 @ghost_action -> emit(select_block, block.key, block.id, block.kind, block.text, block.checked, false)
-                                BlockContents block=block
-                                  forward
-                                    set_todo_checked
-                                active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
-                                hovered bg=fg/3 text=fg border=transparent
-                                pressed bg=fg/6 text=fg
-                            if !block.pending && block.kind != "Page" && block.id == selected_block_id
-                              BlockLine block=block #line
-                                forward
-                                  set_todo_checked
-                                col w=fill
-                                  if block.kind == "Divider"
-                                    Separator
-                                  if block.kind != "Divider"
-                                    input "" #block-edit label="Edit block" <-> block_edit_draft change=emit(block_text_changed, _) hint="Type something…" disabled=(mutation_phase != "idle") w=fill p=4.0 text-size=13.5 line-h=1.3 @control
-                                      active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=5.0
-                                      hovered bg=fg/2 border=fg/5
-                                      disabled value=muted
-                        if block_insert_open && block.id == block_insert_after_id
-                          InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix=block.prefix #block-insert-row(block_insert_after_id)
-                            forward
-                              new_block_kind_changed
-                              close_block_insert
-                            stack w=fill
-                              if new_block_kind != "Divider"
-                                col w=fill gap=2.0
-                                  input "" #block-insert label="New block" <-> block_draft hint="Type, or / for a block kind…" disabled=loading submit=emit(add_block_submit) w=fill p=5.0 text-size=13.5 line-h=1.3 @control
-                                    active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
-                                    hovered bg=fg/2 border=fg/5
-                                    disabled value=muted
-                                  if !empty(slash_kind_matches(block_draft, editable_block_kinds))
-                                    box w=fill p=3.0 bg=surface border=border border-w=1.0 r=8.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
-                                      col w=fill gap=1.0
-                                        for kind in slash_kind_matches(block_draft, editable_block_kinds)
-                                          button label="Set block kind" w=fill h=24.0 p=4.0 @ghost_action -> emit(pick_slash_kind, kind)
-                                            row w=fill h=fill gap=6.0 align=center
-                                              text kind w=fill size=13.0 wrap=none @text-fg
-                                            active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
-                                            hovered bg=brand/14 text=fg
-                                            pressed bg=brand/20
-                              if new_block_kind == "Divider"
-                                button "Insert divider" disabled=loading w=fill h=28.0 p=5.0 @secondary_action -> emit(add_block_submit)
             overlay when=(connected && !empty(active_page) && !empty(selected_block_id) && block_actions_open) dismiss=emit(close_block_actions) backdrop=transparent p=0.0 align-x=start align-y=start
               content
                 space w=fill h=fill

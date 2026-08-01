@@ -225,187 +225,197 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
                     pressed bg=subtle text=fg
               box w=fill h=1.0 bg=separator
                 space w=1.0 h=1.0
-          col w=fill h=fill gap=9.0 pl=18.0 pr=18.0 pt=16.0 pb=8.0
-            if !empty(search_hits)
-              box w=fill h=148.0 p=6.0 bg=elevated border=fg/10 border-w=1.0 r=10.0
-                scroll dir=vertical w=fill h=fill
-                  col w=fill gap=1.0
-                    for hit in search_hits
-                      ChatSearchResult hit=hit
-                        forward
-                          open_chat_search_hit
-            if !connected
-              EmptyState title="Connect to a node" description="Open Settings from the rail below and set the node endpoint."
-            if connected && !loading && empty(messages)
-              EmptyState title="No messages yet" description="Create a channel or start the conversation."
-            if connected && loading && empty(messages)
-              box w=fill h=fill align-x=center align-y=center
-                text "Loading messages…" size=12.5 @text-meta
-            if connected && !empty(messages) && history_view
-              box w=fill h=32.0 pl=10.0 pr=6.0 bg=warning_bg border=warning_line border-w=1.0 r=9.0
-                row w=fill h=fill gap=8.0 align=center
-                  text "Viewing history" w=fill size=12.5 wrap=none @text-warning
-                  button "Jump to latest" h=24.0 p=5.0 @ghost_action -> emit(choose_channel, active_channel)
-                    active bg=surface text=fg border=warning_line border-w=1.0 r=7.0
-                    hovered bg=warning_bg text=fg
-                    pressed bg=accent text=fg
-            if connected && !empty(messages)
-              stack w=fill h=fill
-                sensor show=emit(chat_resized, _, _) resize=emit(chat_resized, _, _)
-                  space w=fill h=fill
-                mouse move=emit(chat_pointer_moved, _, _)
-                  scroll dir=vertical w=fill h=fill anchor-y=end auto=true
-                    col w=fill gap=3.0
-                      if history_has_older(messages)
-                        box w=fill align-x=center pt=4.0 pb=8.0
-                          button "Load older messages" disabled=(history_loading || mutation_phase != "idle") h=30.0 p=6.0 @secondary_action -> emit(load_more_history)
-                            active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=8.0
-                            hovered bg=fg/10 text=fg border=fg/14
-                            pressed bg=fg/14 text=fg
-                      for message in messages
-                        col w=fill gap=0.0
-                          if unread_boundary > 0 && message.seq == unread_marker_seq
-                            row w=fill gap=8.0 align=center pt=8.0 pb=2.0
-                              box w=fill h=1.0 bg=brand/40
-                                text ""
-                              text "New messages" size=12.5 wrap=none @text-brand
-                              box w=fill h=1.0 bg=brand/40
-                                text ""
-                          stack #message(message.id) w=fill
-                            // THE ONE DASHED BORDER IN THE CONSOLE.
-                            // `message.pending` is this app's only
-                            // optimistic write — seeded by
-                            // `optimistic_message`, cleared by
-                            // `merge_message_send_result` — so the
-                            // design system's "not yet settled is
-                            // dashed" rule is drawn here and nowhere
-                            // else. The ring is over the card, so the
-                            // card keeps its own plate.
-                            UnfinalizedFrame pending=message.pending
-                              MessageCard message=message selected=(message.seq == selected_message_seq) hovered=(message.seq == hovered_message_seq) disabled=loading
-                                forward
-                                  message_entered
-                                  message_exited
-                                  add_reaction_at
-                                  remove_reaction_at
-                                  open_thread_for
-                                  open_message_actions_accessibly
-                                  open_message_reactions
-                                  open_message_actions
-                overlay when=(selected_message_seq > 0 && message_action != "toolbar") dismiss=emit(clear_message_selection) backdrop=transparent p=8.0 align-x=end align-y=start
-                  content
+          stack w=fill h=fill
+            col w=fill h=fill gap=9.0 pl=18.0 pr=18.0 pt=16.0 pb=8.0
+              if !connected
+                EmptyState title="Connect to a node" description="Open Settings from the rail below and set the node endpoint."
+              if connected && !loading && empty(messages)
+                EmptyState title="No messages yet" description="Create a channel or start the conversation."
+              if connected && loading && empty(messages)
+                box w=fill h=fill align-x=center align-y=center
+                  text "Loading messages…" size=12.5 @text-meta
+              if connected && !empty(messages) && history_view
+                box w=fill h=32.0 pl=10.0 pr=6.0 bg=warning_bg border=warning_line border-w=1.0 r=9.0
+                  row w=fill h=fill gap=8.0 align=center
+                    text "Viewing history" w=fill size=12.5 wrap=none @text-warning
+                    button "Jump to latest" h=24.0 p=5.0 @ghost_action -> emit(choose_channel, active_channel)
+                      active bg=surface text=fg border=warning_line border-w=1.0 r=7.0
+                      hovered bg=warning_bg text=fg
+                      pressed bg=accent text=fg
+              if connected && !empty(messages)
+                stack w=fill h=fill
+                  sensor show=emit(chat_resized, _, _) resize=emit(chat_resized, _, _)
                     space w=fill h=fill
-                  layer
-                    float x=0.0 y=message_menu_y
-                      col
-                        if message_action == "more"
-                          stack
-                            input "" #message-action-focus label="Message action focus" <-> message_action_focus w=1.0 p=0.0 text-size=1.0 line-h=1.0
-                              active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
-                              focused bg=transparent border=transparent value=transparent border-w=0.0
-                            box w=190.0 p=4.0 style=raised_style()
-                              col w=fill gap=1.0
-                                button "React" label="Manage reactions" disabled=active_channel_archived w=fill h=28.0 p=6.0 @ghost_action -> emit(open_message_reactions, selected_message_seq, message_edit_draft, selected_message_rev)
-                                  active bg=transparent text=muted r=6.0
+                  mouse move=emit(chat_pointer_moved, _, _)
+                    scroll dir=vertical w=fill h=fill anchor-y=end auto=true
+                      col w=fill gap=3.0
+                        if history_has_older(messages)
+                          box w=fill align-x=center pt=4.0 pb=8.0
+                            button "Load older messages" disabled=(history_loading || mutation_phase != "idle") h=30.0 p=6.0 @secondary_action -> emit(load_more_history)
+                              active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=8.0
+                              hovered bg=fg/10 text=fg border=fg/14
+                              pressed bg=fg/14 text=fg
+                        for message in messages
+                          col w=fill gap=0.0
+                            if unread_boundary > 0 && message.seq == unread_marker_seq
+                              row w=fill gap=8.0 align=center pt=8.0 pb=2.0
+                                box w=fill h=1.0 bg=brand/40
+                                  text ""
+                                text "New messages" size=12.5 wrap=none @text-brand
+                                box w=fill h=1.0 bg=brand/40
+                                  text ""
+                            stack #message(message.id) w=fill
+                              // THE ONE DASHED BORDER IN THE CONSOLE.
+                              // `message.pending` is this app's only
+                              // optimistic write — seeded by
+                              // `optimistic_message`, cleared by
+                              // `merge_message_send_result` — so the
+                              // design system's "not yet settled is
+                              // dashed" rule is drawn here and nowhere
+                              // else. The ring is over the card, so the
+                              // card keeps its own plate.
+                              UnfinalizedFrame pending=message.pending
+                                MessageCard message=message selected=(message.seq == selected_message_seq) hovered=(message.seq == hovered_message_seq) disabled=loading
+                                  forward
+                                    message_entered
+                                    message_exited
+                                    add_reaction_at
+                                    remove_reaction_at
+                                    open_thread_for
+                                    open_message_actions_accessibly
+                                    open_message_reactions
+                                    open_message_actions
+                  overlay when=(selected_message_seq > 0 && message_action != "toolbar") dismiss=emit(clear_message_selection) backdrop=transparent p=8.0 align-x=end align-y=start
+                    content
+                      space w=fill h=fill
+                    layer
+                      float x=0.0 y=message_menu_y
+                        col
+                          if message_action == "more"
+                            stack
+                              input "" #message-action-focus label="Message action focus" <-> message_action_focus w=1.0 p=0.0 text-size=1.0 line-h=1.0
+                                active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
+                                focused bg=transparent border=transparent value=transparent border-w=0.0
+                              box w=190.0 p=4.0 style=raised_style()
+                                col w=fill gap=1.0
+                                  button "React" label="Manage reactions" disabled=active_channel_archived w=fill h=28.0 p=6.0 @ghost_action -> emit(open_message_reactions, selected_message_seq, message_edit_draft, selected_message_rev)
+                                    active bg=transparent text=muted r=6.0
+                                    hovered bg=fg/10 text=fg
+                                    pressed bg=fg/15
+                                  button "Open thread" w=fill h=28.0 p=6.0 @ghost_action -> emit(open_thread_for, selected_message_seq)
+                                    active bg=transparent text=muted r=6.0
+                                    hovered bg=fg/10 text=fg
+                                    pressed bg=fg/15
+                                  button "Edit" w=fill h=28.0 p=6.0 @ghost_action -> emit(begin_message_edit, selected_message_seq, message_edit_draft, selected_message_rev)
+                                    active bg=transparent text=muted r=6.0
+                                    hovered bg=fg/10 text=fg
+                                    pressed bg=fg/15
+                                  button "Delete" w=fill h=28.0 p=6.0 @danger_action -> emit(arm_message_delete, selected_message_seq, message_edit_draft, selected_message_rev)
+                                  button "Close" label="Close message actions" w=fill h=28.0 p=6.0 @secondary_action -> emit(clear_message_selection)
+                                    active bg=transparent text=muted r=6.0
+                                    hovered bg=fg/10 text=fg
+                                    pressed bg=fg/15
+                          if message_action == "reactions"
+                            stack
+                              input "" #message-reaction-focus label="Message reaction focus" <-> message_action_focus w=1.0 p=0.0 text-size=1.0 line-h=1.0
+                                active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
+                                focused bg=transparent border=transparent value=transparent border-w=0.0
+                              box p=3.0 style=raised_style()
+                                row gap=2.0 align=center
+                                  button "+ 👍" label="Add thumbs up reaction" disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(add_reaction_submit, "👍")
+                                    active bg=transparent text=fg r=6.0
+                                    hovered bg=fg/10
+                                    pressed bg=fg/15
+                                  button "+ ♥" label="Add heart reaction" disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(add_reaction_submit, "❤️")
+                                    active bg=transparent text=fg r=6.0
+                                    hovered bg=fg/10
+                                    pressed bg=fg/15
+                                  button "+ 😄" label="Add smile reaction" disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(add_reaction_submit, "😄")
+                                    active bg=transparent text=fg r=6.0
+                                    hovered bg=fg/10
+                                    pressed bg=fg/15
+                                  button "+ 🎉" label="Add celebration reaction" disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(add_reaction_submit, "🎉")
+                                    active bg=transparent text=fg r=6.0
+                                    hovered bg=fg/10
+                                    pressed bg=fg/15
+                                  button "+ 👀" label="Add eyes reaction" disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(add_reaction_submit, "👀")
+                                    active bg=transparent text=fg r=6.0
+                                    hovered bg=fg/10
+                                    pressed bg=fg/15
+                                  button "+ 🙌" label="Add raised hands reaction" disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(add_reaction_submit, "🙌")
+                                    active bg=transparent text=fg r=6.0
+                                    hovered bg=fg/10
+                                    pressed bg=fg/15
+                                  for message in messages
+                                    if message.seq == selected_message_seq
+                                      for reaction in message.reactions
+                                        if reaction.reacted_by_me
+                                          button label="Remove my reaction" description=reaction.emoji disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(remove_reaction_submit, reaction.emoji)
+                                            text reaction.emoji size=13.0 @text-fg
+                                            active bg=fg/7 text=fg r=6.0
+                                            hovered bg=fg/12
+                                            pressed bg=fg/17
+                                  button "×" label="Close reactions" disabled=(mutation_phase != "idle") w=26.0 h=26.0 p=4.0 @secondary_action -> emit(clear_message_selection)
+                                    active bg=transparent text=muted r=6.0
+                                    hovered bg=fg/10 text=fg
+                                    pressed bg=fg/15
+                          if message_action == "editing"
+                            box w=fill max-w=520.0 p=3.0 style=raised_style()
+                              row w=fill gap=4.0 align=center
+                                input "" #message-edit label="Edit message" <-> message_edit_draft hint="Edit message" disabled=(mutation_phase != "idle") submit=emit(edit_message_submit) w=fill p=6.2 text-size=13.0 line-h=1.2 @control
+                                  active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                                  hovered bg=fg/4 border=fg/8
+                                  disabled value=muted
+                                button "Save" label="Save message changes" disabled=(mutation_phase != "idle" || empty(trim(message_edit_draft))) h=28.0 p=6.0 @primary_action -> emit(edit_message_submit)
+                                button label="Cancel message edit" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @icon_action -> emit(clear_message_selection)
+                                  box w=fill h=fill align-x=center align-y=center
+                                    text "×" size=14.0
+                                  active bg=transparent text=muted r=7.0
                                   hovered bg=fg/10 text=fg
                                   pressed bg=fg/15
-                                button "Open thread" w=fill h=28.0 p=6.0 @ghost_action -> emit(open_thread_for, selected_message_seq)
-                                  active bg=transparent text=muted r=6.0
-                                  hovered bg=fg/10 text=fg
-                                  pressed bg=fg/15
-                                button "Edit" w=fill h=28.0 p=6.0 @ghost_action -> emit(begin_message_edit, selected_message_seq, message_edit_draft, selected_message_rev)
-                                  active bg=transparent text=muted r=6.0
-                                  hovered bg=fg/10 text=fg
-                                  pressed bg=fg/15
-                                button "Delete" w=fill h=28.0 p=6.0 @danger_action -> emit(arm_message_delete, selected_message_seq, message_edit_draft, selected_message_rev)
-                                button "Close" label="Close message actions" w=fill h=28.0 p=6.0 @secondary_action -> emit(clear_message_selection)
-                                  active bg=transparent text=muted r=6.0
-                                  hovered bg=fg/10 text=fg
-                                  pressed bg=fg/15
-                        if message_action == "reactions"
-                          stack
-                            input "" #message-reaction-focus label="Message reaction focus" <-> message_action_focus w=1.0 p=0.0 text-size=1.0 line-h=1.0
-                              active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
-                              focused bg=transparent border=transparent value=transparent border-w=0.0
-                            box p=3.0 style=raised_style()
-                              row gap=2.0 align=center
-                                button "+ 👍" label="Add thumbs up reaction" disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(add_reaction_submit, "👍")
-                                  active bg=transparent text=fg r=6.0
-                                  hovered bg=fg/10
-                                  pressed bg=fg/15
-                                button "+ ♥" label="Add heart reaction" disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(add_reaction_submit, "❤️")
-                                  active bg=transparent text=fg r=6.0
-                                  hovered bg=fg/10
-                                  pressed bg=fg/15
-                                button "+ 😄" label="Add smile reaction" disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(add_reaction_submit, "😄")
-                                  active bg=transparent text=fg r=6.0
-                                  hovered bg=fg/10
-                                  pressed bg=fg/15
-                                button "+ 🎉" label="Add celebration reaction" disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(add_reaction_submit, "🎉")
-                                  active bg=transparent text=fg r=6.0
-                                  hovered bg=fg/10
-                                  pressed bg=fg/15
-                                button "+ 👀" label="Add eyes reaction" disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(add_reaction_submit, "👀")
-                                  active bg=transparent text=fg r=6.0
-                                  hovered bg=fg/10
-                                  pressed bg=fg/15
-                                button "+ 🙌" label="Add raised hands reaction" disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(add_reaction_submit, "🙌")
-                                  active bg=transparent text=fg r=6.0
-                                  hovered bg=fg/10
-                                  pressed bg=fg/15
-                                for message in messages
-                                  if message.seq == selected_message_seq
-                                    for reaction in message.reactions
-                                      if reaction.reacted_by_me
-                                        button label="Remove my reaction" description=reaction.emoji disabled=(mutation_phase != "idle" || active_channel_archived) h=26.0 p=5.0 @ghost_action -> emit(remove_reaction_submit, reaction.emoji)
-                                          text reaction.emoji size=13.0 @text-fg
-                                          active bg=fg/7 text=fg r=6.0
-                                          hovered bg=fg/12
-                                          pressed bg=fg/17
-                                button "×" label="Close reactions" disabled=(mutation_phase != "idle") w=26.0 h=26.0 p=4.0 @secondary_action -> emit(clear_message_selection)
-                                  active bg=transparent text=muted r=6.0
-                                  hovered bg=fg/10 text=fg
-                                  pressed bg=fg/15
-                        if message_action == "editing"
-                          box w=fill max-w=520.0 p=3.0 style=raised_style()
-                            row w=fill gap=4.0 align=center
-                              input "" #message-edit label="Edit message" <-> message_edit_draft hint="Edit message" disabled=(mutation_phase != "idle") submit=emit(edit_message_submit) w=fill p=6.2 text-size=13.0 line-h=1.2 @control
-                                active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
-                                hovered bg=fg/4 border=fg/8
-                                disabled value=muted
-                              button "Save" label="Save message changes" disabled=(mutation_phase != "idle" || empty(trim(message_edit_draft))) h=28.0 p=6.0 @primary_action -> emit(edit_message_submit)
-                              button label="Cancel message edit" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @icon_action -> emit(clear_message_selection)
-                                box w=fill h=fill align-x=center align-y=center
-                                  text "×" size=14.0
-                                active bg=transparent text=muted r=7.0
-                                hovered bg=fg/10 text=fg
-                                pressed bg=fg/15
-                        if message_action == "delete"
-                          stack
-                            input "" #message-delete-focus label="Message delete focus" <-> message_action_focus w=1.0 p=0.0 text-size=1.0 line-h=1.0
-                              active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
-                              focused bg=transparent border=transparent value=transparent border-w=0.0
-                            box p=3.0 style=raised_style()
-                              row gap=5.0 align=center
-                                text "Delete this message?" size=12.5 @text-muted
-                                button "Delete" disabled=(mutation_phase != "idle") h=26.0 p=5.0 @danger_action -> emit(delete_message_submit)
-                                button "Cancel" disabled=(mutation_phase != "idle") h=26.0 p=5.0 @secondary_action -> emit(clear_message_selection)
-                                  active bg=transparent text=muted r=6.0
-                                  hovered bg=fg/10 text=fg
-                                  pressed bg=fg/15
-            if !empty(failed_message_draft)
-              row w=fill gap=6.0 align=center
-                text "An earlier message wasn’t sent" w=fill size=12.5 @text-muted
-                button "Restore" disabled=(!empty(trim(editor_text(message_editor))) || mutation_phase != "idle") h=28.0 p=5.0 @secondary_action -> emit(restore_failed_message)
-                  active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
-                  hovered bg=fg/14
-                  pressed bg=fg/18
-                button label="Dismiss unsent message" w=28.0 h=28.0 p=0.0 @icon_action -> emit(dismiss_failed_message)
-                  box w=fill h=fill align-x=center align-y=center
-                    text "×" size=14.0
-                  active bg=transparent text=muted r=7.0
-                  hovered bg=fg/10 text=fg
-                  pressed bg=fg/15
+                          if message_action == "delete"
+                            stack
+                              input "" #message-delete-focus label="Message delete focus" <-> message_action_focus w=1.0 p=0.0 text-size=1.0 line-h=1.0
+                                active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
+                                focused bg=transparent border=transparent value=transparent border-w=0.0
+                              box p=3.0 style=raised_style()
+                                row gap=5.0 align=center
+                                  text "Delete this message?" size=12.5 @text-muted
+                                  button "Delete" disabled=(mutation_phase != "idle") h=26.0 p=5.0 @danger_action -> emit(delete_message_submit)
+                                  button "Cancel" disabled=(mutation_phase != "idle") h=26.0 p=5.0 @secondary_action -> emit(clear_message_selection)
+                                    active bg=transparent text=muted r=6.0
+                                    hovered bg=fg/10 text=fg
+                                    pressed bg=fg/15
+              if !empty(failed_message_draft)
+                row w=fill gap=6.0 align=center
+                  text "An earlier message wasn’t sent" w=fill size=12.5 @text-muted
+                  button "Restore" disabled=(!empty(trim(editor_text(message_editor))) || mutation_phase != "idle") h=28.0 p=5.0 @secondary_action -> emit(restore_failed_message)
+                    active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
+                    hovered bg=fg/14
+                    pressed bg=fg/18
+                  button label="Dismiss unsent message" w=28.0 h=28.0 p=0.0 @icon_action -> emit(dismiss_failed_message)
+                    box w=fill h=fill align-x=center align-y=center
+                      text "×" size=14.0
+                    active bg=transparent text=muted r=7.0
+                    hovered bg=fg/10 text=fg
+                    pressed bg=fg/15
+            // THE RESULTS FLOAT. This card used to be the column's first
+            // child, so typing a search reflowed the whole conversation down
+            // by 148px; as a stack layer it drops over the stream instead,
+            // and everything below it keeps its place.
+            // THE RESULTS FLOAT. This card used to be the column's first
+            // child, so a search reflowed the whole conversation down by
+            // 148px; as a stack layer it drops over the stream instead and
+            // everything beneath keeps its place.
+            if !empty(search_hits)
+              box w=fill h=fill pl=18.0 pr=18.0 pt=16.0 align-y=start
+                box w=fill h=148.0 p=6.0 bg=elevated border=fg/10 border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
+                  scroll dir=vertical w=fill h=fill
+                    col w=fill gap=1.0
+                      for hit in search_hits
+                        ChatSearchResult hit=hit
+                          forward
+                            open_chat_search_hit
           // The composer is separated from the stream by a hairline and
           // carries the artifact's own 12/16/14 region padding.
           box w=fill h=1.0 bg=separator
