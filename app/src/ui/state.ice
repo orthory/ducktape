@@ -249,7 +249,16 @@ state
   block_comment_draft = ""
   pending_block_comment = ""
   page_title_selected = false
-  block_edit_draft = ""
+  // The selected block edits in place through this document; dirtiness is
+  // the text's drift from `selected_block_saved_text` (the last text known
+  // saved), because the stock editor's edits never pass through a handler.
+  block_editor:editor = ""
+  selected_block_saved_text = ""
+  block_autosave_inflight_text = ""
+  block_focus_key:i64 = -1
+  // Scratch seat for a block-key payload field (the palette_key precedent:
+  // a route payload's field does not type inside a `let` or a call).
+  block_key_action = ""
   block_autosave_status = "idle"
   block_autosave_generation:i64 = 0
   orphaned_block_drafts:[str] = []

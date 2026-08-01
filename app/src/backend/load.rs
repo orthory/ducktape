@@ -693,6 +693,7 @@ pub(crate) fn page_blocks(wire_blocks: Vec<pages::Block>, active_page: &str) -> 
             id: block.id,
             parent: block.parent.unwrap_or_default(),
             kind: block_kind_name(block.kind).into(),
+            spans: plain_rich_spans(&block.text),
             text: block.text,
             pending: false,
             checked: block.checked,

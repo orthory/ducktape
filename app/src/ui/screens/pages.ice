@@ -21,7 +21,7 @@
 // and not the whole tab. It reports through this screen's own `pages_resized`;
 // it was briefly a caller-filled slot, because a sensor could not carry a
 // component event until ui-lang#239.
-component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:str, connected:bool, connected_rpc:str, password:str, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_delete_armed:bool, block_autosave_status:str, doc_tabs:[str], blocks:[PageBlock], orphaned_block_drafts:[str], orphaned_comment_drafts:[str], bind block_draft:str, block_insert_open:bool, block_insert_after_id:str, new_block_kind:str, block_kinds:[str], editable_block_kinds:[str], selected_block_id:str, selected_block_kind:str, hovered_block_id:str, bind block_edit_draft:str, block_actions_open:bool, block_menu_x:f64, block_menu_y:f64, block_delete_armed:bool, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
+component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:str, connected:bool, connected_rpc:str, password:str, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_delete_armed:bool, block_autosave_status:str, doc_tabs:[str], blocks:[PageBlock], orphaned_block_drafts:[str], orphaned_comment_drafts:[str], bind block_draft:str, block_insert_open:bool, block_insert_after_id:str, new_block_kind:str, block_kinds:[str], editable_block_kinds:[str], selected_block_id:str, selected_block_kind:str, hovered_block_id:str, bind block_editor:editor, block_actions_open:bool, block_menu_x:f64, block_menu_y:f64, block_delete_armed:bool, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
   emits
     toggle_page_create()
     create_page_submit()
@@ -48,7 +48,8 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
     open_block_insert(i64, str)
     select_block(i64, str, str, str, bool, bool)
     set_todo_checked(str, bool)
-    block_text_changed(str)
+    block_key(BlockKeyEvent)
+    block_draft_changed(str)
     close_block_actions()
     selected_block_kind_changed(str)
     move_block_submit(str)
@@ -229,7 +230,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                           stack w=fill
                             if new_block_kind != "Divider"
                               col w=fill gap=2.0
-                                input "" #block-insert label="New block" <-> block_draft hint="Type, or / for a block kind…" disabled=loading submit=emit(add_block_submit) w=fill p=5.0 text-size=13.5 line-h=1.3 @control
+                                input "" #block-insert label="New block" <-> block_draft change=emit(block_draft_changed, _) hint="Type, or / for a block kind…" disabled=loading submit=emit(add_block_submit) w=fill p=5.0 text-size=13.5 line-h=1.3 @control
                                   active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
                                   hovered bg=fg/2 border=fg/5
                                   disabled value=muted
@@ -283,10 +284,60 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                                     if block.kind == "Divider"
                                       Separator
                                     if block.kind != "Divider"
-                                      input "" #block-edit label="Edit block" <-> block_edit_draft change=emit(block_text_changed, _) hint="Type something…" disabled=(mutation_phase != "idle") w=fill p=4.0 text-size=13.5 line-h=1.3 @control
-                                        active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=5.0
-                                        hovered bg=fg/2 border=fg/5
-                                        disabled value=muted
+                                      // THE EDITOR WEARS THE BLOCK'S OWN CLOTHES. Each kind
+                                      // edits at the metrics BlockContents renders it with —
+                                      // same size, rhythm (pt), font and ink — so selecting a
+                                      // block swaps a caret in, not a costume. The structural
+                                      // keys route through `block_key_press` (Enter splits,
+                                      // Backspace-on-empty deletes, Tab indents, Esc leaves);
+                                      // everything else stays native editing, and the
+                                      // highlighter is the composers' own markdown table.
+                                      // Code alone drops it: marks inside code are content.
+                                      match block.kind
+                                        "Heading 1"
+                                          box w=fill pt=20.0
+                                            editor #block-edit(block.kind) <-> block_editor hint="Heading 1" disabled=(mutation_phase != "idle") size=20.0 line-h=1.25 p=0.0 wrap=word font=display key-binding=block_key_press(block.kind, empty(trim(editor_text(block_editor))), (block.child_count > 0)) highlighter=page_inline_marks() -> emit(block_key, _)
+                                              active bg=transparent border=transparent value=primary placeholder=muted selection=fg/18
+                                              disabled value=muted
+                                        "Heading 2"
+                                          box w=fill pt=20.0
+                                            editor #block-edit(block.kind) <-> block_editor hint="Heading 2" disabled=(mutation_phase != "idle") size=16.0 line-h=1.3 p=0.0 wrap=word font=display key-binding=block_key_press(block.kind, empty(trim(editor_text(block_editor))), (block.child_count > 0)) highlighter=page_inline_marks() -> emit(block_key, _)
+                                              active bg=transparent border=transparent value=primary placeholder=muted selection=fg/18
+                                              disabled value=muted
+                                        "Heading 3"
+                                          box w=fill pt=16.0
+                                            editor #block-edit(block.kind) <-> block_editor hint="Heading 3" disabled=(mutation_phase != "idle") size=14.0 line-h=1.35 p=0.0 wrap=word font=display key-binding=block_key_press(block.kind, empty(trim(editor_text(block_editor))), (block.child_count > 0)) highlighter=page_inline_marks() -> emit(block_key, _)
+                                              active bg=transparent border=transparent value=primary placeholder=muted selection=fg/18
+                                              disabled value=muted
+                                        "Quote"
+                                          box w=fill pt=16.0
+                                            row w=fill gap=0.0 align=start
+                                              box w=2.0 h=fill bg=control_line
+                                                space w=1.0 h=1.0
+                                              box w=fill pl=14.0
+                                                editor #block-edit(block.kind) <-> block_editor hint="Quote" disabled=(mutation_phase != "idle") size=14.0 line-h=1.6 p=0.0 wrap=word font=italic key-binding=block_key_press(block.kind, empty(trim(editor_text(block_editor))), (block.child_count > 0)) highlighter=page_inline_marks() -> emit(block_key, _)
+                                                  active bg=transparent border=transparent value=muted placeholder=muted selection=fg/18
+                                                  disabled value=muted
+                                        "Code"
+                                          box w=fill pt=14.0
+                                            box w=fill pl=15.0 pr=15.0 pt=13.0 pb=13.0 bg=primary r=10.0 clip=true
+                                              editor #block-edit(block.kind) <-> block_editor hint="Code" disabled=(mutation_phase != "idle") size=12.0 line-h=1.6 p=0.0 wrap=none font=code key-binding=block_key_press(block.kind, empty(trim(editor_text(block_editor))), (block.child_count > 0)) -> emit(block_key, _)
+                                                active bg=transparent border=transparent value=chevron_idle placeholder=muted selection=fg/30
+                                                disabled value=muted
+                                        "Callout"
+                                          box w=fill pt=14.0
+                                            box w=fill pl=15.0 pr=15.0 pt=13.0 pb=13.0 bg=card_wash border=separator border-w=1.0 r=11.0
+                                              row w=fill gap=11.0 align=start
+                                                box w=20.0 h=20.0 align-x=center align-y=center bg=brand_bg r=6.0
+                                                  text "i" size=10.0 wrap=none font=code_semibold @text-brand
+                                                editor #block-edit(block.kind) <-> block_editor hint="Callout" disabled=(mutation_phase != "idle") size=13.0 line-h=1.6 p=0.0 wrap=word key-binding=block_key_press(block.kind, empty(trim(editor_text(block_editor))), (block.child_count > 0)) highlighter=page_inline_marks() -> emit(block_key, _)
+                                                  active bg=transparent border=transparent value=panel_tile placeholder=muted selection=fg/18
+                                                  disabled value=muted
+                                        _
+                                          box w=fill pt=8.0
+                                            editor #block-edit(block.kind) <-> block_editor hint="Type something…" disabled=(mutation_phase != "idle") size=14.0 line-h=1.65 p=0.0 wrap=word key-binding=block_key_press(block.kind, empty(trim(editor_text(block_editor))), (block.child_count > 0)) highlighter=page_inline_marks() -> emit(block_key, _)
+                                              active bg=transparent border=transparent value=accent_fg placeholder=muted selection=fg/18
+                                              disabled value=muted
                           if block_insert_open && block.id == block_insert_after_id
                             InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix=block.prefix #block-insert-row(block_insert_after_id)
                               forward
@@ -295,7 +346,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                               stack w=fill
                                 if new_block_kind != "Divider"
                                   col w=fill gap=2.0
-                                    input "" #block-insert label="New block" <-> block_draft hint="Type, or / for a block kind…" disabled=loading submit=emit(add_block_submit) w=fill p=5.0 text-size=13.5 line-h=1.3 @control
+                                    input "" #block-insert label="New block" <-> block_draft change=emit(block_draft_changed, _) hint="Type, or / for a block kind…" disabled=loading submit=emit(add_block_submit) w=fill p=5.0 text-size=13.5 line-h=1.3 @control
                                       active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
                                       hovered bg=fg/2 border=fg/5
                                       disabled value=muted

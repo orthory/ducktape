@@ -55,6 +55,10 @@ fn reply_composer(app: &Ducktape) -> String {
     app.reply_editor.text().trim().to_string()
 }
 
+fn block_editor_text(app: &Ducktape) -> String {
+    app.block_editor.text().trim_end().to_string()
+}
+
 #[test]
 fn full_view_fits_a_four_mib_stack() {
     std::thread::Builder::new()
@@ -234,6 +238,12 @@ fn assert_no_polling(lifecycle: &str) {
             // no longer flashes and vanishes. Still gated on a visible
             // toast — it costs nothing at rest.
             "every 300ms when !empty(toast) -> toast_tick",
+            // the block editor's autosave clock: the stock editor's edits
+            // never pass through a handler, so a dirty buffer is the only
+            // signal there is — and the gate IS the dirty test, so the tick
+            // exists solely while unsaved text needs the node. It costs
+            // nothing at rest and dies the moment the save lands.
+            "every 900ms when (connected && !empty(selected_block_id) && trim(editor_text(block_editor)) != selected_block_saved_text) -> block_autosave_tick",
         ]
     );
 }
@@ -356,7 +366,8 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     assert!(lifecycle.contains(
         "active_page_title = keep_str(next.pages_loaded, next.active_page_title, active_page_title)"
     ));
-    assert!(lifecycle.contains("block_edit_draft = refreshed_block_draft("));
+    assert!(lifecycle.contains("block_editor = refreshed_block_editor("));
+    assert!(lifecycle.contains("selected_block_saved_text = resynced_saved"));
     // the comment rail is scoped to the PAGE it hangs off, so its draft
     // survives moving the cursor between blocks and dies with the page.
     assert!(lifecycle.contains(
@@ -639,7 +650,7 @@ fn pages_mutation_keeps_the_canonical_selected_block() {
     app.mutation_phase = "block-kind".into();
     app.selected_block_id = "block-1".into();
     app.selected_block_kind = "Text".into();
-    app.block_edit_draft = "local".into();
+    app.block_editor = compose("local");
     app.block_actions_open = true;
 
     let block = backend::PageBlock {
@@ -653,6 +664,7 @@ fn pages_mutation_keeps_the_canonical_selected_block() {
         prefix: String::new(),
         child_count: 0,
         mark_count: 0,
+        spans: Vec::new(),
     };
     let _ = app.__update(__DucktapeMessage::PagesMutated(backend::PagesData {
         pages: Vec::new(),
@@ -669,7 +681,7 @@ fn pages_mutation_keeps_the_canonical_selected_block() {
 
     assert_eq!(app.selected_block_id, "block-1");
     assert_eq!(app.selected_block_kind, "Todo");
-    assert_eq!(app.block_edit_draft, "canonical");
+    assert_eq!(block_editor_text(&app), "canonical");
     assert!(app.selected_block_checked);
     assert!(!app.block_actions_open);
     assert_eq!(app.mutation_phase, "idle");
@@ -830,6 +842,7 @@ fn flow_typing_inserts_blocks_in_order() {
                 prefix: String::new(),
                 child_count: 0,
                 mark_count: 0,
+                spans: Vec::new(),
             }],
             active_page: "welcome".into(),
             active_page_title: "Welcome".into(),
@@ -1284,7 +1297,7 @@ fn changing_endpoint_clears_remote_bound_interaction_state() {
     app.active_thread_seq = 1;
     app.reply_editor = compose("node a reply");
     app.selected_block_id = "same-id".into();
-    app.block_edit_draft = "node a block".into();
+    app.block_editor = compose("node a block");
     app.block_comments_open = true;
     app.block_comments_target = "same-id".into();
     app.block_comment_draft = "node a comment".into();
@@ -1301,7 +1314,7 @@ fn changing_endpoint_clears_remote_bound_interaction_state() {
     assert_eq!(app.active_thread_seq, 0);
     assert!(reply_composer(&app).is_empty());
     assert!(app.selected_block_id.is_empty());
-    assert!(app.block_edit_draft.is_empty());
+    assert!(block_editor_text(&app).is_empty());
     assert!(!app.block_comments_open);
     assert!(app.block_comments_target.is_empty());
     assert!(app.block_comment_draft.is_empty());
@@ -1349,6 +1362,7 @@ fn page_search_load_selects_the_canonical_block() {
             prefix: String::new(),
             child_count: 0,
             mark_count: 0,
+            spans: Vec::new(),
         }],
         active_page: "page-1".into(),
         active_page_title: "Page".into(),
@@ -1362,7 +1376,7 @@ fn page_search_load_selects_the_canonical_block() {
 
     assert_eq!(app.selected_block_id, "block-1");
     assert_eq!(app.selected_block_kind, "Todo");
-    assert_eq!(app.block_edit_draft, "Canonical text");
+    assert_eq!(block_editor_text(&app), "Canonical text");
     assert!(app.selected_block_checked);
 }
 
@@ -2159,6 +2173,7 @@ fn live_comment_refresh_updates_threads_without_touching_the_draft() {
             prefix: String::new(),
             child_count: 0,
             mark_count: 0,
+            spans: Vec::new(),
         }],
     )));
     let generation = app.block_comments_generation;
@@ -2295,10 +2310,11 @@ fn block_edits_invalidate_an_older_resync() {
     app.connected_rpc = "http://node".into();
     app.selected_block_id = "block-1".into();
     app.selected_block_kind = "Text".into();
-    app.block_edit_draft = "old".into();
+    app.block_editor = compose("new");
+    app.selected_block_saved_text = "old".into();
     app.hydration_generation = 3;
 
-    let _ = app.__update(__DucktapeMessage::BlockTextChanged("new".into()));
+    let _ = app.__update(__DucktapeMessage::BlockAutosaveTick);
     assert_eq!(app.hydration_generation, 4);
 
     // a stale resync from before the edit cannot roll the draft back
@@ -2318,9 +2334,10 @@ fn block_edits_invalidate_an_older_resync() {
             prefix: String::new(),
             child_count: 0,
             mark_count: 0,
+            spans: Vec::new(),
         }],
     )));
-    assert_eq!(app.block_edit_draft, "new");
+    assert_eq!(block_editor_text(&app), "new");
 }
 
 #[test]
@@ -2331,7 +2348,7 @@ fn remote_block_deletion_recovers_local_drafts_and_closes_the_editor() {
     app.hydration_generation = 4;
     app.selected_block_id = "deleted".into();
     app.selected_block_kind = "Text".into();
-    app.block_edit_draft = "unfinished block".into();
+    app.block_editor = compose("unfinished block");
     app.block_autosave_status = "error".into();
     app.block_autosave_generation = 8;
     app.block_comments_open = true;
@@ -2351,7 +2368,7 @@ fn remote_block_deletion_recovers_local_drafts_and_closes_the_editor() {
 
     assert_eq!(app.orphaned_block_drafts, ["unfinished block"]);
     assert!(app.selected_block_id.is_empty());
-    assert!(app.block_edit_draft.is_empty());
+    assert!(block_editor_text(&app).is_empty());
     // the comment rail hangs off the PAGE, and the page survived — so the
     // rail and its half-typed comment survive a block deletion. Only a
     // page change closes it. (The orphan LIST is not asserted here: the
@@ -2447,7 +2464,7 @@ fn reconnect_recovers_active_drafts_for_the_same_endpoint() {
     app.rpc = "http://node".into();
     app.connected_rpc = "http://node".into();
     app.selected_block_id = "block".into();
-    app.block_edit_draft = "unfinished block".into();
+    app.block_editor = compose("unfinished block");
     app.block_autosave_status = "saving".into();
     app.block_comment_draft = "unfinished comment".into();
 
@@ -2464,7 +2481,7 @@ fn page_and_block_context_changes_recover_local_drafts() {
     app.connected_rpc = "http://draft-context-test".into();
     app.selected_block_id = "block-a".into();
     app.selected_block_kind = "Text".into();
-    app.block_edit_draft = "failed edit".into();
+    app.block_editor = compose("failed edit");
     app.block_autosave_status = "error".into();
     app.block_comment_draft = "comment a".into();
 
@@ -2478,17 +2495,17 @@ fn page_and_block_context_changes_recover_local_drafts() {
     ));
     assert_eq!(app.orphaned_block_drafts, ["failed edit"]);
     assert_eq!(app.orphaned_comment_drafts, ["comment a"]);
-    assert_eq!(app.block_edit_draft, "canonical b");
+    assert_eq!(block_editor_text(&app), "canonical b");
 
     app.block_comment_draft = "comment b".into();
     let _ = app.__update(__DucktapeMessage::CloseBlockComments);
     assert_eq!(app.orphaned_comment_drafts, ["comment a", "comment b"]);
 
-    app.block_edit_draft = "saving b".into();
+    app.block_editor = compose("saving b");
     app.block_autosave_status = "saving".into();
     let _ = app.__update(__DucktapeMessage::ChoosePage("next".into()));
     assert_eq!(app.orphaned_block_drafts, ["failed edit", "saving b"]);
-    assert!(app.block_edit_draft.is_empty());
+    assert!(block_editor_text(&app).is_empty());
     assert!(app.selected_block_id.is_empty());
 }
 

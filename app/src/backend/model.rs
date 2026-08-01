@@ -1,3 +1,5 @@
+use iced::widget::text_editor::Content;
+
 use super::*;
 
 pub fn fresh_operation_id(prefix: String) -> String {
@@ -33,6 +35,7 @@ pub fn optimistic_block(
             id,
             parent,
             kind,
+            spans: plain_rich_spans(&text),
             text,
             pending: true,
             checked: false,
@@ -479,20 +482,83 @@ pub fn retain_thread_messages(messages: Vec<ChatMessage>, root_seq: i64) -> Vec<
     if root_seq > 0 { messages } else { Vec::new() }
 }
 
-pub fn refreshed_block_draft(
-    blocks: Vec<PageBlock>,
-    selected_id: String,
-    current: String,
-    autosave_status: String,
-) -> String {
-    let has_local_edit = matches!(autosave_status.as_str(), "saving" | "error");
-    if selected_id.is_empty() || has_local_edit {
-        return current;
+/// Whether the block editor holds work the node does not: a save in flight or
+/// refused, or text that has drifted from the last text known saved. The tick
+/// autosave means an edit is invisible to handlers until it fires, so the
+/// text comparison — not the status — is what catches a fresh keystroke.
+fn block_edit_unsaved(current: &str, saved: &str, autosave_status: &str) -> bool {
+    let save_in_flight_or_refused = matches!(autosave_status, "saving" | "error");
+    save_in_flight_or_refused || current != saved
+}
+
+/// The canonical replacement for the live-resync refresh: the block's
+/// canonical text when the editor is clean, or `None` to keep the local
+/// buffer (and its cursor) untouched.
+fn refreshed_block_text(
+    blocks: &[PageBlock],
+    selected_id: &str,
+    current: &str,
+    saved: &str,
+    autosave_status: &str,
+) -> Option<String> {
+    if selected_id.is_empty() || block_edit_unsaved(current, saved, autosave_status) {
+        return None;
     }
     blocks
-        .into_iter()
+        .iter()
         .find(|block| block.id == selected_id)
-        .map_or(current, |block| block.text)
+        .map(|block| block.text.clone())
+        .filter(|canonical| canonical != current)
+}
+
+/// The live-resync refresh of the block editor itself. The buffer is only
+/// rebuilt when the canonical text actually differs — replacing an equal
+/// `Content` would still throw the cursor to the origin mid-typing.
+pub fn refreshed_block_editor(
+    document: Content,
+    blocks: Vec<PageBlock>,
+    selected_id: String,
+    saved: String,
+    autosave_status: String,
+) -> Content {
+    let current = editor_block_text(&document);
+    match refreshed_block_text(&blocks, &selected_id, &current, &saved, &autosave_status) {
+        Some(canonical) => Content::with_text(&canonical),
+        None => document,
+    }
+}
+
+/// The saved-text mirror of [`refreshed_block_editor`] — the SAME decision on
+/// the SAME inputs, so the editor and its dirty baseline move together.
+pub fn refreshed_block_saved(
+    current: String,
+    blocks: Vec<PageBlock>,
+    selected_id: String,
+    saved: String,
+    autosave_status: String,
+) -> String {
+    refreshed_block_text(&blocks, &selected_id, &current, &saved, &autosave_status).unwrap_or(saved)
+}
+
+/// [`retain_selected_string`] for the editor buffer: deselection empties it
+/// without touching a live selection's buffer (identity pass-through keeps
+/// the cursor).
+pub fn retained_block_editor(document: Content, selected_id: String) -> Content {
+    if selected_id.is_empty() {
+        return Content::new();
+    }
+    document
+}
+
+/// One block's text as the wire sees it: `Content::text()` always appends a
+/// trailing newline that was never typed, so it is stripped — and ONLY it, a
+/// deliberate trailing space mid-edit must stay dirty-visible.
+fn editor_block_text(document: &Content) -> String {
+    let mut text = document.text();
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    text
 }
 
 pub fn remember_orphaned_block_drafts(
@@ -500,10 +566,11 @@ pub fn remember_orphaned_block_drafts(
     blocks: Vec<PageBlock>,
     selected_id: String,
     current: String,
+    saved: String,
     autosave_status: String,
 ) -> Vec<String> {
-    let has_local_edit = matches!(autosave_status.as_str(), "saving" | "error");
-    if has_local_edit && selected_block_missing(&blocks, &selected_id) {
+    let unsaved = block_edit_unsaved(&current, &saved, &autosave_status);
+    if unsaved && selected_block_missing(&blocks, &selected_id) {
         append_recovered_draft(&mut drafts, current);
     }
     drafts
@@ -541,6 +608,134 @@ pub fn refreshed_selected_block(blocks: Vec<PageBlock>, selected_id: String) -> 
         String::new()
     } else {
         selected_id
+    }
+}
+
+/// The nearest committed block ABOVE `id` in document order — where the
+/// selection lands after a Backspace delete, so the typing flow walks up the
+/// page instead of dropping to nothing.
+pub fn previous_block_id(blocks: Vec<PageBlock>, id: String) -> String {
+    let Some(index) = blocks.iter().position(|block| block.id == id) else {
+        return String::new();
+    };
+    blocks[..index]
+        .iter()
+        .rev()
+        .find(|block| !block.pending)
+        .map(|block| block.id.clone())
+        .unwrap_or_default()
+}
+
+/// The keyed-row key of one block, or -1 — a widget-target key that matches
+/// no row, so a focus task built from it is a safe no-op.
+pub fn block_key_of(blocks: Vec<PageBlock>, id: String) -> i64 {
+    blocks
+        .iter()
+        .find(|block| block.id == id)
+        .map_or(-1, |block| block.key)
+}
+
+/// The kind a fresh block continues with after Enter: list-like kinds repeat
+/// themselves (a bullet's Enter makes the next bullet), everything else
+/// starts a plain Text block.
+pub fn follow_kind(kind: String) -> String {
+    match kind.as_str() {
+        "Bullet" | "Number" | "Todo" | "Toggle" => kind,
+        _ => "Text".into(),
+    }
+}
+
+/// The pure step behind the block editor's state-only keys. "split" opens the
+/// insert row under the selected block with the continuing kind and names the
+/// row to focus; "escape" drops the selection and orphans an unsaved draft.
+/// Decide-fn only — the handler applies each field (decide-fns never write).
+#[allow(clippy::too_many_arguments)]
+pub fn block_key_step(
+    action: String,
+    blocks: Vec<PageBlock>,
+    selected_id: String,
+    selected_kind: String,
+    selected_checked: bool,
+    insert_open: bool,
+    insert_after_id: String,
+    insert_kind: String,
+    current: String,
+    saved: String,
+    autosave_status: String,
+    orphaned: Vec<String>,
+) -> BlockKeyStep {
+    let keep = BlockKeyStep {
+        selected_id: selected_id.clone(),
+        selected_kind: selected_kind.clone(),
+        selected_checked,
+        insert_open,
+        insert_after_id: insert_after_id.clone(),
+        insert_kind: insert_kind.clone(),
+        focus_key: -1,
+        orphaned: orphaned.clone(),
+        autosave_bump: 0,
+    };
+    match action.as_str() {
+        "split" => BlockKeyStep {
+            insert_open: true,
+            insert_after_id: selected_id.clone(),
+            insert_kind: follow_kind(selected_kind),
+            focus_key: block_key_of(blocks, selected_id),
+            ..keep
+        },
+        "escape" => BlockKeyStep {
+            selected_id: String::new(),
+            selected_kind: String::new(),
+            selected_checked: false,
+            orphaned: remember_orphaned_block_drafts(
+                orphaned,
+                Vec::new(),
+                selected_id,
+                current,
+                saved,
+                autosave_status,
+            ),
+            autosave_bump: 1,
+            ..keep
+        },
+        // classify_block_key routes only "split" and "escape" here.
+        _ => keep,
+    }
+}
+
+/// The insert draft's markdown-prefix pass, ordered longest-first so `### `
+/// wins over `## ` over `# `.
+const BLOCK_AUTOFORMATS: [(&str, &str); 11] = [
+    ("### ", "Heading 3"),
+    ("## ", "Heading 2"),
+    ("# ", "Heading 1"),
+    ("- ", "Bullet"),
+    ("* ", "Bullet"),
+    ("1. ", "Number"),
+    ("[] ", "Todo"),
+    ("[ ] ", "Todo"),
+    ("> ", "Quote"),
+    ("```", "Code"),
+    ("---", "Divider"),
+];
+
+/// Converts a fresh insert draft's leading markdown shorthand into the block
+/// kind it names, with the shorthand stripped from the draft.
+pub fn autoformat_block_draft(draft: String, kind: String) -> BlockAutoformat {
+    // Only the default kind converts — a "# " typed into a chosen Code or
+    // Quote block is content, not a command.
+    if kind != "Text" {
+        return BlockAutoformat { kind, draft };
+    }
+    let matched = BLOCK_AUTOFORMATS
+        .iter()
+        .find_map(|(prefix, next)| draft.strip_prefix(prefix).map(|rest| (rest, *next)));
+    let Some((rest, next)) = matched else {
+        return BlockAutoformat { kind, draft };
+    };
+    BlockAutoformat {
+        kind: next.into(),
+        draft: rest.into(),
     }
 }
 

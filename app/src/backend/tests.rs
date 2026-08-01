@@ -1193,6 +1193,7 @@ fn concurrent_blocks_preserve_pending_position_then_accept_canonical_order() {
         prefix: String::new(),
         child_count: 0,
         mark_count: 0,
+        spans: Vec::new(),
     };
     let current = vec![block("x", false), block("a", true), block("b", true)];
     let after_b = merge_block_insert_result(
@@ -1807,7 +1808,7 @@ fn block_action_menu_stays_inside_the_page_viewport() {
 }
 
 #[test]
-fn refresh_merges_only_clean_block_drafts() {
+fn refresh_merges_only_clean_block_editors() {
     let blocks = vec![PageBlock {
         key: 0,
         id: "block".into(),
@@ -1819,21 +1820,161 @@ fn refresh_merges_only_clean_block_drafts() {
         prefix: String::new(),
         child_count: 0,
         mark_count: 0,
+        spans: Vec::new(),
     }];
 
+    // Dirty (text drifted from the saved baseline): buffer and baseline hold.
+    let dirty = iced::widget::text_editor::Content::with_text("local");
+    let kept = refreshed_block_editor(
+        dirty,
+        blocks.clone(),
+        "block".into(),
+        "old".into(),
+        "idle".into(),
+    );
+    assert_eq!(kept.text().trim_end(), "local");
     assert_eq!(
-        refreshed_block_draft(
+        refreshed_block_saved(
+            "local".into(),
             blocks.clone(),
             "block".into(),
-            "local".into(),
-            "saving".into(),
+            "old".into(),
+            "idle".into(),
         ),
-        "local"
+        "old"
     );
+
+    // Clean: both take the canonical text on the same decision.
+    let clean = iced::widget::text_editor::Content::with_text("old");
+    let refreshed = refreshed_block_editor(
+        clean,
+        blocks.clone(),
+        "block".into(),
+        "old".into(),
+        "saved".into(),
+    );
+    assert_eq!(refreshed.text().trim_end(), "remote");
     assert_eq!(
-        refreshed_block_draft(blocks, "block".into(), "local".into(), "saved".into()),
+        refreshed_block_saved(
+            "old".into(),
+            blocks,
+            "block".into(),
+            "old".into(),
+            "saved".into(),
+        ),
         "remote"
     );
+}
+
+#[test]
+fn typing_flow_helpers_walk_up_repeat_lists_and_name_keys() {
+    let block = |id: &str, pending: bool| PageBlock {
+        key: page_block_key(id),
+        id: id.into(),
+        parent: "page".into(),
+        kind: "Text".into(),
+        text: id.into(),
+        pending,
+        checked: false,
+        prefix: String::new(),
+        child_count: 0,
+        mark_count: 0,
+        spans: Vec::new(),
+    };
+    let blocks = vec![block("a", false), block("p", true), block("b", false)];
+    assert_eq!(previous_block_id(blocks.clone(), "b".into()), "a");
+    assert_eq!(previous_block_id(blocks.clone(), "a".into()), "");
+    assert_eq!(previous_block_id(blocks.clone(), "ghost".into()), "");
+    assert_eq!(
+        block_key_of(blocks.clone(), "a".into()),
+        page_block_key("a")
+    );
+    assert_eq!(block_key_of(blocks, "ghost".into()), -1);
+
+    assert_eq!(follow_kind("Bullet".into()), "Bullet");
+    assert_eq!(follow_kind("Todo".into()), "Todo");
+    assert_eq!(follow_kind("Heading 1".into()), "Text");
+}
+
+#[test]
+fn block_key_step_split_opens_the_insert_row_and_escape_orphans() {
+    let block = PageBlock {
+        key: page_block_key("here"),
+        id: "here".into(),
+        parent: "page".into(),
+        kind: "Bullet".into(),
+        text: "typed".into(),
+        pending: false,
+        checked: false,
+        prefix: String::new(),
+        child_count: 0,
+        mark_count: 0,
+        spans: Vec::new(),
+    };
+    let split = block_key_step(
+        "split".into(),
+        vec![block.clone()],
+        "here".into(),
+        "Bullet".into(),
+        false,
+        false,
+        String::new(),
+        "Text".into(),
+        "typed".into(),
+        "typed".into(),
+        "saved".into(),
+        Vec::new(),
+    );
+    assert!(split.insert_open);
+    assert_eq!(split.insert_after_id, "here");
+    assert_eq!(split.insert_kind, "Bullet");
+    assert_eq!(split.focus_key, page_block_key("here"));
+    assert_eq!(split.selected_id, "here");
+    assert_eq!(split.autosave_bump, 0);
+
+    let escape = block_key_step(
+        "escape".into(),
+        vec![block],
+        "here".into(),
+        "Bullet".into(),
+        false,
+        false,
+        String::new(),
+        "Text".into(),
+        "typed while dirty".into(),
+        "saved text".into(),
+        "idle".into(),
+        Vec::new(),
+    );
+    assert!(escape.selected_id.is_empty());
+    assert_eq!(escape.autosave_bump, 1);
+    assert_eq!(escape.focus_key, -1);
+    assert_eq!(escape.orphaned, ["typed while dirty"]);
+}
+
+#[test]
+fn autoformat_converts_only_fresh_text_drafts() {
+    let formatted = autoformat_block_draft("# Title".into(), "Text".into());
+    assert_eq!(formatted.kind, "Heading 1");
+    assert_eq!(formatted.draft, "Title");
+    let deeper = autoformat_block_draft("### deep".into(), "Text".into());
+    assert_eq!(deeper.kind, "Heading 3");
+    assert_eq!(deeper.draft, "deep");
+    let todo = autoformat_block_draft("[] milk".into(), "Text".into());
+    assert_eq!(todo.kind, "Todo");
+    assert_eq!(todo.draft, "milk");
+    let divider = autoformat_block_draft("---".into(), "Text".into());
+    assert_eq!(divider.kind, "Divider");
+    assert!(divider.draft.is_empty());
+
+    // A chosen kind is never converted out from under the draft.
+    let code = autoformat_block_draft("# comment".into(), "Code".into());
+    assert_eq!(code.kind, "Code");
+    assert_eq!(code.draft, "# comment");
+    // No shorthand, no change.
+    let plain = autoformat_block_draft("hello".into(), "Text".into());
+    assert_eq!(plain.kind, "Text");
+    assert_eq!(plain.draft, "hello");
 }
 
 #[test]
@@ -1842,6 +1983,7 @@ fn recovered_drafts_are_deduplicated_and_endpoint_scoped() {
         vec!["local".into()],
         Vec::new(),
         "missing".into(),
+        "local".into(),
         "local".into(),
         "error".into(),
     );
