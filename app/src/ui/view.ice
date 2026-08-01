@@ -103,6 +103,7 @@ view
               search_pages_submit -> search_pages_submit
               clear_page_search -> clear_page_search
               arm_page_delete -> arm_page_delete
+              disarm_page_delete -> disarm_page_delete
               delete_page_submit -> delete_page_submit
               close_doc_tab -> close_doc_tab _
               open_page_search_hit -> open_page_search_hit _ _
@@ -145,6 +146,7 @@ view
               fs_mkdir_submit -> fs_mkdir_submit
               fs_new_file_submit -> fs_new_file_submit
               fs_arm_delete -> fs_arm_delete _
+              fs_disarm_delete -> fs_disarm_delete
               fs_delete_submit -> fs_delete_submit
               fs_toggle_history -> fs_toggle_history
               fs_close_diff -> fs_close_diff

@@ -17,6 +17,7 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
     fs_mkdir_submit()
     fs_new_file_submit()
     fs_arm_delete(str)
+    fs_disarm_delete()
     fs_delete_submit()
     fs_toggle_history()
     fs_close_diff()
@@ -52,13 +53,21 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
         space w=fill
         if loading
           text "Loading…" size=12.5 wrap=none @text-caption
-        if !empty(preview_path) && preview_path != delete_target
-          button "Delete object" disabled=loading h=26.0 p=5.0 @secondary_action -> emit(fs_arm_delete, preview_path)
+        // The trigger STAYS a trigger: arming opens the named confirm
+        // dialog below instead of morphing into the red button in place.
+        if !empty(preview_path)
+          button "Delete object" disabled=(loading || !empty(delete_target)) h=26.0 p=5.0 @secondary_action -> emit(fs_arm_delete, preview_path)
             active bg=transparent text=muted border=card_line border-w=1.0 r=7.0
             hovered bg=danger_zone_bg text=fg border=danger_zone_line
             pressed bg=danger_zone_bg
-        if !empty(preview_path) && preview_path == delete_target
-          button "Delete for real" disabled=loading h=26.0 p=5.0 @danger_action -> emit(fs_delete_submit)
+        overlay when=(!empty(delete_target)) dismiss=emit(fs_disarm_delete) backdrop=scrim p=30.0 align-x=center align-y=center
+          content
+            space w=fill h=fill
+          layer
+            ConfirmDelete title="Delete this object" subject=delete_target note="The committed object is removed from duckfs for every member. Earlier snapshots keep their copies." action="Delete object" busy=loading
+              events
+                cancel -> emit(fs_disarm_delete)
+                confirm -> emit(fs_delete_submit)
         button "History" h=26.0 p=5.0 @secondary_action -> emit(fs_toggle_history)
           active bg=surface text=muted border=card_line border-w=1.0 r=7.0
           hovered bg=elevated text=fg

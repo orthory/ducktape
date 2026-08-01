@@ -73,6 +73,9 @@ on fs_new_file_submit
 on fs_arm_delete(path)
   fs_delete_target = path
 
+on fs_disarm_delete
+  fs_delete_target = ""
+
 on fs_delete_submit
   return if fs_loading || !connected || empty(fs_delete_target)
   fs_loading = true

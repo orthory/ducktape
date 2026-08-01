@@ -126,6 +126,9 @@ on arm_page_delete
   return if loading || mutation_phase != "idle" || empty(active_page)
   page_delete_armed = true
 
+on disarm_page_delete
+  page_delete_armed = false
+
 on delete_page_submit
   return if loading || mutation_phase != "idle" || empty(active_page) || !page_delete_armed
   hydration_generation = hydration_generation + 1

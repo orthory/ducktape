@@ -18,6 +18,32 @@
 //         body:
 //           col w=fill gap=10.0
 //             ...
+// THE DESTRUCTIVE CONFIRM — one dialog for every bare delete in the app, so
+// the voice is one voice: name the object, say the blast radius, offer the
+// exit first. Arm-then-act in place survives only INSIDE an intentionally
+// opened menu (the block ••• menu); a bare trigger must never morph into the
+// red button under the same cursor.
+component ConfirmDelete(title:str, subject:str, note:str, action:str, busy:bool)
+  emits
+    cancel()
+    confirm()
+  ModalShell title=title width=418.0
+    close:
+      button label="Cancel" disabled=busy w=26.0 h=26.0 p=0.0 @icon_action -> emit(cancel)
+        box w=fill h=fill align-x=center align-y=center
+          text "×" size=14.0 wrap=none @text-muted
+        active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
+        hovered bg=elevated text=fg
+        pressed bg=subtle text=fg
+    body:
+      col w=fill gap=13.0
+        text subject w=fill size=13.5 font=medium @text-fg
+        text note w=fill size=12.0 line-h=1.5 @text-caption
+        row w=fill gap=8.0 align=end
+          button "Cancel" disabled=busy h=30.0 p=7.0 @secondary_action -> emit(cancel)
+          button label=action disabled=busy h=30.0 p=7.0 @danger_action -> emit(confirm)
+            text action size=13.0 wrap=none
+
 component ModalShell(title:str, width:f64)
   box #root w=width bg=surface border=border border-w=1.0 r=14.0 shadow=shadow_modal shadow-y=24.0 shadow-blur=60.0
     col w=fill pl=22.0 pr=22.0 pt=20.0 pb=22.0 gap=13.0
