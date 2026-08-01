@@ -86,7 +86,7 @@ on reconnect
   page_draft = retain_for_endpoint(page_draft, connected_rpc, rpc)
   block_draft = retain_for_endpoint(block_draft, connected_rpc, rpc)
   page_search_draft = retain_for_endpoint(page_search_draft, connected_rpc, rpc)
-  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
+  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, trim(editor_text(block_editor)), selected_block_saved_text, block_autosave_status)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
   orphaned_block_drafts = retain_drafts_for_endpoint(orphaned_block_drafts, connected_rpc, rpc)
   orphaned_comment_drafts = retain_drafts_for_endpoint(orphaned_comment_drafts, connected_rpc, rpc)
@@ -161,7 +161,8 @@ on reconnect
   block_comment_draft = ""
   pending_block_comment = ""
   page_title_selected = false
-  block_edit_draft = ""
+  block_editor = editor("")
+  selected_block_saved_text = ""
   block_autosave_status = "idle"
   page_delete_armed = false
   block_delete_armed = false
@@ -292,9 +293,14 @@ on live_resynced(next)
   channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
   pages = keep_pages(next.pages_loaded, next.pages, pages)
   blocks = keep_blocks(next.pages_loaded, merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, ""), blocks)
-  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, blocks, selected_block_id, block_edit_draft, block_autosave_status)
+  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, blocks, selected_block_id, trim(editor_text(block_editor)), selected_block_saved_text, block_autosave_status)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, blocks, selected_block_id, block_comment_draft)
-  block_edit_draft = refreshed_block_draft(blocks, selected_block_id, block_edit_draft, block_autosave_status)
+  // The canonical text only replaces the buffer when the editor is CLEAN and
+  // the text actually differs — a rebuilt `Content` throws the cursor to the
+  // origin, so the saved baseline and the buffer move on one shared decision.
+  let resynced_saved = refreshed_block_saved(trim(editor_text(block_editor)), blocks, selected_block_id, selected_block_saved_text, block_autosave_status)
+  block_editor = refreshed_block_editor(block_editor, blocks, selected_block_id, selected_block_saved_text, block_autosave_status)
+  selected_block_saved_text = resynced_saved
   block_autosave_generation = cancel_missing_block_autosave(connected_rpc, block_autosave_generation, blocks, selected_block_id)
   selected_block_id = refreshed_selected_block(blocks, selected_block_id)
   selected_block_kind = retain_selected_string(selected_block_kind, selected_block_id)
@@ -319,7 +325,8 @@ on live_resynced(next)
   block_thread_comments_loading = block_thread_comments_loading && !empty(block_comments_target)
   block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)
   pending_block_comment = retain_selected_string(pending_block_comment, block_comments_target)
-  block_edit_draft = retain_selected_string(block_edit_draft, selected_block_id)
+  block_editor = retained_block_editor(block_editor, selected_block_id)
+  selected_block_saved_text = retain_selected_string(selected_block_saved_text, selected_block_id)
   block_delete_armed = block_delete_armed && !empty(selected_block_id)
   block_actions_open = block_actions_open && !empty(selected_block_id)
   block_insert_open = block_insert_open && active_page == keep_str(next.pages_loaded, next.active_page, active_page)
@@ -439,6 +446,10 @@ subscribe
   run node_logs(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "activity") -> node_log_line _
   every 1s when huddle_joined -> tick
   every 300ms when !empty(toast) -> toast_tick
+  // The block editor's autosave: the stock editor's edits never pass through
+  // a handler, so the gate IS the dirty test — the tick only exists while
+  // the buffer has drifted from the last text known saved.
+  every 900ms when (connected && !empty(selected_block_id) && trim(editor_text(block_editor)) != selected_block_saved_text) -> block_autosave_tick
 
 on modifiers_changed(value)
   shift_held = value.shift

@@ -19,7 +19,11 @@ extern crate::backend
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
   ChatSearchData(generation:i64, hits:[ChatSearchHit])
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
-  PageBlock(key:i64, id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64, mark_count:i64)
+  PageBlock(key:i64, id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64, mark_count:i64, spans:[ChatSpan])
+  BlockKeyLocal(action:str)
+  BlockKeyOp(action:str)
+  BlockKeyStep(selected_id:str, selected_kind:str, selected_checked:bool, insert_open:bool, insert_after_id:str, insert_kind:str, focus_key:i64, orphaned:[str], autosave_bump:i64)
+  BlockAutoformat(kind:str, draft:str)
   PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, selected_block_id:str, selected_block_kind:str, selected_block_text:str, selected_block_checked:bool, page_title_selected:bool)
   BlockInsertResult(data:PagesData, operation_id:str, page_id:str)
   PageCommentThread(id:str, author:str, meta:str, resolved:bool, comment_count:i64)
@@ -285,8 +289,17 @@ extern crate::backend
   sync thread_loading_after_refresh(loading:bool, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> bool
   sync retain_thread_messages(messages:[ChatMessage], root_seq:i64) -> [ChatMessage]
   sync cancel_autosaves(rpc:str, generation:i64) -> i64
-  sync refreshed_block_draft(blocks:[PageBlock], selected_id:str, current:str, autosave_status:str) -> str
-  sync remember_orphaned_block_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str, autosave_status:str) -> [str]
+  sync refreshed_block_editor(document:editor, blocks:[PageBlock], selected_id:str, saved:str, autosave_status:str) -> editor
+  sync refreshed_block_saved(current:str, blocks:[PageBlock], selected_id:str, saved:str, autosave_status:str) -> str
+  sync retained_block_editor(document:editor, selected_id:str) -> editor
+  sync previous_block_id(blocks:[PageBlock], id:str) -> str
+  sync block_key_of(blocks:[PageBlock], id:str) -> i64
+  sync follow_kind(kind:str) -> str
+  sync block_key_step(action:str, blocks:[PageBlock], selected_id:str, selected_kind:str, selected_checked:bool, insert_open:bool, insert_after_id:str, insert_kind:str, current:str, saved:str, autosave_status:str, orphaned:[str]) -> BlockKeyStep
+  sync autoformat_block_draft(draft:str, kind:str) -> BlockAutoformat
+  classify_block_key(event:BlockKeyEvent) -> BlockKeyLocal ! BlockKeyOp
+  block_key_structure(rpc:str, password:str, page_id:str, block_id:str, action:str, select_id:str) -> PagesData ! AppError
+  sync remember_orphaned_block_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str, saved:str, autosave_status:str) -> [str]
   sync remember_orphaned_comment_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str) -> [str]
   sync remove_recovered_draft(drafts:[str], recovered:str) -> [str]
   sync retain_drafts_for_endpoint(drafts:[str], current:str, next:str) -> [str]
@@ -340,6 +353,6 @@ extern crate::backend
   save_block(rpc:str, password:str, page_id:str, block_id:str, kind:str, text:str) -> PagesData ! AppError
   set_block_checked(rpc:str, password:str, page_id:str, block_id:str, checked:bool) -> PagesData ! AppError
   move_block(rpc:str, password:str, page_id:str, block_id:str, direction:str) -> PagesData ! AppError
-  remove_block(rpc:str, password:str, page_id:str, block_id:str) -> PagesData ! AppError
+  remove_block(rpc:str, password:str, page_id:str, block_id:str, select_id:str) -> PagesData ! AppError
   search_pages(rpc:str, page_id:str, text:str, generation:i64) -> PageSearchData ! HydrationError
   palette_search(rpc:str, text:str, generation:i64) -> PaletteSearchData ! HydrationError

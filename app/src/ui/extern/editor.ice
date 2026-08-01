@@ -11,3 +11,10 @@ extern crate::editor
   sync apply_composer_event(document:editor, event:ComposerEvent) -> editor
   sync composer_submits(event:ComposerEvent) -> bool
   sync composer_submit_event() -> ComposerEvent
+  // The pages block editor's seams on the stock Ice `editor` widget: the
+  // structural keys become one checked event (classified in Rust where the
+  // modifiers are known), and the highlighter is the composers' own inline
+  // markdown table, so a block lights up exactly like a message draft.
+  BlockKeyEvent(action:str)
+  editor-binding block_key_press(kind:str, empty:bool, has_children:bool) -> BlockKeyEvent
+  editor-highlighter page_inline_marks()

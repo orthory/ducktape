@@ -1099,6 +1099,7 @@ pub async fn remove_block(
     password: String,
     page_id: String,
     block_id: String,
+    select_id: String,
 ) -> Result<PagesData, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
@@ -1109,11 +1110,49 @@ pub async fn remove_block(
             password,
         )
         .await?;
-        load_pages_data(&rpc, Some(&page_id))
+        load_selected_page_data(&rpc, &page_id, &select_id)
             .await
             .map_err(committed_error)
     }
     .await
+}
+
+/// The classify hop for a block-editor key: state-only keys ("split",
+/// "escape") return on the Ok route, structural keys that need the node
+/// ("delete", "indent", "outdent") on the Err route — the two-route `run` is
+/// the flat handlers' only dispatch.
+pub async fn classify_block_key(
+    event: crate::editor::BlockKeyEvent,
+) -> Result<BlockKeyLocal, BlockKeyOp> {
+    match event.action.as_str() {
+        "split" | "escape" => Ok(BlockKeyLocal {
+            action: event.action,
+        }),
+        _ => Err(BlockKeyOp {
+            action: event.action,
+        }),
+    }
+}
+
+/// One structural block key against the node. Delete lands the selection on
+/// `select_id` (the block above) so a Backspace chain walks up the page.
+pub async fn block_key_structure(
+    rpc: String,
+    password: String,
+    page_id: String,
+    block_id: String,
+    action: String,
+    select_id: String,
+) -> Result<PagesData, AppError> {
+    match action.as_str() {
+        "delete" => remove_block(rpc, password, page_id, block_id, select_id).await,
+        "indent" => move_block(rpc, password, page_id, block_id, "indent".into()).await,
+        "outdent" => move_block(rpc, password, page_id, block_id, "outdent".into()).await,
+        _ => Err(AppError {
+            message: "unknown block key".into(),
+            committed: false,
+        }),
+    }
 }
 
 pub async fn search_pages(

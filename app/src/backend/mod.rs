@@ -24,7 +24,8 @@ pub use ::chat::client::{
     append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
     apply_chat_thread, author_name, chat_message, contains_pending_message, mark_message_groups,
     merge_message_send_result, merge_pending_messages, merge_thread_reply, optimistic_message,
-    parse_message_with_members, rollback_pending_message, short_label, thread_offset_after_reply,
+    parse_message_with_members, plain_rich_spans, rollback_pending_message, short_label,
+    thread_offset_after_reply,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
@@ -174,6 +175,48 @@ pub struct PageBlock {
     pub prefix: String,
     pub child_count: i64,
     pub mark_count: i64,
+    /// Word-level rich runs of `text` (chat's inline grammar); empty means the
+    /// block renders as one plain wrapping `text`.
+    pub spans: Vec<ChatSpan>,
+}
+
+/// One structural key pressed inside the block editor, already past the
+/// classify hop: `action` is "delete", "indent", or "outdent". Carried on the
+/// error route of [`classify_block_key`] so the flat handlers can dispatch
+/// without branching.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BlockKeyOp {
+    pub action: String,
+}
+
+/// The state-only block-editor keys ("split", "escape"), the Ok route of
+/// [`classify_block_key`].
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BlockKeyLocal {
+    pub action: String,
+}
+
+/// The decided next selection/insert state after a local block key — a pure
+/// step the handler applies field by field (decide-fns never write).
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BlockKeyStep {
+    pub selected_id: String,
+    pub selected_kind: String,
+    pub selected_checked: bool,
+    pub insert_open: bool,
+    pub insert_after_id: String,
+    pub insert_kind: String,
+    pub focus_key: i64,
+    pub orphaned: Vec<String>,
+    pub autosave_bump: i64,
+}
+
+/// The insert draft after the markdown-prefix pass: `# `→Heading 1, `- `→
+/// Bullet, and friends, with the matched prefix stripped from the draft.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BlockAutoformat {
+    pub kind: String,
+    pub draft: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]

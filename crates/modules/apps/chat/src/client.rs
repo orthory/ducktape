@@ -930,6 +930,23 @@ fn word_spans(spans: &[Span]) -> Vec<ChatSpan> {
     out
 }
 
+/// Word-level rich runs of one block of text — the pages renderer's view of
+/// the chat inline grammar (no roster, so mentions stay plain ink). Empty when
+/// the text carries no inline mark, keeping the plain single-`text` render;
+/// multi-line text stays plain because a wrapping flex cannot force its line
+/// breaks.
+pub fn plain_rich_spans(text: &str) -> Vec<ChatSpan> {
+    if text.contains('\n') {
+        return Vec::new();
+    }
+    let spans = inline_spans(text, &[]);
+    let marked = spans.iter().any(|span| !span.marks.is_empty());
+    if !marked {
+        return Vec::new();
+    }
+    word_spans(&spans)
+}
+
 // ============================================================================
 // authorship + avatars — display identity derived from rendered handles
 // ============================================================================
@@ -1443,5 +1460,18 @@ mod tests {
         for author in ["agent:chat/reviewer", "module:forge", "system"] {
             assert_eq!(avatar_kind(author), "agent");
         }
+    }
+
+    #[test]
+    fn plain_rich_spans_mark_inline_runs_and_stay_empty_for_plain_text() {
+        let spans = plain_rich_spans("say **hi** to https://duck.example/x");
+        let bold: Vec<_> = spans.iter().filter(|span| span.bold).collect();
+        assert_eq!(bold.len(), 1);
+        assert_eq!(bold[0].text.trim_end(), "hi");
+        assert!(spans.iter().any(|span| span.highlight));
+        assert!(spans.iter().all(|span| !span.text.contains("**")));
+
+        assert!(plain_rich_spans("no marks here").is_empty());
+        assert!(plain_rich_spans("**multi**\nline").is_empty());
     }
 }

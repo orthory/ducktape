@@ -203,12 +203,15 @@ component BlockContents(block:PageBlock)
         box w=fill pt=16.0
           text block.text w=fill size=14.0 line-h=1.35 wrap=word font=display @text-primary
       "Bullet"
-        BulletBlock body=block.text
+        BulletBlock block=block
       "Number"
         box w=fill pt=6.0
           row w=fill gap=11.0 align=start
             text "1." size=12.0 wrap=none font=code @text-label
-            text block.text w=fill size=14.0 line-h=1.65 wrap=word @text-accent_fg
+            if empty(block.spans)
+              text block.text w=fill size=14.0 line-h=1.65 wrap=word @text-accent_fg
+            if !empty(block.spans)
+              PageRichLine spans=block.spans line_h=1.65
       "Todo"
         TodoBlock block=block
           forward
@@ -217,7 +220,10 @@ component BlockContents(block:PageBlock)
         box w=fill pt=8.0
           row w=fill gap=11.0 align=start
             Icon name="chevron-right" tone="label" px=14.0
-            text block.text w=fill size=14.0 line-h=1.7 wrap=word @text-accent_fg
+            if empty(block.spans)
+              text block.text w=fill size=14.0 line-h=1.7 wrap=word @text-accent_fg
+            if !empty(block.spans)
+              PageRichLine spans=block.spans line_h=1.7
       "Quote"
         QuoteBlock body=block.text
       "Callout"
@@ -228,19 +234,44 @@ component BlockContents(block:PageBlock)
         Separator
       _
         box w=fill pt=8.0
-          text block.text w=fill size=14.0 line-h=1.7 wrap=word @text-accent_fg
+          col w=fill
+            if empty(block.spans)
+              text block.text w=fill size=14.0 line-h=1.7 wrap=word @text-accent_fg
+            if !empty(block.spans)
+              PageRichLine spans=block.spans line_h=1.7
 
 // A 5px dot on the gutter ink, not a • glyph in a 16px cell.
 component BulletDot()
   box #root w=5.0 h=5.0 bg=gutter_ink r=2.5
     space w=1.0 h=1.0
 
-component BulletBlock(body:str)
+component BulletBlock(block:PageBlock)
   box #root w=fill pt=6.0
     row w=fill gap=0.0 align=start
       box pt=9.0 pr=11.0
         BulletDot
-      text body w=fill size=14.0 line-h=1.65 wrap=word @text-accent_fg
+      if empty(block.spans)
+        text block.text w=fill size=14.0 line-h=1.65 wrap=word @text-accent_fg
+      if !empty(block.spans)
+        PageRichLine spans=block.spans line_h=1.65
+
+// The pages body's rich runs — chat's RichLine at the document body metrics.
+// Word-level spans reflow in a wrapping flex; links and mentions light up
+// exactly as the chat renderer paints them. Headings, quotes, callouts and
+// code keep their single plain run — their own fonts already carry the voice.
+component PageRichLine(spans:[ChatSpan], line_h:f64)
+  flex w=fill wrap=wrap gap-x=0.0 gap-y=4.0 items=start
+    for span in spans
+      if span.highlight
+        text span.text size=14.0 line-h=line_h font=medium @text-brand
+      if !span.highlight && span.bold && span.italic
+        text span.text size=14.0 line-h=line_h font=strongitalic @text-accent_fg
+      if !span.highlight && span.bold && !span.italic
+        text span.text size=14.0 line-h=line_h font=strong @text-accent_fg
+      if !span.highlight && !span.bold && span.italic
+        text span.text size=14.0 line-h=line_h font=italic @text-accent_fg
+      if !span.highlight && !span.bold && !span.italic
+        text span.text size=14.0 line-h=line_h @text-accent_fg
 
 // ONE CLICK FINALIZES THE TICK. The DRAWN box stays 17px r5 — ink when done,
 // a 1.5px hairline when open — inside a 24px transparent target: a tick is a
@@ -278,8 +309,10 @@ component TodoBlock(block:PageBlock)
       if block.checked
         rich-text w=fill size=14.0 line-h=1.65 wrap=word color=meta
           span block.text strike
-      if !block.checked
+      if !block.checked && empty(block.spans)
         text block.text w=fill size=14.0 line-h=1.65 wrap=word @text-accent_fg
+      if !block.checked && !empty(block.spans)
+        PageRichLine spans=block.spans line_h=1.65
 
 // The rule IS the marker — the artifact draws no gutter glyph on a quote.
 component QuoteBlock(body:str)
