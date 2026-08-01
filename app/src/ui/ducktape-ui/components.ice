@@ -467,6 +467,10 @@ component Typography.Machine(content:str)
       r=5.0
     text content @machine text-fg
 
+// The empty reading sits ON the page, not in a slab: the most common state
+// of a fresh workspace was a full-height bordered grey box competing with
+// the chrome around it, while every other screen's EmptyPlate stayed light.
+// The glyph circle keeps the anchor; the surface is the page's own.
 component EmptyState(title:str, description:str)
   box #root
     with
@@ -475,10 +479,6 @@ component EmptyState(title:str, description:str)
       p=22.0
       align-x=center
       align-y=center
-      bg=muted_bg
-      border=border
-      border-w=1.0
-      r=11.0
     col
       with
         w=fill

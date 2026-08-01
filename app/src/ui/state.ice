@@ -306,6 +306,7 @@ state
   invite_ttl:i64 = 7
   toast = ""
   toast_tone = "info"
+  toast_age:i64 = 0
   leave_armed = false
   // MOTION — deliberately none. A `repeat forever` animation is a one-way
   // ratchet in the runtime: lilt reports it animating from its first
