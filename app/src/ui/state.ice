@@ -86,6 +86,13 @@ state
   explorer_generation:i64 = 0
   explorer_loading = false
   explorer_selected:i64 = 0
+  // ANSWERED = the plane's loader returned at least once (rows or refusal).
+  // The empty plates guard on these: "No members yet" is a lie while the
+  // first load is still in flight. Set by the loaded AND failed arms.
+  members_answered = false
+  agents_answered = false
+  gov_answered = false
+  forge_answered = false
   members_rows:[MemberRow] = []
   members_validators:i64 = 0
   members_residents:i64 = 0

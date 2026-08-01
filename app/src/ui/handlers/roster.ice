@@ -34,17 +34,21 @@ on account_rename_failed(cause)
 
 on agents_loaded(next)
   return if next.generation != agents_generation
+  agents_answered = true
   agents_rows = next.agents
 
 on agents_failed(cause)
   return if cause.generation != agents_generation
+  agents_answered = true
 
 on governance_loaded(next)
   return if next.generation != gov_generation
+  gov_answered = true
   gov_rows = next.proposals
 
 on governance_failed(cause)
   return if cause.generation != gov_generation
+  gov_answered = true
 
 on gov_vote(proposal_id, approve)
   return if !connected || !empty(gov_voting)
@@ -74,6 +78,7 @@ on gov_act_failed(cause)
 
 on members_loaded(next)
   return if next.generation != members_generation
+  members_answered = true
   members_rows = next.members
   members_validators = next.validators
   members_residents = next.residents

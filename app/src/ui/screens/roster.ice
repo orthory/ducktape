@@ -7,7 +7,7 @@
 // That is the whole contract; the bodies below are the ones that used to sit
 // inline in the view's `members:` and `agents:` slots, unchanged.
 
-component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:str, selected:str, admin:bool)
+component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:str, selected:str, admin:bool, answered:bool)
   emits
     pick_members_filter(str)
     open_member(str)
@@ -49,7 +49,7 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
             space w=fill
         box w=fill h=1.0 bg=separator
           space w=1.0 h=1.0
-      if empty(filter_members(rows, filter))
+      if empty(filter_members(rows, filter)) && answered
         box w=fill h=fill p=22.0
           EmptyPlate message="No members here yet — validators, residents and registered agents appear as they join."
       if !empty(filter_members(rows, filter))
@@ -79,7 +79,7 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
               agent_set_status
               gov_propose
 
-component AgentsScreen(rows:[AgentRow])
+component AgentsScreen(rows:[AgentRow], answered:bool)
   col w=fill h=fill
     ScreenHeader title="Agents" meta=agents_summary(rows)
       space w=1.0 h=1.0
@@ -92,7 +92,7 @@ component AgentsScreen(rows:[AgentRow])
         text "The registry records who may act, what they may do, and under whose grant — every entry here is on chain. The acting itself is recorded separately, as each agent's runs." w=fill size=12.0 line-h=1.5 @text-caption
       box w=fill h=1.0 bg=separator
         space w=1.0 h=1.0
-    if empty(rows)
+    if empty(rows) && answered
       box w=fill h=fill p=22.0
         EmptyPlate message="No agents registered — a registered agent appears here with its capability and grants."
     if !empty(rows)
