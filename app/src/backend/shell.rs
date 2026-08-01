@@ -160,6 +160,31 @@ fn active_workspace_name() -> Option<&'static str> {
     .as_deref()
 }
 
+/// The active workspace's http endpoint, from the same registry the titlebar
+/// name comes from. This is what makes a bare `make dev` connect: with no
+/// `DUCKTAPE_NODE` and an empty endpoint field the app fell back to a
+/// hardcoded port while the seeded node listened wherever `node init` picked
+/// its ports — so every first boot opened on "Could not connect" over a
+/// perfectly healthy node the registry knew the address of.
+pub(crate) fn registered_endpoint() -> Option<&'static str> {
+    static ENDPOINT: OnceLock<Option<String>> = OnceLock::new();
+    ENDPOINT
+        .get_or_init(|| {
+            let path = ducktape_home()?.join("registry.json");
+            let registry: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+            let active = registry.get("active")?.as_str()?;
+            let workspace = registry
+                .get("workspaces")?
+                .as_array()?
+                .iter()
+                .find(|workspace| workspace.get("id").and_then(|id| id.as_str()) == Some(active))?;
+            let http = workspace.get("ports")?.get("http")?.as_u64()?;
+            Some(format!("http://127.0.0.1:{http}"))
+        })
+        .as_deref()
+}
+
 /// `$DUCKTAPE_HOME`, else `~/.ducktape` — the same resolution the user key uses.
 pub(crate) fn ducktape_home() -> Option<PathBuf> {
     if let Some(root) = std::env::var_os("DUCKTAPE_HOME") {

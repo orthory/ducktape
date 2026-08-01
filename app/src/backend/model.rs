@@ -627,7 +627,10 @@ pub(crate) struct Tip {
 
 pub(crate) fn rpc_client(input: &str) -> Result<RpcClient, String> {
     let configured = if input.trim().is_empty() {
-        std::env::var("DUCKTAPE_NODE").unwrap_or_else(|_| DEFAULT_RPC.to_string())
+        std::env::var("DUCKTAPE_NODE")
+            .ok()
+            .or_else(|| registered_endpoint().map(str::to_string))
+            .unwrap_or_else(|| DEFAULT_RPC.to_string())
     } else {
         input.trim().to_string()
     };
