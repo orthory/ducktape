@@ -1,5 +1,11 @@
 state
   app_theme = "app"
+  // Which palette reading of AppTheme paints the console. `appearance` is the
+  // persisted override: "" follows the OS, "light"/"dark" pin one reading.
+  // `app_background`/`app_text` are the WINDOW's own base coat — they must
+  // flip with the palette or a dark console boots inside a paper window.
+  app_palette:palette[AppTheme] = AppTheme.app
+  appearance = ""
   app_background = "#fdfdfb"
   app_text = "#2c2b27"
   rpc = ""

@@ -8,11 +8,11 @@ font code family="Geist Mono" weight=normal stretch=normal style=normal
 font code_medium family="Geist Mono" weight=medium stretch=normal style=normal
 font code_semibold family="Geist Mono" weight=semibold stretch=normal style=normal
 
-// ONE contract, ONE palette: 2.0 allows exactly one of each, so the kit's 49
-// semantic roles and the 74 steps the canonical artifact names live together
-// here, in the app's own theme file. `ducktape-ui/default.ice` stays a verbatim
-// vendor copy with its own theme deleted — a UI kit has no business naming
-// `desk`, `rail`, or `diff_hunk_bg`.
+// ONE contract, TWO palettes: the kit's 49 semantic roles and the 74 steps the
+// canonical artifact names live together here, in the app's own theme file,
+// with a light and a dark reading of every token. `ducktape-ui/default.ice`
+// stays a verbatim vendor copy with its own theme deleted — a UI kit has no
+// business naming `desk`, `rail`, or `diff_hunk_bg`.
 theme contract AppTheme
   bg
   surface
@@ -283,3 +283,143 @@ palette app for AppTheme
   kind_run_bg #faf0e9
   kind_task #c08a3e
   kind_task_bg #faf3e6
+
+// The dark reading of the same contract — the same warm family, inverted:
+// deep warm charcoal surfaces, off-white ink, semantic hues lifted one step
+// so they carry on ink-dark plates. The dots keep their light-palette values
+// (they were tuned as signals, not surfaces), and every `fg/N` composite in
+// the screens adapts automatically because `fg` itself flips.
+palette app_dark for AppTheme
+  bg         #1b1a16
+  surface    #22211d
+  fg         #e8e6df
+  muted      #a8a69c
+  muted_bg   #26251f
+  primary    #e8e6df
+  primary_hover #f4f2ea
+  primary_fg #1b1a16
+  disabled   #33322c
+  disabled_fg #6b6a61
+  secondary  #2a2925
+  secondary_fg #b5b3a9
+  accent     #2e2d27
+  accent_fg  #cfcdc4
+  brand      #c98a63
+  brand_fg   #1b1a16
+  brand_bg   #33261d
+  brand_line #4a382b
+  danger     #d97b72
+  danger_fg  #1b1a16
+  danger_bg  #33211f
+  danger_line #4d2f2c
+  danger_dot #e0655c
+  success    #7fb894
+  success_fg #151410
+  success_bg #1e2a22
+  success_line #32473a
+  success_dot #5cb45f
+  warning    #d4a94e
+  warning_fg #151410
+  warning_bg #2e2717
+  warning_line #4d3f22
+  warning_dot #e3b443
+  avatar_bg  #3a3931
+  avatar_fg  #cfcdc4
+  toast_bg   #f3f1ea
+  toast_fg   #26251f
+  border     #35342e
+  control_line #3b3a33
+  input      #85837b
+  ring       #e8e6df
+  glass_thin #1b1a1680
+  glass_regular #1b1a169e
+  glass_sheet #1b1a16db
+  shadow_popover #00000040
+  shadow_toast #00000059
+  shadow_modal #00000073
+  shadow_window #00000059
+  shadow_window_secondary #00000026
+  // SURFACES — the desk sits DEEPER than the content in the dark reading.
+  desk #121110
+  desk_lit #191815
+  rail #201f1b
+  sidebar #1e1d19
+  elevated #2a2925
+  subtle #31302b
+  row_hover #24231e
+  rail_hover #282722
+  // LINES
+  window_line #0e0d0b
+  separator #2c2b26
+  card_line #302f29
+  danger_zone_line #4d2f2c
+  danger_zone_bg #2a1d1b
+  danger_solid #c25a4f
+  danger_solid_hover #d3685c
+  danger_label #8a5a4d
+  // INK — the ramp fades toward the surface, mirroring the light order.
+  ink_hover #f4f2ea
+  strong_ink #dcdad2
+  caption #8f8d84
+  meta #7c7a71
+  hint #6b6a61
+  label #605f56
+  icon_idle #55544c
+  // STATE inks
+  success_tick #7ba78c
+  info #7f9ab8
+  info_bg #1e2530
+  info_line #303e52
+  info_dot #7f9ab8
+  alert_fg #d3685c
+  alert_bg #301f1c
+  alert_line #4d2f2c
+  alert_dot #cf6a5e
+  warning_bg_lit #2a2517
+  scrim #00000080
+  // WASHES — one notch off the dark surface each sits on.
+  bg_wash #201f1a
+  card_wash #23221d
+  card_wash_hover #262520
+  unread_wash #262418
+  brand_wash #2a221b
+  tree_selected #35322a
+  warning_plate #453a1e
+  pending_line #3f3e36
+  control_line_hover #45443c
+  ink_soft #6e6d63
+  chevron_idle #5b5a52
+  gutter_ink #62615a
+  presence_off #4a4941
+  avatar_bg_sm #33322c
+  avatar_fg_sm #a3a198
+  agent_live #7e9e88
+  // FORGE
+  merged #a89ac9
+  merged_bg #2a2633
+  merged_line #443c57
+  final_bg #1e2a22
+  final_line #32473a
+  diff_add_bg #1d2a20
+  diff_add_gutter #24352a
+  diff_add_fg #8fc9a2
+  diff_del_bg #2f1f1c
+  diff_del_gutter #3d2723
+  diff_del_fg #de8b7f
+  diff_hunk_bg #262330
+  // Panel tiles read one step LIGHTER than their surface in the dark reading.
+  panel_tile #2e2d28
+  panel_tile_lit #37362f
+  danger_soft #a05c55
+  tree_folder #c0a86e
+  // EXPLORER
+  kind_page #7fb894
+  kind_page_bg #1e2a22
+  kind_code #a89ac9
+  kind_code_bg #2a2633
+  kind_file #cfcdc4
+  kind_file_bg #2e2d28
+  kind_run #d09068
+  kind_run_bg #33261d
+  kind_task #d4a94e
+  kind_task_bg #2e2717

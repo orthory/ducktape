@@ -189,7 +189,7 @@ view
               gov_vote -> gov_vote _ _
               gov_execute -> gov_execute _
         settings:
-          SettingsScreen account_name=account_name connected_rpc=connected_rpc settings_endpoint=settings_endpoint settings_node_key=settings_node_key settings_height=settings_height settings_data_dir=settings_data_dir settings_key_state=settings_key_state settings_key_path=settings_key_path settings_open_tabs=settings_open_tabs members_rows=members_rows members_validators=members_validators members_residents=members_residents account_id=account_id account_name_draft<->account_name_draft account_renaming=account_renaming account_members=account_members account_nodes=account_nodes rpc<->rpc password<->password status=status loading=loading connected=connected mutation_phase=mutation_phase node_tab=node_tab module_rows=module_rows block_height=block_height node_checkpoint=node_checkpoint node_last_finalized=node_last_finalized node_reachable_label=node_reachable_label node_quorum_label=node_quorum_label node_version=node_version node_root_hash=node_root_hash node_peers=node_peers node_log_filter<->node_log_filter node_log_lines=node_log_lines
+          SettingsScreen account_name=account_name connected_rpc=connected_rpc settings_endpoint=settings_endpoint settings_node_key=settings_node_key settings_height=settings_height settings_data_dir=settings_data_dir settings_key_state=settings_key_state settings_key_path=settings_key_path settings_open_tabs=settings_open_tabs members_rows=members_rows members_validators=members_validators members_residents=members_residents account_id=account_id account_name_draft<->account_name_draft account_renaming=account_renaming account_members=account_members account_nodes=account_nodes appearance=appearance rpc<->rpc password<->password status=status loading=loading connected=connected mutation_phase=mutation_phase node_tab=node_tab module_rows=module_rows block_height=block_height node_checkpoint=node_checkpoint node_last_finalized=node_last_finalized node_reachable_label=node_reachable_label node_quorum_label=node_quorum_label node_version=node_version node_root_hash=node_root_hash node_peers=node_peers node_log_filter<->node_log_filter node_log_lines=node_log_lines
             events
               select_shell_tab -> select_shell_tab _
               reconnect -> reconnect
@@ -201,6 +201,8 @@ view
               select_node_tab -> select_node_tab _
               open_node_modules -> open_node_modules
               node_log_filter_changed -> node_log_filter_changed _
+              set_appearance_light -> set_appearance_light
+              set_appearance_dark -> set_appearance_dark
         explorer:
           ExplorerScreen query<->explorer_query connected=connected searching=explorer_searching loading=explorer_loading kinds=explorer_kinds kind=explorer_kind hits=explorer_hits blocks=explorer_blocks selected=explorer_selected ops=explorer_ops
             events
