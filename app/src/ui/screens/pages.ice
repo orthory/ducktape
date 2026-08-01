@@ -30,6 +30,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
     search_pages_submit()
     clear_page_search()
     arm_page_delete()
+    disarm_page_delete()
     delete_page_submit()
     close_doc_tab(str)
     open_page_search_hit(str, str)
@@ -129,15 +130,15 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                       active bg=transparent text=muted r=7.0
                       hovered bg=fg/10 text=fg
                       pressed bg=fg/15
-                  if !page_delete_armed
-                    button label="Page menu" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @icon_action -> emit(arm_page_delete)
-                      box w=fill h=fill align-x=center align-y=center
-                        text "•••" size=13.0
-                      active bg=transparent text=muted r=7.0
-                      hovered bg=fg/10 text=fg
-                      pressed bg=fg/15
-                  if page_delete_armed
-                    button "Delete page" disabled=(mutation_phase != "idle") h=26.0 p=5.0 @danger_action -> emit(delete_page_submit)
+                  // The trigger STAYS a trigger: arming opens the named
+                  // confirm dialog below — it must never swap the red
+                  // button in under the same cursor.
+                  button label="Delete page" disabled=(mutation_phase != "idle" || page_delete_armed) w=28.0 h=28.0 p=0.0 @icon_action -> emit(arm_page_delete)
+                    box w=fill h=fill align-x=center align-y=center
+                      text "•••" size=13.0
+                    active bg=transparent text=muted r=7.0
+                    hovered bg=fg/10 text=fg
+                    pressed bg=fg/15
                   // THE TICK IS EARNED, NEVER ASSUMED. One discriminant,
                   // one match, and `✓ synced` is painted for "saved"
                   // alone: a write the node REFUSED says so, and an edit
@@ -337,6 +338,14 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                       arm_block_delete
                       remove_block_submit
                       close_block_actions
+            overlay when=page_delete_armed dismiss=emit(disarm_page_delete) backdrop=scrim p=30.0 align-x=center align-y=center
+              content
+                space w=fill h=fill
+              layer
+                ConfirmDelete title="Delete this page" subject=active_page_title note="The page and every block on it are deleted for every member. This cannot be undone from the app." action="Delete page" busy=(mutation_phase != "idle")
+                  events
+                    cancel -> emit(disarm_page_delete)
+                    confirm -> emit(delete_page_submit)
         // The artifact hangs a 306px rail off the document, not a
         // floating card. The Spec tab is omitted: pages carry no kind,
         // no last-editor and no derivation pipeline (see omissions).
