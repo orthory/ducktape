@@ -9,10 +9,12 @@
 // everywhere else; a git client wrote this one against a real wall clock.
 on forge_loaded(next)
   return if next.generation != forge_generation
+  forge_answered = true
   forge_repos = next.repos
 
 on forge_failed(cause)
   return if cause.generation != forge_generation
+  forge_answered = true
 
 // Picking a repo also DISMISSES the switcher. Nothing else clears it on this
 // route, so the popover stayed pinned over the first rows of the tracker list

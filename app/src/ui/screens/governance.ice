@@ -1,7 +1,7 @@
 // APPROVALS — every decision this network is being asked to make, and the ones
 // it has already settled. See `screens/roster.ice` for the screen contract.
 
-component GovernanceScreen(rows:[ProposalRow], voting:str, admin:bool)
+component GovernanceScreen(rows:[ProposalRow], voting:str, admin:bool, answered:bool)
   emits
     gov_vote(str, bool)
     gov_execute(str)
@@ -19,7 +19,7 @@ component GovernanceScreen(rows:[ProposalRow], voting:str, admin:bool)
         GateNote reason="Approval votes are cast by this network's validators, and this node does not hold validator standing." next="You can still read every proposal and follow its tally while it runs."
       // Empty means nothing OPEN. A workspace whose every decision settled
       // still gets the plate, not a silent screen.
-      if open_proposals(rows) <= 0
+      if open_proposals(rows) <= 0 && answered
         EmptyPlate message="No proposals waiting — every decision on this network is finalized."
       if open_proposals(rows) > 0
         col w=fill gap=12.0
