@@ -242,25 +242,28 @@ component BulletBlock(body:str)
         BulletDot
       text body w=fill size=14.0 line-h=1.65 wrap=word @text-accent_fg
 
-// ONE CLICK FINALIZES THE TICK. 17px, r5, ink when done and a 1.5px hairline
-// when open — the artifact's own control, not a menu round-trip.
+// ONE CLICK FINALIZES THE TICK. The DRAWN box stays 17px r5 — ink when done,
+// a 1.5px hairline when open — inside a 24px transparent target: a tick is a
+// precision task at 17px, and the pointer feedback moved to a wash around the
+// box because a button's hover styling cannot reach into its child.
 component TodoCheckbox(block:PageBlock)
   emits
     set_todo_checked(str, bool)
   col #root
     if block.checked
-      button label="Mark not done" w=17.0 h=17.0 p=0.0 @icon_action -> emit(set_todo_checked, block.id, false)
-        box w=fill h=fill align-x=center align-y=center
+      button label="Mark not done" w=24.0 h=24.0 p=0.0 @icon_action -> emit(set_todo_checked, block.id, false)
+        box w=17.0 h=17.0 align-x=center align-y=center bg=primary border=primary border-w=1.5 r=5.0
           text "✓" size=9.0 wrap=none font=code_semibold @text-primary_fg
-        active bg=primary text=primary_fg border=primary border-w=1.5 r=5.0
-        hovered bg=ink_hover text=primary_fg border=ink_hover
-        pressed bg=primary text=primary_fg border=primary
+        active bg=transparent text=primary_fg border=transparent border-w=1.0 r=7.0
+        hovered bg=fg/8
+        pressed bg=fg/12
     if !block.checked
-      button label="Mark done" w=17.0 h=17.0 p=0.0 @icon_action -> emit(set_todo_checked, block.id, true)
-        space w=1.0 h=1.0
-        active bg=surface border=control_line_hover border-w=1.5 r=5.0
-        hovered bg=surface border=primary
-        pressed bg=subtle border=primary
+      button label="Mark done" w=24.0 h=24.0 p=0.0 @icon_action -> emit(set_todo_checked, block.id, true)
+        box w=17.0 h=17.0 bg=surface border=control_line_hover border-w=1.5 r=5.0
+          space w=1.0 h=1.0
+        active bg=transparent border=transparent border-w=1.0 r=7.0
+        hovered bg=fg/8
+        pressed bg=fg/12
 
 // A done todo fades to `meta` and strikes through; an open one keeps body ink.
 component TodoBlock(block:PageBlock)

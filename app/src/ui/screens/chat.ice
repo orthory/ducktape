@@ -118,7 +118,7 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
                 hovered bg=separator text=fg
                 pressed bg=subtle text=fg
             if channel_create_open
-              button label="Close new channel" disabled=(loading || mutation_phase != "idle") w=18.0 h=18.0 p=0.0 @icon_action -> emit(toggle_channel_create)
+              button label="Close new channel" disabled=(loading || mutation_phase != "idle") w=24.0 h=24.0 p=0.0 @icon_action -> emit(toggle_channel_create)
                 box w=fill h=fill align-x=center align-y=center
                   text "×" size=13.0 wrap=none @text-muted
                 active bg=separator text=muted border=transparent border-w=1.0 r=5.0
