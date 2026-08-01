@@ -66,7 +66,27 @@ pub async fn files_ls(
     offscreen_guard(generation)?;
     async {
         let rpc = rpc_client(&rpc)?;
-        let reply = rpc.files_get("ls", &[("path", path.as_str())]).await?;
+        let listed = rpc.files_get("ls", &[("path", path.as_str())]).await;
+        let reply = match listed {
+            Ok(reply) => reply,
+            // A CLIENT reads an uncommitted path as an empty directory, not
+            // an error: a fresh workspace has no `/shared` until something
+            // writes under it, and the module's not-found refusal painted the
+            // global banner over every first-run Files open (#804). Any other
+            // refusal still surfaces.
+            Err(error) => {
+                let message: String = error.into();
+                let uncommitted_path = message.contains("path not found");
+                if !uncommitted_path {
+                    return Err(message);
+                }
+                return Ok(FsListing {
+                    generation,
+                    entries: Vec::new(),
+                    path,
+                });
+            }
+        };
         Ok(FsListing {
             generation,
             entries: fs_entries(&reply),
