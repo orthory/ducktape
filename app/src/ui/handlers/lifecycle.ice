@@ -396,7 +396,7 @@ subscribe
   window file-dropped -> fs_file_dropped _
   run node_logs(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "activity") -> node_log_line _
   every 1s when huddle_joined -> tick
-  every 2800ms when !empty(toast) -> dismiss_toast
+  every 300ms when !empty(toast) -> toast_tick
 
 on modifiers_changed(value)
   shift_held = value.shift

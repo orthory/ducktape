@@ -83,10 +83,22 @@ on workspace_forgotten(forgotten)
 on copy_to_clipboard(text, label)
   toast = label
   toast_tone = "info"
+  toast_age = 0
   task clipboard write text
 
+// One tick per 300ms while a toast shows: the age belongs to THIS toast
+// (setters zero it), so every toast lives its full ~2.8s. The old shape was
+// one shared 2800ms interval — a toast raised late in the window flashed
+// and vanished.
 on dismiss_toast
   toast = ""
+  toast_age = 0
+
+on toast_tick
+  toast_age = toast_age + 1
+  return if toast_age < 9
+  toast = ""
+  toast_age = 0
 
 // Held here beside the loaders that fill them.
 state

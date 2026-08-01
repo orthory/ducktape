@@ -229,7 +229,11 @@ fn assert_no_polling(lifecycle: &str) {
         recurring,
         [
             "every 1s when huddle_joined -> tick",
-            "every 2800ms when !empty(toast) -> dismiss_toast",
+            // the toast's dismissal clock: fine ticks against a per-toast
+            // age, so a toast raised late in the old shared 2800ms window
+            // no longer flashes and vanishes. Still gated on a visible
+            // toast — it costs nothing at rest.
+            "every 300ms when !empty(toast) -> toast_tick",
         ]
     );
 }

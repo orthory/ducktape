@@ -73,6 +73,7 @@ on copy_onboarding_invite
   return if empty(invite_link)
   toast = "Invite link copied"
   toast_tone = "info"
+  toast_age = 0
   task clipboard write invite_link
 
 // Leaving onboarding is the first real connect: the console mounts against the
