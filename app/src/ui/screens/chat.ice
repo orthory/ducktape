@@ -300,15 +300,15 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
                                 stack #message(cached_message.id) w=fill
                                   UnfinalizedFrame pending=cached_message.pending
                                     MessageCard message=cached_message selected=false hovered=false disabled=false
-                                      events
-                                        message_entered -> message_entered _
-                                        message_exited -> message_exited _
-                                        add_reaction_at -> add_reaction_at _ _
-                                        remove_reaction_at -> remove_reaction_at _ _
-                                        open_thread_for -> open_thread_for _
-                                        open_message_actions_accessibly -> open_message_actions_accessibly _ _ _
-                                        open_message_reactions -> open_message_reactions _ _ _
-                                        open_message_actions -> open_message_actions _ _ _
+                                      forward
+                                        message_entered
+                                        message_exited
+                                        add_reaction_at
+                                        remove_reaction_at
+                                        open_thread_for
+                                        open_message_actions_accessibly
+                                        open_message_reactions
+                                        open_message_actions
                   overlay when=(selected_message_seq > 0 && message_action != "toolbar") dismiss=emit(clear_message_selection) backdrop=transparent p=8.0 align-x=end align-y=start
                     content
                       space w=fill h=fill
