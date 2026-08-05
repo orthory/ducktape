@@ -14,3 +14,12 @@ extern crate::call
   sync call_status_after(current:str, event:CallEvent) -> str
   sync apply_call_peer(peers:[CallEvent], event:CallEvent) -> [CallEvent]
   sync call_peer_muted(peers:[CallEvent], node:str) -> bool
+  sync call_video_live_after(peers:[CallEvent], camera:bool) -> bool
+
+// The camera leg — `crate::video`: capture/encode on its own thread, decoded
+// peer frames in a store the tile strip reads. `call_video_tiles` re-renders
+// when `generation` moves (the 15 Hz tick below copies the store's counter).
+extern crate::video
+  sync call_set_camera(on:bool) -> bool
+  sync latest_frame_generation() -> i64
+  component call_video_tiles(generation:i64) -> unit
