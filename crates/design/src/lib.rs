@@ -113,6 +113,7 @@ pub mod icons {
             "nav-members" => include_str!("../assets/icons/nav-members.svg"),
             "nav-pages" => include_str!("../assets/icons/nav-pages.svg"),
             "node" => include_str!("../assets/icons/node.svg"),
+            "pencil" => include_str!("../assets/icons/pencil.svg"),
             "pin" => include_str!("../assets/icons/pin.svg"),
             "plus" => include_str!("../assets/icons/plus.svg"),
             "plus-lg" => include_str!("../assets/icons/plus-lg.svg"),
@@ -124,6 +125,7 @@ pub mod icons {
             "search-lg" => include_str!("../assets/icons/search-lg.svg"),
             "shield" => include_str!("../assets/icons/shield.svg"),
             "shield-check" => include_str!("../assets/icons/shield-check.svg"),
+            "trash" => include_str!("../assets/icons/trash.svg"),
             _ => EMPTY,
         }
     }

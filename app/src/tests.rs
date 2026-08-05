@@ -1036,11 +1036,32 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         .split_once("message_action == \"reactions\"")
         .unwrap()
         .0;
-    assert!(more.contains("button \"React\""));
-    assert!(more.contains("button \"Open thread\""));
-    assert!(more.contains("button \"Edit\""));
-    assert!(more.contains("button \"Delete\""));
-    assert!(more.contains("button \"Close\""));
+    // Icon + sentence rows on one raised plate; Esc and the backdrop dismiss,
+    // so the menu lists no Close row of its own.
+    for row in [
+        "label=\"Manage reactions\"",
+        "label=\"Reply in thread\"",
+        "label=\"Edit message\"",
+        "label=\"Delete message\"",
+    ] {
+        assert!(more.contains(row), "{row}");
+    }
+    for icon in ["\"emoji\"", "\"nav-chat\"", "\"pencil\"", "\"trash\""] {
+        assert!(more.contains(&format!("Icon name={icon}")), "{icon}");
+    }
+    assert!(!more.contains("button \"Close\""));
+    // The reactions arm is the shared ADD grid — removal rides the message's
+    // own reaction chips, which already toggle off for `reacted_by_me`.
+    let picker = chat
+        .split_once("message_action == \"reactions\"")
+        .unwrap()
+        .1
+        .split_once("message_action == \"editing\"")
+        .unwrap()
+        .0;
+    assert!(picker.contains("for emoji in reaction_palette()"));
+    assert!(picker.contains("-> emit(add_reaction_submit, emoji)"));
+    assert!(!picker.contains("remove_reaction_submit"));
 
     let handlers = include_str!("ui/handlers/chat.ice");
     for focus in [
@@ -1107,12 +1128,11 @@ fn thread_messages_mirror_the_main_action_system() {
     assert!(
         thread.contains("sensor show=emit(thread_resized, _, _)")
     );
-    // The picker reuses the seq-targeted reaction mutations against the thread selection.
-    assert!(thread.contains("-> emit(add_reaction_at, thread_selected_seq, \"👍\")"));
-    assert!(
-        thread.contains("-> emit(remove_reaction_at, thread_selected_seq, reaction.emoji)")
-    );
-    // More-menu omits Open thread (already inside the thread).
+    // The picker is the shared ADD grid targeting the thread selection;
+    // removal rides the reply's own reaction chips.
+    assert!(thread.contains("for emoji in reaction_palette()"));
+    assert!(thread.contains("-> emit(add_reaction_at, thread_selected_seq, emoji)"));
+    // More-menu omits Reply in thread (already inside the thread) and Close.
     let more = thread
         .split_once("thread_message_action == \"more\"")
         .unwrap()
@@ -1120,10 +1140,15 @@ fn thread_messages_mirror_the_main_action_system() {
         .split_once("thread_message_action == \"reactions\"")
         .unwrap()
         .0;
-    for label in ["\"React\"", "\"Edit\"", "\"Delete\"", "\"Close\""] {
-        assert!(more.contains(&format!("button {label}")), "{label}");
+    for label in [
+        "label=\"Manage reactions\"",
+        "label=\"Edit message\"",
+        "label=\"Delete message\"",
+    ] {
+        assert!(more.contains(label), "{label}");
     }
-    assert!(!more.contains("Open thread"));
+    assert!(!more.contains("Reply in thread"));
+    assert!(!more.contains("button \"Close\""));
 
     let handlers = include_str!("ui/handlers/chat.ice");
     for name in [
@@ -1564,7 +1589,7 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     // (min_h, max_h, pad); type scale (13.5/1.3) is owned by the adapter.
     // Both chat composers share one plate; the forge note runs compact.
     assert_eq!(
-        SCREENS.matches(", shift_held, 44.0, 150.0, 6.6) #").count(),
+        SCREENS.matches(", shift_held, 44.0, 150.0, 10.0) #").count(),
         2
     );
     assert!(SCREENS.contains(", shift_held, 38.0, 120.0, 6.0) #forge-note"));

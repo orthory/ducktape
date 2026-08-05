@@ -46,12 +46,19 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
           hovered bg=rail_hover text=fg
           pressed bg=subtle text=fg
 
+// One roster row of the details drawer: the key label in machine ink and a
+// quiet ×; the danger reading arrives on hover, not as a red button per row.
 component ChatMemberRow(member:ChatMember, disabled:bool)
   emits
     remove_channel_member_submit(str)
   row w=fill gap=6.0 align=center
-    text member.label w=fill size=12.0 font=code @text-muted
-    button "Remove" description=member.label disabled=disabled h=28.0 p=5.0 @danger_action -> emit(remove_channel_member_submit, member.key)
+    text member.label w=fill size=11.5 wrap=none font=code @text-accent_fg
+    button label="Remove member" description=member.label disabled=disabled w=24.0 h=24.0 p=0.0 @icon_action -> emit(remove_channel_member_submit, member.key)
+      box w=fill h=fill align-x=center align-y=center
+        text "×" size=13.0 wrap=none @text-muted
+      active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+      hovered bg=danger_bg text=fg
+      pressed bg=danger_line text=fg
 
 component RichLine(block:ChatBlock)
   flex w=fill wrap=wrap gap-x=0.0 gap-y=4.0 items=start
@@ -210,8 +217,11 @@ component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled
               add_reaction_at
               remove_reaction_at
               open_thread_for
+      // Selection is a tint, not a ring: the brand wash alone marks the row.
+      // A 1px brand border here read as a loud focus rectangle on every
+      // menu-open (user QA: "border 굵게 생기는거 짜쳐").
       if !message.deleted && selected
-        box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=brand_bg border=brand_line border-w=1.0 r=9.0
+        box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=brand_bg border=transparent border-w=1.0 r=9.0
           MessageContents message=message
             forward
               add_reaction_at
@@ -327,8 +337,9 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, hovered:bool, di
             forward
               add_reaction_at
               remove_reaction_at
+      // Same tint-only selection as MessageCard — no ring.
       if !message.deleted && selected
-        box w=fill p=8.0 bg=accent border=border border-w=1.0 r=9.0
+        box w=fill p=8.0 bg=brand_bg border=transparent border-w=1.0 r=9.0
           ThreadMessageBody message=message
             forward
               add_reaction_at

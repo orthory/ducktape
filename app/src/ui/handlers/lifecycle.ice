@@ -188,6 +188,14 @@ on workspace_connected(next)
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
   active_channel_huddle_count = next.active_channel_huddle_count
+  // Am I in the active channel's huddle — same stanza as `chat_updated`. A
+  // process that reconnects while already on the roster renders LIVE here;
+  // without this the pill only appeared after a manual channel re-pick.
+  huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
+  huddle_joined = huddle_self(next.huddle_roster)
+  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  huddle_channel = keep_str(huddle_joined, active_channel, "")
+  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
   pages = next.pages
   blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
@@ -287,6 +295,15 @@ on live_resynced(next)
   active_channel_archived = keep_bool(next.chat_loaded, next.active_channel_archived, active_channel_archived)
   active_channel_members_only = keep_bool(next.chat_loaded, next.active_channel_members_only, active_channel_members_only)
   active_channel_huddle_count = keep_i64(next.chat_loaded, next.active_channel_huddle_count, active_channel_huddle_count)
+  // The join/leave acks land here: a huddle op forces a chat resync
+  // (`live.rs` sets load_chat on roster changes), and this is where the
+  // roster it fetched finally answers "am I in it". Without these lines the
+  // LIVE pill never appeared until a manual channel re-pick.
+  huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
+  huddle_joined = keep_bool(next.chat_loaded, huddle_self(next.huddle_roster), huddle_joined)
+  huddle_roster = keep_roster(huddle_joined, keep_participants(next.chat_loaded, next.huddle_roster, huddle_roster))
+  huddle_channel = keep_str(huddle_joined, active_channel, "")
+  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = keep_members(next.chat_loaded, next.channel_members, channel_members)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)

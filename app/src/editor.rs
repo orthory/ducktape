@@ -40,21 +40,18 @@ struct ComposerInk {
     ink: Color,
     muted: Color,
     hint: Color,
-    ring: Color,
 }
 
 const LIGHT_INK: ComposerInk = ComposerInk {
     ink: rgb8(0x2c, 0x2b, 0x27),
     muted: rgb8(0x6b, 0x69, 0x62),
     hint: rgb8(0xb3, 0xb1, 0xa8),
-    ring: rgb8(0x26, 0x25, 0x1f),
 };
 
 const DARK_INK: ComposerInk = ComposerInk {
     ink: rgb8(0xe8, 0xe6, 0xdf),
     muted: rgb8(0xa8, 0xa6, 0x9c),
     hint: rgb8(0x6b, 0x6a, 0x61),
-    ring: rgb8(0xe8, 0xe6, 0xdf),
 };
 
 fn composer_ink(theme: &iced::Theme) -> &'static ComposerInk {
@@ -96,6 +93,59 @@ pub fn apply_composer_event(mut document: Content, event: ComposerEvent) -> Cont
         ComposerEvent::Submit => {}
     }
     document
+}
+
+/// The composer toolbar's insertion: wrap the selection in `kind`'s markers,
+/// or insert an empty marker pair and park the cursor inside it. The markers
+/// are the SAME grammar `inline_marks` previews and the renderer parses, so
+/// the button and the typed fence produce identical messages.
+pub fn composer_toggle_mark(mut document: Content, kind: String) -> Content {
+    let (open, close) = match kind.as_str() {
+        "bold" => ("**", "**"),
+        "italic" => ("_", "_"),
+        "code" => ("```\n", "\n```"),
+        "quote" => ("> ", ""),
+        _ => return document,
+    };
+    let selected = document.selection().unwrap_or_default();
+    let marked = format!("{open}{selected}{close}");
+    document.perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+        std::sync::Arc::new(marked),
+    )));
+    if selected.is_empty() {
+        for _ in 0..close.chars().count() {
+            document.perform(text_editor::Action::Move(text_editor::Motion::Left));
+        }
+    }
+    document
+}
+
+/// The composer's formatting shortcuts, classified where the modifiers are
+/// known: Cmd/Ctrl+B bold, Cmd/Ctrl+I italic, Cmd/Ctrl+Shift+C code block,
+/// Cmd/Ctrl+Shift+9 quote — Slack's own table. The editor deliberately lets
+/// command-letter chords bubble (`command_shortcut_bubbles` in the widget), so
+/// this runs from the app's ONE keyboard subscription with the editor's focus
+/// untouched — the toolbar buttons cannot say the same, a click on them
+/// defocuses the editor. An empty verdict is `composer_toggle_mark`'s no-op.
+pub fn composer_mark_shortcut(
+    _logical: iced::keyboard::Key,
+    physical: iced::keyboard::key::Physical,
+    modifiers: iced::keyboard::Modifiers,
+    chat_ready: bool,
+) -> String {
+    use iced::keyboard::key::{Code, Physical};
+    if !chat_ready || !modifiers.command() {
+        return String::new();
+    }
+    let shifted = modifiers.shift();
+    let mark = match physical {
+        Physical::Code(Code::KeyB) if !shifted => "bold",
+        Physical::Code(Code::KeyI) if !shifted => "italic",
+        Physical::Code(Code::KeyC) if shifted => "code",
+        Physical::Code(Code::Digit9) if shifted => "quote",
+        _ => return String::new(),
+    };
+    mark.to_owned()
 }
 
 pub fn rich_composer(
@@ -152,22 +202,13 @@ fn classify(action: RichAction, shift: bool) -> ComposerEvent {
 
 fn composer_style(theme: &iced::Theme, status: text_editor::Status) -> text_editor::Style {
     let ink = composer_ink(theme);
-    let focused = matches!(status, text_editor::Status::Focused { .. });
     let disabled = matches!(status, text_editor::Status::Disabled);
     text_editor::Style {
         background: Color::TRANSPARENT.into(),
-        border: if focused {
-            Border {
-                color: ink.ring,
-                width: 1.0,
-                // The composer mounts inside rounded plates (r=12 cards in
-                // chat, thread and forge) — a square ring visibly pokes their
-                // corners.
-                radius: 9.0.into(),
-            }
-        } else {
-            Border::default()
-        },
+        // NO focus ring of its own: the editor mounts inside a bordered plate
+        // (the r=12 composer card), and an inner rectangle on focus made the
+        // input read as a separate component floating in its card.
+        border: Border::default(),
         placeholder: ink.hint,
         value: if disabled { ink.muted } else { ink.ink },
         selection: Color { a: 0.18, ..ink.ink },
@@ -454,6 +495,63 @@ mod tests {
         assert_eq!(classify(enter.clone(), true), ComposerEvent::Apply(enter));
         let typed = RichAction::Edit(text_editor::Action::Edit(text_editor::Edit::Insert('x')));
         assert_eq!(classify(typed.clone(), false), ComposerEvent::Apply(typed));
+    }
+
+    #[test]
+    fn toolbar_marks_wrap_the_selection_or_park_the_cursor_inside() {
+        // A selection is wrapped in place.
+        let mut document = Content::with_text("ship it");
+        document.perform(text_editor::Action::SelectAll);
+        let document = composer_toggle_mark(document, "bold".into());
+        assert_eq!(document.text().trim_end(), "**ship it**");
+
+        // No selection: an empty pair is inserted and the cursor parks inside
+        // it, so typing lands between the markers.
+        let mut document = composer_toggle_mark(Content::new(), "italic".into());
+        document.perform(text_editor::Action::Edit(text_editor::Edit::Insert('x')));
+        assert_eq!(document.text().trim_end(), "_x_");
+
+        // The block marks are the renderer's own fences.
+        let mut document = Content::with_text("let x = 1;");
+        document.perform(text_editor::Action::SelectAll);
+        let document = composer_toggle_mark(document, "code".into());
+        assert_eq!(document.text().trim_end(), "```\nlet x = 1;\n```");
+
+        // An unknown kind changes nothing.
+        let document = composer_toggle_mark(Content::with_text("keep"), "sparkle".into());
+        assert_eq!(document.text().trim_end(), "keep");
+    }
+
+    #[test]
+    fn mark_shortcuts_follow_slacks_table_and_respect_the_gate() {
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::{Key, Modifiers};
+        let chord = |code, modifiers| {
+            composer_mark_shortcut(Key::Unidentified, Physical::Code(code), modifiers, true)
+        };
+        assert_eq!(chord(Code::KeyB, Modifiers::COMMAND), "bold");
+        assert_eq!(chord(Code::KeyI, Modifiers::COMMAND), "italic");
+        assert_eq!(
+            chord(Code::KeyC, Modifiers::COMMAND | Modifiers::SHIFT),
+            "code"
+        );
+        assert_eq!(
+            chord(Code::Digit9, Modifiers::COMMAND | Modifiers::SHIFT),
+            "quote"
+        );
+        // Plain Cmd+C is copy, not code; plain typing marks nothing.
+        assert_eq!(chord(Code::KeyC, Modifiers::COMMAND), "");
+        assert_eq!(chord(Code::KeyB, Modifiers::default()), "");
+        // Off-chat (or palette-open) the gate swallows everything.
+        assert_eq!(
+            composer_mark_shortcut(
+                Key::Unidentified,
+                Physical::Code(Code::KeyB),
+                Modifiers::COMMAND,
+                false
+            ),
+            ""
+        );
     }
 
     #[test]

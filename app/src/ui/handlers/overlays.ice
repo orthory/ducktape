@@ -69,6 +69,10 @@ on global_key_pressed(event)
   block_insert_open = block_insert_open && escape_key != "block_insert"
   block_insert_after_id = keep_str(escape_key == "block_insert", "", block_insert_after_id)
   forge_repo_menu = forge_repo_menu && escape_key != "repo_menu"
+  // The composer's formatting chords (Cmd/Ctrl+B/I, +Shift+C, +Shift+9). The
+  // editor lets command-letter presses bubble on purpose, so its focus is
+  // still on the draft when the mark lands; an empty verdict is a no-op.
+  message_editor = composer_toggle_mark(message_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, (connected && shell_tab == "chat" && !palette_open)))
   palette_key = palette_key_action(event.key, event.physical_key, event.modifiers, palette_open)
   return if palette_key == "none"
   return if palette_key == "open" && !connected

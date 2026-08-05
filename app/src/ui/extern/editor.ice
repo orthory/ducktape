@@ -11,6 +11,8 @@ extern crate::editor
   sync apply_composer_event(document:editor, event:ComposerEvent) -> editor
   sync composer_submits(event:ComposerEvent) -> bool
   sync composer_submit_event() -> ComposerEvent
+  sync composer_toggle_mark(document:editor, kind:str) -> editor
+  sync composer_mark_shortcut(logical:key, physical:physical-key, modifiers:key-modifiers, chat_ready:bool) -> str
   // The pages block editor's seams on the stock Ice `editor` widget: the
   // structural keys become one checked event (classified in Rust where the
   // modifiers are known), and the highlighter is the composers' own inline

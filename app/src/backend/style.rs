@@ -36,6 +36,14 @@ pub fn icon(name: impl AsRef<str>) -> String {
     design::icons::svg(name.as_ref()).to_string()
 }
 
+/// The titlebar's extra left padding. On macOS the window is drawn with a
+/// hidden title and a transparent, full-size content view (`app.ice`), so the
+/// three traffic lights overlay the content's top-left ~70px — the chain chip
+/// must start past them. Zero on every other platform.
+pub fn titlebar_inset() -> f64 {
+    if cfg!(target_os = "macos") { 68.0 } else { 0.0 }
+}
+
 /// Tints an icon with one step of the artifact's ink ramp. The asset itself is
 /// drawn on `currentColor`, so the tone — not a second asset — is what makes a
 /// muted rail icon and an accent action icon different.
