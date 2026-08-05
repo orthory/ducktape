@@ -79,19 +79,30 @@ component MessageBody(message:ChatMessage)
     for block in message.blocks
       if block.kind == "divider"
         Separator
+      // A code fence is a QUIET slab: the near-surface tint + hairline reads
+      // as "preformatted" in both themes (the old black/26 was a dark slab in
+      // light mode and vanished in dark). The lang tag is an eyebrow label,
+      // not a code line.
       if block.kind == "code"
-        box w=fill p=11.0 bg=black/26 border=fg/11 border-w=1.0 r=9.0
-          col w=fill gap=5.0
+        box w=fill p=11.0 bg=muted_bg border=border border-w=1.0 r=9.0
+          col w=fill gap=6.0
             if !empty(block.lang)
-              text block.lang size=10.5 wrap=none font=code_medium @text-muted
+              text block.lang size=10.0 wrap=none font=code_semibold @text-label
             text block.text w=fill size=12.0 line-h=1.5 font=code wrap=word @text-fg
+      // A quote is a LEFT BAR, not a box — boxed it was indistinguishable
+      // from a code slab at a glance. The bar wears the warm accent hairline
+      // and fills the CONTENT's height (zstack resolves fill layers against
+      // the content union — ducktape-ui 1231692; the earlier row form
+      // degenerated in the infinite-height scroll and ate the whole row).
       if block.kind == "quote"
-        box w=fill p=9.0 pl=13.0 bg=muted_bg border=border border-w=1.0 r=8.0
-          col w=fill
+        stack w=fill
+          col w=fill pl=13.0 pt=2.0 pb=2.0
             if block.rich
               RichLine block=block
             if !block.rich
               text block.text w=fill size=13.5 line-h=1.45 wrap=word @text-fg
+          box w=3.0 h=fill bg=brand_line r=1.5
+            space w=1.0 h=1.0
       if block.kind == "paragraph"
         if block.rich
           RichLine block=block
@@ -146,65 +157,73 @@ component MessageContents(message:ChatMessage, flash:f64)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
-  row w=fill gap=11.0 align=start
+  col w=fill
+    // Run-boundary rhythm: a new author's header breathes a little above,
+    // so grouping reads at a glance — continuations stay tight.
     if message.show_author
-      MessageAvatar initials=message.initial kind=message.avatar_kind
-    if !message.show_author
-      space w=30.0
-    col w=fill gap=2.0
+      space w=1.0 h=4.0
+    row w=fill gap=11.0 align=start
       if message.show_author
-        row w=fill gap=7.0 align=center
-          text message.author size=13.0 wrap=none font=display @text-fg
-          if message.avatar_kind == "agent"
-            box px=5.0 py=2.0 bg=primary r=4.0
-              text "AGENT" size=9.0 wrap=none font=code_semibold @text-primary_fg
-          // The artifact stamps a wall clock here. This chain has none: the
-          // validator writes `consensus_time = height`, so the honest stamp is
-          // the block the message landed in. An unsettled row has no height
-          // yet and simply carries none.
-          if message.height > 0
-            text height_label_short(message.height) size=11.0 wrap=none font=code_medium @text-hint
-          if message.edited
-            text "· edited" size=11.0 wrap=none font=code_medium @text-hint
-          space w=fill
-      MessageBody message=message
-      // Reactions and the replies button STACK — the artifact gives each its
-      // own line under the body, never one shared row.
-      if !empty(message.reactions)
-        flex w=fill wrap=wrap gap-x=5.0 gap-y=5.0 items=start pt=6.0
-          for reaction in message.reactions
-            ReactionChip reaction=reaction seq=message.seq
-              forward
-                add_reaction_at
-                remove_reaction_at
-      if message.reply_count > 0
-        row w=fill gap=6.0 align=center pt=6.0
-          button label="Open thread" p=0.0 @icon_action -> emit(open_thread_for, message.seq)
-            box pl=7.0 pr=9.0 pt=3.0 pb=3.0
-              row gap=6.0 align=center
-                Icon name="nav-chat" tone="accent" px=12.0
-                text message.reply_count size=11.0 wrap=none font=code_medium @text-brand
-                text "replies" size=11.0 wrap=none font=code_medium @text-brand
-            active bg=surface text=brand border=border border-w=1.0 r=8.0
-            hovered bg=muted_bg text=brand border=control_line
-            pressed bg=elevated text=brand
-    // The quiet send-state lane at the row's right edge: an in-flight row
-    // carries a small dot, the settle swaps it for a ✓ that fades out (the
-    // `flash` prop is the animation's opacity — nonzero only on the row the
-    // stream's flash arm anchors). Replaces the old "finalizing…" chip line
-    // that restyled the whole message.
-    //
-    // The pr=7 inset is load-bearing: it tucks the indicator fully inside
-    // the hover toolbar's opaque plate (which ends 8px in from the card
-    // edge, rounded r=9), so hovering OCCLUDES the ✓ instead of leaving a
-    // sliver poking past the plate. The indicator is transient decoration;
-    // the toolbar wins the corner while the cursor is on the row.
-    if message.pending
-      box pr=7.0
-        svg icon("dot") memory w=7.0 h=7.0 style=icon_tint("hint") opacity=0.55
-    if !message.pending && flash > 0.0
-      box pr=7.0
-        svg icon("check") memory w=13.0 h=13.0 style=icon_tint("success-tick") opacity=flash
+        MessageAvatar initials=message.initial kind=message.avatar_kind
+      if !message.show_author
+        space w=30.0
+      col w=fill gap=2.0
+        if message.show_author
+          row w=fill gap=7.0 align=center
+            text message.author size=13.0 wrap=none font=display @text-fg
+            if message.avatar_kind == "agent"
+              box px=5.0 py=2.0 bg=primary r=4.0
+                text "AGENT" size=9.0 wrap=none font=code_semibold @text-primary_fg
+            // The artifact stamps a wall clock here. This chain has none: the
+            // validator writes `consensus_time = height`, so the honest stamp is
+            // the block the message landed in. An unsettled row has no height
+            // yet and simply carries none.
+            if message.height > 0
+              text height_label_short(message.height) size=11.0 wrap=none font=code_medium @text-hint
+            if message.edited
+              text "· edited" size=11.0 wrap=none font=code_medium @text-hint
+            space w=fill
+        MessageBody message=message
+        // Reactions and the replies button STACK — the artifact gives each its
+        // own line under the body, never one shared row.
+        if !empty(message.reactions)
+          flex w=fill wrap=wrap gap-x=5.0 gap-y=5.0 items=start pt=6.0
+            for reaction in message.reactions
+              ReactionChip reaction=reaction seq=message.seq
+                forward
+                  add_reaction_at
+                  remove_reaction_at
+        if message.reply_count > 0
+          row w=fill gap=6.0 align=center pt=6.0
+            button label="Open thread" p=0.0 @icon_action -> emit(open_thread_for, message.seq)
+              box pl=7.0 pr=9.0 pt=3.0 pb=3.0
+                row gap=6.0 align=center
+                  Icon name="nav-chat" tone="accent" px=12.0
+                  text message.reply_count size=11.0 wrap=none font=code_medium @text-brand
+                  if message.reply_count == 1
+                    text "reply" size=11.0 wrap=none font=code_medium @text-brand
+                  if message.reply_count != 1
+                    text "replies" size=11.0 wrap=none font=code_medium @text-brand
+              active bg=surface text=brand border=border border-w=1.0 r=8.0
+              hovered bg=muted_bg text=brand border=control_line
+              pressed bg=elevated text=brand
+      // The quiet send-state lane at the row's right edge: an in-flight row
+      // carries a small dot, the settle swaps it for a ✓ that fades out (the
+      // `flash` prop is the animation's opacity — nonzero only on the row the
+      // stream's flash arm anchors). Replaces the old "finalizing…" chip line
+      // that restyled the whole message.
+      //
+      // The pr=7 inset is load-bearing: it tucks the indicator fully inside
+      // the hover toolbar's opaque plate (which ends 8px in from the card
+      // edge, rounded r=9), so hovering OCCLUDES the ✓ instead of leaving a
+      // sliver poking past the plate. The indicator is transient decoration;
+      // the toolbar wins the corner while the cursor is on the row.
+      if message.pending
+        box pr=7.0
+          svg icon("dot") memory w=7.0 h=7.0 style=icon_tint("hint") opacity=0.55
+      if !message.pending && flash > 0.0
+        box pr=7.0
+          svg icon("check") memory w=13.0 h=13.0 style=icon_tint("success-tick") opacity=flash
 
 component MessageCard(message:ChatMessage, selected:bool, disabled:bool, flash:f64)
   emits

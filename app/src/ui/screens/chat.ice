@@ -236,7 +236,7 @@ component ChatScreen(account_name:str, connected_rpc:str, status:str, block_heig
                     space w=fill h=fill
                   mouse press-at=emit(chat_pointer_pressed, _, _)
                     scroll dir=vertical w=fill h=fill anchor-y=end auto=true
-                      col w=fill gap=3.0
+                      col w=fill gap=3.0 pr=6.0
                         if history_has_older(messages)
                           box w=fill align-x=center pt=4.0 pb=8.0
                             button "Load older messages" disabled=(history_loading || mutation_phase != "idle") h=30.0 p=6.0 @secondary_action -> emit(load_more_history)
