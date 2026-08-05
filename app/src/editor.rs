@@ -120,6 +120,34 @@ pub fn composer_toggle_mark(mut document: Content, kind: String) -> Content {
     document
 }
 
+/// The composer's formatting shortcuts, classified where the modifiers are
+/// known: Cmd/Ctrl+B bold, Cmd/Ctrl+I italic, Cmd/Ctrl+Shift+C code block,
+/// Cmd/Ctrl+Shift+9 quote — Slack's own table. The editor deliberately lets
+/// command-letter chords bubble (`command_shortcut_bubbles` in the widget), so
+/// this runs from the app's ONE keyboard subscription with the editor's focus
+/// untouched — the toolbar buttons cannot say the same, a click on them
+/// defocuses the editor. An empty verdict is `composer_toggle_mark`'s no-op.
+pub fn composer_mark_shortcut(
+    _logical: iced::keyboard::Key,
+    physical: iced::keyboard::key::Physical,
+    modifiers: iced::keyboard::Modifiers,
+    chat_ready: bool,
+) -> String {
+    use iced::keyboard::key::{Code, Physical};
+    if !chat_ready || !modifiers.command() {
+        return String::new();
+    }
+    let shifted = modifiers.shift();
+    let mark = match physical {
+        Physical::Code(Code::KeyB) if !shifted => "bold",
+        Physical::Code(Code::KeyI) if !shifted => "italic",
+        Physical::Code(Code::KeyC) if shifted => "code",
+        Physical::Code(Code::Digit9) if shifted => "quote",
+        _ => return String::new(),
+    };
+    mark.to_owned()
+}
+
 pub fn rich_composer(
     document: &Content,
     hint: String,
@@ -492,6 +520,38 @@ mod tests {
         // An unknown kind changes nothing.
         let document = composer_toggle_mark(Content::with_text("keep"), "sparkle".into());
         assert_eq!(document.text().trim_end(), "keep");
+    }
+
+    #[test]
+    fn mark_shortcuts_follow_slacks_table_and_respect_the_gate() {
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::{Key, Modifiers};
+        let chord = |code, modifiers| {
+            composer_mark_shortcut(Key::Unidentified, Physical::Code(code), modifiers, true)
+        };
+        assert_eq!(chord(Code::KeyB, Modifiers::COMMAND), "bold");
+        assert_eq!(chord(Code::KeyI, Modifiers::COMMAND), "italic");
+        assert_eq!(
+            chord(Code::KeyC, Modifiers::COMMAND | Modifiers::SHIFT),
+            "code"
+        );
+        assert_eq!(
+            chord(Code::Digit9, Modifiers::COMMAND | Modifiers::SHIFT),
+            "quote"
+        );
+        // Plain Cmd+C is copy, not code; plain typing marks nothing.
+        assert_eq!(chord(Code::KeyC, Modifiers::COMMAND), "");
+        assert_eq!(chord(Code::KeyB, Modifiers::default()), "");
+        // Off-chat (or palette-open) the gate swallows everything.
+        assert_eq!(
+            composer_mark_shortcut(
+                Key::Unidentified,
+                Physical::Code(Code::KeyB),
+                Modifiers::COMMAND,
+                false
+            ),
+            ""
+        );
     }
 
     #[test]

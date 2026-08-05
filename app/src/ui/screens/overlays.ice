@@ -52,24 +52,35 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
                       disabled value=muted
               col w=fill gap=6.0
                 Eyebrow label="POSTING" note=""
+                // Two-line cards: the single-line "Members only · added
+                // members post" was wider than its half of the 418px modal
+                // and punched through the button's right edge.
                 row w=fill gap=8.0 align=center
                   if !members_only
-                    box w=fill pl=12.0 pr=12.0 pt=10.0 pb=10.0 bg=muted_bg border=primary border-w=1.5 r=9.0
-                      text "Open · any member posts" size=12.0 wrap=none @text-accent_fg
+                    box w=fill pl=12.0 pr=12.0 pt=8.0 pb=8.0 bg=muted_bg border=primary border-w=1.5 r=9.0
+                      col w=fill gap=2.0
+                        text "Open" size=12.5 wrap=none font=medium @text-accent_fg
+                        text "any member posts" size=11.0 wrap=none @text-caption
                   if members_only
                     button label="Open posting" w=fill p=0.0 @ghost_action -> emit(toggle_channel_create_members_only)
-                      box w=fill pl=12.0 pr=12.0 pt=10.0 pb=10.0
-                        text "Open · any member posts" size=12.0 wrap=none @text-accent_fg
+                      box w=fill pl=12.0 pr=12.0 pt=8.0 pb=8.0
+                        col w=fill gap=2.0
+                          text "Open" size=12.5 wrap=none font=medium @text-accent_fg
+                          text "any member posts" size=11.0 wrap=none @text-caption
                       active bg=surface text=fg border=border border-w=1.5 r=9.0
                       hovered bg=muted_bg text=fg border=control_line
                       pressed bg=elevated text=fg
                   if members_only
-                    box w=fill pl=12.0 pr=12.0 pt=10.0 pb=10.0 bg=muted_bg border=primary border-w=1.5 r=9.0
-                      text "Members only · added members post" size=12.0 wrap=none @text-accent_fg
+                    box w=fill pl=12.0 pr=12.0 pt=8.0 pb=8.0 bg=muted_bg border=primary border-w=1.5 r=9.0
+                      col w=fill gap=2.0
+                        text "Members only" size=12.5 wrap=none font=medium @text-accent_fg
+                        text "added members post" size=11.0 wrap=none @text-caption
                   if !members_only
                     button label="Members-only posting" w=fill p=0.0 @ghost_action -> emit(toggle_channel_create_members_only)
-                      box w=fill pl=12.0 pr=12.0 pt=10.0 pb=10.0
-                        text "Members only · added members post" size=12.0 wrap=none @text-accent_fg
+                      box w=fill pl=12.0 pr=12.0 pt=8.0 pb=8.0
+                        col w=fill gap=2.0
+                          text "Members only" size=12.5 wrap=none font=medium @text-accent_fg
+                          text "added members post" size=11.0 wrap=none @text-caption
                       active bg=surface text=fg border=border border-w=1.5 r=9.0
                       hovered bg=muted_bg text=fg border=control_line
                       pressed bg=elevated text=fg

@@ -785,17 +785,20 @@ fn a_proposal_renders_its_payload_and_its_frozen_bar() {
 
 #[test]
 fn the_huddle_roster_marks_the_row_this_device_holds() {
+    // The wire truth: `HuddleEntry.user` is the kernel's BARE user id, never
+    // `user:{hex}` — the previous fixture invented prefixed entries and
+    // asserted a compare no real roster row could satisfy.
     let me = [0xaau8; 32];
-    let mine = format!("user:{}", hex_encode(&me));
+    let peer = [0xbbu8; 32];
     let roster = huddle_roster(
         &[
             chat::index::HuddleEntry {
-                user: mine,
+                user: hex_encode(&me),
                 node: String::new(),
                 joined_at: 10,
             },
             chat::index::HuddleEntry {
-                user: "agent:runs/triage".into(),
+                user: hex_encode(&peer),
                 node: String::new(),
                 joined_at: 20,
             },
@@ -804,7 +807,7 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
     );
     assert_eq!(roster.len(), 2);
     assert!(roster[0].is_you && !roster[0].is_agent);
-    assert!(!roster[1].is_you && roster[1].is_agent);
+    assert!(!roster[1].is_you && !roster[1].is_agent);
     assert!(huddle_self(roster.clone()));
     assert!(!huddle_self(vec![roster[1].clone()]));
 }

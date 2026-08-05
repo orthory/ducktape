@@ -403,6 +403,16 @@ pub fn keep_roster(joined: bool, next: Vec<HuddleParticipant>) -> Vec<HuddlePart
     if joined { next } else { Vec::new() }
 }
 
+/// [`keep_roster`]'s loaded-gated half: a resync that did NOT load chat must
+/// leave the roster alone rather than blank it.
+pub fn keep_participants(
+    loaded: bool,
+    next: Vec<HuddleParticipant>,
+    current: Vec<HuddleParticipant>,
+) -> Vec<HuddleParticipant> {
+    if loaded { next } else { current }
+}
+
 pub fn keep_pages(loaded: bool, next: Vec<PageItem>, current: Vec<PageItem>) -> Vec<PageItem> {
     if loaded { next } else { current }
 }

@@ -150,23 +150,32 @@ pub struct HuddleParticipant {
     pub joined_at: i64,
 }
 
-/// Render the on-chain huddle roster, marking the row this device holds — the
-/// same `user:{hex}` handle `signed_write` authors with.
+/// Render the on-chain huddle roster, marking the row this device holds.
+///
+/// `HuddleEntry.user` is the kernel's BARE user id (`op.origin.id`) — the
+/// same vocabulary `MemberRow` speaks — and NOT `MsgRow.author`'s
+/// `user:{hex}`. This function compared against the prefixed form for as
+/// long as it existed, so `is_you` never matched a real roster row and the
+/// LIVE pill/leave/timer surface was unreachable; the fixture that covered
+/// it had invented prefixed entries. Match the wire, prefix only to reuse
+/// the author renderer for the label.
 pub(crate) fn huddle_roster(
     members: &[chat::index::HuddleEntry],
     me: Option<&[u8]>,
 ) -> Vec<HuddleParticipant> {
-    let mine = me.map(|key| format!("user:{}", hex_encode(key)));
+    let mine = me.map(hex_encode);
     members
         .iter()
         .map(|member| {
-            let label = author_name(&member.user);
+            let label = author_name(&format!("user:{}", member.user));
             HuddleParticipant {
                 initials: initials_of(&label),
-                is_agent: !member.user.starts_with("user:"),
+                // The module refuses non-User authors ("only external users
+                // may join a huddle"), so every roster row is a person.
+                is_agent: false,
                 is_you: mine.as_deref() == Some(member.user.as_str()),
                 joined_at: number_i64(member.joined_at),
-                key: member_id(&member.user).to_string(),
+                key: member.user.clone(),
                 label,
             }
         })
