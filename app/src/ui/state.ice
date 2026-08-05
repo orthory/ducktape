@@ -335,6 +335,11 @@ state
   call_muted = false
   call_peers:[CallEvent] = []
   call_steered = false
+  call_camera = false
+  call_frame_generation:i64 = 0
+  // Whether any camera in the call is live — the tile strip's mount gate and
+  // the 15 Hz repaint tick's own gate.
+  call_video_live = false
   huddle_roster:[HuddleParticipant] = []
   // The event inspector every finality mark opens.
   // EXPLORER — one query across every module, filtered by result kind.

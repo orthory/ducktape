@@ -220,12 +220,13 @@ view
           box w=fill h=fill align-x=end align-y=end pr=16.0 pb=16.0
             col
               if huddle_joined && huddle_popped
-                HuddlePanel channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at) roster=huddle_roster status=call_status muted=call_muted peers=call_peers
+                HuddlePanel channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at) roster=huddle_roster status=call_status muted=call_muted peers=call_peers camera=call_camera video_live=call_video_live frame_generation=call_frame_generation
                   events
                     dock_huddle -> dock_huddle
                     huddle_go_channel -> huddle_go_channel
                     leave_huddle_here -> leave_huddle_here
                     toggle_call_mute -> toggle_call_mute
+                    toggle_call_camera -> toggle_call_camera
               // The pill says "you are still in a call elsewhere". It hides only
               // where the live pill in the channel header already says so — the
               // Chat tab, looking at the huddle's own channel. On every OTHER

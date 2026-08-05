@@ -136,12 +136,13 @@ component HuddleTile(person:HuddleParticipant, muted:bool)
 // any other channel carries THAT channel's roster, and this panel follows you
 // off the huddle's channel. Then a `pin`ned mount in view.ice's full-window
 // stack under `if huddle_joined && huddle_popped`.
-component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], status:str, muted:bool, peers:[CallEvent])
+component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], status:str, muted:bool, peers:[CallEvent], camera:bool, video_live:bool, frame_generation:i64)
   emits
     dock_huddle
     huddle_go_channel
     leave_huddle_here
     toggle_call_mute
+    toggle_call_camera
   box #root w=296.0 bg=toast_bg border=accent_fg border-w=1.0 r=15.0 clip=true shadow=shadow_modal shadow-y=30.0 shadow-blur=70.0
     col w=fill
       box w=fill pl=11.0 pr=11.0 pt=9.0 pb=9.0
@@ -183,6 +184,10 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
             // black hole this panel used to be.
             if !empty(status)
               text status size=10.5 wrap=none font=code_medium @text-caption
+          // The video strip: every live camera's latest frame (peers first,
+          // the local preview last), only while any camera is on.
+          if video_live
+            extern call_video_tiles(frame_generation)
           row w=fill gap=8.0 wrap wrap-gap=8.0
             for person in roster
               HuddleTile person=person muted=keep_bool(person.is_you, muted, call_peer_muted(peers, person.node))
@@ -201,6 +206,20 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
                 active bg=danger_solid text=primary_fg border=transparent border-w=1.0 r=9.0
                 hovered bg=danger_solid_hover text=primary_fg
                 pressed bg=danger_solid_hover text=primary_fg
+            if !camera
+              button label="Turn the camera on" w=32.0 h=32.0 @icon_action px-0px py-0px -> emit(toggle_call_camera)
+                box w=fill h=fill align-x=center align-y=center
+                  Icon name="camera" tone="caption" px=14.0
+                active bg=ink_hover text=chevron_idle border=transparent border-w=1.0 r=9.0
+                hovered bg=strong_ink text=toast_fg
+                pressed bg=strong_ink text=toast_fg
+            if camera
+              button label="Turn the camera off" w=32.0 h=32.0 @icon_action px-0px py-0px -> emit(toggle_call_camera)
+                box w=fill h=fill align-x=center align-y=center
+                  Icon name="camera" tone="ink" px=14.0
+                active bg=success_dot/25 text=toast_fg border=transparent border-w=1.0 r=9.0
+                hovered bg=strong_ink text=toast_fg
+                pressed bg=strong_ink text=toast_fg
             button label="Open the huddle channel" @icon_action px-11px py-0px -> emit(huddle_go_channel)
               box h=32.0 align-y=center
                 row gap=3.0 align=center

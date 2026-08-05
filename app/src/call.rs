@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chat::call_wire;
+use chat::call_wire::CapturedFrame;
 use chat::voice::FRAME_SAMPLES;
 use iced::futures::stream::BoxStream;
 use iced::futures::{SinkExt as _, StreamExt as _};
@@ -109,16 +110,25 @@ fn handles() -> &'static Mutex<Option<Handles>> {
 /// muted) and beacons the new state to peers; the return value is the state
 /// the view should show.
 pub fn call_set_muted(muted: bool) -> bool {
-    let guard = handles().lock().expect("call handles");
-    if let Some(handles) = guard.as_ref() {
+    if let Some(handles) = handles().lock().expect("call handles").as_ref() {
         handles.muted.store(muted, Ordering::Relaxed);
-        let _ = handles.control.send(ClientControl::Beacon {
-            muted,
-            camera_on: false,
-            sharing: false,
-        });
     }
+    beacon_state();
     muted
+}
+
+/// Beacon the CURRENT local state (mute + camera) to peers — the one place
+/// the beacon is assembled, called by both toggles and the session open.
+pub(crate) fn beacon_state() {
+    let guard = handles().lock().expect("call handles");
+    let Some(handles) = guard.as_ref() else {
+        return;
+    };
+    let _ = handles.control.send(ClientControl::Beacon {
+        muted: handles.muted.load(Ordering::Relaxed),
+        camera_on: crate::video::camera_enabled(),
+        sharing: false,
+    });
 }
 
 /// Steer the fan-out set to the huddle roster's peer NODE keys (self
@@ -187,17 +197,25 @@ async fn run_session(
 
     let audio = AudioThread::start(muted.clone(), mic_tx, playout.clone());
     let audio_note = audio.note.clone();
+
+    // The camera leg (crate::video): its thread mirrors the audio thread's
+    // ownership rules and dies with the same teardown chain.
+    let (video_tx, mut video_rx) = tokio::sync::mpsc::unbounded_channel::<CapturedFrame>();
+    let _video_keepalive = video_tx.clone();
+    let (camera_shutdown_tx, camera_shutdown_rx) = std::sync::mpsc::channel::<()>();
+    let camera_events = events.clone();
+    let camera_thread = std::thread::Builder::new()
+        .name("huddle-camera".into())
+        .spawn(move || crate::video::camera_thread(video_tx, camera_shutdown_rx, camera_events))
+        .ok();
+
     *handles().lock().expect("call handles") = Some(Handles {
         muted: muted.clone(),
         control: control_tx.clone(),
     });
 
     // The hub beacons our state at 1 Hz on our behalf; one push seeds it.
-    let _ = control_tx.send(ClientControl::Beacon {
-        muted: false,
-        camera_on: false,
-        sharing: false,
-    });
+    beacon_state();
     let mut live = CallEvent::of("live");
     live.message = audio_note.lock().expect("audio note").clone();
     let _ = events.send(live).await;
@@ -208,9 +226,11 @@ async fn run_session(
                 Some(Ok(WsMessage::Binary(bytes))) => {
                     if let Some(frame) = call_wire::decode_audio(&bytes) {
                         playout.lock().expect("playout ring").push_frame(&frame);
+                    } else if let Some(frame) = call_wire::decode_peer(&bytes) {
+                        // JPEG decode is ~1–3 ms — off the pump, and dropped
+                        // frames are free (the next one is a keyframe too).
+                        tokio::task::spawn_blocking(move || crate::video::store_peer_frame(frame));
                     }
-                    // Peer video frames land here too once the video lane has
-                    // a decoder; voice v1 lets them fall through.
                 }
                 Some(Ok(WsMessage::Text(text))) => {
                     match serde_json::from_str::<ServerControl>(&text) {
@@ -258,6 +278,16 @@ async fn run_session(
                 }
                 None => break,
             },
+            frame = video_rx.recv() => match frame {
+                Some(frame) => {
+                    let encoded = call_wire::encode_captured(&frame);
+                    if ws_out.send(WsMessage::Binary(encoded)).await.is_err() {
+                        let _ = events.send(CallEvent::of("closed")).await;
+                        break;
+                    }
+                }
+                None => break,
+            },
             control = control_rx.recv() => match control {
                 Some(control) => {
                     let Ok(text) = serde_json::to_string(&control) else { continue };
@@ -276,6 +306,11 @@ async fn run_session(
     }
 
     *handles().lock().expect("call handles") = None;
+    crate::video::reset();
+    drop(camera_shutdown_tx);
+    if let Some(thread) = camera_thread {
+        let _ = thread.join();
+    }
     drop(audio);
 }
 
@@ -594,6 +629,12 @@ pub fn apply_call_peer(peers: Vec<CallEvent>, event: CallEvent) -> Vec<CallEvent
         "closed" | "refused" | "error" => Vec::new(),
         _ => peers,
     }
+}
+
+/// Any live camera in the call — the local one or any peer beaconing
+/// `camera_on` — gates the tile strip and its repaint tick.
+pub fn call_video_live_after(peers: Vec<CallEvent>, camera: bool) -> bool {
+    camera || peers.iter().any(|peer| peer.camera_on)
 }
 
 /// Whether the roster row at `node` is currently muted, per the beacons.

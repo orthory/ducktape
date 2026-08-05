@@ -80,6 +80,8 @@ pub mod icons {
             "bell" => include_str!("../assets/icons/bell.svg"),
             "branch" => include_str!("../assets/icons/branch.svg"),
             "brightness" => include_str!("../assets/icons/brightness.svg"),
+            "camera" => include_str!("../assets/icons/camera.svg"),
+            "camera-off" => include_str!("../assets/icons/camera-off.svg"),
             "check" => include_str!("../assets/icons/check.svg"),
             "chevron-down" => include_str!("../assets/icons/chevron-down.svg"),
             "chevron-right" => include_str!("../assets/icons/chevron-right.svg"),

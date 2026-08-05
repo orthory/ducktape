@@ -25,11 +25,20 @@
 on call_event(event)
   call_status = call_status_after(call_status, event)
   call_muted = keep_bool(event.kind == "connecting", false, call_muted)
+  call_camera = keep_bool(event.kind == "connecting", false, call_camera)
   call_peers = apply_call_peer(call_peers, event)
+  call_video_live = call_video_live_after(call_peers, call_camera)
   call_steered = call_recipients(huddle_recipient_nodes(huddle_roster))
 
 on toggle_call_mute
   call_muted = call_set_muted(!call_muted)
+
+on toggle_call_camera
+  call_camera = call_set_camera(!call_camera)
+  call_video_live = call_video_live_after(call_peers, call_camera)
+
+on video_tick
+  call_frame_generation = latest_frame_generation()
 
 on pop_huddle
   huddle_popped = true
@@ -69,6 +78,8 @@ on leave_huddle_here
   mutation_phase = "huddle"
   call_status = ""
   call_muted = false
+  call_camera = false
+  call_video_live = false
   call_peers = []
   error = ""
   run leave_huddle(connected_rpc, password, huddle_channel) -> chat_acked _ | mutation_failed _
