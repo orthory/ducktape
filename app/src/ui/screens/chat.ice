@@ -32,7 +32,7 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
     leave_huddle_here()
     huddle_go_channel()
     join_huddle_submit()
-    chat_pointer_moved(f64, f64)
+    chat_pointer_pressed(f64, f64)
     load_more_history()
     message_entered(i64)
     message_exited(i64)
@@ -57,7 +57,7 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
     unarchive_channel_submit()
     add_channel_member_submit()
     remove_channel_member_submit(str)
-    thread_pointer_moved(f64, f64)
+    thread_pointer_pressed(f64, f64)
     close_thread()
     thread_message_entered(i64)
     thread_message_exited(i64)
@@ -246,7 +246,7 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
                 stack w=fill h=fill
                   sensor show=emit(chat_resized, _, _) resize=emit(chat_resized, _, _)
                     space w=fill h=fill
-                  mouse move=emit(chat_pointer_moved, _, _)
+                  mouse press-at=emit(chat_pointer_pressed, _, _)
                     scroll dir=vertical w=fill h=fill anchor-y=end auto=true
                       col w=fill gap=3.0
                         if history_has_older(messages)
@@ -511,7 +511,7 @@ component ChatScreen(account_name:str, account_id:str, connected_rpc:str, status
             stack w=fill h=fill
               sensor show=emit(thread_resized, _, _) resize=emit(thread_resized, _, _)
                 space w=fill h=fill
-              mouse move=emit(thread_pointer_moved, _, _)
+              mouse press-at=emit(thread_pointer_pressed, _, _)
                 col w=fill h=fill gap=8.0
                   row w=fill h=28.0 gap=6.0 align=center
                     if thread_target_seq <= 0

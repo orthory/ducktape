@@ -1002,7 +1002,9 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         )
     );
     assert!(chat.contains("dismiss=emit(clear_message_selection) backdrop=transparent"));
-    assert!(chat.contains("mouse move=emit(chat_pointer_moved, _, _)"));
+    assert!(chat.contains("mouse press-at=emit(chat_pointer_pressed, _, _)"));
+    // per-press, never per-move: a move= stream here rebuilds the view per pixel
+    assert!(!chat.contains("mouse move="));
     assert!(chat.contains("float x=0.0 y=message_menu_y"));
     // the pointer sensor is the MESSAGE-LIST stack's first child, so it
     // measures the message list itself and not whatever an overlay happens
@@ -1100,7 +1102,7 @@ fn thread_messages_mirror_the_main_action_system() {
         thread.contains("dismiss=emit(clear_thread_message_selection) backdrop=transparent")
     );
     assert!(thread.contains("float x=0.0 y=thread_menu_y"));
-    assert!(thread.contains("mouse move=emit(thread_pointer_moved, _, _)"));
+    assert!(thread.contains("mouse press-at=emit(thread_pointer_pressed, _, _)"));
     // same seat as the message list — the rail measures itself
     assert!(
         thread.contains("sensor show=emit(thread_resized, _, _)")
@@ -1406,7 +1408,8 @@ fn page_title_and_block_actions_use_native_focus_and_overlay_paths() {
     assert!(!components.contains("defer_focus"));
     assert!(!handlers.contains("focus_page_title"));
     assert!(!include_str!("ui/extern/backend.ice").contains("defer_focus"));
-    assert!(view.contains("mouse move=emit(pages_pointer_moved, _, _)"));
+    assert!(view.contains("mouse press-at=emit(pages_pointer_pressed, _, _)"));
+    assert!(!view.contains("mouse move="));
     assert!(view.contains("overlay when=(connected && !empty(active_page)"));
     assert!(view.contains("dismiss=emit(close_block_actions) backdrop=transparent"));
     assert!(view.contains("float x=(block_menu_x + 10.0)"));

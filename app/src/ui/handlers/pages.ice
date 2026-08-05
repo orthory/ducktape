@@ -155,7 +155,9 @@ on block_exited(id)
   return if hovered_block_id != id
   hovered_block_id = ""
 
-on pages_pointer_moved(x, y)
+// Captured per left press by `press-at` — see `chat_pointer_pressed` for why
+// this is not a `move=` stream.
+on pages_pointer_pressed(x, y)
   pages_pointer_x = x
   pages_pointer_y = y
 
