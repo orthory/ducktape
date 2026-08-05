@@ -240,6 +240,13 @@ on join_huddle_submit
 // the apply is a no-op on Submit, and the single guard below is the send/edit
 // fork. The Send button emits a synthetic Submit through the same route, so
 // there is exactly ONE send path.
+// A toolbar mark is an edit, not a send: wrap the selection (or park the
+// cursor inside a fresh marker pair) and hand the editor back. The same
+// disabled gate as the editor guards the buttons in the view.
+on composer_mark(kind)
+  return if loading || !connected || empty(active_channel)
+  message_editor = composer_toggle_mark(message_editor, kind)
+
 on chat_composer_event(event)
   message_editor = apply_composer_event(message_editor, event)
   return if !composer_submits(event)
@@ -679,15 +686,6 @@ on add_reaction_submit(emoji)
   mutation_phase = "reaction"
   error = ""
   run add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> chat_acked _ | mutation_failed _
-
-on remove_reaction_submit(emoji)
-  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || selected_message_seq <= 0
-  live_thread_generation = live_thread_generation + 1
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  mutation_phase = "reaction"
-  error = ""
-  run remove_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> chat_acked _ | mutation_failed _
 
 on add_reaction_at(seq, emoji)
   return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || seq <= 0

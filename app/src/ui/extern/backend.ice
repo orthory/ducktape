@@ -92,6 +92,7 @@ extern crate::backend
   ProvisionStep(index:i64, label:str, state:str, settled:bool)
   stream provision_progress(workspace:str, rpc:str) -> ProvisionStep
   sync connection_degraded(status:str) -> bool
+  sync titlebar_inset() -> f64
   sync palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
   sync escape_target(logical:key, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, block_actions_open:bool, block_insert_open:bool, forge_repo_menu:bool) -> str
   NavItem(id:str, title:str, icon:str, badge:i64, active:bool, live:bool)
@@ -311,6 +312,7 @@ extern crate::backend
   sync cancel_missing_block_autosave(rpc:str, generation:i64, blocks:[PageBlock], selected_id:str) -> i64
   sync scope_key(scope:str, id:str) -> str
   sync block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
+  sync reaction_palette() -> [str]
   load_chat(rpc:str, channel_id:str) -> ChatData ! AppError
   load_chat_hit(rpc:str, channel_id:str, root_seq:i64, target_seq:i64) -> ChatData ! AppError
   create_channel(rpc:str, password:str, name:str, members_only:bool) -> ChatData ! AppError

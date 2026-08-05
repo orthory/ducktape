@@ -124,6 +124,20 @@ pub async fn remove_channel_member(
     .await
 }
 
+/// The reaction picker's emoji, in grid order — a frequently-used seed the
+/// view lays out 8 per row. Adding here is the whole "add an emoji" change.
+pub fn reaction_palette() -> Vec<String> {
+    [
+        "👍", "❤️", "😄", "😂", "😮", "😢", "🎉", "👀", //
+        "🙌", "🔥", "✅", "❌", "💯", "🚀", "🤔", "😅", //
+        "🙏", "👏", "💪", "✨", "⚡", "🐛", "📌", "❓", //
+        "🦆", "🤝", "😴", "🧠", "➕", "🎯", "🚧", "🏁",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 /// One participant of a channel's live huddle — the roster is consensus state
 /// (`HuddleMember{user, node, joined_at}`), not a count.
 #[derive(Clone, Debug, Hash, PartialEq)]

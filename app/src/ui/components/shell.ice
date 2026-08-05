@@ -133,7 +133,10 @@ component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bo
   emits
     toggle_bell
   col #root w=fill
-    box w=fill h=39.0 px=13.0 bg=elevated
+    // The left padding steps over macOS's traffic lights: with a hidden-title
+    // transparent titlebar the three window buttons overlay the content view's
+    // top-left ~70px, and the chain chip sat under them. Zero elsewhere.
+    box w=fill h=39.0 pl=(13.0 + titlebar_inset()) pr=13.0 bg=elevated
       row w=fill h=fill gap=13.0 align=center
         match phase
           "console"
