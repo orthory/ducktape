@@ -687,9 +687,12 @@ on add_reaction_submit(emoji)
   error = ""
   run add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> chat_acked _ | mutation_failed _
 
+// One-tap reactions do NOT select the row: the tap is its own complete act,
+// and parking the selection tint on the message until the next Esc read as
+// a leftover highlight (QA). The picker path still selects, because its
+// overlay is anchored to the selection.
 on add_reaction_at(seq, emoji)
   return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || seq <= 0
-  selected_message_seq = seq
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -699,7 +702,6 @@ on add_reaction_at(seq, emoji)
 
 on remove_reaction_at(seq, emoji)
   return if loading || mutation_phase != "idle" || active_channel_archived || seq <= 0
-  selected_message_seq = seq
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
