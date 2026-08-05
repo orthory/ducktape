@@ -648,6 +648,59 @@ fn apply_reaction(mut messages: Vec<ChatMessage>, delta: &ChatDelta) -> Vec<Chat
     messages
 }
 
+/// The optimistic half of a reaction tap: the SAME reactor-set fold the live
+/// delta rides, applied locally before the op is submitted. `reactor` must be
+/// the canonical rendered handle (`user:{hex}`) — set semantics then make the
+/// real delta's replay a no-op instead of a double count.
+pub fn optimistic_reaction(
+    messages: Vec<ChatMessage>,
+    seq: i64,
+    emoji: String,
+    added: bool,
+    reactor: String,
+) -> Vec<ChatMessage> {
+    let delta = ChatDelta {
+        kind: "reaction".into(),
+        seq,
+        emoji,
+        added,
+        reactor,
+        by_me: true,
+        ..ChatDelta::default()
+    };
+    apply_reaction(messages, &delta)
+}
+
+/// True when this delta settles one of OUR optimistic rows — the pop edge of
+/// the timeline's transient ✓. Read BEFORE the delta is folded in: the match
+/// is the pending row the canonical row is about to replace.
+pub fn send_settled_by(
+    messages: Vec<ChatMessage>,
+    delta: ChatDelta,
+    active_channel: String,
+) -> bool {
+    delta.kind == "posted"
+        && delta.channel_id == active_channel
+        && messages
+            .iter()
+            .any(|message| message.pending && message.id == delta.message.id)
+}
+
+/// The id anchoring the transient ✓ — overwritten on each settle, kept
+/// through unrelated deltas so an in-flight fade is not torn down.
+pub fn settled_send_id(
+    messages: Vec<ChatMessage>,
+    delta: ChatDelta,
+    active_channel: String,
+    current: String,
+) -> String {
+    if send_settled_by(messages, delta.clone(), active_channel) {
+        delta.message.id
+    } else {
+        current
+    }
+}
+
 // ============================================================================
 // optimistic sends — client-minted rows and their settle/rollback merges
 // ============================================================================

@@ -91,6 +91,7 @@ pub mod icons {
             "copy" => include_str!("../assets/icons/copy.svg"),
             "copy-lg" => include_str!("../assets/icons/copy-lg.svg"),
             "doc" => include_str!("../assets/icons/doc.svg"),
+            "dot" => include_str!("../assets/icons/dot.svg"),
             "emoji" => include_str!("../assets/icons/emoji.svg"),
             "external" => include_str!("../assets/icons/external.svg"),
             "file" => include_str!("../assets/icons/file.svg"),

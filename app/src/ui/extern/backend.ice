@@ -67,6 +67,9 @@ extern crate::backend
   sync merge_message_send_result(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
   sync rollback_pending_message(messages:[ChatMessage], pending_id:str, committed:bool) -> [ChatMessage]
   sync contains_pending_message(messages:[ChatMessage], pending_id:str) -> bool
+  sync reaction_applied(messages:[ChatMessage], seq:i64, emoji:str, added:bool) -> [ChatMessage]
+  sync send_settled_by(messages:[ChatMessage], delta:ChatDelta, active_channel:str) -> bool
+  sync settled_send_id(messages:[ChatMessage], delta:ChatDelta, active_channel:str, current:str) -> str
   sync append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
   sync merge_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
   sync history_has_older(messages:[ChatMessage]) -> bool

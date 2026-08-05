@@ -44,8 +44,7 @@ component NodeBuildRow(version:str, last:bool)
 
 // One card per tier, each with the capability checklist for that tier. The
 // artifact paints the admin and guest cards with a vertical gradient; iced has
-// no gradient primitive, so each takes the gradient's TOP stop as a flat plate
-// — the same substitution UnfinalizedFrame makes for the dashed border.
+// no gradient primitive, so each takes the gradient's TOP stop as a flat plate.
 //
 // `admin` is on the contract's signature and stays there, but nothing here
 // branches on it: it is `is_this_node && role == "validator"`, which is the

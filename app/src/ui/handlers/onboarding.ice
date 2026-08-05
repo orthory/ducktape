@@ -181,7 +181,6 @@ on console_opened(id)
   member_key_draft = ""
   channel_draft = ""
   selected_message_seq = 0
-  hovered_message_seq = 0
   selected_message_rev = 0
   message_action = "toolbar"
   message_edit_draft = ""

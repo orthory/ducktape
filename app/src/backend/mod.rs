@@ -24,8 +24,8 @@ pub use ::chat::client::{
     append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
     apply_chat_thread, author_name, chat_message, contains_pending_message, mark_message_groups,
     merge_message_send_result, merge_pending_messages, merge_thread_reply, optimistic_message,
-    parse_message_with_members, plain_rich_spans, rollback_pending_message, short_label,
-    thread_offset_after_reply,
+    parse_message_with_members, plain_rich_spans, rollback_pending_message, send_settled_by,
+    settled_send_id, short_label, thread_offset_after_reply,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.

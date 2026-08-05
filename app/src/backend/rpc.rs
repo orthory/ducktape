@@ -112,6 +112,16 @@ pub(crate) async fn set_local_user_key(reading: Option<Vec<u8>>) {
     *LOCAL_USER_KEY.write().await = Some(reading);
 }
 
+/// The cached identity WITHOUT waiting — the update thread's synchronous
+/// folds cannot await. `None` covers the cold cache and a held write lock;
+/// by any reaction tap the cache is warm (every hydrate reads it first).
+pub(crate) fn cached_user_key() -> Option<Vec<u8>> {
+    LOCAL_USER_KEY
+        .try_read()
+        .ok()
+        .and_then(|reading| reading.clone().flatten())
+}
+
 async fn read_local_user_key() -> Option<Vec<u8>> {
     let key = user_key_path().ok()?;
     let mut command = tokio::process::Command::new(ducktape_binary());
