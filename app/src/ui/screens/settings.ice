@@ -9,10 +9,13 @@
 // fact families, and the prefix is what says which loader a reading came from.
 // `settings_height` (the facts reading) and `block_height` (the live head) are
 // two different numbers and would collide as one word.
-component SettingsScreen(account_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_height:i64, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_validators:i64, members_residents:i64, account_id:str, bind account_name_draft:str, account_renaming:bool, account_members:i64, account_nodes:i64, appearance:str, bind rpc:str, bind password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], block_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
+component SettingsScreen(account_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_height:i64, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_validators:i64, members_residents:i64, account_id:str, bind account_name_draft:str, account_renaming:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], block_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
   emits
     select_shell_tab(str)
     reconnect()
+    switch_network
+    settings_unlock_submit(str)
+    lock_session
     account_name_draft_changed(str)
     account_rename_submit()
     copy_to_clipboard(str, str)
@@ -23,6 +26,8 @@ component SettingsScreen(account_name:str, connected_rpc:str, settings_endpoint:
     node_log_filter_changed(str)
     set_appearance_light()
     set_appearance_dark()
+  state
+    key_pw = ""
   scroll dir=vertical w=fill h=fill
     col w=fill p=22.0 gap=18.0
       text "Settings" size=16.0 wrap=none font=display @text-primary
@@ -47,25 +52,18 @@ component SettingsScreen(account_name:str, connected_rpc:str, settings_endpoint:
                     active bg=transparent text=brand border=transparent border-w=1.0 r=6.0
                     hovered bg=elevated text=brand
                     pressed bg=subtle text=brand
-        col w=fill gap=9.0
-          GroupLabel label="CONNECTION"
-          box w=fill p=15.0 bg=surface border=card_line border-w=1.0 r=11.0
-            col w=fill gap=9.0
-              input "" #rpc label="RPC endpoint" <-> rpc hint="Node URL" disabled=(loading || (mutation_phase != "idle" && mutation_phase != "recovering")) submit=emit(reconnect) w=fill p=6.2 text-size=13.0 line-h=1.2 @control
-                active bg=muted_bg border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=9.0
-                hovered bg=elevated border=fg/21
-                disabled bg=muted_bg/54 value=muted
-              input "" #password label="Local key password" secure=true <-> password hint="Key password" disabled=(loading || mutation_phase != "idle") w=fill p=6.2 text-size=13.0 line-h=1.2 @control
-                active bg=muted_bg border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=9.0
-                hovered bg=elevated border=fg/21
-                disabled bg=muted_bg/54 value=muted
-              row w=fill gap=9.0 align=center
-                if connection_degraded(status)
-                  Badge.Destructive label=status
-                if !connection_degraded(status)
-                  Badge.Success label=status
-                space w=fill
-                button "Connect" disabled=(loading || (mutation_phase != "idle" && mutation_phase != "recovering")) h=32.0 p=7.0 @primary_action -> emit(reconnect)
+              // The connection's two acts. There is no endpoint field: the
+              // launch window's picker owns WHICH network; this card only
+              // retries the picked one or goes back to the list.
+              box w=fill px=15.0 py=13.0
+                row w=fill gap=9.0 align=center
+                  if connection_degraded(status)
+                    Badge.Destructive label=status
+                  if !connection_degraded(status)
+                    Badge.Success label=status
+                  space w=fill
+                  button "Reconnect" disabled=(loading || (mutation_phase != "idle" && mutation_phase != "recovering")) h=28.0 p=6.0 @secondary_action -> emit(reconnect)
+                  button "Switch network" disabled=(mutation_phase != "idle") h=28.0 p=6.0 @secondary_action -> emit(switch_network)
         col w=fill gap=9.0
           GroupLabel label="APPEARANCE"
           box w=fill p=15.0 bg=surface border=card_line border-w=1.0 r=11.0
@@ -133,7 +131,23 @@ component SettingsScreen(account_name:str, connected_rpc:str, settings_endpoint:
           GroupCard
             col w=fill
               KeyValueRow label="Key state" value=settings_key_state last=false
-              KeyValueRow label="Key path" value=settings_key_path last=true
+              KeyValueRow label="Key path" value=settings_key_path last=false
+              // The session's signing seat. Locked = no password held; the
+              // unlock VERIFIES against user.key (`user key unlock`) before
+              // anything is stored — the old CONNECTION field stored blind.
+              box w=fill px=15.0 py=13.0
+                col w=fill
+                  if empty(password)
+                    row w=fill gap=9.0 align=center
+                      input "" #key-password label="Key password" secure=true <-> key_pw hint="unlock signing…" disabled=(mutation_phase != "idle") submit=emit(settings_unlock_submit, key_pw) w=fill p=6.2 text-size=13.0 line-h=1.2 @control
+                        active bg=muted_bg border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=9.0
+                        hovered bg=elevated border=fg/21
+                        disabled bg=muted_bg/54 value=muted
+                      button "Unlock" disabled=(mutation_phase != "idle" || empty(key_pw)) h=28.0 p=6.0 @secondary_action -> emit(settings_unlock_submit, key_pw)
+                  if !empty(password)
+                    row w=fill gap=9.0 align=center
+                      text "Signing unlocked for this session." w=fill size=12.5 @text-meta
+                      button "Lock" h=28.0 p=6.0 @secondary_action -> emit(lock_session)
         // NO PREFERENCES GROUP. `Change receipts` was a placebo: every
         // finality mark in the app — FinalityChip, the chat tick, the
         // merge stamp — renders unconditionally, so the switch wrote a
@@ -159,9 +173,9 @@ component SettingsScreen(account_name:str, connected_rpc:str, settings_endpoint:
           box w=fill p=15.0 bg=danger_zone_bg border=danger_zone_line border-w=1.0 r=11.0
             row w=fill gap=13.0 align=center
               col w=fill gap=2.0
-                text "Leave this workspace" size=12.5 wrap=none font=medium @text-accent_fg
-                text "Removes the workspace from THIS DEVICE and returns to onboarding. Nothing on the network changes and no key is destroyed." size=10.5 @text-meta
-              button "Leave workspace" disabled=(!connected || mutation_phase != "idle") h=32.0 p=8.0 @icon_action -> emit(forget_workspace_submit)
+                text "Forget this network" size=12.5 wrap=none font=medium @text-accent_fg
+                text "Drops this network from THIS DEVICE's list and returns to the network picker. A running node stays running, nothing on the network changes, and no key is destroyed." size=10.5 @text-meta
+              button "Forget network" disabled=(!connected || mutation_phase != "idle") h=32.0 p=8.0 @icon_action -> emit(forget_workspace_submit)
                 active bg=danger_solid text=brand_fg border=danger_solid border-w=1.0 r=8.0
                 hovered bg=danger_solid_hover text=brand_fg border=danger_solid_hover
                 pressed bg=danger_solid_hover text=brand_fg

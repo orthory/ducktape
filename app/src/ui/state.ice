@@ -281,6 +281,7 @@ state
   hub_key_state = ""
   hub_networks:[HubNetwork] = []
   hub_selected = ""
+  hub_hidden:i64 = 0
   hub_probe_generation:i64 = 0
   // The 24 recovery words, held ONLY between key creation and the "I saved
   // them" confirm — never persisted, cleared on leaving the reveal step.

@@ -32,12 +32,15 @@ pub struct HubProbe {
 }
 
 /// Everything the launch window needs in one boot read: the local user key's
-/// state (the login step's discriminant) and the known-network list.
+/// state (the login step's discriminant), the known-network list, and how
+/// many forgotten workspaces are still on disk — `hidden` is what keeps
+/// forget from being a one-way door nobody can see.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct HubState {
     pub key_state: String,
     pub networks: Vec<HubNetwork>,
     pub preselect: String,
+    pub hidden: i64,
 }
 
 /// What `user key init` hands back: the 24 recovery words (shown exactly
@@ -200,11 +203,27 @@ pub fn without_window(
 
 pub async fn hub_state() -> HubState {
     let networks = known_networks();
+    let forgotten = forgotten_workspaces();
+    let hidden = registered_workspaces()
+        .into_iter()
+        .filter(|(dir_name, _)| forgotten.contains(dir_name))
+        .count() as i64;
     HubState {
         key_state: user_key_state(),
         preselect: preselect_id(&networks),
         networks,
+        hidden,
     }
+}
+
+/// Empty the forgotten-workspaces tombstone list — every hidden local
+/// network reappears in the picker. The one door back: a forgotten dir
+/// cannot be re-joined (the workspace already exists on disk), so without
+/// this a forget was irreversible from the UI.
+pub async fn restore_hidden_networks() -> bool {
+    let mut prefs = read_prefs();
+    prefs["forgotten_workspaces"] = serde_json::json!([]);
+    write_prefs(&prefs)
 }
 
 /// Merge one probe answer into the list — by row id, generations already

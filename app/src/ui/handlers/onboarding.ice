@@ -36,6 +36,7 @@ on onboarding_opened(id)
 // rows. `hub_booted` OWNS the step; the refresh route below never moves it.
 on hub_booted(state)
   hub_key_state = state.key_state
+  hub_hidden = state.hidden
   hub_networks = state.networks
   hub_selected = state.preselect
   hub_step = hub_entry_step(state.key_state)
@@ -46,6 +47,7 @@ on hub_booted(state)
 // already is — the step stays put.
 on hub_refreshed(state)
   hub_key_state = state.key_state
+  hub_hidden = state.hidden
   hub_networks = state.networks
   hub_selected = refreshed_hub_selection(state.networks, hub_selected, state.preselect)
   hub_probe_generation = hub_probe_generation + 1
@@ -133,18 +135,134 @@ on open_network_submit
   onboarding_error = ""
   task window open console -> console_opened _
 
+// A remote endpoint this device holds no workspace for. On a successful
+// connect `remember_network` saves it, which is how a `saved_remotes` row is
+// born — the old Settings endpoint field was the only source before.
+on connect_remote_submit(endpoint)
+  return if mutation_phase != "idle" || empty(trim(endpoint))
+  rpc = canonical_endpoint(endpoint)
+  onboarding_error = ""
+  task window open console -> console_opened _
+
 // The console window exists: point it at the picked endpoint, remember the
 // pick, close the launch window (the OLDEST window — it opened first), and
 // run the same connect boot the single-window app ran on mount.
+//
+// EVERY per-network reading and draft resets to its default here — the pick
+// may name a DIFFERENT network than the last console, and a channel list,
+// half-typed draft, or open thread from the previous one leaking into this
+// console is a lie about where the user is. The generation bumps are the
+// other half: an in-flight load from the previous network must land dead.
+// (`reconnect` is the same-endpoint sibling that deliberately KEEPS drafts.)
 on console_opened(id)
   console_win = some(id)
   connected = false
   loading = true
   status = "Connecting…"
   error = ""
+  block_autosave_generation = cancel_autosaves(connected_rpc, block_autosave_generation)
   connected_rpc = rpc
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
+  mutation_phase = "idle"
+  channels = []
+  messages = []
+  channel_reads = []
+  unread_boundary = 0
+  unread_marker_seq = 0
+  active_channel = ""
+  active_channel_name = ""
+  active_channel_archived = false
+  active_channel_members_only = false
+  active_channel_huddle_count = 0
+  channel_members = []
+  channel_settings_open = false
+  channel_name_draft = ""
+  member_key_draft = ""
+  channel_draft = ""
+  selected_message_seq = 0
+  hovered_message_seq = 0
+  selected_message_rev = 0
+  message_action = "toolbar"
+  message_edit_draft = ""
+  message_draft = ""
+  message_editor = editor("")
+  failed_message_draft = ""
+  failed_reply_draft = ""
+  active_thread_seq = 0
+  thread_target_seq = 0
+  thread_messages = []
+  thread_next_reply_offset = 0
+  thread_has_more = false
+  thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
+  thread_loading = false
+  reply_draft = ""
+  reply_editor = editor("")
+  pending_reply = ""
+  pending_channel = ""
+  pending_message = ""
+  chat_search_draft = ""
+  chat_search_hits = []
+  chat_search_generation = chat_search_generation + 1
+  chat_searching = false
+  pages = []
+  doc_tabs = []
+  blocks = []
+  active_page = ""
+  active_page_title = ""
+  active_page_parent = ""
+  page_draft = ""
+  pending_page = ""
+  block_draft = ""
+  pending_block = ""
+  block_insert_after_id = ""
+  block_insert_open = false
+  selected_block_id = ""
+  hovered_block_id = ""
+  selected_block_kind = ""
+  selected_block_checked = false
+  block_actions_open = false
+  block_comments_generation = block_comments_generation + 1
+  block_comments_open = false
+  block_comments_target = ""
+  block_comment_threads = []
+  block_comment_thread_total = 0
+  block_comment_threads_next_from = 0
+  block_comment_threads_has_more = false
+  block_comment_threads_loading = false
+  active_block_comment_thread = ""
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = false
+  block_comment_draft = ""
+  pending_block_comment = ""
+  page_title_selected = false
+  block_editor = editor("")
+  selected_block_saved_text = ""
+  block_autosave_status = "idle"
+  orphaned_block_drafts = []
+  orphaned_comment_drafts = []
+  page_delete_armed = false
+  block_delete_armed = false
+  page_search_draft = ""
+  page_search_hits = []
+  page_search_generation = page_search_generation + 1
+  page_searching = false
+  // The huddle and its media session belong to the PREVIOUS network.
+  // `call_session` is subscribed `when huddle_joined`, so this clear IS the
+  // teardown — the stream drops and the old node's presence gate reaps the
+  // seat when the socket dies.
+  huddle_joined = false
+  huddle_channel = ""
+  huddle_channel_name = ""
+  huddle_joined_at = 0
+  huddle_popped = false
+  huddle_roster = []
+  call_status = ""
+  call_muted = false
+  call_peers = []
   parallel
     task window close
     run remember_network(connected_rpc) -> network_remembered _
@@ -159,6 +277,10 @@ on forget_network_submit(id, kind)
 
 on network_forgotten(_written)
   run hub_state() -> hub_refreshed _
+
+on restore_hidden_submit
+  return if mutation_phase != "idle"
+  run restore_hidden_networks() -> network_forgotten _
 
 // JOIN — unchanged plumbing, new seams: it starts from the network list and
 // settles back into it through the provisioning/live screens.
@@ -234,11 +356,18 @@ on onboarding_failed(cause)
   mutation_phase = "idle"
   onboarding_error = cause.message
 
-// THE WAY BACK — `Leave workspace` (handlers/node.ice) reopens the launch
-// window; once it is registered, the console closes behind it.
+// THE WAY BACK — the titlebar chip, Settings' Switch network, and Danger
+// Zone's forget all land here: reopen the launch window; once it is
+// registered, the console closes behind it. The list is where it lands —
+// never the unlock ceremony again; the session's password (or the user's
+// deliberate read-only skip) survives a network switch.
+on switch_network
+  return if mutation_phase != "idle"
+  task window open onboarding -> onboarding_reopened _
+
 on onboarding_reopened(id)
   onboarding_win = some(id)
-  hub_step = "loading"
+  hub_step = "networks"
   parallel
     task window close
-    run hub_state() -> hub_booted _
+    run hub_state() -> hub_refreshed _

@@ -36,51 +36,6 @@ preset ui_component_error
   state
     error = "Connection failed"
 
-test connection_panel_contract
-  preset ui_settings
-  viewport 1120 720
-  mount
-    WorkspaceTabs network="testnet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
-      events
-        select_shell_tab -> select_shell_tab _
-        toggle_bell -> toggle_bell
-      huddle:
-        space w=1.0 h=1.0
-      notice:
-        space w=1.0 h=1.0
-      chat:
-        space w=1.0 h=1.0
-      pages:
-        space w=1.0 h=1.0
-      files:
-        space w=1.0 h=1.0
-      members:
-        space w=1.0 h=1.0
-      agents:
-        space w=1.0 h=1.0
-      forge:
-        space w=1.0 h=1.0
-      governance:
-        space w=1.0 h=1.0
-      settings:
-        input "" #rpc label="RPC endpoint" <-> rpc hint="Node URL" w=fill @control
-      explorer:
-        space w=1.0 h=1.0
-      palette:
-        space w=1.0 h=1.0
-      bell:
-        space w=1.0 h=1.0
-  target endpoint = #workspace-tabs/content/rpc
-  expect exists endpoint
-  expect endpoint.width > 160.0
-  click endpoint
-  type "http://127.0.0.1:8080"
-  expect endpoint.value == "http://127.0.0.1:8080"
-  expect rpc == "http://127.0.0.1:8080"
-  key backspace
-  expect endpoint.value == "http://127.0.0.1:808"
-  expect rpc == "http://127.0.0.1:808"
-
 test palette_escape_contract
   preset ui_palette_open
   viewport 1120 720
@@ -89,6 +44,7 @@ test palette_escape_contract
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
+        switch_network -> switch_network
 
 
 
@@ -184,6 +140,7 @@ test minimum_window_layout_contract
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
+        switch_network -> switch_network
 
 
 
@@ -243,7 +200,7 @@ test launch_unlock_contract
   preset ui_launch
   viewport 480 680
   mount
-    HubColumn step="unlock" key_state="encrypted" networks=hub_networks selected="" name="" invite="" reveal="" steps=provision_steps step_index=0 height=-1 tier="" error="" busy=false #hub
+    HubColumn step="unlock" key_state="encrypted" networks=hub_networks selected="" hidden=0 name="" invite="" reveal="" steps=provision_steps step_index=0 height=-1 tier="" error="" busy=false #hub
       events
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
@@ -255,6 +212,8 @@ test launch_unlock_contract
         pick_network -> pick_network _
         open_network_submit -> open_network_submit
         forget_network_submit -> forget_network_submit _ _
+        connect_remote_submit -> connect_remote_submit _
+        restore_hidden_submit -> restore_hidden_submit
         go_join -> go_join
         go_networks -> go_networks
         join_network_submit -> join_network_submit _
@@ -271,7 +230,7 @@ test launch_networks_empty_contract
   preset ui_launch
   viewport 480 680
   mount
-    HubColumn step="networks" key_state="encrypted" networks=hub_networks selected="" name="" invite="" reveal="" steps=provision_steps step_index=0 height=-1 tier="" error="" busy=false #hub
+    HubColumn step="networks" key_state="encrypted" networks=hub_networks selected="" hidden=0 name="" invite="" reveal="" steps=provision_steps step_index=0 height=-1 tier="" error="" busy=false #hub
       events
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
@@ -283,6 +242,8 @@ test launch_networks_empty_contract
         pick_network -> pick_network _
         open_network_submit -> open_network_submit
         forget_network_submit -> forget_network_submit _ _
+        connect_remote_submit -> connect_remote_submit _
+        restore_hidden_submit -> restore_hidden_submit
         go_join -> go_join
         go_networks -> go_networks
         join_network_submit -> join_network_submit _

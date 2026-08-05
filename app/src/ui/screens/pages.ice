@@ -186,7 +186,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
             sensor show=emit(pages_resized, _, _) resize=emit(pages_resized, _, _)
               space w=fill h=fill
             if !connected
-              EmptyState title="Connect to a node" description="Open Settings from the rail below and set the node endpoint."
+              EmptyState title="Not connected" description="Click the network name in the titlebar to pick or reconnect a network."
             if connected && !loading && empty(active_page)
               EmptyState title="No page selected" description="Create a page from the sidebar."
             if connected && !empty(active_page)

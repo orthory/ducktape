@@ -61,25 +61,18 @@ on set_appearance_dark
 on appearance_saved(_written)
   error = error
 
+// A SAME-ENDPOINT retry: the launch window's picker owns which network, so
+// reconnect no longer changes endpoints — the per-endpoint draft retention
+// that lived here collapsed to identity calls and is gone. Typed drafts
+// deliberately survive (the editor harvest + orphan lines); the network
+// lists are re-fetched.
 on reconnect
   return if loading || (mutation_phase != "idle" && mutation_phase != "recovering")
-  rpc = canonical_endpoint(rpc)
   block_autosave_generation = cancel_autosaves(connected_rpc, block_autosave_generation)
-  password = retain_for_endpoint(password, connected_rpc, rpc)
-  channel_draft = retain_for_endpoint(channel_draft, connected_rpc, rpc)
-  message_draft = retain_for_endpoint(trim(editor_text(message_editor)), connected_rpc, rpc)
+  message_draft = trim(editor_text(message_editor))
   message_editor = editor(message_draft)
-  failed_message_draft = retain_for_endpoint(failed_message_draft, connected_rpc, rpc)
-  failed_reply_draft = retain_for_endpoint(failed_reply_draft, connected_rpc, rpc)
-  chat_search_draft = retain_for_endpoint(chat_search_draft, connected_rpc, rpc)
-  page_draft = retain_for_endpoint(page_draft, connected_rpc, rpc)
-  block_draft = retain_for_endpoint(block_draft, connected_rpc, rpc)
-  page_search_draft = retain_for_endpoint(page_search_draft, connected_rpc, rpc)
   orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, trim(editor_text(block_editor)), selected_block_saved_text, block_autosave_status)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
-  orphaned_block_drafts = retain_drafts_for_endpoint(orphaned_block_drafts, connected_rpc, rpc)
-  orphaned_comment_drafts = retain_drafts_for_endpoint(orphaned_comment_drafts, connected_rpc, rpc)
-  connected_rpc = rpc
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = "idle"

@@ -22,11 +22,20 @@ component Brand()
     text "D" size=14.0 wrap=none font=code_semibold @text-toast_fg
 
 // The chain chip left of the network name — a 15px ink plate with the mark.
+// The chip is the way BACK: clicking the network's name returns to the
+// launch window's picker without forgetting anything — the non-destructive
+// sibling of Danger Zone's forget.
 component NetworkChip(name:str)
-  row #root gap=7.0 align=center
-    box w=15.0 h=15.0 align-x=center align-y=center bg=primary r=4.0
-      text "◆" size=7.5 wrap=none font=code_semibold @text-toast_fg
-    text name size=11.5 wrap=none font=display @text-accent_fg
+  emits
+    switch_network
+  button label="Switch network" #root p=4.0 @ghost_action -> emit(switch_network)
+    row gap=7.0 align=center
+      box w=15.0 h=15.0 align-x=center align-y=center bg=primary r=4.0
+        text "◆" size=7.5 wrap=none font=code_semibold @text-toast_fg
+      text name size=11.5 wrap=none font=display @text-accent_fg
+    active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
+    hovered bg=rail_hover text=fg
+    pressed bg=subtle text=fg
 
 // The one dot that carries connection state, at both the pill's 6px and the
 // status card's 7px. A stopped node wears `alert_dot`, never the traffic-light
@@ -132,6 +141,7 @@ component BellBadge(count:i64, sev:str, plate:f64)
 component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
   emits
     toggle_bell
+    switch_network
   col #root w=fill
     // The left padding steps over macOS's traffic lights: with a hidden-title
     // transparent titlebar the three window buttons overlay the content view's
@@ -139,6 +149,8 @@ component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_ba
     box w=fill h=39.0 pl=(13.0 + titlebar_inset()) pr=13.0 bg=elevated
       row w=fill h=fill gap=13.0 align=center
         NetworkChip name=network
+          forward
+            switch_network
         space w=fill
         row gap=6.0 align=center
           tooltip position=bottom gap=6.0 p=0.0 delay=90 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0
@@ -293,12 +305,14 @@ component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degra
   emits
     select_shell_tab(str)
     toggle_bell
+    switch_network
   box w=fill h=fill clip=true bg=bg px-snap=true
     stack w=fill h=fill
       col w=fill h=fill
         TitleBar network=network height=height loading=loading degraded=degraded bell_badge=bell_count bell_sev=bell_sev tier=tier root_hash=root_hash consensus_view=consensus_view quorum=quorum reachable=reachable last_finalized=last_finalized checkpoint=checkpoint #titlebar
           forward
             toggle_bell
+            switch_network
         if degraded
           ConnectionBanner status=status
         row w=fill h=fill
