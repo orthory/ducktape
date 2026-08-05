@@ -1,6 +1,6 @@
 # Onboarding Window: login → network picker → console
 
-Status: DRAFT — backend facts pending recon confirmation.
+Status: IMPLEMENTED — this document matches the shipped shape.
 
 ## Goal
 
