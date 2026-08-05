@@ -1,4 +1,4 @@
-app Ducktape
+daemon Ducktape
   title "Ducktape"
   theme app_theme
   palette app_palette
@@ -9,7 +9,16 @@ app Ducktape
   font "../../../crates/design/assets/fonts/GeistMono[wght].ttf"
   text-size 13.5
   antialiasing true
-  window
+  // The launch window: Discord/Steam-shaped — a small fixed column that
+  // signs the user in and picks a network. It opens on mount and closes when
+  // the console takes over.
+  window onboarding
+    size 480 680
+    position centered
+    resizable false
+  // The console. Same window the single-window app declared, now a named
+  // template `open_network_submit` instantiates.
+  window console
     size 1280 800
     min-size 820 540
     position centered

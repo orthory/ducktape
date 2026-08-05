@@ -139,25 +139,40 @@ pub fn shell_nav(tab: String, approvals: i64, agent_live: bool) -> Vec<NavItem> 
     .collect()
 }
 
-/// The active workspace's name, read once from the CLI's registry. The app and
+/// The demo registry, when this machine has one (`ops/demo-seed.sh` is its
+/// only writer). Read per call, not cached: the launch window switches
+/// networks in-process, so no registry reading may outlive a boot.
+fn demo_registry() -> Option<serde_json::Value> {
+    let path = ducktape_home()?.join("registry.json");
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+fn registry_active_entry() -> Option<serde_json::Value> {
+    let registry = demo_registry()?;
+    let active = registry.get("active")?.as_str()?;
+    registry
+        .get("workspaces")?
+        .as_array()?
+        .iter()
+        .find(|workspace| workspace.get("id").and_then(|id| id.as_str()) == Some(active))
+        .cloned()
+}
+
+/// The registry's `active` workspace id — the launch list's preselection
+/// hint on a demo-seeded machine.
+pub(crate) fn registry_active_workspace() -> Option<String> {
+    demo_registry()?.get("active")?.as_str().map(str::to_string)
+}
+
+/// The active workspace's name, from the CLI's registry. The app and
 /// the CLI name the same workspace, so the titlebar says `demo`, not an IP.
-fn active_workspace_name() -> Option<&'static str> {
-    static NAME: OnceLock<Option<String>> = OnceLock::new();
-    NAME.get_or_init(|| {
-        let path = ducktape_home()?.join("registry.json");
-        let registry: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-        let active = registry.get("active")?.as_str()?;
-        registry
-            .get("workspaces")?
-            .as_array()?
-            .iter()
-            .find(|workspace| workspace.get("id").and_then(|id| id.as_str()) == Some(active))
-            .and_then(|workspace| workspace.get("name").or_else(|| workspace.get("id")))
-            .and_then(|name| name.as_str())
-            .map(str::to_string)
-    })
-    .as_deref()
+fn active_workspace_name() -> Option<String> {
+    let workspace = registry_active_entry()?;
+    workspace
+        .get("name")
+        .or_else(|| workspace.get("id"))
+        .and_then(|name| name.as_str())
+        .map(str::to_string)
 }
 
 /// The active workspace's http endpoint, from the same registry the titlebar
@@ -166,23 +181,10 @@ fn active_workspace_name() -> Option<&'static str> {
 /// hardcoded port while the seeded node listened wherever `node init` picked
 /// its ports — so every first boot opened on "Could not connect" over a
 /// perfectly healthy node the registry knew the address of.
-pub(crate) fn registered_endpoint() -> Option<&'static str> {
-    static ENDPOINT: OnceLock<Option<String>> = OnceLock::new();
-    ENDPOINT
-        .get_or_init(|| {
-            let path = ducktape_home()?.join("registry.json");
-            let registry: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-            let active = registry.get("active")?.as_str()?;
-            let workspace = registry
-                .get("workspaces")?
-                .as_array()?
-                .iter()
-                .find(|workspace| workspace.get("id").and_then(|id| id.as_str()) == Some(active))?;
-            let http = workspace.get("ports")?.get("http")?.as_u64()?;
-            Some(format!("http://127.0.0.1:{http}"))
-        })
-        .as_deref()
+pub(crate) fn registered_endpoint() -> Option<String> {
+    let workspace = registry_active_entry()?;
+    let http = workspace.get("ports")?.get("http")?.as_u64()?;
+    Some(format!("http://127.0.0.1:{http}"))
 }
 
 /// `$DUCKTAPE_HOME`, else `~/.ducktape` — the same resolution the user key uses.
@@ -202,7 +204,7 @@ fn workspaces_root() -> Option<PathBuf> {
 
 /// Every registered workspace as `(chain id, directory)`: a directory holding
 /// a `node.toml` is a workspace, whatever else it contains.
-fn registered_workspaces() -> Vec<(String, PathBuf)> {
+pub(crate) fn registered_workspaces() -> Vec<(String, PathBuf)> {
     let Some(root) = workspaces_root() else {
         return Vec::new();
     };
@@ -222,11 +224,11 @@ fn registered_workspaces() -> Vec<(String, PathBuf)> {
     workspaces
 }
 
-/// One value out of a workspace's `node.toml` (`key = "value"`). The file is
-/// written key-per-line by `write_node_toml`, so this reads it without a toml
-/// parser the app would otherwise not need.
-fn node_toml_value(dir: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("node.toml")).ok()?;
+/// One top-level value out of a workspace file (`key = "value"`). `node.toml`
+/// and `network.toml` are both written key-per-line by the CLI, so this reads
+/// them without a toml parser the app would otherwise not need.
+pub(crate) fn node_dir_value(dir: &Path, file: &str, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(file)).ok()?;
     text.lines()
         .filter_map(|line| line.split_once('='))
         .find(|(name, _)| name.trim() == key)
@@ -242,8 +244,8 @@ fn node_toml_value(dir: &Path, key: &str) -> Option<String> {
 }
 
 /// This workspace's app endpoint, from its `http_listen`.
-fn workspace_endpoint(dir: &Path) -> Option<String> {
-    node_toml_value(dir, "http_listen").map(|listen| format!("http://{listen}"))
+pub(crate) fn workspace_endpoint(dir: &Path) -> Option<String> {
+    node_dir_value(dir, "node.toml", "http_listen").map(|listen| format!("http://{listen}"))
 }
 
 /// The registered workspace this app is pointed at, matched on the endpoint it
@@ -257,7 +259,7 @@ pub(crate) fn workspace_at(rpc: &str) -> Option<(String, PathBuf)> {
 
 /// Workspaces this device has been told to forget — device-local, never wire
 /// state. The directories stay on disk; the console simply stops offering them.
-fn forgotten_workspaces() -> Vec<String> {
+pub(crate) fn forgotten_workspaces() -> Vec<String> {
     read_prefs()["forgotten_workspaces"]
         .as_array()
         .map(|ids| {
@@ -266,19 +268,6 @@ fn forgotten_workspaces() -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Which shell to mount: `console` once this device holds a workspace it has
-/// not forgotten, else `welcome`.
-pub fn onboarding_phase() -> String {
-    let forgotten = forgotten_workspaces();
-    let has_workspace = registered_workspaces()
-        .into_iter()
-        .any(|(chain_id, _)| !forgotten.contains(&chain_id));
-    match has_workspace {
-        true => "console".into(),
-        false => "welcome".into(),
-    }
 }
 
 /// What `node init` / `node join` hand back: the network's id, where it
@@ -525,7 +514,7 @@ pub fn provision_progress(
                     let listen = state
                         .dir
                         .as_deref()
-                        .and_then(|dir| node_toml_value(dir, "http_listen"))
+                        .and_then(|dir| node_dir_value(dir, "node.toml", "http_listen"))
                         .unwrap_or_else(|| state.rpc.clone());
                     state.step = 5;
                     Some((
@@ -590,11 +579,24 @@ pub async fn forget_workspace(rpc: String) -> Result<bool, AppError> {
     Ok(write_prefs(&prefs))
 }
 
-/// The titlebar's chain label: the workspace this app is pointed at, then the
-/// bound account, then the endpoint's host, then the product name.
+/// The titlebar's chain label: the workspace serving the CONNECTED endpoint
+/// (the launch window may have picked any known network, so the registry's
+/// `active` cannot answer), then the demo registry's name, then the bound
+/// account, then the endpoint's host, then the product name.
 pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
+    let connected = workspace_at(rpc.as_ref()).map(|(dir_name, dir)| {
+        let chain_id = node_dir_value(&dir, "network.toml", "chain_id").unwrap_or_default();
+        let named = chain_id.split('#').next().unwrap_or_default();
+        match named.is_empty() {
+            true => dir_name,
+            false => named.to_string(),
+        }
+    });
+    if let Some(workspace) = connected {
+        return workspace;
+    }
     if let Some(workspace) = active_workspace_name() {
-        return workspace.to_string();
+        return workspace;
     }
     let named = account_name.as_ref().trim();
     if !named.is_empty() {

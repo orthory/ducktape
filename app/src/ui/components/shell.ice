@@ -126,10 +126,10 @@ component BellBadge(count:i64, sev:str, plate:f64)
         box w=plate h=13.0 align-x=center align-y=center bg=info_dot border=surface border-w=1.5 r=7.0
           text count size=9.0 wrap=none font=code_semibold @text-brand_fg
 
-// 40px: a 39px bar over its 1px rule. During onboarding the bar keeps only the
-// window controls — the artifact drops the chip and the whole right cluster
-// until a workspace exists, and draws no title in their place.
-component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
+// 40px: a 39px bar over its 1px rule. This bar exists only in the console
+// window — the launch window wears the OS's own chrome — so the chip and the
+// right cluster are unconditional now.
+component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
   emits
     toggle_bell
   col #root w=fill
@@ -138,39 +138,31 @@ component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bo
     // top-left ~70px, and the chain chip sat under them. Zero elsewhere.
     box w=fill h=39.0 pl=(13.0 + titlebar_inset()) pr=13.0 bg=elevated
       row w=fill h=fill gap=13.0 align=center
-        match phase
-          "console"
-            NetworkChip name=network
-          _
-            space w=1.0 h=1.0
+        NetworkChip name=network
         space w=fill
-        match phase
-          "console"
-            row gap=6.0 align=center
-              tooltip position=bottom gap=6.0 p=0.0 delay=90 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0
-                StatusPill degraded=degraded loading=loading
-                StatusCard degraded=degraded loading=loading height=height tier=tier root_hash=root_hash consensus_view=consensus_view quorum=quorum reachable=reachable last_finalized=last_finalized checkpoint=checkpoint
-              stack w=26.0 h=24.0
-                button label="Alerts" p=5.0 @icon_action -> emit(toggle_bell)
-                  col align=center
-                    if bell_badge > 0
-                      Icon name="bell" tone="strong-ink" px=15.0
-                    if bell_badge <= 0
-                      Icon name="bell" tone="label" px=15.0
-                  active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
-                  hovered bg=surface text=fg border=transparent
-                  pressed bg=subtle
-                // The badge is right-anchored: `pin` takes x/y only, so each
-                // width branch names the x that keeps its right edge on the
-                // artifact's line.
-                if bell_badge > 0 && bell_badge < 10
-                  pin x=12.0 y=1.0
-                    BellBadge count=bell_badge sev=bell_sev plate=13.0
-                if bell_badge > 9
-                  pin x=7.0 y=1.0
-                    BellBadge count=bell_badge sev=bell_sev plate=18.0
-          _
-            space w=1.0 h=1.0
+        row gap=6.0 align=center
+          tooltip position=bottom gap=6.0 p=0.0 delay=90 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0
+            StatusPill degraded=degraded loading=loading
+            StatusCard degraded=degraded loading=loading height=height tier=tier root_hash=root_hash consensus_view=consensus_view quorum=quorum reachable=reachable last_finalized=last_finalized checkpoint=checkpoint
+          stack w=26.0 h=24.0
+            button label="Alerts" p=5.0 @icon_action -> emit(toggle_bell)
+              col align=center
+                if bell_badge > 0
+                  Icon name="bell" tone="strong-ink" px=15.0
+                if bell_badge <= 0
+                  Icon name="bell" tone="label" px=15.0
+              active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
+              hovered bg=surface text=fg border=transparent
+              pressed bg=subtle
+            // The badge is right-anchored: `pin` takes x/y only, so each
+            // width branch names the x that keeps its right edge on the
+            // artifact's line.
+            if bell_badge > 0 && bell_badge < 10
+              pin x=12.0 y=1.0
+                BellBadge count=bell_badge sev=bell_sev plate=13.0
+            if bell_badge > 9
+              pin x=7.0 y=1.0
+                BellBadge count=bell_badge sev=bell_sev plate=18.0
     box w=fill h=1.0 bg=border
       space w=1.0 h=1.0
 
@@ -297,14 +289,14 @@ component ScreenHeader(title:str, meta:str)
     box w=fill h=1.0 bg=separator
       space w=1.0 h=1.0
 
-component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, phase:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
+component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
   emits
     select_shell_tab(str)
     toggle_bell
   box w=fill h=fill clip=true bg=bg px-snap=true
     stack w=fill h=fill
       col w=fill h=fill
-        TitleBar phase=phase network=network height=height loading=loading degraded=degraded bell_badge=bell_count bell_sev=bell_sev tier=tier root_hash=root_hash consensus_view=consensus_view quorum=quorum reachable=reachable last_finalized=last_finalized checkpoint=checkpoint #titlebar
+        TitleBar network=network height=height loading=loading degraded=degraded bell_badge=bell_count bell_sev=bell_sev tier=tier root_hash=root_hash consensus_view=consensus_view quorum=quorum reachable=reachable last_finalized=last_finalized checkpoint=checkpoint #titlebar
           forward
             toggle_bell
         if degraded

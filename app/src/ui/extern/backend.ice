@@ -84,13 +84,30 @@ extern crate::backend
   sync restore_draft(current:str, pending:str, keep_pending:bool) -> str
   sync remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
-  sync onboarding_phase() -> str
   sync network_slug(name:str) -> str
   WorkspaceInit(chain_id:str, workspace:str, rpc:str)
   join_network(blob:str) -> WorkspaceInit ! AppError
   mint_invite(workspace:str, role:str, ttl_days:i64) -> str ! AppError
   ProvisionStep(index:i64, label:str, state:str, settled:bool)
   stream provision_progress(workspace:str, rpc:str) -> ProvisionStep
+  HubNetwork(id:str, chain_id:str, name:str, endpoint:str, kind:str, last_used:i64, probed:bool, live:bool, height:i64)
+  HubProbe(generation:i64, id:str, live:bool, height:i64)
+  HubState(key_state:str, networks:[HubNetwork], preselect:str)
+  KeyCreated(words:str, pubkey:str)
+  hub_state() -> HubState
+  stream probe_known_networks(generation:i64) -> HubProbe
+  sync apply_network_probe(networks:[HubNetwork], probe:HubProbe) -> [HubNetwork]
+  sync network_run_hint(row:HubNetwork) -> str
+  sync hub_entry_step(key_state:str) -> str
+  sync selected_network_endpoint(networks:[HubNetwork], id:str) -> str
+  sync refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
+  sync password_problem(password:str, confirm:str) -> str
+  sync without_window(current:window-id?, closed:window-id) -> window-id?
+  create_user_key(password:str) -> KeyCreated ! AppError
+  restore_user_key(words:str, password:str) -> str ! AppError
+  unlock_user_key(password:str) -> str ! AppError
+  remember_network(rpc:str) -> bool
+  forget_network(id:str, kind:str) -> bool
   sync connection_degraded(status:str) -> bool
   sync titlebar_inset() -> f64
   sync palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str

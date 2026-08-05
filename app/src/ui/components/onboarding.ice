@@ -1,189 +1,358 @@
-// THE PRE-CONSOLE PHASE FLOW. Four screens in front of the shell: welcome,
-// join, provisioning, live. `phase` is the single discriminant and "console"
-// is the only value that renders the console instead of this column.
+// THE LAUNCH WINDOW'S COLUMN. `hub_step` is the single discriminant:
+// (create | unlock) -> [reveal | restore] -> networks -> [join ->
+// provisioning -> live]. The console never renders here — it lives in its
+// own window, opened on a network pick.
 //
-// THERE IS NO CREATE ROUTE. Founding a network is an operator act on the node
-// (`ducktape node init`, which is where `--primary-coordinator` and the rest of
-// the network shape get decided). This app attaches to a node somebody already
-// runs; the only way in from here is an invite.
-//
-// MOUNT (view.ice owns the branch):
-//
-//   if phase != "console"
-//     OnboardingPhase phase=phase name=onboarding_name
-//       invite=invite_link steps=provision_steps step_index=provision_index
-//       height=block_height peers_live=… peers_total=… tier=member_tier(members_rows)
-//       error=onboarding_error busy=(mutation_phase != "idle")
-//       events
-//         go_welcome -> go_welcome
-//         go_join -> go_join
-//         copy_onboarding_invite -> copy_onboarding_invite
-//         enter_console -> enter_console
-//         join_network_submit -> join_network_submit _
+// THERE IS NO CREATE-NETWORK ROUTE. Founding a network is an operator act on
+// the node (`ducktape node init`). This app attaches to a node somebody
+// already runs; the only way in from here is an invite.
 //
 // Every route out of this column is a NAMED EVENT, and each event carries the
 // exact name and arity of the app handler it lands on — a component route may
 // only resolve local handlers and declared emissions, so an app handler is
 // never named inside this file.
-//
-// THREE THINGS THE ARTIFACT DRAWS THAT THIS APP REFUSES TO DRAW:
-//
-// 1. THE 80px QR BLOCK IS DROPPED. ui-lang has a native `qr` widget, but its
-//    payload is a STATIC literal (`qr_payload = string | bytes`) and a
-//    runtime-minted invite can never be one. The artifact's own block is 25
-//    hardcoded cells from `((i*7+3)%5 < 2)`, i.e. decoration, not a code.
-//    Shipping either would be a beautiful dead pixel.
-// 2. THE `↗` SHARE BUTTON IS DROPPED. The artifact binds it to the SAME
-//    `copyInvite` handler as `Copy link`; two controls, one behaviour. One
-//    button ships, and no OS share sheet is invented to justify the second.
-// 3. PROVISIONING DOES NOT AUTO-ADVANCE ON A TIMER. The artifact's
-//    `runProvision()` is a fake 850ms clock. This app is a strict CLIENT: it
-//    cannot start a node daemon, so steps 4-5 are a real `/v1/status` poll and
-//    a stalled node gets a visible `blocked` step carrying the command that
-//    fixes it, not a spinner that lies.
 
-// The centred column on the flat second surface. iced has no radial gradient,
-// so the artifact's `radial-gradient(#fdfdfb -> #f7f6f2)` lands as the flat
-// `bg_wash` step — the sanctioned substitution, same as every other plate.
-component OnboardingPhase(phase:str, name:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, peers_live:i64, peers_total:i64, tier:str, error:str, busy:bool)
+component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str, name:str, invite:str, reveal:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool)
   emits
-    go_welcome
+    unlock_submit(str)
+    login_skip
+    create_submit(str)
+    reveal_confirm
+    go_restore
+    go_login
+    restore_submit(str, str)
+    pick_network(str)
+    open_network_submit
+    forget_network_submit(str, str)
     go_join
+    go_networks
+    join_network_submit(str)
     copy_onboarding_invite
     enter_console
-    join_network_submit(str)
-  box #root w=fill h=fill p=30.0 align-x=center align-y=center bg=bg_wash
+  box #root w=fill h=fill p=26.0 align-x=center align-y=center bg=bg_wash
     col gap=0.0
-      match phase
-        "welcome"
-          WelcomeScreen
+      match step
+        "unlock"
+          UnlockScreen key_state=key_state busy=busy error=error #unlock
             forward
+              unlock_submit
+              login_skip
+              go_restore
+        "create"
+          CreateScreen busy=busy error=error
+            forward
+              create_submit
+              go_restore
+        "reveal"
+          RevealScreen words=reveal
+            forward
+              reveal_confirm
+        "restore"
+          RestoreScreen busy=busy error=error
+            forward
+              restore_submit
+              go_login
+        "networks"
+          NetworksScreen networks=networks selected=selected busy=busy error=error #networks
+            forward
+              pick_network
+              open_network_submit
+              forget_network_submit
               go_join
         "provisioning"
           ProvisioningScreen name=name steps=steps step_index=step_index error=error
-            forward
-              go_welcome
         "live"
-          LiveScreen name=name invite=invite height=height peers_live=peers_live peers_total=peers_total tier=tier busy=busy error=error
+          LiveScreen name=name invite=invite height=height peers_live=0 peers_total=0 tier=tier busy=busy error=error
             forward
-              go_welcome
+              go_networks
               copy_onboarding_invite
               enter_console
         "join"
           JoinScreen busy=busy error=error
             forward
-              go_welcome
+              go_networks
               join_network_submit
         _
-          col gap=0.0
-            space w=1.0 h=1.0
+          col gap=0.0 align=center
+            text "…" size=13.5 wrap=none @text-hint
 
-// The 430px column every screen sits in, with the `‹ STEP 1 / 3` control that
-// doubles as the step label. `step` empty hides it, `title` empty hides the
-// heading — Welcome and Live carry their own hero instead.
-component OnboardingShell(phase:str, title:str, step:str)
-  emits
-    go_welcome
-  col #root w=430.0 gap=0.0
-    if step != ""
-      OnboardingStepLabel phase=phase step=step
-        forward
-          go_welcome
-    if title != ""
-      box w=fill pt=16.0
-        text title w=fill size=20.0 wrap=none font=display @text-primary
-    slot
-
-// On Join the step label IS the way back. On Provisioning there is
-// no way back — the workspace already exists on disk — so it is plain text.
-component OnboardingStepLabel(phase:str, step:str)
-  emits
-    go_welcome
-  col #root
-    if phase == "provisioning"
-      row gap=8.0 align=center
-        text step size=11.0 wrap=none font=code_medium @text-meta
-    if phase != "provisioning"
-      button label="Back" @ghost_action px-0px py-0px rounded-6px -> emit(go_welcome)
-        row gap=8.0 align=center
-          text "‹" size=14.0 wrap=none @text-meta
-          text step size=11.0 wrap=none font=code_medium @text-meta
-
-// WELCOME. The brand plate, what this is, and the ONE way in. There is no
-// create route: this app is a client, and founding a network is an operator act
-// on the node. The footer says where the key lives — and it does NOT repeat the
-// artifact's `node boots locally`, because this app never boots one.
-component WelcomeScreen()
-  emits
-    go_join
-  col #root w=430.0 gap=0.0 align=center
+// The brand plate every sign-in screen opens with.
+component HubBrand(title:str, caption:str)
+  col #root w=fill gap=0.0 align=center
     box w=50.0 h=50.0 align-x=center align-y=center bg=primary r=13.0
       text "D" size=22.0 wrap=none font=display @text-toast_fg
     box pt=18.0
-      text "Welcome to Ducktape" size=22.0 wrap=none font=display @text-primary
-    box w=fill pt=6.0
+      text title size=22.0 wrap=none font=display @text-primary
+    if caption != ""
+      box w=fill pt=6.0
+        text caption w=fill size=13.5 line-h=1.55 align-x=center @text-caption
+
+// UNLOCK. Returning device: the password that opens this device's user.key
+// becomes the session's signing password. Reads never need it, so the quiet
+// way past a forgotten password stays one click.
+component UnlockScreen(key_state:str, busy:bool, error:str)
+  emits
+    unlock_submit(str)
+    login_skip
+    go_restore
+  state
+    pw = ""
+  col #root w=428.0 gap=0.0
+    HubBrand title="Welcome back" caption="Unlock this device's identity to sign what you do."
+    if key_state == "encrypted"
+      col w=fill gap=0.0
+        box w=fill pt=26.0
+          text "PASSWORD" size=10.0 wrap=none font=code_semibold @text-label
+        box w=fill pt=8.0
+          box w=fill px=14.0 py=12.0 bg=surface border=primary border-w=1.5 r=10.0
+            input "" #unlock-password label="Key password" <-> pw hint="••••••••" secure=true disabled=busy submit=emit(unlock_submit, pw) w=fill p=0.0 text-size=13.0 line-h=1.2 font=code @control
+              active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+              disabled value=hint
+        box w=fill pt=16.0
+          button label="Unlock" disabled=(busy || empty(pw)) w=fill @primary_action px-0px py-13px rounded-10px -> emit(unlock_submit, pw)
+            text "Unlock →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
+    if key_state != "encrypted"
+      box w=fill pt=22.0
+        GateNote reason="This device's user key is not usable for signing." next="`ducktape user key status` explains; restore from the recovery phrase or continue read-only."
+    box w=fill pt=18.0
+      col w=fill gap=8.0 align=center
+        button "Restore from recovery phrase" disabled=busy h=26.0 p=5.0 @ghost_action -> emit(go_restore)
+          active bg=transparent text=muted r=7.0
+          hovered bg=fg/9 text=fg
+          pressed bg=fg/14
+        button "Continue read-only" disabled=busy h=26.0 p=5.0 @ghost_action -> emit(login_skip)
+          active bg=transparent text=muted r=7.0
+          hovered bg=fg/9 text=fg
+          pressed bg=fg/14
+    OnboardingError message=error
+
+// CREATE. First run: mint this device's identity under a password. The
+// authoritative floor lives in Rust (`password_problem` mirrors the CLI's
+// 8-char minimum); the button stays dead until the pair is acceptable.
+component CreateScreen(busy:bool, error:str)
+  emits
+    create_submit(str)
+    go_restore
+  state
+    pw = ""
+    pw2 = ""
+  col #root w=428.0 gap=0.0
+    HubBrand title="Create your identity" caption="One key, generated on this device. A password seals it; 24 recovery words back it up."
+    box w=fill pt=26.0
+      text "PASSWORD" size=10.0 wrap=none font=code_semibold @text-label
+    box w=fill pt=8.0
+      box w=fill px=14.0 py=12.0 bg=surface border=primary border-w=1.5 r=10.0
+        input "" #create-password label="New password" <-> pw hint="at least 8 characters" secure=true disabled=busy w=fill p=0.0 text-size=13.0 line-h=1.2 font=code @control
+          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+          disabled value=hint
+    box w=fill pt=10.0
+      box w=fill px=14.0 py=12.0 bg=surface border=primary border-w=1.5 r=10.0
+        input "" #create-confirm label="Confirm password" <-> pw2 hint="again" secure=true disabled=busy submit=emit(create_submit, pw) w=fill p=0.0 text-size=13.0 line-h=1.2 font=code @control
+          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+          disabled value=hint
+    if !empty(pw2) && password_problem(pw, pw2) != ""
+      box w=fill pt=10.0
+        text password_problem(pw, pw2) w=fill size=12.0 line-h=1.4 @text-danger_fg
+    box w=fill pt=16.0
+      button label="Create identity" disabled=(busy || empty(pw) || password_problem(pw, pw2) != "") w=fill @primary_action px-0px py-13px rounded-10px -> emit(create_submit, pw)
+        text "Create →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
+    box w=fill pt=18.0
       col w=fill gap=0.0 align=center
-        text "People and agents work on one shared record." size=13.5 line-h=1.55 @text-caption
-        text "Chat, docs, code and approvals in one place." size=13.5 line-h=1.55 @text-caption
-    box w=fill pt=28.0
-      button label="Join with an invite" w=fill @primary_action px-17px py-15px rounded-11px -> emit(go_join)
-        RouteCardBody title="Join with an invite" note="Materializes this device's node from an invite blob." primary=true
-    box w=fill pt=24.0
+        button "Restore from recovery phrase" disabled=busy h=26.0 p=5.0 @ghost_action -> emit(go_restore)
+          active bg=transparent text=muted r=7.0
+          hovered bg=fg/9 text=fg
+          pressed bg=fg/14
+    box w=fill pt=20.0
       col w=fill gap=0.0 align=center
         text "this device's key is generated on-device" size=10.5 wrap=none font=code_medium @text-icon_idle
         text "nothing leaves this machine without your signature" size=10.5 wrap=none font=code_medium @text-icon_idle
-        text "founding a network is `ducktape node init` on the node" size=10.5 wrap=none font=code_medium @text-icon_idle
+    OnboardingError message=error
 
-// One route card's interior: the label, its trailing chevron, and the line
-// that says what the route actually does. `primary` is the ink-filled card.
-component RouteCardBody(title:str, note:str, primary:bool)
-  col #root w=fill gap=3.0
-    if primary
-      row w=fill gap=8.0 align=center
-        text title size=13.5 wrap=none font=display @text-primary_fg
-        space w=fill
-        text "→" size=13.5 wrap=none @text-caption
-    if !primary
-      row w=fill gap=8.0 align=center
-        text title size=13.5 wrap=none font=display @text-accent_fg
-        space w=fill
-        text "→" size=13.5 wrap=none @text-chevron_idle
-    if primary
-      text note w=fill size=12.0 line-h=1.4 @text-ink_soft
-    if !primary
-      text note w=fill size=12.0 line-h=1.4 @text-meta
+// REVEAL. The one time the 24 words exist on screen. No copy button on
+// purpose: a clipboard outlives this screen, paper does not leak.
+component RevealScreen(words:str)
+  emits
+    reveal_confirm
+  col #root w=428.0 gap=0.0
+    HubBrand title="Your recovery phrase" caption="Write these 24 words down, in order. They are the ONLY way back into this identity."
+    box w=fill pt=22.0
+      box w=fill p=14.0 bg=muted_bg border=border border-w=1.0 r=10.0
+        text words w=fill size=13.0 line-h=1.7 font=code @text-accent_fg
+    box w=fill pt=14.0
+      text "Anyone holding these words IS this identity. They are shown once and never stored." w=fill size=12.0 line-h=1.55 @text-caption
+    box w=fill pt=20.0
+      button label="I saved them" w=fill @primary_action px-0px py-13px rounded-10px -> emit(reveal_confirm)
+        text "I saved them — continue →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
+
+// RESTORE. 24 words in, a new password around them, the same pubkey out.
+component RestoreScreen(busy:bool, error:str)
+  emits
+    restore_submit(str, str)
+    go_login
+  state
+    words = ""
+    pw = ""
+  col #root w=428.0 gap=0.0
+    button label="Back" @ghost_action px-0px py-0px rounded-6px -> emit(go_login)
+      row gap=8.0 align=center
+        text "‹" size=14.0 wrap=none @text-meta
+        text "BACK" size=11.0 wrap=none font=code_medium @text-meta
+    box w=fill pt=16.0
+      text "Restore your identity" w=fill size=20.0 wrap=none font=display @text-primary
+    box w=fill pt=6.0
+      text "Paste the 24 recovery words, pick a new password for this device." w=fill size=13.0 line-h=1.5 @text-caption
+    box w=fill pt=20.0
+      text "RECOVERY PHRASE" size=10.0 wrap=none font=code_semibold @text-label
+    box w=fill pt=8.0
+      box w=fill px=14.0 py=12.0 bg=surface border=primary border-w=1.5 r=10.0
+        input "" label="Recovery phrase" <-> words hint="24 words, space-separated" disabled=busy w=fill p=0.0 text-size=12.0 line-h=1.2 font=code @control
+          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+          disabled value=hint
+    box w=fill pt=14.0
+      text "NEW PASSWORD" size=10.0 wrap=none font=code_semibold @text-label
+    box w=fill pt=8.0
+      box w=fill px=14.0 py=12.0 bg=surface border=primary border-w=1.5 r=10.0
+        input "" #restore-password label="New password" <-> pw hint="at least 8 characters" secure=true disabled=busy submit=emit(restore_submit, words, pw) w=fill p=0.0 text-size=13.0 line-h=1.2 font=code @control
+          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+          disabled value=hint
+    box w=fill pt=18.0
+      button label="Restore" disabled=(busy || empty(trim(words)) || empty(pw)) w=fill @primary_action px-0px py-13px rounded-10px -> emit(restore_submit, words, pw)
+        text "Restore →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
+    OnboardingError message=error
+
+// NETWORKS. The launch window's home: every network this device knows —
+// workspaces on disk and saved remote endpoints — most recently used first.
+// An empty list is the old welcome screen wearing its real name.
+component NetworksScreen(networks:[HubNetwork], selected:str, busy:bool, error:str)
+  emits
+    pick_network(str)
+    open_network_submit
+    forget_network_submit(str, str)
+    go_join
+  col #root w=428.0 gap=0.0
+    if empty(networks)
+      col w=fill gap=0.0 align=center
+        HubBrand title="Welcome to Ducktape" caption="People and agents work on one shared record. Chat, docs, code and approvals in one place."
+        box w=fill pt=28.0
+          button label="Join with an invite" #join-cta disabled=busy w=fill @primary_action px-17px py-15px rounded-11px -> emit(go_join)
+            col w=fill gap=3.0
+              row w=fill gap=8.0 align=center
+                text "Join with an invite" size=13.5 wrap=none font=display @text-primary_fg
+                space w=fill
+                text "→" size=13.5 wrap=none @text-caption
+              text "Materializes this device's node from an invite blob." w=fill size=12.0 line-h=1.4 @text-ink_soft
+        box w=fill pt=24.0
+          col w=fill gap=0.0 align=center
+            text "founding a network is `ducktape node init` on the node" size=10.5 wrap=none font=code_medium @text-icon_idle
+    if !empty(networks)
+      col w=fill gap=0.0
+        text "Choose a network" w=fill size=20.0 wrap=none font=display @text-primary
+        box w=fill pt=6.0
+          text "Local workspaces on this device and saved remote endpoints." w=fill size=13.0 line-h=1.5 @text-caption
+        box w=fill pt=16.0
+          scroll dir=vertical w=fill h=360.0
+            col w=fill gap=8.0
+              for row in networks
+                NetworkRow row=row selected=(row.id == selected) busy=busy
+                  forward
+                    pick_network
+                    forget_network_submit
+        box w=fill pt=18.0
+          button label="Open network" disabled=(busy || empty(selected)) w=fill @primary_action px-0px py-13px rounded-10px -> emit(open_network_submit)
+            text "Open →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
+        box w=fill pt=12.0
+          col w=fill gap=0.0 align=center
+            button "Join another network with an invite" disabled=busy h=26.0 p=5.0 @ghost_action -> emit(go_join)
+              active bg=transparent text=muted r=7.0
+              hovered bg=fg/9 text=fg
+              pressed bg=fg/14
+    OnboardingError message=error
+
+// One network row: the liveness dot, the name, where it lives, and — while
+// selected — the honest state line and the forget control.
+component NetworkRow(row:HubNetwork, selected:bool, busy:bool)
+  emits
+    pick_network(str)
+    forget_network_submit(str, str)
+  col #root w=fill gap=0.0
+    if selected
+      col w=fill gap=0.0
+        button label=row.name w=fill p=0.0 @icon_action -> emit(pick_network, row.id)
+          box w=fill px=13.0 pt=11.0 pb=11.0
+            col w=fill gap=4.0
+              row w=fill gap=9.0 align=center
+                NetworkDot probed=row.probed live=row.live
+                text row.name w=fill size=13.5 wrap=none font=display @text-primary
+                text row.kind size=9.5 wrap=none font=code_semibold @text-label
+              row w=fill gap=9.0 align=center
+                text row.endpoint w=fill size=11.0 wrap=none font=code_medium @text-meta
+                if row.height >= 0
+                  text height_label_short(row.height) size=11.0 wrap=none font=code_medium @text-meta
+              if row.probed && !row.live
+                text network_run_hint(row) w=fill size=11.0 wrap=none font=code_medium @text-hint
+          active bg=subtle text=fg border=primary border-w=1.5 r=11.0
+          hovered bg=subtle text=fg
+          pressed bg=rail_hover text=fg
+        box w=fill pt=4.0 align-x=end
+          button "Forget" disabled=busy h=22.0 p=4.0 @ghost_action -> emit(forget_network_submit, row.id, row.kind)
+            active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+            hovered bg=danger_bg text=fg
+            pressed bg=danger_bg text=fg
+    if !selected
+      button label=row.name w=fill p=0.0 @icon_action -> emit(pick_network, row.id)
+        box w=fill px=13.0 pt=11.0 pb=11.0
+          col w=fill gap=4.0
+            row w=fill gap=9.0 align=center
+              NetworkDot probed=row.probed live=row.live
+              text row.name w=fill size=13.5 wrap=none font=display @text-primary
+              text row.kind size=9.5 wrap=none font=code_semibold @text-label
+            row w=fill gap=9.0 align=center
+              text row.endpoint w=fill size=11.0 wrap=none font=code_medium @text-meta
+        active bg=surface text=muted border=border border-w=1.0 r=11.0
+        hovered bg=subtle text=fg
+        pressed bg=rail_hover text=fg
+
+// The row's liveness reading: measured-live, measured-dead, or not answered
+// yet — three states, never a guess.
+component NetworkDot(probed:bool, live:bool)
+  col #root
+    if probed && live
+      box w=8.0 h=8.0 bg=success_dot r=4.0
+        space w=1.0 h=1.0
+    if probed && !live
+      box w=8.0 h=8.0 bg=transparent border=pending_line border-w=2.0 r=4.0
+        space w=1.0 h=1.0
+    if !probed
+      box w=8.0 h=8.0 bg=subtle r=4.0
+        space w=1.0 h=1.0
 
 // PROVISIONING. Five segments of bar and the step the node is actually on.
 // The app does NOT supervise the daemon, so this screen never claims progress
 // it has not observed: it renders exactly what `provision_progress` emitted.
 component ProvisioningScreen(name:str, steps:[ProvisionStep], step_index:i64, error:str)
-  emits
-    go_welcome
-  col #root w=430.0 gap=0.0
-    OnboardingShell phase="provisioning" title="" step="STEP 2 / 3"
-      forward
-        go_welcome
-      col w=fill gap=0.0
-        box w=fill pt=13.0
-          row w=fill gap=6.0 align=center
-            text "Setting up" size=20.0 wrap=none font=display @text-primary
-            text name w=fill size=20.0 wrap=none font=display @text-primary
-        box w=fill pt=18.0
-          box w=fill h=5.0 bg=subtle r=3.0 clip=true
-            row w=fill h=fill gap=0.0
-              ProgressCell filled=(step_index >= 1)
-              ProgressCell filled=(step_index >= 2)
-              ProgressCell filled=(step_index >= 3)
-              ProgressCell filled=(step_index >= 4)
-              ProgressCell filled=(step_index >= 5)
-        box w=fill pt=22.0
-          col w=fill gap=14.0
-            for step in steps
-              ProvisionRow step=step spin=0.0
-        box w=fill pt=26.0
-          col w=fill gap=0.0 align=center
-            text "the console opens as soon as the node answers" size=11.0 wrap=none font=code_medium @text-label
-        OnboardingError message=error
+  col #root w=428.0 gap=0.0
+    row gap=8.0 align=center
+      text "STEP 2 / 3" size=11.0 wrap=none font=code_medium @text-meta
+    box w=fill pt=13.0
+      row w=fill gap=6.0 align=center
+        text "Setting up" size=20.0 wrap=none font=display @text-primary
+        text name w=fill size=20.0 wrap=none font=display @text-primary
+    box w=fill pt=18.0
+      box w=fill h=5.0 bg=subtle r=3.0 clip=true
+        row w=fill h=fill gap=0.0
+          ProgressCell filled=(step_index >= 1)
+          ProgressCell filled=(step_index >= 2)
+          ProgressCell filled=(step_index >= 3)
+          ProgressCell filled=(step_index >= 4)
+          ProgressCell filled=(step_index >= 5)
+    box w=fill pt=22.0
+      col w=fill gap=14.0
+        for step in steps
+          ProvisionRow step=step spin=0.0
+    box w=fill pt=26.0
+      col w=fill gap=0.0 align=center
+        text "the console opens as soon as the node answers" size=11.0 wrap=none font=code_medium @text-label
+    OnboardingError message=error
 
 // One fifth of the 5px bar. Five segments, not a percentage, because the
 // stream reports a step index and nothing finer.
@@ -254,37 +423,38 @@ component ProvisionLabel(label:str, dim:bool)
 // another device can use.
 component LiveScreen(name:str, invite:str, height:i64, peers_live:i64, peers_total:i64, tier:str, busy:bool, error:str)
   emits
-    go_welcome
+    go_networks
     copy_onboarding_invite
     enter_console
-  col #root w=430.0 gap=0.0
-    OnboardingShell phase="live" title="" step=""
-      forward
-        go_welcome
-      col w=fill gap=0.0
-        row w=fill gap=10.0 align=center
-          box w=24.0 h=24.0 align-x=center align-y=center bg=success_bg border=success_line border-w=1.0 r=12.0
-            text "✓" size=12.0 wrap=none font=code_medium @text-success
-          text "Your network is live" w=fill size=20.0 wrap=none font=display @text-primary
-        // the chain id, because "live" is meaningless without which chain
-        box w=fill pt=8.0
-          text name w=fill size=11.0 wrap=none font=code_medium @text-meta
-        box w=fill pt=12.0
-          LiveStatusStrip height=height peers_live=peers_live peers_total=peers_total tier=tier
-        box w=fill pt=20.0
-          text "INVITE A NODE" size=10.0 wrap=none font=code_semibold @text-label
-        box w=fill pt=9.0
-          col w=fill gap=9.0
-            box w=fill px=12.0 py=10.0 bg=muted_bg border=border border-w=1.0 r=9.0
-              InviteValue invite=invite
-            button label="Copy invite" disabled=(busy || empty(invite)) w=fill @primary_action px-0px py-9px rounded-9px -> emit(copy_onboarding_invite)
-              text "Copy link" w=fill size=12.0 wrap=none align-x=center font=display @text-primary_fg
-        box w=fill pt=14.0
-          text "Only a device holding this invite can join, and a member still has to approve it." w=fill size=12.0 line-h=1.55 @text-caption
-        box w=fill pt=24.0
-          button label="Open console" w=fill @primary_action px-0px py-13px rounded-10px -> emit(enter_console)
-            text "Open console →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
-        OnboardingError message=error
+  col #root w=428.0 gap=0.0
+    button label="Back" @ghost_action px-0px py-0px rounded-6px -> emit(go_networks)
+      row gap=8.0 align=center
+        text "‹" size=14.0 wrap=none @text-meta
+        text "NETWORKS" size=11.0 wrap=none font=code_medium @text-meta
+    box w=fill pt=16.0
+      row w=fill gap=10.0 align=center
+        box w=24.0 h=24.0 align-x=center align-y=center bg=success_bg border=success_line border-w=1.0 r=12.0
+          text "✓" size=12.0 wrap=none font=code_medium @text-success
+        text "Your network is live" w=fill size=20.0 wrap=none font=display @text-primary
+    // the chain id, because "live" is meaningless without which chain
+    box w=fill pt=8.0
+      text name w=fill size=11.0 wrap=none font=code_medium @text-meta
+    box w=fill pt=12.0
+      LiveStatusStrip height=height peers_live=peers_live peers_total=peers_total tier=tier
+    box w=fill pt=20.0
+      text "INVITE A NODE" size=10.0 wrap=none font=code_semibold @text-label
+    box w=fill pt=9.0
+      col w=fill gap=9.0
+        box w=fill px=12.0 py=10.0 bg=muted_bg border=border border-w=1.0 r=9.0
+          InviteValue invite=invite
+        button label="Copy invite" disabled=(busy || empty(invite)) w=fill @primary_action px-0px py-9px rounded-9px -> emit(copy_onboarding_invite)
+          text "Copy link" w=fill size=12.0 wrap=none align-x=center font=display @text-primary_fg
+    box w=fill pt=14.0
+      text "Only a device holding this invite can join, and a member still has to approve it." w=fill size=12.0 line-h=1.55 @text-caption
+    box w=fill pt=24.0
+      button label="Open console" w=fill @primary_action px-0px py-13px rounded-10px -> emit(enter_console)
+        text "Open console →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
+    OnboardingError message=error
 
 // The invite is one opaque `🦆<base64>` blob — there is no `ducktape://` URI
 // and no slug inside it. Until it is minted the box says so rather than
@@ -326,41 +496,42 @@ component LiveStatusStrip(height:i64, peers_live:i64, peers_total:i64, tier:str)
       if tier != ""
         text tier size=11.0 wrap=none font=code_medium @text-primary
 
-// JOIN. One field for the blob, and an honest account of what happens next —
-// which is NOT the artifact's `handshake ready · 2 bootstrap peers`. Nothing in
-// this app can decode an invite, so no reading is claimed; the card states the
-// node's own join ladder instead, including the wait the artifact never draws.
+// JOIN. One field for the blob, and an honest account of what happens next.
+// Nothing in this app can decode an invite, so no reading is claimed; the
+// card states the node's own join ladder instead, including the wait.
 component JoinScreen(busy:bool, error:str)
   emits
-    go_welcome
+    go_networks
     join_network_submit(str)
   state
     blob = ""
-  col #root w=430.0 gap=0.0
-    OnboardingShell phase="join" title="Join a network" step="BACK"
-      forward
-        go_welcome
-      col w=fill gap=0.0
-        box w=fill pt=5.0
-          text "Paste an invite to materialize this device's node, download the finalized history, verify it, and ask to join." w=fill size=13.0 line-h=1.5 @text-caption
-        box w=fill pt=20.0
-          text "INVITE BLOB" size=10.0 wrap=none font=code_semibold @text-label
-        box w=fill pt=8.0
-          box w=fill px=14.0 py=12.0 bg=surface border=primary border-w=1.5 r=10.0
-            input "" #join-invite label="Invite blob" <-> blob hint="🦆AAAA…" disabled=busy submit=emit(join_network_submit, blob) w=fill p=0.0 text-size=12.0 line-h=1.2 font=code @control
-              active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
-              disabled value=hint
-        box w=fill pt=18.0
-          box w=fill p=13.0 bg=muted_bg border=separator border-w=1.0 r=10.0
-            col w=fill gap=10.0
-              JoinPhaseRow phase_name="parked" note="waits until a member approves this device" tone="next"
-              JoinPhaseRow phase_name="admitted" note="the network accepts the node" tone="later"
-              JoinPhaseRow phase_name="synced" note="finalized history downloaded and verified" tone="later"
-              JoinPhaseRow phase_name="promoted" note="the console opens on live state" tone="later"
-        box w=fill pt=22.0
-          button label="Join network" disabled=(busy || empty(trim(blob))) w=fill @primary_action px-0px py-13px rounded-10px -> emit(join_network_submit, blob)
-            text "Join →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
-        OnboardingError message=error
+  col #root w=428.0 gap=0.0
+    button label="Back" @ghost_action px-0px py-0px rounded-6px -> emit(go_networks)
+      row gap=8.0 align=center
+        text "‹" size=14.0 wrap=none @text-meta
+        text "NETWORKS" size=11.0 wrap=none font=code_medium @text-meta
+    box w=fill pt=16.0
+      text "Join a network" w=fill size=20.0 wrap=none font=display @text-primary
+    box w=fill pt=5.0
+      text "Paste an invite to materialize this device's node, download the finalized history, verify it, and ask to join." w=fill size=13.0 line-h=1.5 @text-caption
+    box w=fill pt=20.0
+      text "INVITE BLOB" size=10.0 wrap=none font=code_semibold @text-label
+    box w=fill pt=8.0
+      box w=fill px=14.0 py=12.0 bg=surface border=primary border-w=1.5 r=10.0
+        input "" #join-invite label="Invite blob" <-> blob hint="🦆AAAA…" disabled=busy submit=emit(join_network_submit, blob) w=fill p=0.0 text-size=12.0 line-h=1.2 font=code @control
+          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+          disabled value=hint
+    box w=fill pt=18.0
+      box w=fill p=13.0 bg=muted_bg border=separator border-w=1.0 r=10.0
+        col w=fill gap=10.0
+          JoinPhaseRow phase_name="parked" note="waits until a member approves this device" tone="next"
+          JoinPhaseRow phase_name="admitted" note="the network accepts the node" tone="later"
+          JoinPhaseRow phase_name="synced" note="finalized history downloaded and verified" tone="later"
+          JoinPhaseRow phase_name="promoted" note="the console opens on live state" tone="later"
+    box w=fill pt=22.0
+      button label="Join network" disabled=(busy || empty(trim(blob))) w=fill @primary_action px-0px py-13px rounded-10px -> emit(join_network_submit, blob)
+        text "Join →" w=fill size=13.5 wrap=none align-x=center font=display @text-primary_fg
+    OnboardingError message=error
 
 // One rung of the join ladder, in the node's own vocabulary — these are the
 // four `JoinStateView.phase` values, which exist so the console can render
@@ -377,10 +548,10 @@ component JoinPhaseRow(phase_name:str, note:str, tone:str)
     text "·" size=11.0 wrap=none font=code_medium @text-hint
     text note w=fill size=11.0 font=code_medium @text-hint
 
-// A refusal on this column is never a dead end: the workspace is already on
-// disk, so the screen keeps its controls and says what went wrong.
+// A refusal on this column is never a dead end: the screen keeps its
+// controls and says what went wrong.
 component OnboardingError(message:str)
   col #root w=fill
     if !empty(message)
       box w=fill pt=14.0
-        GateNote reason=message next="Nothing was lost — the workspace stays on disk. Fix the cause and try again."
+        GateNote reason=message next="Nothing was lost. Fix the cause and try again."

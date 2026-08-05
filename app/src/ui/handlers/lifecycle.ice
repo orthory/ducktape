@@ -19,23 +19,12 @@ state
   node_quorum_label = "—"
   node_reachable_label = "—"
 
-// FIRST RUN ASKS DISK, NOT THE DEFAULT. `phase` used to initialize to
-// "console" and `mount` went straight to `connect`, so a device with no
-// workspace booted an empty shell over a connection error and the five
-// onboarding screens were reachable only by `Leave workspace`. The disk answer
-// is the discriminant: no registered, unforgotten workspace means "welcome".
+// EVERY BOOT OPENS THE LAUNCH WINDOW — sign in, pick a network, and only
+// then does a console window exist. `onboarding_opened` (handlers/
+// onboarding.ice) loads the hub state and appearance once the window is up;
+// `connect` runs only after a pick, from `console_opened`.
 on mount
-  // ponytail: no OS-appearance follow, and no dark PRE-console. Effects must
-  // be a handler's final statement (E141) and the grammar has no branches, so
-  // the appearance load rides the console path's one parallel group; the
-  // onboarding column boots light, and "ask the OS when nothing is pinned"
-  // waits for a runtime system-theme subscription.
-  phase = onboarding_phase()
-  return if phase != "console"
-  loading = true
-  parallel
-    run load_appearance() -> appearance_loaded _
-    run connect(rpc) -> workspace_connected _ | failed _
+  task window open onboarding -> onboarding_opened _
 
 // The persisted reading, applied on boot. The light block runs first and the
 // dark block reverses it — the handler grammar has no branches, so the
@@ -460,6 +449,9 @@ subscribe
   keyboard press when (connected || palette_open) -> global_key_pressed _
   keyboard modifiers -> modifiers_changed _
   window file-dropped -> fs_file_dropped _
+  // A daemon outlives its windows, so process exit is an explicit decision:
+  // when the LAST tracked window closes, leave.
+  window closed with-id -> window_was_closed _
   run node_logs(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "activity") -> node_log_line _
   every 1s when huddle_joined -> tick
   every 300ms when !empty(toast) -> toast_tick
@@ -470,6 +462,16 @@ subscribe
 
 on modifiers_changed(value)
   shift_held = value.shift
+
+// The daemon's exit rule: closing a window unregisters it, and the process
+// leaves with the last one. The handoff paths (`console_opened`,
+// `onboarding_reopened`) close their predecessor AFTER the successor is
+// registered, so this never fires with a survivor still tracked.
+on window_was_closed(id)
+  onboarding_win = without_window(onboarding_win, id)
+  console_win = without_window(console_win, id)
+  return if (onboarding_win != none) || (console_win != none)
+  exit
 
 on mutation_failed(cause)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, cause.committed)

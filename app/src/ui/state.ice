@@ -269,9 +269,22 @@ state
   page_search_hits:[PageSearchHit] = []
   page_searching = false
   page_search_generation:i64 = 0
-  // ONBOARDING — the phase gate in front of the console. "console" is the only
-  // phase that renders the shell; the rest are the pre-workspace column.
-  phase = "console"
+  // THE TWO WINDOWS — the daemon's whole routing state. The launch window
+  // opens on mount; the console opens on a network pick; whichever id a
+  // window carries decides what it renders, and when both are `none` the
+  // process exits.
+  onboarding_win:window-id? = none
+  console_win:window-id? = none
+  // THE LAUNCH FLOW — one discriminant: loading -> (create | unlock)
+  // -> [reveal | restore] -> networks -> [join -> provisioning -> live].
+  hub_step = "loading"
+  hub_key_state = ""
+  hub_networks:[HubNetwork] = []
+  hub_selected = ""
+  hub_probe_generation:i64 = 0
+  // The 24 recovery words, held ONLY between key creation and the "I saved
+  // them" confirm — never persisted, cleared on leaving the reveal step.
+  reveal_words = ""
   onboarding_name = ""
   onboarding_invite = ""
   onboarding_error = ""

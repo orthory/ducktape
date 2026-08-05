@@ -90,10 +90,26 @@ pub(crate) fn signing_input(password: &str, payload_hex: &str) -> Result<Vec<u8>
     Ok(input)
 }
 
+/// The cached identity: `None` = not read yet, `Some(reading)` = the disk's
+/// answer. A plain cache would freeze the launch state for process life —
+/// the launch window can MINT the key in-process now, so its creators refresh
+/// this through [`set_local_user_key`] instead of demanding a restart.
+static LOCAL_USER_KEY: tokio::sync::RwLock<Option<Option<Vec<u8>>>> =
+    tokio::sync::RwLock::const_new(None);
+
 pub(crate) async fn local_user_key() -> Option<Vec<u8>> {
-    // ponytail: cache the launch identity; restart the app after replacing user.key.
-    static KEY: tokio::sync::OnceCell<Option<Vec<u8>>> = tokio::sync::OnceCell::const_new();
-    KEY.get_or_init(read_local_user_key).await.clone()
+    if let Some(reading) = LOCAL_USER_KEY.read().await.clone() {
+        return reading;
+    }
+    let reading = read_local_user_key().await;
+    *LOCAL_USER_KEY.write().await = Some(reading.clone());
+    reading
+}
+
+/// Replace the cached identity — called by the key ceremonies (init/restore)
+/// with the pubkey the CLI just printed.
+pub(crate) async fn set_local_user_key(reading: Option<Vec<u8>>) {
+    *LOCAL_USER_KEY.write().await = Some(reading);
 }
 
 async fn read_local_user_key() -> Option<Vec<u8>> {
