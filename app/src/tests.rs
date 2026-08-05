@@ -64,8 +64,14 @@ fn full_view_fits_a_four_mib_stack() {
     std::thread::Builder::new()
         .stack_size(4 * 1024 * 1024)
         .spawn(|| {
-            let (app, _) = Ducktape::__boot();
-            let _ = app.__view();
+            let (mut app, _) = Ducktape::__boot();
+            let console = iced::window::Id::unique();
+            app.console_win = Some(console);
+            let _ = app.__view(console);
+            let onboarding = iced::window::Id::unique();
+            app.onboarding_win = Some(onboarding);
+            app.hub_step = "networks".into();
+            let _ = app.__view(onboarding);
         })
         .unwrap()
         .join()
@@ -1548,18 +1554,15 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     let shell = include_str!("ui/components/shell.ice");
     // the shell is titlebar + optional degradation banner over the panes.
     assert!(shell.contains(
-        "component TitleBar(phase:str, network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)"
+        "component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)"
     ));
-    // `phase` is the bar's ONE discriminant, matched twice — the network
-    // chip on the left and the whole status/bell cluster on the right both
-    // vanish before a workspace exists, and nothing is drawn in their
-    // place. A boolean gate here would let one half render without the
-    // other on a device that has no workspace on disk.
+    // The bar exists only in the console window now — the launch window
+    // wears OS chrome — so the chip and the status/bell cluster are
+    // unconditional: no `phase` discriminant may return here.
     let bar = shell.split_once("component TitleBar(").unwrap().1;
     let bar = bar.split_once("\ncomponent ").unwrap().0;
-    assert_eq!(bar.matches("match phase\n").count(), 2);
-    assert_eq!(bar.matches("\"console\"\n").count(), 2);
-    assert!(!bar.contains("if phase"));
+    assert!(bar.contains("NetworkChip name=network"));
+    assert!(!bar.contains("phase"));
     assert!(shell.contains("component ConnectionBanner(status:str)"));
     assert!(shell.contains("if degraded\n          ConnectionBanner status=status"));
     assert!(shell.contains("box #root w=74.0 h=fill pt=13.0 pb=10.0 bg=rail"));

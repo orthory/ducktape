@@ -1,25 +1,29 @@
 view
-  // THE PHASE GATE — the one branch in front of the console. `phase` is the
-  // single discriminant: "console" mounts the shell, every other value mounts
-  // the pre-workspace column, and a device with no workspace on disk starts
-  // there. Without this branch `Leave workspace` strands the user on a
-  // stripped titlebar over a dead console, and a fresh device boots a shell it
-  // cannot connect.
+  // THE WINDOW GATE — the daemon's one dispatch. The `window` binding names
+  // the window being rendered: the launch window mounts the hub column, the
+  // console window mounts the shell. A window neither id claims renders the
+  // hub's quiet loading arm — it exists only between open and register.
   col w=fill h=fill
-    // OMITTED, not faked: `peers_live`/`peers_total` have no state field — the
-    // gossip reading rides NodeFacts but nothing stores it — so the frozen
-    // props are fed 0 and LiveStatusStrip drops the segment rather than
-    // printing a count nobody measured.
-    if phase != "console"
-      OnboardingPhase phase=phase name=onboarding_name invite=invite_link steps=provision_steps step_index=provision_index height=block_height peers_live=0 peers_total=0 tier=member_tier(members_rows) error=onboarding_error busy=(mutation_phase != "idle")
+    if console_win != some(window)
+      HubColumn step=hub_step key_state=hub_key_state networks=hub_networks selected=hub_selected name=onboarding_name invite=invite_link reveal=reveal_words steps=provision_steps step_index=provision_index height=block_height tier=member_tier(members_rows) error=onboarding_error busy=(mutation_phase != "idle")
         events
-          go_welcome -> go_welcome
+          unlock_submit -> unlock_submit _
+          login_skip -> login_skip
+          create_submit -> create_submit _
+          reveal_confirm -> reveal_confirm
+          go_restore -> go_restore
+          go_login -> go_login
+          restore_submit -> restore_submit _ _
+          pick_network -> pick_network _
+          open_network_submit -> open_network_submit
+          forget_network_submit -> forget_network_submit _ _
           go_join -> go_join
+          go_networks -> go_networks
+          join_network_submit -> join_network_submit _
           copy_onboarding_invite -> copy_onboarding_invite
           enter_console -> enter_console
-          join_network_submit -> join_network_submit _
-    if phase == "console"
-      WorkspaceTabs network=network_label(account_name, connected_rpc) status=status height=block_height loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab bell_count=bell_unread bell_sev=bell_worst_severity(bell_items) approvals=open_proposals(gov_rows) account=account_name agent_live=any_agent_active(agents_rows) phase=phase tier=member_tier(members_rows) root_hash=node_root_hash consensus_view=node_view_label quorum=node_quorum_label reachable=node_reachable_label last_finalized=node_last_finalized checkpoint=node_checkpoint #workspace-tabs
+    if console_win == some(window)
+      WorkspaceTabs network=network_label(account_name, connected_rpc) status=status height=block_height loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab bell_count=bell_unread bell_sev=bell_worst_severity(bell_items) approvals=open_proposals(gov_rows) account=account_name agent_live=any_agent_active(agents_rows) tier=member_tier(members_rows) root_hash=node_root_hash consensus_view=node_view_label quorum=node_quorum_label reachable=node_reachable_label last_finalized=node_last_finalized checkpoint=node_checkpoint #workspace-tabs
         events
           select_shell_tab -> select_shell_tab _
           toggle_bell -> toggle_bell

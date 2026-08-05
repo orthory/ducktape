@@ -69,6 +69,8 @@ on forget_workspace_submit
 // `forget_workspace` answers false when the prefs file could not be written.
 // Throwing her out to onboarding on that answer meant the workspace was back in
 // the picker at the next launch, looking like the app had ignored her.
+// On success the launch window reopens; `onboarding_reopened`
+// (handlers/onboarding.ice) closes the console once it is registered.
 on workspace_forgotten(forgotten)
   mutation_phase = "idle"
   error = "This device could not forget the workspace."
@@ -76,7 +78,7 @@ on workspace_forgotten(forgotten)
   connected = false
   status = "Not connected"
   error = ""
-  phase = "welcome"
+  task window open onboarding -> onboarding_reopened _
 
 // The app's one clipboard action: every Copy button routes here so the toast
 // copy lives at the call site and the write itself stays native.

@@ -40,7 +40,7 @@ test connection_panel_contract
   preset ui_settings
   viewport 1120 720
   mount
-    WorkspaceTabs network="testnet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
+    WorkspaceTabs network="testnet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
@@ -85,7 +85,7 @@ test palette_escape_contract
   preset ui_palette_open
   viewport 1120 720
   mount
-    WorkspaceTabs network="testnet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
+    WorkspaceTabs network="testnet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
@@ -180,7 +180,7 @@ test minimum_window_layout_contract
   preset ui_offline
   viewport 1280 800
   mount
-    WorkspaceTabs network="testnet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false phase="console" tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
+    WorkspaceTabs network="testnet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
@@ -227,6 +227,71 @@ test minimum_window_layout_contract
   expect rail.width ~= 74.0
   expect content.x ~= rail.right + 1.0
   expect content.width > 730.0
+
+preset ui_launch
+  state
+    mutation_phase = "idle"
+    onboarding_error = ""
+    hub_step = "networks"
+    hub_networks = []
+    hub_selected = ""
+
+// The launch window's two load-bearing renders: the unlock ceremony's
+// password field is reachable, and an empty network list is the welcome
+// plate whose one CTA routes to the join flow.
+test launch_unlock_contract
+  preset ui_launch
+  viewport 480 680
+  mount
+    HubColumn step="unlock" key_state="encrypted" networks=hub_networks selected="" name="" invite="" reveal="" steps=provision_steps step_index=0 height=-1 tier="" error="" busy=false #hub
+      events
+        unlock_submit -> unlock_submit _
+        login_skip -> login_skip
+        create_submit -> create_submit _
+        reveal_confirm -> reveal_confirm
+        go_restore -> go_restore
+        go_login -> go_login
+        restore_submit -> restore_submit _ _
+        pick_network -> pick_network _
+        open_network_submit -> open_network_submit
+        forget_network_submit -> forget_network_submit _ _
+        go_join -> go_join
+        go_networks -> go_networks
+        join_network_submit -> join_network_submit _
+        copy_onboarding_invite -> copy_onboarding_invite
+        enter_console -> enter_console
+  target pw = #hub/root/unlock/root/unlock-password
+  expect exists pw
+  dispatch go_restore
+  expect hub_step == "restore"
+  dispatch go_login
+  expect hub_step == "unlock"
+
+test launch_networks_empty_contract
+  preset ui_launch
+  viewport 480 680
+  mount
+    HubColumn step="networks" key_state="encrypted" networks=hub_networks selected="" name="" invite="" reveal="" steps=provision_steps step_index=0 height=-1 tier="" error="" busy=false #hub
+      events
+        unlock_submit -> unlock_submit _
+        login_skip -> login_skip
+        create_submit -> create_submit _
+        reveal_confirm -> reveal_confirm
+        go_restore -> go_restore
+        go_login -> go_login
+        restore_submit -> restore_submit _ _
+        pick_network -> pick_network _
+        open_network_submit -> open_network_submit
+        forget_network_submit -> forget_network_submit _ _
+        go_join -> go_join
+        go_networks -> go_networks
+        join_network_submit -> join_network_submit _
+        copy_onboarding_invite -> copy_onboarding_invite
+        enter_console -> enter_console
+  target cta = #hub/root/networks/root/join-cta
+  expect exists cta
+  click cta
+  expect hub_step == "join"
 
 preset ui_palette_overlay
   state
