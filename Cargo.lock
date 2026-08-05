@@ -3015,7 +3015,7 @@ dependencies = [
 [[package]]
 name = "ducktape-ui"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=9c011f6#9c011f6356ff5a3b70c5fd81f141cb17ae4e1188"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=61194fd#61194fd32da6dff274dd6a6417899937cf17bca6"
 dependencies = [
  "iced",
  "ui-lang-runtime",
@@ -9148,7 +9148,7 @@ dependencies = [
 [[package]]
 name = "ui-lang"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=9c011f6#9c011f6356ff5a3b70c5fd81f141cb17ae4e1188"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=61194fd#61194fd32da6dff274dd6a6417899937cf17bca6"
 dependencies = [
  "ui-lang-build",
 ]
@@ -9156,7 +9156,7 @@ dependencies = [
 [[package]]
 name = "ui-lang-build"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=9c011f6#9c011f6356ff5a3b70c5fd81f141cb17ae4e1188"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=61194fd#61194fd32da6dff274dd6a6417899937cf17bca6"
 dependencies = [
  "atomicwrites",
  "fs2",
@@ -9169,7 +9169,7 @@ dependencies = [
 [[package]]
 name = "ui-lang-core"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=9c011f6#9c011f6356ff5a3b70c5fd81f141cb17ae4e1188"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=61194fd#61194fd32da6dff274dd6a6417899937cf17bca6"
 dependencies = [
  "qrcode 0.14.1",
  "serde",
@@ -9179,7 +9179,7 @@ dependencies = [
 [[package]]
 name = "ui-lang-runtime"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=9c011f6#9c011f6356ff5a3b70c5fd81f141cb17ae4e1188"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=61194fd#61194fd32da6dff274dd6a6417899937cf17bca6"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -9187,7 +9187,9 @@ dependencies = [
  "iced",
  "iced_test",
  "iced_tiny_skia",
+ "ouroboros",
  "png 0.18.1",
+ "rustc-hash 2.1.2",
  "serde_json",
  "unicode-segmentation",
 ]
