@@ -12,7 +12,7 @@
 // only resolve local handlers and declared emissions, so an app handler is
 // never named inside this file.
 
-component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str, name:str, invite:str, reveal:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool)
+component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, reveal:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool)
   emits
     unlock_submit(str)
     login_skip
@@ -24,6 +24,8 @@ component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str
     pick_network(str)
     open_network_submit
     forget_network_submit(str, str)
+    connect_remote_submit(str)
+    restore_hidden_submit
     go_join
     go_networks
     join_network_submit(str)
@@ -53,11 +55,13 @@ component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str
               restore_submit
               go_login
         "networks"
-          NetworksScreen networks=networks selected=selected busy=busy error=error #networks
+          NetworksScreen networks=networks selected=selected hidden=hidden busy=busy error=error #networks
             forward
               pick_network
               open_network_submit
               forget_network_submit
+              connect_remote_submit
+              restore_hidden_submit
               go_join
         "provisioning"
           ProvisioningScreen name=name steps=steps step_index=step_index error=error
@@ -223,12 +227,16 @@ component RestoreScreen(busy:bool, error:str)
 // NETWORKS. The launch window's home: every network this device knows —
 // workspaces on disk and saved remote endpoints — most recently used first.
 // An empty list is the old welcome screen wearing its real name.
-component NetworksScreen(networks:[HubNetwork], selected:str, busy:bool, error:str)
+component NetworksScreen(networks:[HubNetwork], selected:str, hidden:i64, busy:bool, error:str)
   emits
     pick_network(str)
     open_network_submit
     forget_network_submit(str, str)
     go_join
+    connect_remote_submit(str)
+    restore_hidden_submit
+  state
+    remote = ""
   col #root w=428.0 gap=0.0
     if empty(networks)
       col w=fill gap=0.0 align=center
@@ -266,6 +274,24 @@ component NetworksScreen(networks:[HubNetwork], selected:str, busy:bool, error:s
               active bg=transparent text=muted r=7.0
               hovered bg=fg/9 text=fg
               pressed bg=fg/14
+        // A remote node this device holds no workspace for — Enter connects,
+        // and a successful connect is what saves it as a remote row.
+        box w=fill pt=10.0
+          box w=fill px=14.0 py=10.0 bg=surface border=border border-w=1.0 r=10.0
+            input "" #remote-endpoint label="Remote node endpoint" <-> remote hint="connect a remote node… (http://host:port)" disabled=busy submit=emit(connect_remote_submit, remote) w=fill p=0.0 text-size=12.0 line-h=1.2 font=code @control
+              active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+              disabled value=hint
+    // Forgetting is not a one-way door: every hidden local network comes
+    // back with one click. Lives OUTSIDE the empty/non-empty branch —
+    // forgetting the ONLY network empties the list, and that is exactly
+    // when the door must stay visible.
+    if hidden > 0
+      box w=fill pt=10.0
+        col w=fill gap=0.0 align=center
+          button "Restore hidden networks" #restore-hidden disabled=busy h=24.0 p=4.0 @ghost_action -> emit(restore_hidden_submit)
+            active bg=transparent text=muted r=7.0
+            hovered bg=fg/9 text=fg
+            pressed bg=fg/14
     OnboardingError message=error
 
 // One network row: the liveness dot, the name, where it lives, and — while

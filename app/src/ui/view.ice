@@ -5,7 +5,7 @@ view
   // hub's quiet loading arm — it exists only between open and register.
   col w=fill h=fill
     if console_win != some(window)
-      HubColumn step=hub_step key_state=hub_key_state networks=hub_networks selected=hub_selected name=onboarding_name invite=invite_link reveal=reveal_words steps=provision_steps step_index=provision_index height=block_height tier=member_tier(members_rows) error=onboarding_error busy=(mutation_phase != "idle")
+      HubColumn step=hub_step key_state=hub_key_state networks=hub_networks selected=hub_selected hidden=hub_hidden name=onboarding_name invite=invite_link reveal=reveal_words steps=provision_steps step_index=provision_index height=block_height tier=member_tier(members_rows) error=onboarding_error busy=(mutation_phase != "idle")
         events
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
@@ -21,12 +21,15 @@ view
           go_networks -> go_networks
           join_network_submit -> join_network_submit _
           copy_onboarding_invite -> copy_onboarding_invite
+          connect_remote_submit -> connect_remote_submit _
+          restore_hidden_submit -> restore_hidden_submit
           enter_console -> enter_console
     if console_win == some(window)
       WorkspaceTabs network=network_label(account_name, connected_rpc) status=status height=block_height loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab bell_count=bell_unread bell_sev=bell_worst_severity(bell_items) approvals=open_proposals(gov_rows) account=account_name agent_live=any_agent_active(agents_rows) tier=member_tier(members_rows) root_hash=node_root_hash consensus_view=node_view_label quorum=node_quorum_label reachable=node_reachable_label last_finalized=node_last_finalized checkpoint=node_checkpoint #workspace-tabs
         events
           select_shell_tab -> select_shell_tab _
           toggle_bell -> toggle_bell
+          switch_network -> switch_network
         notice:
           col w=fill
             if error != ""
@@ -189,7 +192,7 @@ view
               gov_vote -> gov_vote _ _
               gov_execute -> gov_execute _
         settings:
-          SettingsScreen account_name=account_name connected_rpc=connected_rpc settings_endpoint=settings_endpoint settings_node_key=settings_node_key settings_height=settings_height settings_data_dir=settings_data_dir settings_key_state=settings_key_state settings_key_path=settings_key_path settings_open_tabs=settings_open_tabs members_rows=members_rows members_validators=members_validators members_residents=members_residents account_id=account_id account_name_draft<->account_name_draft account_renaming=account_renaming account_members=account_members account_nodes=account_nodes appearance=appearance rpc<->rpc password<->password status=status loading=loading connected=connected mutation_phase=mutation_phase node_tab=node_tab module_rows=module_rows block_height=block_height node_checkpoint=node_checkpoint node_last_finalized=node_last_finalized node_reachable_label=node_reachable_label node_quorum_label=node_quorum_label node_version=node_version node_root_hash=node_root_hash node_peers=node_peers node_log_filter<->node_log_filter node_log_lines=node_log_lines
+          SettingsScreen account_name=account_name connected_rpc=connected_rpc settings_endpoint=settings_endpoint settings_node_key=settings_node_key settings_height=settings_height settings_data_dir=settings_data_dir settings_key_state=settings_key_state settings_key_path=settings_key_path settings_open_tabs=settings_open_tabs members_rows=members_rows members_validators=members_validators members_residents=members_residents account_id=account_id account_name_draft<->account_name_draft account_renaming=account_renaming account_members=account_members account_nodes=account_nodes appearance=appearance password=password status=status loading=loading connected=connected mutation_phase=mutation_phase node_tab=node_tab module_rows=module_rows block_height=block_height node_checkpoint=node_checkpoint node_last_finalized=node_last_finalized node_reachable_label=node_reachable_label node_quorum_label=node_quorum_label node_version=node_version node_root_hash=node_root_hash node_peers=node_peers node_log_filter<->node_log_filter node_log_lines=node_log_lines
             events
               select_shell_tab -> select_shell_tab _
               reconnect -> reconnect
@@ -197,6 +200,9 @@ view
               account_rename_submit -> account_rename_submit
               copy_to_clipboard -> copy_to_clipboard _ _
               settings_clear_tabs -> settings_clear_tabs
+              switch_network -> switch_network
+              settings_unlock_submit -> settings_unlock_submit _
+              lock_session -> lock_session
               forget_workspace_submit -> forget_workspace_submit
               select_node_tab -> select_node_tab _
               open_node_modules -> open_node_modules

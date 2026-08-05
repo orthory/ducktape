@@ -92,7 +92,7 @@ extern crate::backend
   stream provision_progress(workspace:str, rpc:str) -> ProvisionStep
   HubNetwork(id:str, chain_id:str, name:str, endpoint:str, kind:str, last_used:i64, probed:bool, live:bool, height:i64)
   HubProbe(generation:i64, id:str, live:bool, height:i64)
-  HubState(key_state:str, networks:[HubNetwork], preselect:str)
+  HubState(key_state:str, networks:[HubNetwork], preselect:str, hidden:i64)
   KeyCreated(words:str, pubkey:str)
   hub_state() -> HubState
   stream probe_known_networks(generation:i64) -> HubProbe
@@ -108,6 +108,7 @@ extern crate::backend
   unlock_user_key(password:str) -> str ! AppError
   remember_network(rpc:str) -> bool
   forget_network(id:str, kind:str) -> bool
+  restore_hidden_networks() -> bool
   sync connection_degraded(status:str) -> bool
   sync titlebar_inset() -> f64
   sync palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
@@ -320,7 +321,6 @@ extern crate::backend
   sync remember_orphaned_block_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str, saved:str, autosave_status:str) -> [str]
   sync remember_orphaned_comment_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str) -> [str]
   sync remove_recovered_draft(drafts:[str], recovered:str) -> [str]
-  sync retain_drafts_for_endpoint(drafts:[str], current:str, next:str) -> [str]
   sync refreshed_selected_block(blocks:[PageBlock], selected_id:str) -> str
   sync retain_selected_string(value:str, selected_id:str) -> str
   sync retain_selected_i64(value:i64, selected_id:str) -> i64

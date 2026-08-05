@@ -1307,13 +1307,17 @@ fn thread_pagination_preserves_multiple_pending_replies() {
     );
 }
 
+// Opening a (possibly different) network through the console handoff clears
+// every reading and draft of the previous one — and the in-flight huddle —
+// while the KEY password survives: it unlocks this device's user.key, not an
+// endpoint.
 #[test]
-fn changing_endpoint_clears_remote_bound_interaction_state() {
+fn opening_a_network_clears_the_previous_networks_state() {
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
     app.connected_rpc = "http://node-a".into();
     app.rpc = "http://node-b".into();
-    app.password = "node-a-password".into();
+    app.password = "device-key-password".into();
     app.selected_message_seq = 1;
     app.message_action = "editing".into();
     app.message_edit_draft = "node a edit".into();
@@ -1326,11 +1330,15 @@ fn changing_endpoint_clears_remote_bound_interaction_state() {
     app.block_comment_draft = "node a comment".into();
     app.message_editor = compose("node a message");
     app.page_search_draft = "node a search".into();
+    app.huddle_joined = true;
+    app.huddle_channel = "chan-a".into();
 
-    let _ = app.__update(__DucktapeMessage::Reconnect);
+    let _ = app.__update(__DucktapeMessage::ConsoleOpened(
+        iced::window::Id::unique(),
+    ));
 
     assert_eq!(app.connected_rpc, "http://node-b");
-    assert!(app.password.is_empty());
+    assert_eq!(app.password, "device-key-password");
     assert_eq!(app.selected_message_seq, 0);
     assert_eq!(app.message_action, "toolbar");
     assert!(app.message_edit_draft.is_empty());
@@ -1344,6 +1352,8 @@ fn changing_endpoint_clears_remote_bound_interaction_state() {
     assert!(app.message_draft.is_empty());
     assert!(composer(&app).is_empty());
     assert!(app.page_search_draft.is_empty());
+    assert!(!app.huddle_joined);
+    assert!(app.huddle_channel.is_empty());
 
     let _ = app.__update(__DucktapeMessage::Failed(backend::AppError {
         message: "offline".into(),
@@ -1352,18 +1362,18 @@ fn changing_endpoint_clears_remote_bound_interaction_state() {
     assert_eq!(app.connected_rpc, "http://node-b");
 }
 
+// Reconnect is the same-endpoint retry now — the picker owns endpoint
+// changes — so typed drafts survive it untouched.
 #[test]
 fn same_endpoint_reconnect_preserves_unsent_drafts() {
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
     app.connected_rpc = "http://node-a".into();
-    app.rpc = "http://node-a/".into();
     app.message_editor = compose("next message");
     app.failed_message_draft = "unsent message".into();
 
     let _ = app.__update(__DucktapeMessage::Reconnect);
 
-    assert_eq!(app.rpc, "http://node-a");
     assert_eq!(app.connected_rpc, "http://node-a");
     assert_eq!(composer(&app), "next message");
     assert_eq!(app.failed_message_draft, "unsent message");
@@ -1559,7 +1569,11 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(SCREENS.contains("box w=236.0 h=fill bg=sidebar clip=true"));
     assert!(SCREENS.contains("box w=230.0 h=fill bg=sidebar clip=true"));
 
-    assert!(SCREENS.contains("input \"\" #rpc label=\"RPC endpoint\""));
+    // The endpoint field is GONE from Settings — the launch window's picker
+    // owns which network; Settings keeps only Reconnect / Switch network.
+    assert!(!SCREENS.contains("#rpc"));
+    assert!(SCREENS.contains("emit(switch_network)"));
+    assert!(SCREENS.contains("input \"\" #key-password label=\"Key password\""));
     assert!(SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"));
     assert!(SCREENS.contains("box w=fill p=5.0 bg=transparent border=fg/12"));
     // the palette card moved into the overlay layer with the rest of the
@@ -1733,7 +1747,7 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         SCREENS.contains("KeyValueRow label=\"Key state\" value=settings_key_state last=false")
     );
     assert!(
-        SCREENS.contains("KeyValueRow label=\"Key path\" value=settings_key_path last=true")
+        SCREENS.contains("KeyValueRow label=\"Key path\" value=settings_key_path last=false")
     );
 
     for target in [

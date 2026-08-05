@@ -216,7 +216,7 @@ component ChatScreen(account_name:str, connected_rpc:str, status:str, block_heig
           stack w=fill h=fill
             col w=fill h=fill gap=9.0 pl=18.0 pr=18.0 pt=16.0 pb=8.0
               if !connected
-                EmptyState title="Connect to a node" description="Open Settings from the rail below and set the node endpoint."
+                EmptyState title="Not connected" description="Click the network name in the titlebar to pick or reconnect a network."
               if connected && !loading && empty(messages)
                 EmptyState title="No messages yet" description="Create a channel or start the conversation."
               if connected && loading && empty(messages)

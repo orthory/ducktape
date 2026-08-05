@@ -58,6 +58,26 @@ on settings_clear_tabs
   doc_tabs = []
   run clear_doc_tabs(connected_rpc) -> doc_tabs_saved _
 
+// IDENTITY KEY — the session's signing seat. Unlock VERIFIES the password
+// against user.key before keeping it; the old CONNECTION field stored blind.
+// Optimistically stored, cleared by the failure arm — the launch window's
+// unlock uses the same shape.
+on settings_unlock_submit(pw)
+  return if mutation_phase != "idle" || empty(pw)
+  error = ""
+  password = pw
+  run unlock_user_key(password) -> settings_unlocked _ | settings_unlock_failed _
+
+on settings_unlocked(_pubkey)
+  error = ""
+
+on settings_unlock_failed(cause)
+  password = ""
+  error = cause.message
+
+on lock_session
+  password = ""
+
 // PREFERENCES — device-local, one endpoint at a time.
 // DANGER ZONE — forget this workspace on THIS DEVICE and go back to onboarding.
 on forget_workspace_submit

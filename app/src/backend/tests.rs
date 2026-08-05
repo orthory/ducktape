@@ -1992,13 +1992,6 @@ fn recovered_drafts_are_deduplicated_and_endpoint_scoped() {
         "error".into(),
     );
     assert_eq!(drafts, ["local"]);
-    assert_eq!(
-        retain_drafts_for_endpoint(drafts.clone(), "http://node".into(), "http://node".into(),),
-        drafts
-    );
-    assert!(
-        retain_drafts_for_endpoint(drafts, "http://node".into(), "http://other".into(),).is_empty()
-    );
 }
 
 #[test]

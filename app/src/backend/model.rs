@@ -595,14 +595,6 @@ pub fn remove_recovered_draft(mut drafts: Vec<String>, recovered: String) -> Vec
     drafts
 }
 
-pub fn retain_drafts_for_endpoint(
-    drafts: Vec<String>,
-    current: String,
-    next: String,
-) -> Vec<String> {
-    if current == next { drafts } else { Vec::new() }
-}
-
 pub fn refreshed_selected_block(blocks: Vec<PageBlock>, selected_id: String) -> String {
     if selected_block_missing(&blocks, &selected_id) {
         String::new()
