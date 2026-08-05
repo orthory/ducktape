@@ -34,7 +34,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   loading = true
   chat_search_hits = []
   selected_message_seq = 0
-  hovered_message_seq = 0
   selected_message_rev = 0
   message_action = "toolbar"
   message_edit_draft = ""
@@ -76,7 +75,6 @@ on choose_channel(id)
   loading = true
   chat_search_hits = []
   selected_message_seq = 0
-  hovered_message_seq = 0
   selected_message_rev = 0
   message_action = "toolbar"
   message_edit_draft = ""
@@ -113,7 +111,6 @@ on choose_dm(peer_key)
   loading = true
   chat_search_hits = []
   selected_message_seq = 0
-  hovered_message_seq = 0
   selected_message_rev = 0
   message_action = "toolbar"
   message_edit_draft = ""
@@ -402,13 +399,6 @@ on chat_acked(_result)
   channel_create_open = false
   mutation_phase = "idle"
   error = ""
-on message_entered(seq)
-  hovered_message_seq = seq
-
-on message_exited(seq)
-  return if hovered_message_seq != seq
-  hovered_message_seq = 0
-
 // PRESSES, NOT MOVES. The pointer y is read exactly once — when an action
 // menu opens, to anchor its float — so it is captured per left press by
 // `press-at`, which reports through a captured press (the ⋯ button's own
@@ -421,13 +411,6 @@ on chat_pointer_pressed(_x, y)
 
 on chat_resized(_width, height)
   chat_height = height
-
-on thread_message_entered(seq)
-  thread_hovered_seq = seq
-
-on thread_message_exited(seq)
-  return if thread_hovered_seq != seq
-  thread_hovered_seq = 0
 
 on thread_pointer_pressed(_x, y)
   thread_pointer_y = y
@@ -510,17 +493,6 @@ on open_message_actions(seq, body, rev)
     task widget focus #workspace-tabs/content/chat/message-action-focus
     task widget focus-next
 
-on open_message_actions_accessibly(seq, body, rev)
-  return if seq <= 0
-  message_menu_y = 0.0
-  selected_message_seq = seq
-  selected_message_rev = rev
-  message_action = "more"
-  message_edit_draft = body
-  sequential
-    task widget focus #workspace-tabs/content/chat/message-action-focus
-    task widget focus-next
-
 on open_message_reactions(seq, body, rev)
   return if seq <= 0
   message_menu_y = block_action_menu_y(chat_pointer_y, chat_height)
@@ -564,7 +536,6 @@ on open_thread_for(seq)
   message_edit_draft = ""
   thread_selected_seq = 0
   thread_selected_rev = 0
-  thread_hovered_seq = 0
   thread_message_action = "toolbar"
   thread_edit_draft = ""
   thread_generation = thread_generation + 1
@@ -653,7 +624,6 @@ on close_thread
   thread_loading = false
   thread_selected_seq = 0
   thread_selected_rev = 0
-  thread_hovered_seq = 0
   thread_message_action = "toolbar"
   thread_edit_draft = ""
   reply_draft = ""

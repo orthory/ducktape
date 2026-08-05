@@ -198,17 +198,19 @@ component MessageContents(message:ChatMessage)
             hovered bg=muted_bg text=brand border=control_line
             pressed bg=elevated text=brand
 
-component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled:bool)
+component MessageCard(message:ChatMessage, selected:bool, disabled:bool)
   emits
-    message_entered(i64)
-    message_exited(i64)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
-    open_message_actions_accessibly(i64, str, i64)
     open_message_reactions(i64, str, i64)
     open_message_actions(i64, str, i64)
-  mouse enter=emit(message_entered, message.seq) exit=emit(message_exited, message.seq)
+  // DRAW-TIME HOVER: the tint and the toolbar reveal ride the `hover`
+  // widget's cursor check — no enter/exit routes, no hovered state, no view
+  // rebuild per row crossing. A cached lazy row keeps its toolbar at native
+  // latency; that is the whole point (the state-driven version left the
+  // highlight trailing the cursor by the queued rebuilds).
+  hover tint=row_hover r=9.0
     stack w=fill
       if message.deleted
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=transparent border=transparent border-w=1.0 r=9.0
@@ -217,9 +219,7 @@ component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled
               add_reaction_at
               remove_reaction_at
               open_thread_for
-      // Selection is a tint, not a ring: the brand wash alone marks the row.
-      // A 1px brand border here read as a loud focus rectangle on every
-      // menu-open (user QA: "border 굵게 생기는거 짜쳐").
+      // Selection is a tint, not a ring — see the QA note in the stream.
       if !message.deleted && selected
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=brand_bg border=transparent border-w=1.0 r=9.0
           MessageContents message=message
@@ -227,38 +227,20 @@ component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled
               add_reaction_at
               remove_reaction_at
               open_thread_for
-      if !message.deleted && !selected && hovered
-        box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=row_hover border=transparent border-w=1.0 r=9.0
-          MessageContents message=message
-            forward
-              add_reaction_at
-              remove_reaction_at
-              open_thread_for
-      if !message.deleted && !selected && !hovered
+      if !message.deleted && !selected
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=transparent border=transparent border-w=1.0 r=9.0
           MessageContents message=message
             forward
               add_reaction_at
               remove_reaction_at
               open_thread_for
-      if !message.deleted && !message.pending && !hovered
-        box w=fill align-x=end align-y=start pt=3.0 pr=9.0
-          button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> emit(open_message_actions_accessibly, message.seq, message.body, message.rev)
-            active bg=transparent text=muted r=7.0
-            hovered bg=fg/9 text=fg
-            pressed bg=fg/13 text=fg
-      if !message.deleted && !message.pending && hovered
+    col w=fill
+      if !message.deleted && !message.pending
         box w=fill align-x=end align-y=start pr=8.0
           // The designer's own opaque answer for this bar: white card, 1px
-          // border, r9 over the 3/12 popover shadow. The glass file's r13 and
-          // its heavier drop are the blurred variant, which this app has no
-          // compositor for. The artifact hangs it 12px above the row's top
-          // edge; ice has no negative offset, so it sits inside the row.
+          // border, r9 over the 3/12 popover shadow.
           box p=2.0 bg=surface border=border border-w=1.0 r=9.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
             row gap=1.0 align=center
-              // Three one-tap reactions, exactly as the artifact wires them:
-              // one click, no intermediate surface. `♡` still opens the full
-              // picker for the emojis these three do not cover.
               button "👍" label="React with 👍" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(add_reaction_at, message.seq, "👍")
                 active bg=transparent text=muted r=6.0
                 hovered bg=elevated text=fg
@@ -282,17 +264,12 @@ component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled
                 active bg=transparent text=muted r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
-              // The artifact's shield sits here and opens an Event Inspector
-              // rail. The rail is NOT built: mounting it belongs to view.ice
-              // and needs an op hash the app would have to resolve through
-              // /v1/blocks. A shield that opens nothing — and whose handler
-              // discards the open thread and the half-typed reply on the way —
-              // is worse than no shield, so the seat stays empty until the rail
-              // lands. The ⋯ menu below is the only real actions surface.
               button "⋯" label="More message actions" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(open_message_actions, message.seq, message.body, message.rev)
                 active bg=transparent text=muted r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
+      if message.deleted || message.pending
+        space w=1.0 h=1.0
 
 // A reply reads one notch SMALLER than the same message in the timeline: 26px
 // plate, 12px author, and the stamp a step down. The body keeps the shared
@@ -321,15 +298,14 @@ component ThreadMessageBody(message:ChatMessage)
                 add_reaction_at
                 remove_reaction_at
 
-component ThreadMessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled:bool)
+component ThreadMessageCard(message:ChatMessage, selected:bool, disabled:bool)
   emits
-    thread_message_entered(i64)
-    thread_message_exited(i64)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
-  mouse enter=emit(thread_message_entered, message.seq) exit=emit(thread_message_exited, message.seq)
+  // Same draw-time hover as MessageCard — see the note there.
+  hover tint=row_hover r=9.0
     stack w=fill
       if message.deleted
         box w=fill p=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
@@ -337,32 +313,20 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, hovered:bool, di
             forward
               add_reaction_at
               remove_reaction_at
-      // Same tint-only selection as MessageCard — no ring.
       if !message.deleted && selected
         box w=fill p=8.0 bg=brand_bg border=transparent border-w=1.0 r=9.0
           ThreadMessageBody message=message
             forward
               add_reaction_at
               remove_reaction_at
-      if !message.deleted && !selected && hovered
-        box w=fill p=8.0 bg=fg/4 border=fg/7 border-w=1.0 r=9.0
-          ThreadMessageBody message=message
-            forward
-              add_reaction_at
-              remove_reaction_at
-      if !message.deleted && !selected && !hovered
+      if !message.deleted && !selected
         box w=fill p=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
           ThreadMessageBody message=message
             forward
               add_reaction_at
               remove_reaction_at
-      if !message.deleted && !message.pending && !hovered
-        box w=fill align-x=end align-y=start pt=3.0 pr=9.0
-          button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> emit(open_thread_message_actions, message.seq, message.body, message.rev)
-            active bg=transparent text=muted r=7.0
-            hovered bg=fg/9 text=fg
-            pressed bg=fg/13 text=fg
-      if !message.deleted && !message.pending && hovered
+    col w=fill
+      if !message.deleted && !message.pending
         box w=fill align-x=end align-y=start pt=3.0 pr=9.0
           box p=2.0 style=raised_style()
             row gap=1.0 align=center
@@ -374,6 +338,8 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, hovered:bool, di
                 active bg=transparent text=muted r=6.0
                 hovered bg=fg/10 text=fg
                 pressed bg=fg/14 text=fg
+      if message.deleted || message.pending
+        space w=1.0 h=1.0
 
 component ChatSearchResult(hit:ChatSearchHit)
   emits
