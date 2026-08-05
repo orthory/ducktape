@@ -1,6 +1,23 @@
 use super::*;
 use ::chat;
 
+/// One reaction tap folded into the visible rows at CLICK time — the chip
+/// must not wait for the block. Rides the canonical reactor-set fold, so the
+/// settled delta replays over it without drifting the count. No cached
+/// identity (boot race) = no optimistic fold; the resync renders it instead.
+pub fn reaction_applied(
+    messages: Vec<ChatMessage>,
+    seq: i64,
+    emoji: String,
+    added: bool,
+) -> Vec<ChatMessage> {
+    let Some(key) = rpc::cached_user_key() else {
+        return messages;
+    };
+    let reactor = format!("user:{}", hex_encode(&key));
+    chat::client::optimistic_reaction(messages, seq, emoji, added, reactor)
+}
+
 pub async fn rename_channel(
     rpc: String,
     password: String,

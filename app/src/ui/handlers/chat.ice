@@ -655,7 +655,9 @@ on add_reaction_submit(emoji)
   hydration_retry_attempt = 0
   mutation_phase = "reaction"
   error = ""
-  run add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> chat_acked _ | mutation_failed _
+  messages = reaction_applied(messages, selected_message_seq, emoji, true)
+  thread_messages = reaction_applied(thread_messages, selected_message_seq, emoji, true)
+  run add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> chat_acked _ | reaction_failed _
 
 // One-tap reactions do NOT select the row: the tap is its own complete act,
 // and parking the selection tint on the message until the next Esc read as
@@ -668,7 +670,9 @@ on add_reaction_at(seq, emoji)
   hydration_retry_attempt = 0
   mutation_phase = "reaction"
   error = ""
-  run add_reaction(connected_rpc, password, active_channel, seq, emoji) -> chat_acked _ | mutation_failed _
+  messages = reaction_applied(messages, seq, emoji, true)
+  thread_messages = reaction_applied(thread_messages, seq, emoji, true)
+  run add_reaction(connected_rpc, password, active_channel, seq, emoji) -> chat_acked _ | reaction_failed _
 
 on remove_reaction_at(seq, emoji)
   return if loading || mutation_phase != "idle" || active_channel_archived || seq <= 0
@@ -677,7 +681,27 @@ on remove_reaction_at(seq, emoji)
   hydration_retry_attempt = 0
   mutation_phase = "reaction"
   error = ""
-  run remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> chat_acked _ | mutation_failed _
+  messages = reaction_applied(messages, seq, emoji, false)
+  thread_messages = reaction_applied(thread_messages, seq, emoji, false)
+  run remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> chat_acked _ | reaction_failed _
+
+// The settle-✓'s two-beat teardown. Beat one reads the animation still
+// aimed at visible, keeps its anchor and flips the fade; beat two reads it
+// aimed at hidden and drops the anchor, unmounting the ✓ (the 400ms fade
+// always finishes inside one 1200ms beat).
+on send_flash_tick
+  send_flash_id = keep_str(animation.value(send_flash), send_flash_id, "")
+  send_flash = false
+
+// A reaction failure leaves the optimistic fold as a LIE on screen; there is
+// no rollback token (the fold is not invertible under concurrent deltas), so
+// the canonical refetch IS the revert — committed or not.
+on reaction_failed(cause)
+  mutation_phase = mutation_failure_phase(cause.committed)
+  error = cause.message
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  run live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 on reply_composer_event(event)
   reply_editor = apply_composer_event(reply_editor, event)

@@ -141,7 +141,7 @@ component ReactionChip(reaction:ChatReaction, seq:i64)
         hovered bg=elevated text=fg border=control_line
         pressed bg=subtle text=fg
 
-component MessageContents(message:ChatMessage)
+component MessageContents(message:ChatMessage, flash:f64)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -166,17 +166,8 @@ component MessageContents(message:ChatMessage)
             text height_label_short(message.height) size=11.0 wrap=none font=code_medium @text-hint
           if message.edited
             text "· edited" size=11.0 wrap=none font=code_medium @text-hint
-          if !message.pending
-            text "✓" size=10.0 wrap=none font=code_semibold @text-success_tick
           space w=fill
       MessageBody message=message
-      // A row still in flight carries no height and no tick, so without this it
-      // is indistinguishable from a settled one. The chip is the only send-state
-      // surface the timeline has — the right-aligned own-message bubble the
-      // artifact draws is not mounted.
-      if message.pending
-        row w=fill pt=5.0
-          FinalityChip phase="finalizing" height=0
       // Reactions and the replies button STACK — the artifact gives each its
       // own line under the body, never one shared row.
       if !empty(message.reactions)
@@ -197,8 +188,17 @@ component MessageContents(message:ChatMessage)
             active bg=surface text=brand border=border border-w=1.0 r=8.0
             hovered bg=muted_bg text=brand border=control_line
             pressed bg=elevated text=brand
+    // The quiet send-state lane at the row's right edge: an in-flight row
+    // carries a small dot, the settle swaps it for a ✓ that fades out (the
+    // `flash` prop is the animation's opacity — nonzero only on the row the
+    // stream's flash arm anchors). Replaces the old "finalizing…" chip line
+    // that restyled the whole message.
+    if message.pending
+      svg icon("dot") memory w=7.0 h=7.0 style=icon_tint("hint") opacity=0.55
+    if !message.pending && flash > 0.0
+      svg icon("check") memory w=13.0 h=13.0 style=icon_tint("success-tick") opacity=flash
 
-component MessageCard(message:ChatMessage, selected:bool, disabled:bool)
+component MessageCard(message:ChatMessage, selected:bool, disabled:bool, flash:f64)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -214,7 +214,7 @@ component MessageCard(message:ChatMessage, selected:bool, disabled:bool)
     stack w=fill
       if message.deleted
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=transparent border=transparent border-w=1.0 r=9.0
-          MessageContents message=message
+          MessageContents message=message flash=flash
             forward
               add_reaction_at
               remove_reaction_at
@@ -222,14 +222,14 @@ component MessageCard(message:ChatMessage, selected:bool, disabled:bool)
       // Selection is a tint, not a ring — see the QA note in the stream.
       if !message.deleted && selected
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=brand_bg border=transparent border-w=1.0 r=9.0
-          MessageContents message=message
+          MessageContents message=message flash=flash
             forward
               add_reaction_at
               remove_reaction_at
               open_thread_for
       if !message.deleted && !selected
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=transparent border=transparent border-w=1.0 r=9.0
-          MessageContents message=message
+          MessageContents message=message flash=flash
             forward
               add_reaction_at
               remove_reaction_at

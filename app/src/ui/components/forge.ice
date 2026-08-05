@@ -640,7 +640,7 @@ component ReviewCard(review:ForgeReview)
           box px=6.0 py=2.0 bg=elevated r=4.0
             text "outdated" size=9.0 wrap=none font=code_semibold @text-meta
         space w=fill
-        FinalityChip phase="finalized" height=review.created_at
+        FinalityChip height=review.created_at
       if !empty(review.body)
         text review.body w=fill size=13.0 line-h=1.55 @text-accent_fg
       for comment in review.comments

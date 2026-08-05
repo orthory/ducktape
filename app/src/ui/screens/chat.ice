@@ -19,7 +19,7 @@
 // were briefly caller-filled slots: a sensor's show/resize route used to accept
 // only bare `_` payloads and could not carry a component event (ui-lang#239).
 
-component ChatScreen(account_name:str, connected_rpc:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], channels:[ChatChannel], dm_peers:[DmPeer], channel_reads:[ChannelRead], user_key:str, channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
+component ChatScreen(account_name:str, connected_rpc:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], channels:[ChatChannel], dm_peers:[DmPeer], channel_reads:[ChannelRead], user_key:str, channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
   emits
     search_chat_submit()
     clear_chat_search()
@@ -260,33 +260,40 @@ component ChatScreen(account_name:str, connected_rpc:str, status:str, block_heig
                             // check inside MessageCard, so a cached row keeps
                             // it at native latency.
                             //
-                            // THE ONE DASHED BORDER IN THE CONSOLE.
-                            // `message.pending` is this app's only optimistic
-                            // write — seeded by `optimistic_message`, cleared
-                            // by `merge_message_send_result` — so the design
-                            // system's "not yet settled is dashed" rule is
-                            // drawn here (both arms) and nowhere else.
+                            // A message in flight LOOKS like a message: no
+                            // dashed frame, no restyle — send-state lives in
+                            // MessageContents' right-edge lane (pending dot,
+                            // then the settle ✓ fading out). The flash arm is
+                            // the one live mount that carries the animated
+                            // opacity; every other unselected row stays lazy.
                             if message.seq == selected_message_seq
                               stack #message(message.id) w=fill
-                                UnfinalizedFrame pending=message.pending
-                                  MessageCard message=message selected=true disabled=loading
+                                MessageCard message=message selected=true disabled=loading flash=0.0
+                                  forward
+                                    add_reaction_at
+                                    remove_reaction_at
+                                    open_thread_for
+                                    open_message_reactions
+                                    open_message_actions
+                            if message.seq != selected_message_seq && message.id == send_flash_id
+                              stack #message(message.id) w=fill
+                                MessageCard message=message selected=false disabled=false flash=send_flash_value
+                                  forward
+                                    add_reaction_at
+                                    remove_reaction_at
+                                    open_thread_for
+                                    open_message_reactions
+                                    open_message_actions
+                            if message.seq != selected_message_seq && message.id != send_flash_id
+                              lazy message as cached_message
+                                stack #message(cached_message.id) w=fill
+                                  MessageCard message=cached_message selected=false disabled=false flash=0.0
                                     forward
                                       add_reaction_at
                                       remove_reaction_at
                                       open_thread_for
                                       open_message_reactions
                                       open_message_actions
-                            if message.seq != selected_message_seq
-                              lazy message as cached_message
-                                stack #message(cached_message.id) w=fill
-                                  UnfinalizedFrame pending=cached_message.pending
-                                    MessageCard message=cached_message selected=false disabled=false
-                                      forward
-                                        add_reaction_at
-                                        remove_reaction_at
-                                        open_thread_for
-                                        open_message_reactions
-                                        open_message_actions
                   overlay when=(selected_message_seq > 0 && message_action != "toolbar") dismiss=emit(clear_message_selection) backdrop=transparent p=8.0 align-x=end align-y=start
                     content
                       space w=fill h=fill

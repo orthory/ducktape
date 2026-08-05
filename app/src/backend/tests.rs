@@ -1009,6 +1009,88 @@ fn post_commit_hydration_errors_are_not_retryable() {
 }
 
 #[test]
+fn optimistic_reaction_survives_the_canonical_replay() {
+    let mut message = optimistic_message(Vec::new(), "hello".into(), "message-a".into());
+    message[0].pending = false;
+    message[0].seq = 7;
+    let reactor = "user:aa11".to_string();
+
+    let tapped = ::chat::client::optimistic_reaction(message, 7, "👍".into(), true, reactor.clone());
+    assert_eq!(tapped[0].reactions.len(), 1);
+    assert_eq!(tapped[0].reactions[0].emoji, "👍");
+    assert_eq!(tapped[0].reactions[0].count, 1);
+    assert!(tapped[0].reactions[0].reacted_by_me);
+
+    // The settled delta replays the SAME reactor handle — set semantics keep
+    // the count at 1 instead of doubling the optimistic chip.
+    let replay = ChatDelta {
+        kind: "reaction".into(),
+        channel_id: "general".into(),
+        seq: 7,
+        emoji: "👍".into(),
+        added: true,
+        reactor,
+        by_me: true,
+        ..ChatDelta::default()
+    };
+    let replayed = apply_chat_messages(tapped, replay, "general".into());
+    assert_eq!(replayed[0].reactions.len(), 1);
+    assert_eq!(replayed[0].reactions[0].count, 1);
+    assert!(replayed[0].reactions[0].reacted_by_me);
+
+    // The optimistic remove folds the chip away entirely.
+    let removed = ::chat::client::optimistic_reaction(
+        replayed,
+        7,
+        "👍".into(),
+        false,
+        "user:aa11".into(),
+    );
+    assert!(removed[0].reactions.is_empty());
+}
+
+#[test]
+fn send_settle_flash_fires_only_for_own_pending_rows() {
+    let pending = optimistic_message(Vec::new(), "hello".into(), "message-a".into());
+    let mut settled_row = pending[0].clone();
+    settled_row.pending = false;
+    settled_row.seq = 3;
+    let settle = ChatDelta {
+        kind: "posted".into(),
+        channel_id: "general".into(),
+        seq: 3,
+        message: settled_row,
+        ..ChatDelta::default()
+    };
+
+    assert!(send_settled_by(
+        pending.clone(),
+        settle.clone(),
+        "general".into()
+    ));
+    assert_eq!(
+        settled_send_id(pending.clone(), settle.clone(), "general".into(), "".into()),
+        "message-a"
+    );
+    // Wrong channel, someone else's post, and a non-post delta all keep the
+    // current anchor instead of flashing.
+    assert!(!send_settled_by(
+        pending.clone(),
+        settle.clone(),
+        "other".into()
+    ));
+    let mut foreign = settle.clone();
+    foreign.message.id = "someone-else".into();
+    assert!(!send_settled_by(pending.clone(), foreign, "general".into()));
+    let mut reaction = settle;
+    reaction.kind = "reaction".into();
+    assert_eq!(
+        settled_send_id(pending, reaction, "general".into(), "kept".into()),
+        "kept"
+    );
+}
+
+#[test]
 fn concurrent_optimistic_messages_settle_independently() {
     let pending = optimistic_message(
         optimistic_message(Vec::new(), "first".into(), "message-a".into()),

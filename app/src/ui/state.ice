@@ -77,6 +77,14 @@ state
   reply_editor:editor = ""
   pending_message = ""
   pending_message_id = ""
+  // The transient settle ✓: `send_flash_id` anchors it to the row whose
+  // optimistic send just landed, `send_flash` drives its opacity — true pops
+  // it in on the settle delta, the NEXT live event flips it false and fades
+  // it out. No timer: consensus itself is the metronome (blocks keep coming).
+  send_flash_id = ""
+  send_flash:animation[bool] = false
+    easing ease-in-out
+    duration 400ms
   failed_message_draft = ""
   failed_reply_draft = ""
   chat_search_draft = ""

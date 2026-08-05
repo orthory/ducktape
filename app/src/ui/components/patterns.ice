@@ -1,66 +1,29 @@
-// The four product patterns the Design System states as law, in ONE place each,
-// so that no screen ever spells them itself. Finality words, the unfinalized
-// ring, the refusal plate, and the human-vs-agent shape all live here.
+// The product patterns the Design System states as law, in ONE place each,
+// so that no screen ever spells them itself. The finality stamp, the refusal
+// plate, and the human-vs-agent shape all live here.
 //
 // ONE SANCTIONED SUBSTITUTION — settled, do not re-litigate per screen:
 //
 // GRADIENT -> FLAT SURFACE. The console is deliberately opaque; every
 // rgba()+backdrop-filter plate in the glass file is painted at its value from
 // the designer's own non-glass variant.
-//
-// THE DASH IS NO LONGER A SUBSTITUTION. It used to be: iced's Border is colour
-// + width + radius only, so the ring shipped SOLID at 1.5px in `pending_line`.
-// ui-lang 2.0 lowers `border-dash=` to a canvas stroke over the surface, so the
-// artifact's rule — "anything not yet finalized has a dashed border" — is now drawn
-// as the dashes it always said, and this component is the ONLY place that
-// spells them.
 
-// THE FINALITY STORY. Three phases, the same words on every surface that
-// carries a write: messages, reviews, merges, proposals, the inspector.
-// `finalizing…` is optimistic, `batched` is bound into a merkle root, and
-// `✓ finalized · h N` is the only one that may claim proof. No ✓ without a
-// height behind it.
-component FinalityChip(phase:str, height:i64)
+// THE FINALITY STAMP. `✓ finalized · h N` is the only wording that may claim
+// proof — no ✓ without a height behind it. An IN-FLIGHT write is not a phase
+// on this chip anymore: the chat timeline shows it as a quiet right-edge dot
+// (MessageContents) and settles into a transient ✓, so an unsettled row reads
+// as a normal message, not a restyled one.
+component FinalityChip(height:i64)
   col #root
-    match phase
-      "finalizing"
-        row gap=4.0 align=center
-          // static ring, not a spinner — nothing drives state.ice `spin`, so a
-          // turning arc would freeze mid-turn (see overlay.ice)
-          box w=9.0 h=9.0 bg=transparent border=input border-w=1.5 r=4.5
-            space w=1.0 h=1.0
-          text "finalizing…" size=12.0 wrap=none @text-ink_soft
-      "batched"
-        box px=7.0 py=2.0 bg=subtle r=5.0
-          text "batched" size=12.0 wrap=none font=code_semibold @text-strong_ink
-      _
-        box px=7.0 py=2.0 bg=final_bg border=final_line border-w=1.0 r=5.0
-          row gap=4.0 align=center
-            text "✓ finalized" size=9.0 wrap=none font=code_semibold @text-success_tick
-            if height > 0
-              text "·" size=9.0 wrap=none font=code_semibold @text-success_tick
-            if height > 0
-              text "h" size=9.0 wrap=none font=code_semibold @text-success_tick
-            if height > 0
-              text height size=9.0 wrap=none font=code_semibold @text-success_tick
-
-// UNFINALIZED MEANS A DASHED RING. Wrap any card, row or bubble whose write has
-// not settled; the ring is drawn over the child so the child keeps its own
-// plate. The radius is the app's card radius — the frozen signature carries no
-// radius prop, and every wrapped surface today is a 10-12px card.
-//
-// MOUNTED on the chat stream (view.ice), around every message while
-// `ChatMessage.pending` holds — the one optimistic write this app makes, seeded
-// by `optimistic_message` and cleared by `merge_message_send_result`. It is the
-// only surface in the console that draws a dash, which is the point: the rule
-// lives HERE, and a second screen that grows an unsettled write wraps it in
-// this rather than spelling a dash of its own.
-component UnfinalizedFrame(pending:bool)
-  stack #root w=fill
-    slot
-    if pending
-      box w=fill h=fill bg=transparent border=pending_line border-w=1.5 border-dash=(4.0, 3.0) r=10.0
-        space w=1.0 h=1.0
+    box px=7.0 py=2.0 bg=final_bg border=final_line border-w=1.0 r=5.0
+      row gap=4.0 align=center
+        text "✓ finalized" size=9.0 wrap=none font=code_semibold @text-success_tick
+        if height > 0
+          text "·" size=9.0 wrap=none font=code_semibold @text-success_tick
+        if height > 0
+          text "h" size=9.0 wrap=none font=code_semibold @text-success_tick
+        if height > 0
+          text height size=9.0 wrap=none font=code_semibold @text-success_tick
 
 // PERMISSION GATING SHOWS ITS REASON. Never hide a control and never disable
 // one silently: say why it is refused and what unlocks it. `reason` is the

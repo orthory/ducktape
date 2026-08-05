@@ -248,6 +248,10 @@ fn assert_no_polling(lifecycle: &str) {
             // no longer flashes and vanishes. Still gated on a visible
             // toast — it costs nothing at rest.
             "every 300ms when !empty(toast) -> toast_tick",
+            // the settle-✓'s dismissal clock: two beats — hold + fade, then
+            // unmount. Gated on the flash anchor, so it exists only for the
+            // seconds after one of OUR sends settles.
+            "every 1200ms when !empty(send_flash_id) -> send_flash_tick",
             // the block editor's autosave clock: the stock editor's edits
             // never pass through a handler, so a dirty buffer is the only
             // signal there is — and the gate IS the dirty test, so the tick

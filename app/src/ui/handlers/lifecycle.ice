@@ -220,6 +220,11 @@ on live_updated(next)
   return if next.kind == "retry"
   block_height = keep_i64(next.height >= 0, next.height, block_height)
   channels = apply_chat_channels(channels, next.chat)
+  // Settle-✓ choreography, read against the PRE-fold rows: the settle delta
+  // pops the tick (true), any later live event — the next block at the
+  // latest — starts its fade (false). Same-value writes are no-ops.
+  send_flash = send_settled_by(messages, next.chat, active_channel)
+  send_flash_id = settled_send_id(messages, next.chat, active_channel, send_flash_id)
   messages = apply_chat_messages(messages, next.chat, active_channel)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   thread_messages = apply_chat_thread(thread_messages, next.chat, active_channel, active_thread_seq)
@@ -457,6 +462,11 @@ subscribe
   run node_logs(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "activity") -> node_log_line _
   every 1s when huddle_joined -> tick
   every 300ms when !empty(toast) -> toast_tick
+  // The settle-✓'s dismissal clock: tick one holds the tick on screen and
+  // starts its fade, tick two unmounts it. Gated on an anchored ✓ — it costs
+  // nothing outside the seconds after a send settles. A live delta may start
+  // the fade earlier; this clock is the floor a quiet network needs.
+  every 1200ms when !empty(send_flash_id) -> send_flash_tick
   // The block editor's autosave: the stock editor's edits never pass through
   // a handler, so the gate IS the dirty test — the tick only exists while
   // the buffer has drifted from the last text known saved.
