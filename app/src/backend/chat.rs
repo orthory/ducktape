@@ -148,6 +148,9 @@ pub struct HuddleParticipant {
     pub is_agent: bool,
     pub is_you: bool,
     pub joined_at: i64,
+    /// The member's NODE key (hex) — the overlay identity the call hub fans
+    /// media out to; `call_recipients` steers with exactly these.
+    pub node: String,
 }
 
 /// Render the on-chain huddle roster, marking the row this device holds.
@@ -176,6 +179,7 @@ pub(crate) fn huddle_roster(
                 is_you: mine.as_deref() == Some(member.user.as_str()),
                 joined_at: number_i64(member.joined_at),
                 key: member.user.clone(),
+                node: member.node.clone(),
                 label,
             }
         })
@@ -186,6 +190,16 @@ pub(crate) fn huddle_roster(
 /// button from the LIVE pill with its ✕ Leave.
 pub fn huddle_self(roster: Vec<HuddleParticipant>) -> bool {
     roster.iter().any(|participant| participant.is_you)
+}
+
+/// The call fan-out set: every roster peer's node key, self excluded — the
+/// shape `CallClientControl::Recipients` wants.
+pub fn huddle_recipient_nodes(roster: Vec<HuddleParticipant>) -> Vec<String> {
+    roster
+        .into_iter()
+        .filter(|participant| !participant.is_you)
+        .map(|participant| participant.node)
+        .collect()
 }
 
 // The huddle's elapsed clock is a LOCAL session fact on a NATIVE `every 1s`

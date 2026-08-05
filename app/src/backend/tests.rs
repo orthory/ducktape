@@ -596,6 +596,7 @@ fn a_roster_survives_only_while_this_device_is_in_the_huddle() {
         is_agent: false,
         is_you: true,
         joined_at: 0,
+        node: "aa11".into(),
     }];
     assert_eq!(keep_roster(true, roster.clone()).len(), 1);
     assert!(

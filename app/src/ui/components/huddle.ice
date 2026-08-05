@@ -32,7 +32,7 @@
 // is how iced spells the artifact's `stopPropagation` on a nested control.
 // NOTE: the frozen signature carries no roster, so the artifact's overlapping
 // 18px face stack inside this pill cannot be drawn here (see the report).
-component HuddleLivePill(name:str, elapsed:str)
+component HuddleLivePill(name:str, elapsed:str, muted:bool)
   emits
     pop_huddle
     leave_huddle_here
@@ -44,6 +44,8 @@ component HuddleLivePill(name:str, elapsed:str)
           text "LIVE" size=10.5 wrap=none font=code_medium @text-toast_fg
           if !empty(elapsed)
             text elapsed size=10.5 wrap=none font=code_medium @text-toast_fg
+          if muted
+            Icon name="mic-off" tone="caption" px=11.0
           Icon name="popout" tone="caption" px=11.0
         active bg=transparent text=toast_fg border=transparent border-w=1.0 r=6.0
         hovered bg=ink_hover text=toast_fg
@@ -101,7 +103,7 @@ component HuddleDockedPill(channel:str, elapsed:str)
 // The width is fixed so exactly two tiles fit the 296px panel's wrapping row:
 // 296 less its 1px border either side and its 13px insets leaves 268, and
 // 128 + 8 + 128 is 264.
-component HuddleTile(person:HuddleParticipant)
+component HuddleTile(person:HuddleParticipant, muted:bool)
   box #root w=128.0 pl=8.0 pr=8.0 pt=12.0 pb=12.0 bg=ink_hover r=11.0
     col w=fill gap=6.0 align=center
       if person.is_agent
@@ -115,6 +117,8 @@ component HuddleTile(person:HuddleParticipant)
       // for `you` in its member rows — the huddle grid otherwise renders four
       // identical tiles and never says which one is her.
       row gap=4.0 align=center
+        if muted
+          Icon name="mic-off" tone="caption" px=10.0
         text person.label size=12.0 wrap=none font=medium @text-chevron_idle
         if person.is_you
           text "you" size=9.0 wrap=none font=medium @text-caption
@@ -132,11 +136,12 @@ component HuddleTile(person:HuddleParticipant)
 // any other channel carries THAT channel's roster, and this panel follows you
 // off the huddle's channel. Then a `pin`ned mount in view.ice's full-window
 // stack under `if huddle_joined && huddle_popped`.
-component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant])
+component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], status:str, muted:bool, peers:[CallEvent])
   emits
     dock_huddle
     huddle_go_channel
     leave_huddle_here
+    toggle_call_mute
   box #root w=296.0 bg=toast_bg border=accent_fg border-w=1.0 r=15.0 clip=true shadow=shadow_modal shadow-y=30.0 shadow-blur=70.0
     col w=fill
       box w=fill pl=11.0 pr=11.0 pt=9.0 pb=9.0
@@ -172,10 +177,30 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant])
               text elapsed size=12.0 wrap=none font=code_semibold @text-toast_fg
             if empty(elapsed)
               text "LIVE" size=12.0 wrap=none font=code_semibold @text-toast_fg
+            space w=fill
+            // The call's own word: connecting → live (with any device note),
+            // or the hub's refusal prose — the "Voice connection failed."
+            // black hole this panel used to be.
+            if !empty(status)
+              text status size=10.5 wrap=none font=code_medium @text-caption
           row w=fill gap=8.0 wrap wrap-gap=8.0
             for person in roster
-              HuddleTile person=person
+              HuddleTile person=person muted=keep_bool(person.is_you, muted, call_peer_muted(peers, person.node))
           row w=fill gap=7.0 align=center
+            if !muted
+              button label="Mute the microphone" w=32.0 h=32.0 @icon_action px-0px py-0px -> emit(toggle_call_mute)
+                box w=fill h=fill align-x=center align-y=center
+                  Icon name="mic" tone="caption" px=14.0
+                active bg=ink_hover text=chevron_idle border=transparent border-w=1.0 r=9.0
+                hovered bg=strong_ink text=toast_fg
+                pressed bg=strong_ink text=toast_fg
+            if muted
+              button label="Unmute the microphone" w=32.0 h=32.0 @icon_action px-0px py-0px -> emit(toggle_call_mute)
+                box w=fill h=fill align-x=center align-y=center
+                  Icon name="mic-off" tone="danger" px=14.0
+                active bg=danger_solid text=primary_fg border=transparent border-w=1.0 r=9.0
+                hovered bg=danger_solid_hover text=primary_fg
+                pressed bg=danger_solid_hover text=primary_fg
             button label="Open the huddle channel" @icon_action px-11px py-0px -> emit(huddle_go_channel)
               box h=32.0 align-y=center
                 row gap=3.0 align=center

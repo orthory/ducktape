@@ -29,6 +29,7 @@ daemon Ducktape
 
 use "extern/backend.ice"
 use "extern/editor.ice"
+use "extern/call.ice"
 use "ducktape-ui/default.ice"
 use "theme.ice"
 use "state.ice"

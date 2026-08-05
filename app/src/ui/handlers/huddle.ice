@@ -18,6 +18,19 @@
 //    instant and has none to invent: the surfaces below take `elapsed` as a
 //    STRING precisely so that case can pass "" and render LIVE with no clock.
 
+// One call-session event: fold the status prose, the peer beacons, and — on
+// every event — re-steer the fan-out set to the roster's current node keys
+// (an idle no-op between roster changes, and exactly what the fresh session
+// needs the moment it connects).
+on call_event(event)
+  call_status = call_status_after(call_status, event)
+  call_muted = keep_bool(event.kind == "connecting", false, call_muted)
+  call_peers = apply_call_peer(call_peers, event)
+  call_steered = call_recipients(huddle_recipient_nodes(huddle_roster))
+
+on toggle_call_mute
+  call_muted = call_set_muted(!call_muted)
+
 on pop_huddle
   huddle_popped = true
 
@@ -54,5 +67,8 @@ on leave_huddle_here
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = "huddle"
+  call_status = ""
+  call_muted = false
+  call_peers = []
   error = ""
   run leave_huddle(connected_rpc, password, huddle_channel) -> chat_acked _ | mutation_failed _
