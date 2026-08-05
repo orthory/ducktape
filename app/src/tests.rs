@@ -495,7 +495,6 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     app.message_draft = "channel draft".into();
     app.selected_message_seq = 7;
     app.selected_message_rev = 2;
-    app.hovered_message_seq = 7;
     app.message_action = "editing".into();
     app.message_edit_draft = "message edit".into();
     app.channel_settings_open = true;
@@ -526,7 +525,6 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     assert_eq!(app.active_channel, "fallback-channel");
     assert_eq!(app.selected_message_seq, 0);
     assert_eq!(app.selected_message_rev, 0);
-    assert_eq!(app.hovered_message_seq, 0);
     assert_eq!(app.message_action, "toolbar");
     assert!(app.message_edit_draft.is_empty());
     assert!(!app.channel_settings_open);
@@ -910,14 +908,10 @@ fn message_actions_require_explicit_intent() {
     let (mut app, _) = Ducktape::__boot();
     app.mutation_phase = "idle".into();
 
-    let _ = app.__update(__DucktapeMessage::MessageEntered(7));
-    assert_eq!(app.hovered_message_seq, 7);
     app.chat_pointer_y = 450.0;
     app.chat_height = 500.0;
     let _ = app.__update(__DucktapeMessage::OpenMessageActions(7, "hello".into(), 2));
     assert_eq!(app.message_menu_y, 260.0);
-    let _ = app.__update(__DucktapeMessage::MessageExited(7));
-    assert_eq!(app.hovered_message_seq, 0);
     assert_eq!(app.selected_message_seq, 7);
     assert_eq!(app.message_action, "more");
     let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "hello".into(), 2));
@@ -937,13 +931,6 @@ fn message_actions_require_explicit_intent() {
     let _ = app.__update(__DucktapeMessage::ClearMessageSelection);
     let _ = app.__update(__DucktapeMessage::ArmMessageDelete(7, "hello".into(), 2));
     assert_eq!(app.message_action, "delete");
-    let _ = app.__update(__DucktapeMessage::OpenMessageActionsAccessibly(
-        7,
-        "hello".into(),
-        2,
-    ));
-    assert_eq!(app.message_action, "more");
-    assert_eq!(app.message_menu_y, 0.0);
 }
 
 #[test]
@@ -956,12 +943,13 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         .split_once("component ThreadMessageCard")
         .unwrap()
         .0;
-    assert!(toolbar.contains("mouse enter=emit(message_entered, message.seq)"));
-    assert!(toolbar.contains("if !message.deleted && !message.pending && hovered"));
-    assert!(toolbar.contains("if !message.deleted && !message.pending && !hovered"));
-    assert!(toolbar.contains("-> emit(open_message_actions_accessibly, message.seq, message.body, message.rev)"));
-    assert!(!toolbar.contains("hovered || selected"));
-    assert_eq!(toolbar.matches("w=26.0 h=26.0").count(), 1);
+    // Hover is DRAW-TIME: the `hover` widget reveals the toolbar under the
+    // cursor with no enter/exit routes and no hovered state — a cached lazy
+    // row keeps native-latency hover.
+    assert!(toolbar.contains("hover tint=row_hover r=9.0"));
+    assert!(toolbar.contains("if !message.deleted && !message.pending"));
+    assert!(!toolbar.contains("&& hovered"));
+    assert!(!toolbar.contains("mouse enter="));
     // the artifact's hover bar is five 27×25 cells: three one-tap reactions,
     // the reaction picker and the overflow menu (Console:244).
     assert_eq!(toolbar.matches("w=27.0 h=25.0").count(), 5);
@@ -1088,7 +1076,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     ] {
         assert!(chat.contains(&format!("input \"\" {focus}")));
     }
-    assert_eq!(handlers.matches("task widget focus-next").count(), 7);
+    assert_eq!(handlers.matches("task widget focus-next").count(), 6);
     assert!(!include_str!("ui/extern/backend.ice").contains("task focus_next()"));
     let activate = handlers
         .split_once("on begin_message_edit(seq, body, rev)\n")
@@ -1107,9 +1095,7 @@ fn thread_messages_mirror_the_main_action_system() {
         .split_once("component ThreadMessageCard")
         .unwrap()
         .1;
-    assert!(card.contains(
-        "mouse enter=emit(thread_message_entered, message.seq) exit=emit(thread_message_exited, message.seq)"
-    ));
+    assert!(card.contains("hover tint=row_hover r=9.0"));
     assert!(
         card.contains(
             "-> emit(open_thread_message_reactions, message.seq, message.body, message.rev)"

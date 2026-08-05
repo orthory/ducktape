@@ -99,7 +99,6 @@ on reconnect
   channel_name_draft = ""
   member_key_draft = ""
   selected_message_seq = 0
-  hovered_message_seq = 0
   selected_message_rev = 0
   message_action = "toolbar"
   message_edit_draft = ""
@@ -264,7 +263,6 @@ on live_resynced(next)
   selected_message_rev = message_seq_after_failure(selected_message_rev, "message-edit", selected_message_seq <= 0)
   message_action = message_action_after_failure(message_action, "message-edit", selected_message_seq <= 0)
   message_edit_draft = message_text_after_failure(message_edit_draft, "message-edit", selected_message_seq <= 0)
-  hovered_message_seq = refreshed_required_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), hovered_message_seq)
   channel_settings_open = channel_settings_open && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel)
   channel_name_draft = retain_for_endpoint(channel_name_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   member_key_draft = retain_for_endpoint(member_key_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))

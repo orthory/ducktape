@@ -41,7 +41,7 @@ view
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
         chat:
-          ChatScreen account_name=account_name connected_rpc=connected_rpc status=status block_height=block_height search_draft<->chat_search_draft searching=chat_searching search_hits=chat_search_hits channels=channels dm_peers=dm_peers channel_reads=channel_reads user_key=settings_user_key channel_create_open=channel_create_open connected=connected loading=loading mutation_phase=mutation_phase active_channel=active_channel active_dm_peer=active_dm_peer active_channel_name=active_channel_name active_channel_archived=active_channel_archived active_channel_members_only=active_channel_members_only channel_members=channel_members huddle_joined=huddle_joined huddle_channel=huddle_channel huddle_channel_name=huddle_channel_name huddle_joined_at=huddle_joined_at huddle_now=huddle_now call_muted=call_muted messages=messages history_view=history_view history_loading=history_loading unread_boundary=unread_boundary unread_marker_seq=unread_marker_seq selected_message_seq=selected_message_seq hovered_message_seq=hovered_message_seq selected_message_rev=selected_message_rev message_action=message_action message_menu_y=message_menu_y message_action_focus<->message_action_focus message_edit_draft<->message_edit_draft failed_message_draft=failed_message_draft message_editor<->message_editor channel_settings_open=channel_settings_open channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft active_thread_seq=active_thread_seq thread_target_seq=thread_target_seq thread_messages=thread_messages thread_hovered_seq=thread_hovered_seq thread_selected_seq=thread_selected_seq thread_selected_rev=thread_selected_rev thread_message_action=thread_message_action thread_menu_y=thread_menu_y thread_edit_draft<->thread_edit_draft thread_has_more=thread_has_more thread_next_reply_offset=thread_next_reply_offset thread_loading=thread_loading failed_reply_draft=failed_reply_draft reply_editor<->reply_editor shift_held=shift_held #chat
+          ChatScreen account_name=account_name connected_rpc=connected_rpc status=status block_height=block_height search_draft<->chat_search_draft searching=chat_searching search_hits=chat_search_hits channels=channels dm_peers=dm_peers channel_reads=channel_reads user_key=settings_user_key channel_create_open=channel_create_open connected=connected loading=loading mutation_phase=mutation_phase active_channel=active_channel active_dm_peer=active_dm_peer active_channel_name=active_channel_name active_channel_archived=active_channel_archived active_channel_members_only=active_channel_members_only channel_members=channel_members huddle_joined=huddle_joined huddle_channel=huddle_channel huddle_channel_name=huddle_channel_name huddle_joined_at=huddle_joined_at huddle_now=huddle_now call_muted=call_muted messages=messages history_view=history_view history_loading=history_loading unread_boundary=unread_boundary unread_marker_seq=unread_marker_seq selected_message_seq=selected_message_seq selected_message_rev=selected_message_rev message_action=message_action message_menu_y=message_menu_y message_action_focus<->message_action_focus message_edit_draft<->message_edit_draft failed_message_draft=failed_message_draft message_editor<->message_editor channel_settings_open=channel_settings_open channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft active_thread_seq=active_thread_seq thread_target_seq=thread_target_seq thread_messages=thread_messages thread_selected_seq=thread_selected_seq thread_selected_rev=thread_selected_rev thread_message_action=thread_message_action thread_menu_y=thread_menu_y thread_edit_draft<->thread_edit_draft thread_has_more=thread_has_more thread_next_reply_offset=thread_next_reply_offset thread_loading=thread_loading failed_reply_draft=failed_reply_draft reply_editor<->reply_editor shift_held=shift_held #chat
             events
               search_chat_submit -> search_chat_submit
               clear_chat_search -> clear_chat_search
@@ -56,13 +56,10 @@ view
               join_huddle_submit -> join_huddle_submit
               chat_pointer_pressed -> chat_pointer_pressed _ _
               load_more_history -> load_more_history
-              message_entered -> message_entered _
-              message_exited -> message_exited _
               add_reaction_at -> add_reaction_at _ _
               remove_reaction_at -> remove_reaction_at _ _
               open_thread_for -> open_thread_for _
               open_message_actions -> open_message_actions _ _ _
-              open_message_actions_accessibly -> open_message_actions_accessibly _ _ _
               open_message_reactions -> open_message_reactions _ _ _
               begin_message_edit -> begin_message_edit _ _ _
               arm_message_delete -> arm_message_delete _ _ _
@@ -81,8 +78,6 @@ view
               remove_channel_member_submit -> remove_channel_member_submit _
               thread_pointer_pressed -> thread_pointer_pressed _ _
               close_thread -> close_thread
-              thread_message_entered -> thread_message_entered _
-              thread_message_exited -> thread_message_exited _
               open_thread_message_actions -> open_thread_message_actions _ _ _
               open_thread_message_reactions -> open_thread_message_reactions _ _ _
               begin_thread_message_edit -> begin_thread_message_edit _ _ _

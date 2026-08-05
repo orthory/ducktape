@@ -41,7 +41,6 @@ state
   channel_name_draft = ""
   member_key_draft = ""
   selected_message_seq:i64 = 0
-  hovered_message_seq:i64 = 0
   chat_pointer_y = 0.0
   chat_height = 720.0
   message_menu_y = 0.0
@@ -59,7 +58,6 @@ state
   live_thread_generation:i64 = 0
   thread_selected_seq:i64 = 0
   thread_selected_rev:i64 = 0
-  thread_hovered_seq:i64 = 0
   thread_message_action = "toolbar"
   thread_edit_draft = ""
   thread_pointer_y = 0.0
