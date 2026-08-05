@@ -26,7 +26,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
     toggle_page_create()
     create_page_submit()
     choose_page(str)
-    pages_pointer_moved(f64, f64)
+    pages_pointer_pressed(f64, f64)
     search_pages_submit()
     clear_page_search()
     arm_page_delete()
@@ -102,7 +102,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                   choose_page
     box w=1.0 h=fill bg=separator
       space w=1.0 h=1.0
-    mouse move=emit(pages_pointer_moved, _, _)
+    mouse press-at=emit(pages_pointer_pressed, _, _)
       row w=fill h=fill
         col w=fill h=fill
           // The 50px document header bar: the page title and the one

@@ -52,7 +52,7 @@ pub struct ChatMember {
     pub label: String,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     pub id: String,
     pub seq: i64,
@@ -79,6 +79,56 @@ pub struct ChatMessage {
     /// seconds: render it as a height, never as a wall clock. 0 while pending.
     pub time: i64,
     pub reactions: Vec<ChatReaction>,
+}
+
+/// The lazy-row dependency hash. `body` and `blocks` are deliberately NOT
+/// hashed: they are the bulk of the record, and every visible change to them
+/// arrives with a field this impl does hash — an edit bumps `rev` (the
+/// optimistic-concurrency token `edit_message` requires), a delete flips
+/// `deleted`, and the optimistic settle flips `pending`/`height`. Hashing the
+/// full text again made every view rebuild re-hash the whole conversation:
+/// the stream's `lazy` rows compare exactly this hash once per rebuild.
+impl std::hash::Hash for ChatMessage {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Self {
+            id,
+            seq,
+            author,
+            meta,
+            body: _,
+            blocks: _,
+            pending,
+            rev,
+            edited,
+            deleted,
+            reply_count,
+            thread_seq,
+            show_author,
+            initial,
+            avatar_kind,
+            mine,
+            height,
+            time,
+            reactions,
+        } = self;
+        id.hash(state);
+        seq.hash(state);
+        author.hash(state);
+        meta.hash(state);
+        pending.hash(state);
+        rev.hash(state);
+        edited.hash(state);
+        deleted.hash(state);
+        reply_count.hash(state);
+        thread_seq.hash(state);
+        show_author.hash(state);
+        initial.hash(state);
+        avatar_kind.hash(state);
+        mine.hash(state);
+        height.hash(state);
+        time.hash(state);
+        reactions.hash(state);
+    }
 }
 
 impl Default for ChatMessage {

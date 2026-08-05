@@ -402,7 +402,14 @@ on message_exited(seq)
   return if hovered_message_seq != seq
   hovered_message_seq = 0
 
-on chat_pointer_moved(_x, y)
+// PRESSES, NOT MOVES. The pointer y is read exactly once — when an action
+// menu opens, to anchor its float — so it is captured per left press by
+// `press-at`, which reports through a captured press (the ⋯ button's own
+// press-down lands here first, then its click opens the menu one event
+// later). The old `move=` stream republished on every cursor pixel and
+// rebuilt the whole view each time; hovering a busy channel was a rebuild
+// storm.
+on chat_pointer_pressed(_x, y)
   chat_pointer_y = y
 
 on chat_resized(_width, height)
@@ -415,7 +422,7 @@ on thread_message_exited(seq)
   return if thread_hovered_seq != seq
   thread_hovered_seq = 0
 
-on thread_pointer_moved(_x, y)
+on thread_pointer_pressed(_x, y)
   thread_pointer_y = y
 
 on thread_resized(_width, height)

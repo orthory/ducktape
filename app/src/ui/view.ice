@@ -50,7 +50,7 @@ view
               leave_huddle_here -> leave_huddle_here
               huddle_go_channel -> huddle_go_channel
               join_huddle_submit -> join_huddle_submit
-              chat_pointer_moved -> chat_pointer_moved _ _
+              chat_pointer_pressed -> chat_pointer_pressed _ _
               load_more_history -> load_more_history
               message_entered -> message_entered _
               message_exited -> message_exited _
@@ -75,7 +75,7 @@ view
               unarchive_channel_submit -> unarchive_channel_submit
               add_channel_member_submit -> add_channel_member_submit
               remove_channel_member_submit -> remove_channel_member_submit _
-              thread_pointer_moved -> thread_pointer_moved _ _
+              thread_pointer_pressed -> thread_pointer_pressed _ _
               close_thread -> close_thread
               thread_message_entered -> thread_message_entered _
               thread_message_exited -> thread_message_exited _
@@ -99,7 +99,7 @@ view
               toggle_page_create -> toggle_page_create
               create_page_submit -> create_page_submit
               choose_page -> choose_page _
-              pages_pointer_moved -> pages_pointer_moved _ _
+              pages_pointer_pressed -> pages_pointer_pressed _ _
               search_pages_submit -> search_pages_submit
               clear_page_search -> clear_page_search
               arm_page_delete -> arm_page_delete
