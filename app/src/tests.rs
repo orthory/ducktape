@@ -962,20 +962,20 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     // four cells are the artifact's own typographic glyphs, not icons.
     assert_eq!(toolbar.matches("p=5.0 @icon_action").count(), 1);
     assert!(components.contains(
-        "text message.author size=13.0 wrap=none font=display @text-fg\n          if message.avatar_kind == \"agent\""
+        "text message.author size=13.0 wrap=none font=display @text-fg\n            if message.avatar_kind == \"agent\""
     ));
     // the stamp beside the author is the block the message was finalized
     // in — a chain fact the app can prove, never a wall-clock time.
     assert!(components.contains(
-        "if message.height > 0\n            text height_label_short(message.height) size=11.0 wrap=none font=code_medium @text-hint"
+        "if message.height > 0\n              text height_label_short(message.height) size=11.0 wrap=none font=code_medium @text-hint"
     ));
     // Slack-style grouping: the shared avatar + author header only renders
     // for a run's first message; continuations keep the body aligned via a
     // gutter that matches the avatar's width.
     assert!(components.contains(
-        "if message.show_author\n      MessageAvatar initials=message.initial kind=message.avatar_kind"
+        "if message.show_author\n        MessageAvatar initials=message.initial kind=message.avatar_kind"
     ));
-    assert!(components.contains("if !message.show_author\n      space w=30.0"));
+    assert!(components.contains("if !message.show_author\n        space w=30.0"));
     assert!(components.contains("\"human\"\n        PersonAvatar initials=initials plate=30.0 ink=11.0"));
     assert!(components.contains("\"agent\"\n        AgentAvatar initials=initials plate=30.0 ink=11.0"));
     assert!(!components.contains("avatar_style"));
