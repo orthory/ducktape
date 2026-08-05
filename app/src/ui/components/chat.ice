@@ -193,10 +193,18 @@ component MessageContents(message:ChatMessage, flash:f64)
     // `flash` prop is the animation's opacity — nonzero only on the row the
     // stream's flash arm anchors). Replaces the old "finalizing…" chip line
     // that restyled the whole message.
+    //
+    // The pr=7 inset is load-bearing: it tucks the indicator fully inside
+    // the hover toolbar's opaque plate (which ends 8px in from the card
+    // edge, rounded r=9), so hovering OCCLUDES the ✓ instead of leaving a
+    // sliver poking past the plate. The indicator is transient decoration;
+    // the toolbar wins the corner while the cursor is on the row.
     if message.pending
-      svg icon("dot") memory w=7.0 h=7.0 style=icon_tint("hint") opacity=0.55
+      box pr=7.0
+        svg icon("dot") memory w=7.0 h=7.0 style=icon_tint("hint") opacity=0.55
     if !message.pending && flash > 0.0
-      svg icon("check") memory w=13.0 h=13.0 style=icon_tint("success-tick") opacity=flash
+      box pr=7.0
+        svg icon("check") memory w=13.0 h=13.0 style=icon_tint("success-tick") opacity=flash
 
 component MessageCard(message:ChatMessage, selected:bool, disabled:bool, flash:f64)
   emits
