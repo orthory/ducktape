@@ -6,7 +6,7 @@ extern crate::backend
   ChatSpan(text:str, bold:bool, italic:bool, highlight:bool, link:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
   ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, mine:bool, height:i64, time:i64, reactions:[ChatReaction])
-  HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64)
+  HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
   ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
   SendReceipt(operation_id:str, channel_id:str)
   ChatDelta(kind:str, channel_id:str, seq:i64, root_seq:i64, message:ChatMessage, channel:ChatChannel, name:str, archived:bool, emoji:str, added:bool, reactor:str, by_me:bool, member:ChatMember)
@@ -331,6 +331,8 @@ extern crate::backend
   sync block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
   sync reaction_palette() -> [str]
   sync keep_participants(loaded:bool, next:[HuddleParticipant], current:[HuddleParticipant]) -> [HuddleParticipant]
+  sync huddle_recipient_nodes(roster:[HuddleParticipant]) -> [str]
+  sync huddle_refresh_hits(delta:ChatDelta, active_channel:str) -> bool
   load_chat(rpc:str, channel_id:str) -> ChatData ! AppError
   load_chat_hit(rpc:str, channel_id:str, root_seq:i64, target_seq:i64) -> ChatData ! AppError
   create_channel(rpc:str, password:str, name:str, members_only:bool) -> ChatData ! AppError

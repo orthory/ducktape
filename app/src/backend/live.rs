@@ -403,6 +403,16 @@ pub fn keep_roster(joined: bool, next: Vec<HuddleParticipant>) -> Vec<HuddlePart
     if joined { next } else { Vec::new() }
 }
 
+/// A huddle roster changed on the channel ON SCREEN. The delta path answers
+/// the sidebar dot through the refreshed channel row, but `huddle_joined` and
+/// `huddle_roster` are recomputed only by a chat reload — and the join/leave
+/// ack path carries no roster at all — so exactly this delta must trigger
+/// one. Without it the LIVE pill appeared only after a manual channel
+/// re-pick (or a restart), which read as "huddle does nothing".
+pub fn huddle_refresh_hits(delta: ChatDelta, active_channel: String) -> bool {
+    delta.kind == "channel-updated" && delta.channel_id == active_channel
+}
+
 /// [`keep_roster`]'s loaded-gated half: a resync that did NOT load chat must
 /// leave the roster alone rather than blank it.
 pub fn keep_participants(

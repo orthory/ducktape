@@ -25,8 +25,13 @@ pages.workspace = true
 # `sdk::Origin::External(..).actor_string()` on the product path, so a
 # dev-dependency here builds every TEST lane and breaks only the BINARY.
 sdk.workspace = true
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+# The huddle's media leg (`src/call.rs`): microphone/speaker streams and the
+# `/v1/call/ws` socket the node's call hub serves.
+cpal = "0.15"
+tokio-tungstenite = "0.24"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "lazy", "svg", "tokio", "wgpu", "x11"] }
 ducktape-ui = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "61194fd", default-features = false, features = ["full"] }

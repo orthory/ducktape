@@ -241,12 +241,15 @@ on live_updated(next)
   bell_unread = bell_unread_after(bell_unread, bell_items, next.bell)
   bell_items = apply_bell(bell_items, next.bell)
   forge_discussion = apply_chat_messages(forge_discussion, next.chat, forge_item_channel)
-  return if !forge_live_hit(next.kind, next.module) && !next.load_chat && !next.load_pages
+  // A huddle change on the ACTIVE channel forces the chat resync the delta
+  // path cannot carry: `huddle_joined`/`huddle_roster` are answered only by
+  // a full chat load (see `huddle_refresh_hits`).
+  return if !forge_live_hit(next.kind, next.module) && !next.load_chat && !next.load_pages && !huddle_refresh_hits(next.chat, active_channel)
   forge_generation = keep_i64(forge_live_hit(next.kind, next.module), forge_generation + 1, forge_generation)
-  hydration_generation = keep_i64(next.load_chat || next.load_pages, hydration_generation + 1, hydration_generation)
-  hydration_retry_attempt = keep_i64(next.load_chat || next.load_pages, 0, hydration_retry_attempt)
+  hydration_generation = keep_i64(next.load_chat || next.load_pages || huddle_refresh_hits(next.chat, active_channel), hydration_generation + 1, hydration_generation)
+  hydration_retry_attempt = keep_i64(next.load_chat || next.load_pages || huddle_refresh_hits(next.chat, active_channel), 0, hydration_retry_attempt)
   parallel
-    run live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
+    run live_resync_load(connected_rpc, active_channel, active_page, resync_planes((next.load_chat || huddle_refresh_hits(next.chat, active_channel)), next.load_pages), next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
     run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, forge_generation) -> forge_refreshed _ | forge_failed _
 
 on live_resynced(next)
@@ -446,6 +449,11 @@ on tick
 // have taken the log console dark without a word.
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
+  // THE CALL SESSION IS THIS SUBSCRIPTION. Joining a huddle flips
+  // `huddle_joined` and the media leg connects; leaving (or disconnecting)
+  // stops the subscription, the stream drops, and the websocket + audio
+  // threads tear down with it. No imperative start/stop anywhere.
+  run call_session(connected_rpc, huddle_channel) when (connected && huddle_joined && !empty(huddle_channel)) -> call_event _
   keyboard press when (connected || palette_open) -> global_key_pressed _
   keyboard modifiers -> modifiers_changed _
   window file-dropped -> fs_file_dropped _

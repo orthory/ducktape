@@ -329,6 +329,12 @@ state
   huddle_joined_at:i64 = 0
   huddle_now:i64 = 0
   huddle_popped = false
+  // The live call session's surface: status prose, the local mute, and the
+  // peers' 1 Hz beacons (kind="peer" rows keyed by node key).
+  call_status = ""
+  call_muted = false
+  call_peers:[CallEvent] = []
+  call_steered = false
   huddle_roster:[HuddleParticipant] = []
   // The event inspector every finality mark opens.
   // EXPLORER — one query across every module, filtered by result kind.
