@@ -343,6 +343,11 @@ block = { path = "patches/block" }
 # dev binary from ~516 MB to a fraction of that.
 [profile.dev.package.ducktape-app]
 debug = 0
+# Deliberately NOT opt-level'd: A/B-measured zero win on the module-switch
+# stall (570 ms with and without opt-level 1) at a 5x compile-time cost on
+# the one crate app work always touches. The switch cost lives in the
+# already-optimized shaping/layout stack, ~10 ms per cold-rebuilt row — see
+# the ducktape-ui stanza below.
 
 # `make dev` runs the desktop app under the dev profile, and an unoptimized
 # GUI stack is a lag machine on its own: cosmic-text shapes every glyph run
@@ -351,6 +356,22 @@ debug = 0
 # (a `package."*"` wildcard would drag the node's wasmtime universe to O2,
 # which this box cannot compile reliably — #887).
 [profile.dev.package.iced]
+opt-level = 2
+
+# The ice framework layer itself — the widget builders, layout drivers and
+# memo/lazy machinery every view rebuild runs through. These were the LAST
+# opt-0 crates on the view hot path (iced/wgpu/cosmic-text below were already
+# covered), and they are what a module switch actually spends: measured on
+# this box, Pages->Chat with 40 mounted rows stalled ~700 ms with these at
+# opt-0. They rebuild only on a pin bump (ducktape-ui) or rarely (design), so
+# the compile-time cost of optimizing them is paid almost never.
+[profile.dev.package.ducktape-ui]
+opt-level = 2
+
+[profile.dev.package.ui-lang-runtime]
+opt-level = 2
+
+[profile.dev.package.design]
 opt-level = 2
 
 [profile.dev.package.iced_core]
