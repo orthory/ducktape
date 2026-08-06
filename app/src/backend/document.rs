@@ -182,7 +182,7 @@ pub async fn save_page_document(
         });
     }
     if ops.is_empty() {
-        let data = load_selected_page_data(&client, &page_id, "")
+        let data = load_selected_page_data(&client, &page_id)
             .await
             .map_err(failed)?;
         return Ok(DocumentSaveResult {
@@ -218,7 +218,7 @@ pub async fn save_page_document(
         }
     }
 
-    let data = load_selected_page_data(&client, &page_id, "")
+    let data = load_selected_page_data(&client, &page_id)
         .await
         .map_err(failed)?;
     Ok(DocumentSaveResult {

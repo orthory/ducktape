@@ -240,7 +240,6 @@ state
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_title_selected = false
   // THE PAGE IS ONE BUFFER. `page_editor` holds the whole document; its drift
   // from `page_saved_text` (the last text known written) IS the dirty signal,
   // because the editor's own edits never pass through a handler. The save tick

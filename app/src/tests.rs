@@ -424,7 +424,7 @@ fn context_destroying_page_handlers_recover_drafts() {
     // node's text on the next load. A half-typed COMMENT still has nowhere
     // else to live, so every context-destroying handler still guards it.
     for name in [
-        "open_page_search_hit(page_id, block_id)",
+        "open_page_search_hit(page_id, _block_id)",
         "choose_page(id)",
         "toggle_block_comments",
         "pages_mutated(next)",
@@ -2085,8 +2085,6 @@ fn live_comment_refresh_updates_threads_without_touching_the_draft() {
             checked: false,
             prefix: String::new(),
             child_count: 0,
-            mark_count: 0,
-            spans: Vec::new(),
         }],
     )));
     let generation = app.block_comments_generation;

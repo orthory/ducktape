@@ -19,9 +19,8 @@ extern crate::backend
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
   ChatSearchData(generation:i64, hits:[ChatSearchHit])
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
-  PageBlock(key:i64, id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64, mark_count:i64, spans:[ChatSpan])
-  PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, selected_block_id:str, selected_block_kind:str, selected_block_text:str, selected_block_checked:bool, page_title_selected:bool)
-  BlockInsertResult(data:PagesData, operation_id:str, page_id:str)
+  PageBlock(key:i64, id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64)
+  PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
   PageCommentThread(id:str, author:str, meta:str, resolved:bool, comment_count:i64)
   PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
   BlockThreadListData(generation:i64, target:str, from:i64, threads:[PageCommentThread], total:i64, next_from:i64, has_more:bool)
@@ -30,7 +29,6 @@ extern crate::backend
   PageSearchHit(page_id:str, block_id:str, kind:str, text:str)
   PageSearchData(generation:i64, hits:[PageSearchHit])
   PaletteSearchData(generation:i64, chat_hits:[ChatSearchHit], page_hits:[PageSearchHit])
-  AutosaveResult(generation:i64, written:bool)
   // `refusal` is not a failure: the write was NOT attempted because carrying it
   // out would have destroyed records. `document` is the canonical text either
   // way — the buffer takes it, which is what rolls an illegal edit back.
@@ -314,7 +312,6 @@ extern crate::backend
   sync thread_loading_after_refresh(loading:bool, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> bool
   sync retain_thread_messages(messages:[ChatMessage], root_seq:i64) -> [ChatMessage]
   sync cancel_autosaves(rpc:str, generation:i64) -> i64
-  sync follow_kind(kind:str) -> str
   sync remember_orphaned_comment_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str) -> [str]
   sync remove_recovered_draft(drafts:[str], recovered:str) -> [str]
   sync retain_drafts_for_endpoint(drafts:[str], current:str, next:str) -> [str]
@@ -355,7 +352,7 @@ extern crate::backend
   add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   search_chat(rpc:str, channel_id:str, text:str, generation:i64) -> ChatSearchData ! HydrationError
-  load_page(rpc:str, page_id:str, selected_block_id:str) -> PagesData ! AppError
+  load_page(rpc:str, page_id:str) -> PagesData ! AppError
   load_block_threads(rpc:str, target:str, from:i64, generation:i64) -> BlockThreadListData ! HydrationError
   load_page_threads(rpc:str, page_id:str, generation:i64) -> BlockThreadListData ! HydrationError
   load_block_comment_page(rpc:str, target:str, thread_id:str, from:i64, generation:i64) -> BlockCommentData ! HydrationError
@@ -376,6 +373,5 @@ extern crate::backend
   sync refreshed_page_editor(document:editor, title:str, blocks:[PageBlock], saved:str) -> editor
   sync refreshed_page_saved(document:editor, title:str, blocks:[PageBlock], saved:str) -> str
   sync saved_baseline(written:bool, canonical:str, submitted:str) -> str
-  set_block_checked(rpc:str, password:str, page_id:str, block_id:str, checked:bool) -> PagesData ! AppError
   search_pages(rpc:str, page_id:str, text:str, generation:i64) -> PageSearchData ! HydrationError
   palette_search(rpc:str, text:str, generation:i64) -> PaletteSearchData ! HydrationError

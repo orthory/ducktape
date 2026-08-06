@@ -83,20 +83,3 @@ component PageCommentCard(comment:PageComment)
         text comment.author w=fill size=12.0 wrap=none font=display @text-primary
         text comment.meta size=10.5 wrap=none font=code_medium @text-label
       text comment.text w=fill size=12.0 line-h=1.55 wrap=word @text-panel_tile
-// The pages body's rich runs — chat's RichLine at the document body metrics.
-// Word-level spans reflow in a wrapping flex; links and mentions light up
-// exactly as the chat renderer paints them. Headings, quotes, callouts and
-// code keep their single plain run — their own fonts already carry the voice.
-component PageRichLine(spans:[ChatSpan], line_h:f64)
-  flex w=fill wrap=wrap gap-x=0.0 gap-y=4.0 items=start
-    for span in spans
-      if span.highlight
-        text span.text size=14.0 line-h=line_h font=medium @text-brand
-      if !span.highlight && span.bold && span.italic
-        text span.text size=14.0 line-h=line_h font=strongitalic @text-accent_fg
-      if !span.highlight && span.bold && !span.italic
-        text span.text size=14.0 line-h=line_h font=strong @text-accent_fg
-      if !span.highlight && !span.bold && span.italic
-        text span.text size=14.0 line-h=line_h font=italic @text-accent_fg
-      if !span.highlight && !span.bold && !span.italic
-        text span.text size=14.0 line-h=line_h @text-accent_fg

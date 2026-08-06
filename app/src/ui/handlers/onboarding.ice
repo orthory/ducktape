@@ -231,7 +231,6 @@ on console_opened(id)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_title_selected = false
   page_editor = editor("")
   page_saved_text = ""
   page_inflight_text = ""

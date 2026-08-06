@@ -132,7 +132,6 @@ on reconnect
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_title_selected = false
   page_editor = editor("")
   page_saved_text = ""
   page_refusal = ""
@@ -315,7 +314,6 @@ on live_resynced(next)
   block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)
   pending_block_comment = retain_selected_string(pending_block_comment, block_comments_target)
   page_delete_armed = page_delete_armed && active_page == keep_str(next.pages_loaded, next.active_page, active_page)
-  page_title_selected = page_title_selected && active_page == keep_str(next.pages_loaded, next.active_page, active_page)
   active_page = keep_str(next.pages_loaded, next.active_page, active_page)
   active_page_title = keep_str(next.pages_loaded, next.active_page_title, active_page_title)
   active_page_parent = keep_str(next.pages_loaded, next.active_page_parent, active_page_parent)

@@ -404,16 +404,6 @@ pub fn retain_drafts_for_endpoint(
     if current == next { drafts } else { Vec::new() }
 }
 
-/// The kind a fresh block continues with after Enter: list-like kinds repeat
-/// themselves (a bullet's Enter makes the next bullet), everything else
-/// starts a plain Text block.
-pub fn follow_kind(kind: String) -> String {
-    match kind.as_str() {
-        "Bullet" | "Number" | "Todo" | "Toggle" => kind,
-        _ => "Text".into(),
-    }
-}
-
 pub fn retain_selected_string(value: String, selected_id: String) -> String {
     if selected_id.is_empty() {
         String::new()

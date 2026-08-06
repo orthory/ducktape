@@ -709,8 +709,6 @@ mod tests {
             checked: false,
             prefix: INDENT.repeat(depth),
             child_count: 0,
-            mark_count: 0,
-            spans: Vec::new(),
         }
     }
 

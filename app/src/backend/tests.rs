@@ -1381,16 +1381,9 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     assert_eq!(pages.blocks[0].text, "A signed page block");
 
     let origin = rpc.origin().to_string();
-    let selected_page = load_page(origin.clone(), "welcome".into(), "intro".into())
-        .await
-        .unwrap();
-    assert_eq!(selected_page.selected_block_id, "intro");
-    assert_eq!(selected_page.selected_block_text, "A signed page block");
-    let selected_title = load_page(origin.clone(), "welcome".into(), "welcome".into())
-        .await
-        .unwrap();
-    assert!(selected_title.page_title_selected);
-    assert!(selected_title.selected_block_id.is_empty());
+    let loaded_page = load_page(origin.clone(), "welcome".into()).await.unwrap();
+    assert_eq!(loaded_page.active_page, "welcome");
+    assert_eq!(loaded_page.blocks[0].text, "A signed page block");
     let workspace = connect(origin.clone()).await.unwrap();
     let mut live = live_events(origin.clone());
     let ready = live.next().await.unwrap();
@@ -1822,27 +1815,8 @@ fn page_updates_preserve_exact_text() {
 }
 
 #[test]
-fn autosave_keeps_only_the_latest_ticket() {
-    let key = "autosave-test";
-    let first = begin_autosave(key);
-    let latest = begin_autosave(key);
-    assert!(!autosave_is_current(key, first));
-    assert!(autosave_is_current(key, latest));
-    assert!(!finish_autosave(key, first));
-    assert!(finish_autosave(key, latest));
-    assert!(!autosave_is_current(key, latest));
-}
-
-#[test]
-fn reconnect_cancels_only_the_previous_endpoint_autosaves() {
-    let old_key = "http://old\0page";
-    let other_key = "http://other\0page";
-    let old_ticket = begin_autosave(old_key);
-    let other_ticket = begin_autosave(other_key);
-
+fn cancelling_autosaves_bumps_the_generation() {
     assert_eq!(cancel_autosaves("http://old".into(), 4), 5);
-    assert!(!autosave_is_current(old_key, old_ticket));
-    assert!(finish_autosave(other_key, other_ticket));
 }
 
 #[test]

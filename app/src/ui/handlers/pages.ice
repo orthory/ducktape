@@ -23,7 +23,7 @@ on clear_page_search
   page_search_hits = []
   page_searching = false
 
-on open_page_search_hit(page_id, block_id)
+on open_page_search_hit(page_id, _block_id)
   return if loading || mutation_phase != "idle"
   palette_open = false
   shell_tab = "pages"
@@ -50,11 +50,10 @@ on open_page_search_hit(page_id, block_id)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_title_selected = false
   block_autosave_status = "idle"
   page_delete_armed = false
   error = ""
-  run load_page(connected_rpc, page_id, block_id) -> pages_updated _ | failed _
+  run load_page(connected_rpc, page_id) -> pages_updated _ | failed _
 
 on choose_page(id)
   return if loading || mutation_phase != "idle"
@@ -81,11 +80,10 @@ on choose_page(id)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_title_selected = false
   block_autosave_status = "idle"
   page_delete_armed = false
   error = ""
-  run load_page(connected_rpc, id, "") -> pages_updated _ | failed _
+  run load_page(connected_rpc, id) -> pages_updated _ | failed _
 
 on create_page_submit
   return if loading || mutation_phase != "idle" || empty(trim(page_draft))
@@ -332,7 +330,6 @@ on pages_updated(next)
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
-  page_title_selected = next.page_title_selected
   // A page LOAD always installs its own text: there is no draft to protect,
   // because the buffer belonged to the page being left.
   page_editor = editor(page_document_text(active_page_title, blocks))
@@ -369,7 +366,6 @@ on pages_mutated(next)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_title_selected = next.page_title_selected
   // A MUTATION MUST NOT EAT A KEYSTROKE. Creating a page or posting a comment
   // does not touch this document, so the buffer is replaced only when it is
   // clean AND the node's text actually differs.
@@ -394,7 +390,7 @@ on close_doc_tab(id)
   closing_doc_tab = ""
   parallel
     run save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
-    run load_page(connected_rpc, active_page, "") -> pages_updated _ | failed _
+    run load_page(connected_rpc, active_page) -> pages_updated _ | failed _
 
 // THE DOCUMENT'S ONE EDIT ROUTE. Every key lands here: `apply_page_action`
 // resolves the list/indent behaviours in the buffer and NOTHING reaches the

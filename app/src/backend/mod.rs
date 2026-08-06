@@ -24,8 +24,8 @@ pub use ::chat::client::{
     append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
     apply_chat_thread, author_name, chat_message, contains_pending_message, mark_message_groups,
     merge_message_send_result, merge_pending_messages, merge_thread_reply, optimistic_message,
-    parse_message_with_members, plain_rich_spans, reply_settled_by, rollback_pending_message,
-    send_settled_by, settled_reply_id, settled_send_id, short_label, thread_offset_after_reply,
+    parse_message_with_members, reply_settled_by, rollback_pending_message, send_settled_by,
+    settled_reply_id, settled_send_id, short_label, thread_offset_after_reply,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
@@ -189,10 +189,6 @@ pub struct PageBlock {
     pub checked: bool,
     pub prefix: String,
     pub child_count: i64,
-    pub mark_count: i64,
-    /// Word-level rich runs of `text` (chat's inline grammar); empty means the
-    /// block renders as one plain wrapping `text`.
-    pub spans: Vec<ChatSpan>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -202,18 +198,6 @@ pub struct PagesData {
     pub active_page: String,
     pub active_page_title: String,
     pub active_page_parent: String,
-    pub selected_block_id: String,
-    pub selected_block_kind: String,
-    pub selected_block_text: String,
-    pub selected_block_checked: bool,
-    pub page_title_selected: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct BlockInsertResult {
-    pub data: PagesData,
-    pub operation_id: String,
-    pub page_id: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -282,12 +266,6 @@ pub struct PageSearchHit {
 pub struct PageSearchData {
     pub generation: i64,
     pub hits: Vec<PageSearchHit>,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct AutosaveResult {
-    pub generation: i64,
-    pub written: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]

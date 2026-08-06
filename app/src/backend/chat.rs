@@ -653,15 +653,10 @@ pub async fn search_chat(
     })
 }
 
-pub async fn load_page(
-    rpc: String,
-    page_id: String,
-    selected_block_id: String,
-) -> Result<PagesData, AppError> {
+pub async fn load_page(rpc: String, page_id: String) -> Result<PagesData, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
-        let pages = load_pages_data(&rpc, Some(&page_id)).await?;
-        Ok(with_selected_block(pages, &selected_block_id))
+        load_pages_data(&rpc, Some(&page_id)).await
     }
     .await
     .map_err(app_error)
@@ -890,23 +885,6 @@ pub async fn create_page(
     .await
 }
 
-pub async fn autosave_page_title(
-    rpc: String,
-    password: String,
-    page_id: String,
-    title: String,
-) -> Result<bool, AppError> {
-    async {
-        if page_id.is_empty() {
-            return Err("choose a page first".to_string());
-        }
-        let title = bounded_exact_text(title, "page title", 512)?;
-        debounced_page_text(rpc, password, page_id, title).await
-    }
-    .await
-    .map_err(app_error)
-}
-
 pub async fn delete_page(
     rpc: String,
     password: String,
@@ -927,32 +905,6 @@ pub async fn delete_page(
         )
         .await?;
         load_pages_data(&rpc, None).await.map_err(committed_error)
-    }
-    .await
-}
-
-pub async fn set_block_checked(
-    rpc: String,
-    password: String,
-    page_id: String,
-    block_id: String,
-    checked: bool,
-) -> Result<PagesData, AppError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "pages",
-            pages::encode_msg(&PageMsg::SetChecked {
-                block_id: block_id.clone(),
-                checked,
-            }),
-            password,
-        )
-        .await?;
-        load_selected_page_data(&rpc, &page_id, &block_id)
-            .await
-            .map_err(committed_error)
     }
     .await
 }
