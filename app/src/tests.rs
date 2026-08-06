@@ -250,11 +250,10 @@ fn assert_no_polling(lifecycle: &str) {
     assert_eq!(
         recurring,
         [
-            // the video tile strip's repaint clock: the frame store ticks at
-            // most 25 Hz into state, matched to the capture cadence — and
-            // only while the huddle window (the strip's only mount) is open
-            // with a live camera. Docked or voice-only huddles pay nothing.
-            "every 40ms when ((huddle_win != none) && call_video_live) -> video_tick",
+            // NO video clock here, on purpose: the tile strip is a
+            // self-redrawing widget that repaints only its own window at
+            // the capture cadence. A reintroduced video tick would rebuild
+            // EVERY window's view tree per beat — fail the build instead.
             "every 1s when huddle_joined -> tick",
             // the toast's dismissal clock: fine ticks against a per-toast
             // age, so a toast raised late in the old shared 2800ms window

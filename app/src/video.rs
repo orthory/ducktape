@@ -18,16 +18,19 @@
 //! THREADING mirrors the audio leg: one OS thread owns the nokhwa camera
 //! (not `Send`), polls the camera toggle, opens the device only while it is
 //! on, and dies with the session's shutdown sender. Decoded peer frames land
-//! in a global store the `call_video_tiles` extern component reads; a 25 Hz
-//! ice tick (gated on the huddle window being open) republishes the store's
-//! generation so the panel repaints while frames move.
+//! in a global store the `call_video_tiles` extern component reads; the strip
+//! is a SELF-REDRAWING widget that repaints its own window at the capture
+//! cadence — no app message, no view rebuild, no other window woken.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use chat::call_wire::{CapturedFrame, PeerFrame};
-use iced::Element;
+use iced::advanced::layout::{self, Layout};
+use iced::advanced::widget::{Tree, tree};
+use iced::advanced::{Shell, Widget, mouse, renderer};
+use iced::{Element, Event, Length, Rectangle, Size, window};
 
 /// Capture cadence while the camera is on (~25 fps). The loop treats this as
 /// a DEADLINE, not a sleep: per-frame work (MJPEG decode, encode, preview
@@ -121,18 +124,7 @@ fn store() -> &'static Mutex<VideoStore> {
     })
 }
 
-static GENERATION: AtomicI64 = AtomicI64::new(0);
 static CAMERA_ON: AtomicBool = AtomicBool::new(false);
-
-fn bump() {
-    GENERATION.fetch_add(1, Ordering::Relaxed);
-}
-
-/// The store's write counter — the 25 Hz ice tick copies it into state so the
-/// panel rebuilds exactly when a frame moved.
-pub fn latest_frame_generation() -> i64 {
-    GENERATION.load(Ordering::Relaxed)
-}
 
 pub(crate) fn camera_enabled() -> bool {
     CAMERA_ON.load(Ordering::Relaxed)
@@ -144,7 +136,6 @@ pub fn call_set_camera(on: bool) -> bool {
     CAMERA_ON.store(on, Ordering::Relaxed);
     if !on {
         store().lock().expect("video store").preview = None;
-        bump();
     }
     crate::call::beacon_state();
     on
@@ -157,7 +148,6 @@ pub(crate) fn reset() {
     store.peers.clear();
     store.preview = None;
     CAMERA_ON.store(false, Ordering::Relaxed);
-    bump();
 }
 
 /// A peer's encoded frame off the call socket: decode and store. Runs on a
@@ -172,7 +162,6 @@ pub(crate) fn store_peer_frame(frame: PeerFrame) {
         .expect("video store")
         .peers
         .insert(peer, tile);
-    bump();
 }
 
 fn hex_of(key: &[u8; 32]) -> String {
@@ -230,7 +219,6 @@ pub(crate) fn store_preview(rgb: &[u8], width: u32, height: u32) {
         height,
         handle: iced::widget::image::Handle::from_rgba(width, height, rgba),
     });
-    bump();
 }
 
 /// The camera thread body: poll the toggle, hold the device only while on,
@@ -327,44 +315,171 @@ pub(crate) fn camera_thread(
     }
 }
 
-/// The tile strip the huddle panel mounts: every peer's latest frame plus the
-/// local preview, wrapped to the panel's width. Reads the global store; the
-/// `generation` prop only exists so ice rebuilds this mount when the 25 Hz
-/// tick sees a new frame.
-pub fn call_video_tiles(_generation: i64) -> Element<'static, ()> {
-    let store = store().lock().expect("video store");
-    let mut tiles: Vec<Element<'static, ()>> = Vec::new();
-    let mut ordered: Vec<(&String, &TileFrame)> = store.peers.iter().collect();
-    ordered.sort_by(|a, b| a.0.cmp(b.0));
-    for (_peer, frame) in ordered {
-        tiles.push(tile(frame));
-    }
-    if let Some(preview) = &store.preview {
-        tiles.push(tile(preview));
-    }
-    drop(store);
-    let strip = tiles
-        .into_iter()
-        .fold(iced::widget::Row::new().spacing(8.0), iced::widget::Row::push);
-    iced::widget::container(iced::widget::scrollable(strip).direction(
-        iced::widget::scrollable::Direction::Horizontal(
-            iced::widget::scrollable::Scrollbar::new().width(2).scroller_width(2),
-        ),
-    ))
-    .into()
+/// The tile strip the huddle panel mounts — a SELF-REDRAWING widget, not a
+/// state-driven mount. The previous design republished the store's write
+/// counter into app state on a 25 Hz subscription, and in iced ONE message
+/// rebuilds EVERY window's whole view tree: the console paid full rebuilds
+/// 25 times a second for pixels it never shows. This widget instead reads
+/// the store in its own draw pass and schedules the next redraw of ITS OWN
+/// window (`Shell::request_redraw_at` — redraw requests are per-window all
+/// the way down to winit), so a live camera costs the huddle window a paint
+/// pass and costs every other window nothing at all.
+pub fn call_video_tiles() -> Element<'static, ()> {
+    Element::new(VideoStrip)
 }
 
-fn tile(frame: &TileFrame) -> Element<'static, ()> {
-    // `Handle` is `Bytes`-backed (Arc) and its `Id` survives the clone, so this
-    // is a refcount bump that keeps pointing at the renderer's cached upload.
-    let height = TILE_WIDTH * frame.height.max(1) as f32 / frame.width.max(1) as f32;
-    iced::widget::container(
-        iced::widget::image(frame.handle.clone())
-            .width(TILE_WIDTH)
-            .height(height)
-            .content_fit(iced::ContentFit::Cover),
-    )
-    .into()
+/// Displayed tile plate: fixed 4:3, the frame Cover-cropped onto it, wrapped
+/// into rows on the strip's width.
+const TILE_HEIGHT: f32 = 96.0;
+const TILE_GAP: f32 = 8.0;
+/// The paint cadence while any tile is live — matches `CAPTURE_INTERVAL`.
+const REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+
+struct VideoStrip;
+
+#[derive(Default)]
+struct StripState {
+    /// The wrap-grid's height depends ONLY on the tile count, so layout is
+    /// invalidated exactly when the count moves (a join, a leave, a camera
+    /// toggle) — never per frame.
+    tiles_seen: usize,
+}
+
+fn tile_count() -> usize {
+    let store = store().lock().expect("video store");
+    store.peers.len() + usize::from(store.preview.is_some())
+}
+
+/// Peers in stable key order, the local preview last — the same order the
+/// row-based strip always drew. `Handle` is `Bytes`-backed (Arc) and its
+/// `Id` survives the clone, so each entry is a refcount bump that keeps
+/// pointing at the renderer's cached upload.
+fn tiles_snapshot() -> Vec<(u32, u32, iced::widget::image::Handle)> {
+    let store = store().lock().expect("video store");
+    let mut ordered: Vec<(&String, &TileFrame)> = store.peers.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    let mut tiles: Vec<_> = ordered
+        .into_iter()
+        .map(|(_, frame)| (frame.width, frame.height, frame.handle.clone()))
+        .collect();
+    if let Some(preview) = &store.preview {
+        tiles.push((preview.width, preview.height, preview.handle.clone()));
+    }
+    tiles
+}
+
+fn grid_columns(width: f32) -> usize {
+    ((width + TILE_GAP) / (TILE_WIDTH + TILE_GAP)).floor().max(1.0) as usize
+}
+
+fn grid_height(count: usize, columns: usize) -> f32 {
+    if count == 0 {
+        return 0.0;
+    }
+    let rows = count.div_ceil(columns);
+    rows as f32 * TILE_HEIGHT + (rows - 1) as f32 * TILE_GAP
+}
+
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for VideoStrip
+where
+    Renderer: iced::advanced::image::Renderer<Handle = iced::widget::image::Handle>,
+{
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<StripState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(StripState::default())
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Shrink)
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        _renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let width = limits.max().width;
+        let count = tile_count();
+        tree.state.downcast_mut::<StripState>().tiles_seen = count;
+        layout::Node::new(Size::new(width, grid_height(count, grid_columns(width))))
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        _layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _renderer: &Renderer,
+        _clipboard: &mut dyn iced::advanced::Clipboard,
+        shell: &mut Shell<'_, Message>,
+        _viewport: &Rectangle,
+    ) {
+        let Event::Window(window::Event::RedrawRequested(now)) = event else {
+            return;
+        };
+        let count = tile_count();
+        if tree.state.downcast_ref::<StripState>().tiles_seen != count {
+            shell.invalidate_layout();
+        }
+        if count > 0 {
+            shell.request_redraw_at(*now + REDRAW_INTERVAL);
+        }
+        // Zero tiles = idle, nothing scheduled. Frames cannot appear without
+        // a camera beacon riding the call control channel first; that roster
+        // message rebuilds the app, the rebuild redraws this window once,
+        // and the clock re-arms right here.
+    }
+
+    fn draw(
+        &self,
+        _tree: &Tree,
+        renderer: &mut Renderer,
+        _theme: &Theme,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        let columns = grid_columns(bounds.width);
+        for (index, (width, height, handle)) in tiles_snapshot().into_iter().enumerate() {
+            let cell = Rectangle {
+                x: bounds.x + (index % columns) as f32 * (TILE_WIDTH + TILE_GAP),
+                y: bounds.y + (index / columns) as f32 * (TILE_HEIGHT + TILE_GAP),
+                width: TILE_WIDTH,
+                height: TILE_HEIGHT,
+            };
+            let Some(clip) = cell.intersection(viewport) else {
+                continue;
+            };
+            // Cover: scale the frame to fill the plate, center, crop by clip.
+            let scale = (TILE_WIDTH / width.max(1) as f32).max(TILE_HEIGHT / height.max(1) as f32);
+            let drawn = Size::new(width as f32 * scale, height as f32 * scale);
+            let drawing = Rectangle {
+                x: cell.x + (cell.width - drawn.width) / 2.0,
+                y: cell.y + (cell.height - drawn.height) / 2.0,
+                width: drawn.width,
+                height: drawn.height,
+            };
+            renderer.draw_image(
+                iced::advanced::image::Image {
+                    handle,
+                    filter_method: iced::widget::image::FilterMethod::default(),
+                    rotation: iced::Radians(0.0),
+                    border_radius: 6.0.into(),
+                    opacity: 1.0,
+                    snap: true,
+                },
+                drawing,
+                clip,
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -423,9 +538,9 @@ mod tests {
                 .map(|frame| frame.handle.id())
         };
         reset();
-        let before = latest_frame_generation();
+        assert_eq!(tile_count(), 0);
         store_preview(&[10, 20, 30], 1, 1);
-        assert!(latest_frame_generation() > before);
+        assert_eq!(tile_count(), 1);
         let first = preview_id().expect("preview");
         assert_eq!(first, preview_id().expect("preview"));
         store_preview(&[40, 50, 60], 1, 1);
@@ -433,5 +548,16 @@ mod tests {
         reset();
         assert!(preview_id().is_none());
         assert!(!camera_enabled());
+    }
+
+    /// The strip's whole layout contract: columns floor on width and never
+    /// hit zero, height is rows of fixed plates — count in, size out.
+    #[test]
+    fn the_grid_wraps_on_width_and_sizes_by_count() {
+        assert_eq!(grid_columns(300.0), 2);
+        assert_eq!(grid_columns(100.0), 1);
+        assert_eq!(grid_height(0, 2), 0.0);
+        assert_eq!(grid_height(1, 2), TILE_HEIGHT);
+        assert_eq!(grid_height(3, 2), 2.0 * TILE_HEIGHT + TILE_GAP);
     }
 }

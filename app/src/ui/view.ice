@@ -29,7 +29,7 @@ view
     // window instead of a card wearing drawn traffic lights. Its close button
     // docks (see `window_was_closed`); leaving the huddle closes it.
     if huddle_win == some(window)
-      HuddlePanel channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at) roster=huddle_roster status=call_status muted=call_muted peers=call_peers camera=call_camera video_live=call_video_live frame_generation=call_frame_generation #huddle
+      HuddlePanel channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at) roster=huddle_roster status=call_status muted=call_muted peers=call_peers camera=call_camera video_live=call_video_live #huddle
         events
           dock_huddle -> dock_huddle
           huddle_go_channel -> huddle_go_channel
