@@ -499,7 +499,12 @@ pub fn apply_chat_thread(
         return thread;
     }
     match delta.kind.as_str() {
-        "reply" if delta.root_seq == active_thread_seq => merge_thread_reply(thread, delta.message),
+        // the rail's root carries the reply summary its replies rule draws —
+        // bump it here exactly as the stream's timeline arm does, then merge
+        // the reply row itself.
+        "reply" if delta.root_seq == active_thread_seq => {
+            merge_thread_reply(bump_reply_summary(thread, delta.root_seq), delta.message)
+        }
         "edited" => apply_edit_content(thread, delta.seq, &delta.message),
         "deleted" => apply_tombstone(thread, delta.seq),
         "reaction" => apply_reaction(thread, &delta),
@@ -1444,6 +1449,33 @@ pub fn dm_channel_id(a: &str, b: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_delta_bumps_the_open_thread_roots_summary() {
+        let root = ChatMessage {
+            seq: 1,
+            id: "g1".into(),
+            reply_count: 1,
+            ..ChatMessage::default()
+        };
+        let reply = ChatMessage {
+            seq: 3,
+            id: "g3".into(),
+            thread_seq: 1,
+            ..ChatMessage::default()
+        };
+        let delta = ChatDelta {
+            kind: "reply".into(),
+            channel_id: "general".into(),
+            seq: 3,
+            root_seq: 1,
+            message: reply,
+            ..ChatDelta::default()
+        };
+        let thread = apply_chat_thread(vec![root], delta, "general".into(), 1);
+        assert_eq!(thread[0].reply_count, 2, "the rail's replies rule reads this");
+        assert!(thread.iter().any(|message| message.seq == 3));
+    }
 
     #[test]
     fn a_dm_id_is_pair_symmetric_and_survives_the_namespace_rule() {

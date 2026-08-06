@@ -302,7 +302,7 @@ component MessageCard(message:ChatMessage, selected:bool, disabled:bool, flash:f
 // `MessageContents` — the run rhythm, the quiet code slab and quote bar, the
 // reaction chips and the right-edge send-state lane — instead of a second
 // spelling of them; the rail's own body component drifted a whole redesign
-// behind and is deleted. The rail's narrowness is its 300px plate, not a
+// behind and is deleted. The rail's narrowness is its 330px plate, not a
 // smaller type scale.
 //
 // What genuinely diverges is the CARD CHROME: the toolbar is thread-scoped
@@ -350,10 +350,9 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, disabled:bool, f
       if !message.deleted && !message.pending
         box w=fill align-x=end align-y=start pr=8.0
           // The stream's bar, minus its open-thread seat AND its one-tap
-          // reactions: the rail is a fixed 300px plate, and the full 145px bar
-          // starts covering the author header 69px in. Two seats (61px) leave
-          // 153px of header clear; the one-tap set lives one click away
-          // behind ♡.
+          // reactions: the rail is a fixed 330px plate, and the full 145px
+          // bar would still cover half the author header. Two seats (61px)
+          // keep it clear; the one-tap set lives one click away behind ♡.
           box p=2.0 bg=surface border=border border-w=1.0 r=9.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
             row gap=1.0 align=center
               button "♡" label="Manage reactions" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(open_thread_message_reactions, message.seq, message.body, message.rev)
@@ -415,35 +414,25 @@ component ComposerGate(reason:str)
 // THREAD RAIL — the artifact opens the rail body with the root message in its
 // own divided block, at a type scale one notch under a reply.
 //
-// The rail's 50px HEADER BAR is not a component: it is drawn inline by view.ice
-// (view.ice:600), it is a pane header — which main.rs pins as a view.ice-only
-// shape, never a second header inside a component file — and closing its ledger
-// gap also moves the 300px plate to 330px `bg=sidebar` with a 16px body inset,
-// all attributes of the box in view.ice. The artifact's values for whoever owns
-// that edit: 50px plate, `pl=16 pr=16`, bottom 1px `separator` hairline,
-// `Thread` at 13.0 `font=display`, then `#<channel>` at 11.0 `@text-caption`,
-// then a right-aligned 24×24 r6 `×`. Note the artifact has NO reply count in
-// the header and no "Thread result" title — view.ice ships both today, and the
-// second one is the only signpost a chat-search hit has, so the port must keep
-// it rather than follow the artifact literally.
+// The rail's 50px HEADER BAR is not a component: it is drawn inline by
+// screens/chat.ice — a pane header is a screen-only shape, never a second
+// header inside a component file. The artifact's header carries no reply
+// count and no "Thread result" title; the screen keeps "Thread result"
+// deliberately, because it is the only signpost a chat-search hit gets, and
+// trades the count for the honest replies rule below.
 // ============================================================================
 
-// MOUNTED — the view half of ledger gap "Thread rail gives the parent message
-// its own divided block", closed by splitting the rail's existing loop in
-// view.ice on `thread_message.seq == active_thread_seq`. No state field and no
-// backend fn: `active_thread_seq` IS the root's seq and `thread_messages`
-// carries the root.
-//
 // THE TRADE, TAKEN DELIBERATELY: the artifact's parent block is READ-ONLY, so
 // the root loses the hover bar, reactions and edit/delete that ThreadMessageCard
 // gave it in the rail. It does NOT lose them from the product — the rail is a
-// 300px pane BESIDE the stream, never over it, so the same message is on screen
-// in the stream at the same moment with its full MessageCard toolbar. The cost
+// pane BESIDE the stream, never over it, so the same message is on screen in
+// the stream at the same moment with its full MessageCard toolbar. The cost
 // is one extra glance, not a capability.
 //
-// NO `N replies` RULE between the block and the replies. It was built, deleted,
-// and stays deleted: its count wants `thread_messages` minus the root, which is
-// the loaded page and not the reply count whenever `thread_has_more` holds.
+// THE `N replies` RULE is honest now, which is why it lives here and not in
+// the header: the count is the ROOT's own `reply_count` — the field the
+// stream's reply pill already trusts — not `len(thread_messages)` (root
+// included) and not the loaded page (short whenever `thread_has_more` holds).
 component ThreadParentBlock(message:ChatMessage)
   col #root w=fill
     row w=fill gap=10.0 align=start pb=14.0
@@ -457,15 +446,13 @@ component ThreadParentBlock(message:ChatMessage)
         MessageBody message=message
     box w=fill h=1.0 bg=separator
       space w=1.0 h=1.0
-
-// The artifact's `N replies` rule between the parent block and the replies was
-// built here and is deleted: two `text` widgets are markup, not a component, and
-// it could not have told the truth anyway. Its count wanted `thread_messages`
-// MINUS the root, and no fn returns that — `len(thread_messages)` (the count
-// view.ice already shows in the rail header) is one too many for a reply count.
-// Whoever mounts ThreadParentBlock gets the rule for free in the same view.ice
-// edit, from the loop's own arms; the artifact draws it at 10.5 `font=code_medium`
-// `@text-label` with `pt=13.0 pb=4.0`.
+    if message.reply_count > 0
+      row w=fill gap=4.0 align=center pt=13.0 pb=4.0
+        text message.reply_count size=10.5 wrap=none font=code_medium @text-label
+        if message.reply_count == 1
+          text "reply" size=10.5 wrap=none font=code_medium @text-label
+        if message.reply_count != 1
+          text "replies" size=10.5 wrap=none font=code_medium @text-label
 
 // The EVENT INSPECTOR was built here and mounted nowhere, so it is deleted
 // rather than left as a panel no user can reach. What it needed was a lookup
