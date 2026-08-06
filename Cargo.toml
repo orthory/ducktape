@@ -343,11 +343,19 @@ block = { path = "patches/block" }
 # dev binary from ~516 MB to a fraction of that.
 [profile.dev.package.ducktape-app]
 debug = 0
-# Deliberately NOT opt-level'd: A/B-measured zero win on the module-switch
-# stall (570 ms with and without opt-level 1) at a 5x compile-time cost on
-# the one crate app work always touches. The switch cost lives in the
-# already-optimized shaping/layout stack, ~10 ms per cold-rebuilt row — see
-# the ducktape-ui stanza below.
+# opt-level 1 is load-bearing for STACK SAFETY, not speed: ducktape-ui's
+# codegen outlines component uses into per-use methods (98e2b82 — rustc's
+# front-end went superlinear on the old single 100k-line view fn), and at
+# opt-level 0 the outlined debug frames stack up to 8-12 MiB of view render
+# — past the 8 MiB main-thread default (guarded by the
+# full_view_fits_a_four_mib_stack contract). SROA at opt-level 1 collapses
+# the frames back under 4 MiB. Build cost on this crate: 110 s -> 240 s,
+# still well under the 360 s the monolithic view cost at opt-level 0, and
+# cargo check (90 s, was 366 s) never pays it. (The old "zero win at 5x
+# cost" A/B that argued against opt-level here predates the outlining
+# split; the module-switch stall it measured was fixed in the shaping
+# stack, see the ducktape-ui stanza below.)
+opt-level = 1
 
 # `make dev` runs the desktop app under the dev profile, and an unoptimized
 # GUI stack is a lag machine on its own: cosmic-text shapes every glyph run
