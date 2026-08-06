@@ -96,6 +96,11 @@ state
   chat_searching = false
   chat_search_generation:i64 = 0
   history_view = false
+  // Whether older pages exist below the loaded timeline — mirrored on every
+  // write that can move the list's OLDEST row, because computing it in the
+  // view means deep-cloning the whole timeline through the extern ABI on
+  // every single frame.
+  has_older_history = false
   shell_tab = "chat"
   explorer_blocks:[ExplorerBlock] = []
   explorer_ops:[ExplorerOp] = []
@@ -270,6 +275,11 @@ state
   onboarding_win:window-id? = none
   console_win:window-id? = none
   huddle_win:window-id? = none
+  // The titlebar's chain label, computed ONCE per connection (and on the
+  // account fold, its fallback) — `network_label` scans the workspaces dir
+  // and parses tomls, which is a per-frame disk tax when called from a view
+  // mount. The view reads this mirror instead.
+  network_name = ""
   // THE LAUNCH FLOW — one discriminant: loading -> (create | unlock)
   // -> [reveal | restore] -> networks -> [join -> provisioning -> live].
   hub_step = "loading"

@@ -9,7 +9,7 @@
 // fact families, and the prefix is what says which loader a reading came from.
 // `settings_height` (the facts reading) and `block_height` (the live head) are
 // two different numbers and would collide as one word.
-component SettingsScreen(account_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_height:i64, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_validators:i64, members_residents:i64, account_id:str, bind account_name_draft:str, account_renaming:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], block_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
+component SettingsScreen(account_name:str, network_name:str, settings_endpoint:str, settings_node_key:str, settings_height:i64, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_validators:i64, members_residents:i64, account_id:str, bind account_name_draft:str, account_renaming:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], block_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
   emits
     select_shell_tab(str)
     reconnect()
@@ -36,7 +36,7 @@ component SettingsScreen(account_name:str, connected_rpc:str, settings_endpoint:
           GroupLabel label="NETWORK"
           GroupCard
             col w=fill
-              KeyValueRow label="Workspace" value=network_label(account_name, connected_rpc) last=false
+              KeyValueRow label="Workspace" value=network_name last=false
               KeyValueRow label="Endpoint" value=settings_endpoint last=false
               KeyValueRow label="Node key" value=settings_node_key last=false
               KeyValueRow label="Block height" value=height_label(settings_height) last=false

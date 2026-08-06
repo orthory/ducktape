@@ -79,6 +79,7 @@ on reconnect
   connected = false
   channels = []
   messages = []
+  has_older_history = false
   channel_reads = []
   unread_boundary = 0
   active_channel = ""
@@ -147,12 +148,14 @@ on reconnect
 on workspace_connected(next)
   rpc = next.rpc
   connected_rpc = next.rpc
+  network_name = network_label(account_name, connected_rpc)
   status = next.status
   block_height = next.height
   channels = next.channels
   channel_reads = initial_channel_reads(next.channels, channel_reads)
   unread_boundary = 0
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  has_older_history = history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
@@ -249,6 +252,7 @@ on live_resynced(next)
   channels = keep_channels(next.chat_loaded, next.channels, channels)
   channel_reads = initial_channel_reads(channels, channel_reads)
   messages = keep_messages(next.chat_loaded, merge_pending_messages(next.messages, messages, active_channel, next.active_channel, ""), messages)
+  has_older_history = history_has_older(messages)
   failed_message_draft = remember_failed_draft(failed_message_draft, "channel", message_draft, active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel))
   selected_message_seq = refreshed_required_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), selected_message_seq)
   failed_message_draft = remember_failed_draft(failed_message_draft, message_action, message_edit_draft, selected_message_seq > 0 || message_action != "editing")
@@ -374,6 +378,7 @@ on select_shell_tab(next)
   // trip cold-rebuilds every mounted row in one frame, so the mount cost must
   // not compound with how far she once paged back. "Load older" re-earns it.
   messages = trim_timeline_on_leave(next, messages)
+  has_older_history = history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   // A hydration error belongs to the pane that raised it. Leaving it up after
   // a navigation tells the user the pane they just opened is broken, which is
