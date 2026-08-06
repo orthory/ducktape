@@ -499,6 +499,43 @@ fn move_block(document: Content, line: usize, direction: i32) -> Content {
     rebuilt(moved, landing)
 }
 
+/// The lines a dragged block may land BEFORE: every block-span start past the
+/// title, plus the end of the document. What the widget snaps a drag to.
+pub fn drop_boundaries(document: &Content) -> Vec<usize> {
+    let mut boundaries: Vec<usize> = spans_of(document)
+        .iter()
+        .map(|span| span.start)
+        .filter(|&start| start > 0)
+        .collect();
+    boundaries.push(document.line_count());
+    boundaries
+}
+
+/// Land the block containing `from` so it starts at `boundary` (one of
+/// [`drop_boundaries`]). Dropping a block onto its own edges is the identity.
+pub fn drop_move(document: Content, from: usize, boundary: usize) -> Content {
+    let spans = spans_of(&document);
+    let Some(index) = spans.iter().position(|span| span.contains(&from)) else {
+        return document;
+    };
+    let span = spans[index].clone();
+    let unchanged = span.contains(&0) || (boundary >= span.start && boundary <= span.end);
+    if unchanged {
+        return document;
+    }
+    history::record(|| (document.text(), document.cursor()));
+    let mut lines = document_lines(&document);
+    let block: Vec<String> = lines[span.clone()].to_vec();
+    lines.drain(span.clone());
+    let landing = match boundary > span.end {
+        true => boundary - span.len(),
+        false => boundary,
+    };
+    let landing = landing.min(lines.len());
+    lines.splice(landing..landing, block);
+    rebuilt(lines, landing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,5 +654,34 @@ mod tests {
         assert!(menu.items.iter().all(|item| item.tag != "turn"));
         close();
         let _ = document;
+    }
+
+    #[test]
+    fn drop_boundaries_are_block_starts_past_the_title_plus_the_end() {
+        // The fence block (1..4) contributes ONE boundary at its start; the
+        // title contributes none.
+        let document = doc("Title\n```\ncode\n```\npara", 0, 0);
+        assert_eq!(drop_boundaries(&document), vec![1, 4, 5]);
+    }
+
+    #[test]
+    fn a_drop_lands_the_whole_block_before_the_boundary() {
+        // Drag the paragraph above the fence block.
+        let up = drop_move(doc("Title\n```\ncode\n```\npara", 4, 0), 4, 1);
+        assert_eq!(up.text(), "Title\npara\n```\ncode\n```");
+        assert_eq!(up.cursor().position, Position { line: 1, column: 0 });
+        // Drag the fence block (grabbed on a BODY line) to the end.
+        let down = drop_move(doc("Title\n```\ncode\n```\npara", 2, 0), 2, 5);
+        assert_eq!(down.text(), "Title\npara\n```\ncode\n```");
+        // Dropping onto the block's own edges is the identity.
+        let held = drop_move(doc("Title\none\ntwo", 1, 0), 1, 2);
+        assert_eq!(held.text(), "Title\none\ntwo");
+        // The undo lane covers the move.
+        history::reset();
+        let moved = drop_move(doc("Title\none\ntwo", 1, 0), 1, 3);
+        assert_eq!(moved.text(), "Title\ntwo\none");
+        let restored = history::undo(|| (moved.text(), moved.cursor())).expect("undo");
+        assert_eq!(restored.text(), "Title\none\ntwo");
+        history::reset();
     }
 }
