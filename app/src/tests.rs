@@ -1631,11 +1631,9 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     );
     assert!(SCREENS.contains(", shift_held, 38.0, 120.0, 6.0) #forge-note"));
     assert!(SCREENS.contains("button \"Send\" disabled="));
-    assert!(
-        SCREENS.contains(
-            "h=29.0 p=7.0 @primary_action -> emit(composer_event, composer_submit_event())"
-        )
-    );
+    assert!(SCREENS.contains(
+        "h=29.0 @primary_action @px-12px @py-7px -> emit(composer_event, composer_submit_event())"
+    ));
     assert!(
         SCREENS
             .matches("box w=fill h=fill align-x=center align-y=center")

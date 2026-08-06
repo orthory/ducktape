@@ -1139,12 +1139,14 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         wrap=none
                         font=code_medium
                         @text-label
+                    space w=8.0
                     button "Send" -> emit(composer_event, composer_submit_event())
                       with
                         disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)) || empty(trim(editor_text(message_editor))))
                         h=29.0
-                        p=7.0
                         @primary_action
+                        @px-12px
+                        @py-7px
         // THE DETAILS DRAWER — a sidebar-toned rail with one header bar, the
         // channel's identity up top, eyebrowed NAME and MEMBERS sections, and
         // the archive act alone at the bottom where a destructive control
@@ -1600,13 +1602,15 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 wrap=none
                                 font=code_medium
                                 @text-label
+                            space w=8.0
                             button "Send" -> emit(reply_composer_event, composer_submit_event())
                               with
                                 label="Send reply"
                                 disabled=(thread_loading || active_channel_archived || empty(trim(editor_text(reply_editor))))
                                 h=28.0
-                                p=6.0
                                 @primary_action
+                                @px-11px
+                                @py-6px
               overlay
                 with
                   when=(thread_selected_seq > 0 && thread_message_action != "toolbar")
