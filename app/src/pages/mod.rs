@@ -114,6 +114,7 @@ pub enum PageEvent {
     OpenLink(String),
     Menu(MenuEvent),
     Gutter(usize, GutterButton),
+    GutterDrop(usize, usize),
 }
 
 /// Classify a left press over `(line, position)` — the widget's
@@ -162,7 +163,8 @@ pub fn page_link_of(event: PageEvent) -> String {
         PageEvent::Action(_)
         | PageEvent::ToggleTodo(_)
         | PageEvent::Menu(_)
-        | PageEvent::Gutter(..) => String::new(),
+        | PageEvent::Gutter(..)
+        | PageEvent::GutterDrop(..) => String::new(),
     }
 }
 
@@ -219,6 +221,9 @@ pub fn page_document(
         // Line 0 is the title — it takes no gutter, like the reference
         // editor's title row.
         .on_gutter(|line, button| (line > 0).then_some(PageEvent::Gutter(line, button)))
+        .on_gutter_drop(menu::drop_boundaries(document), |from, boundary| {
+            Some(PageEvent::GutterDrop(from, boundary))
+        })
         .menu(menu::current(document))
         .on_menu(PageEvent::Menu)
         .into()
@@ -284,6 +289,7 @@ pub fn apply_page_event(document: Content, event: PageEvent) -> Content {
         PageEvent::OpenLink(_) => document,
         PageEvent::Menu(event) => menu::apply(document, event),
         PageEvent::Gutter(line, button) => menu::gutter(document, line, button),
+        PageEvent::GutterDrop(from, boundary) => menu::drop_move(document, from, boundary),
     }
 }
 
