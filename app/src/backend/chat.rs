@@ -871,6 +871,30 @@ pub async fn resolve_comment_thread(
     .map_err(app_error)
 }
 
+/// Hand a WEB link to the OS opener. Only http(s) is a link this surface
+/// opens — everything else stays text (this passes a string to a shell
+/// command, and the scheme gate is the trust boundary).
+pub async fn open_external_url(url: String) -> Result<bool, AppError> {
+    async {
+        let is_web = url.starts_with("http://") || url.starts_with("https://");
+        if !is_web {
+            return Err("only web links open from a page".to_string());
+        }
+        let opener = match std::env::consts::OS {
+            "macos" => "open",
+            "windows" => "explorer",
+            _ => "xdg-open",
+        };
+        tokio::process::Command::new(opener)
+            .arg(&url)
+            .spawn()
+            .map_err(|error| format!("could not open the link: {error}"))?;
+        Ok(true)
+    }
+    .await
+    .map_err(app_error)
+}
+
 pub(crate) fn comment_thread_id(thread_id: String) -> Result<String, String> {
     if thread_id.is_empty() {
         Ok(fresh_id("thread"))
