@@ -53,8 +53,17 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
     load_more_block_comments()
     post_block_comment_submit()
   row w=fill h=fill
-    box w=230.0 h=fill bg=sidebar clip=true
-      col w=fill h=fill gap=0.0
+    box
+      with
+        w=230.0
+        h=fill
+        bg=sidebar
+        clip=true
+      col
+        with
+          w=fill
+          h=fill
+          gap=0.0
         // THE SIDEBAR HEAD, from the component that owns the shape.
         // Chat's head is deliberately NOT this one: it interleaves a
         // connection dot BETWEEN the title and the count, which is past
@@ -62,34 +71,94 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
         SidebarHeader title="Pages" count=len(pages)
           col
             if !page_create_open
-              button label="New page" disabled=(loading || mutation_phase != "idle" || !connected) p=0.0 @icon_action -> emit(toggle_page_create)
-                Icon name="plus" tone="label" px=16.0
+              button -> emit(toggle_page_create)
+                with
+                  label="New page"
+                  disabled=(loading || mutation_phase != "idle" || !connected)
+                  p=0.0
+                  @icon_action
+                Icon
+                  with
+                    name="plus"
+                    tone="label"
+                    px=16.0
                 active bg=transparent text=muted border=transparent border-w=1.0 r=5.0
                 hovered bg=separator text=fg
                 pressed bg=subtle text=fg
             if page_create_open
-              button label="Close new page" disabled=(loading || mutation_phase != "idle") w=24.0 h=24.0 p=0.0 @icon_action -> emit(toggle_page_create)
-                box w=fill h=fill align-x=center align-y=center
-                  text "×" size=13.0 wrap=none @text-muted
+              button -> emit(toggle_page_create)
+                with
+                  label="Close new page"
+                  disabled=(loading || mutation_phase != "idle")
+                  w=24.0
+                  h=24.0
+                  p=0.0
+                  @icon_action
+                box
+                  with
+                    w=fill
+                    h=fill
+                    align-x=center
+                    align-y=center
+                  text "×"
+                    with
+                      size=13.0
+                      wrap=none
+                      @text-muted
                 active bg=separator text=muted border=transparent border-w=1.0 r=5.0
                 hovered bg=subtle text=fg
                 pressed bg=subtle text=fg
         if page_create_open
-          row w=fill h=28.0 gap=5.0 align=center
-            input "" #new-page label="New page title" <-> page_draft hint="New page" disabled=(loading || mutation_phase != "idle" || !connected) submit=emit(create_page_submit) w=fill p=6.2 text-size=13.0 line-h=1.2 @control
+          row
+            with
+              w=fill
+              h=28.0
+              gap=5.0
+              align=center
+            input "" #new-page <-> page_draft
+              with
+                label="New page title"
+                hint="New page"
+                disabled=(loading || mutation_phase != "idle" || !connected)
+                submit=emit(create_page_submit)
+                w=fill
+                p=6.2
+                text-size=13.0
+                line-h=1.2
+                @control
               active bg=muted_bg border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
               hovered bg=elevated border=fg/21
               disabled bg=muted_bg/54 value=muted
-            button label="Create page" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(page_draft))) w=28.0 h=28.0 p=0.0 @icon_action -> emit(create_page_submit)
-              box w=fill h=fill align-x=center align-y=center
+            button -> emit(create_page_submit)
+              with
+                label="Create page"
+                disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(page_draft)))
+                w=28.0
+                h=28.0
+                p=0.0
+                @icon_action
+              box
+                with
+                  w=fill
+                  h=fill
+                  align-x=center
+                  align-y=center
                 text "+" size=14.0
-        scroll dir=vertical w=fill h=fill
+        scroll
+          with
+            dir=vertical
+            w=fill
+            h=fill
           col w=fill gap=2.0
             for page in pages
               PageButton page=page selected=(page.id == active_page)
                 forward
                   choose_page
-    box w=1.0 h=fill bg=separator
+    box
+      with
+        w=1.0
+        h=fill
+        bg=separator
       space w=1.0 h=1.0
     row w=fill h=fill
       col w=fill h=fill
@@ -97,21 +166,63 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
         // always-on trust signal the surface carries.
         if connected && !empty(active_page)
           col w=fill
-            box w=fill h=50.0 pl=22.0 pr=22.0
-              row w=fill h=fill gap=9.0 align=center
-                text active_page_title w=fill size=13.5 wrap=none font=display @text-fg
+            box
+              with
+                w=fill
+                h=50.0
+                pl=22.0
+                pr=22.0
+              row
+                with
+                  w=fill
+                  h=fill
+                  gap=9.0
+                  align=center
+                text active_page_title
+                  with
+                    w=fill
+                    size=13.5
+                    wrap=none
+                    font=display
+                    @text-fg
                 // DOCUMENT ACTIONS BELONG IN THE DOCUMENT HEADER. The
                 // artifact's B1 bar is title + meta + the sync chip.
                 // The parent crumb takes the artifact's `pgMeta` seat.
                 if !empty(active_page_parent)
-                  text active_page_parent size=11.0 wrap=none font=code @text-hint
-                input "" #page-search label="Search pages" <-> page_search_draft hint="Search pages…" disabled=(!connected || page_searching) submit=emit(search_pages_submit) w=190.0 p=6.2 text-size=13.0 line-h=1.2 @control
+                  text active_page_parent
+                    with
+                      size=11.0
+                      wrap=none
+                      font=code
+                      @text-hint
+                input "" #page-search <-> page_search_draft
+                  with
+                    label="Search pages"
+                    hint="Search pages…"
+                    disabled=(!connected || page_searching)
+                    submit=emit(search_pages_submit)
+                    w=190.0
+                    p=6.2
+                    text-size=13.0
+                    line-h=1.2
+                    @control
                   active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                   hovered bg=fg/5 border=fg/8
                   disabled value=muted
                 if !empty(page_search_hits)
-                  button label="Clear page search" w=28.0 h=28.0 p=0.0 @icon_action -> emit(clear_page_search)
-                    box w=fill h=fill align-x=center align-y=center
+                  button -> emit(clear_page_search)
+                    with
+                      label="Clear page search"
+                      w=28.0
+                      h=28.0
+                      p=0.0
+                      @icon_action
+                    box
+                      with
+                        w=fill
+                        h=fill
+                        align-x=center
+                        align-y=center
                       text "×" size=14.0
                     active bg=transparent text=muted r=7.0
                     hovered bg=fg/10 text=fg
@@ -123,20 +234,55 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                 // about that line (`load_page_threads` asks for the page
                 // and all of its blocks at once). It sits in the header
                 // wearing its own count, like every other document action.
-                button label="Comments" disabled=(mutation_phase != "idle") h=26.0 p=5.0 @ghost_action -> emit(toggle_block_comments)
-                  row h=fill gap=5.0 align=center
-                    Icon name="nav-chat" tone="label" px=14.0
-                    text "Comments" size=11.5 wrap=none @text-muted
+                button -> emit(toggle_block_comments)
+                  with
+                    label="Comments"
+                    disabled=(mutation_phase != "idle")
+                    h=26.0
+                    p=5.0
+                    @ghost_action
+                  row
+                    with
+                      h=fill
+                      gap=5.0
+                      align=center
+                    Icon
+                      with
+                        name="nav-chat"
+                        tone="label"
+                        px=14.0
+                    text "Comments"
+                      with
+                        size=11.5
+                        wrap=none
+                        @text-muted
                     if block_comment_thread_total > 0
-                      text count_label(block_comment_thread_total) size=10.5 wrap=none font=code_medium @text-label
+                      text count_label(block_comment_thread_total)
+                        with
+                          size=10.5
+                          wrap=none
+                          font=code_medium
+                          @text-label
                   active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                   hovered bg=fg/8 text=fg border=fg/10
                   pressed bg=fg/12 text=fg
                 // The trigger STAYS a trigger: arming opens the named
                 // confirm dialog below — it must never swap the red
                 // button in under the same cursor.
-                button label="Delete page" disabled=(mutation_phase != "idle" || page_delete_armed) w=28.0 h=28.0 p=0.0 @icon_action -> emit(arm_page_delete)
-                  box w=fill h=fill align-x=center align-y=center
+                button -> emit(arm_page_delete)
+                  with
+                    label="Delete page"
+                    disabled=(mutation_phase != "idle" || page_delete_armed)
+                    w=28.0
+                    h=28.0
+                    p=0.0
+                    @icon_action
+                  box
+                    with
+                      w=fill
+                      h=fill
+                      align-x=center
+                      align-y=center
                     text "•••" size=13.0
                   active bg=transparent text=muted r=7.0
                   hovered bg=fg/10 text=fg
@@ -148,40 +294,128 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                 // at all.
                 match block_autosave_status
                   "saving"
-                    box px=9.0 py=4.0 bg=warning_bg border=warning_line border-w=1.0 r=7.0
-                      text "saving…" size=10.5 wrap=none font=code_medium @text-warning
+                    box
+                      with
+                        px=9.0
+                        py=4.0
+                        bg=warning_bg
+                        border=warning_line
+                        border-w=1.0
+                        r=7.0
+                      text "saving…"
+                        with
+                          size=10.5
+                          wrap=none
+                          font=code_medium
+                          @text-warning
                   "error"
-                    box px=9.0 py=4.0 bg=danger_bg border=danger_line border-w=1.0 r=7.0
-                      text "not saved" size=10.5 wrap=none font=code_medium @text-danger
+                    box
+                      with
+                        px=9.0
+                        py=4.0
+                        bg=danger_bg
+                        border=danger_line
+                        border-w=1.0
+                        r=7.0
+                      text "not saved"
+                        with
+                          size=10.5
+                          wrap=none
+                          font=code_medium
+                          @text-danger
                   "saved"
-                    box px=9.0 py=4.0 bg=final_bg border=final_line border-w=1.0 r=7.0
-                      text "✓ synced" size=10.5 wrap=none font=code_medium @text-success_tick
+                    box
+                      with
+                        px=9.0
+                        py=4.0
+                        bg=final_bg
+                        border=final_line
+                        border-w=1.0
+                        r=7.0
+                      text "✓ synced"
+                        with
+                          size=10.5
+                          wrap=none
+                          font=code_medium
+                          @text-success_tick
                   _
                     space w=1.0 h=1.0
-            box w=fill h=1.0 bg=separator
+            box
+              with
+                w=fill
+                h=1.0
+                bg=separator
               space w=1.0 h=1.0
         if connected && !empty(doc_tab_rows(doc_tabs, pages, active_page))
-          box w=fill h=34.0 pl=8.0 pr=8.0 bg=sidebar border=separator border-w=1.0
-            scroll dir=horizontal w=fill h=fill bar=hidden
-              row h=fill gap=2.0 align=center
+          box
+            with
+              w=fill
+              h=34.0
+              pl=8.0
+              pr=8.0
+              bg=sidebar
+              border=separator
+              border-w=1.0
+            scroll
+              with
+                dir=horizontal
+                w=fill
+                h=fill
+                bar=hidden
+              row
+                with
+                  h=fill
+                  gap=2.0
+                  align=center
                 for tab in doc_tab_rows(doc_tabs, pages, active_page)
                   row gap=0.0 align=center
-                    button label="Open page tab" h=26.0 p=5.0 @ghost_action -> emit(choose_page, tab.id)
-                      row h=fill gap=5.0 align=center
+                    button -> emit(choose_page, tab.id)
+                      with
+                        label="Open page tab"
+                        h=26.0
+                        p=5.0
+                        @ghost_action
+                      row
+                        with
+                          h=fill
+                          gap=5.0
+                          align=center
                         if tab.active
-                          text tab.title size=13.0 wrap=none font=medium @text-fg
+                          text tab.title
+                            with
+                              size=13.0
+                              wrap=none
+                              font=medium
+                              @text-fg
                         if !tab.active
-                          text tab.title size=13.0 wrap=none @text-muted
+                          text tab.title
+                            with
+                              size=13.0
+                              wrap=none
+                              @text-muted
                       active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                       hovered bg=fg/5 text=fg
                       pressed bg=fg/8
-                    button "×" label="Close page tab" w=24.0 h=24.0 p=0.0 @icon_action -> emit(close_doc_tab, tab.id)
+                    button "×" -> emit(close_doc_tab, tab.id)
+                      with
+                        label="Close page tab"
+                        w=24.0
+                        h=24.0
+                        p=0.0
+                        @icon_action
                       active bg=transparent text=muted r=6.0
                       hovered bg=fg/8 text=fg
                       pressed bg=fg/12
-        stack w=fill h=fill clip=true
+        stack
+          with
+            w=fill
+            h=fill
+            clip=true
           if !connected
-            EmptyState title="Not connected" description="Click the network name in the titlebar to pick or reconnect a network."
+            EmptyState
+              with
+                title="Not connected"
+                description="Click the network name in the titlebar to pick or reconnect a network."
           if connected && !loading && empty(active_page)
             EmptyState title="No page selected" description="Create a page from the sidebar."
           if connected && !empty(active_page)
@@ -189,11 +423,36 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
             // itself, which is what keeps its caret-reveal alive — an outer
             // scrollable would hand it infinite height, and typing below the
             // fold would walk the caret off screen with nothing following it.
-            box w=fill h=fill max-w=766.0 mx=auto pl=22.0 pr=22.0 pt=26.0 pb=18.0
-              col w=fill h=fill gap=8.0
+            box
+              with
+                w=fill
+                h=fill
+                max-w=766.0
+                mx=auto
+                pl=22.0
+                pr=22.0
+                pt=26.0
+                pb=18.0
+              col
+                with
+                  w=fill
+                  h=fill
+                  gap=8.0
                 if !empty(page_search_hits)
-                  box w=fill h=148.0 p=5.0 bg=elevated border=fg/8 border-w=1.0 r=9.0
-                    scroll dir=vertical w=fill h=fill
+                  box
+                    with
+                      w=fill
+                      h=148.0
+                      p=5.0
+                      bg=elevated
+                      border=fg/8
+                      border-w=1.0
+                      r=9.0
+                    scroll
+                      with
+                        dir=vertical
+                        w=fill
+                        h=fill
                       col w=fill gap=1.0
                         for hit in page_search_hits
                           PageSearchResult hit=hit
@@ -204,20 +463,63 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                 // the time this paints; a buffer the user kept typing into is
                 // preserved, and this line explains why it is not saving yet.
                 if !empty(page_refusal)
-                  box w=fill px=12.0 py=9.0 bg=alert_bg border=alert_line border-w=1.0 r=9.0
-                    text page_refusal w=fill size=12.5 wrap=word @text-alert_fg
+                  box
+                    with
+                      w=fill
+                      px=12.0
+                      py=9.0
+                      bg=alert_bg
+                      border=alert_line
+                      border-w=1.0
+                      r=9.0
+                    text page_refusal
+                      with
+                        w=fill
+                        size=12.5
+                        wrap=word
+                        @text-alert_fg
                 if !empty(orphaned_comment_drafts)
-                  box w=fill p=7.0 bg=elevated border=fg/9 border-w=1.0 r=9.0
+                  box
+                    with
+                      w=fill
+                      p=7.0
+                      bg=elevated
+                      border=fg/9
+                      border-w=1.0
+                      r=9.0
                     col w=fill gap=5.0
-                      text "Recovered drafts" size=13.0 font=medium @text-fg
+                      text "Recovered drafts"
+                        with
+                          size=13.0
+                          font=medium
+                          @text-fg
                       for recovered_comment in orphaned_comment_drafts
-                        row w=fill gap=5.0 align=center
-                          text recovered_comment w=fill size=13.5 @text-muted
-                          button "Use" label="Use as comment" disabled=(loading || mutation_phase != "idle") h=26.0 p=5.0 @ghost_action -> emit(use_orphaned_comment_draft, recovered_comment)
+                        row
+                          with
+                            w=fill
+                            gap=5.0
+                            align=center
+                          text recovered_comment
+                            with
+                              w=fill
+                              size=13.5
+                              @text-muted
+                          button "Use" -> emit(use_orphaned_comment_draft, recovered_comment)
+                            with
+                              label="Use as comment"
+                              disabled=(loading || mutation_phase != "idle")
+                              h=26.0
+                              p=5.0
+                              @ghost_action
                             active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
                             hovered bg=fg/14
                             pressed bg=fg/18
-                          button "Discard" disabled=(loading || mutation_phase != "idle") h=26.0 p=5.0 @danger_action -> emit(discard_orphaned_comment_draft, recovered_comment)
+                          button "Discard" -> emit(discard_orphaned_comment_draft, recovered_comment)
+                            with
+                              disabled=(loading || mutation_phase != "idle")
+                              h=26.0
+                              p=5.0
+                              @danger_action
                 // THE PAGE. One editor, the whole document — see the file
                 // header. It is never disabled while connected: a page you
                 // can read is a page you can type in. It FILLS the column
@@ -227,25 +529,78 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                 if !empty(subpage_blocks(blocks))
                   // The 46px inset matches the editor's hover-gutter strip, so
                   // subpages align with the text column, not the gutter.
-                  col w=fill gap=2.0 pt=10.0 pl=46.0
-                    text "Subpages" size=10.5 wrap=none font=code_medium @text-hint
+                  col
+                    with
+                      w=fill
+                      gap=2.0
+                      pt=10.0
+                      pl=46.0
+                    text "Subpages"
+                      with
+                        size=10.5
+                        wrap=none
+                        font=code_medium
+                        @text-hint
                     for child in subpage_blocks(blocks)
-                      button label="Open subpage" description=child.text w=fill p=6.0 @ghost_action -> emit(choose_page, child.id)
-                        row w=fill gap=8.0 align=center
-                          Icon name="doc" tone="label" px=14.0
+                      button -> emit(choose_page, child.id)
+                        with
+                          label="Open subpage"
+                          description=child.text
+                          w=fill
+                          p=6.0
+                          @ghost_action
+                        row
+                          with
+                            w=fill
+                            gap=8.0
+                            align=center
+                          Icon
+                            with
+                              name="doc"
+                              tone="label"
+                              px=14.0
                           if empty(child.text)
-                            text "Untitled" w=fill size=13.5 wrap=none font=medium @text-muted
+                            text "Untitled"
+                              with
+                                w=fill
+                                size=13.5
+                                wrap=none
+                                font=medium
+                                @text-muted
                           if !empty(child.text)
-                            text child.text w=fill size=13.5 wrap=none font=medium @text-fg
-                          text "›" size=13.0 wrap=none @text-label
+                            text child.text
+                              with
+                                w=fill
+                                size=13.5
+                                wrap=none
+                                font=medium
+                                @text-fg
+                          text "›"
+                            with
+                              size=13.0
+                              wrap=none
+                              @text-label
                         active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
                         hovered bg=fg/4 text=fg border=fg/7
                         pressed bg=fg/8 text=fg
-          overlay when=page_delete_armed dismiss=emit(disarm_page_delete) backdrop=scrim p=30.0 align-x=center align-y=center
+          overlay
+            with
+              when=page_delete_armed
+              dismiss=emit(disarm_page_delete)
+              backdrop=scrim
+              p=30.0
+              align-x=center
+              align-y=center
             content
               space w=fill h=fill
             layer
-              ConfirmDelete title="Delete this page" subject=active_page_title note="The page and every block on it are deleted for every member. This cannot be undone from the app." action="Delete page" busy=(mutation_phase != "idle")
+              ConfirmDelete
+                with
+                  title="Delete this page"
+                  subject=active_page_title
+                  note="The page and every block on it are deleted for every member. This cannot be undone from the app."
+                  action="Delete page"
+                  busy=(mutation_phase != "idle")
                 events
                   cancel -> emit(disarm_page_delete)
                   confirm -> emit(delete_page_submit)
@@ -253,68 +608,192 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
       // floating card. The Spec tab is omitted: pages carry no kind,
       // no last-editor and no derivation pipeline (see omissions).
       if connected && !empty(active_page) && block_comments_open
-        box w=1.0 h=fill bg=separator
+        box
+          with
+            w=1.0
+            h=fill
+            bg=separator
           space w=1.0 h=1.0
-        box w=306.0 h=fill bg=sidebar clip=true
+        box
+          with
+            w=306.0
+            h=fill
+            bg=sidebar
+            clip=true
           col w=fill h=fill
-            box w=fill h=50.0 pl=16.0 pr=16.0
-              row w=fill h=fill gap=18.0 align=center
-                TabLabel label="Comments" count=block_comment_thread_total active=true
+            box
+              with
+                w=fill
+                h=50.0
+                pl=16.0
+                pr=16.0
+              row
+                with
+                  w=fill
+                  h=fill
+                  gap=18.0
+                  align=center
+                TabLabel
+                  with
+                    label="Comments"
+                    count=block_comment_thread_total
+                    active=true
                 space w=fill
-                button label="Close comments" disabled=(mutation_phase != "idle") w=24.0 h=24.0 p=4.0 @icon_action -> emit(close_block_comments)
-                  box w=fill h=fill align-x=center align-y=center
-                    text "×" size=13.0 wrap=none @text-muted
+                button -> emit(close_block_comments)
+                  with
+                    label="Close comments"
+                    disabled=(mutation_phase != "idle")
+                    w=24.0
+                    h=24.0
+                    p=4.0
+                    @icon_action
+                  box
+                    with
+                      w=fill
+                      h=fill
+                      align-x=center
+                      align-y=center
+                    text "×"
+                      with
+                        size=13.0
+                        wrap=none
+                        @text-muted
                   active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
-            box w=fill h=1.0 bg=separator
+            box
+              with
+                w=fill
+                h=1.0
+                bg=separator
               space w=1.0 h=1.0
-            col w=fill h=fill p=12.0 gap=6.0
+            col
+              with
+                w=fill
+                h=fill
+                p=12.0
+                gap=6.0
               if empty(active_block_comment_thread)
-                scroll dir=vertical w=fill h=fill
+                scroll
+                  with
+                    dir=vertical
+                    w=fill
+                    h=fill
                   col w=fill gap=1.0
                     if empty(block_comment_threads) && !block_comment_threads_loading
-                      text "No comments yet" w=fill size=12.5 align-x=center @text-muted
+                      text "No comments yet"
+                        with
+                          w=fill
+                          size=12.5
+                          align-x=center
+                          @text-muted
                     for comment_thread in block_comment_threads
-                      PageCommentThreadButton thread=comment_thread anchor=comment_anchor_label(blocks, comment_thread.target, active_page)
+                      PageCommentThreadButton
+                        with
+                          thread=comment_thread
+                          anchor=comment_anchor_label(blocks, comment_thread.target, active_page)
                         forward
                           open_block_comment_thread
                     if block_comment_threads_has_more
-                      button "More" disabled=(block_comment_threads_loading || mutation_phase != "idle") h=24.0 p=4.0 @secondary_action -> emit(load_more_block_threads)
+                      button "More" -> emit(load_more_block_threads)
+                        with
+                          disabled=(block_comment_threads_loading || mutation_phase != "idle")
+                          h=24.0
+                          p=4.0
+                          @secondary_action
                         active bg=transparent text=muted r=6.0
                         hovered bg=fg/9 text=fg
                         pressed bg=fg/14
               if !empty(active_block_comment_thread)
-                row w=fill gap=5.0 align=center
-                  button "← Threads" disabled=(block_thread_comments_loading || mutation_phase != "idle") h=24.0 p=4.0 @secondary_action -> emit(close_block_comment_thread)
+                row
+                  with
+                    w=fill
+                    gap=5.0
+                    align=center
+                  button "← Threads" -> emit(close_block_comment_thread)
+                    with
+                      disabled=(block_thread_comments_loading || mutation_phase != "idle")
+                      h=24.0
+                      p=4.0
+                      @secondary_action
                     active bg=transparent text=muted r=6.0
                     hovered bg=fg/9 text=fg
                     pressed bg=fg/14
-                  text comment_anchor_label(blocks, active_thread_target, active_page) w=fill size=10.5 wrap=none font=code_medium @text-hint
+                  text comment_anchor_label(blocks, active_thread_target, active_page)
+                    with
+                      w=fill
+                      size=10.5
+                      wrap=none
+                      font=code_medium
+                      @text-hint
                   if !thread_is_resolved(block_comment_threads, active_block_comment_thread)
-                    button "Resolve" disabled=(mutation_phase != "idle") h=24.0 p=4.0 @secondary_action -> emit(resolve_thread_submit, true)
+                    button "Resolve" -> emit(resolve_thread_submit, true)
+                      with
+                        disabled=(mutation_phase != "idle")
+                        h=24.0
+                        p=4.0
+                        @secondary_action
                       active bg=transparent text=muted r=6.0
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
                   if thread_is_resolved(block_comment_threads, active_block_comment_thread)
-                    button "Reopen" disabled=(mutation_phase != "idle") h=24.0 p=4.0 @secondary_action -> emit(resolve_thread_submit, false)
+                    button "Reopen" -> emit(resolve_thread_submit, false)
+                      with
+                        disabled=(mutation_phase != "idle")
+                        h=24.0
+                        p=4.0
+                        @secondary_action
                       active bg=transparent text=muted r=6.0
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
-                scroll dir=vertical w=fill h=fill
+                scroll
+                  with
+                    dir=vertical
+                    w=fill
+                    h=fill
                   col w=fill gap=1.0
                     for page_comment in block_thread_comments
                       PageCommentCard comment=page_comment
                     if block_thread_comments_has_more
-                      button "More" disabled=(block_thread_comments_loading || mutation_phase != "idle") h=24.0 p=4.0 @secondary_action -> emit(load_more_block_comments)
+                      button "More" -> emit(load_more_block_comments)
+                        with
+                          disabled=(block_thread_comments_loading || mutation_phase != "idle")
+                          h=24.0
+                          p=4.0
+                          @secondary_action
                         active bg=transparent text=muted r=6.0
                         hovered bg=fg/9 text=fg
                         pressed bg=fg/14
               if empty(active_block_comment_thread)
-                text comment_compose_hint(blocks, caret_comment_target, active_page) w=fill size=10.5 wrap=none font=code_medium @text-hint
-              row w=fill gap=5.0 align=center
-                input "" #page-comment(scope_key(connected_rpc, active_page)) label="New page comment" <-> block_comment_draft hint="Add a comment…" disabled=(mutation_phase != "idle" || block_comment_threads_loading || block_thread_comments_loading) submit=emit(post_block_comment_submit) w=fill p=6.2 text-size=13.0 line-h=1.2 @control
+                text comment_compose_hint(blocks, caret_comment_target, active_page)
+                  with
+                    w=fill
+                    size=10.5
+                    wrap=none
+                    font=code_medium
+                    @text-hint
+              row
+                with
+                  w=fill
+                  gap=5.0
+                  align=center
+                input "" #page-comment(scope_key(connected_rpc, active_page)) <-> block_comment_draft
+                  with
+                    label="New page comment"
+                    hint="Add a comment…"
+                    disabled=(mutation_phase != "idle" || block_comment_threads_loading || block_thread_comments_loading)
+                    submit=emit(post_block_comment_submit)
+                    w=fill
+                    p=6.2
+                    text-size=13.0
+                    line-h=1.2
+                    @control
                   active bg=transparent border=fg/8 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                   hovered bg=fg/4 border=fg/11
                   disabled value=muted
-                button "Post" disabled=(mutation_phase != "idle" || empty(trim(block_comment_draft)) || block_comment_threads_loading || block_thread_comments_loading) h=28.0 p=5.0 @primary_action -> emit(post_block_comment_submit)
+                button "Post" -> emit(post_block_comment_submit)
+                  with
+                    disabled=(mutation_phase != "idle" || empty(trim(block_comment_draft)) || block_comment_threads_loading || block_thread_comments_loading)
+                    h=28.0
+                    p=5.0
+                    @primary_action

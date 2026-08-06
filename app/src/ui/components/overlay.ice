@@ -29,26 +29,93 @@ component ConfirmDelete(title:str, subject:str, note:str, action:str, busy:bool)
     confirm()
   ModalShell title=title width=418.0
     close:
-      button label="Cancel" disabled=busy w=26.0 h=26.0 p=0.0 @icon_action -> emit(cancel)
-        box w=fill h=fill align-x=center align-y=center
-          text "×" size=14.0 wrap=none @text-muted
+      button -> emit(cancel)
+        with
+          label="Cancel"
+          disabled=busy
+          w=26.0
+          h=26.0
+          p=0.0
+          @icon_action
+        box
+          with
+            w=fill
+            h=fill
+            align-x=center
+            align-y=center
+          text "×"
+            with
+              size=14.0
+              wrap=none
+              @text-muted
         active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
         hovered bg=elevated text=fg
         pressed bg=subtle text=fg
     body:
       col w=fill gap=13.0
-        text subject w=fill size=13.5 font=medium @text-fg
-        text note w=fill size=12.0 line-h=1.5 @text-caption
-        row w=fill gap=8.0 align=end
-          button "Cancel" disabled=busy h=30.0 p=7.0 @secondary_action -> emit(cancel)
-          button label=action disabled=busy h=30.0 p=7.0 @danger_action -> emit(confirm)
+        text subject
+          with
+            w=fill
+            size=13.5
+            font=medium
+            @text-fg
+        text note
+          with
+            w=fill
+            size=12.0
+            line-h=1.5
+            @text-caption
+        row
+          with
+            w=fill
+            gap=8.0
+            align=end
+          button "Cancel" -> emit(cancel)
+            with
+              disabled=busy
+              h=30.0
+              p=7.0
+              @secondary_action
+          button -> emit(confirm)
+            with
+              label=action
+              disabled=busy
+              h=30.0
+              p=7.0
+              @danger_action
             text action size=13.0 wrap=none
 
 component ModalShell(title:str, width:f64)
-  box #root w=width bg=surface border=border border-w=1.0 r=14.0 shadow=shadow_modal shadow-y=24.0 shadow-blur=60.0
-    col w=fill pl=22.0 pr=22.0 pt=20.0 pb=22.0 gap=13.0
-      row w=fill gap=10.0 align=center
-        text title w=fill size=16.0 wrap=none font=display @text-primary
+  box #root
+    with
+      w=width
+      bg=surface
+      border=border
+      border-w=1.0
+      r=14.0
+      shadow=shadow_modal
+      shadow-y=24.0
+      shadow-blur=60.0
+    col
+      with
+        w=fill
+        pl=22.0
+        pr=22.0
+        pt=20.0
+        pb=22.0
+        gap=13.0
+      row
+        with
+          w=fill
+          gap=10.0
+          align=center
+        text title
+          with
+            w=fill
+            size=16.0
+            wrap=none
+            font=display
+            @text-primary
         slot close
       slot body
 
@@ -60,19 +127,46 @@ component ModalShell(title:str, width:f64)
 // no item in this campaign owns. `Toast.Confirm` is the same component under
 // the family's own dotted convention (Badge.Success, Alert.Warning).
 component Toast.Confirm(message:str, tone:str)
-  box #root px=16.0 py=10.0 bg=toast_bg r=10.0 shadow=shadow_toast shadow-y=6.0 shadow-blur=18.0
+  box #root
+    with
+      px=16.0
+      py=10.0
+      bg=toast_bg
+      r=10.0
+      shadow=shadow_toast
+      shadow-y=6.0
+      shadow-blur=18.0
     row gap=9.0 align=center
       match tone
         "error"
-          box w=6.0 h=6.0 bg=danger_dot r=3.0
+          box
+            with
+              w=6.0
+              h=6.0
+              bg=danger_dot
+              r=3.0
             space w=1.0 h=1.0
         "warning"
-          box w=6.0 h=6.0 bg=warning_dot r=3.0
+          box
+            with
+              w=6.0
+              h=6.0
+              bg=warning_dot
+              r=3.0
             space w=1.0 h=1.0
         _
-          box w=6.0 h=6.0 bg=success_dot r=3.0
+          box
+            with
+              w=6.0
+              h=6.0
+              bg=success_dot
+              r=3.0
             space w=1.0 h=1.0
-      text message size=12.5 wrap=none @text-toast_fg
+      text message
+        with
+          size=12.5
+          wrap=none
+          @text-toast_fg
 
 // `Switch` (a 38x22 track with an 18px knob sliding 2px -> 18px, over the
 // label/note pair) was built here and is DELETED — this console has nothing to
@@ -94,7 +188,17 @@ component Toast.Confirm(message:str, tone:str)
 // message ⋯ menu, bell. The caller pins it (stack + pin, or an `overlay` layer)
 // and fills it with its own rows.
 component Popover(width:f64)
-  box #root w=width p=5.0 bg=surface border=border border-w=1.0 r=11.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+  box #root
+    with
+      w=width
+      p=5.0
+      bg=surface
+      border=border
+      border-w=1.0
+      r=11.0
+      shadow=shadow_popover
+      shadow-y=3.0
+      shadow-blur=12.0
     col w=fill
       slot
 
@@ -103,19 +207,52 @@ component Popover(width:f64)
 // the PR detail tabs and the node tabs each pick with their own handler.
 component TabLabel(label:str, count:i64, active:bool)
   col #root
-    row gap=7.0 pt=10.0 pb=10.0 align=center
+    row
+      with
+        gap=7.0
+        pt=10.0
+        pb=10.0
+        align=center
       if active
-        text label size=13.0 wrap=none font=display @text-primary
+        text label
+          with
+            size=13.0
+            wrap=none
+            font=display
+            @text-primary
       if !active
-        text label size=13.0 wrap=none font=display @text-meta
+        text label
+          with
+            size=13.0
+            wrap=none
+            font=display
+            @text-meta
       if count > 0
-        box px=7.0 py=1.0 bg=elevated r=9.0
-          text count size=10.0 wrap=none font=code_semibold @text-meta
+        box
+          with
+            px=7.0
+            py=1.0
+            bg=elevated
+            r=9.0
+          text count
+            with
+              size=10.0
+              wrap=none
+              font=code_semibold
+              @text-meta
     if active
-      box w=fill h=2.0 bg=primary
+      box
+        with
+          w=fill
+          h=2.0
+          bg=primary
         space w=1.0 h=1.0
     if !active
-      box w=fill h=2.0 bg=transparent
+      box
+        with
+          w=fill
+          h=2.0
+          bg=transparent
         space w=1.0 h=1.0
 
 // A filter chip with its matched count: the Explorer kind strip and the
@@ -123,15 +260,49 @@ component TabLabel(label:str, count:i64, active:bool)
 component FilterChip(label:str, count:i64, selected:bool)
   col #root
     if selected
-      box px=11.0 py=6.0 bg=primary border=primary border-w=1.0 r=8.0
+      box
+        with
+          px=11.0
+          py=6.0
+          bg=primary
+          border=primary
+          border-w=1.0
+          r=8.0
         row gap=6.0 align=center
-          text label size=12.0 wrap=none font=display @text-primary_fg
-          text count size=10.0 wrap=none font=code_semibold @text-meta
+          text label
+            with
+              size=12.0
+              wrap=none
+              font=display
+              @text-primary_fg
+          text count
+            with
+              size=10.0
+              wrap=none
+              font=code_semibold
+              @text-meta
     if !selected
-      box px=11.0 py=6.0 bg=surface border=border border-w=1.0 r=8.0
+      box
+        with
+          px=11.0
+          py=6.0
+          bg=surface
+          border=border
+          border-w=1.0
+          r=8.0
         row gap=6.0 align=center
-          text label size=12.0 wrap=none font=display @text-secondary_fg
-          text count size=10.0 wrap=none font=code_semibold @text-label
+          text label
+            with
+              size=12.0
+              wrap=none
+              font=display
+              @text-secondary_fg
+          text count
+            with
+              size=10.0
+              wrap=none
+              font=code_semibold
+              @text-label
 
 // The 9px mono section label, with the artifact's optional trailing note
 // (`needs quorum to change`) hung beside it.
@@ -140,9 +311,19 @@ component FilterChip(label:str, count:i64, selected:bool)
 // backend.rs, which this file does not own — it renders tight until that lands.
 component Eyebrow(label:str, note:str)
   row #root gap=8.0 align=center
-    text label size=9.0 wrap=none font=code_semibold @text-label
+    text label
+      with
+        size=9.0
+        wrap=none
+        font=code_semibold
+        @text-label
     if note != ""
-      text note size=9.0 wrap=none font=code_semibold @text-label
+      text note
+        with
+          size=9.0
+          wrap=none
+          font=code_semibold
+          @text-label
 
 // NO SPINNER COMPONENT. The artifact's 2px ring with a transparent quarter is
 // a CSS keyframe; the ice equivalent is a `canvas` arc turned by
@@ -159,10 +340,33 @@ component Eyebrow(label:str, note:str)
 // One NETWORK stat card: a mono caps label over the machine reading, with an
 // optional unit suffix (`ms`) beside it.
 component StatCard(label:str, value:str, note:str)
-  box #root w=fill px=13.0 py=11.0 bg=surface border=card_line border-w=1.0 r=10.0
+  box #root
+    with
+      w=fill
+      px=13.0
+      py=11.0
+      bg=surface
+      border=card_line
+      border-w=1.0
+      r=10.0
     col w=fill gap=3.0
-      text label size=9.0 wrap=none font=code_semibold @text-label
+      text label
+        with
+          size=9.0
+          wrap=none
+          font=code_semibold
+          @text-label
       row gap=4.0 align=center
-        text value size=14.0 wrap=none font=code_semibold @text-primary
+        text value
+          with
+            size=14.0
+            wrap=none
+            font=code_semibold
+            @text-primary
         if note != ""
-          text note size=11.0 wrap=none font=code_medium @text-meta
+          text note
+            with
+              size=11.0
+              wrap=none
+              font=code_medium
+              @text-meta

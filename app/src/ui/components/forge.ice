@@ -40,20 +40,70 @@
 // gets printed. `about` is the workspace bio, not an invented tagline.
 component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str)
   col #root w=fill gap=7.0
-    row w=fill gap=10.0 align=center
-      box w=30.0 h=30.0 align-x=center align-y=center bg=primary r=8.0
-        Icon name="branch" tone="paper" px=16.0
-      text org size=16.0 wrap=none font=display @text-primary
-      box px=6.0 py=2.0 bg=brand r=4.0
-        text "ORG" size=9.0 wrap=none font=code_semibold @text-brand_fg
+    row
+      with
+        w=fill
+        gap=10.0
+        align=center
+      box
+        with
+          w=30.0
+          h=30.0
+          align-x=center
+          align-y=center
+          bg=primary
+          r=8.0
+        Icon
+          with
+            name="branch"
+            tone="paper"
+            px=16.0
+      text org
+        with
+          size=16.0
+          wrap=none
+          font=display
+          @text-primary
+      box
+        with
+          px=6.0
+          py=2.0
+          bg=brand
+          r=4.0
+        text "ORG"
+          with
+            size=9.0
+            wrap=none
+            font=code_semibold
+            @text-brand_fg
       space w=fill
       row gap=5.0 align=center
-        text repos size=10.5 wrap=none font=code_medium @text-meta
-        text "repositories ·" size=10.5 wrap=none font=code_medium @text-meta
-        text tier size=10.5 wrap=none font=code_medium @text-meta
+        text repos
+          with
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-meta
+        text "repositories ·"
+          with
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-meta
+        text tier
+          with
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-meta
     if !empty(about)
       box w=fill max-w=680.0
-        text about w=fill size=12.5 line-h=1.5 @text-caption
+        text about
+          with
+            w=fill
+            size=12.5
+            line-h=1.5
+            @text-caption
 
 // One repo card. The artifact org-qualifies the title, but the org it would be
 // qualified WITH is the network name the header and the breadcrumb are both fed
@@ -71,23 +121,77 @@ component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str)
 component RepoCard(repo:ForgeRepo)
   emits
     forge_open_repo(str)
-  button label="Open repo" description=repo.name w=fill p=0.0 @icon_action -> emit(forge_open_repo, repo.name)
-    box w=fill pl=17.0 pr=17.0 pt=15.0 pb=15.0
+  button -> emit(forge_open_repo, repo.name)
+    with
+      label="Open repo"
+      description=repo.name
+      w=fill
+      p=0.0
+      @icon_action
+    box
+      with
+        w=fill
+        pl=17.0
+        pr=17.0
+        pt=15.0
+        pb=15.0
       col w=fill gap=10.0
-        row w=fill gap=8.0 align=center
-          Icon name="branch" tone="muted" px=14.0
-          text repo.name size=14.0 wrap=none font=display @text-primary
+        row
+          with
+            w=fill
+            gap=8.0
+            align=center
+          Icon
+            with
+              name="branch"
+              tone="muted"
+              px=14.0
+          text repo.name
+            with
+              size=14.0
+              wrap=none
+              font=display
+              @text-primary
         if !empty(repo.about)
-          text repo.about w=fill size=12.0 line-h=1.5 @text-caption
-        row w=fill gap=14.0 align=center
+          text repo.about
+            with
+              w=fill
+              size=12.0
+              line-h=1.5
+              @text-caption
+        row
+          with
+            w=fill
+            gap=14.0
+            align=center
           if !empty(repo.language)
             row gap=5.0 align=center
-              box w=7.0 h=7.0 bg=kind_code r=3.5
+              box
+                with
+                  w=7.0
+                  h=7.0
+                  bg=kind_code
+                  r=3.5
                 space w=1.0 h=1.0
-              text repo.language size=10.5 wrap=none @text-meta
-          text repo.head w=fill size=10.5 wrap=none font=code_medium @text-input
+              text repo.language
+                with
+                  size=10.5
+                  wrap=none
+                  @text-meta
+          text repo.head
+            with
+              w=fill
+              size=10.5
+              wrap=none
+              font=code_medium
+              @text-input
           if repo.updated_at > 0
-            text relative_time(repo.updated_at) size=10.5 wrap=none font=code_medium @text-hint
+            text relative_time(repo.updated_at)
+              with
+                size=10.5
+                wrap=none
+                font=code_medium
+                @text-hint
     active bg=surface text=fg border=card_line border-w=1.0 r=13.0
     hovered bg=card_wash_hover text=fg border=pending_line
     pressed bg=elevated text=fg
@@ -104,25 +208,84 @@ component RepoCard(repo:ForgeRepo)
 // repo name the way the artifact's hover does. `branch` renders only when the
 // caller has a default branch to name.
 component RepoCrumb(org:str, repo:str, branch:str, open:bool)
-  row #root w=fill gap=9.0 align=center
-    box w=28.0 h=28.0 align-x=center align-y=center bg=primary r=8.0
-      Icon name="branch" tone="paper" px=15.0
-    text org size=14.0 wrap=none font=display @text-caption
-    text "/" size=14.0 wrap=none @text-chevron_idle
+  row #root
+    with
+      w=fill
+      gap=9.0
+      align=center
+    box
+      with
+        w=28.0
+        h=28.0
+        align-x=center
+        align-y=center
+        bg=primary
+        r=8.0
+      Icon
+        with
+          name="branch"
+          tone="paper"
+          px=15.0
+    text org
+      with
+        size=14.0
+        wrap=none
+        font=display
+        @text-caption
+    text "/"
+      with
+        size=14.0
+        wrap=none
+        @text-chevron_idle
     if open
-      text repo size=14.0 wrap=none font=display @text-brand
+      text repo
+        with
+          size=14.0
+          wrap=none
+          font=display
+          @text-brand
     if !open
-      text repo size=14.0 wrap=none font=display @text-primary
+      text repo
+        with
+          size=14.0
+          wrap=none
+          font=display
+          @text-primary
     if open
-      Icon name="chevron-down" tone="accent" px=11.0
+      Icon
+        with
+          name="chevron-down"
+          tone="accent"
+          px=11.0
     if !open
-      Icon name="chevron-down" tone="ink" px=11.0
+      Icon
+        with
+          name="chevron-down"
+          tone="ink"
+          px=11.0
     if !empty(branch)
-      box px=8.0 py=3.0 bg=surface border=border border-w=1.0 r=7.0
+      box
+        with
+          px=8.0
+          py=3.0
+          bg=surface
+          border=border
+          border-w=1.0
+          r=7.0
         row gap=5.0 align=center
-          box w=6.0 h=6.0 bg=success_dot r=3.0
+          box
+            with
+              w=6.0
+              h=6.0
+              bg=success_dot
+              r=3.0
             space w=1.0 h=1.0
-          text branch size=10.5 wrap=none font=code_medium @text-muted
+          text branch
+            with
+              size=10.5
+              wrap=none
+              font=code_medium
+              @text-muted
     space w=fill
 
 // One row of the 290px repo switcher. The artifact's right-hand `N PR` /
@@ -133,18 +296,62 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
     forge_open_repo(str)
   col #root w=fill
     if active
-      button label="Switch repo" description=repo.name w=fill p=0.0 @icon_action -> emit(forge_open_repo, repo.name)
-        box w=fill pl=9.0 pr=9.0 pt=8.0 pb=8.0
-          row w=fill gap=9.0 align=center
-            text repo.name w=fill size=13.0 wrap=none font=display @text-primary
+      button -> emit(forge_open_repo, repo.name)
+        with
+          label="Switch repo"
+          description=repo.name
+          w=fill
+          p=0.0
+          @icon_action
+        box
+          with
+            w=fill
+            pl=9.0
+            pr=9.0
+            pt=8.0
+            pb=8.0
+          row
+            with
+              w=fill
+              gap=9.0
+              align=center
+            text repo.name
+              with
+                w=fill
+                size=13.0
+                wrap=none
+                font=display
+                @text-primary
         active bg=elevated text=fg border=transparent border-w=1.0 r=8.0
         hovered bg=elevated text=fg
         pressed bg=subtle text=fg
     if !active
-      button label="Switch repo" description=repo.name w=fill p=0.0 @icon_action -> emit(forge_open_repo, repo.name)
-        box w=fill pl=9.0 pr=9.0 pt=8.0 pb=8.0
-          row w=fill gap=9.0 align=center
-            text repo.name w=fill size=13.0 wrap=none font=display @text-primary
+      button -> emit(forge_open_repo, repo.name)
+        with
+          label="Switch repo"
+          description=repo.name
+          w=fill
+          p=0.0
+          @icon_action
+        box
+          with
+            w=fill
+            pl=9.0
+            pr=9.0
+            pt=8.0
+            pb=8.0
+          row
+            with
+              w=fill
+              gap=9.0
+              align=center
+            text repo.name
+              with
+                w=fill
+                size=13.0
+                wrap=none
+                font=display
+                @text-primary
         active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
         hovered bg=elevated text=fg
         pressed bg=subtle text=fg
@@ -185,17 +392,53 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
 // log lands, the header fills without a layout change.
 component ForgeCodeTab(path:str, message:str, author:str, stamp:str)
   row #root w=fill h=fill
-    box w=258.0 h=fill bg=sidebar
-      scroll dir=vertical w=fill h=fill
-        col w=fill pt=9.0 pb=9.0
-          box w=fill pl=16.0 pr=16.0 pt=5.0 pb=8.0
-            text "FILES" size=9.0 wrap=none font=code_semibold @text-label
+    box
+      with
+        w=258.0
+        h=fill
+        bg=sidebar
+      scroll
+        with
+          dir=vertical
+          w=fill
+          h=fill
+        col
+          with
+            w=fill
+            pt=9.0
+            pb=9.0
+          box
+            with
+              w=fill
+              pl=16.0
+              pr=16.0
+              pt=5.0
+              pb=8.0
+            text "FILES"
+              with
+                size=9.0
+                wrap=none
+                font=code_semibold
+                @text-label
           slot files
-    box w=1.0 h=fill bg=separator
+    box
+      with
+        w=1.0
+        h=fill
+        bg=separator
       space w=1.0 h=1.0
     col w=fill h=fill
-      ForgeCodeHeader path=path message=message author=author stamp=stamp
-      scroll dir=vertical w=fill h=fill
+      ForgeCodeHeader
+        with
+          path
+          message
+          author
+          stamp
+      scroll
+        with
+          dir=vertical
+          w=fill
+          h=fill
         slot source
 
 // One directory row. The caret is the artifact's rotation drawn as the two
@@ -208,13 +451,39 @@ component ForgeCodeTab(path:str, message:str, author:str, stamp:str)
 // folder gold has no step in the ink ramp; `warning` (#a07b32) is the ramp's
 // nearest true step to #a08a5a, as it is on the duckfs tree.
 component ForgeTreeDirRow(name:str, depth:f64, open:bool)
-  row #root w=fill gap=6.0 align=center pt=5.0 pb=5.0 pr=14.0 pl=(10.0 + depth * 15.0)
+  row #root
+    with
+      w=fill
+      gap=6.0
+      align=center
+      pt=5.0
+      pb=5.0
+      pr=14.0
+      pl=(10.0 + depth * 15.0)
     if open
-      Icon name="chevron-down" tone="meta" px=10.0
+      Icon
+        with
+          name="chevron-down"
+          tone="meta"
+          px=10.0
     if !open
-      Icon name="chevron-right" tone="meta" px=10.0
-    Icon name="folder" tone="warning" px=13.0
-    text name w=fill size=12.5 wrap=none font=display @text-accent_fg
+      Icon
+        with
+          name="chevron-right"
+          tone="meta"
+          px=10.0
+    Icon
+      with
+        name="folder"
+        tone="warning"
+        px=13.0
+    text name
+      with
+        w=fill
+        size=12.5
+        wrap=none
+        font=display
+        @text-accent_fg
 
 // One file row. Selected wears `tree_selected` and the ink steps forward; the
 // file name is mono on both, because a path is a machine value.
@@ -222,19 +491,51 @@ component ForgeTreeFileRow(name:str, depth:f64, selected:bool)
   col #root w=fill
     if selected
       box w=fill bg=tree_selected
-        ForgeTreeFileFace name=name depth=depth selected=true
+        ForgeTreeFileFace
+          with
+            name
+            depth
+            selected=true
     if !selected
       box w=fill
-        ForgeTreeFileFace name=name depth=depth selected=false
+        ForgeTreeFileFace
+          with
+            name
+            depth
+            selected=false
 
 // The file row's contents, in one place so the two plates cannot drift apart.
 component ForgeTreeFileFace(name:str, depth:f64, selected:bool)
-  row #root w=fill gap=6.0 align=center pt=5.0 pb=5.0 pr=14.0 pl=(10.0 + depth * 15.0)
-    Icon name="file" tone="label" px=12.0
+  row #root
+    with
+      w=fill
+      gap=6.0
+      align=center
+      pt=5.0
+      pb=5.0
+      pr=14.0
+      pl=(10.0 + depth * 15.0)
+    Icon
+      with
+        name="file"
+        tone="label"
+        px=12.0
     if selected
-      text name w=fill size=12.5 wrap=none font=code @text-primary
+      text name
+        with
+          w=fill
+          size=12.5
+          wrap=none
+          font=code
+          @text-primary
     if !selected
-      text name w=fill size=12.5 wrap=none font=code @text-secondary_fg
+      text name
+        with
+          w=fill
+          size=12.5
+          wrap=none
+          font=code
+          @text-secondary_fg
 
 // The reader's 42px header: the path this pane is showing, the last commit
 // message under that path, and who landed it when.
@@ -246,23 +547,64 @@ component ForgeTreeFileFace(name:str, depth:f64, selected:bool)
 // prints the path alone rather than an empty middot run.
 component ForgeCodeHeader(path:str, message:str, author:str, stamp:str)
   col #root w=fill
-    box w=fill h=42.0 pl=16.0 pr=16.0 bg=surface
-      row w=fill h=fill gap=10.0 align=center clip=true
-        text path size=12.0 wrap=none font=code_semibold @text-accent_fg
+    box
+      with
+        w=fill
+        h=42.0
+        pl=16.0
+        pr=16.0
+        bg=surface
+      row
+        with
+          w=fill
+          h=fill
+          gap=10.0
+          align=center
+          clip=true
+        text path
+          with
+            size=12.0
+            wrap=none
+            font=code_semibold
+            @text-accent_fg
         // The message takes the slack and is clipped by it — iced has no
         // text-overflow, so the column IS the ellipsis. It renders even when
         // empty, because it is also what holds the right-hand meta at the edge.
         box w=fill clip=true
           col w=fill
             if !empty(message)
-              text message size=10.5 wrap=none font=code @text-meta
+              text message
+                with
+                  size=10.5
+                  wrap=none
+                  font=code
+                  @text-meta
         if !empty(author)
-          text author size=10.0 wrap=none font=code @text-label
+          text author
+            with
+              size=10.0
+              wrap=none
+              font=code
+              @text-label
         if !empty(author) && !empty(stamp)
-          text "·" size=10.0 wrap=none font=code @text-label
+          text "·"
+            with
+              size=10.0
+              wrap=none
+              font=code
+              @text-label
         if !empty(stamp)
-          text stamp size=10.0 wrap=none font=code @text-label
-    box w=fill h=1.0 bg=separator
+          text stamp
+            with
+              size=10.0
+              wrap=none
+              font=code
+              @text-label
+    box
+      with
+        w=fill
+        h=1.0
+        bg=separator
       space w=1.0 h=1.0
 
 // One source line: a 44px right-aligned gutter on `rail` at the artifact's own
@@ -283,11 +625,40 @@ component ForgeCodeHeader(path:str, message:str, author:str, stamp:str)
 // annotation affordance — `ReviewComment` anchors into a PR's diff, not into a
 // file read at a rev; `DiffRow` below is where a line comment is authored.)
 component ForgeCodeLine(number:str, code:str)
-  row #root w=fill gap=0.0 align=center
-    box w=44.0 h=20.0 pr=12.0 align-y=center bg=rail
-      text number w=fill size=12.0 wrap=none align-x=right font=code @text-icon_idle
-    box w=fill h=20.0 pl=13.0 align-y=center clip=true
-      text code w=fill size=12.0 wrap=none font=code @text-accent_fg
+  row #root
+    with
+      w=fill
+      gap=0.0
+      align=center
+    box
+      with
+        w=44.0
+        h=20.0
+        pr=12.0
+        align-y=center
+        bg=rail
+      text number
+        with
+          w=fill
+          size=12.0
+          wrap=none
+          align-x=right
+          font=code
+          @text-icon_idle
+    box
+      with
+        w=fill
+        h=20.0
+        pl=13.0
+        align-y=center
+        clip=true
+      text code
+        with
+          w=fill
+          size=12.0
+          wrap=none
+          font=code
+          @text-accent_fg
 
 // The reader with nothing to read. This is one plate for three true reasons —
 // no file picked yet, a binary blob, a blob past the read cap — so the caller
@@ -297,13 +668,30 @@ component ForgeCodeLine(number:str, code:str)
 // string: the mirror is a fetch of the node's own forge remote, and the app
 // ships no editor for it.
 component ForgeCodeEmpty(name:str, note:str)
-  box #root w=fill p=48.0 align-x=center
+  box #root
+    with
+      w=fill
+      p=48.0
+      align-x=center
     col gap=9.0 align=center
       if !empty(name)
-        text name size=14.0 wrap=none font=code_semibold @text-caption
-      text "Synced from the node · view only" size=11.5 wrap=none @text-label
+        text name
+          with
+            size=14.0
+            wrap=none
+            font=code_semibold
+            @text-caption
+      text "Synced from the node · view only"
+        with
+          size=11.5
+          wrap=none
+          @text-label
       if !empty(note)
-        text note size=11.5 wrap=none @text-label
+        text note
+          with
+            size=11.5
+            wrap=none
+            @text-label
 
 // ── TRACKER ───────────────────────────────────────────────────────────────
 
@@ -326,26 +714,72 @@ component TrackerRow(item:ForgeItem)
   emits
     forge_open_item(i64)
   col #root w=fill
-    button label="Open item" description=item.title w=fill p=0.0 @icon_action -> emit(forge_open_item, item.number)
-      box w=fill pl=24.0 pr=24.0 pt=13.0 pb=13.0
-        row w=fill gap=13.0 align=start
+    button -> emit(forge_open_item, item.number)
+      with
+        label="Open item"
+        description=item.title
+        w=fill
+        p=0.0
+        @icon_action
+      box
+        with
+          w=fill
+          pl=24.0
+          pr=24.0
+          pt=13.0
+          pb=13.0
+        row
+          with
+            w=fill
+            gap=13.0
+            align=start
           match item.kind
             "pr"
               PrStatePlate state=item.state
             "issue"
               IssueStateGlyph state=item.state
           col w=fill gap=4.0
-            text item.title w=fill size=14.0 wrap=none font=display @text-primary
+            text item.title
+              with
+                w=fill
+                size=14.0
+                wrap=none
+                font=display
+                @text-primary
             row gap=5.0 align=center
               row gap=0.0 align=center
-                text "#" size=11.0 wrap=none font=code_medium @text-meta
-                text item.number size=11.0 wrap=none font=code_medium @text-meta
-              text "· opened by" size=11.0 wrap=none font=code_medium @text-meta
-              text item.author_name size=11.0 wrap=none font=code_medium @text-meta
+                text "#"
+                  with
+                    size=11.0
+                    wrap=none
+                    font=code_medium
+                    @text-meta
+                text item.number
+                  with
+                    size=11.0
+                    wrap=none
+                    font=code_medium
+                    @text-meta
+              text "· opened by"
+                with
+                  size=11.0
+                  wrap=none
+                  font=code_medium
+                  @text-meta
+              text item.author_name
+                with
+                  size=11.0
+                  wrap=none
+                  font=code_medium
+                  @text-meta
       active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
       hovered bg=row_hover text=fg
       pressed bg=elevated text=fg
-    box w=fill h=1.0 bg=elevated
+    box
+      with
+        w=fill
+        h=1.0
+        bg=elevated
       space w=1.0 h=1.0
 
 // The 24px state square: one glyph, three plates.
@@ -353,14 +787,53 @@ component PrStatePlate(state:str)
   col #root
     match state
       "open"
-        box w=24.0 h=24.0 align-x=center align-y=center bg=success_bg border=success_line border-w=1.0 r=7.0
-          Icon name="pull-request" tone="success" px=13.0
+        box
+          with
+            w=24.0
+            h=24.0
+            align-x=center
+            align-y=center
+            bg=success_bg
+            border=success_line
+            border-w=1.0
+            r=7.0
+          Icon
+            with
+              name="pull-request"
+              tone="success"
+              px=13.0
       "merged"
-        box w=24.0 h=24.0 align-x=center align-y=center bg=merged_bg border=merged_line border-w=1.0 r=7.0
-          Icon name="pull-request" tone="muted" px=13.0
+        box
+          with
+            w=24.0
+            h=24.0
+            align-x=center
+            align-y=center
+            bg=merged_bg
+            border=merged_line
+            border-w=1.0
+            r=7.0
+          Icon
+            with
+              name="pull-request"
+              tone="muted"
+              px=13.0
       _
-        box w=24.0 h=24.0 align-x=center align-y=center bg=elevated border=border border-w=1.0 r=7.0
-          Icon name="pull-request" tone="muted" px=13.0
+        box
+          with
+            w=24.0
+            h=24.0
+            align-x=center
+            align-y=center
+            bg=elevated
+            border=border
+            border-w=1.0
+            r=7.0
+          Icon
+            with
+              name="pull-request"
+              tone="muted"
+              px=13.0
 
 // Issues carry their state in the glyph itself — the one place the artifact
 // swaps the mark instead of the plate.
@@ -368,9 +841,17 @@ component IssueStateGlyph(state:str)
   col #root
     match state
       "open"
-        Icon name="issue-open" tone="success" px=17.0
+        Icon
+          with
+            name="issue-open"
+            tone="success"
+            px=17.0
       _
-        Icon name="issue-closed" tone="muted" px=17.0
+        Icon
+          with
+            name="issue-closed"
+            tone="muted"
+            px=17.0
 
 // ── ITEM DETAIL ───────────────────────────────────────────────────────────
 
@@ -381,20 +862,54 @@ component BackToList(kind:str)
   col #root
     match kind
       "pr"
-        button label="Back to pull requests" p=0.0 @icon_action -> emit(forge_close_item)
-          box pl=7.0 pr=9.0 pt=4.0 pb=4.0
+        button -> emit(forge_close_item)
+          with
+            label="Back to pull requests"
+            p=0.0
+            @icon_action
+          box
+            with
+              pl=7.0
+              pr=9.0
+              pt=4.0
+              pb=4.0
             row gap=5.0 align=center
-              text "‹" size=14.0 wrap=none @text-muted
-              text "Pull requests" size=12.0 wrap=none @text-muted
+              text "‹"
+                with
+                  size=14.0
+                  wrap=none
+                  @text-muted
+              text "Pull requests"
+                with
+                  size=12.0
+                  wrap=none
+                  @text-muted
           active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
           hovered bg=row_hover text=fg
           pressed bg=elevated text=fg
       "issue"
-        button label="Back to issues" p=0.0 @icon_action -> emit(forge_close_item)
-          box pl=7.0 pr=9.0 pt=4.0 pb=4.0
+        button -> emit(forge_close_item)
+          with
+            label="Back to issues"
+            p=0.0
+            @icon_action
+          box
+            with
+              pl=7.0
+              pr=9.0
+              pt=4.0
+              pb=4.0
             row gap=5.0 align=center
-              text "‹" size=14.0 wrap=none @text-muted
-              text "Issues" size=12.0 wrap=none @text-muted
+              text "‹"
+                with
+                  size=14.0
+                  wrap=none
+                  @text-muted
+              text "Issues"
+                with
+                  size=12.0
+                  wrap=none
+                  @text-muted
           active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
           hovered bg=row_hover text=fg
           pressed bg=elevated text=fg
@@ -405,20 +920,68 @@ component PrStatePill(state:str)
   col #root
     match state
       "open"
-        box px=11.0 py=5.0 bg=success_bg border=success_line border-w=1.0 r=8.0
+        box
+          with
+            px=11.0
+            py=5.0
+            bg=success_bg
+            border=success_line
+            border-w=1.0
+            r=8.0
           row gap=6.0 align=center
-            Icon name="pull-request" tone="success" px=13.0
-            text "Open" size=12.0 wrap=none font=display @text-success
+            Icon
+              with
+                name="pull-request"
+                tone="success"
+                px=13.0
+            text "Open"
+              with
+                size=12.0
+                wrap=none
+                font=display
+                @text-success
       "merged"
-        box px=11.0 py=5.0 bg=merged_bg border=merged_line border-w=1.0 r=8.0
+        box
+          with
+            px=11.0
+            py=5.0
+            bg=merged_bg
+            border=merged_line
+            border-w=1.0
+            r=8.0
           row gap=6.0 align=center
-            Icon name="pull-request" tone="muted" px=13.0
-            text "Merged" size=12.0 wrap=none font=display @text-merged
+            Icon
+              with
+                name="pull-request"
+                tone="muted"
+                px=13.0
+            text "Merged"
+              with
+                size=12.0
+                wrap=none
+                font=display
+                @text-merged
       _
-        box px=11.0 py=5.0 bg=elevated border=border border-w=1.0 r=8.0
+        box
+          with
+            px=11.0
+            py=5.0
+            bg=elevated
+            border=border
+            border-w=1.0
+            r=8.0
           row gap=6.0 align=center
-            Icon name="pull-request" tone="muted" px=13.0
-            text "Closed" size=12.0 wrap=none font=display @text-muted
+            Icon
+              with
+                name="pull-request"
+                tone="muted"
+                px=13.0
+            text "Closed"
+              with
+                size=12.0
+                wrap=none
+                font=display
+                @text-muted
 
 // `+284 −96 · 7 files` — the artifact colours the two counts and greys the file
 // tally; `forge_stats` collapsed all three into one muted string. `files=0`
@@ -426,16 +989,51 @@ component PrStatePill(state:str)
 component DiffCount(additions:i64, deletions:i64, files:i64)
   row #root gap=6.0 align=center
     row gap=0.0 align=center
-      text "+" size=10.5 wrap=none font=code_medium @text-success
-      text additions size=10.5 wrap=none font=code_medium @text-success
+      text "+"
+        with
+          size=10.5
+          wrap=none
+          font=code_medium
+          @text-success
+      text additions
+        with
+          size=10.5
+          wrap=none
+          font=code_medium
+          @text-success
     row gap=0.0 align=center
-      text "−" size=10.5 wrap=none font=code_medium @text-alert_fg
-      text deletions size=10.5 wrap=none font=code_medium @text-alert_fg
+      text "−"
+        with
+          size=10.5
+          wrap=none
+          font=code_medium
+          @text-alert_fg
+      text deletions
+        with
+          size=10.5
+          wrap=none
+          font=code_medium
+          @text-alert_fg
     if files > 0
       row gap=4.0 align=center
-        text "·" size=10.5 wrap=none font=code_medium @text-caption
-        text files size=10.5 wrap=none font=code_medium @text-caption
-        text "files" size=10.5 wrap=none font=code_medium @text-caption
+        text "·"
+          with
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-caption
+        text files
+          with
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-caption
+        text "files"
+          with
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-caption
 
 // The item body as an authored card: a header strip that attributes it, then
 // the body. `open_item` stores a body for BOTH kinds and the caller renders this
@@ -449,26 +1047,93 @@ component DiffCount(additions:i64, deletions:i64, files:i64)
 // not the handle it is derived from, so the plate would have to guess. It is
 // left out rather than drawn as a lie.
 component IssueBodyCard(author:str, body:str)
-  box #root w=fill max-w=660.0 bg=surface border=card_line border-w=1.0 r=11.0 clip=true
+  box #root
+    with
+      w=fill
+      max-w=660.0
+      bg=surface
+      border=card_line
+      border-w=1.0
+      r=11.0
+      clip=true
     col w=fill
-      box w=fill pl=13.0 pr=13.0 pt=8.0 pb=8.0 bg=card_wash
-        row w=fill gap=7.0 align=center
-          text "opened by" size=12.0 wrap=none @text-caption
-          text author size=12.0 wrap=none font=display @text-primary
-      box w=fill h=1.0 bg=separator
+      box
+        with
+          w=fill
+          pl=13.0
+          pr=13.0
+          pt=8.0
+          pb=8.0
+          bg=card_wash
+        row
+          with
+            w=fill
+            gap=7.0
+            align=center
+          text "opened by"
+            with
+              size=12.0
+              wrap=none
+              @text-caption
+          text author
+            with
+              size=12.0
+              wrap=none
+              font=display
+              @text-primary
+      box
+        with
+          w=fill
+          h=1.0
+          bg=separator
         space w=1.0 h=1.0
-      box w=fill pl=15.0 pr=15.0 pt=13.0 pb=13.0
-        text body w=fill size=13.0 line-h=1.6 @text-accent_fg
+      box
+        with
+          w=fill
+          pl=15.0
+          pr=15.0
+          pt=13.0
+          pb=13.0
+        text body
+          with
+            w=fill
+            size=13.0
+            line-h=1.6
+            @text-accent_fg
 
 // ── MERGE ─────────────────────────────────────────────────────────────────
 
 // Merged wears the violet plate, and the note is this chain's own merge fact
 // (`Merged as <oid> · <branches>`), not the artifact's seeded event name.
 component MergedBanner(note:str)
-  row #root w=fill gap=9.0 align=center
-    box w=24.0 h=24.0 align-x=center align-y=center bg=merged_bg border=merged_line border-w=1.0 r=7.0
-      text "✓" size=12.0 wrap=none font=code_semibold @text-merged
-    text note w=fill size=13.0 wrap=none font=display @text-merged
+  row #root
+    with
+      w=fill
+      gap=9.0
+      align=center
+    box
+      with
+        w=24.0
+        h=24.0
+        align-x=center
+        align-y=center
+        bg=merged_bg
+        border=merged_line
+        border-w=1.0
+        r=7.0
+      text "✓"
+        with
+          size=12.0
+          wrap=none
+          font=code_semibold
+          @text-merged
+    text note
+      with
+        w=fill
+        size=13.0
+        wrap=none
+        font=display
+        @text-merged
 
 // The advisory above the merge button, and the ONLY thing said there. It is a
 // recommendation, never a refusal: `ForgeMsg::MergePr` runs `author_from_origin`
@@ -478,16 +1143,47 @@ component MergedBanner(note:str)
 component MergeAdvisory(change_requests:i64)
   col #root w=fill
     if change_requests == 1
-      row w=fill gap=7.0 align=center
-        box w=6.0 h=6.0 bg=warning_dot r=3.0
+      row
+        with
+          w=fill
+          gap=7.0
+          align=center
+        box
+          with
+            w=6.0
+            h=6.0
+            bg=warning_dot
+            r=3.0
           space w=1.0 h=1.0
-        text "a reviewer requested changes — merge not recommended" w=fill size=12.0 @text-warning
+        text "a reviewer requested changes — merge not recommended"
+          with
+            w=fill
+            size=12.0
+            @text-warning
     if change_requests > 1
-      row w=fill gap=7.0 align=center
-        box w=6.0 h=6.0 bg=warning_dot r=3.0
+      row
+        with
+          w=fill
+          gap=7.0
+          align=center
+        box
+          with
+            w=6.0
+            h=6.0
+            bg=warning_dot
+            r=3.0
           space w=1.0 h=1.0
-        text change_requests size=11.0 wrap=none font=code_medium @text-warning
-        text "reviewers requested changes — merge not recommended" w=fill size=12.0 @text-warning
+        text change_requests
+          with
+            size=11.0
+            wrap=none
+            font=code_medium
+            @text-warning
+        text "reviewers requested changes — merge not recommended"
+          with
+            w=fill
+            size=12.0
+            @text-warning
 
 // The merge write, on the ink plate with the glyph the artifact gives it.
 component MergeButton(busy:bool, disabled:bool)
@@ -495,14 +1191,42 @@ component MergeButton(busy:bool, disabled:bool)
     forge_merge_submit
   col #root
     if busy
-      button label="Merging" disabled=true @primary_action px-18px py-9px rounded-9px -> emit(forge_merge_submit)
+      button -> emit(forge_merge_submit)
+        with
+          label="Merging"
+          disabled=true
+          @primary_action
+          @px-18px
+          @py-9px
+          @rounded-9px
         row gap=7.0 align=center
-          text "Merging…" size=13.0 wrap=none font=display @text-primary_fg
+          text "Merging…"
+            with
+              size=13.0
+              wrap=none
+              font=display
+              @text-primary_fg
     if !busy
-      button label="Merge pull request" disabled=disabled @primary_action px-18px py-9px rounded-9px -> emit(forge_merge_submit)
+      button -> emit(forge_merge_submit)
+        with
+          label="Merge pull request"
+          disabled=disabled
+          @primary_action
+          @px-18px
+          @py-9px
+          @rounded-9px
         row gap=7.0 align=center
-          Icon name="pull-request" tone="paper" px=13.0
-          text "Merge pull request" size=13.0 wrap=none font=display @text-primary_fg
+          Icon
+            with
+              name="pull-request"
+              tone="paper"
+              px=13.0
+          text "Merge pull request"
+            with
+              size=13.0
+              wrap=none
+              font=display
+              @text-primary_fg
 
 // THERE IS NO FORGE GATE, so there is no gate note. A `ForgeGateNote` keyed on
 // `forge_gate(member_tier(...))` briefly told a resident the node refuses its
@@ -528,15 +1252,51 @@ component MergeButton(busy:bool, disabled:bool)
 component DiffPane(file:str, additions:i64, deletions:i64, lines:[DiffLine])
   emits
     forge_comment_open(str, str, str)
-  box #root w=fill max-w=720.0 bg=surface border=card_line border-w=1.0 r=11.0 clip=true
+  box #root
+    with
+      w=fill
+      max-w=720.0
+      bg=surface
+      border=card_line
+      border-w=1.0
+      r=11.0
+      clip=true
     col w=fill
-      box w=fill pl=14.0 pr=14.0 pt=10.0 pb=10.0 bg=card_wash
-        row w=fill gap=9.0 align=center
-          Icon name="branch" tone="muted" px=13.0
-          text file size=12.0 wrap=none font=code_semibold @text-accent_fg
-          DiffCount additions=additions deletions=deletions files=0
+      box
+        with
+          w=fill
+          pl=14.0
+          pr=14.0
+          pt=10.0
+          pb=10.0
+          bg=card_wash
+        row
+          with
+            w=fill
+            gap=9.0
+            align=center
+          Icon
+            with
+              name="branch"
+              tone="muted"
+              px=13.0
+          text file
+            with
+              size=12.0
+              wrap=none
+              font=code_semibold
+              @text-accent_fg
+          DiffCount
+            with
+              additions
+              deletions
+              files=0
           space w=fill
-      box w=fill h=1.0 bg=separator
+      box
+        with
+          w=fill
+          h=1.0
+          bg=separator
         space w=1.0 h=1.0
       col w=fill
         for line in lines
@@ -560,68 +1320,298 @@ component DiffRow(line:DiffLine)
   col #root w=fill
     match line.kind
       "file"
-        box w=fill pl=14.0 pr=14.0 pt=5.0 pb=5.0 bg=card_wash
-          text line.text w=fill size=11.0 wrap=none font=code_medium @text-caption
+        box
+          with
+            w=fill
+            pl=14.0
+            pr=14.0
+            pt=5.0
+            pb=5.0
+            bg=card_wash
+          text line.text
+            with
+              w=fill
+              size=11.0
+              wrap=none
+              font=code_medium
+              @text-caption
       "hunk"
-        box w=fill pl=14.0 pr=14.0 pt=5.0 pb=5.0 bg=diff_hunk_bg
-          text line.text w=fill size=11.0 wrap=none font=code_medium @text-merged
+        box
+          with
+            w=fill
+            pl=14.0
+            pr=14.0
+            pt=5.0
+            pb=5.0
+            bg=diff_hunk_bg
+          text line.text
+            with
+              w=fill
+              size=11.0
+              wrap=none
+              font=code_medium
+              @text-merged
       "add"
         box w=fill bg=diff_add_bg
-          row w=fill gap=0.0 align=center
-            box w=34.0 h=20.0 pr=8.0 align-y=center bg=diff_add_gutter
-              text line.old_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
+          row
+            with
+              w=fill
+              gap=0.0
+              align=center
+            box
+              with
+                w=34.0
+                h=20.0
+                pr=8.0
+                align-y=center
+                bg=diff_add_gutter
+              text line.old_no
+                with
+                  w=fill
+                  size=12.0
+                  wrap=none
+                  align-x=right
+                  font=code
+                  @text-gutter_ink
             if empty(line.path)
-              box w=34.0 h=20.0 pr=8.0 align-y=center bg=diff_add_gutter
-                text line.new_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
+              box
+                with
+                  w=34.0
+                  h=20.0
+                  pr=8.0
+                  align-y=center
+                  bg=diff_add_gutter
+                text line.new_no
+                  with
+                    w=fill
+                    size=12.0
+                    wrap=none
+                    align-x=right
+                    font=code
+                    @text-gutter_ink
             if !empty(line.path)
-              button label="Comment on this line" w=34.0 h=20.0 p=0.0 @ghost_action -> emit(forge_comment_open, line.path, line.new_no, "new")
-                box w=fill h=20.0 pr=8.0 align-y=center
-                  text line.new_no w=fill size=12.0 wrap=none align-x=right font=code
+              button -> emit(forge_comment_open, line.path, line.new_no, "new")
+                with
+                  label="Comment on this line"
+                  w=34.0
+                  h=20.0
+                  p=0.0
+                  @ghost_action
+                box
+                  with
+                    w=fill
+                    h=20.0
+                    pr=8.0
+                    align-y=center
+                  text line.new_no
+                    with
+                      w=fill
+                      size=12.0
+                      wrap=none
+                      align-x=right
+                      font=code
                 active bg=diff_add_gutter text=gutter_ink
                 hovered bg=brand_bg text=brand
                 pressed bg=brand_wash text=brand
-            box w=14.0 h=20.0 align-x=center align-y=center
-              text line.sign size=12.0 wrap=none font=code @text-diff_add_fg
-            box w=fill h=20.0 pr=12.0 align-y=center
-              text line.text w=fill size=12.0 wrap=none font=code @text-diff_add_fg
+            box
+              with
+                w=14.0
+                h=20.0
+                align-x=center
+                align-y=center
+              text line.sign
+                with
+                  size=12.0
+                  wrap=none
+                  font=code
+                  @text-diff_add_fg
+            box
+              with
+                w=fill
+                h=20.0
+                pr=12.0
+                align-y=center
+              text line.text
+                with
+                  w=fill
+                  size=12.0
+                  wrap=none
+                  font=code
+                  @text-diff_add_fg
       "del"
         box w=fill bg=diff_del_bg
-          row w=fill gap=0.0 align=center
+          row
+            with
+              w=fill
+              gap=0.0
+              align=center
             if empty(line.path)
-              box w=34.0 h=20.0 pr=8.0 align-y=center bg=diff_del_gutter
-                text line.old_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
+              box
+                with
+                  w=34.0
+                  h=20.0
+                  pr=8.0
+                  align-y=center
+                  bg=diff_del_gutter
+                text line.old_no
+                  with
+                    w=fill
+                    size=12.0
+                    wrap=none
+                    align-x=right
+                    font=code
+                    @text-gutter_ink
             if !empty(line.path)
-              button label="Comment on this deleted line" w=34.0 h=20.0 p=0.0 @ghost_action -> emit(forge_comment_open, line.path, line.old_no, "old")
-                box w=fill h=20.0 pr=8.0 align-y=center
-                  text line.old_no w=fill size=12.0 wrap=none align-x=right font=code
+              button -> emit(forge_comment_open, line.path, line.old_no, "old")
+                with
+                  label="Comment on this deleted line"
+                  w=34.0
+                  h=20.0
+                  p=0.0
+                  @ghost_action
+                box
+                  with
+                    w=fill
+                    h=20.0
+                    pr=8.0
+                    align-y=center
+                  text line.old_no
+                    with
+                      w=fill
+                      size=12.0
+                      wrap=none
+                      align-x=right
+                      font=code
                 active bg=diff_del_gutter text=gutter_ink
                 hovered bg=brand_bg text=brand
                 pressed bg=brand_wash text=brand
-            box w=34.0 h=20.0 pr=8.0 align-y=center bg=diff_del_gutter
-              text line.new_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
-            box w=14.0 h=20.0 align-x=center align-y=center
-              text line.sign size=12.0 wrap=none font=code @text-diff_del_fg
-            box w=fill h=20.0 pr=12.0 align-y=center
-              text line.text w=fill size=12.0 wrap=none font=code @text-diff_del_fg
+            box
+              with
+                w=34.0
+                h=20.0
+                pr=8.0
+                align-y=center
+                bg=diff_del_gutter
+              text line.new_no
+                with
+                  w=fill
+                  size=12.0
+                  wrap=none
+                  align-x=right
+                  font=code
+                  @text-gutter_ink
+            box
+              with
+                w=14.0
+                h=20.0
+                align-x=center
+                align-y=center
+              text line.sign
+                with
+                  size=12.0
+                  wrap=none
+                  font=code
+                  @text-diff_del_fg
+            box
+              with
+                w=fill
+                h=20.0
+                pr=12.0
+                align-y=center
+              text line.text
+                with
+                  w=fill
+                  size=12.0
+                  wrap=none
+                  font=code
+                  @text-diff_del_fg
       "ctx"
         box w=fill bg=surface
-          row w=fill gap=0.0 align=center
-            box w=34.0 h=20.0 pr=8.0 align-y=center bg=card_wash
-              text line.old_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
+          row
+            with
+              w=fill
+              gap=0.0
+              align=center
+            box
+              with
+                w=34.0
+                h=20.0
+                pr=8.0
+                align-y=center
+                bg=card_wash
+              text line.old_no
+                with
+                  w=fill
+                  size=12.0
+                  wrap=none
+                  align-x=right
+                  font=code
+                  @text-gutter_ink
             if empty(line.path)
-              box w=34.0 h=20.0 pr=8.0 align-y=center bg=card_wash
-                text line.new_no w=fill size=12.0 wrap=none align-x=right font=code @text-gutter_ink
+              box
+                with
+                  w=34.0
+                  h=20.0
+                  pr=8.0
+                  align-y=center
+                  bg=card_wash
+                text line.new_no
+                  with
+                    w=fill
+                    size=12.0
+                    wrap=none
+                    align-x=right
+                    font=code
+                    @text-gutter_ink
             if !empty(line.path)
-              button label="Comment on this line" w=34.0 h=20.0 p=0.0 @ghost_action -> emit(forge_comment_open, line.path, line.new_no, "new")
-                box w=fill h=20.0 pr=8.0 align-y=center
-                  text line.new_no w=fill size=12.0 wrap=none align-x=right font=code
+              button -> emit(forge_comment_open, line.path, line.new_no, "new")
+                with
+                  label="Comment on this line"
+                  w=34.0
+                  h=20.0
+                  p=0.0
+                  @ghost_action
+                box
+                  with
+                    w=fill
+                    h=20.0
+                    pr=8.0
+                    align-y=center
+                  text line.new_no
+                    with
+                      w=fill
+                      size=12.0
+                      wrap=none
+                      align-x=right
+                      font=code
                 active bg=card_wash text=gutter_ink
                 hovered bg=brand_bg text=brand
                 pressed bg=brand_wash text=brand
-            box w=14.0 h=20.0 align-x=center align-y=center
-              text line.sign size=12.0 wrap=none font=code @text-panel_tile
-            box w=fill h=20.0 pr=12.0 align-y=center
-              text line.text w=fill size=12.0 wrap=none font=code @text-panel_tile
+            box
+              with
+                w=14.0
+                h=20.0
+                align-x=center
+                align-y=center
+              text line.sign
+                with
+                  size=12.0
+                  wrap=none
+                  font=code
+                  @text-panel_tile
+            box
+              with
+                w=fill
+                h=20.0
+                pr=12.0
+                align-y=center
+              text line.text
+                with
+                  w=fill
+                  size=12.0
+                  wrap=none
+                  font=code
+                  @text-panel_tile
 
 // ── REVIEWS ───────────────────────────────────────────────────────────────
 
@@ -630,26 +1620,95 @@ component DiffRow(line:DiffLine)
 // A review that is in state is finalized by construction, so the chip claims
 // exactly what it can prove.
 component ReviewCard(review:ForgeReview)
-  box #root w=fill pl=13.0 pr=13.0 pt=11.0 pb=11.0 bg=surface border=card_line border-w=1.0 r=10.0
+  box #root
+    with
+      w=fill
+      pl=13.0
+      pr=13.0
+      pt=11.0
+      pb=11.0
+      bg=surface
+      border=card_line
+      border-w=1.0
+      r=10.0
     col w=fill gap=6.0
-      row w=fill gap=7.0 align=center
-        text review.author_name size=13.0 wrap=none font=display @text-primary
+      row
+        with
+          w=fill
+          gap=7.0
+          align=center
+        text review.author_name
+          with
+            size=13.0
+            wrap=none
+            font=display
+            @text-primary
         ReviewVerdict verdict=review.verdict
-        text review.commit size=11.0 wrap=none font=code_medium @text-hint
+        text review.commit
+          with
+            size=11.0
+            wrap=none
+            font=code_medium
+            @text-hint
         if review.outdated
-          box px=6.0 py=2.0 bg=elevated r=4.0
-            text "outdated" size=9.0 wrap=none font=code_semibold @text-meta
+          box
+            with
+              px=6.0
+              py=2.0
+              bg=elevated
+              r=4.0
+            text "outdated"
+              with
+                size=9.0
+                wrap=none
+                font=code_semibold
+                @text-meta
         space w=fill
         FinalityChip height=review.created_at
       if !empty(review.body)
-        text review.body w=fill size=13.0 line-h=1.55 @text-accent_fg
+        text review.body
+          with
+            w=fill
+            size=13.0
+            line-h=1.55
+            @text-accent_fg
       for comment in review.comments
-        box w=fill pl=11.0 pr=11.0 pt=9.0 pb=9.0 bg=brand_wash border=brand_line border-w=1.0 r=9.0
+        box
+          with
+            w=fill
+            pl=11.0
+            pr=11.0
+            pt=9.0
+            pb=9.0
+            bg=brand_wash
+            border=brand_line
+            border-w=1.0
+            r=9.0
           col w=fill gap=4.0
-            row w=fill gap=7.0 align=center
-              text comment.anchor w=fill size=11.0 wrap=none font=code_medium @text-brand
-              text "review comment" size=10.0 wrap=none font=code_semibold @text-label
-            text comment.body w=fill size=12.0 line-h=1.55 @text-panel_tile
+            row
+              with
+                w=fill
+                gap=7.0
+                align=center
+              text comment.anchor
+                with
+                  w=fill
+                  size=11.0
+                  wrap=none
+                  font=code_medium
+                  @text-brand
+              text "review comment"
+                with
+                  size=10.0
+                  wrap=none
+                  font=code_semibold
+                  @text-label
+            text comment.body
+              with
+                w=fill
+                size=12.0
+                line-h=1.55
+                @text-panel_tile
 
 // The verdict in its own tone: approval is the success ink, a change request is
 // the refusal ink, a comment is neither.
@@ -657,11 +1716,26 @@ component ReviewVerdict(verdict:str)
   col #root
     match verdict
       "approve"
-        text verdict_label(verdict) size=10.5 wrap=none font=code_medium @text-success
+        text verdict_label(verdict)
+          with
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-success
       "request_changes"
-        text verdict_label(verdict) size=10.5 wrap=none font=code_medium @text-alert_fg
+        text verdict_label(verdict)
+          with
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-alert_fg
       _
-        text verdict_label(verdict) size=10.5 wrap=none font=code_medium @text-meta
+        text verdict_label(verdict)
+          with
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-meta
 
 // One seat of the forge tab bar: the tracker under one kind filter. Both the
 // Pull requests and the Issues arms are this component with a different filter
@@ -674,8 +1748,19 @@ component ForgeTrackerList(items:[ForgeItem], empty_message:str)
       box w=fill p=22.0
         EmptyPlate message=empty_message
     if !empty(items)
-      scroll dir=vertical w=fill h=fill
-        col w=fill pl=12.0 pr=12.0 pt=6.0 pb=18.0 gap=1.0
+      scroll
+        with
+          dir=vertical
+          w=fill
+          h=fill
+        col
+          with
+            w=fill
+            pl=12.0
+            pr=12.0
+            pt=6.0
+            pb=18.0
+            gap=1.0
           for item in items
             TrackerRow item=item
               forward

@@ -29,7 +29,11 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
     // THE CRUMB BAR, not a screen header: where you are, what is here,
     // and who may write under it. The counts are pure folds over the
     // listing already on screen — never a second `files_ls`.
-    CrumbBar path=path dirs=fs_dir_count(entries) files=fs_file_count(entries)
+    CrumbBar
+      with
+        path
+        dirs=fs_dir_count(entries)
+        files=fs_file_count(entries)
       forward
         fs_open_dir
     // WHERE THE WRITE CONTROLS LIVE — decided here, once. The artifact's
@@ -38,101 +42,282 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
     // regression. They sit in ONE bar under the header, never as per-row
     // hover affordances, so the three panes below stay the artifact's read
     // surface and the destructive verb always names the selected object.
-    box w=fill pl=20.0 pr=20.0 pt=10.0 pb=10.0
-      row w=fill h=28.0 gap=8.0 align=center
-        button "↑" label="Parent directory" disabled=(loading || empty(path)) w=26.0 h=26.0 p=0.0 @icon_action -> emit(fs_open_parent)
+    box
+      with
+        w=fill
+        pl=20.0
+        pr=20.0
+        pt=10.0
+        pb=10.0
+      row
+        with
+          w=fill
+          h=28.0
+          gap=8.0
+          align=center
+        button "↑" -> emit(fs_open_parent)
+          with
+            label="Parent directory"
+            disabled=(loading || empty(path))
+            w=26.0
+            h=26.0
+            p=0.0
+            @icon_action
           active bg=surface text=muted border=card_line border-w=1.0 r=7.0
           hovered bg=elevated text=fg
           pressed bg=subtle
-        input "" #fs-new label="New entry name" <-> new_name change=emit(fs_new_name_changed, _) hint="new name…" disabled=loading w=160.0 p=5.0 text-size=13.0 line-h=1.2 @control
+        input "" #fs-new <-> new_name
+          with
+            label="New entry name"
+            change=emit(fs_new_name_changed, _)
+            hint="new name…"
+            disabled=loading
+            w=160.0
+            p=5.0
+            text-size=13.0
+            line-h=1.2
+            @control
           active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=7.0
           hovered bg=muted_bg border=control_line
           disabled bg=muted_bg/54 value=muted
-        button "+ Folder" disabled=(loading || empty(trim(new_name))) h=26.0 p=5.0 @secondary_action -> emit(fs_mkdir_submit)
-        button "+ File" disabled=(loading || empty(trim(new_name))) h=26.0 p=5.0 @secondary_action -> emit(fs_new_file_submit)
+        button "+ Folder" -> emit(fs_mkdir_submit)
+          with
+            disabled=(loading || empty(trim(new_name)))
+            h=26.0
+            p=5.0
+            @secondary_action
+        button "+ File" -> emit(fs_new_file_submit)
+          with
+            disabled=(loading || empty(trim(new_name)))
+            h=26.0
+            p=5.0
+            @secondary_action
         space w=fill
         if loading
-          text "Loading…" size=12.5 wrap=none @text-caption
+          text "Loading…"
+            with
+              size=12.5
+              wrap=none
+              @text-caption
         // The trigger STAYS a trigger: arming opens the named confirm
         // dialog below instead of morphing into the red button in place.
         if !empty(preview_path)
-          button "Delete object" disabled=(loading || !empty(delete_target)) h=26.0 p=5.0 @secondary_action -> emit(fs_arm_delete, preview_path)
+          button "Delete object" -> emit(fs_arm_delete, preview_path)
+            with
+              disabled=(loading || !empty(delete_target))
+              h=26.0
+              p=5.0
+              @secondary_action
             active bg=transparent text=muted border=card_line border-w=1.0 r=7.0
             hovered bg=danger_zone_bg text=fg border=danger_zone_line
             pressed bg=danger_zone_bg
-        overlay when=(!empty(delete_target)) dismiss=emit(fs_disarm_delete) backdrop=scrim p=30.0 align-x=center align-y=center
+        overlay
+          with
+            when=(!empty(delete_target))
+            dismiss=emit(fs_disarm_delete)
+            backdrop=scrim
+            p=30.0
+            align-x=center
+            align-y=center
           content
             space w=fill h=fill
           layer
-            ConfirmDelete title="Delete this object" subject=delete_target note="The committed object is removed from duckfs for every member. Earlier snapshots keep their copies." action="Delete object" busy=loading
+            ConfirmDelete
+              with
+                title="Delete this object"
+                subject=delete_target
+                note="The committed object is removed from duckfs for every member. Earlier snapshots keep their copies."
+                action="Delete object"
+                busy=loading
               events
                 cancel -> emit(fs_disarm_delete)
                 confirm -> emit(fs_delete_submit)
-        button "History" h=26.0 p=5.0 @secondary_action -> emit(fs_toggle_history)
+        button "History" -> emit(fs_toggle_history)
+          with
+            h=26.0
+            p=5.0
+            @secondary_action
           active bg=surface text=muted border=card_line border-w=1.0 r=7.0
           hovered bg=elevated text=fg
           pressed bg=subtle
-    box w=fill h=1.0 bg=separator
+    box
+      with
+        w=fill
+        h=1.0
+        bg=separator
       space w=1.0 h=1.0
     row w=fill h=fill
       // 206px directory pane. `files_ls` loads one level at a time, so this
       // is the current level's directories, not a recursively expanded tree
       // — depth stays 0 until a per-level expansion state exists.
-      box w=206.0 h=fill bg=sidebar clip=true
+      box
+        with
+          w=206.0
+          h=fill
+          bg=sidebar
+          clip=true
         col w=fill h=fill
           // The artifact's A1 header. Without it a level with no
           // subdirectories rendered a blank 206px column that reads as a
           // broken pane rather than an empty one. The subtitle states
           // what duckfs IS and needs no reading to back it.
-          box w=fill pl=14.0 pr=14.0 pt=14.0 pb=11.0
+          box
+            with
+              w=fill
+              pl=14.0
+              pr=14.0
+              pt=14.0
+              pb=11.0
             col w=fill gap=2.0
-              text "duckfs" size=13.5 wrap=none font=display @text-fg
-              text "content-addressed · replicated" size=9.5 wrap=none font=code @text-hint
-          box w=fill h=1.0 bg=separator
+              text "duckfs"
+                with
+                  size=13.5
+                  wrap=none
+                  font=display
+                  @text-fg
+              text "content-addressed · replicated"
+                with
+                  size=9.5
+                  wrap=none
+                  font=code
+                  @text-hint
+          box
+            with
+              w=fill
+              h=1.0
+              bg=separator
             space w=1.0 h=1.0
-          scroll dir=vertical w=fill h=fill bar=hidden
-            col w=fill pl=6.0 pr=6.0 pt=8.0 pb=8.0 gap=1.0
+          scroll
+            with
+              dir=vertical
+              w=fill
+              h=fill
+              bar=hidden
+            col
+              with
+                w=fill
+                pl=6.0
+                pr=6.0
+                pt=8.0
+                pb=8.0
+                gap=1.0
               if fs_dir_count(entries) <= 0
-                box w=fill pl=12.0 pr=12.0 pt=6.0 pb=6.0
+                box
+                  with
+                    w=fill
+                    pl=12.0
+                    pr=12.0
+                    pt=6.0
+                    pb=6.0
                   text "No folders here." size=11.0 @text-hint
               for entry in entries
                 if entry.kind == "dir"
-                  FsTreeRow entry=entry selected=false depth=0.0
+                  FsTreeRow
+                    with
+                      entry
+                      selected=false
+                      depth=0.0
                     forward
                       fs_open_dir
-      box w=1.0 h=fill bg=separator
+      box
+        with
+          w=1.0
+          h=fill
+          bg=separator
         space w=1.0 h=1.0
       col w=fill h=fill
         if history_open
-          scroll dir=vertical w=fill h=fill
-            col w=fill p=18.0 gap=8.0
+          scroll
+            with
+              dir=vertical
+              w=fill
+              h=fill
+            col
+              with
+                w=fill
+                p=18.0
+                gap=8.0
               if !empty(diff_from)
                 col w=fill gap=6.0
-                  row w=fill gap=8.0 align=center
+                  row
+                    with
+                      w=fill
+                      gap=8.0
+                      align=center
                     GroupLabel label="CHANGES VS HEAD"
                     space w=fill
-                    button "Back" h=22.0 p=4.0 @secondary_action -> emit(fs_close_diff)
+                    button "Back" -> emit(fs_close_diff)
+                      with
+                        h=22.0
+                        p=4.0
+                        @secondary_action
                       active bg=surface text=muted border=card_line border-w=1.0 r=6.0
                       hovered bg=elevated text=fg
                       pressed bg=subtle
                   if empty(diff)
                     text "No differences." size=12.5 @text-caption
                   for entry in diff
-                    row w=fill gap=8.0 align=center
-                      text entry.kind w=64.0 size=12.0 wrap=none font=code @text-meta
-                      text entry.path w=fill size=12.0 wrap=none font=code @text-fg
+                    row
+                      with
+                        w=fill
+                        gap=8.0
+                        align=center
+                      text entry.kind
+                        with
+                          w=64.0
+                          size=12.0
+                          wrap=none
+                          font=code
+                          @text-meta
+                      text entry.path
+                        with
+                          w=fill
+                          size=12.0
+                          wrap=none
+                          font=code
+                          @text-fg
               if empty(diff_from)
                 col w=fill gap=8.0
                   GroupLabel label="SNAPSHOTS"
                   for snapshot in history
-                    box w=fill p=11.0 bg=surface border=card_line border-w=1.0 r=10.0
+                    box
+                      with
+                        w=fill
+                        p=11.0
+                        bg=surface
+                        border=card_line
+                        border-w=1.0
+                        r=10.0
                       col w=fill gap=3.0
-                        row w=fill gap=8.0 align=center
-                          text snapshot.short_id size=12.0 wrap=none font=code @text-fg
-                          text height_label(snapshot.height) size=12.0 wrap=none font=code @text-meta
+                        row
+                          with
+                            w=fill
+                            gap=8.0
+                            align=center
+                          text snapshot.short_id
+                            with
+                              size=12.0
+                              wrap=none
+                              font=code
+                              @text-fg
+                          text height_label(snapshot.height)
+                            with
+                              size=12.0
+                              wrap=none
+                              font=code
+                              @text-meta
                           space w=fill
-                          text snapshot.author size=12.0 wrap=none font=code @text-meta
-                          button "Diff" h=20.0 p=3.0 @ghost_action -> emit(fs_show_diff, snapshot.id)
+                          text snapshot.author
+                            with
+                              size=12.0
+                              wrap=none
+                              font=code
+                              @text-meta
+                          button "Diff" -> emit(fs_show_diff, snapshot.id)
+                            with
+                              h=20.0
+                              p=3.0
+                              @ghost_action
                             active bg=surface text=muted border=card_line border-w=1.0 r=6.0
                             hovered bg=elevated text=fg
                             pressed bg=subtle
@@ -145,7 +330,11 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
               box w=fill p=22.0
                 EmptyPlate message="Empty directory — nothing is committed under this path."
             if !empty(entries)
-              scroll dir=vertical w=fill h=fill
+              scroll
+                with
+                  dir=vertical
+                  w=fill
+                  h=fill
                 col w=fill
                   for entry in entries
                     ObjectRow entry=entry selected=(entry.path == preview_path)
@@ -154,39 +343,98 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
                         fs_open_file
             if !empty(preview_path)
               col w=fill h=300.0
-                box w=fill h=1.0 bg=separator
+                box
+                  with
+                    w=fill
+                    h=1.0
+                    bg=separator
                   space w=1.0 h=1.0
-                box w=fill h=fill p=16.0
-                  col w=fill h=fill gap=8.0
-                    row w=fill gap=8.0 align=center
-                      text preview_path w=fill size=12.0 wrap=none font=code @text-meta
+                box
+                  with
+                    w=fill
+                    h=fill
+                    p=16.0
+                  col
+                    with
+                      w=fill
+                      h=fill
+                      gap=8.0
+                    row
+                      with
+                        w=fill
+                        gap=8.0
+                        align=center
+                      text preview_path
+                        with
+                          w=fill
+                          size=12.0
+                          wrap=none
+                          font=code
+                          @text-meta
                       if preview_truncated
-                        text "first 64 KiB" size=12.5 wrap=none @text-caption
+                        text "first 64 KiB"
+                          with
+                            size=12.5
+                            wrap=none
+                            @text-caption
                       if !preview_binary && !editing && !preview_truncated
-                        button "Edit" h=22.0 p=4.0 @secondary_action -> emit(fs_begin_edit)
+                        button "Edit" -> emit(fs_begin_edit)
+                          with
+                            h=22.0
+                            p=4.0
+                            @secondary_action
                           active bg=surface text=muted border=card_line border-w=1.0 r=6.0
                           hovered bg=elevated text=fg
                           pressed bg=subtle
                       if editing
-                        button "Cancel" h=22.0 p=4.0 @secondary_action -> emit(fs_cancel_edit)
+                        button "Cancel" -> emit(fs_cancel_edit)
+                          with
+                            h=22.0
+                            p=4.0
+                            @secondary_action
                           active bg=surface text=muted border=card_line border-w=1.0 r=6.0
                           hovered bg=elevated text=fg
                           pressed bg=subtle
                       if editing
-                        button "Save" disabled=loading h=22.0 p=4.0 @primary_action -> emit(fs_save_edit)
+                        button "Save" -> emit(fs_save_edit)
+                          with
+                            disabled=loading
+                            h=22.0
+                            p=4.0
+                            @primary_action
                     stack w=fill h=fill
                       if editing
-                        editor #fs-editor <-> draft hint="File contents…" disabled=loading min-h=200.0 size=12.0 line-h=1.3 p=6.6 wrap=word
+                        editor #fs-editor <-> draft
+                          with
+                            hint="File contents…"
+                            disabled=loading
+                            min-h=200.0
+                            size=12.0
+                            line-h=1.3
+                            p=6.6
+                            wrap=word
                           active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
                           hovered bg=muted_bg border=control_line
                           focused bg=muted_bg border=ring border-w=1.0
                       if !editing
-                        scroll dir=vertical w=fill h=fill
+                        scroll
+                          with
+                            dir=vertical
+                            w=fill
+                            h=fill
                           col w=fill gap=6.0
                             if preview_binary
-                              text preview_text size=12.0 font=code @text-meta
+                              text preview_text
+                                with
+                                  size=12.0
+                                  font=code
+                                  @text-meta
                             if !preview_binary
-                              text preview_text size=12.0 font=code @text-fg
+                              text preview_text
+                                with
+                                  size=12.0
+                                  font=code
+                                  @text-fg
       if !empty(preview_path)
         for entry in entries
           if entry.path == preview_path
@@ -198,7 +446,11 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
             // `subscribe` block in handlers/lifecycle.ice — which this
             // file does not own. Wiring the load there lights these two
             // rows with no change here.
-            ObjectPanel entry=entry changed_by="" changed_height=0
+            ObjectPanel
+              with
+                entry
+                changed_by=""
+                changed_height=0
 
 component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading:bool, kinds:[KindCount], kind:str, hits:[ExplorerHit], blocks:[ExplorerBlock], selected:i64, ops:[ExplorerOp])
   emits
@@ -208,30 +460,99 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
     pick_explorer_kind(str)
     select_explorer_block(i64)
   col w=fill h=fill
-    col w=fill pl=24.0 pr=24.0 pt=22.0 gap=16.0
-      ScreenTitle title="Explorer" detail="Search everything this workspace has recorded, or read the blocks this node verified for itself — newest first, each one openable for the ops it carried."
+    col
+      with
+        w=fill
+        pl=24.0
+        pr=24.0
+        pt=22.0
+        gap=16.0
+      ScreenTitle
+        with
+          title="Explorer"
+          detail="Search everything this workspace has recorded, or read the blocks this node verified for itself — newest first, each one openable for the ops it carried."
       // THE QUERY BOX, on the artifact's own 1.5px ink outline.
       box w=fill max-w=860.0
-        row w=fill gap=10.0 align=center
-          box w=fill pl=14.0 pr=14.0 pt=2.0 pb=2.0 bg=surface border=primary border-w=1.5 r=11.0
-            row w=fill gap=10.0 align=center
-              Icon name="search" tone="label" px=16.0
-              input "" #explorer-search label="Search this workspace" <-> query hint="Search messages, pages, issues, files, runs…" disabled=(!connected || searching) submit=emit(explorer_search_submit) w=fill p=6.2 text-size=13.0 line-h=1.2 @control
+        row
+          with
+            w=fill
+            gap=10.0
+            align=center
+          box
+            with
+              w=fill
+              pl=14.0
+              pr=14.0
+              pt=2.0
+              pb=2.0
+              bg=surface
+              border=primary
+              border-w=1.5
+              r=11.0
+            row
+              with
+                w=fill
+                gap=10.0
+                align=center
+              Icon
+                with
+                  name="search"
+                  tone="label"
+                  px=16.0
+              input "" #explorer-search <-> query
+                with
+                  label="Search this workspace"
+                  hint="Search messages, pages, issues, files, runs…"
+                  disabled=(!connected || searching)
+                  submit=emit(explorer_search_submit)
+                  w=fill
+                  p=6.2
+                  text-size=13.0
+                  line-h=1.2
+                  @control
                 active bg=transparent border=transparent value=fg placeholder=hint selection=fg/18 border-w=0.0 r=0.0
                 hovered bg=transparent border=transparent
                 disabled value=muted
               if !empty(trim(query))
-                button label="Clear workspace search" w=22.0 h=22.0 p=0.0 @icon_action -> emit(clear_explorer_search)
-                  box w=fill h=fill align-x=center align-y=center
-                    text "×" size=14.0 wrap=none @text-muted
+                button -> emit(clear_explorer_search)
+                  with
+                    label="Clear workspace search"
+                    w=22.0
+                    h=22.0
+                    p=0.0
+                    @icon_action
+                  box
+                    with
+                      w=fill
+                      h=fill
+                      align-x=center
+                      align-y=center
+                    text "×"
+                      with
+                        size=14.0
+                        wrap=none
+                        @text-muted
                   active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
           if searching
-            text "Searching…" size=12.5 wrap=none @text-caption
+            text "Searching…"
+              with
+                size=12.5
+                wrap=none
+                @text-caption
           if loading
-            text "Loading…" size=12.5 wrap=none @text-caption
-          button "Refresh" disabled=loading h=30.0 p=7.0 @outline_action -> emit(refresh_explorer)
+            text "Loading…"
+              with
+                size=12.5
+                wrap=none
+                @text-caption
+          button "Refresh" -> emit(refresh_explorer)
+            with
+              disabled=loading
+              h=30.0
+              p=7.0
+              @outline_action
       // THE KIND STRIP. Drawn FROM the reply, never from a fixed list
       // of labels: every chip here names a kind `search_workspace`
       // genuinely ran, so a count of 0 means "nothing matched", never
@@ -243,25 +564,57 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
       // waste.
       if !empty(kinds)
         box w=fill max-w=860.0
-          flex w=fill wrap=wrap gap-x=7.0 gap-y=7.0 items=start
-            button label="Show every result" p=0.0 @ghost_action -> emit(pick_explorer_kind, "all")
-              FilterChip label="All" count=len(hits) selected=(kind == "all")
+          flex
+            with
+              w=fill
+              wrap=wrap
+              gap-x=7.0
+              gap-y=7.0
+              items=start
+            button -> emit(pick_explorer_kind, "all")
+              with
+                label="Show every result"
+                p=0.0
+                @ghost_action
+              FilterChip
+                with
+                  label="All"
+                  count=len(hits)
+                  selected=(kind == "all")
               active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
               hovered bg=row_hover text=fg
               pressed bg=elevated text=fg
             for kind_count in kinds
-              button label="Filter results by kind" description=kind_count.label p=0.0 @ghost_action -> emit(pick_explorer_kind, kind_count.kind)
-                FilterChip label=kind_count.label count=kind_count.count selected=(kind == kind_count.kind)
+              button -> emit(pick_explorer_kind, kind_count.kind)
+                with
+                  label="Filter results by kind"
+                  description=kind_count.label
+                  p=0.0
+                  @ghost_action
+                FilterChip
+                  with
+                    label=kind_count.label
+                    count=kind_count.count
+                    selected=(kind == kind_count.kind)
                 active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                 hovered bg=row_hover text=fg
                 pressed bg=elevated text=fg
-    col w=fill h=fill p=18.0 gap=11.0
+    col
+      with
+        w=fill
+        h=fill
+        p=18.0
+        gap=11.0
       // RESULTS TAKE THE SCREEN while a query stands; the block ledger
       // is what the screen falls back to. A hit is a READING, not a
       // route: nothing here dispatches on `hit.target` yet, so the card
       // is not wrapped in a button that would go nowhere.
       if !empty(hits)
-        scroll dir=vertical w=fill h=fill
+        scroll
+          with
+            dir=vertical
+            w=fill
+            h=fill
           box w=fill max-w=860.0
             col w=fill gap=8.0
               for hit in hits
@@ -278,42 +631,145 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
       if empty(hits) && !searching && !empty(trim(query))
         EmptyPlate message="Nothing matched that query in this workspace."
       if empty(hits) && empty(blocks) && !loading && empty(trim(query))
-        EmptyState title="No blocks yet" description="Non-empty blocks appear here as they finalize."
+        EmptyState
+          with
+            title="No blocks yet"
+            description="Non-empty blocks appear here as they finalize."
       if empty(hits) && !empty(blocks)
-        row w=fill h=fill gap=10.0
-          box w=340.0 h=fill p=6.0 bg=muted_bg border=fg/10 border-w=1.0 r=10.0
-            scroll dir=vertical w=fill h=fill
+        row
+          with
+            w=fill
+            h=fill
+            gap=10.0
+          box
+            with
+              w=340.0
+              h=fill
+              p=6.0
+              bg=muted_bg
+              border=fg/10
+              border-w=1.0
+              r=10.0
+            scroll
+              with
+                dir=vertical
+                w=fill
+                h=fill
               // `pr` is the scrollbar's gutter: the bar paints OVER the
               // content, and without it the op count on every row was
               // clipped by the track.
-              col w=fill pr=10.0 gap=1.0
+              col
+                with
+                  w=fill
+                  pr=10.0
+                  gap=1.0
                 for block in blocks
-                  button label="Inspect block" w=fill p=6.0 @ghost_action -> emit(select_explorer_block, block.height)
-                    row w=fill h=fill gap=8.0 align=center
-                      text block.height size=12.0 wrap=none font=code @text-fg
-                      text block.hash w=fill size=12.0 wrap=none font=code @text-muted
-                      text block.op_count size=12.0 wrap=none font=code @text-muted
+                  button -> emit(select_explorer_block, block.height)
+                    with
+                      label="Inspect block"
+                      w=fill
+                      p=6.0
+                      @ghost_action
+                    row
+                      with
+                        w=fill
+                        h=fill
+                        gap=8.0
+                        align=center
+                      text block.height
+                        with
+                          size=12.0
+                          wrap=none
+                          font=code
+                          @text-fg
+                      text block.hash
+                        with
+                          w=fill
+                          size=12.0
+                          wrap=none
+                          font=code
+                          @text-muted
+                      text block.op_count
+                        with
+                          size=12.0
+                          wrap=none
+                          font=code
+                          @text-muted
                     active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
                     hovered bg=row_hover text=fg
                     pressed bg=accent
-          box w=fill h=fill p=8.0 bg=muted_bg border=fg/10 border-w=1.0 r=10.0
+          box
+            with
+              w=fill
+              h=fill
+              p=8.0
+              bg=muted_bg
+              border=fg/10
+              border-w=1.0
+              r=10.0
             stack w=fill h=fill
               if selected <= 0
-                EmptyState title="Select a block" description="Its operations and dispatch traces appear here."
+                EmptyState
+                  with
+                    title="Select a block"
+                    description="Its operations and dispatch traces appear here."
               if selected > 0
-                scroll dir=vertical w=fill h=fill
+                scroll
+                  with
+                    dir=vertical
+                    w=fill
+                    h=fill
                   col w=fill gap=6.0
                     for op in explorer_ops_at(ops, selected)
-                      box w=fill p=8.0 bg=surface border=fg/10 border-w=1.0 r=9.0
+                      box
+                        with
+                          w=fill
+                          p=8.0
+                          bg=surface
+                          border=fg/10
+                          border-w=1.0
+                          r=9.0
                         col w=fill gap=3.0
-                          row w=fill gap=8.0 align=center
-                            text op.target size=14.0 wrap=none font=display @text-fg
+                          row
+                            with
+                              w=fill
+                              gap=8.0
+                              align=center
+                            text op.target
+                              with
+                                size=14.0
+                                wrap=none
+                                font=display
+                                @text-fg
                             StatusBadge label=op.disposition
                             space w=fill
-                            text op.op_hash size=12.0 wrap=none font=code @text-muted
-                          row w=fill gap=8.0 align=center
-                            text "by" size=11.0 wrap=none font=code_medium @text-muted
-                            text op.proposer size=12.0 wrap=none font=code @text-muted
+                            text op.op_hash
+                              with
+                                size=12.0
+                                wrap=none
+                                font=code
+                                @text-muted
+                          row
+                            with
+                              w=fill
+                              gap=8.0
+                              align=center
+                            text "by"
+                              with
+                                size=11.0
+                                wrap=none
+                                font=code_medium
+                                @text-muted
+                            text op.proposer
+                              with
+                                size=12.0
+                                wrap=none
+                                font=code
+                                @text-muted
                           if !empty(op.trace)
-                            text op.trace size=12.0 font=code @text-muted
+                            text op.trace
+                              with
+                                size=12.0
+                                font=code
+                                @text-muted
                           text op.payload size=13.5 @text-fg

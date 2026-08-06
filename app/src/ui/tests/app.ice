@@ -40,13 +40,30 @@ test palette_escape_contract
   preset ui_palette_open
   viewport 1120 720
   mount
-    WorkspaceTabs network="testnet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
+    WorkspaceTabs #workspace-tabs
+      with
+        network="testnet"
+        status
+        height=84912
+        loading
+        degraded=false
+        tab=shell_tab
+        bell_count=0
+        bell_sev="info"
+        approvals=0
+        account=""
+        agent_live=false
+        tier="validator"
+        root_hash=""
+        consensus_view="—"
+        quorum="—"
+        reachable="—"
+        last_finalized=0
+        checkpoint=0
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
         switch_network -> switch_network
-
-
 
       huddle:
         space w=1.0 h=1.0
@@ -73,7 +90,12 @@ test palette_escape_contract
       palette:
         stack w=fill h=fill
           if palette_open
-            input "" #palette-input label="Search everything" <-> palette_draft hint="Search messages and pages… (Esc closes)" w=540.0 @control
+            input "" #palette-input <-> palette_draft
+              with
+                label="Search everything"
+                hint="Search messages and pages… (Esc closes)"
+                w=540.0
+                @control
       bell:
         space w=1.0 h=1.0
   target palette = #workspace-tabs/palette-input
@@ -89,7 +111,11 @@ test channel_draft_contract
   viewport 480 240
   mount
     Field label="Channel name" description="Used when creating a channel." #channel-field
-      input "" #draft label="Channel name" <-> channel_draft hint="general" @control
+      input "" #draft <-> channel_draft
+        with
+          label="Channel name"
+          hint="general"
+          @control
   target draft = #channel-field/root/draft
   expect channel_draft == ""
   click draft
@@ -107,10 +133,17 @@ test shared_components_contract
   viewport 560 360
   mount
     box #surface w=fill
-      Panel title="Shared components" description="The app uses the default component library." #library
+      Panel #library
+        with
+          title="Shared components"
+          description="The app uses the default component library."
         col w=fill gap=12.0
           Alert.Destructive title="Connection failed" description=error #alert
-          row w=fill gap=8.0 align=center
+          row
+            with
+              w=fill
+              gap=8.0
+              align=center
             Badge.Success label="Ready" #badge
             Kbd label="Esc" #kbd
           button "Dismiss" #dismiss @primary_action -> dismiss_error
@@ -136,13 +169,30 @@ test minimum_window_layout_contract
   preset ui_offline
   viewport 1280 800
   mount
-    WorkspaceTabs network="testnet" status=status height=84912 loading=loading degraded=false tab=shell_tab bell_count=0 bell_sev="info" approvals=0 account="" agent_live=false tier="validator" root_hash="" consensus_view="—" quorum="—" reachable="—" last_finalized=0 checkpoint=0 #workspace-tabs
+    WorkspaceTabs #workspace-tabs
+      with
+        network="testnet"
+        status
+        height=84912
+        loading
+        degraded=false
+        tab=shell_tab
+        bell_count=0
+        bell_sev="info"
+        approvals=0
+        account=""
+        agent_live=false
+        tier="validator"
+        root_hash=""
+        consensus_view="—"
+        quorum="—"
+        reachable="—"
+        last_finalized=0
+        checkpoint=0
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
         switch_network -> switch_network
-
-
 
       huddle:
         space w=1.0 h=1.0
@@ -200,7 +250,22 @@ test launch_unlock_contract
   preset ui_launch
   viewport 480 680
   mount
-    HubColumn step="unlock" key_state="encrypted" networks=hub_networks selected="" hidden=0 name="" invite="" reveal="" steps=provision_steps step_index=0 height=-1 tier="" error="" busy=false #hub
+    HubColumn #hub
+      with
+        step="unlock"
+        key_state="encrypted"
+        networks=hub_networks
+        selected=""
+        hidden=0
+        name=""
+        invite=""
+        reveal=""
+        steps=provision_steps
+        step_index=0
+        height=-1
+        tier=""
+        error=""
+        busy=false
       events
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
@@ -230,7 +295,22 @@ test launch_networks_empty_contract
   preset ui_launch
   viewport 480 680
   mount
-    HubColumn step="networks" key_state="encrypted" networks=hub_networks selected="" hidden=0 name="" invite="" reveal="" steps=provision_steps step_index=0 height=-1 tier="" error="" busy=false #hub
+    HubColumn #hub
+      with
+        step="networks"
+        key_state="encrypted"
+        networks=hub_networks
+        selected=""
+        hidden=0
+        name=""
+        invite=""
+        reveal=""
+        steps=provision_steps
+        step_index=0
+        height=-1
+        tier=""
+        error=""
+        busy=false
       events
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
@@ -267,7 +347,19 @@ test palette_overlay_contract
   preset ui_palette_overlay
   viewport 1120 720
   mount
-    OverlayLayer create_open=false members_only=false draft<->channel_draft busy=false connected=true loading=false toast="" tone="info" open=palette_open query<->palette_draft searching=palette_searching chat_hits=palette_chat_hits page_hits=palette_page_hits #overlays
+    OverlayLayer draft<->channel_draft query<->palette_draft #overlays
+      with
+        create_open=false
+        members_only=false
+        busy=false
+        connected=true
+        loading=false
+        toast=""
+        tone="info"
+        open=palette_open
+        searching=palette_searching
+        chat_hits=palette_chat_hits
+        page_hits=palette_page_hits
       events
         toggle_channel_create -> toggle_channel_create
         toggle_channel_create_members_only -> toggle_channel_create_members_only
