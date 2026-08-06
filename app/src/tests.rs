@@ -581,10 +581,12 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     app.thread_has_more = true;
     app.reply_editor = compose("reply in progress");
     app.message_editor = compose("next message");
-    app.mutation_phase = "reaction".into();
+    app.mutation_phase = "channel".into();
     app.pending_message = "sent message".into();
 
     // an unrelated mutation's ack carries no snapshot — nothing to stomp
+    // (reactions no longer route through ChatAcked at all; a channel op is
+    // the surviving non-message phase)
     let _ = app.__update(__DucktapeMessage::ChatAcked(true));
 
     assert_eq!(app.selected_message_seq, 7);
@@ -597,6 +599,35 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     assert!(app.thread_has_more);
     assert_eq!(reply_composer(&app), "reply in progress");
     assert_eq!(composer(&app), "next message");
+    assert_eq!(app.mutation_phase, "idle");
+}
+
+/// The picker-dismissal bug in one contract: an in-flight reaction must not
+/// take the global mutation lock. A locked picker's disabled cells capture
+/// no press, so the SECOND click of a picking session fell through to the
+/// backdrop and dismissed the overlay; the hover bar's one-tap reactions
+/// silently no-op'd through the same window.
+#[test]
+fn reactions_run_outside_the_mutation_lock() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected_rpc = "http://node".into();
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.messages = vec![message(7, "root", false)];
+    app.selected_message_seq = 7;
+    app.selected_message_rev = 1;
+    app.message_action = "reactions".into();
+
+    let _ = app.__update(__DucktapeMessage::AddReactionSubmit("👍".into()));
+
+    assert_eq!(app.mutation_phase, "idle", "reactions never take the lock");
+    assert_eq!(app.selected_message_seq, 7);
+    assert_eq!(app.message_action, "reactions", "the picker stays open");
+
+    // the ack leaves the picker exactly where it was — multi-pick works
+    let _ = app.__update(__DucktapeMessage::ReactionAcked(true));
+    assert_eq!(app.selected_message_seq, 7);
+    assert_eq!(app.message_action, "reactions");
     assert_eq!(app.mutation_phase, "idle");
 }
 
@@ -982,6 +1013,10 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     assert!(picker.contains("for emoji in reaction_palette()"));
     assert!(picker.contains("-> emit(add_reaction_submit, emoji)"));
     assert!(!picker.contains("remove_reaction_submit"));
+    // Cells must stay pressable while a reaction is in flight: a disabled
+    // button captures no press, and an uncaptured press inside the overlay
+    // dismisses it (see `reactions_run_outside_the_mutation_lock`).
+    assert!(!picker.contains("mutation_phase"));
 
     let handlers = include_str!("ui/handlers/chat.ice");
     for focus in [
@@ -1062,6 +1097,15 @@ fn thread_messages_mirror_the_main_action_system() {
     // removal rides the reply's own reaction chips.
     assert!(thread.contains("for emoji in reaction_palette()"));
     assert!(thread.contains("-> emit(add_reaction_at, thread_selected_seq, emoji)"));
+    // Same pressable-while-in-flight contract as the stream picker.
+    let thread_picker = thread
+        .split_once("thread_message_action == \"reactions\"")
+        .unwrap()
+        .1
+        .split_once("thread_message_action == \"editing\"")
+        .unwrap()
+        .0;
+    assert!(!thread_picker.contains("mutation_phase"));
     // More-menu omits Reply in thread (already inside the thread) and Close.
     let more = thread
         .split_once("thread_message_action == \"more\"")
