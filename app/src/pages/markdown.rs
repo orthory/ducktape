@@ -337,6 +337,8 @@ struct Ink {
     code_ink: Color,
     code_plate: Color,
     code_line: Color,
+    callout_plate: Color,
+    callout_line: Color,
 }
 
 const fn rgb8(r: u8, g: u8, b: u8) -> Color {
@@ -357,6 +359,8 @@ const LIGHT: Ink = Ink {
     code_ink: rgb8(0xc8, 0xc6, 0xbc),
     code_plate: rgb8(0x26, 0x25, 0x1f),
     code_line: rgb8(0x35, 0x33, 0x2c),
+    callout_plate: rgb8(0xfa, 0xf9, 0xf6),
+    callout_line: rgb8(0xef, 0xee, 0xe9),
 };
 
 const DARK: Ink = Ink {
@@ -368,6 +372,8 @@ const DARK: Ink = Ink {
     code_ink: rgb8(0xc8, 0xc6, 0xbc),
     code_plate: rgb8(0x1a, 0x19, 0x16),
     code_line: rgb8(0x2c, 0x2b, 0x25),
+    callout_plate: rgb8(0x23, 0x22, 0x1d),
+    callout_line: rgb8(0x2c, 0x2b, 0x26),
 };
 
 fn ink(dark: bool) -> &'static Ink {
@@ -389,6 +395,19 @@ fn code_font() -> Font {
     Font {
         family: Family::Name(design::fonts::FAMILY_MONO),
         ..crate::Ducktape::default_font()
+    }
+}
+
+/// The callout tile — the `card_wash` plate the block widget used to draw,
+/// painted by the highlighter now that the callout is a line of the document.
+fn callout_plate(ink: &Ink) -> TextHighlight {
+    TextHighlight {
+        background: ink.callout_plate.into(),
+        border: Border {
+            color: ink.callout_line,
+            width: 1.0,
+            radius: 11.0.into(),
+        },
     }
 }
 
@@ -503,6 +522,8 @@ fn body_format(style: Style, ink: &Ink) -> Format {
         format.line_height = Some(LineHeight::Absolute(Pixels(
             CALLOUT_SIZE * CALLOUT_LINE_HEIGHT,
         )));
+        format.line_highlight = Some(callout_plate(ink));
+        format.line_padding = Padding::from([9.0, 14.0]);
         return format;
     }
     if style.quote {
