@@ -38,9 +38,6 @@ on toggle_call_camera
   call_camera = call_set_camera(!call_camera)
   call_video_live = call_video_live_after(call_peers, call_camera)
 
-on video_tick
-  call_frame_generation = latest_frame_generation()
-
 // POPPING OPENS A REAL WINDOW, and the window's existence IS the popped
 // state — there is no `huddle_popped` bool to keep in step with it. Docking
 // closes it; so does the OS close button, which lands in `window_was_closed`

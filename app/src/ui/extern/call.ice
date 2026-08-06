@@ -17,9 +17,9 @@ extern crate::call
   sync call_video_live_after(peers:[CallEvent], camera:bool) -> bool
 
 // The camera leg — `crate::video`: capture/encode on its own thread, decoded
-// peer frames in a store the tile strip reads. `call_video_tiles` re-renders
-// when `generation` moves (the 15 Hz tick below copies the store's counter).
+// peer frames in a store the tile strip reads. `call_video_tiles` is a
+// SELF-REDRAWING widget: it repaints its own window at the capture cadence
+// via per-window redraw requests — no tick, no state, no app rebuild.
 extern crate::video
   sync call_set_camera(on:bool) -> bool
-  sync latest_frame_generation() -> i64
-  component call_video_tiles(generation:i64) -> unit
+  component call_video_tiles() -> unit

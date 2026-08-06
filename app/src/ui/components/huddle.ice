@@ -157,7 +157,7 @@ component HuddleTile(person:HuddleParticipant, muted:bool)
 // It reads `huddle_roster` from app state, which is kept ONLY while
 // `active_channel == huddle_channel` — the same guard `huddle_channel` itself
 // carries, since a load of any other channel carries THAT channel's roster.
-component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], status:str, muted:bool, peers:[CallEvent], camera:bool, video_live:bool, frame_generation:i64)
+component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], status:str, muted:bool, peers:[CallEvent], camera:bool, video_live:bool)
   emits
     dock_huddle
     huddle_go_channel
@@ -192,9 +192,10 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
             if !empty(status)
               text status size=10.5 wrap=none font=code_medium @text-caption
           // The video strip: every live camera's latest frame (peers first,
-          // the local preview last), only while any camera is on.
+          // the local preview last), only while any camera is on. The widget
+          // repaints itself — mounting it is the whole contract.
           if video_live
-            extern call_video_tiles(frame_generation)
+            extern call_video_tiles()
           row w=fill gap=8.0 wrap wrap-gap=8.0
             for person in roster
               HuddleTile person=person muted=keep_bool(person.is_you, muted, call_peer_muted(peers, person.node))

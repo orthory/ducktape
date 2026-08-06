@@ -449,11 +449,8 @@ subscribe
   // stops the subscription, the stream drops, and the websocket + audio
   // threads tear down with it. No imperative start/stop anywhere.
   run call_session(connected_rpc, huddle_channel) when (connected && huddle_joined && !empty(huddle_channel)) -> call_event _
-  // The tile strip repaints from the store's generation, 25 Hz, matched to
-  // the capture cadence — and only while the huddle WINDOW is open: the strip
-  // mounts nowhere else, so a docked huddle must not pay full-app rebuilds
-  // for zero pixels.
-  every 40ms when ((huddle_win != none) && call_video_live) -> video_tick
+  // Video has NO subscription: the tile strip is a self-redrawing widget
+  // that repaints only its own window at the capture cadence.
   keyboard press when (connected || palette_open) -> global_key_pressed _
   keyboard modifiers -> modifiers_changed _
   window file-dropped -> fs_file_dropped _
