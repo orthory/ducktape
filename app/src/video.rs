@@ -35,11 +35,21 @@ const JPEG_QUALITY: u8 = 60;
 /// Tile width in the strip; height follows the frame's aspect.
 const TILE_WIDTH: f32 = 128.0;
 
-/// One decoded tile: RGBA pixels at (width, height).
+/// One decoded tile: the renderer handle, built ONCE per decoded frame, plus
+/// the capture size the tile's aspect ratio is computed from.
+///
+/// THE HANDLE'S IDENTITY IS THE WHOLE POINT. `Handle::from_rgba` stamps a
+/// fresh `Id` on every call (iced_core `image.rs`), and iced_wgpu treats a
+/// never-seen id as a never-seen image: full copy, fresh atlas allocation,
+/// and — above its 2 MiB synchronous-upload cliff — nothing drawn in the
+/// frame the id first appears (iced_wgpu `image/cache.rs`). Minting the
+/// handle here rather than in `tile()` means every view rebuild between two
+/// captures hands the renderer the SAME id and hits its cache, so a tile
+/// holds the last decoded frame on screen until the next one arrives.
 struct TileFrame {
     width: u32,
     height: u32,
-    rgba: Vec<u8>,
+    handle: iced::widget::image::Handle,
 }
 
 struct VideoStore {
@@ -130,10 +140,11 @@ fn decode_frame(data: &[u8]) -> Option<TileFrame> {
         ));
     let pixels = decoder.decode().ok()?;
     let (width, height) = decoder.dimensions()?;
+    let (width, height) = (width as u32, height as u32);
     Some(TileFrame {
-        width: width as u32,
-        height: height as u32,
-        rgba: pixels,
+        width,
+        height,
+        handle: iced::widget::image::Handle::from_rgba(width, height, pixels),
     })
 }
 
@@ -161,7 +172,7 @@ pub(crate) fn store_preview(rgb: &[u8], width: u32, height: u32) {
     store().lock().expect("video store").preview = Some(TileFrame {
         width,
         height,
-        rgba,
+        handle: iced::widget::image::Handle::from_rgba(width, height, rgba),
     });
     bump();
 }
@@ -175,7 +186,7 @@ pub(crate) fn camera_thread(
     events: iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
 ) {
     use nokhwa::pixel_format::RgbFormat;
-    use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
+    use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType, Resolution};
 
     let mut camera: Option<nokhwa::Camera> = None;
     let started = std::time::Instant::now();
@@ -193,8 +204,20 @@ pub(crate) fn camera_thread(
             continue;
         }
         if camera.is_none() {
+            // 640×480 AT ITS HIGHEST FRAME RATE — the size this module has
+            // always documented, and now the size it actually asks for.
+            // `AbsoluteHighestFrameRate` meant "highest frame rate, then the
+            // HIGHEST resolution" (nokhwa-core `types.rs`), so a 720p/1080p
+            // webcam negotiated a mode whose q60 JPEG overruns the mesh's
+            // ~126 KiB `MAX_FRAME_BYTES` — `encode_frame` then returns `None`
+            // and the frame is dropped, preview included — and whose RGBA
+            // (3.7 MB at 720p) is over iced's 2 MiB synchronous-upload cliff.
+            // Both halves of that read as the tile blinking.
+            // ponytail: fixed VGA, no ladder — a camera with no 640×480 mode
+            // refuses to open (surfaced as "live · camera: …"); the upgrade
+            // path is a box-downsample in this loop, before the encode.
             let requested = RequestedFormat::new::<RgbFormat>(
-                RequestedFormatType::AbsoluteHighestFrameRate,
+                RequestedFormatType::HighestResolution(Resolution::new(640, 480)),
             );
             match nokhwa::Camera::new(CameraIndex::Index(0), requested)
                 .and_then(|mut device| device.open_stream().map(|()| device))
@@ -267,14 +290,11 @@ pub fn call_video_tiles(_generation: i64) -> Element<'static, ()> {
 }
 
 fn tile(frame: &TileFrame) -> Element<'static, ()> {
-    let handle = iced::widget::image::Handle::from_rgba(
-        frame.width,
-        frame.height,
-        frame.rgba.clone(),
-    );
+    // `Handle` is `Bytes`-backed (Arc) and its `Id` survives the clone, so this
+    // is a refcount bump that keeps pointing at the renderer's cached upload.
     let height = TILE_WIDTH * frame.height.max(1) as f32 / frame.width.max(1) as f32;
     iced::widget::container(
-        iced::widget::image(handle)
+        iced::widget::image(frame.handle.clone())
             .width(TILE_WIDTH)
             .height(height)
             .content_fit(iced::ContentFit::Cover),
@@ -298,18 +318,36 @@ mod tests {
         assert!(encoded.len() < chat::video::MAX_FRAME_BYTES);
         let tile = decode_frame(&encoded).expect("decode");
         assert_eq!((tile.width, tile.height), (64, 48));
-        assert_eq!(tile.rgba.len(), 64 * 48 * 4);
+        assert!(matches!(
+            &tile.handle,
+            iced::widget::image::Handle::Rgba { pixels, .. } if pixels.len() == 64 * 48 * 4
+        ));
     }
 
+    /// One global store, so this stays ONE test — and it carries the blink's
+    /// property: a stored frame owns ONE renderer handle, so every view
+    /// rebuild between two captures reads the same id and the renderer keeps
+    /// its upload. Only a new frame is a new id.
     #[test]
     fn the_store_folds_frames_and_resets_clean() {
+        let preview_id = || {
+            store()
+                .lock()
+                .unwrap()
+                .preview
+                .as_ref()
+                .map(|frame| frame.handle.id())
+        };
         reset();
         let before = latest_frame_generation();
         store_preview(&[10, 20, 30], 1, 1);
         assert!(latest_frame_generation() > before);
-        assert!(store().lock().unwrap().preview.is_some());
+        let first = preview_id().expect("preview");
+        assert_eq!(first, preview_id().expect("preview"));
+        store_preview(&[40, 50, 60], 1, 1);
+        assert_ne!(first, preview_id().expect("preview"));
         reset();
-        assert!(store().lock().unwrap().preview.is_none());
+        assert!(preview_id().is_none());
         assert!(!camera_enabled());
     }
 }

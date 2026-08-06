@@ -26,6 +26,12 @@ daemon Ducktape
       title-hidden true
       titlebar-transparent true
       fullsize-content-view true
+  // The huddle, popped out. It keeps REAL chrome — no `platform macos` block
+  // here — because the OS close button IS the dock control; the console is
+  // the one window that trades its titlebar away to draw its own.
+  window huddle
+    size 320 460
+    min-size 300 260
 
 use "extern/backend.ice"
 use "extern/editor.ice"

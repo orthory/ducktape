@@ -80,8 +80,9 @@ component HuddleStart()
 // `TitleBar`/`WorkspaceTabs` carry no huddle props, and the slot already sits
 // above the whole console, so it needs no signature change. The slot anchors
 // bottom-right; this component draws no offset of its own.
-// The artifact's visibility rule is `huddle_joined && !huddle_popped &&
-// !(shell_tab == "chat" && huddle_channel == active_channel)`.
+// The visibility rule is `huddle_joined && huddle_win == none &&
+// !(shell_tab == "chat" && huddle_channel == active_channel)` — the pill is
+// what the huddle docks BACK into when its window closes.
 component HuddleDockedPill(channel:str, elapsed:str)
   emits
     pop_huddle
@@ -100,8 +101,8 @@ component HuddleDockedPill(channel:str, elapsed:str)
 // ONE PARTICIPANT, on the dark panel. The human/agent shape rule holds — circle
 // vs rounded square — but the plates are the panel's own dark steps, not the
 // paper avatar tokens, so `PrincipalAvatar` is deliberately not reused here.
-// The width is fixed so exactly two tiles fit the 296px panel's wrapping row:
-// 296 less its 1px border either side and its 13px insets leaves 268, and
+// The width is fixed so exactly two tiles fit the panel's wrapping row: the
+// huddle window's 300px minimum less its 13px insets leaves 274, and
 // 128 + 8 + 128 is 264.
 component HuddleTile(person:HuddleParticipant, muted:bool)
   box #root w=128.0 pl=8.0 pr=8.0 pt=12.0 pb=12.0 bg=ink_hover r=11.0
@@ -123,19 +124,21 @@ component HuddleTile(person:HuddleParticipant, muted:bool)
         if person.is_you
           text "you" size=9.0 wrap=none font=medium @text-caption
 
-// THE POPPED PANEL — 296px, pinned bottom-right by the caller's stack. Three
-// bands: the traffic-light header with its dock button, the body (elapsed +
-// roster grid + controls), and nothing else. See the file header for the four
-// bands the artifact has that this one honestly refuses to draw.
+// THE POPPED PANEL — the whole content of the huddle's own OS window. Two
+// bands: the header with its dock button, and the body (elapsed + roster grid
+// + controls). See the file header for the four bands the artifact has that
+// this one honestly refuses to draw.
 //
-// MOUNTED in the window-level `huddle` slot (view.ice) under
-// `huddle_joined && huddle_popped`, so the LIVE pill's `pop_huddle` click now
-// opens this panel. It reads `huddle_roster` from app state; `next.huddle_roster`
-// `huddle_self` has read it. It must be kept ONLY while `active_channel ==
-// huddle_channel`, the same guard `huddle_channel` itself carries — a load of
-// any other channel carries THAT channel's roster, and this panel follows you
-// off the huddle's channel. Then a `pin`ned mount in view.ice's full-window
-// stack under `if huddle_joined && huddle_popped`.
+// IT DRAWS NO WINDOW CHROME. It used to be a 296px card pinned in the
+// console's corner, wearing three hand-drawn traffic lights as costume; it is
+// a real window now (`window huddle` in app.ice), so the frame, the shadow and
+// the dots are the OS's and the close button docks. The `collapse` button
+// stays because closing this window does NOT leave the huddle, and a control
+// that says so is worth one glyph.
+//
+// It reads `huddle_roster` from app state, which is kept ONLY while
+// `active_channel == huddle_channel` — the same guard `huddle_channel` itself
+// carries, since a load of any other channel carries THAT channel's roster.
 component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], status:str, muted:bool, peers:[CallEvent], camera:bool, video_live:bool, frame_generation:i64)
   emits
     dock_huddle
@@ -143,24 +146,10 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
     leave_huddle_here
     toggle_call_mute
     toggle_call_camera
-  box #root w=296.0 bg=toast_bg border=accent_fg border-w=1.0 r=15.0 clip=true shadow=shadow_modal shadow-y=30.0 shadow-blur=70.0
+  box #root w=fill h=fill bg=toast_bg clip=true
     col w=fill
       box w=fill pl=11.0 pr=11.0 pt=9.0 pb=9.0
         row w=fill gap=9.0 align=center
-          // The artifact draws three static traffic lights. In a real window a
-          // red dot that eats the click is a trap, and this panel has exactly
-          // one way to close — docking it — so the red dot IS that control and
-          // the two beside it stay the chrome they are drawn as.
-          row gap=5.0 align=center
-            button label="Dock the huddle window" w=8.0 h=8.0 @icon_action px-0px py-0px -> emit(dock_huddle)
-              space w=8.0 h=8.0
-              active bg=danger_dot text=danger_dot border=transparent border-w=1.0 r=4.0
-              hovered bg=danger_solid text=danger_solid
-              pressed bg=danger_solid_hover text=danger_solid_hover
-            box w=8.0 h=8.0 bg=warning_dot r=4.0
-              space w=1.0 h=1.0
-            box w=8.0 h=8.0 bg=success_dot r=4.0
-              space w=1.0 h=1.0
           text "Huddle ·" size=10.5 wrap=none font=code_medium @text-ink_soft
           text channel w=fill size=10.5 wrap=none font=code_medium @text-ink_soft
           button label="Dock the huddle window" @icon_action p-4px -> emit(dock_huddle)

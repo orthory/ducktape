@@ -486,3 +486,14 @@ opt-level = 3
 [profile.dev.package.wasmparser]
 opt-level = 3
 
+# The sign-in unlock, and every signed write after it, runs one argon2id pass
+# over a 64 MiB buffer (`bin/node/src/userkey.rs` DEFAULT_M_KIB) — the KDF is
+# SUPPOSED to be expensive, but only at its release speed. Unoptimized it is
+# ~15x that: `target/debug/ducktape user key unlock` measured 1.85 s per
+# derivation on this box, against 0.00 s for the process spawn and 0.00 s for
+# the no-KDF `user key status`. That is the whole of the "sign-in takes
+# forever" report, and it taxes every `user sign-frame` too. Same params, same
+# algorithm — this only compiles the memory-fill loop properly.
+[profile.dev.package.argon2]
+opt-level = 3
+

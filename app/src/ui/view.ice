@@ -1,10 +1,11 @@
 view
   // THE WINDOW GATE — the daemon's one dispatch. The `window` binding names
   // the window being rendered: the launch window mounts the hub column, the
-  // console window mounts the shell. A window neither id claims renders the
-  // hub's quiet loading arm — it exists only between open and register.
+  // console window mounts the shell, the popped huddle mounts the panel. A
+  // window no id claims renders the hub's quiet loading arm — it exists only
+  // between open and register.
   col w=fill h=fill
-    if console_win != some(window)
+    if (console_win != some(window)) && (huddle_win != some(window))
       HubColumn step=hub_step key_state=hub_key_state networks=hub_networks selected=hub_selected hidden=hub_hidden name=onboarding_name invite=invite_link reveal=reveal_words steps=provision_steps step_index=provision_index height=block_height tier=member_tier(members_rows) error=onboarding_error busy=(mutation_phase != "idle")
         events
           unlock_submit -> unlock_submit _
@@ -24,6 +25,17 @@ view
           connect_remote_submit -> connect_remote_submit _
           restore_hidden_submit -> restore_hidden_submit
           enter_console -> enter_console
+    // THE HUDDLE WINDOW — the same panel, now the whole content of a real OS
+    // window instead of a card wearing drawn traffic lights. Its close button
+    // docks (see `window_was_closed`); leaving the huddle closes it.
+    if huddle_win == some(window)
+      HuddlePanel channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at) roster=huddle_roster status=call_status muted=call_muted peers=call_peers camera=call_camera video_live=call_video_live frame_generation=call_frame_generation #huddle
+        events
+          dock_huddle -> dock_huddle
+          huddle_go_channel -> huddle_go_channel
+          leave_huddle_here -> leave_huddle_here
+          toggle_call_mute -> toggle_call_mute
+          toggle_call_camera -> toggle_call_camera
     if console_win == some(window)
       WorkspaceTabs network=network_label(account_name, connected_rpc) status=status height=block_height loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab bell_count=bell_unread bell_sev=bell_worst_severity(bell_items) approvals=open_proposals(gov_rows) account=account_name agent_live=any_agent_active(agents_rows) tier=member_tier(members_rows) root_hash=node_root_hash consensus_view=node_view_label quorum=node_quorum_label reachable=node_reachable_label last_finalized=node_last_finalized checkpoint=node_checkpoint #workspace-tabs
         events
@@ -220,20 +232,13 @@ view
         huddle:
           box w=fill h=fill align-x=end align-y=end pr=16.0 pb=16.0
             col
-              if huddle_joined && huddle_popped
-                HuddlePanel channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at) roster=huddle_roster status=call_status muted=call_muted peers=call_peers camera=call_camera video_live=call_video_live frame_generation=call_frame_generation
-                  events
-                    dock_huddle -> dock_huddle
-                    huddle_go_channel -> huddle_go_channel
-                    leave_huddle_here -> leave_huddle_here
-                    toggle_call_mute -> toggle_call_mute
-                    toggle_call_camera -> toggle_call_camera
-              // The pill says "you are still in a call elsewhere". It hides only
-              // where the live pill in the channel header already says so — the
-              // Chat tab, looking at the huddle's own channel. On every OTHER
-              // screen it must show even when that channel is the selected one,
-              // which the missing `shell_tab` term used to suppress.
-              if huddle_joined && !huddle_popped && (shell_tab != "chat" || huddle_channel != active_channel)
+              // The pill says "you are still in a call elsewhere". It hides while
+              // the huddle has its own window, and where the live pill in the
+              // channel header already says so — the Chat tab, looking at the
+              // huddle's own channel. On every OTHER screen it must show even
+              // when that channel is the selected one, which the missing
+              // `shell_tab` term used to suppress.
+              if huddle_joined && (huddle_win == none) && (shell_tab != "chat" || huddle_channel != active_channel)
                 HuddleDockedPill channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at)
                   events
                     pop_huddle -> pop_huddle

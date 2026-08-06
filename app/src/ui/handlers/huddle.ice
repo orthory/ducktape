@@ -2,8 +2,9 @@
 //
 // TWO FACTS SHAPE THIS FILE:
 //
-// 1. POPPING IS VIEW STATE. `pop_huddle`/`dock_huddle` write one bool and touch
-//    no chain — the same pure view toggles the artifact uses.
+// 1. POPPING IS A WINDOW, NOT A BOOL. `pop_huddle`/`dock_huddle` open and
+//    close the daemon's third window and touch no chain; `huddle_win` holding
+//    an id IS "the huddle is popped out".
 // 2. THE ELAPSED CLOCK IS A LOCAL SESSION FACT. It is counted by a 1 Hz tick on
 //    THIS machine into `huddle_now`, never derived from a module record's time:
 //    a consensus write is stamped with the block HEIGHT on a validator network
@@ -40,11 +41,30 @@ on toggle_call_camera
 on video_tick
   call_frame_generation = latest_frame_generation()
 
+// POPPING OPENS A REAL WINDOW, and the window's existence IS the popped
+// state — there is no `huddle_popped` bool to keep in step with it. Docking
+// closes it; so does the OS close button, which lands in `window_was_closed`
+// (handlers/lifecycle.ice) and clears `huddle_win` there.
+// ponytail: a second `pop_huddle` while the window is already open is a
+// no-op rather than a focus-raise — a handler has no if-blocks and window
+// tasks are terminal, so "open it or raise it" needs the two paths split.
+// The docked pill hides while the window lives; only the channel-header LIVE
+// pill can still reach this. Give that pill a `popped` prop when it bites.
 on pop_huddle
-  huddle_popped = true
+  return if huddle_win != none
+  task window open huddle -> huddle_opened _
 
+on huddle_opened(id)
+  huddle_win = some(id)
+
+// ponytail: a huddle that ends WITHOUT this window (another device leaves,
+// the node drops the seat) leaves the window up on an empty roster — its OS
+// close button is the only way out, and the docked pill correctly stays gone.
+// `huddle_joined` is folded in five places (handlers/chat.ice, lifecycle.ice)
+// and `assert_no_polling` forbids a watchdog tick, so the upgrade is one
+// appended `task window close target=window_target(huddle_win)` per fold.
 on dock_huddle
-  huddle_popped = false
+  task window close target=window_target(huddle_win)
 
 // The panel and the huddle's channel are the same conversation, so opening one
 // docks the other. `choose_channel` owns the whole channel-switch reset; this
@@ -60,7 +80,6 @@ on dock_huddle
 on huddle_go_channel
   return if loading || mutation_phase != "idle" || empty(huddle_channel)
   shell_tab = "chat"
-  huddle_popped = false
   flow
     from done huddle_channel
     done -> choose_channel _
@@ -82,4 +101,8 @@ on leave_huddle_here
   call_video_live = false
   call_peers = []
   error = ""
-  run leave_huddle(connected_rpc, password, huddle_channel) -> chat_acked _ | mutation_failed _
+  // Leaving is the one thing that ends the huddle window: it has nothing left
+  // to show. A window task is terminal, so the leave call rides beside it.
+  parallel
+    task window close target=window_target(huddle_win)
+    run leave_huddle(connected_rpc, password, huddle_channel) -> chat_acked _ | mutation_failed _

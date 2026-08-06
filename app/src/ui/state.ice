@@ -275,12 +275,14 @@ state
   page_search_hits:[PageSearchHit] = []
   page_searching = false
   page_search_generation:i64 = 0
-  // THE TWO WINDOWS — the daemon's whole routing state. The launch window
-  // opens on mount; the console opens on a network pick; whichever id a
-  // window carries decides what it renders, and when both are `none` the
-  // process exits.
+  // THE THREE WINDOWS — the daemon's whole routing state. The launch window
+  // opens on mount; the console opens on a network pick; the huddle opens
+  // when the call is popped out. Whichever id a window carries decides what
+  // it renders, and when the launch window and the console are both `none`
+  // the process exits — a lone huddle window never keeps the daemon alive.
   onboarding_win:window-id? = none
   console_win:window-id? = none
+  huddle_win:window-id? = none
   // THE LAUNCH FLOW — one discriminant: loading -> (create | unlock)
   // -> [reveal | restore] -> networks -> [join -> provisioning -> live].
   hub_step = "loading"
@@ -329,13 +331,13 @@ state
   dm_peers_generation:i64 = 0
   active_dm_peer = ""
   // HUDDLE — whether SHE is in it, where, since when, the tick that drives the
-  // elapsed clock, whether the panel is popped, and who else is on the call.
+  // elapsed clock, and who else is on the call. There is no `popped` bool:
+  // the huddle window's own existence (`huddle_win`) is that state.
   huddle_joined = false
   huddle_channel = ""
   huddle_channel_name = ""
   huddle_joined_at:i64 = 0
   huddle_now:i64 = 0
-  huddle_popped = false
   // The live call session's surface: status prose, the local mute, and the
   // peers' 1 Hz beacons (kind="peer" rows keyed by node key).
   call_status = ""

@@ -190,6 +190,17 @@ pub fn password_problem(password: String, confirm: String) -> String {
     String::new()
 }
 
+/// The close/focus target for a window that may not be open. `Some(id)` names
+/// it; `None` yields a fresh id that names NO window, and iced drops a
+/// `window::Action::Close` for an id its manager does not hold (iced_winit
+/// `lib.rs`). That no-op IS how an ice handler — which has no if-blocks and
+/// whose window tasks are terminal — spells a conditional close. It is also
+/// the only way to reach `target=`, which demands `window-id`, not
+/// `window-id?`.
+pub fn window_target(current: Option<iced::window::Id>) -> iced::window::Id {
+    current.unwrap_or_else(iced::window::Id::unique)
+}
+
 /// Clear a tracked window id when it is the one that closed.
 pub fn without_window(
     current: Option<iced::window::Id>,

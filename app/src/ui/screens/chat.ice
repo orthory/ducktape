@@ -563,7 +563,10 @@ component ChatScreen(account_name:str, connected_rpc:str, status:str, block_heig
                       pressed bg=brand_bg
                   Separator
                   scroll dir=vertical w=fill h=fill anchor-y=end auto=true
-                    col w=fill gap=1.0
+                    // Same 6px off the scrollbar as the stream — the rail
+                    // draws the same code/quote slabs now, and they hugged
+                    // the right edge without it (#927).
+                    col w=fill gap=1.0 pr=6.0
                       for thread_message in thread_messages
                         // THE ROOT GETS ITS OWN DIVIDED BLOCK. One
                         // loop, one discriminant: `active_thread_seq`
@@ -582,6 +585,7 @@ component ChatScreen(account_name:str, connected_rpc:str, status:str, block_heig
                             forward
                               add_reaction_at
                               remove_reaction_at
+                              open_thread_for
                               open_thread_message_actions
                               open_thread_message_reactions
                       if thread_has_more && thread_next_reply_offset >= 0

@@ -72,6 +72,9 @@ fn full_view_fits_a_four_mib_stack() {
             app.onboarding_win = Some(onboarding);
             app.hub_step = "networks".into();
             let _ = app.__view(onboarding);
+            let huddle = iced::window::Id::unique();
+            app.huddle_win = Some(huddle);
+            let _ = app.__view(huddle);
         })
         .unwrap()
         .join()
@@ -1108,8 +1111,15 @@ fn thread_messages_mirror_the_main_action_system() {
     assert!(
         card.contains("-> emit(open_thread_message_actions, message.seq, message.body, message.rev)")
     );
-    // No open-thread action from inside a thread you are already reading.
-    assert!(!card.contains("open_thread_for"));
+    // A reply is the SAME message block as a timeline row — the rail mounts
+    // the shared contents rather than a second spelling of them, so the
+    // message redesign lands in both lanes at once.
+    assert!(card.contains("MessageContents message=message flash=0.0"));
+    // No open-thread action from inside a thread you are already reading. The
+    // shared contents still declare the event (their reply pill emits it) so
+    // the card forwards it, but the rail's toolbar has no seat for it — and a
+    // reply carries no replies, so the pill never renders here.
+    assert!(!card.contains("label=\"Open thread\""));
 
     let thread = include_str!("ui/screens/chat.ice")
         .split_once("if active_thread_seq > 0 && !channel_settings_open")
@@ -1570,6 +1580,15 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(shell.contains("component ConnectionBanner(status:str)"));
     assert!(shell.contains("if degraded\n          ConnectionBanner status=status"));
     assert!(shell.contains("box #root w=74.0 h=fill pt=13.0 pb=10.0 bg=rail"));
+    // The status tooltip ALWAYS overflows the window's right edge, and iced
+    // snaps an overflowing tip hard against it. The paper therefore belongs to
+    // StatusCard and the tooltip frame stays transparent, so the `pr` gutter
+    // can hold the card off the wall on the bell card's line.
+    assert!(bar.contains("tooltip position=bottom gap=6.0 p=0.0 delay=90 style=transparent"));
+    assert!(bar.contains("box pr=13.0\n              StatusCard "));
+    assert!(shell.contains(
+        "box #root w=284.0 pl=14.0 pr=14.0 pt=13.0 pb=13.0 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0"
+    ));
     assert!(SCREENS.contains("box w=236.0 h=fill bg=sidebar clip=true"));
     assert!(SCREENS.contains("box w=230.0 h=fill bg=sidebar clip=true"));
 

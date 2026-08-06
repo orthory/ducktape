@@ -322,12 +322,31 @@ pub async fn live_resync_load(
         };
         let load_chat = planes == "chat" || planes == "both";
         let load_pages = planes == "pages" || planes == "both";
-        if load_chat {
-            let chat = load_chat_data(
-                &rpc,
-                (!channel_id.is_empty()).then_some(channel_id.as_str()),
-            )
-            .await?;
+        // `both` is the arm the boot pays: the stream's `ready` event resyncs
+        // each plane the moment the console connects. The two planes share
+        // nothing, so they run together rather than one behind the other.
+        let (chat, pages) = tokio::try_join!(
+            async {
+                match load_chat {
+                    true => load_chat_data(
+                        &rpc,
+                        (!channel_id.is_empty()).then_some(channel_id.as_str()),
+                    )
+                    .await
+                    .map(Some),
+                    false => Ok(None),
+                }
+            },
+            async {
+                match load_pages {
+                    true => load_pages_data(&rpc, (!page_id.is_empty()).then_some(page_id.as_str()))
+                        .await
+                        .map(Some),
+                    false => Ok(None),
+                }
+            }
+        )?;
+        if let Some(chat) = chat {
             refresh.chat_loaded = true;
             refresh.channels = chat.channels;
             refresh.messages = chat.messages;
@@ -339,9 +358,7 @@ pub async fn live_resync_load(
             refresh.huddle_roster = chat.huddle_roster;
             refresh.channel_members = chat.channel_members;
         }
-        if load_pages {
-            let pages =
-                load_pages_data(&rpc, (!page_id.is_empty()).then_some(page_id.as_str())).await?;
+        if let Some(pages) = pages {
             refresh.pages_loaded = true;
             refresh.pages = pages.pages;
             refresh.blocks = pages.blocks;

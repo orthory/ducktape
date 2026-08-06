@@ -106,6 +106,7 @@ extern crate::backend
   sync refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
   sync password_problem(password:str, confirm:str) -> str
   sync without_window(current:window-id?, closed:window-id) -> window-id?
+  sync window_target(current:window-id?) -> window-id
   create_user_key(password:str) -> KeyCreated ! AppError
   restore_user_key(words:str, password:str) -> str ! AppError
   unlock_user_key(password:str) -> str ! AppError

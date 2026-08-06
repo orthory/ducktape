@@ -298,73 +298,84 @@ component MessageCard(message:ChatMessage, selected:bool, disabled:bool, flash:f
       if message.deleted || message.pending
         space w=1.0 h=1.0
 
-// A reply reads one notch SMALLER than the same message in the timeline: 26px
-// plate, 12px author, and the stamp a step down. The body keeps the shared
-// block renderer — `MessageBody` is also mounted by the forge discussion, so
-// its scale is not this component's to change.
-component ThreadMessageBody(message:ChatMessage)
-  emits
-    add_reaction_at(i64, str)
-    remove_reaction_at(i64, str)
-  row w=fill gap=10.0 align=start
-    PrincipalAvatar initials=message.initial is_agent=(message.avatar_kind == "agent") plate=26.0 ink=9.0 ring=""
-    col w=fill gap=1.0
-      row w=fill gap=6.0 align=center
-        text message.author size=12.0 wrap=none font=display @text-fg
-        if message.height > 0
-          text height_label_short(message.height) size=10.0 wrap=none font=code_semibold @text-hint
-        if message.edited
-          text "· edited" size=10.0 wrap=none font=code_semibold @text-hint
-        space w=fill
-      MessageBody message=message
-      if !empty(message.reactions)
-        flex w=fill wrap=wrap gap-x=5.0 gap-y=5.0 items=start pt=5.0
-          for reaction in message.reactions
-            ReactionChip reaction=reaction seq=message.seq
-              forward
-                add_reaction_at
-                remove_reaction_at
-
+// A REPLY IS THE SAME MESSAGE BLOCK AS A TIMELINE ROW. It mounts
+// `MessageContents` — the run rhythm, the quiet code slab and quote bar, the
+// reaction chips and the right-edge send-state lane — instead of a second
+// spelling of them; the rail's own body component drifted a whole redesign
+// behind and is deleted. The rail's narrowness is its 300px plate, not a
+// smaller type scale.
+//
+// What genuinely diverges is the CARD CHROME: the toolbar is thread-scoped
+// (`open_thread_message_*`) and carries no open-thread button, because you are
+// already reading the thread. The card padding matches MessageCard's so the
+// pr=7 indicator inset still tucks under the pr=8 toolbar plate (#926).
+//
+// `flash=0.0` — the settle ✓ is anchored by `send_flash_id` against the
+// channel stream, and the rail has no such anchor; a reply in flight shows the
+// pending dot and settles into a plain row. `open_thread_for` is forwarded
+// only because `MessageContents` declares it: it fires from the reply pill,
+// and a reply carries no replies (`reply_count` only ever climbs on a root),
+// so the pill never renders here.
 component ThreadMessageCard(message:ChatMessage, selected:bool, disabled:bool)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
+    open_thread_for(i64)
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
   // Same draw-time hover as MessageCard — see the note there.
   hover tint=row_hover r=9.0
     stack w=fill
       if message.deleted
-        box w=fill p=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
-          ThreadMessageBody message=message
+        box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=transparent border=transparent border-w=1.0 r=9.0
+          MessageContents message=message flash=0.0
             forward
               add_reaction_at
               remove_reaction_at
+              open_thread_for
       if !message.deleted && selected
-        box w=fill p=8.0 bg=brand_bg border=transparent border-w=1.0 r=9.0
-          ThreadMessageBody message=message
+        box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=brand_bg border=transparent border-w=1.0 r=9.0
+          MessageContents message=message flash=0.0
             forward
               add_reaction_at
               remove_reaction_at
+              open_thread_for
       if !message.deleted && !selected
-        box w=fill p=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
-          ThreadMessageBody message=message
+        box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=transparent border=transparent border-w=1.0 r=9.0
+          MessageContents message=message flash=0.0
             forward
               add_reaction_at
               remove_reaction_at
+              open_thread_for
     col w=fill
       if !message.deleted && !message.pending
-        box w=fill align-x=end align-y=start pt=3.0 pr=9.0
-          box p=2.0 style=raised_style()
+        box w=fill align-x=end align-y=start pr=8.0
+          // The stream's bar, minus its open-thread seat: same opaque plate,
+          // same three one-tap reactions, same picker and overflow.
+          box p=2.0 bg=surface border=border border-w=1.0 r=9.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
             row gap=1.0 align=center
-              button "♡" label="Manage reactions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> emit(open_thread_message_reactions, message.seq, message.body, message.rev)
+              button "👍" label="React with 👍" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(add_reaction_at, message.seq, "👍")
                 active bg=transparent text=muted r=6.0
-                hovered bg=fg/10 text=fg
-                pressed bg=fg/14 text=fg
-              button "…" label="More message actions" disabled=disabled w=26.0 h=26.0 p=4.0 @ghost_action -> emit(open_thread_message_actions, message.seq, message.body, message.rev)
+                hovered bg=elevated text=fg
+                pressed bg=subtle text=fg
+              button "✅" label="React with ✅" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(add_reaction_at, message.seq, "✅")
                 active bg=transparent text=muted r=6.0
-                hovered bg=fg/10 text=fg
-                pressed bg=fg/14 text=fg
+                hovered bg=elevated text=fg
+                pressed bg=subtle text=fg
+              button "👀" label="React with 👀" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(add_reaction_at, message.seq, "👀")
+                active bg=transparent text=muted r=6.0
+                hovered bg=elevated text=fg
+                pressed bg=subtle text=fg
+              box w=1.0 h=16.0 bg=subtle
+                space w=1.0 h=1.0
+              button "♡" label="Manage reactions" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(open_thread_message_reactions, message.seq, message.body, message.rev)
+                active bg=transparent text=muted r=6.0
+                hovered bg=elevated text=fg
+                pressed bg=subtle text=fg
+              button "⋯" label="More message actions" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(open_thread_message_actions, message.seq, message.body, message.rev)
+                active bg=transparent text=muted r=6.0
+                hovered bg=elevated text=fg
+                pressed bg=subtle text=fg
       if message.deleted || message.pending
         space w=1.0 h=1.0
 
