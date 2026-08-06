@@ -24,47 +24,122 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
       // All / Humans / Agents / Validators. `filter_members` owns the
       // predicate so the strip and the list can never disagree.
       col w=fill
-        box w=fill pl=22.0 pr=22.0 pt=12.0 pb=12.0
-          row w=fill gap=7.0 align=center
-            button label="Show every member" p=0.0 @ghost_action -> emit(pick_members_filter, "all")
-              FilterChip label="All" count=len(rows) selected=(filter == "all")
+        box
+          with
+            w=fill
+            pl=22.0
+            pr=22.0
+            pt=12.0
+            pb=12.0
+          row
+            with
+              w=fill
+              gap=7.0
+              align=center
+            button -> emit(pick_members_filter, "all")
+              with
+                label="Show every member"
+                p=0.0
+                @ghost_action
+              FilterChip
+                with
+                  label="All"
+                  count=len(rows)
+                  selected=(filter == "all")
               active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
               hovered bg=row_hover text=fg
               pressed bg=elevated text=fg
-            button label="Show people only" p=0.0 @ghost_action -> emit(pick_members_filter, "humans")
-              FilterChip label="Humans" count=len(filter_members(rows, "humans")) selected=(filter == "humans")
+            button -> emit(pick_members_filter, "humans")
+              with
+                label="Show people only"
+                p=0.0
+                @ghost_action
+              FilterChip
+                with
+                  label="Humans"
+                  count=len(filter_members(rows, "humans"))
+                  selected=(filter == "humans")
               active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
               hovered bg=row_hover text=fg
               pressed bg=elevated text=fg
-            button label="Show agents only" p=0.0 @ghost_action -> emit(pick_members_filter, "agents")
-              FilterChip label="Agents" count=len(filter_members(rows, "agents")) selected=(filter == "agents")
+            button -> emit(pick_members_filter, "agents")
+              with
+                label="Show agents only"
+                p=0.0
+                @ghost_action
+              FilterChip
+                with
+                  label="Agents"
+                  count=len(filter_members(rows, "agents"))
+                  selected=(filter == "agents")
               active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
               hovered bg=row_hover text=fg
               pressed bg=elevated text=fg
-            button label="Show validators only" p=0.0 @ghost_action -> emit(pick_members_filter, "validators")
-              FilterChip label="Validators" count=len(filter_members(rows, "validators")) selected=(filter == "validators")
+            button -> emit(pick_members_filter, "validators")
+              with
+                label="Show validators only"
+                p=0.0
+                @ghost_action
+              FilterChip
+                with
+                  label="Validators"
+                  count=len(filter_members(rows, "validators"))
+                  selected=(filter == "validators")
               active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
               hovered bg=row_hover text=fg
               pressed bg=elevated text=fg
             space w=fill
-        box w=fill h=1.0 bg=separator
+        box
+          with
+            w=fill
+            h=1.0
+            bg=separator
           space w=1.0 h=1.0
       if empty(filter_members(rows, filter)) && answered
-        box w=fill h=fill p=22.0
-          EmptyPlate message="No members here yet — validators, residents and registered agents appear as they join."
+        box
+          with
+            w=fill
+            h=fill
+            p=22.0
+          EmptyPlate
+            with
+              message="No members here yet — validators, residents and registered agents appear as they join."
       if !empty(filter_members(rows, filter))
-        scroll dir=vertical w=fill h=fill
-          col w=fill pl=12.0 pr=12.0 pt=6.0 pb=6.0 gap=1.0
+        scroll
+          with
+            dir=vertical
+            w=fill
+            h=fill
+          col
+            with
+              w=fill
+              pl=12.0
+              pr=12.0
+              pt=6.0
+              pb=6.0
+              gap=1.0
             for member in filter_members(rows, filter)
               col w=fill
                 if member.key == selected
-                  button label="Open member" description=member.label w=fill p=0.0 @ghost_action -> emit(open_member, member.key)
+                  button -> emit(open_member, member.key)
+                    with
+                      label="Open member"
+                      description=member.label
+                      w=fill
+                      p=0.0
+                      @ghost_action
                     MemberRowCard member=member
                     active bg=elevated text=fg border=transparent border-w=1.0 r=9.0
                     hovered bg=elevated text=fg
                     pressed bg=subtle text=fg
                 if member.key != selected
-                  button label="Open member" description=member.label w=fill p=0.0 @ghost_action -> emit(open_member, member.key)
+                  button -> emit(open_member, member.key)
+                    with
+                      label="Open member"
+                      description=member.label
+                      w=fill
+                      p=0.0
+                      @ghost_action
                     MemberRowCard member=member
                     active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
                     hovered bg=row_hover text=fg
@@ -88,15 +163,44 @@ component AgentsScreen(rows:[AgentRow], answered:bool)
     // WHO may do WHAT under WHICH grant, and the doing itself is recorded
     // separately as that agent's runs.
     col w=fill
-      box w=fill pl=22.0 pr=22.0 pt=12.0 pb=10.0
-        text "The registry records who may act, what they may do, and under whose grant — every entry here is on chain. The acting itself is recorded separately, as each agent's runs." w=fill size=12.0 line-h=1.5 @text-caption
-      box w=fill h=1.0 bg=separator
+      box
+        with
+          w=fill
+          pl=22.0
+          pr=22.0
+          pt=12.0
+          pb=10.0
+        text "The registry records who may act, what they may do, and under whose grant — every entry here is on chain. The acting itself is recorded separately, as each agent's runs."
+          with
+            w=fill
+            size=12.0
+            line-h=1.5
+            @text-caption
+      box
+        with
+          w=fill
+          h=1.0
+          bg=separator
         space w=1.0 h=1.0
     if empty(rows) && answered
-      box w=fill h=fill p=22.0
-        EmptyPlate message="No agents registered — a registered agent appears here with its capability and grants."
+      box
+        with
+          w=fill
+          h=fill
+          p=22.0
+        EmptyPlate
+          with
+            message="No agents registered — a registered agent appears here with its capability and grants."
     if !empty(rows)
-      scroll dir=vertical w=fill h=fill
-        col w=fill p=18.0 gap=11.0
+      scroll
+        with
+          dir=vertical
+          w=fill
+          h=fill
+        col
+          with
+            w=fill
+            p=18.0
+            gap=11.0
           for agent in rows
             AgentCard agent=agent

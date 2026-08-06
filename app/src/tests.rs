@@ -8,16 +8,51 @@ use super::*;
 /// markup, so they must read where that markup now lives. `view.ice` keeps
 /// only the mounts, and asserting a widget shape against it now would pass
 /// vacuously — the worst kind of green.
-const SCREENS: &str = concat!(
-    include_str!("ui/screens/chat.ice"),
-    include_str!("ui/screens/forge.ice"),
-    include_str!("ui/screens/governance.ice"),
-    include_str!("ui/screens/overlays.ice"),
-    include_str!("ui/screens/pages.ice"),
-    include_str!("ui/screens/roster.ice"),
-    include_str!("ui/screens/settings.ice"),
-    include_str!("ui/screens/storage.ice"),
-);
+static SCREENS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    inlined(concat!(
+        include_str!("ui/screens/chat.ice"),
+        include_str!("ui/screens/forge.ice"),
+        include_str!("ui/screens/governance.ice"),
+        include_str!("ui/screens/overlays.ice"),
+        include_str!("ui/screens/pages.ice"),
+        include_str!("ui/screens/roster.ice"),
+        include_str!("ui/screens/settings.ice"),
+        include_str!("ui/screens/storage.ice"),
+    ))
+});
+
+/// Fold `with` blocks back onto their node line, so the source sweeps keep
+/// pinning a node and its props as ONE readable line no matter how
+/// `cargo ice fmt` wrapped it — and so `!contains` sweeps stay falsifiable
+/// instead of passing vacuously against wrapped text. Props keep source
+/// order; a trailing `-> route` stays last.
+fn inlined(source: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut lines = source.lines().peekable();
+    while let Some(line) = lines.next() {
+        let indent = line.len() - line.trim_start().len();
+        if line.trim() == "with" && !out.is_empty() {
+            let mut props = Vec::new();
+            while let Some(next) = lines.peek() {
+                let deeper = next.len() - next.trim_start().len() > indent;
+                if next.trim().is_empty() || !deeper {
+                    break;
+                }
+                props.push(next.trim().to_owned());
+                lines.next();
+            }
+            let node = out.pop().expect("with follows its node line");
+            let props = props.join(" ");
+            out.push(match node.split_once(" -> ") {
+                Some((head, route)) => format!("{head} {props} -> {route}"),
+                None => format!("{node} {props}"),
+            });
+            continue;
+        }
+        out.push(line.to_owned());
+    }
+    out.join("\n")
+}
 
 fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
     backend::ChatMessage {
@@ -85,7 +120,7 @@ fn full_view_fits_a_four_mib_stack() {
 fn default_ice_color(name: &str) -> iced::Color {
     // 2.0 allows ONE theme contract and one palette, so the kit's theme moved
     // out of the vendored copy into the app's own file.
-    let source = include_str!("ui/theme.ice");
+    let source = inlined(include_str!("ui/theme.ice"));
     let value = source
         .lines()
         .find_map(|line| {
@@ -281,12 +316,12 @@ fn assert_no_polling(lifecycle: &str) {
 fn forge_depth_rides_the_established_seams() {
     // the forge handlers moved out of lifecycle.ice into their own file;
     // the seams they guard did not, so the guard reads both.
-    let lifecycle = concat!(
+    let lifecycle = inlined(concat!(
         include_str!("ui/handlers/lifecycle.ice"),
         include_str!("ui/handlers/forge.ice"),
-    );
-    let forge = include_str!("ui/components/forge.ice");
-    let backend = include_str!("ui/extern/backend.ice");
+    ));
+    let forge = inlined(include_str!("ui/components/forge.ice"));
+    let backend = inlined(include_str!("ui/extern/backend.ice"));
 
     // the item discussion IS a chat surface: hydrated through the chat
     // lanes and spliced by the SAME fold the chat pane uses, scoped to
@@ -317,12 +352,12 @@ fn forge_depth_rides_the_established_seams() {
     assert!(lifecycle.contains(
         "run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, forge_generation)"
     ));
-    assert_no_polling(lifecycle);
+    assert_no_polling(&lifecycle);
 
     // approvals stay advisory in the merge box — `MergeAdvisory` is the
     // ONLY thing said above the merge button, and it recommends, never
     // refuses. The merged state renders the CAS'd commit.
-    let forge_screen = include_str!("ui/screens/forge.ice");
+    let forge_screen = inlined(include_str!("ui/screens/forge.ice"));
     assert!(forge_screen.contains("MergeAdvisory change_requests=forge_item_change_requests"));
     assert_eq!(forge.matches("merge not recommended").count(), 2);
     // MergeAdvisory owns the count: no OTHER predicate may branch on it.
@@ -340,9 +375,9 @@ fn forge_depth_rides_the_established_seams() {
 
 #[test]
 fn background_refresh_preserves_editing_state() {
-    let root = include_str!("ui/app.ice");
-    let view = include_str!("ui/view.ice");
-    let lifecycle = include_str!("ui/handlers/lifecycle.ice");
+    let root = inlined(include_str!("ui/app.ice"));
+    let view = inlined(include_str!("ui/view.ice"));
+    let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
     assert!(!view.contains("sync_phase"));
     assert!(root.contains("use \"view.ice\""));
     assert!(!lifecycle.contains("on refresh_now"));
@@ -351,7 +386,7 @@ fn background_refresh_preserves_editing_state() {
     // the one legitimate refresh affordance.
     let before_explorer = view
         .split_once("    explorer:")
-        .map_or(view, |(head, _)| head);
+        .map_or(view.as_str(), |(head, _)| head);
     assert!(!before_explorer.contains("button \"Refresh\""));
 
     let refresh = lifecycle
@@ -390,7 +425,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     assert!(refresh.contains("selected_message_seq = refreshed_required_message_seq("));
     assert!(refresh.contains("failed_message_draft = remember_failed_draft("));
     assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
-    assert_no_polling(lifecycle);
+    assert_no_polling(&lifecycle);
     assert!(lifecycle.contains("run live_resync_load(connected_rpc"));
     assert!(lifecycle.contains("run refresh_live_thread(connected_rpc"));
     assert!(lifecycle.contains("parallel\n    run refresh_live_thread("));
@@ -408,7 +443,8 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     ));
     // the live comment-list callback settles state and stops — re-entering
     // the resync from inside it would loop the rail against the page.
-    let comment_callbacks = include_str!("ui/handlers/pages.ice")
+    let pages_handlers = inlined(include_str!("ui/handlers/pages.ice"));
+    let comment_callbacks = pages_handlers
         .split_once("on block_threads_loaded(next)\n")
         .unwrap()
         .1
@@ -420,7 +456,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
 
 #[test]
 fn context_destroying_page_handlers_recover_drafts() {
-    let pages = include_str!("ui/handlers/pages.ice");
+    let pages = inlined(include_str!("ui/handlers/pages.ice"));
     // The page BODY is no longer among the drafts to rescue: it is one buffer
     // that flushes to the node on its own tick and is reinstalled from the
     // node's text on the next load. A half-typed COMMENT still has nowhere
@@ -828,7 +864,7 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
     assert_eq!(app.messages[1].id, second_id);
     assert!(app.messages[1].pending);
 
-    let chat = include_str!("ui/screens/chat.ice");
+    let chat = inlined(include_str!("ui/screens/chat.ice"));
     assert!(chat.contains("stack #message(message.id) w=fill"));
     assert!(!chat.contains("#message(message.seq)"));
 }
@@ -853,7 +889,7 @@ fn history_windows_offer_a_jump_back_to_latest() {
     )));
     assert!(!app.history_view);
 
-    let chat = include_str!("ui/screens/chat.ice");
+    let chat = inlined(include_str!("ui/screens/chat.ice"));
     assert!(chat.contains("button \"Jump to latest\""));
     assert!(chat.contains("-> emit(choose_channel, active_channel)"));
 }
@@ -890,7 +926,7 @@ fn message_actions_require_explicit_intent() {
 
 #[test]
 fn message_action_toolbar_stays_compact_and_accessible() {
-    let components = include_str!("ui/components/chat.ice");
+    let components = inlined(include_str!("ui/components/chat.ice"));
     let toolbar = components
         .split_once("component MessageCard")
         .unwrap()
@@ -927,8 +963,8 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         "if message.show_author\n        MessageAvatar initials=message.initial kind=message.avatar_kind"
     ));
     assert!(components.contains("if !message.show_author\n        space w=30.0"));
-    assert!(components.contains("\"human\"\n        PersonAvatar initials=initials plate=30.0 ink=11.0"));
-    assert!(components.contains("\"agent\"\n        AgentAvatar initials=initials plate=30.0 ink=11.0"));
+    assert!(components.contains("\"human\"\n        PersonAvatar initials plate=30.0 ink=11.0"));
+    assert!(components.contains("\"agent\"\n        AgentAvatar initials plate=30.0 ink=11.0"));
     assert!(!components.contains("avatar_style"));
     // Rich bodies render structured blocks, not one flattened string.
     assert!(components.contains("for block in message.blocks"));
@@ -948,7 +984,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         "button label=\"Open thread\" disabled=disabled p=5.0 @icon_action -> emit(open_thread_for, message.seq)"
     ));
 
-    let chat = include_str!("ui/screens/chat.ice");
+    let chat = inlined(include_str!("ui/screens/chat.ice"));
     assert!(
         chat.contains("overlay when=(selected_message_seq > 0 && message_action != \"toolbar\")")
     );
@@ -1018,7 +1054,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     // dismisses it (see `reactions_run_outside_the_mutation_lock`).
     assert!(!picker.contains("mutation_phase"));
 
-    let handlers = include_str!("ui/handlers/chat.ice");
+    let handlers = inlined(include_str!("ui/handlers/chat.ice"));
     for focus in [
         "#workspace-tabs/content/chat/message-action-focus",
         "#workspace-tabs/content/chat/message-reaction-focus",
@@ -1034,7 +1070,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         assert!(chat.contains(&format!("input \"\" {focus}")));
     }
     assert_eq!(handlers.matches("task widget focus-next").count(), 6);
-    assert!(!include_str!("ui/extern/backend.ice").contains("task focus_next()"));
+    assert!(!inlined(include_str!("ui/extern/backend.ice")).contains("task focus_next()"));
     let activate = handlers
         .split_once("on begin_message_edit(seq, body, rev)\n")
         .unwrap()
@@ -1047,7 +1083,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
 
 #[test]
 fn thread_messages_mirror_the_main_action_system() {
-    let components = include_str!("ui/components/chat.ice");
+    let components = inlined(include_str!("ui/components/chat.ice"));
     let card = components
         .split_once("component ThreadMessageCard")
         .unwrap()
@@ -1059,7 +1095,9 @@ fn thread_messages_mirror_the_main_action_system() {
         )
     );
     assert!(
-        card.contains("-> emit(open_thread_message_actions, message.seq, message.body, message.rev)")
+        card.contains(
+            "-> emit(open_thread_message_actions, message.seq, message.body, message.rev)"
+        )
     );
     assert!(card.contains(
         "-> emit(open_thread_message_reactions, message.seq, message.body, message.rev)"
@@ -1078,7 +1116,8 @@ fn thread_messages_mirror_the_main_action_system() {
     // reply carries no replies, so the pill never renders here.
     assert!(!card.contains("label=\"Open thread\""));
 
-    let thread = include_str!("ui/screens/chat.ice")
+    let chat_screen = inlined(include_str!("ui/screens/chat.ice"));
+    let thread = chat_screen
         .split_once("if active_thread_seq > 0 && !channel_settings_open")
         .unwrap()
         .1;
@@ -1090,9 +1129,7 @@ fn thread_messages_mirror_the_main_action_system() {
     assert!(thread.contains("float x=0.0 y=thread_menu_y"));
     assert!(thread.contains("mouse press-at=emit(thread_pointer_pressed, _, _)"));
     // same seat as the message list — the rail measures itself
-    assert!(
-        thread.contains("sensor show=emit(thread_resized, _, _)")
-    );
+    assert!(thread.contains("sensor show=emit(thread_resized, _, _)"));
     // The picker is the shared ADD grid targeting the thread selection;
     // removal rides the reply's own reaction chips.
     assert!(thread.contains("for emoji in reaction_palette()"));
@@ -1124,7 +1161,7 @@ fn thread_messages_mirror_the_main_action_system() {
     assert!(!more.contains("Reply in thread"));
     assert!(!more.contains("button \"Close\""));
 
-    let handlers = include_str!("ui/handlers/chat.ice");
+    let handlers = inlined(include_str!("ui/handlers/chat.ice"));
     for name in [
         "on open_thread_message_actions(seq, body, rev)",
         "on open_thread_message_reactions(seq, body, rev)",
@@ -1313,9 +1350,7 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.huddle_joined = true;
     app.huddle_channel = "chan-a".into();
 
-    let _ = app.__update(__DucktapeMessage::ConsoleOpened(
-        iced::window::Id::unique(),
-    ));
+    let _ = app.__update(__DucktapeMessage::ConsoleOpened(iced::window::Id::unique()));
 
     assert_eq!(app.connected_rpc, "http://node-b");
     assert_eq!(app.password, "device-key-password");
@@ -1395,9 +1430,9 @@ fn same_endpoint_reconnect_preserves_unsent_drafts() {
 
 #[test]
 fn the_page_surface_is_one_editor_with_no_click_to_edit_left() {
-    let components = include_str!("ui/components/pages.ice");
-    let handlers = include_str!("ui/handlers/pages.ice");
-    let view = include_str!("ui/screens/pages.ice");
+    let components = inlined(include_str!("ui/components/pages.ice"));
+    let handlers = inlined(include_str!("ui/handlers/pages.ice"));
+    let view = inlined(include_str!("ui/screens/pages.ice"));
 
     // THE TITLE IS LINE 0 OF THE BUFFER, not a control. The click-to-edit
     // title editor is gone the same way the click-to-edit blocks are; these
@@ -1406,7 +1441,7 @@ fn the_page_surface_is_one_editor_with_no_click_to_edit_left() {
     assert!(!components.contains("task widget focus #title-input"));
     assert!(!components.contains("defer_focus"));
     assert!(!handlers.contains("focus_page_title"));
-    assert!(!include_str!("ui/extern/backend.ice").contains("defer_focus"));
+    assert!(!inlined(include_str!("ui/extern/backend.ice")).contains("defer_focus"));
     // THE CANVAS HAS NO MENUS LEFT TO PLACE. The block-actions popover, its
     // pointer tracking and the insert row's type dropdown are gone with the
     // click-to-edit model — a page is one editor, and `# ` is the block-type
@@ -1429,7 +1464,7 @@ fn the_page_surface_is_one_editor_with_no_click_to_edit_left() {
 
 #[test]
 fn shell_uses_canonical_glass_and_opaque_content() {
-    let ui = concat!(
+    let ui = inlined(concat!(
         include_str!("ui/app.ice"),
         include_str!("ui/extern/backend.ice"),
         include_str!("ui/state.ice"),
@@ -1452,7 +1487,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         include_str!("ui/handlers/lifecycle.ice"),
         include_str!("ui/handlers/chat.ice"),
         include_str!("ui/handlers/pages.ice"),
-    );
+    ));
     for gradient in ["linear(", "radial(", "conic("] {
         assert!(!ui.contains(gradient), "{gradient}");
         assert!(!SCREENS.contains(gradient), "{gradient}");
@@ -1460,7 +1495,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     // The window is opaque. iced has no backdrop blur, so the chrome paints
     // the artifact's own non-glass ladder — desk/rail/sidebar/content — and
     // never a translucent tint that would composite over the desktop.
-    let app = include_str!("ui/app.ice");
+    let app = inlined(include_str!("ui/app.ice"));
     assert!(!app.contains("\n    transparent true"));
     assert!(!app.contains("\n    blur true"));
     assert!(app.contains("\n  bg app_background"));
@@ -1474,7 +1509,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
 
     // The palette moved with the theme: 2.0 permits one contract and one
     // palette, and the vendored kit copy no longer carries either.
-    let defaults = include_str!("ui/theme.ice");
+    let defaults = inlined(include_str!("ui/theme.ice"));
     for material in [
         "bg         #fdfdfb",
         "surface    #ffffff",
@@ -1492,7 +1527,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     ] {
         assert!(defaults.contains(material), "{material}");
     }
-    let theme = include_str!("ui/theme.ice");
+    let theme = inlined(include_str!("ui/theme.ice"));
     assert!(theme.contains("font ui family=\"Geist\" weight=normal"));
     assert!(theme.contains("font display family=\"Geist\" weight=semibold"));
     assert!(theme.contains("font strong family=\"Geist\" weight=bold"));
@@ -1519,7 +1554,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         assert!(theme.contains(app_token), "{app_token}");
     }
 
-    let shell = include_str!("ui/components/shell.ice");
+    let shell = inlined(include_str!("ui/components/shell.ice"));
     // the shell is titlebar + optional degradation banner over the panes.
     assert!(shell.contains(
         "component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)"
@@ -1544,9 +1579,9 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     // their STATE MIRRORS (`network_name`, `has_older_history`) instead. If
     // either name returns to a view or screen file, the per-frame tax is back.
     assert!(!SCREENS.contains("network_label("));
-    assert!(!include_str!("ui/view.ice").contains("network_label("));
+    assert!(!inlined(include_str!("ui/view.ice")).contains("network_label("));
     assert!(!SCREENS.contains("history_has_older("));
-    assert!(!include_str!("ui/view.ice").contains("history_has_older("));
+    assert!(!inlined(include_str!("ui/view.ice")).contains("history_has_older("));
     assert!(bar.contains("box pr=13.0\n              StatusCard "));
     assert!(shell.contains(
         "box #root w=284.0 pl=14.0 pr=14.0 pt=13.0 pb=13.0 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0"
@@ -1558,7 +1593,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     // owns which network; Settings keeps only Reconnect / Switch network.
     assert!(!SCREENS.contains("#rpc"));
     assert!(SCREENS.contains("emit(switch_network)"));
-    assert!(SCREENS.contains("input \"\" #key-password label=\"Key password\""));
+    assert!(SCREENS.contains("input \"\" #key-password <-> key_pw label=\"Key password\""));
     assert!(SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"));
     // Both chat composers wear the SAME plate now — the rail dropped its old
     // transparent fg/12 frame for the stream's surface/control_line/r12 chrome.
@@ -1570,12 +1605,13 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     );
     // the palette card moved into the overlay layer with the rest of the
     // window-level surfaces; the assertion follows the code it guards.
-    let overlays = include_str!("ui/screens/overlays.ice");
+    let overlays = inlined(include_str!("ui/screens/overlays.ice"));
     assert!(overlays.contains(
         "bg=surface border=border border-w=1.0 r=14.0 shadow=shadow_modal shadow-y=24.0 shadow-blur=60.0"
     ));
 
-    for authored in [shell, include_str!("ui/components/pages.ice"), SCREENS] {
+    let authored_pages = inlined(include_str!("ui/components/pages.ice"));
+    for authored in [&shell, &authored_pages, &*SCREENS] {
         assert!(!authored.contains("shadow=black/"));
         assert!(!authored.contains("shadow=shadow "));
     }
@@ -1588,7 +1624,9 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     // (min_h, max_h, pad); type scale (13.5/1.3) is owned by the adapter.
     // Both chat composers share one plate; the forge note runs compact.
     assert_eq!(
-        SCREENS.matches(", shift_held, 44.0, 150.0, 10.0) #").count(),
+        SCREENS
+            .matches(", shift_held, 44.0, 150.0, 10.0) #")
+            .count(),
         2
     );
     assert!(SCREENS.contains(", shift_held, 38.0, 120.0, 6.0) #forge-note"));
@@ -1611,11 +1649,11 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
         assert!(!line.contains(" h="), "{line}");
     }
 
-    let components = concat!(
+    let components = inlined(concat!(
         include_str!("ui/components/shell.ice"),
         include_str!("ui/components/chat.ice"),
         include_str!("ui/components/pages.ice"),
-    );
+    ));
     // the pane header is ONE geometry: a 50px plate holding a `gap=9.0`
     // centered row. Chat and pages both draw it, from their screens — the
     // components carry the pane bodies, never a second header shape.
@@ -1701,17 +1739,17 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         }
     }
 
-    let view = include_str!("ui/view.ice");
-    let shell = include_str!("ui/components/shell.ice");
-    let chat = include_str!("ui/components/chat.ice");
-    let pages = include_str!("ui/components/pages.ice");
-    let kit = include_str!("ui/components/kit.ice");
-    let forge = include_str!("ui/components/forge.ice");
+    let view = inlined(include_str!("ui/view.ice"));
+    let shell = inlined(include_str!("ui/components/shell.ice"));
+    let chat = inlined(include_str!("ui/components/chat.ice"));
+    let pages = inlined(include_str!("ui/components/pages.ice"));
+    let kit = inlined(include_str!("ui/components/kit.ice"));
+    let forge = inlined(include_str!("ui/components/forge.ice"));
 
-    assert_recipe_owns_states("screens", SCREENS, "@primary_action");
-    assert_recipe_owns_states("screens", SCREENS, "@danger_action");
-    assert_recipe_owns_states("chat.ice", chat, "@danger_action");
-    assert_recipe_owns_states("pages.ice", pages, "@danger_action");
+    assert_recipe_owns_states("screens", &SCREENS, "@primary_action");
+    assert_recipe_owns_states("screens", &SCREENS, "@danger_action");
+    assert_recipe_owns_states("chat.ice", &chat, "@danger_action");
+    assert_recipe_owns_states("pages.ice", &pages, "@danger_action");
     assert!(!SCREENS.contains("active bg=brand text=fg"));
     assert!(!SCREENS.contains("hovered bg=brand/10"));
     assert!(!SCREENS.contains("hovered bg=brand/12"));
@@ -1737,9 +1775,7 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     assert!(
         SCREENS.contains("KeyValueRow label=\"Key state\" value=settings_key_state last=false")
     );
-    assert!(
-        SCREENS.contains("KeyValueRow label=\"Key path\" value=settings_key_path last=false")
-    );
+    assert!(SCREENS.contains("KeyValueRow label=\"Key path\" value=settings_key_path last=false"));
 
     for target in [
         "rename_channel_submit",
@@ -1749,9 +1785,10 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         "gov_execute",
         "account_rename_submit",
     ] {
+        let kit_components = inlined(include_str!("ui/components/kit.ice"));
         let action = SCREENS
             .lines()
-            .chain(include_str!("ui/components/kit.ice").lines())
+            .chain(kit_components.lines())
             .find(|line| line.trim_start().starts_with("button ") && line.contains(target))
             .unwrap_or_else(|| panic!("missing action target {target}"));
         assert!(action.contains("@secondary_action"), "{action}");
@@ -1759,8 +1796,8 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     // A divider is `---` typed into the document now, not a button.
     assert!(!SCREENS.contains("Insert divider"));
 
-    assert_controls_inherit_focus("screens", SCREENS);
-    assert_controls_inherit_focus("pages.ice", pages);
+    assert_controls_inherit_focus("screens", &SCREENS);
+    assert_controls_inherit_focus("pages.ice", &pages);
     // The three composer editors carried ad-hoc `focused border=ring`
     // status blocks; their focus ring now lives in the rich composer
     // adapter (`editor::composer_style`). One authored site remains.
@@ -1817,7 +1854,7 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     // the semantic status plate is the kit's, so every screen that reports
     // a good outcome paints the same three tokens.
     assert!(kit.contains("bg=success_bg border=success_line border-w=1.0"));
-    for source in [view, shell, chat, pages, kit, forge, SCREENS] {
+    for source in [&view, &shell, &chat, &pages, &kit, &forge, &*SCREENS] {
         assert!(!source.contains("bg=success/"));
         assert!(!source.contains("border=success/"));
     }
@@ -1828,27 +1865,51 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
 #[test]
 fn ice_sources_hold_to_the_design_system() {
     let sources = [
-        ("view.ice", include_str!("ui/view.ice")),
-        ("chat.ice", include_str!("ui/components/chat.ice")),
-        ("dm.ice", include_str!("ui/components/dm.ice")),
-        ("files.ice", include_str!("ui/components/files.ice")),
-        ("forge.ice", include_str!("ui/components/forge.ice")),
-        ("huddle.ice", include_str!("ui/components/huddle.ice")),
-        ("icon.ice", include_str!("ui/components/icon.ice")),
-        ("kit.ice", include_str!("ui/components/kit.ice")),
-        ("node.ice", include_str!("ui/components/node.ice")),
+        ("view.ice", inlined(include_str!("ui/view.ice"))),
+        ("chat.ice", inlined(include_str!("ui/components/chat.ice"))),
+        ("dm.ice", inlined(include_str!("ui/components/dm.ice"))),
+        (
+            "files.ice",
+            inlined(include_str!("ui/components/files.ice")),
+        ),
+        (
+            "forge.ice",
+            inlined(include_str!("ui/components/forge.ice")),
+        ),
+        (
+            "huddle.ice",
+            inlined(include_str!("ui/components/huddle.ice")),
+        ),
+        ("icon.ice", inlined(include_str!("ui/components/icon.ice"))),
+        ("kit.ice", inlined(include_str!("ui/components/kit.ice"))),
+        ("node.ice", inlined(include_str!("ui/components/node.ice"))),
         (
             "onboarding.ice",
-            include_str!("ui/components/onboarding.ice"),
+            inlined(include_str!("ui/components/onboarding.ice")),
         ),
-        ("overlay.ice", include_str!("ui/components/overlay.ice")),
-        ("pages.ice", include_str!("ui/components/pages.ice")),
-        ("patterns.ice", include_str!("ui/components/patterns.ice")),
-        ("roster.ice", include_str!("ui/components/roster.ice")),
-        ("shell.ice", include_str!("ui/components/shell.ice")),
+        (
+            "overlay.ice",
+            inlined(include_str!("ui/components/overlay.ice")),
+        ),
+        (
+            "pages.ice",
+            inlined(include_str!("ui/components/pages.ice")),
+        ),
+        (
+            "patterns.ice",
+            inlined(include_str!("ui/components/patterns.ice")),
+        ),
+        (
+            "roster.ice",
+            inlined(include_str!("ui/components/roster.ice")),
+        ),
+        (
+            "shell.ice",
+            inlined(include_str!("ui/components/shell.ice")),
+        ),
         // the screens carry the console's authored type scale now that
         // view.ice holds only the mounts.
-        ("screens", SCREENS),
+        ("screens", SCREENS.clone()),
     ];
     for (name, source) in sources {
         for line in source.lines() {
@@ -1880,10 +1941,10 @@ fn ice_sources_hold_to_the_design_system() {
 
     // the font identity: theme roles bind to the design crate's families,
     // and the app embeds exactly the crate's font assets.
-    let theme = include_str!("ui/theme.ice");
+    let theme = inlined(include_str!("ui/theme.ice"));
     assert!(theme.contains(&format!("family=\"{}\"", design::fonts::FAMILY_UI)));
     assert!(theme.contains(&format!("family=\"{}\"", design::fonts::FAMILY_MONO)));
-    let app = include_str!("ui/app.ice");
+    let app = inlined(include_str!("ui/app.ice"));
     for asset in design::fonts::ASSETS {
         assert!(
             app.contains(&format!("font \"../../../crates/design/{asset}\"")),
@@ -2005,7 +2066,7 @@ fn every_status_fill_carries_a_readable_foreground_in_both_themes() {
 #[test]
 fn block_comments_dock_a_rail_beside_the_document() {
     // the pages screen is its own file now, so the slot slicing is gone.
-    let pages = include_str!("ui/screens/pages.ice");
+    let pages = inlined(include_str!("ui/screens/pages.ice"));
     // the rail is a sibling of the document, separated by the same 1px rule
     // every other docked column uses — never an overlay layer.
     let rail = pages
@@ -2029,10 +2090,10 @@ fn block_comments_dock_a_rail_beside_the_document() {
     // a per-block menu — the rail was always page-scoped.
     assert!(pages.contains("button label=\"Comments\""));
     assert!(pages.contains("-> emit(toggle_block_comments)"));
-    let components = include_str!("ui/components/pages.ice");
+    let components = inlined(include_str!("ui/components/pages.ice"));
     assert!(!components.contains("component BlockActionsMenu"));
 
-    let handlers = include_str!("ui/handlers/pages.ice");
+    let handlers = inlined(include_str!("ui/handlers/pages.ice"));
     assert!(handlers.contains("on post_block_comment_submit"));
     // A NEW comment anchors on the CARET's block (the thread's own target on
     // a reply) — never blindly on the page.
@@ -2724,7 +2785,7 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
 fn unread_indicators_are_wired_client_local_only() {
     // Sidebar badge: ChannelButton takes an `unread` flag and paints the
     // brand treatment + dot when set.
-    let components = include_str!("ui/components/chat.ice");
+    let components = inlined(include_str!("ui/components/chat.ice"));
     assert!(
         components
             .contains("component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)")
@@ -2734,9 +2795,9 @@ fn unread_indicators_are_wired_client_local_only() {
         "if unread\n                text channel.name w=fill size=13.0 wrap=none font=medium @text-fg"
     ));
 
-    let screen = include_str!("ui/screens/chat.ice");
+    let screen = inlined(include_str!("ui/screens/chat.ice"));
     assert!(screen.contains(
-        "ChannelButton channel=channel selected=(channel.id == active_channel) unread=channel_is_unread(channel_reads, channel.id, channel.head_seq)"
+        "ChannelButton channel selected=(channel.id == active_channel) unread=channel_is_unread(channel_reads, channel.id, channel.head_seq)"
     ));
     // In-channel divider anchored on the first message past the frozen
     // boundary. The seq is a STATE FIELD recomputed where messages or the
@@ -2748,13 +2809,13 @@ fn unread_indicators_are_wired_client_local_only() {
     assert!(screen.contains("text \"New messages\" size=12.5 wrap=none @text-brand"));
 
     // Freeze happens on a real channel change; connect seeds caught-up.
-    let lifecycle = include_str!("ui/handlers/lifecycle.ice");
+    let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
     assert!(
         lifecycle.contains("channel_reads = initial_channel_reads(next.channels, channel_reads)")
     );
     // navigation loads freeze on the real channel change (chat.ice);
     // the resync path freezes against the possibly-unchanged channel.
-    let chat = include_str!("ui/handlers/chat.ice");
+    let chat = inlined(include_str!("ui/handlers/chat.ice"));
     assert!(chat.contains(
         "unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)"
     ));
@@ -2769,7 +2830,7 @@ fn unread_indicators_are_wired_client_local_only() {
     ));
 
     // Client-local only: no wire read-cursor leaked into the module surface.
-    let backend_ice = include_str!("ui/extern/backend.ice");
+    let backend_ice = inlined(include_str!("ui/extern/backend.ice"));
     assert!(!backend_ice.contains("read_cursor"));
     assert!(!backend_ice.contains("mark_read(rpc"));
 }

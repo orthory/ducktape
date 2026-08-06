@@ -5,10 +5,23 @@ component GovernanceScreen(rows:[ProposalRow], voting:str, admin:bool, answered:
   emits
     gov_vote(str, bool)
     gov_execute(str)
-  scroll dir=vertical w=fill h=fill
-    col w=fill p=22.0 gap=16.0
+  scroll
+    with
+      dir=vertical
+      w=fill
+      h=fill
+    col
+      with
+        w=fill
+        p=22.0
+        gap=16.0
       row gap=9.0 align=center
-        text "Approvals" size=16.0 wrap=none font=display @text-primary
+        text "Approvals"
+          with
+            size=16.0
+            wrap=none
+            font=display
+            @text-primary
         // The chip counts what is WAITING. Finalized rows have their own
         // section below and are never folded into this number.
         if open_proposals(rows) > 0
@@ -16,7 +29,10 @@ component GovernanceScreen(rows:[ProposalRow], voting:str, admin:bool, answered:
       // The artifact bands the screen when the reader cannot vote. Its words
       // are ADMIN/MAINTAINER; ours are the tiers this chain actually grants.
       if !admin
-        GateNote reason="Approval votes are cast by this network's validators, and this node does not hold validator standing." next="You can still read every proposal and follow its tally while it runs."
+        GateNote
+          with
+            reason="Approval votes are cast by this network's validators, and this node does not hold validator standing."
+            next="You can still read every proposal and follow its tally while it runs."
       // Empty means nothing OPEN. A workspace whose every decision settled
       // still gets the plate, not a silent screen.
       if open_proposals(rows) <= 0 && answered

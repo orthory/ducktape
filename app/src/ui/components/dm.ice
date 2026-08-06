@@ -16,35 +16,91 @@
 component DmButton(peer:DmPeer, selected:bool)
   emits
     choose_dm(str)
-  box #root w=fill pl=8.0 pr=8.0
+  box #root
+    with
+      w=fill
+      pl=8.0
+      pr=8.0
     col w=fill
       if selected
-        button label=peer.name w=fill p=0.0 @icon_action -> emit(choose_dm, peer.key)
-          box w=fill pl=10.0 pr=10.0 pt=6.0 pb=6.0
+        button -> emit(choose_dm, peer.key)
+          with
+            label=peer.name
+            w=fill
+            p=0.0
+            @icon_action
+          box
+            with
+              w=fill
+              pl=10.0
+              pr=10.0
+              pt=6.0
+              pb=6.0
             DmRow peer=peer selected=true
           active bg=subtle text=fg border=transparent border-w=1.0 r=7.0
           hovered bg=subtle text=fg
           pressed bg=rail_hover text=fg
       if !selected
-        button label=peer.name w=fill p=0.0 @icon_action -> emit(choose_dm, peer.key)
-          box w=fill pl=10.0 pr=10.0 pt=6.0 pb=6.0
+        button -> emit(choose_dm, peer.key)
+          with
+            label=peer.name
+            w=fill
+            p=0.0
+            @icon_action
+          box
+            with
+              w=fill
+              pl=10.0
+              pr=10.0
+              pt=6.0
+              pb=6.0
             DmRow peer=peer selected=false
           active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
           hovered bg=rail_hover text=fg
           pressed bg=subtle text=fg
 
 component DmRow(peer:DmPeer, selected:bool)
-  row #root w=fill gap=8.0 align=center
-    PrincipalAvatar initials=peer.initials is_agent=peer.is_agent plate=18.0 ink=8.0 ring=""
+  row #root
+    with
+      w=fill
+      gap=8.0
+      align=center
+    PrincipalAvatar
+      with
+        initials=peer.initials
+        is_agent=peer.is_agent
+        plate=18.0
+        ink=8.0
+        ring=""
     if selected
-      text peer.name w=fill size=13.0 wrap=none @text-fg
+      text peer.name
+        with
+          w=fill
+          size=13.0
+          wrap=none
+          @text-fg
     if !selected
-      text peer.name w=fill size=13.0 wrap=none @text-muted
+      text peer.name
+        with
+          w=fill
+          size=13.0
+          wrap=none
+          @text-muted
     if peer.is_agent
       // NOT the AGENT badge: that one is ink-on-white at 9px. This is the
       // hairline-grey chip the artifact reserves for the sidebar.
-      box px=4.0 py=1.0 bg=label r=3.0
-        text "AI" size=9.0 wrap=none font=code_semibold @text-primary_fg
+      box
+        with
+          px=4.0
+          py=1.0
+          bg=label
+          r=3.0
+        text "AI"
+          with
+            size=9.0
+            wrap=none
+            font=code_semibold
+            @text-primary_fg
 
 // The chat header's DM identity — a 24px peer plate and the peer's name, in
 // place of the `# channel` title. The AGENT badge marks a machine peer.
@@ -66,8 +122,29 @@ component DmRow(peer:DmPeer, selected:bool)
 // the derived two-party name. An empty plate is never the render.
 component DmHeader(peer:DmPeer)
   row #root gap=9.0 align=center
-    PrincipalAvatar initials=peer.initials is_agent=peer.is_agent plate=24.0 ink=9.0 ring=""
-    text peer.name size=14.0 wrap=none font=display @text-fg
+    PrincipalAvatar
+      with
+        initials=peer.initials
+        is_agent=peer.is_agent
+        plate=24.0
+        ink=9.0
+        ring=""
+    text peer.name
+      with
+        size=14.0
+        wrap=none
+        font=display
+        @text-fg
     if peer.is_agent
-      box px=5.0 py=2.0 bg=primary r=4.0
-        text "AGENT" size=9.0 wrap=none font=code_semibold @text-primary_fg
+      box
+        with
+          px=5.0
+          py=2.0
+          bg=primary
+          r=4.0
+        text "AGENT"
+          with
+            size=9.0
+            wrap=none
+            font=code_semibold
+            @text-primary_fg

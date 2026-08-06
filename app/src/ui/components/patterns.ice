@@ -15,29 +15,83 @@
 // as a normal message, not a restyled one.
 component FinalityChip(height:i64)
   col #root
-    box px=7.0 py=2.0 bg=final_bg border=final_line border-w=1.0 r=5.0
+    box
+      with
+        px=7.0
+        py=2.0
+        bg=final_bg
+        border=final_line
+        border-w=1.0
+        r=5.0
       row gap=4.0 align=center
-        text "✓ finalized" size=9.0 wrap=none font=code_semibold @text-success_tick
+        text "✓ finalized"
+          with
+            size=9.0
+            wrap=none
+            font=code_semibold
+            @text-success_tick
         if height > 0
-          text "·" size=9.0 wrap=none font=code_semibold @text-success_tick
+          text "·"
+            with
+              size=9.0
+              wrap=none
+              font=code_semibold
+              @text-success_tick
         if height > 0
-          text "h" size=9.0 wrap=none font=code_semibold @text-success_tick
+          text "h"
+            with
+              size=9.0
+              wrap=none
+              font=code_semibold
+              @text-success_tick
         if height > 0
-          text height size=9.0 wrap=none font=code_semibold @text-success_tick
+          text height
+            with
+              size=9.0
+              wrap=none
+              font=code_semibold
+              @text-success_tick
 
 // PERMISSION GATING SHOWS ITS REASON. Never hide a control and never disable
 // one silently: say why it is refused and what unlocks it. `reason` is the
 // refusal, `next` is the move that clears it.
 component GateNote(reason:str, next:str)
-  box #root w=fill px=13.0 py=11.0 bg=warning_bg_lit border=warning_line border-w=1.0 r=9.0
-    row w=fill gap=8.0 align=start
+  box #root
+    with
+      w=fill
+      px=13.0
+      py=11.0
+      bg=warning_bg_lit
+      border=warning_line
+      border-w=1.0
+      r=9.0
+    row
+      with
+        w=fill
+        gap=8.0
+        align=start
       col pt=4.0
-        box w=6.0 h=6.0 bg=warning_dot r=3.0
+        box
+          with
+            w=6.0
+            h=6.0
+            bg=warning_dot
+            r=3.0
           space w=1.0 h=1.0
       col w=fill gap=2.0
-        text reason w=fill size=12.0 line-h=1.45 @text-warning
+        text reason
+          with
+            w=fill
+            size=12.0
+            line-h=1.45
+            @text-warning
         if next != ""
-          text next w=fill size=12.0 line-h=1.45 @text-caption
+          text next
+            with
+              w=fill
+              size=12.0
+              line-h=1.45
+              @text-caption
 
 // HUMAN VS AGENT IS A SHAPE, EVERYWHERE. A person is a circle, a machine is a
 // rounded square. The rule is never mixed and never carried by colour alone.
@@ -47,31 +101,86 @@ component PrincipalAvatar(initials:str, is_agent:bool, plate:f64, ink:f64, ring:
   col #root
     match ring
       "paper"
-        box p=1.5 bg=surface r=(plate / 2.0 + 1.5)
-          PrincipalPlate initials=initials is_agent=is_agent plate=plate ink=ink
+        box
+          with
+            p=1.5
+            bg=surface
+            r=(plate / 2.0 + 1.5)
+          PrincipalPlate
+            with
+              initials
+              is_agent
+              plate
+              ink
       "rail"
-        box p=1.5 bg=rail r=(plate / 2.0 + 1.5)
-          PrincipalPlate initials=initials is_agent=is_agent plate=plate ink=ink
+        box
+          with
+            p=1.5
+            bg=rail
+            r=(plate / 2.0 + 1.5)
+          PrincipalPlate
+            with
+              initials
+              is_agent
+              plate
+              ink
       _
-        PrincipalPlate initials=initials is_agent=is_agent plate=plate ink=ink
+        PrincipalPlate
+          with
+            initials
+            is_agent
+            plate
+            ink
 
 component PrincipalPlate(initials:str, is_agent:bool, plate:f64, ink:f64)
   col #root
     if is_agent
-      AgentPlate initials=initials plate=plate ink=ink
+      AgentPlate
+        with
+          initials
+          plate
+          ink
     if !is_agent
-      HumanPlate initials=initials plate=plate ink=ink
+      HumanPlate
+        with
+          initials
+          plate
+          ink
 
 // The 18px sidebar plates sit on a lighter step than the 24px and up ones —
 // at that size the roster plate would otherwise read as a filled dot.
 component HumanPlate(initials:str, plate:f64, ink:f64)
   col #root
     if plate <= 18.0
-      box w=plate h=plate align-x=center align-y=center bg=avatar_bg_sm r=(plate / 2.0)
-        text initials size=ink wrap=none font=display @text-avatar_fg_sm
+      box
+        with
+          w=plate
+          h=plate
+          align-x=center
+          align-y=center
+          bg=avatar_bg_sm
+          r=(plate / 2.0)
+        text initials
+          with
+            size=ink
+            wrap=none
+            font=display
+            @text-avatar_fg_sm
     if plate > 18.0
-      box w=plate h=plate align-x=center align-y=center bg=avatar_bg r=(plate / 2.0)
-        text initials size=ink wrap=none font=display @text-muted
+      box
+        with
+          w=plate
+          h=plate
+          align-x=center
+          align-y=center
+          bg=avatar_bg
+          r=(plate / 2.0)
+        text initials
+          with
+            size=ink
+            wrap=none
+            font=display
+            @text-muted
 
 // The square's radius steps with the plate — 6 at 18, 7 at 24, 8 at 28-32,
 // 9 at 34, 10 at 40 and up. A fixed radius is the bug this replaces.
@@ -80,19 +189,56 @@ component HumanPlate(initials:str, plate:f64, ink:f64)
 component AgentPlate(initials:str, plate:f64, ink:f64)
   col #root
     if plate >= 40.0
-      AgentSquare initials=initials plate=plate ink=ink radius=10.0
+      AgentSquare
+        with
+          initials
+          plate
+          ink
+          radius=10.0
     if plate >= 33.0 && plate < 40.0
-      AgentSquare initials=initials plate=plate ink=ink radius=9.0
+      AgentSquare
+        with
+          initials
+          plate
+          ink
+          radius=9.0
     if plate >= 25.0 && plate < 33.0
-      AgentSquare initials=initials plate=plate ink=ink radius=8.0
+      AgentSquare
+        with
+          initials
+          plate
+          ink
+          radius=8.0
     if plate >= 22.0 && plate < 25.0
-      AgentSquare initials=initials plate=plate ink=ink radius=7.0
+      AgentSquare
+        with
+          initials
+          plate
+          ink
+          radius=7.0
     if plate < 22.0
-      AgentSquare initials=initials plate=plate ink=ink radius=6.0
+      AgentSquare
+        with
+          initials
+          plate
+          ink
+          radius=6.0
 
 component AgentSquare(initials:str, plate:f64, ink:f64, radius:f64)
-  box #root w=plate h=plate align-x=center align-y=center bg=primary r=radius
-    text initials size=ink wrap=none font=code_semibold @text-toast_fg
+  box #root
+    with
+      w=plate
+      h=plate
+      align-x=center
+      align-y=center
+      bg=primary
+      r=radius
+    text initials
+      with
+        size=ink
+        wrap=none
+        font=code_semibold
+        @text-toast_fg
 
 // The machine marker in its one sanctioned form: what an agent is doing right
 // now, on a wash plate with a hairline. `live` lights the pulse.
@@ -127,30 +273,70 @@ component StillDot(plate:f64, tone:str)
   col #root
     match tone
       "warning"
-        box w=plate h=plate bg=warning_dot/55 r=(plate / 2.0)
+        box
+          with
+            w=plate
+            h=plate
+            bg=warning_dot/55
+            r=(plate / 2.0)
           space w=1.0 h=1.0
       "danger"
-        box w=plate h=plate bg=danger_dot/55 r=(plate / 2.0)
+        box
+          with
+            w=plate
+            h=plate
+            bg=danger_dot/55
+            r=(plate / 2.0)
           space w=1.0 h=1.0
       "info"
-        box w=plate h=plate bg=info_dot/55 r=(plate / 2.0)
+        box
+          with
+            w=plate
+            h=plate
+            bg=info_dot/55
+            r=(plate / 2.0)
           space w=1.0 h=1.0
       _
-        box w=plate h=plate bg=success_dot/55 r=(plate / 2.0)
+        box
+          with
+            w=plate
+            h=plate
+            bg=success_dot/55
+            r=(plate / 2.0)
           space w=1.0 h=1.0
 
 component PulseDot(plate:f64, tone:str)
   col #root
     match tone
       "warning"
-        box w=plate h=plate bg=warning_dot r=(plate / 2.0)
+        box
+          with
+            w=plate
+            h=plate
+            bg=warning_dot
+            r=(plate / 2.0)
           space w=1.0 h=1.0
       "danger"
-        box w=plate h=plate bg=danger_dot r=(plate / 2.0)
+        box
+          with
+            w=plate
+            h=plate
+            bg=danger_dot
+            r=(plate / 2.0)
           space w=1.0 h=1.0
       "info"
-        box w=plate h=plate bg=info_dot r=(plate / 2.0)
+        box
+          with
+            w=plate
+            h=plate
+            bg=info_dot
+            r=(plate / 2.0)
           space w=1.0 h=1.0
       _
-        box w=plate h=plate bg=success_dot r=(plate / 2.0)
+        box
+          with
+            w=plate
+            h=plate
+            bg=success_dot
+            r=(plate / 2.0)
           space w=1.0 h=1.0

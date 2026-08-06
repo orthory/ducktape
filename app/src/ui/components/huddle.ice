@@ -37,42 +37,116 @@ component HuddleLivePill(name:str, elapsed:str, muted:bool, popped:bool)
     pop_huddle
     focus_huddle
     leave_huddle_here
-  box #root bg=toast_bg r=9.0 pl=9.0 pr=10.0 pt=5.0 pb=5.0
+  box #root
+    with
+      bg=toast_bg
+      r=9.0
+      pl=9.0
+      pr=10.0
+      pt=5.0
+      pb=5.0
     row gap=8.0 align=center
       // Two arms, one face: while the huddle window is up, the pill's click
       // RAISES it instead of trying to open a second one (which a branch-free
       // handler could only swallow as a no-op).
       if !popped
-        button label=name @icon_action px-0px py-0px -> emit(pop_huddle)
+        button -> emit(pop_huddle)
+          with
+            label=name
+            @icon_action
+            @px-0px
+            @py-0px
           row gap=8.0 align=center
             PulseDot plate=6.0 tone="success"
-            text "LIVE" size=10.5 wrap=none font=code_medium @text-toast_fg
+            text "LIVE"
+              with
+                size=10.5
+                wrap=none
+                font=code_medium
+                @text-toast_fg
             if !empty(elapsed)
-              text elapsed size=10.5 wrap=none font=code_medium @text-toast_fg
+              text elapsed
+                with
+                  size=10.5
+                  wrap=none
+                  font=code_medium
+                  @text-toast_fg
             if muted
-              Icon name="mic-off" tone="caption" px=11.0
-            Icon name="popout" tone="caption" px=11.0
+              Icon
+                with
+                  name="mic-off"
+                  tone="caption"
+                  px=11.0
+            Icon
+              with
+                name="popout"
+                tone="caption"
+                px=11.0
           active bg=transparent text=toast_fg border=transparent border-w=1.0 r=6.0
           hovered bg=ink_hover text=toast_fg
           pressed bg=ink_hover text=toast_fg
       if popped
-        button label="Focus the huddle window" @icon_action px-0px py-0px -> emit(focus_huddle)
+        button -> emit(focus_huddle)
+          with
+            label="Focus the huddle window"
+            @icon_action
+            @px-0px
+            @py-0px
           row gap=8.0 align=center
             PulseDot plate=6.0 tone="success"
-            text "LIVE" size=10.5 wrap=none font=code_medium @text-toast_fg
+            text "LIVE"
+              with
+                size=10.5
+                wrap=none
+                font=code_medium
+                @text-toast_fg
             if !empty(elapsed)
-              text elapsed size=10.5 wrap=none font=code_medium @text-toast_fg
+              text elapsed
+                with
+                  size=10.5
+                  wrap=none
+                  font=code_medium
+                  @text-toast_fg
             if muted
-              Icon name="mic-off" tone="caption" px=11.0
-            Icon name="popout" tone="caption" px=11.0
+              Icon
+                with
+                  name="mic-off"
+                  tone="caption"
+                  px=11.0
+            Icon
+              with
+                name="popout"
+                tone="caption"
+                px=11.0
           active bg=transparent text=toast_fg border=transparent border-w=1.0 r=6.0
           hovered bg=ink_hover text=toast_fg
           pressed bg=ink_hover text=toast_fg
-      box w=1.0 h=14.0 bg=panel_tile
+      box
+        with
+          w=1.0
+          h=14.0
+          bg=panel_tile
         space w=1.0 h=1.0
-      button label="Leave the huddle" w=24.0 h=24.0 @icon_action px-0px py-0px -> emit(leave_huddle_here)
-        box w=fill h=fill align-x=center align-y=center
-          text "✕" size=10.5 wrap=none font=code_medium @text-danger_soft
+      button -> emit(leave_huddle_here)
+        with
+          label="Leave the huddle"
+          w=24.0
+          h=24.0
+          @icon_action
+          @px-0px
+          @py-0px
+        box
+          with
+            w=fill
+            h=fill
+            align-x=center
+            align-y=center
+          text "✕"
+            with
+              size=10.5
+              wrap=none
+              font=code_medium
+              @text-danger_soft
         active bg=transparent text=danger_soft border=transparent border-w=1.0 r=5.0
         hovered bg=strong_ink text=danger_soft
         pressed bg=strong_ink text=danger_soft
@@ -83,10 +157,24 @@ component HuddleLivePill(name:str, elapsed:str, muted:bool, popped:bool)
 component HuddleStart()
   emits
     join_huddle_submit
-  button #root label="Start a huddle" @icon_action px-9px py-5px -> emit(join_huddle_submit)
+  button #root -> emit(join_huddle_submit)
+    with
+      label="Start a huddle"
+      @icon_action
+      @px-9px
+      @py-5px
     row gap=7.0 align=center
-      Icon name="headphones" tone="muted" px=14.0
-      text "Huddle" size=12.0 wrap=none font=display @text-accent_fg
+      Icon
+        with
+          name="headphones"
+          tone="muted"
+          px=14.0
+      text "Huddle"
+        with
+          size=12.0
+          wrap=none
+          font=display
+          @text-accent_fg
     active bg=surface text=accent_fg border=control_line border-w=1.0 r=9.0
     hovered bg=muted_bg text=accent_fg border=control_line_hover
     pressed bg=subtle text=accent_fg
@@ -104,14 +192,39 @@ component HuddleStart()
 component HuddleDockedPill(channel:str, elapsed:str)
   emits
     pop_huddle
-  box #root r=8.0 shadow=shadow_toast shadow-y=2.0 shadow-blur=8.0 clip=true
-    button label="Open the huddle window" @icon_action px-8px py-4px -> emit(pop_huddle)
+  box #root
+    with
+      r=8.0
+      shadow=shadow_toast
+      shadow-y=2.0
+      shadow-blur=8.0
+      clip=true
+    button -> emit(pop_huddle)
+      with
+        label="Open the huddle window"
+        @icon_action
+        @px-8px
+        @py-4px
       row gap=7.0 align=center
         PulseDot plate=6.0 tone="success"
-        text channel size=10.5 wrap=none font=code_medium @text-toast_fg
+        text channel
+          with
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-toast_fg
         if !empty(elapsed)
-          text elapsed size=10.5 wrap=none font=code_medium @text-caption
-        Icon name="popout" tone="caption" px=11.0
+          text elapsed
+            with
+              size=10.5
+              wrap=none
+              font=code_medium
+              @text-caption
+        Icon
+          with
+            name="popout"
+            tone="caption"
+            px=11.0
       active bg=toast_bg text=toast_fg border=transparent border-w=1.0 r=8.0
       hovered bg=ink_hover text=toast_fg
       pressed bg=ink_hover text=toast_fg
@@ -123,24 +236,74 @@ component HuddleDockedPill(channel:str, elapsed:str)
 // huddle window's 300px minimum less its 13px insets leaves 274, and
 // 128 + 8 + 128 is 264.
 component HuddleTile(person:HuddleParticipant, muted:bool)
-  box #root w=128.0 pl=8.0 pr=8.0 pt=12.0 pb=12.0 bg=ink_hover r=11.0
-    col w=fill gap=6.0 align=center
+  box #root
+    with
+      w=128.0
+      pl=8.0
+      pr=8.0
+      pt=12.0
+      pb=12.0
+      bg=ink_hover
+      r=11.0
+    col
+      with
+        w=fill
+        gap=6.0
+        align=center
       if person.is_agent
-        box w=34.0 h=34.0 align-x=center align-y=center bg=accent_fg r=10.0
-          text person.initials size=11.0 wrap=none font=code_medium @text-ink_soft
+        box
+          with
+            w=34.0
+            h=34.0
+            align-x=center
+            align-y=center
+            bg=accent_fg
+            r=10.0
+          text person.initials
+            with
+              size=11.0
+              wrap=none
+              font=code_medium
+              @text-ink_soft
       if !person.is_agent
-        box w=34.0 h=34.0 align-x=center align-y=center bg=panel_tile r=17.0
-          text person.initials size=12.0 wrap=none font=display @text-ink_soft
+        box
+          with
+            w=34.0
+            h=34.0
+            align-x=center
+            align-y=center
+            bg=panel_tile
+            r=17.0
+          text person.initials
+            with
+              size=12.0
+              wrap=none
+              font=display
+              @text-ink_soft
       // `is_you` is resolved against the same user bytes `signed_write` authors
       // with, so the self tile is marked with the 9px caption the artifact uses
       // for `you` in its member rows — the huddle grid otherwise renders four
       // identical tiles and never says which one is her.
       row gap=4.0 align=center
         if muted
-          Icon name="mic-off" tone="caption" px=10.0
-        text person.label size=12.0 wrap=none font=medium @text-chevron_idle
+          Icon
+            with
+              name="mic-off"
+              tone="caption"
+              px=10.0
+        text person.label
+          with
+            size=12.0
+            wrap=none
+            font=medium
+            @text-chevron_idle
         if person.is_you
-          text "you" size=9.0 wrap=none font=medium @text-caption
+          text "you"
+            with
+              size=9.0
+              wrap=none
+              font=medium
+              @text-caption
 
 // THE POPPED PANEL — the whole content of the huddle's own OS window. Two
 // bands: the header with its dock button, and the body (elapsed + roster grid
@@ -164,83 +327,247 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
     leave_huddle_here
     toggle_call_mute
     toggle_call_camera
-  box #root w=fill h=fill bg=toast_bg clip=true
+  box #root
+    with
+      w=fill
+      h=fill
+      bg=toast_bg
+      clip=true
     col w=fill
-      box w=fill pl=11.0 pr=11.0 pt=9.0 pb=9.0
-        row w=fill gap=9.0 align=center
-          text "Huddle ·" size=10.5 wrap=none font=code_medium @text-ink_soft
-          text channel w=fill size=10.5 wrap=none font=code_medium @text-ink_soft
-          button label="Dock the huddle window" @icon_action p-4px -> emit(dock_huddle)
-            Icon name="collapse" tone="caption" px=12.0
+      box
+        with
+          w=fill
+          pl=11.0
+          pr=11.0
+          pt=9.0
+          pb=9.0
+        row
+          with
+            w=fill
+            gap=9.0
+            align=center
+          text "Huddle ·"
+            with
+              size=10.5
+              wrap=none
+              font=code_medium
+              @text-ink_soft
+          text channel
+            with
+              w=fill
+              size=10.5
+              wrap=none
+              font=code_medium
+              @text-ink_soft
+          button -> emit(dock_huddle)
+            with
+              label="Dock the huddle window"
+              @icon_action
+              @p-4px
+            Icon
+              with
+                name="collapse"
+                tone="caption"
+                px=12.0
             active bg=transparent text=caption border=transparent border-w=1.0 r=5.0
             hovered bg=ink_hover text=toast_fg
             pressed bg=ink_hover text=toast_fg
-      box w=fill h=1.0 bg=accent_fg
+      box
+        with
+          w=fill
+          h=1.0
+          bg=accent_fg
         space w=1.0 h=1.0
-      box w=fill pl=13.0 pr=13.0 pt=13.0 pb=11.0
+      box
+        with
+          w=fill
+          pl=13.0
+          pr=13.0
+          pt=13.0
+          pb=11.0
         col w=fill gap=12.0
           row gap=8.0 align=center
             PulseDot plate=6.0 tone="success"
             if !empty(elapsed)
-              text elapsed size=12.0 wrap=none font=code_semibold @text-toast_fg
+              text elapsed
+                with
+                  size=12.0
+                  wrap=none
+                  font=code_semibold
+                  @text-toast_fg
             if empty(elapsed)
-              text "LIVE" size=12.0 wrap=none font=code_semibold @text-toast_fg
+              text "LIVE"
+                with
+                  size=12.0
+                  wrap=none
+                  font=code_semibold
+                  @text-toast_fg
             space w=fill
             // The call's own word: connecting → live (with any device note),
             // or the hub's refusal prose — the "Voice connection failed."
             // black hole this panel used to be.
             if !empty(status)
-              text status size=10.5 wrap=none font=code_medium @text-caption
+              text status
+                with
+                  size=10.5
+                  wrap=none
+                  font=code_medium
+                  @text-caption
           // The video strip: every live camera's latest frame (peers first,
           // the local preview last), only while any camera is on. The widget
           // repaints itself — mounting it is the whole contract.
           if video_live
             extern call_video_tiles()
-          row w=fill gap=8.0 wrap wrap-gap=8.0
+          row wrap
+            with
+              w=fill
+              gap=8.0
+              wrap-gap=8.0
             for person in roster
-              HuddleTile person=person muted=keep_bool(person.is_you, muted, call_peer_muted(peers, person.node))
-          row w=fill gap=7.0 align=center
+              HuddleTile
+                with
+                  person
+                  muted=keep_bool(person.is_you, muted, call_peer_muted(peers, person.node))
+          row
+            with
+              w=fill
+              gap=7.0
+              align=center
             if !muted
-              button label="Mute the microphone" w=32.0 h=32.0 @icon_action px-0px py-0px -> emit(toggle_call_mute)
-                box w=fill h=fill align-x=center align-y=center
-                  Icon name="mic" tone="caption" px=14.0
+              button -> emit(toggle_call_mute)
+                with
+                  label="Mute the microphone"
+                  w=32.0
+                  h=32.0
+                  @icon_action
+                  @px-0px
+                  @py-0px
+                box
+                  with
+                    w=fill
+                    h=fill
+                    align-x=center
+                    align-y=center
+                  Icon
+                    with
+                      name="mic"
+                      tone="caption"
+                      px=14.0
                 active bg=ink_hover text=chevron_idle border=transparent border-w=1.0 r=9.0
                 hovered bg=strong_ink text=toast_fg
                 pressed bg=strong_ink text=toast_fg
             if muted
-              button label="Unmute the microphone" w=32.0 h=32.0 @icon_action px-0px py-0px -> emit(toggle_call_mute)
-                box w=fill h=fill align-x=center align-y=center
-                  Icon name="mic-off" tone="danger" px=14.0
+              button -> emit(toggle_call_mute)
+                with
+                  label="Unmute the microphone"
+                  w=32.0
+                  h=32.0
+                  @icon_action
+                  @px-0px
+                  @py-0px
+                box
+                  with
+                    w=fill
+                    h=fill
+                    align-x=center
+                    align-y=center
+                  Icon
+                    with
+                      name="mic-off"
+                      tone="danger"
+                      px=14.0
                 active bg=danger_solid text=primary_fg border=transparent border-w=1.0 r=9.0
                 hovered bg=danger_solid_hover text=primary_fg
                 pressed bg=danger_solid_hover text=primary_fg
             if !camera
-              button label="Turn the camera on" w=32.0 h=32.0 @icon_action px-0px py-0px -> emit(toggle_call_camera)
-                box w=fill h=fill align-x=center align-y=center
-                  Icon name="camera" tone="caption" px=14.0
+              button -> emit(toggle_call_camera)
+                with
+                  label="Turn the camera on"
+                  w=32.0
+                  h=32.0
+                  @icon_action
+                  @px-0px
+                  @py-0px
+                box
+                  with
+                    w=fill
+                    h=fill
+                    align-x=center
+                    align-y=center
+                  Icon
+                    with
+                      name="camera"
+                      tone="caption"
+                      px=14.0
                 active bg=ink_hover text=chevron_idle border=transparent border-w=1.0 r=9.0
                 hovered bg=strong_ink text=toast_fg
                 pressed bg=strong_ink text=toast_fg
             if camera
-              button label="Turn the camera off" w=32.0 h=32.0 @icon_action px-0px py-0px -> emit(toggle_call_camera)
-                box w=fill h=fill align-x=center align-y=center
-                  Icon name="camera" tone="ink" px=14.0
+              button -> emit(toggle_call_camera)
+                with
+                  label="Turn the camera off"
+                  w=32.0
+                  h=32.0
+                  @icon_action
+                  @px-0px
+                  @py-0px
+                box
+                  with
+                    w=fill
+                    h=fill
+                    align-x=center
+                    align-y=center
+                  Icon
+                    with
+                      name="camera"
+                      tone="ink"
+                      px=14.0
                 active bg=success_dot/25 text=toast_fg border=transparent border-w=1.0 r=9.0
                 hovered bg=strong_ink text=toast_fg
                 pressed bg=strong_ink text=toast_fg
-            button label="Open the huddle channel" @icon_action px-11px py-0px -> emit(huddle_go_channel)
+            button -> emit(huddle_go_channel)
+              with
+                label="Open the huddle channel"
+                @icon_action
+                @px-11px
+                @py-0px
               box h=32.0 align-y=center
                 row gap=3.0 align=center
-                  text "open" size=12.0 wrap=none font=medium @text-chevron_idle
-                  text "#" size=12.0 wrap=none font=medium @text-ink_soft
-                  text channel size=12.0 wrap=none font=medium @text-chevron_idle
+                  text "open"
+                    with
+                      size=12.0
+                      wrap=none
+                      font=medium
+                      @text-chevron_idle
+                  text "#"
+                    with
+                      size=12.0
+                      wrap=none
+                      font=medium
+                      @text-ink_soft
+                  text channel
+                    with
+                      size=12.0
+                      wrap=none
+                      font=medium
+                      @text-chevron_idle
               active bg=ink_hover text=chevron_idle border=transparent border-w=1.0 r=9.0
               hovered bg=strong_ink text=toast_fg
               pressed bg=strong_ink text=toast_fg
             space w=fill
-            button label="Leave the huddle" @icon_action px-13px py-0px -> emit(leave_huddle_here)
+            button -> emit(leave_huddle_here)
+              with
+                label="Leave the huddle"
+                @icon_action
+                @px-13px
+                @py-0px
               box h=32.0 align-y=center
-                text "Leave" size=12.0 wrap=none font=display @text-primary_fg
+                text "Leave"
+                  with
+                    size=12.0
+                    wrap=none
+                    font=display
+                    @text-primary_fg
               active bg=danger_solid text=primary_fg border=transparent border-w=1.0 r=9.0
               hovered bg=danger_solid_hover text=primary_fg
               pressed bg=danger_solid_hover text=primary_fg
@@ -251,12 +578,32 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
 component HuddleElsewhere(name:str)
   emits
     huddle_go_channel
-  button #root label="Open the channel the huddle is in" @icon_action px-11px py-5px -> emit(huddle_go_channel)
+  button #root -> emit(huddle_go_channel)
+    with
+      label="Open the channel the huddle is in"
+      @icon_action
+      @px-11px
+      @py-5px
     row gap=7.0 align=center
       PulseDot plate=6.0 tone="success"
-      text "#" size=12.0 wrap=none font=display @text-hint
-      text name size=12.0 wrap=none font=display @text-accent_fg
-      text "· call in progress" size=12.0 wrap=none font=display @text-caption
+      text "#"
+        with
+          size=12.0
+          wrap=none
+          font=display
+          @text-hint
+      text name
+        with
+          size=12.0
+          wrap=none
+          font=display
+          @text-accent_fg
+      text "· call in progress"
+        with
+          size=12.0
+          wrap=none
+          font=display
+          @text-caption
     active bg=surface text=accent_fg border=control_line border-w=1.0 r=9.0
     hovered bg=muted_bg text=accent_fg border=control_line_hover
     pressed bg=subtle text=accent_fg

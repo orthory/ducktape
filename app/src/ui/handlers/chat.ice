@@ -539,7 +539,6 @@ on begin_message_edit(seq, body, rev)
 // the settled chip on my own bubble both land here, and both name the same
 // right rail — so opening one closes the other.
 
-
 on open_thread_for(seq)
   return if seq <= 0 || empty(active_channel)
   channel_settings_open = false

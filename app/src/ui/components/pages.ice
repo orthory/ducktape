@@ -11,22 +11,70 @@ component PageButton(page:PageItem, selected:bool)
     choose_page(str)
   col w=fill
     if selected
-      button label=page.title w=fill @ghost_action px-12px py-7px -> emit(choose_page, page.id)
-        row w=fill gap=8.0 align=center
+      button -> emit(choose_page, page.id)
+        with
+          label=page.title
+          w=fill
+          @ghost_action
+          @px-12px
+          @py-7px
+        row
+          with
+            w=fill
+            gap=8.0
+            align=center
           if !empty(page.prefix)
-            text page.prefix size=12.0 wrap=none font=code @text-label
-          Icon name="doc" tone="label" px=14.0
-          text page.title w=fill size=12.5 wrap=none @text-fg
+            text page.prefix
+              with
+                size=12.0
+                wrap=none
+                font=code
+                @text-label
+          Icon
+            with
+              name="doc"
+              tone="label"
+              px=14.0
+          text page.title
+            with
+              w=fill
+              size=12.5
+              wrap=none
+              @text-fg
         active bg=subtle text=fg border=transparent border-w=1.0 r=7.0
         hovered bg=rail_hover text=fg
         pressed bg=subtle text=fg
     if !selected
-      button label=page.title w=fill @ghost_action px-12px py-7px -> emit(choose_page, page.id)
-        row w=fill gap=8.0 align=center
+      button -> emit(choose_page, page.id)
+        with
+          label=page.title
+          w=fill
+          @ghost_action
+          @px-12px
+          @py-7px
+        row
+          with
+            w=fill
+            gap=8.0
+            align=center
           if !empty(page.prefix)
-            text page.prefix size=12.0 wrap=none font=code @text-label
-          Icon name="doc" tone="label" px=14.0
-          text page.title w=fill size=12.5 wrap=none @text-muted
+            text page.prefix
+              with
+                size=12.0
+                wrap=none
+                font=code
+                @text-label
+          Icon
+            with
+              name="doc"
+              tone="label"
+              px=14.0
+          text page.title
+            with
+              w=fill
+              size=12.5
+              wrap=none
+              @text-muted
         active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
         hovered bg=rail_hover text=fg
         pressed bg=subtle text=fg
@@ -34,12 +82,36 @@ component PageButton(page:PageItem, selected:bool)
 component PageSearchResult(hit:PageSearchHit)
   emits
     open_page_search_hit(str, str)
-  button label=hit.text w=fill p=7.0 @ghost_action -> emit(open_page_search_hit, hit.page_id, hit.block_id)
+  button -> emit(open_page_search_hit, hit.page_id, hit.block_id)
+    with
+      label=hit.text
+      w=fill
+      p=7.0
+      @ghost_action
     col w=fill gap=2.0
-      row w=fill gap=7.0 align=center
-        text hit.kind w=fill size=10.5 font=code_medium @text-muted
-        text hit.block_id size=12.0 wrap=none font=code @text-muted
-      text hit.text w=fill size=13.5 wrap=word @text-fg
+      row
+        with
+          w=fill
+          gap=7.0
+          align=center
+        text hit.kind
+          with
+            w=fill
+            size=10.5
+            font=code_medium
+            @text-muted
+        text hit.block_id
+          with
+            size=12.0
+            wrap=none
+            font=code
+            @text-muted
+      text hit.text
+        with
+          w=fill
+          size=13.5
+          wrap=word
+          @text-fg
     active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
     hovered bg=fg/6 text=fg border=fg/8
     pressed bg=fg/10 text=fg border=fg/12
@@ -64,24 +136,100 @@ component PageSearchResult(hit:PageSearchHit)
 component PageCommentThreadButton(thread:PageCommentThread, anchor:str)
   emits
     open_block_comment_thread(str, str)
-  button label=thread.author description=thread.meta w=fill @ghost_action px-12px py-11px -> emit(open_block_comment_thread, thread.id, thread.target)
+  button -> emit(open_block_comment_thread, thread.id, thread.target)
+    with
+      label=thread.author
+      description=thread.meta
+      w=fill
+      @ghost_action
+      @px-12px
+      @py-11px
     col w=fill gap=7.0
-      row w=fill gap=8.0 align=center
-        PrincipalAvatar initials=initials_of(thread.author) is_agent=false plate=22.0 ink=9.0 ring=""
-        text thread.author w=fill size=12.0 wrap=none font=display @text-primary
-        text "›" size=13.0 wrap=none @text-label
+      row
+        with
+          w=fill
+          gap=8.0
+          align=center
+        PrincipalAvatar
+          with
+            initials=initials_of(thread.author)
+            is_agent=false
+            plate=22.0
+            ink=9.0
+            ring=""
+        text thread.author
+          with
+            w=fill
+            size=12.0
+            wrap=none
+            font=display
+            @text-primary
+        text "›"
+          with
+            size=13.0
+            wrap=none
+            @text-label
       // WHERE it anchors — the one thing the old rail never told you.
-      text anchor w=fill size=10.5 wrap=none font=code_medium @text-hint
-      text thread.meta w=fill size=12.0 line-h=1.55 wrap=word @text-panel_tile
+      text anchor
+        with
+          w=fill
+          size=10.5
+          wrap=none
+          font=code_medium
+          @text-hint
+      text thread.meta
+        with
+          w=fill
+          size=12.0
+          line-h=1.55
+          wrap=word
+          @text-panel_tile
     active bg=surface text=fg border=card_line border-w=1.0 r=11.0
     hovered bg=card_wash_hover text=fg border=control_line
     pressed bg=card_wash text=fg border=control_line
 
 component PageCommentCard(comment:PageComment)
-  box w=fill pl=12.0 pr=12.0 pt=11.0 pb=11.0 bg=surface border=card_line border-w=1.0 r=11.0
+  box
+    with
+      w=fill
+      pl=12.0
+      pr=12.0
+      pt=11.0
+      pb=11.0
+      bg=surface
+      border=card_line
+      border-w=1.0
+      r=11.0
     col w=fill gap=7.0
-      row w=fill gap=8.0 align=center
-        PrincipalAvatar initials=initials_of(comment.author) is_agent=false plate=22.0 ink=9.0 ring=""
-        text comment.author w=fill size=12.0 wrap=none font=display @text-primary
-        text comment.meta size=10.5 wrap=none font=code_medium @text-label
-      text comment.text w=fill size=12.0 line-h=1.55 wrap=word @text-panel_tile
+      row
+        with
+          w=fill
+          gap=8.0
+          align=center
+        PrincipalAvatar
+          with
+            initials=initials_of(comment.author)
+            is_agent=false
+            plate=22.0
+            ink=9.0
+            ring=""
+        text comment.author
+          with
+            w=fill
+            size=12.0
+            wrap=none
+            font=display
+            @text-primary
+        text comment.meta
+          with
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-label
+      text comment.text
+        with
+          w=fill
+          size=12.0
+          line-h=1.55
+          wrap=word
+          @text-panel_tile

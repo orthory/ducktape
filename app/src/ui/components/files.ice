@@ -36,14 +36,32 @@ component FsTreeRow(entry:FsEntry, selected:bool, depth:f64)
     fs_open_dir(str)
   col #root w=fill
     if selected
-      button label="Open directory" w=fill p=0.0 @ghost_action -> emit(fs_open_dir, entry.path)
-        FsTreeFace name=entry.name depth=depth dimmed=false
+      button -> emit(fs_open_dir, entry.path)
+        with
+          label="Open directory"
+          w=fill
+          p=0.0
+          @ghost_action
+        FsTreeFace
+          with
+            name=entry.name
+            depth
+            dimmed=false
         active bg=subtle text=fg border=transparent border-w=1.0 r=7.0
         hovered bg=subtle
         pressed bg=rail_hover
     if !selected
-      button label="Open directory" w=fill p=0.0 @ghost_action -> emit(fs_open_dir, entry.path)
-        FsTreeFace name=entry.name depth=depth dimmed=true
+      button -> emit(fs_open_dir, entry.path)
+        with
+          label="Open directory"
+          w=fill
+          p=0.0
+          @ghost_action
+        FsTreeFace
+          with
+            name=entry.name
+            depth
+            dimmed=true
         active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
         hovered bg=rail_hover
         pressed bg=subtle
@@ -53,12 +71,36 @@ component FsTreeRow(entry:FsEntry, selected:bool, depth:f64)
 // (#a07b32) is the ramp's own muted gold and the nearest true step to the
 // artifact's #a08a5a.
 component FsTreeFace(name:str, depth:f64, dimmed:bool)
-  row #root w=fill gap=7.0 align=center pt=6.0 pb=6.0 pr=12.0 pl=(11.0 + depth * 14.0)
-    Icon name="folder" tone="warning" px=13.0
+  row #root
+    with
+      w=fill
+      gap=7.0
+      align=center
+      pt=6.0
+      pb=6.0
+      pr=12.0
+      pl=(11.0 + depth * 14.0)
+    Icon
+      with
+        name="folder"
+        tone="warning"
+        px=13.0
     if dimmed
-      text name w=fill size=12.0 wrap=none font=code_medium @text-muted
+      text name
+        with
+          w=fill
+          size=12.0
+          wrap=none
+          font=code_medium
+          @text-muted
     if !dimmed
-      text name w=fill size=12.0 wrap=none font=code_medium @text-fg
+      text name
+        with
+          w=fill
+          size=12.0
+          wrap=none
+          font=code_medium
+          @text-fg
 
 // The crumb bar over the object table: where you are, what is here, and who is
 // allowed to write under it.
@@ -79,20 +121,67 @@ component CrumbBar(path:str, dirs:i64, files:i64)
   emits
     fs_open_dir(str)
   col #root w=fill
-    box w=fill h=50.0 px=20.0
-      row w=fill h=fill gap=6.0 align=center
-        button label="Go to the duckfs root" p=0.0 @ghost_action -> emit(fs_open_dir, "")
-          text "duckfs" size=12.5 wrap=none font=code_semibold @text-primary
+    box
+      with
+        w=fill
+        h=50.0
+        px=20.0
+      row
+        with
+          w=fill
+          h=fill
+          gap=6.0
+          align=center
+        button -> emit(fs_open_dir, "")
+          with
+            label="Go to the duckfs root"
+            p=0.0
+            @ghost_action
+          text "duckfs"
+            with
+              size=12.5
+              wrap=none
+              font=code_semibold
+              @text-primary
           active bg=transparent text=primary border=transparent border-w=1.0 r=6.0
           hovered bg=elevated
           pressed bg=subtle
         if !empty(path)
-          text path size=12.5 wrap=none font=code_semibold @text-primary
-        row gap=4.0 align=center pl=4.0
-          text files size=11.0 wrap=none font=code @text-hint
-          text "files ·" size=11.0 wrap=none font=code @text-hint
-          text dirs size=11.0 wrap=none font=code @text-hint
-          text "dirs" size=11.0 wrap=none font=code @text-hint
+          text path
+            with
+              size=12.5
+              wrap=none
+              font=code_semibold
+              @text-primary
+        row
+          with
+            gap=4.0
+            align=center
+            pl=4.0
+          text files
+            with
+              size=11.0
+              wrap=none
+              font=code
+              @text-hint
+          text "files ·"
+            with
+              size=11.0
+              wrap=none
+              font=code
+              @text-hint
+          text dirs
+            with
+              size=11.0
+              wrap=none
+              font=code
+              @text-hint
+          text "dirs"
+            with
+              size=11.0
+              wrap=none
+              font=code
+              @text-hint
         space w=fill
         // duckfs write authority, stated in full rather than per-path, in the
         // terms check_authority actually uses (crates/duckfs/core/src/paths.rs).
@@ -101,8 +190,16 @@ component CrumbBar(path:str, dirs:i64, files:i64)
         // own a home tree. Both roots reject a write on their own. A path
         // prefix test is not expressible here, and one honest rule beats a
         // guessed branch.
-        text "writes · /home/<owner>/** by that owner · /shared/** by any member · roots not writable" size=10.5 wrap=none @text-meta
-    box w=fill h=1.0 bg=separator
+        text "writes · /home/<owner>/** by that owner · /shared/** by any member · roots not writable"
+          with
+            size=10.5
+            wrap=none
+            @text-meta
+    box
+      with
+        w=fill
+        h=1.0
+        bg=separator
       space w=1.0 h=1.0
 
 // The object table's column header. It owns the column widths, and `ObjectRow`
@@ -110,12 +207,44 @@ component CrumbBar(path:str, dirs:i64, files:i64)
 // lining up.
 component ObjectTableHeader()
   col #root w=fill
-    box w=fill px=20.0 py=9.0
-      row w=fill gap=12.0 align=center
-        text "NAME" w=fill size=9.0 wrap=none font=code_semibold @text-gutter_ink
-        text "SIZE" w=72.0 align-x=right size=9.0 wrap=none font=code_semibold @text-gutter_ink
-        text "OBJECT" w=92.0 align-x=right size=9.0 wrap=none font=code_semibold @text-gutter_ink
-    box w=fill h=1.0 bg=elevated
+    box
+      with
+        w=fill
+        px=20.0
+        py=9.0
+      row
+        with
+          w=fill
+          gap=12.0
+          align=center
+        text "NAME"
+          with
+            w=fill
+            size=9.0
+            wrap=none
+            font=code_semibold
+            @text-gutter_ink
+        text "SIZE"
+          with
+            w=72.0
+            align-x=right
+            size=9.0
+            wrap=none
+            font=code_semibold
+            @text-gutter_ink
+        text "OBJECT"
+          with
+            w=92.0
+            align-x=right
+            size=9.0
+            wrap=none
+            font=code_semibold
+            @text-gutter_ink
+    box
+      with
+        w=fill
+        h=1.0
+        bg=elevated
       space w=1.0 h=1.0
 
 // One entry. A directory opens; a file selects into the object panel. Only a
@@ -126,24 +255,43 @@ component ObjectRow(entry:FsEntry, selected:bool)
     fs_open_file(str)
   col #root w=fill
     if entry.kind == "dir"
-      button label="Open directory" w=fill p=0.0 @ghost_action -> emit(fs_open_dir, entry.path)
+      button -> emit(fs_open_dir, entry.path)
+        with
+          label="Open directory"
+          w=fill
+          p=0.0
+          @ghost_action
         ObjectRowFace entry=entry
         active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
         hovered bg=row_hover
         pressed bg=subtle
     if entry.kind != "dir" && selected
-      button label="Show object" w=fill p=0.0 @ghost_action -> emit(fs_open_file, entry.path)
+      button -> emit(fs_open_file, entry.path)
+        with
+          label="Show object"
+          w=fill
+          p=0.0
+          @ghost_action
         ObjectRowFace entry=entry
         active bg=elevated text=fg border=transparent border-w=1.0 r=0.0
         hovered bg=elevated
         pressed bg=subtle
     if entry.kind != "dir" && !selected
-      button label="Show object" w=fill p=0.0 @ghost_action -> emit(fs_open_file, entry.path)
+      button -> emit(fs_open_file, entry.path)
+        with
+          label="Show object"
+          w=fill
+          p=0.0
+          @ghost_action
         ObjectRowFace entry=entry
         active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
         hovered bg=row_hover
         pressed bg=subtle
-    box w=fill h=1.0 bg=muted_bg
+    box
+      with
+        w=fill
+        h=1.0
+        bg=muted_bg
       space w=1.0 h=1.0
 
 // The row's contents. A directory's SIZE reads as an em dash because
@@ -157,25 +305,79 @@ component ObjectRow(entry:FsEntry, selected:bool)
 // across SIZE and the file name on every row. The clip box is the column; the
 // text fills it.
 component ObjectRowFace(entry:FsEntry)
-  row #root w=fill gap=12.0 align=center px=20.0 py=11.0 clip=true
-    row w=fill gap=9.0 align=center clip=true
+  row #root
+    with
+      w=fill
+      gap=12.0
+      align=center
+      px=20.0
+      py=11.0
+      clip=true
+    row
+      with
+        w=fill
+        gap=9.0
+        align=center
+        clip=true
       if entry.kind == "dir"
-        Icon name="folder" tone="warning" px=16.0
+        Icon
+          with
+            name="folder"
+            tone="warning"
+            px=16.0
       if entry.kind != "dir"
-        Icon name="file" tone="label" px=16.0
-      text entry.name w=fill size=12.5 wrap=none font=code_medium @text-accent_fg
+        Icon
+          with
+            name="file"
+            tone="label"
+            px=16.0
+      text entry.name
+        with
+          w=fill
+          size=12.5
+          wrap=none
+          font=code_medium
+          @text-accent_fg
     box w=72.0 clip=true
       col w=fill
         if entry.kind == "dir"
-          text "—" w=fill align-x=right size=11.0 wrap=none font=code @text-input
+          text "—"
+            with
+              w=fill
+              align-x=right
+              size=11.0
+              wrap=none
+              font=code
+              @text-input
         if entry.kind != "dir"
-          text size_label(entry.size) w=fill align-x=right size=11.0 wrap=none font=code @text-input
+          text size_label(entry.size)
+            with
+              w=fill
+              align-x=right
+              size=11.0
+              wrap=none
+              font=code
+              @text-input
     box w=92.0 clip=true
       col w=fill
         if empty(entry.object)
-          text "—" w=fill align-x=right size=11.0 wrap=none font=code @text-hint
+          text "—"
+            with
+              w=fill
+              align-x=right
+              size=11.0
+              wrap=none
+              font=code
+              @text-hint
         if !empty(entry.object)
-          text entry.object w=fill align-x=right size=11.0 wrap=none font=code @text-hint
+          text entry.object
+            with
+              w=fill
+              align-x=right
+              size=11.0
+              wrap=none
+              font=code
+              @text-hint
 
 // The 306px object panel: identity, then the machine values behind it. The
 // artifact's kind chip is an uppercased file extension; Ice cannot split a
@@ -190,28 +392,92 @@ component ObjectRowFace(entry:FsEntry)
 // the panel never says "author" or "by" alone.
 component ObjectPanel(entry:FsEntry, changed_by:str, changed_height:i64)
   row #root w=306.0 h=fill
-    box w=1.0 h=fill bg=separator
+    box
+      with
+        w=1.0
+        h=fill
+        bg=separator
       space w=1.0 h=1.0
-    box w=fill h=fill bg=sidebar
+    box
+      with
+        w=fill
+        h=fill
+        bg=sidebar
       col w=fill h=fill
-        box w=fill h=50.0 px=16.0
-          row w=fill h=fill gap=8.0 align=center
-            text "Object" size=13.0 wrap=none font=display @text-fg
+        box
+          with
+            w=fill
+            h=50.0
+            px=16.0
+          row
+            with
+              w=fill
+              h=fill
+              gap=8.0
+              align=center
+            text "Object"
+              with
+                size=13.0
+                wrap=none
+                font=display
+                @text-fg
             space w=fill
             if entry.kind == "dir"
-              box px=7.0 py=3.0 bg=elevated r=5.0
-                text "DIR" size=9.0 wrap=none font=code_semibold @text-input
+              box
+                with
+                  px=7.0
+                  py=3.0
+                  bg=elevated
+                  r=5.0
+                text "DIR"
+                  with
+                    size=9.0
+                    wrap=none
+                    font=code_semibold
+                    @text-input
             if entry.kind != "dir"
-              box px=7.0 py=3.0 bg=elevated r=5.0
-                text "FILE" size=9.0 wrap=none font=code_semibold @text-input
-        box w=fill h=1.0 bg=separator
+              box
+                with
+                  px=7.0
+                  py=3.0
+                  bg=elevated
+                  r=5.0
+                text "FILE"
+                  with
+                    size=9.0
+                    wrap=none
+                    font=code_semibold
+                    @text-input
+        box
+          with
+            w=fill
+            h=1.0
+            bg=separator
           space w=1.0 h=1.0
-        scroll dir=vertical w=fill h=fill
+        scroll
+          with
+            dir=vertical
+            w=fill
+            h=fill
           col w=fill p=16.0
-            text entry.name w=fill size=13.5 font=code_semibold @text-primary
+            text entry.name
+              with
+                w=fill
+                size=13.5
+                font=code_semibold
+                @text-primary
             box w=fill pt=4.0
-              text entry.path w=fill size=10.5 font=code @text-hint
-            col w=fill gap=7.0 pt=14.0
+              text entry.path
+                with
+                  w=fill
+                  size=10.5
+                  font=code
+                  @text-hint
+            col
+              with
+                w=fill
+                gap=7.0
+                pt=14.0
               // a directory has a tree digest too, so this arm is only the
               // defensive default for a reply that omitted the field
               if empty(entry.object)
@@ -237,28 +503,85 @@ component ObjectPanel(entry:FsEntry, changed_by:str, changed_height:i64)
 // for the same reason the table cells are: a 64-hex object id is wider than
 // this 306px panel and would otherwise paint outside the pill's own border.
 component ObjectFact(label:str, value:str)
-  box #root w=fill px=12.0 py=9.0 border=card_line border-w=1.0 r=8.0 clip=true
-    row w=fill gap=10.0 align=center
-      text label size=11.0 wrap=none font=code @text-meta
+  box #root
+    with
+      w=fill
+      px=12.0
+      py=9.0
+      border=card_line
+      border-w=1.0
+      r=8.0
+      clip=true
+    row
+      with
+        w=fill
+        gap=10.0
+        align=center
+      text label
+        with
+          size=11.0
+          wrap=none
+          font=code
+          @text-meta
       space w=fill
-      text value size=11.0 wrap=none font=code @text-secondary_fg
+      text value
+        with
+          size=11.0
+          wrap=none
+          font=code
+          @text-secondary_fg
 
 // EXPLORER — one result. Presentational on purpose: the card carries no route,
 // because where a hit opens is the screen's decision, so `view.ice` wraps this
 // in the button that navigates.
 component ExplorerCard(hit:ExplorerHit)
-  box #root w=fill px=15.0 py=13.0 bg=surface border=separator border-w=1.0 r=11.0 clip=true
-    row w=fill gap=12.0 align=start
+  box #root
+    with
+      w=fill
+      px=15.0
+      py=13.0
+      bg=surface
+      border=separator
+      border-w=1.0
+      r=11.0
+      clip=true
+    row
+      with
+        w=fill
+        gap=12.0
+        align=start
       ExplorerKindPlate kind=hit.kind code=hit.code
       col w=fill gap=3.0
-        row w=fill gap=8.0 align=center
-          text hit.title w=fill size=13.0 wrap=none font=display @text-primary
+        row
+          with
+            w=fill
+            gap=8.0
+            align=center
+          text hit.title
+            with
+              w=fill
+              size=13.0
+              wrap=none
+              font=display
+              @text-primary
           ExplorerKindBadge kind=hit.kind
         // the snippet is raw message/page body of any length — it wraps, the
         // same way chat's own search hits do. The title and meta stay single
         // runs and are held inside the card by the clip.
-        text hit.snippet w=fill size=12.0 wrap=word line-h=1.5 @text-input
-        text hit.meta w=fill size=10.5 wrap=none font=code @text-label
+        text hit.snippet
+          with
+            w=fill
+            size=12.0
+            wrap=word
+            line-h=1.5
+            @text-input
+        text hit.meta
+          with
+            w=fill
+            size=10.5
+            wrap=none
+            font=code
+            @text-label
 
 // The 28px mono plate. Kind reads before the text does: one ink and one wash
 // per source, never a shared grey. `message` is the fallback tone.
@@ -266,23 +589,95 @@ component ExplorerKindPlate(kind:str, code:str)
   col #root
     match kind
       "page"
-        box w=28.0 h=28.0 align-x=center align-y=center bg=kind_page_bg r=8.0
-          text code size=10.0 wrap=none font=code_semibold @text-kind_page
+        box
+          with
+            w=28.0
+            h=28.0
+            align-x=center
+            align-y=center
+            bg=kind_page_bg
+            r=8.0
+          text code
+            with
+              size=10.0
+              wrap=none
+              font=code_semibold
+              @text-kind_page
       "code"
-        box w=28.0 h=28.0 align-x=center align-y=center bg=kind_code_bg r=8.0
-          text code size=10.0 wrap=none font=code_semibold @text-kind_code
+        box
+          with
+            w=28.0
+            h=28.0
+            align-x=center
+            align-y=center
+            bg=kind_code_bg
+            r=8.0
+          text code
+            with
+              size=10.0
+              wrap=none
+              font=code_semibold
+              @text-kind_code
       "file"
-        box w=28.0 h=28.0 align-x=center align-y=center bg=kind_file_bg r=8.0
-          text code size=10.0 wrap=none font=code_semibold @text-kind_file
+        box
+          with
+            w=28.0
+            h=28.0
+            align-x=center
+            align-y=center
+            bg=kind_file_bg
+            r=8.0
+          text code
+            with
+              size=10.0
+              wrap=none
+              font=code_semibold
+              @text-kind_file
       "run"
-        box w=28.0 h=28.0 align-x=center align-y=center bg=kind_run_bg r=8.0
-          text code size=10.0 wrap=none font=code_semibold @text-kind_run
+        box
+          with
+            w=28.0
+            h=28.0
+            align-x=center
+            align-y=center
+            bg=kind_run_bg
+            r=8.0
+          text code
+            with
+              size=10.0
+              wrap=none
+              font=code_semibold
+              @text-kind_run
       "task"
-        box w=28.0 h=28.0 align-x=center align-y=center bg=kind_task_bg r=8.0
-          text code size=10.0 wrap=none font=code_semibold @text-kind_task
+        box
+          with
+            w=28.0
+            h=28.0
+            align-x=center
+            align-y=center
+            bg=kind_task_bg
+            r=8.0
+          text code
+            with
+              size=10.0
+              wrap=none
+              font=code_semibold
+              @text-kind_task
       _
-        box w=28.0 h=28.0 align-x=center align-y=center bg=info_bg r=8.0
-          text code size=10.0 wrap=none font=code_semibold @text-info
+        box
+          with
+            w=28.0
+            h=28.0
+            align-x=center
+            align-y=center
+            bg=info_bg
+            r=8.0
+          text code
+            with
+              size=10.0
+              wrap=none
+              font=code_semibold
+              @text-info
 
 // The badge beside the title, on the same tint pair as the plate. The artifact
 // sets it at 8.5px, which is not a step on the type scale; 9px is the badge
@@ -291,20 +686,80 @@ component ExplorerKindBadge(kind:str)
   col #root
     match kind
       "page"
-        box px=5.0 py=2.0 bg=kind_page_bg r=4.0
-          text "PAGE" size=9.0 wrap=none font=code_semibold @text-kind_page
+        box
+          with
+            px=5.0
+            py=2.0
+            bg=kind_page_bg
+            r=4.0
+          text "PAGE"
+            with
+              size=9.0
+              wrap=none
+              font=code_semibold
+              @text-kind_page
       "code"
-        box px=5.0 py=2.0 bg=kind_code_bg r=4.0
-          text "CODE" size=9.0 wrap=none font=code_semibold @text-kind_code
+        box
+          with
+            px=5.0
+            py=2.0
+            bg=kind_code_bg
+            r=4.0
+          text "CODE"
+            with
+              size=9.0
+              wrap=none
+              font=code_semibold
+              @text-kind_code
       "file"
-        box px=5.0 py=2.0 bg=kind_file_bg r=4.0
-          text "FILE" size=9.0 wrap=none font=code_semibold @text-kind_file
+        box
+          with
+            px=5.0
+            py=2.0
+            bg=kind_file_bg
+            r=4.0
+          text "FILE"
+            with
+              size=9.0
+              wrap=none
+              font=code_semibold
+              @text-kind_file
       "run"
-        box px=5.0 py=2.0 bg=kind_run_bg r=4.0
-          text "RUN" size=9.0 wrap=none font=code_semibold @text-kind_run
+        box
+          with
+            px=5.0
+            py=2.0
+            bg=kind_run_bg
+            r=4.0
+          text "RUN"
+            with
+              size=9.0
+              wrap=none
+              font=code_semibold
+              @text-kind_run
       "task"
-        box px=5.0 py=2.0 bg=kind_task_bg r=4.0
-          text "TASK" size=9.0 wrap=none font=code_semibold @text-kind_task
+        box
+          with
+            px=5.0
+            py=2.0
+            bg=kind_task_bg
+            r=4.0
+          text "TASK"
+            with
+              size=9.0
+              wrap=none
+              font=code_semibold
+              @text-kind_task
       _
-        box px=5.0 py=2.0 bg=info_bg r=4.0
-          text "MESSAGE" size=9.0 wrap=none font=code_semibold @text-info
+        box
+          with
+            px=5.0
+            py=2.0
+            bg=info_bg
+            r=4.0
+          text "MESSAGE"
+            with
+              size=9.0
+              wrap=none
+              font=code_semibold
+              @text-info

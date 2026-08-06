@@ -6,7 +6,22 @@ view
   // between open and register.
   col w=fill h=fill
     if (console_win != some(window)) && (huddle_win != some(window))
-      HubColumn step=hub_step key_state=hub_key_state networks=hub_networks selected=hub_selected hidden=hub_hidden name=onboarding_name invite=invite_link reveal=reveal_words steps=provision_steps step_index=provision_index height=block_height tier=member_tier(members_rows) error=onboarding_error busy=(mutation_phase != "idle")
+      HubColumn
+        with
+          step=hub_step
+          key_state=hub_key_state
+          networks=hub_networks
+          selected=hub_selected
+          hidden=hub_hidden
+          name=onboarding_name
+          invite=invite_link
+          reveal=reveal_words
+          steps=provision_steps
+          step_index=provision_index
+          height=block_height
+          tier=member_tier(members_rows)
+          error=onboarding_error
+          busy=(mutation_phase != "idle")
         events
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
@@ -29,7 +44,16 @@ view
     // window instead of a card wearing drawn traffic lights. Its close button
     // docks (see `window_was_closed`); leaving the huddle closes it.
     if huddle_win == some(window)
-      HuddlePanel channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at) roster=huddle_roster status=call_status muted=call_muted peers=call_peers camera=call_camera video_live=call_video_live #huddle
+      HuddlePanel #huddle
+        with
+          channel=huddle_channel_name
+          elapsed=mmss(huddle_now - huddle_joined_at)
+          roster=huddle_roster
+          status=call_status
+          muted=call_muted
+          peers=call_peers
+          camera=call_camera
+          video_live=call_video_live
         events
           dock_huddle -> dock_huddle
           huddle_go_channel -> huddle_go_channel
@@ -37,7 +61,26 @@ view
           toggle_call_mute -> toggle_call_mute
           toggle_call_camera -> toggle_call_camera
     if console_win == some(window)
-      WorkspaceTabs network=network_name status=status height=block_height loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab bell_count=bell_unread bell_sev=bell_worst_severity(bell_items) approvals=open_proposals(gov_rows) account=account_name agent_live=any_agent_active(agents_rows) tier=member_tier(members_rows) root_hash=node_root_hash consensus_view=node_view_label quorum=node_quorum_label reachable=node_reachable_label last_finalized=node_last_finalized checkpoint=node_checkpoint #workspace-tabs
+      WorkspaceTabs #workspace-tabs
+        with
+          network=network_name
+          status
+          height=block_height
+          loading=(loading || mutation_phase != "idle")
+          degraded=connection_degraded(status)
+          tab=shell_tab
+          bell_count=bell_unread
+          bell_sev=bell_worst_severity(bell_items)
+          approvals=open_proposals(gov_rows)
+          account=account_name
+          agent_live=any_agent_active(agents_rows)
+          tier=member_tier(members_rows)
+          root_hash=node_root_hash
+          consensus_view=node_view_label
+          quorum=node_quorum_label
+          reachable=node_reachable_label
+          last_finalized=node_last_finalized
+          checkpoint=node_checkpoint
         events
           select_shell_tab -> select_shell_tab _
           toggle_bell -> toggle_bell
@@ -45,18 +88,107 @@ view
         notice:
           col w=fill
             if error != ""
-              box w=fill pl=12.0 pr=12.0 pb=8.0
-                box w=fill p=8.0 bg=danger_bg border=danger_line border-w=1.0 r=12.0
-                  row w=fill gap=8.0 align=center
-                    box w=20.0 h=20.0 align-x=center align-y=center bg=danger_dot r=10.0
-                      text "!" size=14.0 font=medium @text-danger_fg
-                    text error w=fill size=13.5 @text-fg
-                    button "Dismiss" h=26.0 p=5.0 @ghost_action -> dismiss_error
+              box
+                with
+                  w=fill
+                  pl=12.0
+                  pr=12.0
+                  pb=8.0
+                box
+                  with
+                    w=fill
+                    p=8.0
+                    bg=danger_bg
+                    border=danger_line
+                    border-w=1.0
+                    r=12.0
+                  row
+                    with
+                      w=fill
+                      gap=8.0
+                      align=center
+                    box
+                      with
+                        w=20.0
+                        h=20.0
+                        align-x=center
+                        align-y=center
+                        bg=danger_dot
+                        r=10.0
+                      text "!"
+                        with
+                          size=14.0
+                          font=medium
+                          @text-danger_fg
+                    text error
+                      with
+                        w=fill
+                        size=13.5
+                        @text-fg
+                    button "Dismiss" -> dismiss_error
+                      with
+                        h=26.0
+                        p=5.0
+                        @ghost_action
                       active bg=transparent text=muted r=7.0
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
         chat:
-          ChatScreen network_name=network_name status=status block_height=block_height search_draft<->chat_search_draft searching=chat_searching search_hits=chat_search_hits channels=channels dm_peers=dm_peers channel_reads=channel_reads user_key=settings_user_key channel_create_open=channel_create_open connected=connected loading=loading mutation_phase=mutation_phase active_channel=active_channel active_dm_peer=active_dm_peer active_channel_name=active_channel_name active_channel_archived=active_channel_archived active_channel_members_only=active_channel_members_only channel_members=channel_members huddle_joined=huddle_joined huddle_channel=huddle_channel huddle_channel_name=huddle_channel_name huddle_joined_at=huddle_joined_at huddle_now=huddle_now call_muted=call_muted huddle_popped=(huddle_win != none) messages=messages has_older_history=has_older_history history_view=history_view history_loading=history_loading unread_boundary=unread_boundary unread_marker_seq=unread_marker_seq selected_message_seq=selected_message_seq selected_message_rev=selected_message_rev send_flash_id=send_flash_id send_flash_value=animation.interpolate(send_flash, 0.0, 1.0) message_action=message_action message_menu_y=message_menu_y message_action_focus<->message_action_focus message_edit_draft<->message_edit_draft failed_message_draft=failed_message_draft message_editor<->message_editor channel_settings_open=channel_settings_open channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft active_thread_seq=active_thread_seq thread_target_seq=thread_target_seq thread_messages=thread_messages thread_selected_seq=thread_selected_seq thread_selected_rev=thread_selected_rev thread_message_action=thread_message_action thread_menu_y=thread_menu_y thread_send_flash_id=thread_send_flash_id thread_edit_draft<->thread_edit_draft thread_has_more=thread_has_more thread_next_reply_offset=thread_next_reply_offset thread_loading=thread_loading failed_reply_draft=failed_reply_draft reply_editor<->reply_editor shift_held=shift_held #chat
+          ChatScreen search_draft<->chat_search_draft message_action_focus<->message_action_focus message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
+            with
+              network_name
+              status
+              block_height
+              searching=chat_searching
+              search_hits=chat_search_hits
+              channels
+              dm_peers
+              channel_reads
+              user_key=settings_user_key
+              channel_create_open
+              connected
+              loading
+              mutation_phase
+              active_channel
+              active_dm_peer
+              active_channel_name
+              active_channel_archived
+              active_channel_members_only
+              channel_members
+              huddle_joined
+              huddle_channel
+              huddle_channel_name
+              huddle_joined_at
+              huddle_now
+              call_muted
+              huddle_popped=(huddle_win != none)
+              messages
+              has_older_history
+              history_view
+              history_loading
+              unread_boundary
+              unread_marker_seq
+              selected_message_seq
+              selected_message_rev
+              send_flash_id
+              send_flash_value=animation.interpolate(send_flash, 0.0, 1.0)
+              message_action
+              message_menu_y
+              failed_message_draft
+              channel_settings_open
+              active_thread_seq
+              thread_target_seq
+              thread_messages
+              thread_selected_seq
+              thread_selected_rev
+              thread_message_action
+              thread_menu_y
+              thread_send_flash_id
+              thread_has_more
+              thread_next_reply_offset
+              thread_loading
+              failed_reply_draft
+              shift_held
             events
               search_chat_submit -> search_chat_submit
               clear_chat_search -> clear_chat_search
@@ -109,7 +241,39 @@ view
               thread_resized -> thread_resized _ _
 
         pages:
-          PagesScreen pages=pages page_create_open=page_create_open loading=loading mutation_phase=mutation_phase connected=connected connected_rpc=connected_rpc password=password dark=(appearance == "dark") page_draft<->page_draft active_page=active_page active_page_title=active_page_title active_page_parent=active_page_parent page_search_draft<->page_search_draft page_searching=page_searching page_search_hits=page_search_hits page_delete_armed=page_delete_armed block_autosave_status=block_autosave_status page_refusal=page_refusal doc_tabs=doc_tabs blocks=blocks commented_block_ids=commented_block_ids caret_comment_target=caret_comment_target active_thread_target=active_thread_target orphaned_comment_drafts=orphaned_comment_drafts page_editor<->page_editor block_comments_open=block_comments_open block_comment_thread_total=block_comment_thread_total block_comment_threads=block_comment_threads block_comment_threads_loading=block_comment_threads_loading block_comment_threads_has_more=block_comment_threads_has_more active_block_comment_thread=active_block_comment_thread block_thread_comments=block_thread_comments block_thread_comments_loading=block_thread_comments_loading block_thread_comments_has_more=block_thread_comments_has_more block_comment_draft<->block_comment_draft #pages
+          PagesScreen page_draft<->page_draft page_search_draft<->page_search_draft page_editor<->page_editor block_comment_draft<->block_comment_draft #pages
+            with
+              pages
+              page_create_open
+              loading
+              mutation_phase
+              connected
+              connected_rpc
+              password
+              dark=(appearance == "dark")
+              active_page
+              active_page_title
+              active_page_parent
+              page_searching
+              page_search_hits
+              page_delete_armed
+              block_autosave_status
+              page_refusal
+              doc_tabs
+              blocks
+              commented_block_ids
+              caret_comment_target
+              active_thread_target
+              orphaned_comment_drafts
+              block_comments_open
+              block_comment_thread_total
+              block_comment_threads
+              block_comment_threads_loading
+              block_comment_threads_has_more
+              active_block_comment_thread
+              block_thread_comments
+              block_thread_comments_loading
+              block_thread_comments_has_more
             events
               toggle_page_create -> toggle_page_create
               create_page_submit -> create_page_submit
@@ -134,7 +298,21 @@ view
               resolve_thread_submit -> resolve_thread_submit _
 
         files:
-          FilesScreen path=fs_path entries=fs_entries loading=fs_loading new_name<->fs_new_name preview_path=fs_preview_path delete_target=fs_delete_target history_open=fs_history_open diff_from=fs_diff_from diff=fs_diff history=fs_history preview_truncated=fs_preview_truncated preview_binary=fs_preview_binary editing=fs_editing draft<->fs_editor preview_text=fs_preview_text
+          FilesScreen new_name<->fs_new_name draft<->fs_editor
+            with
+              path=fs_path
+              entries=fs_entries
+              loading=fs_loading
+              preview_path=fs_preview_path
+              delete_target=fs_delete_target
+              history_open=fs_history_open
+              diff_from=fs_diff_from
+              diff=fs_diff
+              history=fs_history
+              preview_truncated=fs_preview_truncated
+              preview_binary=fs_preview_binary
+              editing=fs_editing
+              preview_text=fs_preview_text
             events
               fs_open_dir -> fs_open_dir _
               fs_open_file -> fs_open_file _
@@ -152,7 +330,15 @@ view
               fs_cancel_edit -> fs_cancel_edit
               fs_save_edit -> fs_save_edit
         members:
-          MembersScreen rows=members_rows validators=members_validators residents=members_residents filter=members_filter selected=members_selected admin=members_is_admin(members_rows) answered=members_answered
+          MembersScreen
+            with
+              rows=members_rows
+              validators=members_validators
+              residents=members_residents
+              filter=members_filter
+              selected=members_selected
+              admin=members_is_admin(members_rows)
+              answered=members_answered
             events
               pick_members_filter -> pick_members_filter _
               open_member -> open_member _
@@ -162,7 +348,54 @@ view
         agents:
           AgentsScreen rows=agents_rows answered=agents_answered
         forge:
-          ForgeScreen org=network_name about=account_bio tier=member_tier(members_rows) repos=forge_repos open_repo=forge_repo repo_menu=forge_repo_menu branches=forge_branches tab=forge_tab items=forge_items tree_repo=forge_tree_repo tree_path=forge_tree_path tree_entries=forge_tree_entries file_path=forge_file_path file_text=forge_file_text file_binary=forge_file_binary file_truncated=forge_file_truncated forge_item_number=forge_item_number forge_item_kind=forge_item_kind forge_item_title=forge_item_title forge_item_state=forge_item_state forge_item_author=forge_item_author forge_item_branches=forge_item_branches forge_item_body=forge_item_body forge_item_files_changed=forge_item_files_changed forge_item_additions=forge_item_additions forge_item_deletions=forge_item_deletions forge_item_diff=forge_item_diff forge_item_diff_truncated=forge_item_diff_truncated forge_item_merge_oid=forge_item_merge_oid forge_item_source_oid=forge_item_source_oid forge_item_channel=forge_item_channel forge_item_approvals=forge_item_approvals forge_item_change_requests=forge_item_change_requests forge_item_reviews=forge_item_reviews merge_conflicts=forge_merge_conflicts merge_busy=forge_merge_busy review_verdict=forge_review_verdict review_draft<->forge_review_draft review_busy=forge_review_busy comment_target=forge_comment_target(forge_comment_path, forge_comment_line, forge_comment_side) comment_draft<->forge_comment_draft staged_comments=forge_comment_staged answered=forge_answered discussion=forge_discussion discussion_editor<->forge_discussion_editor discussion_pending=forge_discussion_pending connected=connected loading=loading shift_held=shift_held
+          ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
+            with
+              org=network_name
+              about=account_bio
+              tier=member_tier(members_rows)
+              repos=forge_repos
+              open_repo=forge_repo
+              repo_menu=forge_repo_menu
+              branches=forge_branches
+              tab=forge_tab
+              items=forge_items
+              tree_repo=forge_tree_repo
+              tree_path=forge_tree_path
+              tree_entries=forge_tree_entries
+              file_path=forge_file_path
+              file_text=forge_file_text
+              file_binary=forge_file_binary
+              file_truncated=forge_file_truncated
+              forge_item_number
+              forge_item_kind
+              forge_item_title
+              forge_item_state
+              forge_item_author
+              forge_item_branches
+              forge_item_body
+              forge_item_files_changed
+              forge_item_additions
+              forge_item_deletions
+              forge_item_diff
+              forge_item_diff_truncated
+              forge_item_merge_oid
+              forge_item_source_oid
+              forge_item_channel
+              forge_item_approvals
+              forge_item_change_requests
+              forge_item_reviews
+              merge_conflicts=forge_merge_conflicts
+              merge_busy=forge_merge_busy
+              review_verdict=forge_review_verdict
+              review_busy=forge_review_busy
+              comment_target=forge_comment_target(forge_comment_path, forge_comment_line, forge_comment_side)
+              staged_comments=forge_comment_staged
+              answered=forge_answered
+              discussion=forge_discussion
+              discussion_pending=forge_discussion_pending
+              connected
+              loading
+              shift_held
             events
               forge_open_repo -> forge_open_repo _
               forge_close_repo -> forge_close_repo
@@ -181,12 +414,51 @@ view
               forge_comment_drop -> forge_comment_drop _
               note_composer_event -> forge_composer_event _
         governance:
-          GovernanceScreen rows=gov_rows voting=gov_voting admin=members_is_admin(members_rows) answered=gov_answered
+          GovernanceScreen
+            with
+              rows=gov_rows
+              voting=gov_voting
+              admin=members_is_admin(members_rows)
+              answered=gov_answered
             events
               gov_vote -> gov_vote _ _
               gov_execute -> gov_execute _
         settings:
-          SettingsScreen account_name=account_name network_name=network_name settings_endpoint=settings_endpoint settings_node_key=settings_node_key settings_height=settings_height settings_data_dir=settings_data_dir settings_key_state=settings_key_state settings_key_path=settings_key_path settings_open_tabs=settings_open_tabs members_rows=members_rows members_validators=members_validators members_residents=members_residents account_id=account_id account_name_draft<->account_name_draft account_renaming=account_renaming account_members=account_members account_nodes=account_nodes appearance=appearance password=password status=status loading=loading connected=connected mutation_phase=mutation_phase node_tab=node_tab module_rows=module_rows block_height=block_height node_checkpoint=node_checkpoint node_last_finalized=node_last_finalized node_reachable_label=node_reachable_label node_quorum_label=node_quorum_label node_version=node_version node_root_hash=node_root_hash node_peers=node_peers node_log_filter<->node_log_filter node_log_lines=node_log_lines
+          SettingsScreen account_name_draft<->account_name_draft node_log_filter<->node_log_filter
+            with
+              account_name
+              network_name
+              settings_endpoint
+              settings_node_key
+              settings_height
+              settings_data_dir
+              settings_key_state
+              settings_key_path
+              settings_open_tabs
+              members_rows
+              members_validators
+              members_residents
+              account_id
+              account_renaming
+              account_members
+              account_nodes
+              appearance
+              password
+              status
+              loading
+              connected
+              mutation_phase
+              node_tab
+              module_rows
+              block_height
+              node_checkpoint
+              node_last_finalized
+              node_reachable_label
+              node_quorum_label
+              node_version
+              node_root_hash
+              node_peers
+              node_log_lines
             events
               select_shell_tab -> select_shell_tab _
               reconnect -> reconnect
@@ -204,7 +476,17 @@ view
               set_appearance_light -> set_appearance_light
               set_appearance_dark -> set_appearance_dark
         explorer:
-          ExplorerScreen query<->explorer_query connected=connected searching=explorer_searching loading=explorer_loading kinds=explorer_kinds kind=explorer_kind hits=explorer_hits blocks=explorer_blocks selected=explorer_selected ops=explorer_ops
+          ExplorerScreen query<->explorer_query
+            with
+              connected
+              searching=explorer_searching
+              loading=explorer_loading
+              kinds=explorer_kinds
+              kind=explorer_kind
+              hits=explorer_hits
+              blocks=explorer_blocks
+              selected=explorer_selected
+              ops=explorer_ops
             events
               explorer_search_submit -> explorer_search_submit
               clear_explorer_search -> clear_explorer_search
@@ -212,7 +494,14 @@ view
               pick_explorer_kind -> pick_explorer_kind _
               select_explorer_block -> select_explorer_block _
         huddle:
-          box w=fill h=fill align-x=end align-y=end pr=16.0 pb=16.0
+          box
+            with
+              w=fill
+              h=fill
+              align-x=end
+              align-y=end
+              pr=16.0
+              pb=16.0
             col
               // The pill says "you are still in a call elsewhere". It hides while
               // the huddle has its own window, and where the live pill in the
@@ -221,11 +510,26 @@ view
               // when that channel is the selected one, which the missing
               // `shell_tab` term used to suppress.
               if huddle_joined && (huddle_win == none) && (shell_tab != "chat" || huddle_channel != active_channel)
-                HuddleDockedPill channel=huddle_channel_name elapsed=mmss(huddle_now - huddle_joined_at)
+                HuddleDockedPill
+                  with
+                    channel=huddle_channel_name
+                    elapsed=mmss(huddle_now - huddle_joined_at)
                   events
                     pop_huddle -> pop_huddle
         palette:
-          OverlayLayer create_open=channel_create_open members_only=channel_create_members_only draft<->channel_draft busy=(mutation_phase != "idle") connected=connected loading=loading toast=toast tone=toast_tone open=palette_open query<->palette_draft searching=palette_searching chat_hits=palette_chat_hits page_hits=palette_page_hits #overlays
+          OverlayLayer draft<->channel_draft query<->palette_draft #overlays
+            with
+              create_open=channel_create_open
+              members_only=channel_create_members_only
+              busy=(mutation_phase != "idle")
+              connected
+              loading
+              toast
+              tone=toast_tone
+              open=palette_open
+              searching=palette_searching
+              chat_hits=palette_chat_hits
+              page_hits=palette_page_hits
             events
               toggle_channel_create -> toggle_channel_create
               toggle_channel_create_members_only -> toggle_channel_create_members_only
@@ -238,30 +542,97 @@ view
         bell:
           stack w=fill h=fill
             if bell_open
-              button label="Close notifications" w=fill h=fill p=0.0 @icon_action -> close_bell
+              button -> close_bell
+                with
+                  label="Close notifications"
+                  w=fill
+                  h=fill
+                  p=0.0
+                  @icon_action
                 space w=fill h=fill
                 active bg=transparent border=transparent
             if bell_open
-              box w=fill h=fill align-x=end align-y=start pt=44.0 pr=13.0
-                box w=342.0 bg=surface border=border border-w=1.0 r=13.0 clip=true shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0
+              box
+                with
+                  w=fill
+                  h=fill
+                  align-x=end
+                  align-y=start
+                  pt=44.0
+                  pr=13.0
+                box
+                  with
+                    w=342.0
+                    bg=surface
+                    border=border
+                    border-w=1.0
+                    r=13.0
+                    clip=true
+                    shadow=shadow_modal
+                    shadow-y=16.0
+                    shadow-blur=40.0
                   col w=fill
-                    box w=fill pl=13.0 pr=13.0 pt=11.0 pb=9.0
-                      row w=fill gap=8.0 align=center
-                        text "Alerts" size=12.5 wrap=none @text-primary
-                        text bell_unread size=10.5 wrap=none font=code_medium @text-meta
-                        text "unread" size=12.5 wrap=none @text-meta
+                    box
+                      with
+                        w=fill
+                        pl=13.0
+                        pr=13.0
+                        pt=11.0
+                        pb=9.0
+                      row
+                        with
+                          w=fill
+                          gap=8.0
+                          align=center
+                        text "Alerts"
+                          with
+                            size=12.5
+                            wrap=none
+                            @text-primary
+                        text bell_unread
+                          with
+                            size=10.5
+                            wrap=none
+                            font=code_medium
+                            @text-meta
+                        text "unread"
+                          with
+                            size=12.5
+                            wrap=none
+                            @text-meta
                         space w=fill
-                        button "Mark all read" disabled=(bell_unread <= 0) h=22.0 p=4.0 @ghost_action -> mark_bell_read_submit
+                        button "Mark all read" -> mark_bell_read_submit
+                          with
+                            disabled=(bell_unread <= 0)
+                            h=22.0
+                            p=4.0
+                            @ghost_action
                           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                           hovered bg=elevated text=brand
                           pressed bg=subtle text=brand
-                    box w=fill h=1.0 bg=separator
+                    box
+                      with
+                        w=fill
+                        h=1.0
+                        bg=separator
                       space w=1.0 h=1.0
                     if empty(bell_items)
-                      box w=fill p=26.0 align-x=center
+                      box
+                        with
+                          w=fill
+                          p=26.0
+                          align-x=center
                         text "Nothing yet — mentions and deliveries land here." size=12.0 @text-meta
                     if !empty(bell_items)
-                      scroll dir=vertical w=fill h=290.0
-                        col w=fill p=5.0 gap=1.0
+                      scroll
+                        with
+                          dir=vertical
+                          w=fill
+                          h=290.0
+                        col
+                          with
+                            w=fill
+                            p=5.0
+                            gap=1.0
                           for item in bell_items
                             BellRow item=item
