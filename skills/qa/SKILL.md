@@ -54,6 +54,29 @@ exactly this limit.
 For the embedding harness (`simnode::boot`) and the chat wire facts, see the
 `sim-lane` skill.
 
+### On macOS: the first exec of a fresh build pays Gatekeeper
+
+The FIRST exec of any freshly built binary is scanned whole-file by
+syspolicyd before it runs. Measured 2026-08-06 on macmini-duke: 3.2 s wall at
+0% process CPU for the ~1 GB debug `ducktape`, 0.012 s once cached — and the
+cache keys on the binary's hash, so **every rebuild pays it again on first
+run**. Signing does not help: arm64 binaries are already ad-hoc signed by the
+linker, and a Developer ID identity doesn't survive a rebuild's new hash
+either (notarization is for quarantined downloads, not local builds).
+
+Two remedies, use both:
+- The app pre-warms its signer CLI at launch-window open (`hub_state()`
+  spawns `ducktape --version` fire-and-forget), so the scan finishes while
+  the password is being typed.
+- On a dev Mac, grant the terminal the **Developer Tools** exception
+  (System Settings → Privacy & Security → Developer Tools; surface the pane
+  with `sudo spctl developer-mode enable-terminal`). Locally built products
+  of an exempted terminal skip the first-run scan entirely.
+
+A Linux box structurally cannot reproduce this class — when a Mac feels
+seconds slower than the rig on a first action after a rebuild, time the CLI
+twice on the Mac before suspecting the app.
+
 ## Live node inspection
 
 A running daemon (`cargo run -p noded`, or a workspace node seeded by
