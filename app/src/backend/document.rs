@@ -108,7 +108,14 @@ pub fn installed_page_editor(
     canonical: String,
 ) -> iced::widget::text_editor::Content {
     match install {
-        true => iced::widget::text_editor::Content::with_text(&canonical),
+        true => {
+            // The buffer is another page's now: undoing across the swap would
+            // restore the PREVIOUS page's text here, and a menu opened on it
+            // would hang over unrelated lines.
+            crate::pages::history::reset();
+            crate::pages::menu::close();
+            iced::widget::text_editor::Content::with_text(&canonical)
+        }
         false => document,
     }
 }

@@ -5,7 +5,7 @@ version.workspace = true
 publish = false
 
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "8066d99", version = "=0.1.0" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "66ccc13", version = "=0.1.0" }
 
 [dependencies]
 chat.workspace = true
@@ -39,9 +39,9 @@ zune-jpeg = "0.4"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "image-without-codecs", "lazy", "svg", "tokio", "wgpu", "x11"] }
-ducktape-ui = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "8066d99", default-features = false, features = ["full"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "8066d99" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "8066d99", version = "=0.1.0" }
+ducktape-ui = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "66ccc13", default-features = false, features = ["full"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "66ccc13" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "66ccc13", version = "=0.1.0" }
 
 [dev-dependencies]
 commonware-cryptography.workspace = true
