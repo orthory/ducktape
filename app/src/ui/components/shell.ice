@@ -68,12 +68,16 @@ component StatusPill(degraded:bool, loading:bool)
 // The 284px card behind the pill: what this node knows about the chain it is
 // standing on. Every value comes off /v1/status through `load_node_facts`.
 //
+// The card owns its own paper — same surface the bell card wears, r13 over the
+// 16/40 modal shadow — because the tooltip frame around it must stay
+// transparent to carry the edge gutter (see the mount below).
+//
 // OMITTED, not faked: the `gossip` row (NodeFacts carries peers_live/total but
 // no state field holds them) and the 26-bar sparkline (it needs the newest 26
 // of a 100-block window with a clamped bar height, and neither a slice nor a
 // clamp exists as a helper). Both are named in the handoff report.
 component StatusCard(degraded:bool, loading:bool, height:i64, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
-  box #root w=284.0 pl=14.0 pr=14.0 pt=13.0 pb=13.0
+  box #root w=284.0 pl=14.0 pr=14.0 pt=13.0 pb=13.0 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0
     col w=fill gap=11.0
       row w=fill gap=7.0 align=center
         StatusDot degraded=degraded loading=loading plate=7.0
@@ -153,9 +157,16 @@ component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_ba
             switch_network
         space w=fill
         row gap=6.0 align=center
-          tooltip position=bottom gap=6.0 p=0.0 delay=90 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0
+          // The pill sits ~78px from the window's right wall and the card is
+          // 284 wide, so the tip ALWAYS overflows — and an overflowing tooltip
+          // is snapped hard to the viewport edge, with no inset of its own.
+          // The frame is therefore transparent and carries a 13px right gutter,
+          // which lands the card's right edge on the same line the bell card
+          // holds (view.ice `pr=13.0`) instead of glued to the wall.
+          tooltip position=bottom gap=6.0 p=0.0 delay=90 style=transparent
             StatusPill degraded=degraded loading=loading
-            StatusCard degraded=degraded loading=loading height=height tier=tier root_hash=root_hash consensus_view=consensus_view quorum=quorum reachable=reachable last_finalized=last_finalized checkpoint=checkpoint
+            box pr=13.0
+              StatusCard degraded=degraded loading=loading height=height tier=tier root_hash=root_hash consensus_view=consensus_view quorum=quorum reachable=reachable last_finalized=last_finalized checkpoint=checkpoint
           stack w=26.0 h=24.0
             button label="Alerts" p=5.0 @icon_action -> emit(toggle_bell)
               col align=center
