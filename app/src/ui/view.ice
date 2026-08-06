@@ -109,7 +109,7 @@ view
               thread_resized -> thread_resized _ _
 
         pages:
-          PagesScreen pages=pages page_create_open=page_create_open loading=loading mutation_phase=mutation_phase connected=connected connected_rpc=connected_rpc password=password dark=(appearance == "dark") page_draft<->page_draft active_page=active_page active_page_title=active_page_title active_page_parent=active_page_parent page_search_draft<->page_search_draft page_searching=page_searching page_search_hits=page_search_hits page_delete_armed=page_delete_armed block_autosave_status=block_autosave_status page_refusal=page_refusal doc_tabs=doc_tabs blocks=blocks orphaned_comment_drafts=orphaned_comment_drafts page_editor<->page_editor block_comments_open=block_comments_open block_comment_thread_total=block_comment_thread_total block_comment_threads=block_comment_threads block_comment_threads_loading=block_comment_threads_loading block_comment_threads_has_more=block_comment_threads_has_more active_block_comment_thread=active_block_comment_thread block_thread_comments=block_thread_comments block_thread_comments_loading=block_thread_comments_loading block_thread_comments_has_more=block_thread_comments_has_more block_comment_draft<->block_comment_draft #pages
+          PagesScreen pages=pages page_create_open=page_create_open loading=loading mutation_phase=mutation_phase connected=connected connected_rpc=connected_rpc password=password dark=(appearance == "dark") page_draft<->page_draft active_page=active_page active_page_title=active_page_title active_page_parent=active_page_parent page_search_draft<->page_search_draft page_searching=page_searching page_search_hits=page_search_hits page_delete_armed=page_delete_armed block_autosave_status=block_autosave_status page_refusal=page_refusal doc_tabs=doc_tabs blocks=blocks commented_block_ids=commented_block_ids caret_comment_target=caret_comment_target active_thread_target=active_thread_target orphaned_comment_drafts=orphaned_comment_drafts page_editor<->page_editor block_comments_open=block_comments_open block_comment_thread_total=block_comment_thread_total block_comment_threads=block_comment_threads block_comment_threads_loading=block_comment_threads_loading block_comment_threads_has_more=block_comment_threads_has_more active_block_comment_thread=active_block_comment_thread block_thread_comments=block_thread_comments block_thread_comments_loading=block_thread_comments_loading block_thread_comments_has_more=block_thread_comments_has_more block_comment_draft<->block_comment_draft #pages
             events
               toggle_page_create -> toggle_page_create
               create_page_submit -> create_page_submit
@@ -126,11 +126,12 @@ view
               page_edited -> page_edited _
               toggle_block_comments -> toggle_block_comments
               close_block_comments -> close_block_comments
-              open_block_comment_thread -> open_block_comment_thread _
+              open_block_comment_thread -> open_block_comment_thread _ _
               load_more_block_threads -> load_more_block_threads
               close_block_comment_thread -> close_block_comment_thread
               load_more_block_comments -> load_more_block_comments
               post_block_comment_submit -> post_block_comment_submit
+              resolve_thread_submit -> resolve_thread_submit _
 
         files:
           FilesScreen path=fs_path entries=fs_entries loading=fs_loading new_name<->fs_new_name preview_path=fs_preview_path delete_target=fs_delete_target history_open=fs_history_open diff_from=fs_diff_from diff=fs_diff history=fs_history preview_truncated=fs_preview_truncated preview_binary=fs_preview_binary editing=fs_editing draft<->fs_editor preview_text=fs_preview_text

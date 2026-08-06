@@ -138,6 +138,8 @@ fn live_refresh(
         blocks,
         active_page: active_page.into(),
         active_page_title: active_page.into(),
+        comment_thread_total: 0,
+        commented_block_ids: Vec::new(),
         active_page_parent: String::new(),
     }
 }
@@ -1981,15 +1983,28 @@ fn block_comments_dock_a_rail_beside_the_document() {
 
     let handlers = include_str!("ui/handlers/pages.ice");
     assert!(handlers.contains("on post_block_comment_submit"));
+    // A NEW comment anchors on the CARET's block (the thread's own target on
+    // a reply) — never blindly on the page.
     assert!(handlers.contains(
-        "run post_block_comment(connected_rpc, password, block_comments_target, active_block_comment_thread"
+        "run post_block_comment(connected_rpc, password, active_thread_target, active_block_comment_thread"
     ));
+    assert!(handlers.contains(
+        "let fresh_target = keep_str(!empty(caret_comment_target), caret_comment_target, active_page)"
+    ));
+    // Opening a thread rides the thread's OWN anchor — a block-anchored
+    // thread opened with the page id is refused by the node.
+    assert!(handlers.contains("on open_block_comment_thread(id, target)"));
+    // The document wears its comment story: washes from the load, resolve
+    // available from the open thread.
+    assert!(pages.contains("commented_lines(blocks, commented_block_ids)"));
+    assert!(pages.contains("-> emit(resolve_thread_submit, true)"));
 }
 
 #[test]
 fn comment_pages_merge_by_identity_and_ordinal() {
     let thread = |id: &str, count: i64| backend::PageCommentThread {
         id: id.into(),
+        target: "page".into(),
         author: "user".into(),
         meta: count.to_string(),
         resolved: false,
@@ -2111,6 +2126,7 @@ fn live_comment_refresh_updates_threads_without_touching_the_draft() {
             from: 0,
             threads: vec![backend::PageCommentThread {
                 id: "thread-1".into(),
+                target: "page".into(),
                 author: "user".into(),
                 meta: "1".into(),
                 resolved: false,

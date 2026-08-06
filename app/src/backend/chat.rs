@@ -693,17 +693,10 @@ pub async fn load_page_threads(
         let page_id = required_id(page_id, "page")?;
         let rpc = rpc_client(&rpc)?;
         let blocks = load_page_blocks(&rpc, &page_id).await?;
-        let mut targets = vec![page_id.clone()];
-        targets.extend(blocks.into_iter().map(|block| block.id));
-        let reply: PagesViewReply = rpc
-            .view("pages", &PagesViewQuery::ThreadsForTargets { targets })
-            .await?;
-        let PagesViewReply::Threads(groups) = reply else {
-            return Err("node returned an invalid comment thread page".to_string());
-        };
-        let threads: Vec<PageCommentThread> = groups
+        let block_ids: Vec<String> = blocks.into_iter().map(|block| block.id).collect();
+        let threads: Vec<PageCommentThread> = query_page_thread_rows(&rpc, &page_id, &block_ids)
+            .await?
             .into_iter()
-            .flat_map(|group| group.threads)
             .map(page_comment_thread)
             .collect();
         let total = count_i64(threads.len());
@@ -849,6 +842,33 @@ pub async fn post_block_comment(
             .map_err(committed_error)
     }
     .await
+}
+
+/// Flip a thread's resolved flag. The node's own op; the caller reloads the
+/// rail to pick the new state up.
+pub async fn resolve_comment_thread(
+    rpc: String,
+    password: String,
+    thread_id: String,
+    resolved: bool,
+) -> Result<bool, AppError> {
+    async {
+        let thread_id = required_id(thread_id, "comment thread")?;
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "pages",
+            pages::encode_msg(&PageMsg::ResolveThread {
+                thread_id,
+                resolved,
+            }),
+            password,
+        )
+        .await?;
+        Ok(true)
+    }
+    .await
+    .map_err(app_error)
 }
 
 pub(crate) fn comment_thread_id(thread_id: String) -> Result<String, String> {

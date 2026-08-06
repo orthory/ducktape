@@ -102,7 +102,10 @@ pub(crate) fn known_networks() -> Vec<HubNetwork> {
             }
         })
         .collect();
-    let remotes = prefs["saved_remotes"].as_array().cloned().unwrap_or_default();
+    let remotes = prefs["saved_remotes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     for remote in remotes {
         let Some(endpoint) = remote["endpoint"].as_str() else {
             continue;
@@ -338,7 +341,10 @@ pub async fn remember_network(rpc: String) -> bool {
     let key = match workspace_at(&endpoint) {
         Some((dir_name, _)) => dir_name,
         None => {
-            let mut remotes = prefs["saved_remotes"].as_array().cloned().unwrap_or_default();
+            let mut remotes = prefs["saved_remotes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             let known = remotes
                 .iter()
                 .any(|remote| remote["endpoint"].as_str() == Some(endpoint.as_str()));
@@ -359,7 +365,10 @@ pub async fn remember_network(rpc: String) -> bool {
 pub async fn forget_network(id: String, kind: String) -> bool {
     let mut prefs = read_prefs();
     if kind == "remote" {
-        let remotes = prefs["saved_remotes"].as_array().cloned().unwrap_or_default();
+        let remotes = prefs["saved_remotes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let kept: Vec<_> = remotes
             .into_iter()
             .filter(|remote| remote["endpoint"].as_str() != Some(id.as_str()))
@@ -490,7 +499,9 @@ async fn user_key_cli_raw(args: &[&str], path: &Path, input: Vec<u8>) -> Result<
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut child = command.spawn().map_err(|error| {
-        format!("could not start the ducktape key tool ({error}); build node-bin or set DUCKTAPE_BIN")
+        format!(
+            "could not start the ducktape key tool ({error}); build node-bin or set DUCKTAPE_BIN"
+        )
     })?;
     let mut stdin = child
         .stdin

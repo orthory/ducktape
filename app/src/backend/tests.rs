@@ -996,7 +996,8 @@ fn optimistic_reaction_survives_the_canonical_replay() {
     message[0].seq = 7;
     let reactor = "user:aa11".to_string();
 
-    let tapped = ::chat::client::optimistic_reaction(message, 7, "👍".into(), true, reactor.clone());
+    let tapped =
+        ::chat::client::optimistic_reaction(message, 7, "👍".into(), true, reactor.clone());
     assert_eq!(tapped[0].reactions.len(), 1);
     assert_eq!(tapped[0].reactions[0].emoji, "👍");
     assert_eq!(tapped[0].reactions[0].count, 1);
@@ -1020,13 +1021,8 @@ fn optimistic_reaction_survives_the_canonical_replay() {
     assert!(replayed[0].reactions[0].reacted_by_me);
 
     // The optimistic remove folds the chip away entirely.
-    let removed = ::chat::client::optimistic_reaction(
-        replayed,
-        7,
-        "👍".into(),
-        false,
-        "user:aa11".into(),
-    );
+    let removed =
+        ::chat::client::optimistic_reaction(replayed, 7, "👍".into(), false, "user:aa11".into());
     assert!(removed[0].reactions.is_empty());
 }
 
@@ -1050,7 +1046,12 @@ fn reply_settle_flash_mirrors_the_stream_for_the_thread_rail() {
         "general".into()
     ));
     assert_eq!(
-        settled_reply_id(pending.clone(), settle.clone(), "general".into(), String::new()),
+        settled_reply_id(
+            pending.clone(),
+            settle.clone(),
+            "general".into(),
+            String::new()
+        ),
         "reply-a"
     );
     // Each lane fires only on its own delta kind: a `reply` is the rail's
@@ -1062,7 +1063,11 @@ fn reply_settle_flash_mirrors_the_stream_for_the_thread_rail() {
     ));
     let mut as_post = settle.clone();
     as_post.kind = "posted".into();
-    assert!(!reply_settled_by(pending.clone(), as_post, "general".into()));
+    assert!(!reply_settled_by(
+        pending.clone(),
+        as_post,
+        "general".into()
+    ));
     assert!(!reply_settled_by(pending, settle, "other".into()));
 }
 

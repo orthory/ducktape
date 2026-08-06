@@ -127,6 +127,7 @@ on reconnect
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
+  active_thread_target = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -318,6 +319,8 @@ on live_resynced(next)
   block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)
   pending_block_comment = retain_selected_string(pending_block_comment, block_comments_target)
   page_delete_armed = page_delete_armed && active_page == keep_str(next.pages_loaded, next.active_page, active_page)
+  block_comment_thread_total = keep_i64(next.pages_loaded, next.comment_thread_total, block_comment_thread_total)
+  commented_block_ids = keep_strs(next.pages_loaded, next.commented_block_ids, commented_block_ids)
   active_page = keep_str(next.pages_loaded, next.active_page, active_page)
   active_page_title = keep_str(next.pages_loaded, next.active_page_title, active_page_title)
   active_page_parent = keep_str(next.pages_loaded, next.active_page_parent, active_page_parent)

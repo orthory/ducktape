@@ -52,11 +52,14 @@ const HIDDEN_SIZE: f32 = 0.01;
 /// Where the caret is, and which palette is being painted. The whole point of
 /// carrying it into the highlighter is the marker reveal: syntax on the caret's
 /// own line stays legible so it can be edited, everywhere else it disappears.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Caret {
     pub line: usize,
     pub column: usize,
     pub dark: bool,
+    /// Document lines inside a block carrying an unresolved comment thread —
+    /// they wear a quiet wash so the anchor is visible in the document.
+    pub commented: Vec<i64>,
 }
 
 /// One painted run. `Marker` is the markdown syntax itself; every other variant
@@ -81,6 +84,7 @@ pub struct Style {
     pub strong: bool,
     pub emphasis: bool,
     pub link: bool,
+    pub commented: bool,
 }
 
 /// The block shape a line's leading bytes declare. `Body` is the absence of a
@@ -187,21 +191,23 @@ impl Highlighter for DocumentHighlighter {
         Self {
             current_line: 0,
             fences: vec![false],
-            caret: *caret,
+            caret: caret.clone(),
         }
     }
 
     fn update(&mut self, caret: &Self::Settings) {
         // A palette flip restyles every line; a caret move only restyles the
         // line it left and the line it landed on.
-        if self.caret.dark != caret.dark {
-            self.caret = *caret;
+        let restyle_everything =
+            self.caret.dark != caret.dark || self.caret.commented != caret.commented;
+        if restyle_everything {
+            self.caret = caret.clone();
             self.fences.truncate(1);
             self.current_line = 0;
             return;
         }
         let earliest = self.caret.line.min(caret.line);
-        self.caret = *caret;
+        self.caret = caret.clone();
         self.change_line(earliest);
     }
 
@@ -219,9 +225,10 @@ impl Highlighter for DocumentHighlighter {
         let index = self.current_line;
         let inside_code = self.fences[index];
         let on_caret_line = index == self.caret.line;
+        let commented = self.caret.commented.contains(&(index as i64));
         let (marks, next_inside) = match index == 0 {
             true => (vec![(0..line.len(), Mark::Title)], false),
-            false => highlight(line, inside_code, on_caret_line),
+            false => highlight(line, inside_code, on_caret_line, commented),
         };
 
         self.current_line += 1;
@@ -242,6 +249,7 @@ fn highlight(
     line: &str,
     inside_code: bool,
     on_caret_line: bool,
+    commented: bool,
 ) -> (Vec<(Range<usize>, Mark)>, bool) {
     if is_fence(line) {
         let fence = vec![(
@@ -265,6 +273,7 @@ fn highlight(
         quote: prefix == Prefix::Quote,
         callout: prefix == Prefix::Callout,
         divider: prefix == Prefix::Divider,
+        commented,
         ..Style::default()
     };
 
@@ -339,6 +348,7 @@ struct Ink {
     code_line: Color,
     callout_plate: Color,
     callout_line: Color,
+    comment_wash: Color,
 }
 
 const fn rgb8(r: u8, g: u8, b: u8) -> Color {
@@ -372,6 +382,7 @@ const LIGHT: Ink = Ink {
     code_line: wash(0x3a, 0x38, 0x33, 0.10),
     callout_plate: wash(0xa0, 0x5a, 0x3c, 0.06),
     callout_line: wash(0xa0, 0x5a, 0x3c, 0.14),
+    comment_wash: wash(0xa0, 0x5a, 0x3c, 0.09),
 };
 
 const DARK: Ink = Ink {
@@ -385,6 +396,7 @@ const DARK: Ink = Ink {
     code_line: wash(0xd4, 0xd2, 0xca, 0.12),
     callout_plate: wash(0xc9, 0x8a, 0x63, 0.10),
     callout_line: wash(0xc9, 0x8a, 0x63, 0.20),
+    comment_wash: wash(0xc9, 0x8a, 0x63, 0.13),
 };
 
 fn ink(dark: bool) -> &'static Ink {
@@ -519,6 +531,19 @@ fn body_format(style: Style, ink: &Ink) -> Format {
         font: Some(body_font(weight, italic)),
         ..Format::default()
     };
+    // A commented block wears a quiet brand wash across its lines — the
+    // in-document anchor for the rail's threads. The callout keeps its own
+    // tile (the stronger plate already marks the line).
+    if style.commented && !style.callout {
+        format.line_highlight = Some(TextHighlight {
+            background: ink.comment_wash.into(),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 6.0.into(),
+            },
+        });
+    }
     if let Some(level) = style.heading {
         let step = usize::from(level).saturating_sub(1).min(2);
         let size = HEADING_SIZE[step];
@@ -589,28 +614,28 @@ mod tests {
 
     #[test]
     fn a_fence_toggles_the_carry_and_its_body_is_never_reparsed() {
-        let (marks, inside) = highlight("```", false, false);
+        let (marks, inside) = highlight("```", false, false, false);
         assert!(inside);
         assert!(matches!(marks[0].1, Mark::Fence { hidden: true }));
         // `# ` inside a fence is code, not a heading.
-        let (body, still_inside) = highlight("# not a heading", true, false);
+        let (body, still_inside) = highlight("# not a heading", true, false, false);
         assert!(still_inside);
         assert_eq!(body, vec![(0..15, Mark::CodeBody)]);
-        let (_, closed) = highlight("```", true, false);
+        let (_, closed) = highlight("```", true, false, false);
         assert!(!closed);
     }
 
     #[test]
     fn the_caret_line_reveals_its_markers_and_other_lines_hide_them() {
-        let (away, _) = highlight("## Heading", false, false);
+        let (away, _) = highlight("## Heading", false, false, false);
         assert!(matches!(away[0].1, Mark::Marker { hidden: true, .. }));
-        let (under, _) = highlight("## Heading", false, true);
+        let (under, _) = highlight("## Heading", false, true, false);
         assert!(matches!(under[0].1, Mark::Marker { hidden: false, .. }));
     }
 
     #[test]
     fn inline_marks_ride_on_top_of_the_block_style_at_the_right_offsets() {
-        let (marks, _) = highlight("## say **hi**", false, false);
+        let (marks, _) = highlight("## say **hi**", false, false, false);
         let bold = marks
             .iter()
             .find(|(_, mark)| matches!(mark, Mark::Body(style) if style.strong))
@@ -630,6 +655,7 @@ mod tests {
             line: 0,
             column: 0,
             dark: false,
+            commented: Vec::new(),
         });
         let title: Vec<_> = highlighter.highlight_line("# still the title").collect();
         assert_eq!(title, vec![(0..17, Mark::Title)]);
@@ -662,6 +688,7 @@ mod plate_probe {
             line: 0,
             column: 0,
             dark: false,
+            commented: Vec::new(),
         });
         let lines = [
             "Team Runbook v2",

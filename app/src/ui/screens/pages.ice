@@ -29,7 +29,7 @@
 // the very defect the body just lost: you had to CLICK the title to edit it.
 // As line 0 it needs no control at all, and Enter at its end / Backspace at the
 // body's start are ordinary text edits that cross the boundary for free.
-component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:str, connected:bool, connected_rpc:str, password:str, dark:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_delete_armed:bool, block_autosave_status:str, page_refusal:str, doc_tabs:[str], blocks:[PageBlock], orphaned_comment_drafts:[str], bind page_editor:editor, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
+component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:str, connected:bool, connected_rpc:str, password:str, dark:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_delete_armed:bool, block_autosave_status:str, page_refusal:str, doc_tabs:[str], blocks:[PageBlock], commented_block_ids:[str], caret_comment_target:str, active_thread_target:str, orphaned_comment_drafts:[str], bind page_editor:editor, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
   emits
     toggle_page_create()
     create_page_submit()
@@ -46,7 +46,8 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
     page_edited(PageAction)
     toggle_block_comments()
     close_block_comments()
-    open_block_comment_thread(str)
+    open_block_comment_thread(str, str)
+    resolve_thread_submit(bool)
     load_more_block_threads()
     close_block_comment_thread()
     load_more_block_comments()
@@ -124,9 +125,10 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                 // wearing its own count, like every other document action.
                 button label="Comments" disabled=(mutation_phase != "idle") h=26.0 p=5.0 @ghost_action -> emit(toggle_block_comments)
                   row h=fill gap=5.0 align=center
-                    Icon name="message" tone="label" px=14.0
+                    Icon name="nav-chat" tone="label" px=14.0
+                    text "Comments" size=11.5 wrap=none @text-muted
                     if block_comment_thread_total > 0
-                      text count_label(block_comment_thread_total) size=10.5 wrap=none font=code_medium @text-muted
+                      text count_label(block_comment_thread_total) size=10.5 wrap=none font=code_medium @text-label
                   active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                   hovered bg=fg/8 text=fg border=fg/10
                   pressed bg=fg/12 text=fg
@@ -220,7 +222,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                 // header. It is never disabled while connected: a page you
                 // can read is a page you can type in. It FILLS the column
                 // and scrolls itself.
-                extern page_document(page_editor, dark, (loading || !connected)) #document -> emit(page_edited, _)
+                extern page_document(page_editor, dark, (loading || !connected), commented_lines(blocks, commented_block_ids)) #document -> emit(page_edited, _)
                 // Subpages: navigation, listed rather than typed.
                 if !empty(subpage_blocks(blocks))
                   col w=fill gap=2.0 pt=10.0
@@ -272,7 +274,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                     if empty(block_comment_threads) && !block_comment_threads_loading
                       text "No comments yet" w=fill size=12.5 align-x=center @text-muted
                     for comment_thread in block_comment_threads
-                      PageCommentThreadButton thread=comment_thread
+                      PageCommentThreadButton thread=comment_thread anchor=comment_anchor_label(blocks, comment_thread.target, active_page)
                         forward
                           open_block_comment_thread
                     if block_comment_threads_has_more
@@ -286,6 +288,17 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                     active bg=transparent text=muted r=6.0
                     hovered bg=fg/9 text=fg
                     pressed bg=fg/14
+                  text comment_anchor_label(blocks, active_thread_target, active_page) w=fill size=10.5 wrap=none font=code_medium @text-hint
+                  if !thread_is_resolved(block_comment_threads, active_block_comment_thread)
+                    button "Resolve" disabled=(mutation_phase != "idle") h=24.0 p=4.0 @secondary_action -> emit(resolve_thread_submit, true)
+                      active bg=transparent text=muted r=6.0
+                      hovered bg=fg/9 text=fg
+                      pressed bg=fg/14
+                  if thread_is_resolved(block_comment_threads, active_block_comment_thread)
+                    button "Reopen" disabled=(mutation_phase != "idle") h=24.0 p=4.0 @secondary_action -> emit(resolve_thread_submit, false)
+                      active bg=transparent text=muted r=6.0
+                      hovered bg=fg/9 text=fg
+                      pressed bg=fg/14
                 scroll dir=vertical w=fill h=fill
                   col w=fill gap=1.0
                     for page_comment in block_thread_comments
@@ -295,6 +308,8 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                         active bg=transparent text=muted r=6.0
                         hovered bg=fg/9 text=fg
                         pressed bg=fg/14
+              if empty(active_block_comment_thread)
+                text comment_compose_hint(blocks, caret_comment_target, active_page) w=fill size=10.5 wrap=none font=code_medium @text-hint
               row w=fill gap=5.0 align=center
                 input "" #page-comment(scope_key(connected_rpc, active_page)) label="New page comment" <-> block_comment_draft hint="Add a comment…" disabled=(mutation_phase != "idle" || block_comment_threads_loading || block_thread_comments_loading) submit=emit(post_block_comment_submit) w=fill p=6.2 text-size=13.0 line-h=1.2 @control
                   active bg=transparent border=fg/8 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
