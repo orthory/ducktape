@@ -532,6 +532,15 @@ fn shift_indent(document: &mut Content, steps: i32) -> bool {
             },
             "  ",
         );
+        // `replace_range` parks the caret after the pasted indent; the caret
+        // belongs on the character it was on, two columns to the right.
+        document.move_to(Cursor {
+            position: Position {
+                line: cursor.position.line,
+                column: cursor.position.column + 2,
+            },
+            selection: None,
+        });
         return true;
     }
     let removable = indent.min(2);
@@ -550,6 +559,13 @@ fn shift_indent(document: &mut Content, steps: i32) -> bool {
         },
         "",
     );
+    document.move_to(Cursor {
+        position: Position {
+            line: cursor.position.line,
+            column: cursor.position.column.saturating_sub(removable),
+        },
+        selection: None,
+    });
     true
 }
 
@@ -757,6 +773,23 @@ mod tests {
         assert_eq!(press(nested, Edit::Unindent), "  - one");
         let flat = typed("- one", 0, 5);
         assert_eq!(press(flat, Edit::Unindent), "- one");
+    }
+
+    #[test]
+    fn tab_keeps_the_caret_on_its_character() {
+        let indent = PageAction::Edit(Action::Edit(Edit::Indent));
+        let nested = apply_page_action(typed("Title\n- a\n- one", 2, 5), indent);
+        assert_eq!(nested.text(), "Title\n- a\n  - one");
+        assert_eq!(nested.cursor().position.column, 7);
+        let unindent = PageAction::Edit(Action::Edit(Edit::Unindent));
+        let lifted = apply_page_action(typed("Title\n- a\n  - one", 2, 7), unindent);
+        assert_eq!(lifted.text(), "Title\n- a\n- one");
+        assert_eq!(lifted.cursor().position.column, 5);
+        // A caret inside the indent being removed clamps to the margin.
+        let unindent = PageAction::Edit(Action::Edit(Edit::Unindent));
+        let clamped = apply_page_action(typed("Title\n- a\n  - one", 2, 1), unindent);
+        assert_eq!(clamped.text(), "Title\n- a\n- one");
+        assert_eq!(clamped.cursor().position.column, 0);
     }
 
     #[test]
