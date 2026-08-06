@@ -280,6 +280,8 @@ pub struct LiveRefresh {
     pub active_page: String,
     pub active_page_title: String,
     pub active_page_parent: String,
+    pub comment_thread_total: i64,
+    pub commented_block_ids: Vec<String>,
 }
 
 /// `planes` is `chat` | `pages` | `both` — the flat Ice surface's
@@ -319,6 +321,8 @@ pub async fn live_resync_load(
             active_page: String::new(),
             active_page_title: String::new(),
             active_page_parent: String::new(),
+            comment_thread_total: 0,
+            commented_block_ids: Vec::new(),
         };
         let load_chat = planes == "chat" || planes == "both";
         let load_pages = planes == "pages" || planes == "both";
@@ -339,9 +343,11 @@ pub async fn live_resync_load(
             },
             async {
                 match load_pages {
-                    true => load_pages_data(&rpc, (!page_id.is_empty()).then_some(page_id.as_str()))
-                        .await
-                        .map(Some),
+                    true => {
+                        load_pages_data(&rpc, (!page_id.is_empty()).then_some(page_id.as_str()))
+                            .await
+                            .map(Some)
+                    }
                     false => Ok(None),
                 }
             }
@@ -365,6 +371,8 @@ pub async fn live_resync_load(
             refresh.active_page = pages.active_page;
             refresh.active_page_title = pages.active_page_title;
             refresh.active_page_parent = pages.active_page_parent;
+            refresh.comment_thread_total = pages.comment_thread_total;
+            refresh.commented_block_ids = pages.commented_block_ids;
         }
         Ok(refresh)
     }
@@ -441,6 +449,10 @@ pub fn keep_participants(
 }
 
 pub fn keep_pages(loaded: bool, next: Vec<PageItem>, current: Vec<PageItem>) -> Vec<PageItem> {
+    if loaded { next } else { current }
+}
+
+pub fn keep_strs(loaded: bool, next: Vec<String>, current: Vec<String>) -> Vec<String> {
     if loaded { next } else { current }
 }
 

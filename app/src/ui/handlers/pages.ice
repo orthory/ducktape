@@ -44,6 +44,7 @@ on open_page_search_hit(page_id, _block_id)
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
+  active_thread_target = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -74,6 +75,7 @@ on choose_page(id)
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
+  active_thread_target = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -151,6 +153,7 @@ on toggle_block_comments
   block_comment_threads_has_more = false
   block_comment_threads_loading = block_comments_open
   active_block_comment_thread = ""
+  active_thread_target = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -172,6 +175,7 @@ on close_block_comments
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
+  active_thread_target = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -183,6 +187,7 @@ on block_threads_loaded(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = next.threads
   block_comment_thread_total = next.total
+  commented_block_ids = commented_targets_of(next.threads, active_page)
   block_comment_threads_next_from = next.next_from
   block_comment_threads_has_more = next.has_more
   block_comment_threads_loading = false
@@ -211,19 +216,23 @@ on block_threads_failed(cause)
   block_comment_threads_loading = false
   error = cause.message
 
-on open_block_comment_thread(id)
+on open_block_comment_thread(id, target)
   return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || empty(id)
   block_comments_generation = block_comments_generation + 1
   active_block_comment_thread = id
+  // The thread's OWN anchor, not the page: the node validates a comment read
+  // against the thread's target, so a block-anchored thread opened with the
+  // page id was refused — the rail could list it but never open it.
+  active_thread_target = target
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
   block_thread_comments_loading = true
   error = ""
-  run load_block_comment_page(connected_rpc, block_comments_target, active_block_comment_thread, 0, block_comments_generation) -> block_comment_page_loaded _ | block_comment_page_failed _
+  run load_block_comment_page(connected_rpc, active_thread_target, active_block_comment_thread, 0, block_comments_generation) -> block_comment_page_loaded _ | block_comment_page_failed _
 
 on block_comment_page_loaded(next)
-  return if next.generation != block_comments_generation || next.target != block_comments_target || next.thread_id != active_block_comment_thread || !block_comments_open
+  return if next.generation != block_comments_generation || next.target != active_thread_target || next.thread_id != active_block_comment_thread || !block_comments_open
   block_thread_comments = next.comments
   block_thread_comments_next_from = next.next_from
   block_thread_comments_has_more = next.has_more
@@ -235,10 +244,10 @@ on load_more_block_comments
   block_comments_generation = block_comments_generation + 1
   block_thread_comments_loading = true
   error = ""
-  run load_block_comment_page(connected_rpc, block_comments_target, active_block_comment_thread, block_thread_comments_next_from, block_comments_generation) -> block_comment_page_appended _ | block_comment_page_failed _
+  run load_block_comment_page(connected_rpc, active_thread_target, active_block_comment_thread, block_thread_comments_next_from, block_comments_generation) -> block_comment_page_appended _ | block_comment_page_failed _
 
 on block_comment_page_appended(next)
-  return if next.generation != block_comments_generation || next.target != block_comments_target || next.thread_id != active_block_comment_thread || !block_comments_open
+  return if next.generation != block_comments_generation || next.target != active_thread_target || next.thread_id != active_block_comment_thread || !block_comments_open
   block_thread_comments = append_page_comments(block_thread_comments, next.comments)
   block_thread_comments_next_from = next.next_from
   block_thread_comments_has_more = next.has_more
@@ -250,28 +259,51 @@ on block_comment_page_failed(cause)
   block_thread_comments_loading = false
   error = cause.message
 
+on resolve_thread_submit(resolved)
+  return if loading || mutation_phase != "idle" || !block_comments_open || empty(active_block_comment_thread)
+  mutation_phase = "comment-resolve"
+  error = ""
+  run resolve_comment_thread(connected_rpc, password, active_block_comment_thread, resolved) -> thread_resolved _ | thread_resolve_failed _
+
+on thread_resolved(_written)
+  mutation_phase = "idle"
+  block_comments_generation = block_comments_generation + 1
+  block_comment_threads_loading = true
+  error = ""
+  run load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
+
+on thread_resolve_failed(cause)
+  mutation_phase = "idle"
+  error = cause.message
+
 on close_block_comment_thread
   block_comments_generation = block_comments_generation + 1
   active_block_comment_thread = ""
+  active_thread_target = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
   block_thread_comments_loading = false
 
 on post_block_comment_submit
-  return if loading || block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || block_comments_target != active_page || empty(trim(block_comment_draft))
+  return if loading || block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || empty(active_page) || empty(trim(block_comment_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = "block-comment"
   pending_block_comment = trim(block_comment_draft)
   block_comment_draft = ""
+  // A reply stays on its thread's anchor; a NEW comment anchors on the block
+  // the caret sits in — the Notion gesture — and on the page from the title
+  // line (or before any edit placed the caret).
+  let fresh_target = keep_str(!empty(caret_comment_target), caret_comment_target, active_page)
+  active_thread_target = keep_str(!empty(active_block_comment_thread), active_thread_target, fresh_target)
   block_comments_generation = block_comments_generation + 1
   block_thread_comments_loading = true
   error = ""
-  run post_block_comment(connected_rpc, password, block_comments_target, active_block_comment_thread, pending_block_comment, block_comments_generation) -> block_comment_posted _ | block_comment_post_failed _
+  run post_block_comment(connected_rpc, password, active_thread_target, active_block_comment_thread, pending_block_comment, block_comments_generation) -> block_comment_posted _ | block_comment_post_failed _
 
 on block_comment_posted(next)
-  return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
+  return if next.generation != block_comments_generation || next.target != active_thread_target || !block_comments_open
   active_block_comment_thread = next.thread_id
   block_thread_comments = next.comments
   block_thread_comments_next_from = next.next_from
@@ -319,6 +351,7 @@ on pages_updated(next)
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
+  active_thread_target = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -340,6 +373,9 @@ on pages_updated(next)
   page_editor = installed_page_editor(page_editor, page_install, page_landing)
   page_saved_text = keep_str(page_install, page_landing, page_saved_text)
   page_refusal = ""
+  block_comment_thread_total = next.comment_thread_total
+  commented_block_ids = next.commented_block_ids
+  caret_comment_target = ""
   block_autosave_status = "idle"
   block_autosave_generation = block_autosave_generation + 1
   loading = false
@@ -372,6 +408,7 @@ on pages_mutated(next)
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
+  active_thread_target = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -381,6 +418,8 @@ on pages_mutated(next)
   page_editor = installed_page_editor(page_editor, page_install, page_landing)
   page_saved_text = keep_str(page_install, page_landing, page_saved_text)
   page_refusal = ""
+  block_comment_thread_total = next.comment_thread_total
+  commented_block_ids = next.commented_block_ids
   block_autosave_status = "idle"
   page_delete_armed = false
   mutation_phase = "idle"
@@ -417,6 +456,7 @@ on close_doc_tab(id)
 // typing at buffer speed on a consensus-backed document.
 on page_edited(action)
   page_editor = apply_page_action(page_editor, action)
+  caret_comment_target = caret_block_id(page_editor, blocks)
   // The refusal describes an edit that was already rolled back; the next
   // keystroke is the user moving on from it.
   page_refusal = ""

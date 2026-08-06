@@ -11,7 +11,7 @@ extern crate::backend
   SendReceipt(operation_id:str, channel_id:str)
   ChatDelta(kind:str, channel_id:str, seq:i64, root_seq:i64, message:ChatMessage, channel:ChatChannel, name:str, archived:bool, emoji:str, added:bool, reactor:str, by_me:bool, member:ChatMember)
   PagesDelta(kind:str, comments:bool)
-  LiveRefresh(generation:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages_loaded:bool, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
+  LiveRefresh(generation:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages_loaded:bool, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_ids:[str])
   ThreadLoadData(generation:i64, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   ThreadPageData(generation:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   LiveThreadData(generation:i64, channel_id:str, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
@@ -20,8 +20,8 @@ extern crate::backend
   ChatSearchData(generation:i64, hits:[ChatSearchHit])
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
   PageBlock(key:i64, id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64)
-  PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
-  PageCommentThread(id:str, author:str, meta:str, resolved:bool, comment_count:i64)
+  PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_ids:[str])
+  PageCommentThread(id:str, target:str, author:str, meta:str, resolved:bool, comment_count:i64)
   PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
   BlockThreadListData(generation:i64, target:str, from:i64, threads:[PageCommentThread], total:i64, next_from:i64, has_more:bool)
   BlockCommentData(generation:i64, target:str, thread_id:str, from:i64, comments:[PageComment], next_from:i64, has_more:bool)
@@ -33,7 +33,7 @@ extern crate::backend
   // out would have destroyed records. `document` is the canonical text either
   // way — the buffer takes it, which is what rolls an illegal edit back.
   DocumentSaveResult(generation:i64, written:bool, refusal:str, data:PagesData, document:str)
-  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
+  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_ids:[str])
   BellItem(seq:i64, kind:str, body:str, source:str, height:i64, read:bool)
   BellDelta(kind:str, item:BellItem, up_to_seq:i64)
   BellData(generation:i64, unread:i64, items:[BellItem])
@@ -301,6 +301,9 @@ extern crate::backend
   sync keep_str(loaded:bool, next:str, current:str) -> str
   sync keep_bool(loaded:bool, next:bool, current:bool) -> bool
   sync keep_i64(loaded:bool, next:i64, current:i64) -> i64
+  sync keep_strs(loaded:bool, next:[str], current:[str]) -> [str]
+  sync commented_targets_of(threads:[PageCommentThread], page_id:str) -> [str]
+  sync thread_is_resolved(threads:[PageCommentThread], id:str) -> bool
   sync keep_forge_repos(loaded:bool, next:[ForgeRepo], current:[ForgeRepo]) -> [ForgeRepo]
   sync keep_branches(loaded:bool, next:[str], current:[str]) -> [str]
   sync keep_forge_items(loaded:bool, next:[ForgeItem], current:[ForgeItem]) -> [ForgeItem]
@@ -357,6 +360,7 @@ extern crate::backend
   load_block_comment_page(rpc:str, target:str, thread_id:str, from:i64, generation:i64) -> BlockCommentData ! HydrationError
   refresh_block_comments(rpc:str, target:str, thread_id:str, generation:i64) -> BlockCommentsRefreshData ! HydrationError
   post_block_comment(rpc:str, password:str, target:str, thread_id:str, text:str, generation:i64) -> BlockCommentData ! AppError
+  resolve_comment_thread(rpc:str, password:str, thread_id:str, resolved:bool) -> bool ! AppError
   create_page(rpc:str, password:str, title:str) -> PagesData ! AppError
   delete_page(rpc:str, password:str, page_id:str) -> PagesData ! AppError
   // THE PAGE'S ONE WRITE PATH. The edited buffer in, the module's own ops

@@ -19,7 +19,11 @@ extern crate::editor
 // node. The dirty-gated tick in handlers/pages.ice is the only write path.
 extern crate::pages
   PageAction()
-  component page_document(document:&editor, dark:bool, disabled:bool) -> PageAction
+  component page_document(document:&editor, dark:bool, disabled:bool, commented:[i64]) -> PageAction
   sync apply_page_action(document:editor, action:PageAction) -> editor
   sync page_text(document:editor) -> str
   sync has_unclosed_fence(text:str) -> bool
+  sync caret_block_id(document:editor, blocks:[PageBlock]) -> str
+  sync commented_lines(blocks:[PageBlock], targets:[str]) -> [i64]
+  sync comment_anchor_label(blocks:[PageBlock], target:str, page_id:str) -> str
+  sync comment_compose_hint(blocks:[PageBlock], target:str, page_id:str) -> str

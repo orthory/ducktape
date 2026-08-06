@@ -226,12 +226,15 @@ on console_opened(id)
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
+  active_thread_target = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
+  commented_block_ids = []
+  caret_comment_target = ""
   page_editor = editor("")
   page_saved_text = ""
   page_inflight_text = ""

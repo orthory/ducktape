@@ -61,15 +61,17 @@ component PageSearchResult(hit:PageSearchHit)
 //     Carrying them through is a projection change, not a view change; until
 //     then the right-hand slot shows the ordinal the record does have
 //     (`#3`, `#3 · edited`) rather than an invented age.
-component PageCommentThreadButton(thread:PageCommentThread)
+component PageCommentThreadButton(thread:PageCommentThread, anchor:str)
   emits
-    open_block_comment_thread(str)
-  button label=thread.author description=thread.meta w=fill @ghost_action px-12px py-11px -> emit(open_block_comment_thread, thread.id)
+    open_block_comment_thread(str, str)
+  button label=thread.author description=thread.meta w=fill @ghost_action px-12px py-11px -> emit(open_block_comment_thread, thread.id, thread.target)
     col w=fill gap=7.0
       row w=fill gap=8.0 align=center
         PrincipalAvatar initials=initials_of(thread.author) is_agent=false plate=22.0 ink=9.0 ring=""
         text thread.author w=fill size=12.0 wrap=none font=display @text-primary
         text "›" size=13.0 wrap=none @text-label
+      // WHERE it anchors — the one thing the old rail never told you.
+      text anchor w=fill size=10.5 wrap=none font=code_medium @text-hint
       text thread.meta w=fill size=12.0 line-h=1.55 wrap=word @text-panel_tile
     active bg=surface text=fg border=card_line border-w=1.0 r=11.0
     hovered bg=card_wash_hover text=fg border=control_line

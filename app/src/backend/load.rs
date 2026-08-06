@@ -36,6 +36,8 @@ pub(crate) async fn load_workspace(
         active_page: pages.active_page,
         active_page_title: pages.active_page_title,
         active_page_parent: pages.active_page_parent,
+        comment_thread_total: pages.comment_thread_total,
+        commented_block_ids: pages.commented_block_ids,
     })
 }
 
@@ -627,6 +629,7 @@ pub(crate) fn page_comment_thread(thread: ThreadRow) -> PageCommentThread {
     };
     PageCommentThread {
         id: thread.id,
+        target: thread.target,
         author: author_name(&thread.opener),
         meta: if thread.resolved {
             format!("{count_label} · resolved")
@@ -686,6 +689,8 @@ pub(crate) async fn load_pages_data(
             active_page,
             active_page_title: String::new(),
             active_page_parent,
+            comment_thread_total: 0,
+            commented_block_ids: Vec::new(),
         });
     }
     let wire_blocks = load_page_blocks(rpc, &active_page).await?;
@@ -694,13 +699,52 @@ pub(crate) async fn load_pages_data(
         .map(|block| block.text.clone())
         .unwrap_or_default();
     let blocks = page_blocks(wire_blocks, &active_page);
+    // One grouped ThreadsForTargets ride-along, so the surface knows its
+    // comment story — the header count and the commented-line washes — the
+    // moment the page opens, not only after the rail is.
+    let block_ids: Vec<String> = blocks.iter().map(|block| block.id.clone()).collect();
+    let threads = query_page_thread_rows(rpc, &active_page, &block_ids).await?;
+    let comment_thread_total = count_i64(threads.len());
+    let commented_block_ids = commented_targets(&active_page, &threads);
     Ok(PagesData {
         pages,
         blocks,
         active_page,
         active_page_title,
         active_page_parent,
+        comment_thread_total,
+        commented_block_ids,
     })
+}
+
+/// Every thread anchored to the page or any of its blocks, one grouped query.
+pub(crate) async fn query_page_thread_rows(
+    rpc: &RpcClient,
+    page_id: &str,
+    block_ids: &[String],
+) -> Result<Vec<ThreadRow>, String> {
+    let mut targets = vec![page_id.to_string()];
+    targets.extend(block_ids.iter().cloned());
+    let reply: PagesViewReply = rpc
+        .view("pages", &PagesViewQuery::ThreadsForTargets { targets })
+        .await?;
+    let PagesViewReply::Threads(groups) = reply else {
+        return Err("node returned an invalid comment thread page".into());
+    };
+    Ok(groups.into_iter().flat_map(|group| group.threads).collect())
+}
+
+/// The BLOCK ids carrying an unresolved thread — the page's own id is not a
+/// line, so it never marks one.
+pub(crate) fn commented_targets(page_id: &str, threads: &[ThreadRow]) -> Vec<String> {
+    let mut targets: Vec<String> = threads
+        .iter()
+        .filter(|thread| !thread.resolved && thread.target != page_id)
+        .map(|thread| thread.target.clone())
+        .collect();
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 pub(crate) fn page_blocks(wire_blocks: Vec<pages::Block>, active_page: &str) -> Vec<PageBlock> {

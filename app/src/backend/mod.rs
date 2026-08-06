@@ -198,11 +198,20 @@ pub struct PagesData {
     pub active_page: String,
     pub active_page_title: String,
     pub active_page_parent: String,
+    /// Every open comment thread on the page or its blocks — the header count
+    /// the surface wears BEFORE the rail is ever opened.
+    pub comment_thread_total: i64,
+    /// The block ids carrying at least one unresolved thread, for the
+    /// commented-line washes in the document.
+    pub commented_block_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PageCommentThread {
     pub id: String,
+    /// The block (or page) id the thread anchors to — the wire always carried
+    /// it; dropping it here was what made block-anchored threads unopenable.
+    pub target: String,
     pub author: String,
     pub meta: String,
     pub resolved: bool,
@@ -288,6 +297,8 @@ pub struct WorkspaceData {
     pub active_page: String,
     pub active_page_title: String,
     pub active_page_parent: String,
+    pub comment_thread_total: i64,
+    pub commented_block_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]

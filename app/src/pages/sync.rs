@@ -194,6 +194,36 @@ fn render_line(line: &Line) -> String {
     format!("{indent}{marker}{}", line.text)
 }
 
+/// Each prose block's [start, len] in DOCUMENT LINES (line 0 is the title).
+/// Derived from the rendered shape itself, so a Code block counts its fences
+/// and body exactly as the buffer shows them; subpages take no lines.
+pub fn line_spans(blocks: &[PageBlock]) -> Vec<(String, usize, usize)> {
+    let mut spans = Vec::new();
+    let mut next = 1;
+    for block in blocks.iter().filter(|block| is_prose(block)) {
+        let rendered = render_line(&Line {
+            kind: block.kind.clone(),
+            text: block.text.clone(),
+            checked: block.checked,
+            depth: block.prefix.len() / INDENT.len(),
+        });
+        let lines = rendered.split('\n').count();
+        spans.push((block.id.clone(), next, lines));
+        next += lines;
+    }
+    spans
+}
+
+/// The block the document line sits in — "" for the title line and for lines
+/// past the last saved block (fresh typing the node has not seen yet).
+pub fn block_at_line(blocks: &[PageBlock], line: usize) -> String {
+    line_spans(blocks)
+        .into_iter()
+        .find(|(_, start, len)| line >= *start && line < start + len)
+        .map(|(id, _, _)| id)
+        .unwrap_or_default()
+}
+
 /// True while the buffer holds an ODD number of fence lines — an open ``` with
 /// no close yet. Parsing such a buffer folds everything under the open fence
 /// into one Code block, and the plan would then REMOVE the blocks that
@@ -939,6 +969,32 @@ mod tests {
     fn emptying_the_buffer_leaves_an_empty_title_and_no_blocks() {
         assert_eq!(document_title(""), "");
         assert_eq!(document_body(""), Vec::new());
+    }
+
+    #[test]
+    fn line_spans_mirror_the_rendered_document_and_skip_subpages() {
+        let blocks = [
+            block("Heading 1", "title-ish", 0),
+            block("Text", "para", 0),
+            block("Page", "a subpage", 0),
+            block("Code", "a\nb", 0),
+            block("Todo", "ship", 0),
+        ];
+        // Line 0 is the page title; the code block is fence+2 body+fence.
+        assert_eq!(
+            line_spans(&blocks),
+            vec![
+                ("title-ish".into(), 1, 1),
+                ("para".into(), 2, 1),
+                ("a\nb".into(), 3, 4),
+                ("ship".into(), 7, 1),
+            ]
+        );
+        assert_eq!(block_at_line(&blocks, 0), "");
+        assert_eq!(block_at_line(&blocks, 2), "para");
+        assert_eq!(block_at_line(&blocks, 5), "a\nb");
+        assert_eq!(block_at_line(&blocks, 7), "ship");
+        assert_eq!(block_at_line(&blocks, 8), "");
     }
 
     #[test]

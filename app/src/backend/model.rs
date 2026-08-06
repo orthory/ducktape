@@ -412,6 +412,26 @@ pub fn remove_recovered_draft(mut drafts: Vec<String>, recovered: String) -> Vec
     drafts
 }
 
+/// The commented BLOCK ids in a thread list — the page's own id marks no line.
+pub fn commented_targets_of(threads: Vec<PageCommentThread>, page_id: String) -> Vec<String> {
+    let mut targets: Vec<String> = threads
+        .into_iter()
+        .filter(|thread| !thread.resolved && thread.target != page_id)
+        .map(|thread| thread.target)
+        .collect();
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+/// The open thread's resolved flag, read off the rail's own list.
+pub fn thread_is_resolved(threads: Vec<PageCommentThread>, id: String) -> bool {
+    threads
+        .iter()
+        .find(|thread| thread.id == id)
+        .is_some_and(|thread| thread.resolved)
+}
+
 pub fn retain_selected_string(value: String, selected_id: String) -> String {
     if selected_id.is_empty() {
         String::new()
@@ -490,9 +510,8 @@ pub(crate) fn rpc_client(input: &str) -> Result<RpcClient, String> {
     // (one hydrate fans out 13 of them in a single parallel).
     // ponytail: never evicts — the map holds one entry per endpoint the user
     // has ever pointed this session at, which is their handful of networks.
-    static CLIENTS: std::sync::Mutex<
-        std::collections::BTreeMap<String, RpcClient>,
-    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    static CLIENTS: std::sync::Mutex<std::collections::BTreeMap<String, RpcClient>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
     let mut clients = CLIENTS.lock().expect("rpc client cache");
     if let Some(client) = clients.get(&configured) {
         return Ok(client.clone());

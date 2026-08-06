@@ -27,6 +27,65 @@ pub fn has_unclosed_fence(text: String) -> bool {
     sync::has_unclosed_fence(&text)
 }
 
+/// The block the CARET sits in — where a new comment anchors. "" on the title
+/// line (and on unsaved fresh lines), which the caller reads as "the page".
+pub fn caret_block_id(document: Content, blocks: Vec<crate::backend::PageBlock>) -> String {
+    sync::block_at_line(&blocks, document.cursor().position.line)
+}
+
+/// The document lines wearing a commented block's wash, for the highlighter.
+pub fn commented_lines(blocks: Vec<crate::backend::PageBlock>, targets: Vec<String>) -> Vec<i64> {
+    let mut lines = Vec::new();
+    for (id, start, len) in sync::line_spans(&blocks) {
+        if !targets.contains(&id) {
+            continue;
+        }
+        for line in start..start + len {
+            lines.push(line as i64);
+        }
+    }
+    lines
+}
+
+/// Where a comment thread anchors, in the reader's own words: the line number
+/// and a snippet of the block it marks, or the page itself.
+/// The composer's own caption: where a NEW comment will anchor.
+pub fn comment_compose_hint(
+    blocks: Vec<crate::backend::PageBlock>,
+    target: String,
+    page_id: String,
+) -> String {
+    format!(
+        "New comment on {}",
+        comment_anchor_label(blocks, target, page_id)
+    )
+}
+
+pub fn comment_anchor_label(
+    blocks: Vec<crate::backend::PageBlock>,
+    target: String,
+    page_id: String,
+) -> String {
+    if target.is_empty() || target == page_id {
+        return "this page".into();
+    }
+    let spans = sync::line_spans(&blocks);
+    let Some((_, start, _)) = spans.into_iter().find(|(id, _, _)| *id == target) else {
+        return "a removed block".into();
+    };
+    let snippet = blocks
+        .iter()
+        .find(|block| block.id == target)
+        .map(|block| block.text.trim().to_string())
+        .unwrap_or_default();
+    let snippet = match snippet.char_indices().nth(36) {
+        Some((cut, _)) => format!("{}…", &snippet[..cut]),
+        None if snippet.is_empty() => "an empty line".into(),
+        None => snippet,
+    };
+    format!("line {start} · {snippet}")
+}
+
 use iced::advanced::text::Wrapping;
 use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text_editor::{self, Action, Content, Cursor, Edit, Position};
@@ -42,8 +101,14 @@ use markdown::{BODY_LINE_HEIGHT, BODY_SIZE, Caret, DocumentHighlighter};
 /// the heading on the same left edge as the paragraph under it.
 const DOCUMENT_PAD_X: f32 = 2.0;
 
-/// The page's writing surface.
-pub fn page_document(document: &Content, dark: bool, disabled: bool) -> Element<'_, PageAction> {
+/// The page's writing surface. `commented` is the document lines wearing a
+/// commented block's wash.
+pub fn page_document(
+    document: &Content,
+    dark: bool,
+    disabled: bool,
+    commented: Vec<i64>,
+) -> Element<'_, PageAction> {
     let cursor = document.cursor().position;
     let editor = RichTextEditor::new(document, content_version(document))
         .id("page-document")
@@ -63,6 +128,7 @@ pub fn page_document(document: &Content, dark: bool, disabled: bool) -> Element<
                 line: cursor.line,
                 column: cursor.column,
                 dark,
+                commented,
             },
             u64::from(dark),
             move |mark| markdown::format(mark, dark),
@@ -531,6 +597,42 @@ mod tests {
         assert_eq!(press(nested, Edit::Unindent), "  - one");
         let flat = typed("- one", 0, 5);
         assert_eq!(press(flat, Edit::Unindent), "- one");
+    }
+
+    #[test]
+    fn comment_anchors_read_as_lines_and_wash_every_line_of_the_block() {
+        let block = |kind: &str, text: &str| crate::backend::PageBlock {
+            key: 0,
+            id: text.into(),
+            parent: String::new(),
+            kind: kind.into(),
+            text: text.into(),
+            pending: false,
+            checked: false,
+            prefix: String::new(),
+            child_count: 0,
+        };
+        let blocks = vec![block("Text", "para"), block("Code", "a\nb")];
+        assert_eq!(
+            comment_anchor_label(blocks.clone(), "page-id".into(), "page-id".into()),
+            "this page"
+        );
+        assert_eq!(
+            comment_anchor_label(blocks.clone(), "para".into(), "page-id".into()),
+            "line 1 · para"
+        );
+        assert_eq!(
+            comment_anchor_label(blocks.clone(), "gone".into(), "page-id".into()),
+            "a removed block"
+        );
+        // The code block owns lines 2..=5 (fence, two body lines, fence).
+        assert_eq!(
+            commented_lines(blocks.clone(), vec!["a\nb".into()]),
+            vec![2, 3, 4, 5]
+        );
+        // The caret in the code body anchors a comment on that block.
+        let content = typed("Title\npara\n```\na\nb\n```", 3, 1);
+        assert_eq!(caret_block_id(content, blocks), "a\nb");
     }
 
     #[test]

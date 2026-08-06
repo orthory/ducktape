@@ -255,6 +255,12 @@ state
   // payload's fields do not type inside `let`, so the decision lands here).
   page_landing = ""
   page_install = false
+  // The page's comment story, live from every page load: the block ids
+  // carrying an unresolved thread (the document's washes) and the caret's
+  // own block (where a fresh comment anchors), tracked per edit.
+  commented_block_ids:[str] = []
+  caret_comment_target = ""
+  active_thread_target = ""
   page_inflight_text = ""
   // Why a write was NOT attempted — see DocumentSaveResult. Cleared by the
   // next edit, because it describes an edit that has already been undone.
