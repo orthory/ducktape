@@ -28,10 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use chat::call_wire::{CapturedFrame, PeerFrame};
-use iced::advanced::layout::{self, Layout};
-use iced::advanced::widget::{Tree, tree};
-use iced::advanced::{Shell, Widget, mouse, renderer};
-use iced::{Element, Event, Length, Rectangle, Size, window};
+use iced::{Element, Rectangle, Size};
 
 /// Toggle/shutdown poll while no camera is open. With a camera open the loop
 /// paces itself at the NEGOTIATED MODE'S OWN RATE instead — the local preview
@@ -178,10 +175,10 @@ fn hex_of(key: &[u8; 32]) -> String {
 
 fn decode_frame(data: &[u8]) -> Option<TileFrame> {
     let mut decoder = zune_jpeg::JpegDecoder::new(data);
-    decoder
-        .set_options(zune_jpeg::zune_core::options::DecoderOptions::default().jpeg_set_out_colorspace(
-            zune_jpeg::zune_core::colorspace::ColorSpace::RGBA,
-        ));
+    decoder.set_options(
+        zune_jpeg::zune_core::options::DecoderOptions::default()
+            .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA),
+    );
     let pixels = decoder.decode().ok()?;
     let (width, height) = decoder.dimensions()?;
     // An oversized peer frame is bounded HERE, not trusted to have been
@@ -273,9 +270,9 @@ pub(crate) fn camera_thread(
             // RGBA blew iced's 2 MiB upload cliff — both read as blinking.
             // A camera with no VGA mode falls back to that same request and
             // the shrink below brings its frames onto the identical budget.
-            let vga = RequestedFormat::new::<RgbFormat>(
-                RequestedFormatType::HighestResolution(Resolution::new(640, 480)),
-            );
+            let vga = RequestedFormat::new::<RgbFormat>(RequestedFormatType::HighestResolution(
+                Resolution::new(640, 480),
+            ));
             let any =
                 RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
             match nokhwa::Camera::new(CameraIndex::Index(0), vga)
@@ -316,8 +313,7 @@ pub(crate) fn camera_thread(
         };
         let (width, height) = (decoded.width(), decoded.height());
         let rgb = decoded.into_raw();
-        let (rgb, width, height) =
-            shrink_to_budget::<3>(rgb, width, height, CAPTURE_PIXEL_BUDGET);
+        let (rgb, width, height) = shrink_to_budget::<3>(rgb, width, height, CAPTURE_PIXEL_BUDGET);
         // The preview mirrors EVERY captured frame, before and regardless of
         // the wire: the self-view has no bandwidth to respect, and a frame
         // the encoder refuses (over the mesh cap) must not freeze it.
@@ -341,17 +337,25 @@ pub(crate) fn camera_thread(
     }
 }
 
-/// The tile strip the huddle panel mounts — a SELF-REDRAWING widget, not a
-/// state-driven mount. The previous design republished the store's write
-/// counter into app state on a 25 Hz subscription, and in iced ONE message
-/// rebuilds EVERY window's whole view tree: the console paid full rebuilds
-/// 25 times a second for pixels it never shows. This widget instead reads
-/// the store in its own draw pass and schedules the next redraw of ITS OWN
-/// window (`Shell::request_redraw_at` — redraw requests are per-window all
-/// the way down to winit), so a live camera costs the huddle window a paint
-/// pass and costs every other window nothing at all.
+/// The tile strip the huddle panel mounts — a runtime `LiveSurface`, not a
+/// state-driven mount. The surface reads the store in its own draw pass and
+/// repaints only ITS OWN window at the paint ceiling, so a live camera costs
+/// the huddle window a paint pass and costs every other window nothing at
+/// all (the state-driven predecessor rebuilt EVERY window's view tree per
+/// beat). The layout key is the tile count: the wrap-grid's height depends
+/// only on it, so layout invalidates on a join/leave/camera toggle — never
+/// per frame. Zero tiles parks the clock; frames cannot appear without a
+/// camera beacon riding the call control channel first, and that roster
+/// message redraws the window once, which re-arms it.
 pub fn call_video_tiles() -> Element<'static, ()> {
-    Element::new(VideoStrip)
+    ui_lang_runtime::live_surface(
+        REDRAW_INTERVAL,
+        |width| Size::new(width, grid_height(tile_count(), grid_columns(width))),
+        || tile_count() as u64,
+        || tile_count() > 0,
+        paint_tiles,
+    )
+    .into()
 }
 
 /// Displayed tile plate: fixed 4:3, the frame Cover-cropped onto it, wrapped
@@ -362,16 +366,6 @@ const TILE_GAP: f32 = 8.0;
 /// native-rate preview and full-rate peers; frames that didn't change
 /// between beats are Arc-cached handles the renderer draws for free.
 const REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
-
-struct VideoStrip;
-
-#[derive(Default)]
-struct StripState {
-    /// The wrap-grid's height depends ONLY on the tile count, so layout is
-    /// invalidated exactly when the count moves (a join, a leave, a camera
-    /// toggle) — never per frame.
-    tiles_seen: usize,
-}
 
 fn tile_count() -> usize {
     let store = store().lock().expect("video store");
@@ -397,7 +391,9 @@ fn tiles_snapshot() -> Vec<(u32, u32, iced::widget::image::Handle)> {
 }
 
 fn grid_columns(width: f32) -> usize {
-    ((width + TILE_GAP) / (TILE_WIDTH + TILE_GAP)).floor().max(1.0) as usize
+    ((width + TILE_GAP) / (TILE_WIDTH + TILE_GAP))
+        .floor()
+        .max(1.0) as usize
 }
 
 fn grid_height(count: usize, columns: usize) -> f32 {
@@ -408,105 +404,41 @@ fn grid_height(count: usize, columns: usize) -> f32 {
     rows as f32 * TILE_HEIGHT + (rows - 1) as f32 * TILE_GAP
 }
 
-impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for VideoStrip
-where
-    Renderer: iced::advanced::image::Renderer<Handle = iced::widget::image::Handle>,
-{
-    fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<StripState>()
-    }
+fn paint_tiles(renderer: &mut iced::Renderer, bounds: Rectangle, viewport: &Rectangle) {
+    use iced::advanced::image::Renderer as _;
 
-    fn state(&self) -> tree::State {
-        tree::State::new(StripState::default())
-    }
-
-    fn size(&self) -> Size<Length> {
-        Size::new(Length::Fill, Length::Shrink)
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        _renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        let width = limits.max().width;
-        let count = tile_count();
-        tree.state.downcast_mut::<StripState>().tiles_seen = count;
-        layout::Node::new(Size::new(width, grid_height(count, grid_columns(width))))
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &Event,
-        _layout: Layout<'_>,
-        _cursor: mouse::Cursor,
-        _renderer: &Renderer,
-        _clipboard: &mut dyn iced::advanced::Clipboard,
-        shell: &mut Shell<'_, Message>,
-        _viewport: &Rectangle,
-    ) {
-        let Event::Window(window::Event::RedrawRequested(now)) = event else {
-            return;
+    let columns = grid_columns(bounds.width);
+    for (index, (width, height, handle)) in tiles_snapshot().into_iter().enumerate() {
+        let cell = Rectangle {
+            x: bounds.x + (index % columns) as f32 * (TILE_WIDTH + TILE_GAP),
+            y: bounds.y + (index / columns) as f32 * (TILE_HEIGHT + TILE_GAP),
+            width: TILE_WIDTH,
+            height: TILE_HEIGHT,
         };
-        let count = tile_count();
-        if tree.state.downcast_ref::<StripState>().tiles_seen != count {
-            shell.invalidate_layout();
-        }
-        if count > 0 {
-            shell.request_redraw_at(*now + REDRAW_INTERVAL);
-        }
-        // Zero tiles = idle, nothing scheduled. Frames cannot appear without
-        // a camera beacon riding the call control channel first; that roster
-        // message rebuilds the app, the rebuild redraws this window once,
-        // and the clock re-arms right here.
-    }
-
-    fn draw(
-        &self,
-        _tree: &Tree,
-        renderer: &mut Renderer,
-        _theme: &Theme,
-        _style: &renderer::Style,
-        layout: Layout<'_>,
-        _cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        let bounds = layout.bounds();
-        let columns = grid_columns(bounds.width);
-        for (index, (width, height, handle)) in tiles_snapshot().into_iter().enumerate() {
-            let cell = Rectangle {
-                x: bounds.x + (index % columns) as f32 * (TILE_WIDTH + TILE_GAP),
-                y: bounds.y + (index / columns) as f32 * (TILE_HEIGHT + TILE_GAP),
-                width: TILE_WIDTH,
-                height: TILE_HEIGHT,
-            };
-            let Some(clip) = cell.intersection(viewport) else {
-                continue;
-            };
-            // Cover: scale the frame to fill the plate, center, crop by clip.
-            let scale = (TILE_WIDTH / width.max(1) as f32).max(TILE_HEIGHT / height.max(1) as f32);
-            let drawn = Size::new(width as f32 * scale, height as f32 * scale);
-            let drawing = Rectangle {
-                x: cell.x + (cell.width - drawn.width) / 2.0,
-                y: cell.y + (cell.height - drawn.height) / 2.0,
-                width: drawn.width,
-                height: drawn.height,
-            };
-            renderer.draw_image(
-                iced::advanced::image::Image {
-                    handle,
-                    filter_method: iced::widget::image::FilterMethod::default(),
-                    rotation: iced::Radians(0.0),
-                    border_radius: 6.0.into(),
-                    opacity: 1.0,
-                    snap: true,
-                },
-                drawing,
-                clip,
-            );
-        }
+        let Some(clip) = cell.intersection(viewport) else {
+            continue;
+        };
+        // Cover: scale the frame to fill the plate, center, crop by clip.
+        let scale = (TILE_WIDTH / width.max(1) as f32).max(TILE_HEIGHT / height.max(1) as f32);
+        let drawn = Size::new(width as f32 * scale, height as f32 * scale);
+        let drawing = Rectangle {
+            x: cell.x + (cell.width - drawn.width) / 2.0,
+            y: cell.y + (cell.height - drawn.height) / 2.0,
+            width: drawn.width,
+            height: drawn.height,
+        };
+        renderer.draw_image(
+            iced::advanced::image::Image {
+                handle,
+                filter_method: iced::widget::image::FilterMethod::default(),
+                rotation: iced::Radians(0.0),
+                border_radius: 6.0.into(),
+                opacity: 1.0,
+                snap: true,
+            },
+            drawing,
+            clip,
+        );
     }
 }
 
@@ -547,7 +479,8 @@ mod tests {
         assert_eq!(pixels.len(), 640 * 360 * 4);
         assert!(pixels.iter().all(|&byte| byte == 7));
         // A frame already inside the budget passes through untouched.
-        let (pixels, w, h) = shrink_to_budget::<3>(vec![9; 64 * 48 * 3], 64, 48, CAPTURE_PIXEL_BUDGET);
+        let (pixels, w, h) =
+            shrink_to_budget::<3>(vec![9; 64 * 48 * 3], 64, 48, CAPTURE_PIXEL_BUDGET);
         assert_eq!((w, h, pixels.len()), (64, 48, 64 * 48 * 3));
     }
 
