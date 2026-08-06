@@ -662,42 +662,48 @@ on delete_message_submit
   error = ""
   run delete_message(connected_rpc, password, active_channel, selected_message_seq) -> chat_acked _ | mutation_failed _
 
+// REACTIONS DO NOT TAKE THE MUTATION LOCK. They are additive reactor-set ops
+// with no rev CAS — like message sends, which already run concurrently on
+// operation ids. When they held `mutation_phase`, every in-flight reaction
+// disabled all 32 picker cells for the whole sign-and-submit round trip, and
+// a disabled cell captures no press, so the SECOND click of a picking
+// session fell through to the backdrop and dismissed the picker; the hover
+// bar's one-tap reactions silently no-op'd through the same window. The
+// reactor-set fold is idempotent, so even a double-tap of the same emoji is
+// safe, and the settled delta replays canonically over any interleaving.
 on add_reaction_submit(emoji)
-  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || selected_message_seq <= 0
+  return if loading || empty(active_channel) || active_channel_archived || selected_message_seq <= 0
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "reaction"
   error = ""
   messages = reaction_applied(messages, selected_message_seq, emoji, true)
   thread_messages = reaction_applied(thread_messages, selected_message_seq, emoji, true)
-  run add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> chat_acked _ | reaction_failed _
+  run add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> reaction_acked _ | reaction_failed _
 
 // One-tap reactions do NOT select the row: the tap is its own complete act,
 // and parking the selection tint on the message until the next Esc read as
 // a leftover highlight (QA). The picker path still selects, because its
 // overlay is anchored to the selection.
 on add_reaction_at(seq, emoji)
-  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || seq <= 0
+  return if loading || empty(active_channel) || active_channel_archived || seq <= 0
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "reaction"
   error = ""
   messages = reaction_applied(messages, seq, emoji, true)
   thread_messages = reaction_applied(thread_messages, seq, emoji, true)
-  run add_reaction(connected_rpc, password, active_channel, seq, emoji) -> chat_acked _ | reaction_failed _
+  run add_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 on remove_reaction_at(seq, emoji)
-  return if loading || mutation_phase != "idle" || active_channel_archived || seq <= 0
+  return if loading || active_channel_archived || seq <= 0
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "reaction"
   error = ""
   messages = reaction_applied(messages, seq, emoji, false)
   thread_messages = reaction_applied(thread_messages, seq, emoji, false)
-  run remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> chat_acked _ | reaction_failed _
+  run remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 // The settle-✓'s two-beat teardown. Beat one reads the animation still
 // aimed at visible, keeps its anchor and flips the fade; beat two reads it
@@ -708,11 +714,18 @@ on send_flash_tick
   thread_send_flash_id = keep_str(animation.value(send_flash), thread_send_flash_id, "")
   send_flash = false
 
+// A reaction's ack has nothing to restore: the optimistic fold is already on
+// screen and the settled delta replays over it. Reactions never touch
+// `mutation_phase` (see `add_reaction_submit`), so the shared `chat_acked`
+// phase teardown has no business here — only a stale error to clear.
+on reaction_acked(_result)
+  error = ""
+
 // A reaction failure leaves the optimistic fold as a LIE on screen; there is
 // no rollback token (the fold is not invertible under concurrent deltas), so
-// the canonical refetch IS the revert — committed or not.
+// the canonical refetch IS the revert — committed or not. No phase to reset:
+// reactions run outside the mutation lock.
 on reaction_failed(cause)
-  mutation_phase = mutation_failure_phase(cause.committed)
   error = cause.message
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0

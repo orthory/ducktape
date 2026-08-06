@@ -359,7 +359,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               box p=8.0 style=raised_style()
                                 flex w=234.0 wrap=wrap gap-x=2.0 gap-y=2.0 items=start
                                   for emoji in reaction_palette()
-                                    button label="Add reaction" description=emoji disabled=(mutation_phase != "idle" || active_channel_archived) w=27.0 h=27.0 p=0.0 @ghost_action -> emit(add_reaction_submit, emoji)
+                                    button label="Add reaction" description=emoji disabled=active_channel_archived w=27.0 h=27.0 p=0.0 @ghost_action -> emit(add_reaction_submit, emoji)
                                       box w=fill h=fill align-x=center align-y=center
                                         text emoji size=14.0 wrap=none @text-fg
                                       active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
@@ -671,7 +671,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           box p=8.0 style=raised_style()
                             flex w=234.0 wrap=wrap gap-x=2.0 gap-y=2.0 items=start
                               for emoji in reaction_palette()
-                                button label="Add reaction" description=emoji disabled=(mutation_phase != "idle" || active_channel_archived) w=27.0 h=27.0 p=0.0 @ghost_action -> emit(add_reaction_at, thread_selected_seq, emoji)
+                                button label="Add reaction" description=emoji disabled=active_channel_archived w=27.0 h=27.0 p=0.0 @ghost_action -> emit(add_reaction_at, thread_selected_seq, emoji)
                                   box w=fill h=fill align-x=center align-y=center
                                     text emoji size=14.0 wrap=none @text-fg
                                   active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
