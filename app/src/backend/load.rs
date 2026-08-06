@@ -7,9 +7,16 @@ pub(crate) async fn load_workspace(
     page_id: Option<&str>,
     generation: i64,
 ) -> Result<WorkspaceData, String> {
-    let tip = tip_from_status(rpc.status().await?)?;
-    let chat = load_chat_data(rpc, channel_id).await?;
-    let pages = load_pages_data(rpc, page_id).await?;
+    // Three independent trees. Serialized, chat's first paint waited on a
+    // status probe, then on the whole pages plane — a page index plus the
+    // consensus `/v1/query` blocks read — none of which the message list
+    // renders. Concurrent, the console opens on the slowest leg, not their sum.
+    let (status, chat, pages) = tokio::try_join!(
+        async { rpc.status().await.map_err(String::from) },
+        load_chat_data(rpc, channel_id),
+        load_pages_data(rpc, page_id)
+    )?;
+    let tip = tip_from_status(status)?;
     Ok(WorkspaceData {
         generation,
         rpc: rpc.origin().to_string(),
@@ -107,15 +114,16 @@ pub(crate) async fn load_chat_data(
         huddle_roster(&info.channel.huddle, me.as_deref())
     });
     let active_channel_head_seq = active_wire_channel.map_or(0, |info| info.head_seq);
-    let channel_members = if active_channel.is_empty() {
-        Vec::new()
-    } else {
-        load_channel_members(rpc, &active_channel).await?
-    };
-    let messages = if active_channel.is_empty() {
-        Vec::new()
-    } else {
-        load_messages(rpc, &active_channel, active_channel_head_seq).await?
+    // Both read only the active channel, which is decided above — the member
+    // roll has no business sitting in front of the timeline. `local_user_key`
+    // is awaited before this so the cached identity is warm for both legs
+    // (there is no single-flight; two cold callers would each spawn the CLI).
+    let (channel_members, messages) = match active_channel.is_empty() {
+        true => (Vec::new(), Vec::new()),
+        false => tokio::try_join!(
+            load_channel_members(rpc, &active_channel),
+            load_messages(rpc, &active_channel, active_channel_head_seq)
+        )?,
     };
     Ok(ChatData {
         channels,
@@ -199,33 +207,7 @@ pub async fn load_older_messages(
     let result = async {
         let rpc = rpc_client(&rpc)?;
         let before = u64::try_from(before_seq).unwrap_or(0);
-        let mut cursor = before.saturating_sub(1);
-        let mut roots = Vec::new();
-        while cursor > 0 && roots.len() < CHAT_TIMELINE_ROOT_LIMIT {
-            let limit = cursor.min(CHAT_VIEW_PAGE_LIMIT);
-            let from_seq = cursor - limit + 1;
-            let reply: ChatViewReply = rpc
-                .view(
-                    "chat",
-                    &ChatViewQuery::MessagesRange {
-                        channel_id: channel_id.clone(),
-                        from_seq,
-                        limit: Some(limit as usize),
-                    },
-                )
-                .await?;
-            let ChatViewReply::Messages(rows) = reply else {
-                return Err("node returned an invalid message list".to_string());
-            };
-            roots.extend(rows.into_iter().filter(|row| row.thread.is_none()));
-            if from_seq == 1 {
-                break;
-            }
-            cursor = from_seq - 1;
-        }
-        roots.sort_by_key(|row| row.seq);
-        let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
-        roots.drain(..excess);
+        let roots = walk_roots_back(&rpc, &channel_id, before.saturating_sub(1)).await?;
         let current_user = local_user_key().await;
         let messages: Vec<ChatMessage> = roots
             .into_iter()
@@ -299,9 +281,45 @@ pub(crate) async fn load_messages(
     channel_id: &str,
     head_seq: u64,
 ) -> Result<Vec<ChatMessage>, String> {
-    let mut cursor = head_seq;
+    let roots = walk_roots_back(rpc, channel_id, head_seq).await?;
+    let current_user = local_user_key().await;
+    let mut messages: Vec<ChatMessage> = roots
+        .into_iter()
+        .map(|row| chat_message(row, current_user.as_deref()))
+        .collect();
+    mark_message_groups(&mut messages);
+    Ok(messages)
+}
+
+/// Walk a channel's history backward from `cursor` in view-sized pages, keeping
+/// only thread roots, oldest first.
+///
+/// Bounded at BOTH ends. It stops at [`CHAT_TIMELINE_ROOT_LIMIT`] roots as it
+/// always did, and now also after [`CHAT_TIMELINE_MAX_PAGES`] pages: replies are
+/// filtered client-side, so a channel whose traffic is mostly thread replies
+/// never fills the root quota and used to walk head→1 in 256-row hops with the
+/// message list blank the whole time. Stopping early leaves
+/// [`history_has_older`] true, so the "Load older messages" button covers the
+/// rest — one bounded page per click instead of one unbounded walk per open.
+async fn walk_roots_back(
+    rpc: &RpcClient,
+    channel_id: &str,
+    mut cursor: u64,
+) -> Result<Vec<MsgRow>, String> {
+    let mut fetched = 0;
     let mut roots = Vec::new();
-    while cursor > 0 && roots.len() < CHAT_TIMELINE_ROOT_LIMIT {
+    while cursor > 0 {
+        let quota_filled = roots.len() >= CHAT_TIMELINE_ROOT_LIMIT;
+        // The page bound applies only once the walk has something to show. An
+        // empty page would return no roots, leave `oldest_message_seq` exactly
+        // where it was, and turn "Load older messages" into a button that can
+        // be clicked forever. Seq 1 is always a root — a reply's root carries a
+        // smaller seq — so a rootless stretch still terminates at the channel's
+        // first message.
+        let walked_far_enough = fetched >= CHAT_TIMELINE_MAX_PAGES && !roots.is_empty();
+        if quota_filled || walked_far_enough {
+            break;
+        }
         let limit = cursor.min(CHAT_VIEW_PAGE_LIMIT);
         let from_seq = cursor - limit + 1;
         let reply: ChatViewReply = rpc
@@ -318,6 +336,7 @@ pub(crate) async fn load_messages(
             return Err("node returned an invalid message list".into());
         };
         roots.extend(rows.into_iter().filter(|row| row.thread.is_none()));
+        fetched += 1;
         if from_seq == 1 {
             break;
         }
@@ -326,13 +345,7 @@ pub(crate) async fn load_messages(
     roots.sort_by_key(|row| row.seq);
     let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
     roots.drain(..excess);
-    let current_user = local_user_key().await;
-    let mut messages: Vec<ChatMessage> = roots
-        .into_iter()
-        .map(|row| chat_message(row, current_user.as_deref()))
-        .collect();
-    mark_message_groups(&mut messages);
-    Ok(messages)
+    Ok(roots)
 }
 
 /// One page of older history, returned to the reducer with the generation that

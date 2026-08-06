@@ -55,10 +55,25 @@ const PROVISION_PATIENCE: u32 = 8;
 /// The voting window a membership proposal opens with, in consensus seconds —
 /// the same value the CLI's membership ceremony uses.
 const GOVERNANCE_VOTING_PERIOD: u64 = 1_000_000;
-const CHAT_TIMELINE_ROOT_LIMIT: usize = 128;
+/// How many thread roots one timeline load mounts. This number IS the cost of
+/// switching into chat: the shell routes modules with a `match tab`, so the
+/// inactive screen is not built at all and every row's lazy cache dies with it
+/// — coming back pays one cold widget build plus one cold text layout per row,
+/// on the UI thread, in one frame. The viewport shows ~15 rows, so 40 is ~2.5
+/// screens of scrollback and "Load older messages" pages in the rest.
+///
+/// ponytail: a knob, not a measured optimum — raise it when the timeline
+/// virtualizes and the mount stops being linear in it.
+const CHAT_TIMELINE_ROOT_LIMIT: usize = 40;
 /// The chat view clamps one message page to 256 rows (default 50, max 256), so
 /// the timeline walk steps in 256-row pages.
 const CHAT_VIEW_PAGE_LIMIT: u64 = 256;
+/// How many such pages one backward walk may spend hunting roots. The walk
+/// filters thread replies client-side, so a thread-heavy channel yields few
+/// roots per page and would otherwise crawl head→seq 1 in 256-row hops before
+/// chat paints anything. Bounded, a load costs at most this many round trips
+/// and leaves the rest to "Load older messages".
+const CHAT_TIMELINE_MAX_PAGES: u32 = 4;
 
 /// Client-local read cursor for one channel: the newest `seq` this device has
 /// "seen". There is no wire read-cursor — this list lives only in app state and

@@ -1766,6 +1766,11 @@ async fn timeline_pages_past_thread_only_traffic() {
     let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
     assert_eq!(chat.messages.len(), 1);
     assert_eq!(chat.messages[0].body, "root stays visible");
+    // The backward walk is page-bounded now, but the bound may never cut it
+    // short of a root: a page that yields none keeps going, so the walk still
+    // reaches seq 1 here and "Load older messages" stays correctly hidden
+    // rather than becoming a button that returns an empty page forever.
+    assert!(!history_has_older(chat.messages.clone()));
     let first = load_thread_data(&rpc, "general", 1, 0).await.unwrap();
     assert_eq!(first.messages.len(), 257);
     assert_eq!(first.next_reply_offset, 256);
