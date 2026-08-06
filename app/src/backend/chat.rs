@@ -690,6 +690,20 @@ pub async fn load_page_threads(
     generation: i64,
 ) -> Result<BlockThreadListData, HydrationError> {
     let result = async {
+        // "" is `page_edited`'s "not my turn" — its parallel always fires
+        // both runs; an empty target answers empty without touching the node
+        // (and no open rail matches an empty target, so the answer is inert).
+        if page_id.is_empty() {
+            return Ok(BlockThreadListData {
+                generation,
+                target: String::new(),
+                from: 0,
+                threads: Vec::new(),
+                total: 0,
+                next_from: 0,
+                has_more: false,
+            });
+        }
         let page_id = required_id(page_id, "page")?;
         let rpc = rpc_client(&rpc)?;
         let blocks = load_page_blocks(&rpc, &page_id).await?;
@@ -876,6 +890,11 @@ pub async fn resolve_comment_thread(
 /// command, and the scheme gate is the trust boundary).
 pub async fn open_external_url(url: String) -> Result<bool, AppError> {
     async {
+        // "" is `page_edited`'s "not my turn" (see its parallel) — nothing
+        // was asked, nothing opens.
+        if url.is_empty() {
+            return Ok(false);
+        }
         let is_web = url.starts_with("http://") || url.starts_with("https://");
         if !is_web {
             return Err("only web links open from a page".to_string());

@@ -70,6 +70,9 @@ pub enum Mark {
     Marker { hidden: bool, style: Style },
     Body(Style),
     ListMarker(Style),
+    /// A todo's `[ ]`/`[x]` — drawn as a checkbox (the span highlight is the
+    /// box), never as bracket glyphs.
+    Tick { checked: bool, style: Style },
     Fence { hidden: bool },
     CodeBody,
 }
@@ -85,6 +88,8 @@ pub struct Style {
     pub emphasis: bool,
     pub link: bool,
     pub commented: bool,
+    /// A checked todo's content — muted and struck through.
+    pub done: bool,
 }
 
 /// The block shape a line's leading bytes declare. `Body` is the absence of a
@@ -265,6 +270,10 @@ fn highlight(
     }
 
     let (prefix, content) = prefix_of(line);
+    let marker = &line[..content];
+    let ticked_done =
+        prefix == Prefix::List && (marker.ends_with("[x] ") || marker.ends_with("[X] "));
+    let ticked = ticked_done || (prefix == Prefix::List && marker.ends_with("[ ] "));
     let style = Style {
         heading: match prefix {
             Prefix::Heading(level) => Some(level),
@@ -274,18 +283,39 @@ fn highlight(
         callout: prefix == Prefix::Callout,
         divider: prefix == Prefix::Divider,
         commented,
+        done: ticked_done,
         ..Style::default()
     };
 
     let mut marks = Vec::new();
-    // The marker run. A list keeps its own — it IS the bullet the reader sees.
+    // The marker run. A list keeps its own — it IS the bullet the reader
+    // sees — but a todo's bullet yields to the checkbox: the `- ` reveals
+    // only under the caret and the `[ ]` run IS the box, always.
     match prefix {
         Prefix::Body => {}
-        Prefix::List => marks.push((0..content, Mark::ListMarker(style))),
+        Prefix::List => match ticked {
+            false => marks.push((0..content, Mark::ListMarker(style))),
+            true => {
+                marks.push((
+                    0..content - 4,
+                    Mark::Marker {
+                        hidden: !on_caret_line,
+                        style,
+                    },
+                ));
+                marks.push((
+                    content - 4..content - 1,
+                    Mark::Tick {
+                        checked: ticked_done,
+                        style,
+                    },
+                ));
+            }
+        },
         Prefix::Divider => marks.push((
             0..line.len(),
             Mark::Marker {
-                hidden: false,
+                hidden: !on_caret_line,
                 style,
             },
         )),
@@ -303,8 +333,14 @@ fn highlight(
     }
 
     // The line's own body carries the block style; the inline scanner then
-    // overlays bold/italic/link on top of it, offset past the prefix.
-    marks.push((content..line.len(), Mark::Body(style)));
+    // overlays bold/italic/link on top of it, offset past the prefix. A
+    // todo's body starts at the gap after the box, so the box keeps its
+    // breathing room.
+    let body_start = match ticked {
+        true => content - 1,
+        false => content,
+    };
+    marks.push((body_start..line.len(), Mark::Body(style)));
     for (range, inline) in inline_marks(&line[content..]) {
         let shifted = content + range.start..content + range.end;
         let inline_style = match inline {
@@ -349,6 +385,8 @@ struct Ink {
     callout_plate: Color,
     callout_line: Color,
     comment_wash: Color,
+    rule: Color,
+    tick_fill: Color,
 }
 
 const fn rgb8(r: u8, g: u8, b: u8) -> Color {
@@ -383,6 +421,8 @@ const LIGHT: Ink = Ink {
     callout_plate: wash(0xa0, 0x5a, 0x3c, 0.06),
     callout_line: wash(0xa0, 0x5a, 0x3c, 0.14),
     comment_wash: wash(0xa0, 0x5a, 0x3c, 0.09),
+    rule: wash(0x3a, 0x38, 0x33, 0.16),
+    tick_fill: rgb8(0xa0, 0x5a, 0x3c),
 };
 
 const DARK: Ink = Ink {
@@ -397,6 +437,8 @@ const DARK: Ink = Ink {
     callout_plate: wash(0xc9, 0x8a, 0x63, 0.10),
     callout_line: wash(0xc9, 0x8a, 0x63, 0.20),
     comment_wash: wash(0xc9, 0x8a, 0x63, 0.13),
+    rule: wash(0xd4, 0xd2, 0xca, 0.18),
+    tick_fill: rgb8(0xc9, 0x8a, 0x63),
 };
 
 fn ink(dark: bool) -> &'static Ink {
@@ -460,10 +502,22 @@ pub fn format(mark: &Mark, dark: bool) -> Format {
         },
         Mark::Marker { hidden, style } => {
             let mut format = body_format(style, ink);
+            // The marker is scaffolding: a done todo strikes its CONTENT, never
+            // its bullet — a struck collapsed bullet paints a floating dash.
+            format.strikethrough = None;
             format.color = Some(match hidden {
                 true => Color::TRANSPARENT,
                 false => ink.marker,
             });
+            if hidden && style.divider {
+                // A divider away from the caret IS the rule: the glyphs go
+                // transparent at full size — the line keeps its height and
+                // its click target — and the hairline paints across the
+                // column. Under the caret the literal `---` returns to be
+                // edited.
+                format.line_rule = Some(ink.rule);
+                return format;
+            }
             if hidden {
                 // Collapse the glyphs without collapsing the LINE: the body run
                 // beside them still carries the real line height.
@@ -476,6 +530,40 @@ pub fn format(mark: &Mark, dark: bool) -> Format {
             color: Some(ink.muted),
             ..body_format(style, ink)
         },
+        Mark::Tick { checked, style } => {
+            // The bracket glyphs are scaffolding: the box the reader sees is
+            // the span highlight drawn around them — an outline until the
+            // todo is done, a filled square after.
+            let mut format = body_format(style, ink);
+            format.color = Some(Color::TRANSPARENT);
+            format.strikethrough = None;
+            // The collapsed `- ` bullet beside this run cannot carry the line,
+            // so the tick holds the body metrics ABSOLUTELY — the same job the
+            // body run does for a heading's hidden marker.
+            format.size = Some(Pixels(BODY_SIZE));
+            format.line_height = Some(LineHeight::Absolute(Pixels(BODY_SIZE * BODY_LINE_HEIGHT)));
+            let (fill, line) = match checked {
+                true => (ink.tick_fill, ink.tick_fill),
+                false => (Color::TRANSPARENT, ink.marker),
+            };
+            format.highlight = Some(TextHighlight {
+                background: fill.into(),
+                border: Border {
+                    color: line,
+                    width: 1.4,
+                    radius: 4.0.into(),
+                },
+            });
+            // Paint-only NEGATIVE padding: the span box spans the line's full
+            // height, and the checkbox wants to hug the glyph row instead.
+            format.padding = Padding {
+                top: -4.5,
+                bottom: -4.5,
+                left: -0.5,
+                right: -0.5,
+            };
+            format
+        }
         Mark::Body(style) => body_format(style, ink),
         Mark::Fence { hidden } => Format {
             color: Some(match hidden {
@@ -519,7 +607,7 @@ fn body_format(style: Style, ink: &Ink) -> Format {
     };
     let color = if style.link {
         ink.link
-    } else if style.quote || style.divider {
+    } else if style.done || style.quote || style.divider {
         ink.muted
     } else if style.heading.is_some() {
         ink.strong
@@ -529,6 +617,7 @@ fn body_format(style: Style, ink: &Ink) -> Format {
     let mut format = Format {
         color: Some(color),
         font: Some(body_font(weight, italic)),
+        strikethrough: style.done.then_some(ink.marker),
         ..Format::default()
     };
     // A commented block wears a quiet brand wash across its lines — the
@@ -662,6 +751,54 @@ mod tests {
         // ...and line 1 parses normally, so the title costs the body nothing.
         let body: Vec<_> = highlighter.highlight_line("# a real heading").collect();
         assert!(matches!(body[0].1, Mark::Marker { .. }));
+    }
+
+    #[test]
+    fn a_divider_away_from_the_caret_is_a_rule_not_three_dashes() {
+        let (away, _) = highlight("---", false, false, false);
+        assert!(matches!(away[0].1, Mark::Marker { hidden: true, .. }));
+        let painted = format(&away[0].1, false);
+        assert_eq!(painted.color, Some(Color::TRANSPARENT));
+        assert!(painted.line_rule.is_some());
+        // Full size: the line keeps its height and its click target.
+        assert!(painted.size.is_none());
+        // Under the caret the literal returns and the rule goes.
+        let (under, _) = highlight("---", false, true, false);
+        let editable = format(&under[0].1, false);
+        assert!(editable.line_rule.is_none());
+        assert_ne!(editable.color, Some(Color::TRANSPARENT));
+    }
+
+    #[test]
+    fn a_todo_line_splits_into_bullet_box_and_body() {
+        let (marks, _) = highlight("- [ ] ship", false, false, false);
+        assert_eq!(marks[0].0, 0..2);
+        assert!(matches!(marks[0].1, Mark::Marker { hidden: true, .. }));
+        assert_eq!(marks[1].0, 2..5);
+        assert!(matches!(marks[1].1, Mark::Tick { checked: false, .. }));
+        // The body starts at the gap so the box keeps its breathing room.
+        assert_eq!(marks[2].0, 5..10);
+        assert!(matches!(marks[2].1, Mark::Body(_)));
+        // The box is the span highlight; the bracket glyphs are invisible.
+        let tick = format(&marks[1].1, false);
+        assert_eq!(tick.color, Some(Color::TRANSPARENT));
+        assert!(tick.highlight.is_some());
+        // A plain bullet keeps its visible marker, exactly as before.
+        let (bullet, _) = highlight("- plain", false, false, false);
+        assert!(matches!(bullet[0].1, Mark::ListMarker(_)));
+    }
+
+    #[test]
+    fn a_done_todo_fills_the_box_and_strikes_the_text() {
+        let (marks, _) = highlight("- [x] done", false, false, false);
+        assert!(matches!(marks[1].1, Mark::Tick { checked: true, .. }));
+        let Mark::Body(style) = marks[2].1 else {
+            unreachable!("a body run")
+        };
+        assert!(style.done);
+        let body = format(&marks[2].1, false);
+        assert!(body.strikethrough.is_some());
+        assert_eq!(body.color, Some(LIGHT.muted));
     }
 
     #[test]
