@@ -99,14 +99,15 @@ use iced::widget::text_editor::{self, Action, Content, Cursor, Edit, Position};
 use iced::{Border, Color, Element, Padding};
 use std::hash::{Hash as _, Hasher as _};
 use ui_lang_runtime::rich_text_editor::{
-    ContentVersion, GUTTER_WIDTH, GutterButton, MenuEvent, RichTextEditor,
+    ContentVersion, GUTTER_WIDTH, GutterButton, MARGIN_WIDTH, MenuEvent, RichTextEditor,
 };
 
 pub use ui_lang_runtime::rich_text_editor::Action as PageAction;
 
 /// Everything the page surface can emit: an ordinary editor interaction, a
 /// checkbox tick (a consumed line press over a todo's `[ ]`), a link the
-/// reader asked to open, an anchored-menu event, or a gutter press.
+/// reader asked to open, an anchored-menu event, a gutter press, or a press
+/// on a commented block's margin badge.
 #[derive(Clone, Debug)]
 pub enum PageEvent {
     Action(PageAction),
@@ -115,6 +116,7 @@ pub enum PageEvent {
     Menu(MenuEvent),
     Gutter(usize, GutterButton),
     GutterDrop(usize, usize),
+    OpenComments,
 }
 
 /// Classify a left press over `(line, position)` — the widget's
@@ -164,8 +166,28 @@ pub fn page_link_of(event: PageEvent) -> String {
         | PageEvent::ToggleTodo(_)
         | PageEvent::Menu(_)
         | PageEvent::Gutter(..)
-        | PageEvent::GutterDrop(..) => String::new(),
+        | PageEvent::GutterDrop(..)
+        | PageEvent::OpenComments => String::new(),
     }
+}
+
+/// True for a margin-badge press — the handler's guard for opening the rail.
+pub fn page_opens_comments(event: PageEvent) -> bool {
+    matches!(event, PageEvent::OpenComments)
+}
+
+/// The first line of each commented run — where a margin badge sits.
+// ponytail: two ADJACENT commented blocks merge into one run and share one
+// badge; split on block spans if that ever reads wrong.
+fn comment_marks(commented: &[i64]) -> Vec<usize> {
+    let mut marks = Vec::new();
+    for (index, &line) in commented.iter().enumerate() {
+        let run_start = index == 0 || commented[index - 1] != line - 1;
+        if run_start && line >= 0 {
+            marks.push(line as usize);
+        }
+    }
+    marks
 }
 
 use markdown::{BODY_LINE_HEIGHT, BODY_SIZE, Caret, DocumentHighlighter};
@@ -183,6 +205,7 @@ pub fn page_document(
     commented: Vec<i64>,
 ) -> Element<'_, PageEvent> {
     let cursor = document.cursor().position;
+    let marks = comment_marks(&commented);
     let editor = RichTextEditor::new(document, content_version(document))
         .id("page-document")
         .placeholder("Write something… `#` for a heading, `-` for a list")
@@ -196,9 +219,11 @@ pub fn page_document(
         .line_height(BODY_LINE_HEIGHT)
         .wrapping(Wrapping::Word)
         // The left inset carries the widget's hover gutter ("+" and the
-        // handle) so the affordance aligns with the line it belongs to.
+        // handle), the right one the comment badges — both aligned to the
+        // line they belong to.
         .padding(Padding {
             left: GUTTER_WIDTH + DOCUMENT_PAD_X,
+            right: MARGIN_WIDTH + DOCUMENT_PAD_X,
             ..Padding::from([0.0, DOCUMENT_PAD_X])
         })
         .highlight_with::<DocumentHighlighter>(
@@ -218,6 +243,7 @@ pub fn page_document(
     editor
         .on_action(PageEvent::Action)
         .on_line_press(line_press)
+        .margin_marks(marks, |_| PageEvent::OpenComments)
         // Line 0 is the title — it takes no gutter, like the reference
         // editor's title row.
         .on_gutter(|line, button| (line > 0).then_some(PageEvent::Gutter(line, button)))
@@ -286,7 +312,7 @@ pub fn apply_page_event(document: Content, event: PageEvent) -> Content {
             document
         }
         PageEvent::ToggleTodo(line) => toggle_todo(document, line),
-        PageEvent::OpenLink(_) => document,
+        PageEvent::OpenLink(_) | PageEvent::OpenComments => document,
         PageEvent::Menu(event) => menu::apply(document, event),
         PageEvent::Gutter(line, button) => menu::gutter(document, line, button),
         PageEvent::GutterDrop(from, boundary) => menu::drop_move(document, from, boundary),
@@ -828,6 +854,14 @@ mod tests {
         // editor-valued sync could never read it).
         assert_eq!(block_at_line_target(blocks.clone(), 3), "a\nb");
         assert_eq!(block_at_line_target(blocks, 0), "");
+    }
+
+    #[test]
+    fn margin_badges_sit_on_the_first_line_of_each_commented_run() {
+        assert_eq!(comment_marks(&[2, 3, 4, 5, 9]), vec![2, 9]);
+        assert_eq!(comment_marks(&[]), Vec::<usize>::new());
+        assert!(page_opens_comments(PageEvent::OpenComments));
+        assert!(!page_opens_comments(PageEvent::OpenLink("x".into())));
     }
 
     #[test]

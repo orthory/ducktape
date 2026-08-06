@@ -460,10 +460,23 @@ on page_edited(event)
   // The refusal describes an edit that was already rolled back; the next
   // keystroke is the user moving on from it.
   page_refusal = ""
-  // A link press never touched the buffer — it is a hand-off to the OS.
+  // A margin-badge press opens the comments rail. Every rail field is already
+  // at its reset value whenever the rail is closed (every close path resets
+  // them), so opening is just the flip plus the thread load. A badge press
+  // with the rail already open is a no-op.
+  let page_rail_open = page_opens_comments(event) && !block_comments_open && !loading && mutation_phase == "idle" && !empty(active_page)
+  block_comments_generation = block_comments_generation + keep_i64(page_rail_open, 1, 0)
+  block_comments_open = block_comments_open || page_rail_open
+  block_comments_target = keep_str(page_rail_open, active_page, block_comments_target)
+  block_comment_threads_loading = block_comment_threads_loading || page_rail_open
+  // A link press never touched the buffer — it is a hand-off to the OS. The
+  // two runs are exclusive by event kind; each backend treats an empty
+  // argument as "not my turn" and answers without side effects.
   page_link = page_link_of(event)
-  return if empty(page_link)
-  run open_external_url(page_link) -> external_url_opened _ | external_url_failed _
+  return if empty(page_link) && !page_rail_open
+  parallel
+    run open_external_url(page_link) -> external_url_opened _ | external_url_failed _
+    run load_page_threads(connected_rpc, keep_str(page_rail_open, active_page, ""), block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on external_url_opened(_opened)
   error = error
