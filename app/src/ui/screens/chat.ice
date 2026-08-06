@@ -19,7 +19,7 @@
 // were briefly caller-filled slots: a sensor's show/resize route used to accept
 // only bare `_` payloads and could not carry a component event (ui-lang#239).
 
-component ChatScreen(account_name:str, connected_rpc:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], channels:[ChatChannel], dm_peers:[DmPeer], channel_reads:[ChannelRead], user_key:str, channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
+component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], channels:[ChatChannel], dm_peers:[DmPeer], channel_reads:[ChannelRead], user_key:str, channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
   emits
     search_chat_submit()
     clear_chat_search()
@@ -75,7 +75,7 @@ component ChatScreen(account_name:str, connected_rpc:str, status:str, block_heig
       col w=fill h=fill
         box w=fill pl=14.0 pr=14.0 pt=14.0 pb=11.0
           row w=fill gap=8.0 align=center
-            text network_label(account_name, connected_rpc) size=13.5 wrap=none font=display @text-fg
+            text network_name size=13.5 wrap=none font=display @text-fg
             if connection_degraded(status)
               box w=7.0 h=7.0 bg=danger_dot r=3.5
                 space w=1.0 h=1.0
@@ -239,7 +239,7 @@ component ChatScreen(account_name:str, connected_rpc:str, status:str, block_heig
                   mouse press-at=emit(chat_pointer_pressed, _, _)
                     scroll dir=vertical w=fill h=fill anchor-y=end auto=true
                       col w=fill gap=3.0 pr=6.0
-                        if history_has_older(messages)
+                        if has_older_history
                           box w=fill align-x=center pt=4.0 pb=8.0
                             button "Load older messages" disabled=(history_loading || mutation_phase != "idle") h=30.0 p=6.0 @secondary_action -> emit(load_more_history)
                               active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=8.0

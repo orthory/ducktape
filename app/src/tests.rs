@@ -1493,6 +1493,14 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     // StatusCard and the tooltip frame stays transparent, so the `pr` gutter
     // can hold the card off the wall on the bell card's line.
     assert!(bar.contains("tooltip position=bottom gap=13.5 p=0.0 delay=90 style=transparent"));
+    // Per-frame extern bans. These two walk the disk (workspace tomls) or
+    // deep-clone the whole timeline through the extern ABI, so the view reads
+    // their STATE MIRRORS (`network_name`, `has_older_history`) instead. If
+    // either name returns to a view or screen file, the per-frame tax is back.
+    assert!(!SCREENS.contains("network_label("));
+    assert!(!include_str!("ui/view.ice").contains("network_label("));
+    assert!(!SCREENS.contains("history_has_older("));
+    assert!(!include_str!("ui/view.ice").contains("history_has_older("));
     assert!(bar.contains("box pr=13.0\n              StatusCard "));
     assert!(shell.contains(
         "box #root w=284.0 pl=14.0 pr=14.0 pt=13.0 pb=13.0 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0"

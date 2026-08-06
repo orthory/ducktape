@@ -6,6 +6,9 @@ on account_loaded(next)
   account_bound = next.bound
   account_id = next.account_id
   account_name = next.display_name
+  // The label's fallback chain ends at the account name — refresh the mirror
+  // now that it arrived (the workspace/chain_id cases win and are unchanged).
+  network_name = network_label(account_name, connected_rpc)
   account_bio = next.bio
   account_members = next.members
   account_nodes = next.nodes

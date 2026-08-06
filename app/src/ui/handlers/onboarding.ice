@@ -165,6 +165,7 @@ on console_opened(id)
   error = ""
   block_autosave_generation = cancel_autosaves(connected_rpc, block_autosave_generation)
   connected_rpc = rpc
+  network_name = network_label(account_name, connected_rpc)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = "idle"

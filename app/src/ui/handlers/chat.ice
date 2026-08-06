@@ -67,6 +67,7 @@ on choose_channel(id)
   active_channel = id
   active_channel_name = channel_display_name(channels, active_channel, active_channel_name)
   messages = []
+  has_older_history = false
   unread_marker_seq = 0
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
@@ -104,6 +105,7 @@ on choose_dm(peer_key)
   // Same visible switch as `choose_channel`: the stale room leaves the pane
   // immediately; the DM header already derives from `dm_peers`.
   messages = []
+  has_older_history = false
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   hydration_generation = hydration_generation + 1
@@ -280,6 +282,7 @@ on chat_updated(next)
   history_view = false
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
@@ -320,6 +323,7 @@ on chat_hit_loaded(next)
   history_view = true
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
@@ -361,6 +365,7 @@ on channel_created(next)
   mutation_phase = "idle"
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
@@ -607,6 +612,7 @@ on load_more_history
 on history_loaded(next)
   return if next.generation != history_generation || !history_loading
   messages = prepend_history(messages, next.messages)
+  has_older_history = history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   history_loading = false
   error = ""
