@@ -201,6 +201,17 @@ pub fn window_target(current: Option<iced::window::Id>) -> iced::window::Id {
     current.unwrap_or_else(iced::window::Id::unique)
 }
 
+/// [`window_target`] gated on a bool: while `keep` holds, yields a fresh id
+/// (a no-op close); once it does not, names the window. How a branch-free
+/// fold spells "close the huddle window only if the huddle ended".
+pub fn window_target_unless(keep: bool, current: Option<iced::window::Id>) -> iced::window::Id {
+    if keep {
+        iced::window::Id::unique()
+    } else {
+        window_target(current)
+    }
+}
+
 /// Clear a tracked window id when it is the one that closed.
 pub fn without_window(
     current: Option<iced::window::Id>,
@@ -394,12 +405,17 @@ pub async fn restore_user_key(words: String, password: String) -> Result<String,
 }
 
 /// `user key unlock` — a pure decrypt probe: succeeds iff `password` opens
-/// this device's key. Nothing persists; the login step's verifier.
+/// this device's key. Nothing persists on disk, but the pubkey the probe just
+/// proved seeds the in-process identity cache — its two siblings above already
+/// do, and without it the first hydrate pays a `user key status` subprocess to
+/// re-read what this derivation already paid 64 MiB to learn.
 pub async fn unlock_user_key(password: String) -> Result<String, AppError> {
     async {
         let path = user_key_path()?;
         let stdout = user_key_cli(&["unlock", "--key"], &path, password).await?;
-        last_line(&stdout)
+        let pubkey = last_line(&stdout)?;
+        set_local_user_key(hex_decode(&pubkey).ok()).await;
+        Ok(pubkey)
     }
     .await
     .map_err(app_error)

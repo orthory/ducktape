@@ -19,7 +19,7 @@
 // were briefly caller-filled slots: a sensor's show/resize route used to accept
 // only bare `_` payloads and could not carry a component event (ui-lang#239).
 
-component ChatScreen(account_name:str, connected_rpc:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], channels:[ChatChannel], dm_peers:[DmPeer], channel_reads:[ChannelRead], user_key:str, channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
+component ChatScreen(account_name:str, connected_rpc:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], channels:[ChatChannel], dm_peers:[DmPeer], channel_reads:[ChannelRead], user_key:str, channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
   emits
     search_chat_submit()
     clear_chat_search()
@@ -29,6 +29,7 @@ component ChatScreen(account_name:str, connected_rpc:str, status:str, block_heig
     choose_dm(str)
     toggle_channel_settings()
     pop_huddle()
+    focus_huddle()
     leave_huddle_here()
     huddle_go_channel()
     join_huddle_submit()
@@ -176,9 +177,10 @@ component ChatScreen(account_name:str, connected_rpc:str, status:str, block_heig
                   // The huddle control, in its three mutually exclusive
                   // states — in it here, in it elsewhere, in none.
                   if huddle_joined && huddle_channel == active_channel
-                    HuddleLivePill name=active_channel_name elapsed=mmss(huddle_now - huddle_joined_at) muted=call_muted
+                    HuddleLivePill name=active_channel_name elapsed=mmss(huddle_now - huddle_joined_at) muted=call_muted popped=huddle_popped
                       forward
                         pop_huddle
+                        focus_huddle
                         leave_huddle_here
                   if huddle_joined && huddle_channel != active_channel
                     HuddleElsewhere name=huddle_channel_name
@@ -580,8 +582,19 @@ component ChatScreen(account_name:str, connected_rpc:str, status:str, block_heig
                         // is.
                         if thread_message.seq == active_thread_seq
                           ThreadParentBlock message=thread_message
-                        if thread_message.seq != active_thread_seq
-                          ThreadMessageCard message=thread_message selected=(thread_message.seq == thread_target_seq) disabled=loading
+                        // The settle ✓ mirrors the stream's arms: the one
+                        // reply `thread_send_flash_id` anchors rides the
+                        // shared fade, every other row passes 0.0.
+                        if thread_message.seq != active_thread_seq && thread_message.id == thread_send_flash_id
+                          ThreadMessageCard message=thread_message selected=(thread_message.seq == thread_target_seq) disabled=loading flash=send_flash_value
+                            forward
+                              add_reaction_at
+                              remove_reaction_at
+                              open_thread_for
+                              open_thread_message_actions
+                              open_thread_message_reactions
+                        if thread_message.seq != active_thread_seq && thread_message.id != thread_send_flash_id
+                          ThreadMessageCard message=thread_message selected=(thread_message.seq == thread_target_seq) disabled=loading flash=0.0
                             forward
                               add_reaction_at
                               remove_reaction_at

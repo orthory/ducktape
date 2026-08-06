@@ -163,7 +163,9 @@ component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_ba
           // The frame is therefore transparent and carries a 13px right gutter,
           // which lands the card's right edge on the same line the bell card
           // holds (view.ice `pr=13.0`) instead of glued to the wall.
-          tooltip position=bottom gap=6.0 p=0.0 delay=90 style=transparent
+          // gap=13.5 lands the card's TOP on the bell card's line too
+          // (view.ice pt=44.0): one dropdown line, both titlebar cards.
+          tooltip position=bottom gap=13.5 p=0.0 delay=90 style=transparent
             StatusPill degraded=degraded loading=loading
             box pr=13.0
               StatusCard degraded=degraded loading=loading height=height tier=tier root_hash=root_hash consensus_view=consensus_view quorum=quorum reachable=reachable last_finalized=last_finalized checkpoint=checkpoint

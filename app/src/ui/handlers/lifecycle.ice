@@ -214,6 +214,9 @@ on workspace_connected(next)
     run load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
     run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     run load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_failed _
+    // The huddle window mirrors the old popped-card gate: it closes the
+    // moment a fold finds `huddle_joined` false. A no-op while still joined.
+    task window close target=window_target_unless(huddle_joined, huddle_win)
 
 on live_updated(next)
   status = next.status
@@ -223,8 +226,9 @@ on live_updated(next)
   // Settle-✓ choreography, read against the PRE-fold rows: the settle delta
   // pops the tick (true), any later live event — the next block at the
   // latest — starts its fade (false). Same-value writes are no-ops.
-  send_flash = send_settled_by(messages, next.chat, active_channel)
+  send_flash = (send_settled_by(messages, next.chat, active_channel)) || (reply_settled_by(thread_messages, next.chat, active_channel))
   send_flash_id = settled_send_id(messages, next.chat, active_channel, send_flash_id)
+  thread_send_flash_id = settled_reply_id(thread_messages, next.chat, active_channel, thread_send_flash_id)
   messages = apply_chat_messages(messages, next.chat, active_channel)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   thread_messages = apply_chat_thread(thread_messages, next.chat, active_channel, active_thread_seq)
@@ -362,6 +366,9 @@ on live_resynced(next)
   parallel
     run refresh_live_thread(connected_rpc, active_channel, active_thread_seq, thread_target_seq, thread_next_reply_offset, live_thread_generation) -> live_thread_refreshed _ | live_thread_refresh_failed _
     run load_page_threads(connected_rpc, block_comments_target, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
+    // Same close-if-ended mirror as `workspace_connected` — this is the fold
+    // the steady state pays (a roster change forces a chat resync into here).
+    task window close target=window_target_unless(huddle_joined, huddle_win)
 
 on live_resync_failed(cause)
   return if cause.generation != hydration_generation
@@ -384,6 +391,11 @@ on live_thread_refresh_failed(cause)
 
 on select_shell_tab(next)
   shell_tab = next
+  // Leaving Chat prunes paged-in scrollback to one load's worth: the return
+  // trip cold-rebuilds every mounted row in one frame, so the mount cost must
+  // not compound with how far she once paged back. "Load older" re-earns it.
+  messages = trim_timeline_on_leave(next, messages)
+  unread_marker_seq = first_unread_seq(messages, unread_boundary)
   // A hydration error belongs to the pane that raised it. Leaving it up after
   // a navigation tells the user the pane they just opened is broken, which is
   // a lie the banner has no way to walk back — it is dismissed by hand or not
@@ -466,7 +478,7 @@ subscribe
   // starts its fade, tick two unmounts it. Gated on an anchored ✓ — it costs
   // nothing outside the seconds after a send settles. A live delta may start
   // the fade earlier; this clock is the floor a quiet network needs.
-  every 1200ms when !empty(send_flash_id) -> send_flash_tick
+  every 1200ms when (!empty(send_flash_id)) || (!empty(thread_send_flash_id)) -> send_flash_tick
   // The block editor's autosave: the stock editor's edits never pass through
   // a handler, so the gate IS the dirty test — the tick only exists while
   // the buffer has drifted from the last text known saved.

@@ -1050,6 +1050,61 @@ fn optimistic_reaction_survives_the_canonical_replay() {
 }
 
 #[test]
+fn reply_settle_flash_mirrors_the_stream_for_the_thread_rail() {
+    let pending = optimistic_message(Vec::new(), "a reply".into(), "reply-a".into());
+    let mut settled_row = pending[0].clone();
+    settled_row.pending = false;
+    settled_row.seq = 9;
+    let settle = ChatDelta {
+        kind: "reply".into(),
+        channel_id: "general".into(),
+        root_seq: 3,
+        seq: 9,
+        message: settled_row,
+        ..ChatDelta::default()
+    };
+    assert!(reply_settled_by(
+        pending.clone(),
+        settle.clone(),
+        "general".into()
+    ));
+    assert_eq!(
+        settled_reply_id(pending.clone(), settle.clone(), "general".into(), String::new()),
+        "reply-a"
+    );
+    // Each lane fires only on its own delta kind: a `reply` is the rail's
+    // edge and never the stream's, and a `posted` is the reverse.
+    assert!(!send_settled_by(
+        pending.clone(),
+        settle.clone(),
+        "general".into()
+    ));
+    let mut as_post = settle.clone();
+    as_post.kind = "posted".into();
+    assert!(!reply_settled_by(pending.clone(), as_post, "general".into()));
+    assert!(!reply_settled_by(pending, settle, "other".into()));
+}
+
+#[test]
+fn leaving_chat_prunes_scrollback_to_one_load() {
+    let mut messages = Vec::new();
+    for seq in 0..(CHAT_TIMELINE_ROOT_LIMIT + 50) {
+        messages = optimistic_message(messages, format!("m{seq}"), format!("id-{seq}"));
+    }
+    // Staying on chat keeps the paged-in scrollback…
+    let kept = trim_timeline_on_leave("chat".into(), messages.clone());
+    assert_eq!(kept.len(), CHAT_TIMELINE_ROOT_LIMIT + 50);
+    // …and leaving prunes to one load's worth, newest rows surviving.
+    let trimmed = trim_timeline_on_leave("pages".into(), messages);
+    assert_eq!(trimmed.len(), CHAT_TIMELINE_ROOT_LIMIT);
+    assert_eq!(
+        trimmed.last().unwrap().body,
+        format!("m{}", CHAT_TIMELINE_ROOT_LIMIT + 49)
+    );
+    assert_eq!(trimmed.first().unwrap().body, "m50");
+}
+
+#[test]
 fn send_settle_flash_fires_only_for_own_pending_rows() {
     let pending = optimistic_message(Vec::new(), "hello".into(), "message-a".into());
     let mut settled_row = pending[0].clone();

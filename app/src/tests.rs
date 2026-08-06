@@ -254,7 +254,7 @@ fn assert_no_polling(lifecycle: &str) {
             // the settle-✓'s dismissal clock: two beats — hold + fade, then
             // unmount. Gated on the flash anchor, so it exists only for the
             // seconds after one of OUR sends settles.
-            "every 1200ms when !empty(send_flash_id) -> send_flash_tick",
+            "every 1200ms when (!empty(send_flash_id)) || (!empty(thread_send_flash_id)) -> send_flash_tick",
             // the block editor's autosave clock: the stock editor's edits
             // never pass through a handler, so a dirty buffer is the only
             // signal there is — and the gate IS the dirty test, so the tick
@@ -1114,7 +1114,11 @@ fn thread_messages_mirror_the_main_action_system() {
     // A reply is the SAME message block as a timeline row — the rail mounts
     // the shared contents rather than a second spelling of them, so the
     // message redesign lands in both lanes at once.
-    assert!(card.contains("MessageContents message=message flash=0.0"));
+    assert!(card.contains("MessageContents message=message flash=flash"));
+    // The rail's settle ✓ is real now: the card takes the fade as a prop and
+    // `thread_send_flash_id` anchors it from the screen's flash arm. (`card`
+    // starts right after the component name, so the signature is its head.)
+    assert!(card.starts_with("(message:ChatMessage, selected:bool, disabled:bool, flash:f64)"));
     // No open-thread action from inside a thread you are already reading. The
     // shared contents still declare the event (their reply pill emits it) so
     // the card forwards it, but the rail's toolbar has no seat for it — and a
@@ -1584,7 +1588,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     // snaps an overflowing tip hard against it. The paper therefore belongs to
     // StatusCard and the tooltip frame stays transparent, so the `pr` gutter
     // can hold the card off the wall on the bell card's line.
-    assert!(bar.contains("tooltip position=bottom gap=6.0 p=0.0 delay=90 style=transparent"));
+    assert!(bar.contains("tooltip position=bottom gap=13.5 p=0.0 delay=90 style=transparent"));
     assert!(bar.contains("box pr=13.0\n              StatusCard "));
     assert!(shell.contains(
         "box #root w=284.0 pl=14.0 pr=14.0 pt=13.0 pb=13.0 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0"

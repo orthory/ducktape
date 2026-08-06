@@ -362,6 +362,19 @@ pub fn history_has_older(messages: Vec<ChatMessage>) -> bool {
     messages.first().is_some_and(|message| message.seq > 1)
 }
 
+/// Leaving the Chat tab prunes paged-in scrollback back to one load's worth.
+/// Re-entering chat cold-rebuilds every mounted row in a single frame, so the
+/// mount cost must not compound with how far someone once paged back —
+/// "Load older messages" re-earns the rest on demand.
+pub fn trim_timeline_on_leave(tab: String, mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    if tab != "chat" && messages.len() > CHAT_TIMELINE_ROOT_LIMIT {
+        let excess = messages.len() - CHAT_TIMELINE_ROOT_LIMIT;
+        messages.drain(..excess);
+        mark_message_groups(&mut messages);
+    }
+    messages
+}
+
 /// The seq of the oldest loaded root (the ceiling for the next older page).
 pub fn oldest_message_seq(messages: Vec<ChatMessage>) -> i64 {
     messages.first().map_or(0, |message| message.seq)
@@ -482,10 +495,18 @@ pub(crate) async fn load_thread_data(
     let thread = query_thread_page(rpc, channel_id, root_seq).await?;
     let (loaded, has_more) = thread_page_bound(thread.replies.len() as u64, through_reply_offset);
     let current_user = local_user_key().await;
-    let messages = std::iter::once(thread.root)
-        .chain(thread.replies.into_iter().take(loaded as usize))
+    let root = chat_message(thread.root, current_user.as_deref());
+    let mut replies: Vec<ChatMessage> = thread
+        .replies
+        .into_iter()
+        .take(loaded as usize)
         .map(|row| chat_message(row, current_user.as_deref()))
         .collect();
+    // The rail draws the stream's run rhythm now, so replies group the same
+    // way — but the ROOT renders as its own divided block, so the run starts
+    // at the first reply rather than folding it under the root's author.
+    mark_message_groups(&mut replies);
+    let messages = std::iter::once(root).chain(replies).collect();
     Ok(ThreadData {
         root_seq: number_i64(root_seq),
         target_seq: 0,

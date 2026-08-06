@@ -310,13 +310,12 @@ component MessageCard(message:ChatMessage, selected:bool, disabled:bool, flash:f
 // already reading the thread. The card padding matches MessageCard's so the
 // pr=7 indicator inset still tucks under the pr=8 toolbar plate (#926).
 //
-// `flash=0.0` — the settle ✓ is anchored by `send_flash_id` against the
-// channel stream, and the rail has no such anchor; a reply in flight shows the
-// pending dot and settles into a plain row. `open_thread_for` is forwarded
-// only because `MessageContents` declares it: it fires from the reply pill,
-// and a reply carries no replies (`reply_count` only ever climbs on a root),
-// so the pill never renders here.
-component ThreadMessageCard(message:ChatMessage, selected:bool, disabled:bool)
+// `flash` — the rail's own settle ✓: `thread_send_flash_id` anchors it to the
+// reply whose optimistic send just landed, on the stream's shared fade.
+// `open_thread_for` is forwarded only because `MessageContents` declares it:
+// it fires from the reply pill, and a reply carries no replies
+// (`reply_count` only ever climbs on a root), so the pill never renders here.
+component ThreadMessageCard(message:ChatMessage, selected:bool, disabled:bool, flash:f64)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -328,21 +327,21 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, disabled:bool)
     stack w=fill
       if message.deleted
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=transparent border=transparent border-w=1.0 r=9.0
-          MessageContents message=message flash=0.0
+          MessageContents message=message flash=flash
             forward
               add_reaction_at
               remove_reaction_at
               open_thread_for
       if !message.deleted && selected
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=brand_bg border=transparent border-w=1.0 r=9.0
-          MessageContents message=message flash=0.0
+          MessageContents message=message flash=flash
             forward
               add_reaction_at
               remove_reaction_at
               open_thread_for
       if !message.deleted && !selected
         box w=fill pl=7.0 pr=7.0 pt=6.0 pb=6.0 bg=transparent border=transparent border-w=1.0 r=9.0
-          MessageContents message=message flash=0.0
+          MessageContents message=message flash=flash
             forward
               add_reaction_at
               remove_reaction_at

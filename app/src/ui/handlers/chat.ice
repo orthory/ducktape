@@ -311,6 +311,10 @@ on chat_updated(next)
   thread_loading = false
   loading = false
   error = ""
+  // The huddle ended under this fold (or the roster she is on is another
+  // channel's): the window mirrors the old popped-card gate, which also
+  // vanished the moment `huddle_joined` dropped. A no-op while still joined.
+  task window close target=window_target_unless(huddle_joined, huddle_win)
 
 on chat_hit_loaded(next)
   history_view = true
@@ -347,6 +351,8 @@ on chat_hit_loaded(next)
   thread_loading = false
   loading = false
   error = ""
+  // Same close-if-ended mirror as `chat_updated` above.
+  task window close target=window_target_unless(huddle_joined, huddle_win)
 
 on channel_created(next)
   pending_channel = ""
@@ -385,6 +391,8 @@ on channel_created(next)
   live_thread_generation = live_thread_generation + 1
   thread_loading = false
   error = ""
+  // Same close-if-ended mirror as `chat_updated` above.
+  task window close target=window_target_unless(huddle_joined, huddle_win)
 
 on chat_acked(_result)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, true)
@@ -691,6 +699,7 @@ on remove_reaction_at(seq, emoji)
 // always finishes inside one 1200ms beat).
 on send_flash_tick
   send_flash_id = keep_str(animation.value(send_flash), send_flash_id, "")
+  thread_send_flash_id = keep_str(animation.value(send_flash), thread_send_flash_id, "")
   send_flash = false
 
 // A reaction failure leaves the optimistic fold as a LIE on screen; there is

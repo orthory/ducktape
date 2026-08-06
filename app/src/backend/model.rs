@@ -821,5 +821,19 @@ pub(crate) fn rpc_client(input: &str) -> Result<RpcClient, String> {
     } else {
         input.trim().to_string()
     };
-    RpcClient::new(&configured).map_err(Into::into)
+    // One client per origin for the process's life: the reqwest pool and TLS
+    // setup survive across externs instead of being rebuilt by every `run`
+    // (one hydrate fans out 13 of them in a single parallel).
+    // ponytail: never evicts — the map holds one entry per endpoint the user
+    // has ever pointed this session at, which is their handful of networks.
+    static CLIENTS: std::sync::Mutex<
+        std::collections::BTreeMap<String, RpcClient>,
+    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let mut clients = CLIENTS.lock().expect("rpc client cache");
+    if let Some(client) = clients.get(&configured) {
+        return Ok(client.clone());
+    }
+    let client = RpcClient::new(&configured).map_err(String::from)?;
+    clients.insert(configured, client.clone());
+    Ok(client)
 }

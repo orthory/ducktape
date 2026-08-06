@@ -82,6 +82,10 @@ state
   // it in on the settle delta, the NEXT live event flips it false and fades
   // it out. No timer: consensus itself is the metronome (blocks keep coming).
   send_flash_id = ""
+  // Its thread-rail twin: anchors the same fade to a settled REPLY row. One
+  // shared `send_flash` drives both opacities — two lanes settling in the
+  // same beat share one fade, which reads fine and needs no second animation.
+  thread_send_flash_id = ""
   send_flash:animation[bool] = false
     easing ease-in-out
     duration 400ms
