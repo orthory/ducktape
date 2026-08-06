@@ -189,7 +189,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
             // itself, which is what keeps its caret-reveal alive — an outer
             // scrollable would hand it infinite height, and typing below the
             // fold would walk the caret off screen with nothing following it.
-            box w=fill h=fill max-w=720.0 mx=auto pl=22.0 pr=22.0 pt=26.0 pb=18.0
+            box w=fill h=fill max-w=766.0 mx=auto pl=22.0 pr=22.0 pt=26.0 pb=18.0
               col w=fill h=fill gap=8.0
                 if !empty(page_search_hits)
                   box w=fill h=148.0 p=5.0 bg=elevated border=fg/8 border-w=1.0 r=9.0
@@ -225,7 +225,9 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                 extern page_document(page_editor, dark, (loading || !connected), commented_lines(blocks, commented_block_ids)) #document -> emit(page_edited, _)
                 // Subpages: navigation, listed rather than typed.
                 if !empty(subpage_blocks(blocks))
-                  col w=fill gap=2.0 pt=10.0
+                  // The 46px inset matches the editor's hover-gutter strip, so
+                  // subpages align with the text column, not the gutter.
+                  col w=fill gap=2.0 pt=10.0 pl=46.0
                     text "Subpages" size=10.5 wrap=none font=code_medium @text-hint
                     for child in subpage_blocks(blocks)
                       button label="Open subpage" description=child.text w=fill p=6.0 @ghost_action -> emit(choose_page, child.id)

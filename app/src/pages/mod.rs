@@ -1,11 +1,12 @@
 //! The page document surface — ONE editor over the whole page.
 //!
 //! The block scaffolding this replaces (click a line to select it, a per-kind
-//! editor swapped in behind a button, a `+`/`⋮⋮` gutter cluster, an insert row
-//! with a block-type dropdown parked at the right margin, a `/` menu) is gone.
-//! A page is text. The caret goes where you click because there is nothing to
-//! select first; a line becomes a heading because you typed `# `, which is the
-//! same gesture the block-type menu existed to perform.
+//! editor swapped in behind a button, an insert row with a block-type dropdown
+//! parked at the right margin) is gone. A page is text. The caret goes where
+//! you click because there is nothing to select first; a line becomes a
+//! heading because you typed `# ` — or because you picked it from the block
+//! affordances that ride ON the text ([`menu`]): "/" opens the palette at the
+//! caret, and the hovered line wears a "+"/handle gutter aligned to it.
 //!
 //! The three layers, and where each one lives:
 //!   * [`markdown`] paints — syntax carries the formatting, and hides itself
@@ -20,6 +21,7 @@
 
 pub mod history;
 pub mod markdown;
+pub mod menu;
 pub mod sync;
 
 /// The `sync` predicate at the extern boundary, which hands values, not
@@ -96,18 +98,22 @@ use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text_editor::{self, Action, Content, Cursor, Edit, Position};
 use iced::{Border, Color, Element, Padding};
 use std::hash::{Hash as _, Hasher as _};
-use ui_lang_runtime::rich_text_editor::{ContentVersion, RichTextEditor};
+use ui_lang_runtime::rich_text_editor::{
+    ContentVersion, GUTTER_WIDTH, GutterButton, MenuEvent, RichTextEditor,
+};
 
 pub use ui_lang_runtime::rich_text_editor::Action as PageAction;
 
 /// Everything the page surface can emit: an ordinary editor interaction, a
-/// checkbox tick (a consumed line press over a todo's `[ ]`), or a link the
-/// reader asked to open.
+/// checkbox tick (a consumed line press over a todo's `[ ]`), a link the
+/// reader asked to open, an anchored-menu event, or a gutter press.
 #[derive(Clone, Debug)]
 pub enum PageEvent {
     Action(PageAction),
     ToggleTodo(usize),
     OpenLink(String),
+    Menu(MenuEvent),
+    Gutter(usize, GutterButton),
 }
 
 /// Classify a left press over `(line, position)` — the widget's
@@ -153,14 +159,17 @@ fn link_at(line: &str, column: usize) -> Option<String> {
 pub fn page_link_of(event: PageEvent) -> String {
     match event {
         PageEvent::OpenLink(url) => url,
-        PageEvent::Action(_) | PageEvent::ToggleTodo(_) => String::new(),
+        PageEvent::Action(_)
+        | PageEvent::ToggleTodo(_)
+        | PageEvent::Menu(_)
+        | PageEvent::Gutter(..) => String::new(),
     }
 }
 
 use markdown::{BODY_LINE_HEIGHT, BODY_SIZE, Caret, DocumentHighlighter};
 
-/// The document's left gutter. Wide enough that a hidden `### ` marker leaves
-/// the heading on the same left edge as the paragraph under it.
+/// The breathing room past the text on each side; the left side adds the
+/// widget's own hover-gutter strip on top of it.
 const DOCUMENT_PAD_X: f32 = 2.0;
 
 /// The page's writing surface. `commented` is the document lines wearing a
@@ -184,7 +193,12 @@ pub fn page_document(
         .size(BODY_SIZE)
         .line_height(BODY_LINE_HEIGHT)
         .wrapping(Wrapping::Word)
-        .padding(Padding::from([0.0, DOCUMENT_PAD_X]))
+        // The left inset carries the widget's hover gutter ("+" and the
+        // handle) so the affordance aligns with the line it belongs to.
+        .padding(Padding {
+            left: GUTTER_WIDTH + DOCUMENT_PAD_X,
+            ..Padding::from([0.0, DOCUMENT_PAD_X])
+        })
         .highlight_with::<DocumentHighlighter>(
             Caret {
                 line: cursor.line,
@@ -202,6 +216,11 @@ pub fn page_document(
     editor
         .on_action(PageEvent::Action)
         .on_line_press(line_press)
+        // Line 0 is the title — it takes no gutter, like the reference
+        // editor's title row.
+        .on_gutter(|line, button| (line > 0).then_some(PageEvent::Gutter(line, button)))
+        .menu(menu::current(document))
+        .on_menu(PageEvent::Menu)
         .into()
 }
 
@@ -256,9 +275,15 @@ fn content_version(document: &Content) -> ContentVersion {
 /// effect).
 pub fn apply_page_event(document: Content, event: PageEvent) -> Content {
     match event {
-        PageEvent::Action(action) => apply_page_action(document, action),
+        PageEvent::Action(action) => {
+            let document = apply_page_action(document, action.clone());
+            menu::after_action(&document, &action);
+            document
+        }
         PageEvent::ToggleTodo(line) => toggle_todo(document, line),
         PageEvent::OpenLink(_) => document,
+        PageEvent::Menu(event) => menu::apply(document, event),
+        PageEvent::Gutter(line, button) => menu::gutter(document, line, button),
     }
 }
 
