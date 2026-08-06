@@ -349,24 +349,13 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, disabled:bool, f
     col w=fill
       if !message.deleted && !message.pending
         box w=fill align-x=end align-y=start pr=8.0
-          // The stream's bar, minus its open-thread seat: same opaque plate,
-          // same three one-tap reactions, same picker and overflow.
+          // The stream's bar, minus its open-thread seat AND its one-tap
+          // reactions: the rail is a fixed 300px plate, and the full 145px bar
+          // starts covering the author header 69px in. Two seats (61px) leave
+          // 153px of header clear; the one-tap set lives one click away
+          // behind ♡.
           box p=2.0 bg=surface border=border border-w=1.0 r=9.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
             row gap=1.0 align=center
-              button "👍" label="React with 👍" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(add_reaction_at, message.seq, "👍")
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
-              button "✅" label="React with ✅" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(add_reaction_at, message.seq, "✅")
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
-              button "👀" label="React with 👀" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(add_reaction_at, message.seq, "👀")
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
-              box w=1.0 h=16.0 bg=subtle
-                space w=1.0 h=1.0
               button "♡" label="Manage reactions" disabled=disabled w=27.0 h=25.0 p=4.0 @ghost_action -> emit(open_thread_message_reactions, message.seq, message.body, message.rev)
                 active bg=transparent text=muted r=6.0
                 hovered bg=elevated text=fg
