@@ -145,8 +145,11 @@ on connect_remote_submit(endpoint)
   task window open console -> console_opened _
 
 // The console window exists: point it at the picked endpoint, remember the
-// pick, close the launch window (the OLDEST window — it opened first), and
-// run the same connect boot the single-window app ran on mount.
+// pick, close the launch window BY ID, and run the same connect boot the
+// single-window app ran on mount. By id, not the targetless `task window
+// close` this used to be: that compiles to "the oldest window", and the
+// daemon's third window (the popped huddle) can outlive the console, so
+// oldest stopped meaning predecessor.
 //
 // EVERY per-network reading and draft resets to its default here — the pick
 // may name a DIFFERENT network than the last console, and a channel list,
@@ -257,13 +260,12 @@ on console_opened(id)
   huddle_channel = ""
   huddle_channel_name = ""
   huddle_joined_at = 0
-  huddle_popped = false
   huddle_roster = []
   call_status = ""
   call_muted = false
   call_peers = []
   parallel
-    task window close
+    task window close target=window_target(onboarding_win)
     run remember_network(connected_rpc) -> network_remembered _
     run connect(connected_rpc) -> workspace_connected _ | failed _
 
@@ -357,7 +359,9 @@ on onboarding_failed(cause)
 
 // THE WAY BACK — the titlebar chip, Settings' Switch network, and Danger
 // Zone's forget all land here: reopen the launch window; once it is
-// registered, the console closes behind it. The list is where it lands —
+// registered, the console closes behind it — and the popped huddle with it,
+// since the huddle it showed belongs to the network being left. The list is
+// where it lands —
 // never the unlock ceremony again; the session's password (or the user's
 // deliberate read-only skip) survives a network switch.
 on switch_network
@@ -368,5 +372,6 @@ on onboarding_reopened(id)
   onboarding_win = some(id)
   hub_step = "networks"
   parallel
-    task window close
+    task window close target=window_target(console_win)
+    task window close target=window_target(huddle_win)
     run hub_state() -> hub_refreshed _

@@ -479,9 +479,13 @@ on modifiers_changed(value)
 // leaves with the last one. The handoff paths (`console_opened`,
 // `onboarding_reopened`) close their predecessor AFTER the successor is
 // registered, so this never fires with a survivor still tracked.
+// The huddle window is deliberately NOT in the survivor guard: closing it is a
+// dock, not an exit, and a lone huddle window must never keep the daemon alive
+// after its console is gone.
 on window_was_closed(id)
   onboarding_win = without_window(onboarding_win, id)
   console_win = without_window(console_win, id)
+  huddle_win = without_window(huddle_win, id)
   return if (onboarding_win != none) || (console_win != none)
   exit
 
