@@ -22,8 +22,13 @@
 // screen's: the sidebar's new-page field, the document search field and the
 // rail's composer all write back to the state their handlers read and clear.
 // `page_document` is bound too — the buffer IS app state, so the save tick can
-// read it. The doc TITLE editor is not among them: `PageTitleEditor` owns a
-// local draft and autosaves through its own `run`.
+// read it.
+//
+// THE TITLE IS LINE 0 OF THAT SAME BUFFER. It is a page property on the wire,
+// not a block, but making it a separate control is what left the document with
+// the very defect the body just lost: you had to CLICK the title to edit it.
+// As line 0 it needs no control at all, and Enter at its end / Backspace at the
+// body's start are ordinary text edits that cross the boundary for free.
 component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:str, connected:bool, connected_rpc:str, password:str, dark:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_delete_armed:bool, block_autosave_status:str, page_refusal:str, doc_tabs:[str], blocks:[PageBlock], orphaned_comment_drafts:[str], bind page_editor:editor, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
   emits
     toggle_page_create()
@@ -181,7 +186,6 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
             scroll dir=vertical w=fill h=fill bar=hidden
               box w=fill max-w=720.0 mx=auto pl=22.0 pr=22.0 pt=26.0 pb=120.0
                 col w=fill gap=8.0
-                  PageTitleEditor rpc=connected_rpc password=password page_id=active_page title=active_page_title disabled=(loading || !connected || mutation_phase != "idle") #page-title(scope_key(connected_rpc, active_page))
                   if !empty(page_search_hits)
                     box w=fill h=148.0 p=5.0 bg=elevated border=fg/8 border-w=1.0 r=9.0
                       scroll dir=vertical w=fill h=fill

@@ -31,6 +31,11 @@ use crate::editor::{Inline, inline_marks};
 
 pub const BODY_SIZE: f32 = 14.0;
 pub const BODY_LINE_HEIGHT: f32 = 1.65;
+/// Line 0 is the page title. It reads a step above H1 so the document opens on
+/// an obvious title, and it is the ONLY line whose shape is positional rather
+/// than declared by a prefix.
+const TITLE_SIZE: f32 = 22.0;
+const TITLE_LINE_HEIGHT: f32 = 1.15;
 const HEADING_SIZE: [f32; 3] = [20.0, 16.0, 14.0];
 const HEADING_LINE_HEIGHT: [f32; 3] = [1.25, 1.3, 1.35];
 const QUOTE_LINE_HEIGHT: f32 = 1.6;
@@ -58,6 +63,7 @@ pub struct Caret {
 /// is content wearing the shape that syntax declared.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mark {
+    Title,
     Marker { hidden: bool, style: Style },
     Body(Style),
     ListMarker(Style),
@@ -213,7 +219,10 @@ impl Highlighter for DocumentHighlighter {
         let index = self.current_line;
         let inside_code = self.fences[index];
         let on_caret_line = index == self.caret.line;
-        let (marks, next_inside) = highlight(line, inside_code, on_caret_line);
+        let (marks, next_inside) = match index == 0 {
+            true => (vec![(0..line.len(), Mark::Title)], false),
+            false => highlight(line, inside_code, on_caret_line),
+        };
 
         self.current_line += 1;
         match self.fences.len() == self.current_line {
@@ -400,6 +409,13 @@ fn code_plate(ink: &Ink) -> TextHighlight {
 pub fn format(mark: &Mark, dark: bool) -> Format {
     let ink = ink(dark);
     match *mark {
+        Mark::Title => Format {
+            color: Some(ink.strong),
+            font: Some(body_font(Weight::Semibold, FontStyle::Normal)),
+            size: Some(Pixels(TITLE_SIZE)),
+            line_height: Some(LineHeight::Absolute(Pixels(TITLE_SIZE * TITLE_LINE_HEIGHT))),
+            ..Format::default()
+        },
         Mark::Marker { hidden, style } => {
             let mut format = body_format(style, ink);
             format.color = Some(match hidden {
@@ -574,6 +590,20 @@ mod tests {
         };
         // ...and it is STILL a heading, so it keeps the heading metrics.
         assert_eq!(style.heading, Some(2));
+    }
+
+    #[test]
+    fn line_zero_is_the_title_and_nothing_in_it_is_markdown() {
+        let mut highlighter = <DocumentHighlighter as Highlighter>::new(&Caret {
+            line: 0,
+            column: 0,
+            dark: false,
+        });
+        let title: Vec<_> = highlighter.highlight_line("# still the title").collect();
+        assert_eq!(title, vec![(0..17, Mark::Title)]);
+        // ...and line 1 parses normally, so the title costs the body nothing.
+        let body: Vec<_> = highlighter.highlight_line("# a real heading").collect();
+        assert!(matches!(body[0].1, Mark::Marker { .. }));
     }
 
     #[test]

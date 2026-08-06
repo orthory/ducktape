@@ -294,12 +294,6 @@ on live_resynced(next)
   pages = keep_pages(next.pages_loaded, next.pages, pages)
   blocks = keep_blocks(next.pages_loaded, merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, ""), blocks)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, blocks, active_page, block_comment_draft)
-  // The canonical text only replaces the buffer when the editor is CLEAN and
-  // the text actually differs — a rebuilt `Content` throws the cursor to the
-  // origin, so the saved baseline and the buffer move on one shared decision.
-  let resynced_saved = refreshed_page_saved(page_editor, blocks, page_saved_text)
-  page_editor = refreshed_page_editor(page_editor, blocks, page_saved_text)
-  page_saved_text = resynced_saved
   // THE COMMENTS RAIL IS DOCUMENT-SCOPED (handlers/pages.ice:300). Its anchor is
   // the PAGE it was opened on, never a block selection — keyed on
   // `selected_block_id` it closed itself, and threw the half-typed comment away,
@@ -325,6 +319,13 @@ on live_resynced(next)
   active_page = keep_str(next.pages_loaded, next.active_page, active_page)
   active_page_title = keep_str(next.pages_loaded, next.active_page_title, active_page_title)
   active_page_parent = keep_str(next.pages_loaded, next.active_page_parent, active_page_parent)
+  // AFTER the title lands, because the title is line 0 of the buffer. The
+  // canonical text only replaces the buffer when the editor is CLEAN and the
+  // text actually differs — a rebuilt `Content` throws the cursor to the
+  // origin, so the saved baseline and the buffer move on one shared decision.
+  let resynced_saved = refreshed_page_saved(page_editor, active_page_title, blocks, page_saved_text)
+  page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
+  page_saved_text = resynced_saved
   error = ""
   block_comments_generation = block_comments_generation + 1
   live_thread_generation = live_thread_generation + 1

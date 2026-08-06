@@ -335,8 +335,8 @@ on pages_updated(next)
   page_title_selected = next.page_title_selected
   // A page LOAD always installs its own text: there is no draft to protect,
   // because the buffer belonged to the page being left.
-  page_editor = editor(page_markdown(blocks))
-  page_saved_text = page_markdown(blocks)
+  page_editor = editor(page_document_text(active_page_title, blocks))
+  page_saved_text = page_document_text(active_page_title, blocks)
   page_refusal = ""
   block_autosave_status = "idle"
   block_autosave_generation = block_autosave_generation + 1
@@ -373,8 +373,8 @@ on pages_mutated(next)
   // A MUTATION MUST NOT EAT A KEYSTROKE. Creating a page or posting a comment
   // does not touch this document, so the buffer is replaced only when it is
   // clean AND the node's text actually differs.
-  page_editor = refreshed_page_editor(page_editor, blocks, page_saved_text)
-  page_saved_text = refreshed_page_saved(page_editor, blocks, page_saved_text)
+  page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
+  page_saved_text = refreshed_page_saved(page_editor, active_page_title, blocks, page_saved_text)
   block_autosave_status = "idle"
   page_delete_armed = false
   mutation_phase = "idle"

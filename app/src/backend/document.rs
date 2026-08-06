@@ -12,7 +12,9 @@
 
 use super::*;
 
-use crate::pages::sync::{BlockOp, DocumentPlan, document_plan, parse_document, stored_lines};
+use crate::pages::sync::{
+    BlockOp, DocumentPlan, document_body, document_plan, document_title, stored_lines,
+};
 
 /// The page's child pages, in document order. Subpages are navigation, not
 /// prose: they have no markdown spelling, so the document editor never holds
@@ -33,10 +35,10 @@ pub fn count_label(count: i64) -> String {
     }
 }
 
-/// The document text a page's blocks render as (see `crate::pages::sync`).
+/// The buffer a page opens on: its title as line 0, its blocks under it.
 /// The extern boundary hands lists by value, hence the owned parameter.
-pub fn page_markdown(blocks: Vec<PageBlock>) -> String {
-    crate::pages::sync::page_markdown(&blocks)
+pub fn page_document_text(title: String, blocks: Vec<PageBlock>) -> String {
+    crate::pages::sync::page_document_text(&title, &blocks)
 }
 
 /// A live resync replaces the buffer only when it is CLEAN and the node's own
@@ -45,10 +47,11 @@ pub fn page_markdown(blocks: Vec<PageBlock>) -> String {
 /// this surface can do, so a remote change simply waits for the next save.
 pub fn refreshed_page_editor(
     document: iced::widget::text_editor::Content,
+    title: String,
     blocks: Vec<PageBlock>,
     saved: String,
 ) -> iced::widget::text_editor::Content {
-    match refreshed_page_text(&document, &blocks, &saved) {
+    match refreshed_page_text(&document, &title, &blocks, &saved) {
         Some(canonical) => iced::widget::text_editor::Content::with_text(&canonical),
         None => document,
     }
@@ -58,14 +61,16 @@ pub fn refreshed_page_editor(
 /// on the SAME inputs, so the buffer and its dirty baseline move together.
 pub fn refreshed_page_saved(
     document: iced::widget::text_editor::Content,
+    title: String,
     blocks: Vec<PageBlock>,
     saved: String,
 ) -> String {
-    refreshed_page_text(&document, &blocks, &saved).unwrap_or(saved)
+    refreshed_page_text(&document, &title, &blocks, &saved).unwrap_or(saved)
 }
 
 fn refreshed_page_text(
     document: &iced::widget::text_editor::Content,
+    title: &str,
     blocks: &[PageBlock],
     saved: &str,
 ) -> Option<String> {
@@ -73,7 +78,7 @@ fn refreshed_page_text(
     if dirty {
         return None;
     }
-    let canonical = crate::pages::sync::page_markdown(blocks);
+    let canonical = crate::pages::sync::page_document_text(title, blocks);
     (canonical != saved).then_some(canonical)
 }
 
@@ -113,8 +118,11 @@ pub async fn save_page_document(
     let current = load_pages_data(&client, Some(&page_id))
         .await
         .map_err(failed)?;
+    let canonical = |data: &PagesData| {
+        crate::pages::sync::page_document_text(&data.active_page_title, &data.blocks)
+    };
     let stored = stored_lines(&current.blocks);
-    let wanted = parse_document(&text);
+    let wanted = document_body(&text);
     let DocumentPlan { ops, refusal } = document_plan(&stored, &wanted);
 
     if !refusal.is_empty() {
@@ -122,17 +130,41 @@ pub async fn save_page_document(
             generation,
             written: false,
             refusal,
-            document: crate::pages::sync::page_markdown(&current.blocks),
+            document: canonical(&current),
             data: current,
         });
     }
-    if ops.is_empty() {
+
+    // The title is line 0 of the same buffer but a page property on the wire,
+    // so it gets its own write — before the body, so a rename lands even if a
+    // block op is refused after it.
+    let title = document_title(&text);
+    let title_moved = title != current.active_page_title;
+    if title_moved {
+        let bounded = bounded_exact_text(title, "page title", 512).map_err(failed)?;
+        debounced_page_text(rpc.clone(), password.clone(), page_id.clone(), bounded)
+            .await
+            .map_err(failed)?;
+    }
+    if ops.is_empty() && !title_moved {
         return Ok(DocumentSaveResult {
             generation,
             written: false,
             refusal: String::new(),
-            document: crate::pages::sync::page_markdown(&current.blocks),
+            document: canonical(&current),
             data: current,
+        });
+    }
+    if ops.is_empty() {
+        let data = load_selected_page_data(&client, &page_id, "")
+            .await
+            .map_err(failed)?;
+        return Ok(DocumentSaveResult {
+            generation,
+            written: true,
+            refusal: String::new(),
+            document: canonical(&data),
+            data,
         });
     }
 
@@ -167,7 +199,7 @@ pub async fn save_page_document(
         generation,
         written: true,
         refusal: String::new(),
-        document: crate::pages::sync::page_markdown(&data.blocks),
+        document: canonical(&data),
         data,
     })
 }

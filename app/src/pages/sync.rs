@@ -93,7 +93,31 @@ pub fn is_prose(block: &PageBlock) -> bool {
     block.kind != "Page"
 }
 
-/// The document text for a page's blocks.
+/// THE TITLE IS LINE 0. It is a page property on the wire, not a block, but in
+/// the buffer it is simply the document's first line — which is what makes
+/// Enter at the end of the title and Backspace at the start of the body work
+/// without either being special-cased: they are ordinary text edits, and the
+/// save path reads line 0 back out.
+pub fn page_document_text(title: &str, blocks: &[PageBlock]) -> String {
+    let body = page_markdown(blocks);
+    match body.is_empty() {
+        true => title.to_string(),
+        false => format!("{title}\n{body}"),
+    }
+}
+
+/// The title the buffer is carrying.
+pub fn document_title(text: &str) -> String {
+    text.lines().next().unwrap_or_default().trim().to_string()
+}
+
+/// Everything under the title, resolved into block lines.
+pub fn document_body(text: &str) -> Vec<Line> {
+    let body = text.split_once('\n').map_or("", |(_, body)| body);
+    parse_document(body)
+}
+
+/// The document text for a page's blocks, title excluded.
 pub fn page_markdown(blocks: &[PageBlock]) -> String {
     let lines: Vec<String> = blocks
         .iter()
@@ -645,6 +669,41 @@ mod tests {
             mark_count: 0,
             spans: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_title_is_line_zero_and_the_body_starts_under_it() {
+        let blocks = [block("Text", "first", 0), block("Bullet", "second", 0)];
+        let text = page_document_text("My page", &blocks);
+        assert_eq!(text, "My page\nfirst\n- second");
+        assert_eq!(document_title(&text), "My page");
+        assert_eq!(
+            document_body(&text),
+            vec![line("Text", "first"), line("Bullet", "second")]
+        );
+    }
+
+    #[test]
+    fn a_title_only_page_has_no_body_and_no_stray_blank_line() {
+        let text = page_document_text("Just a title", &[]);
+        assert_eq!(text, "Just a title");
+        assert_eq!(document_title(&text), "Just a title");
+        assert_eq!(document_body(&text), Vec::new());
+    }
+
+    #[test]
+    fn markdown_on_the_title_line_stays_literal_because_a_title_has_no_kind() {
+        // `# ` on line 0 is part of the title's own text, not a heading marker:
+        // `document_body` never sees line 0, so nothing can parse it.
+        let text = "# Not a heading\nbody";
+        assert_eq!(document_title(text), "# Not a heading");
+        assert_eq!(document_body(text), vec![line("Text", "body")]);
+    }
+
+    #[test]
+    fn emptying_the_buffer_leaves_an_empty_title_and_no_blocks() {
+        assert_eq!(document_title(""), "");
+        assert_eq!(document_body(""), Vec::new());
     }
 
     #[test]
