@@ -18,6 +18,7 @@
 //! dirty-gated save tick reconciles the whole document afterwards. That is what
 //! keeps the surface responsive and the write path in one auditable place.
 
+pub mod history;
 pub mod markdown;
 pub mod sync;
 
@@ -27,10 +28,14 @@ pub fn has_unclosed_fence(text: String) -> bool {
     sync::has_unclosed_fence(&text)
 }
 
-/// The block the CARET sits in — where a new comment anchors. "" on the title
-/// line (and on unsaved fresh lines), which the caller reads as "the page".
-pub fn caret_block_id(document: Content, blocks: Vec<crate::backend::PageBlock>) -> String {
-    sync::block_at_line(&blocks, document.cursor().position.line)
+/// The block a document LINE sits in — where a new comment anchors. The line
+/// arrives from the ice `editor_cursor_line` inspector, which BORROWS the
+/// buffer: an `editor`-valued sync argument is a `Content::clone`, and that
+/// clone REBUILDS FROM TEXT — the cursor resets to the origin. "" on the
+/// title line (and on unsaved fresh lines) reads as "the page".
+pub fn block_at_line_target(blocks: Vec<crate::backend::PageBlock>, line: i64) -> String {
+    let line = usize::try_from(line).unwrap_or(0);
+    sync::block_at_line(&blocks, line)
 }
 
 /// The document lines wearing a commented block's wash, for the highlighter.
@@ -95,6 +100,63 @@ use ui_lang_runtime::rich_text_editor::{ContentVersion, RichTextEditor};
 
 pub use ui_lang_runtime::rich_text_editor::Action as PageAction;
 
+/// Everything the page surface can emit: an ordinary editor interaction, a
+/// checkbox tick (a consumed line press over a todo's `[ ]`), or a link the
+/// reader asked to open.
+#[derive(Clone, Debug)]
+pub enum PageEvent {
+    Action(PageAction),
+    ToggleTodo(usize),
+    OpenLink(String),
+}
+
+/// Classify a left press over `(line, position)` — the widget's
+/// `on_line_press` seam. `Some` consumes the press.
+fn line_press(line: &str, position: Position) -> Option<PageEvent> {
+    if let Some(range) = todo_box_columns(line)
+        && range.contains(&position.column)
+    {
+        return Some(PageEvent::ToggleTodo(position.line));
+    }
+    let url = link_at(line, position.column)?;
+    Some(PageEvent::OpenLink(url))
+}
+
+/// The CHARACTER columns of a todo line's `[ ]` box, tick included.
+fn todo_box_columns(line: &str) -> Option<std::ops::Range<usize>> {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let indent = line.len() - trimmed.len();
+    let ticked = trimmed.starts_with("- [ ] ")
+        || trimmed.starts_with("- [x] ")
+        || trimmed.starts_with("- [X] ");
+    ticked.then(|| indent + 2..indent + 5)
+}
+
+/// The http(s) link under the CHARACTER column, if any. Only web schemes are
+/// openable — this hands a string to the OS.
+fn link_at(line: &str, column: usize) -> Option<String> {
+    let byte = line
+        .char_indices()
+        .nth(column)
+        .map_or(line.len(), |(offset, _)| offset);
+    crate::editor::inline_marks(line)
+        .into_iter()
+        .find(|(range, inline)| {
+            matches!(inline, crate::editor::Inline::Link) && range.contains(&byte)
+        })
+        .map(|(range, _)| line[range].to_string())
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+}
+
+/// The link an event carries — "" otherwise, so a flat handler can guard on
+/// emptiness.
+pub fn page_link_of(event: PageEvent) -> String {
+    match event {
+        PageEvent::OpenLink(url) => url,
+        PageEvent::Action(_) | PageEvent::ToggleTodo(_) => String::new(),
+    }
+}
+
 use markdown::{BODY_LINE_HEIGHT, BODY_SIZE, Caret, DocumentHighlighter};
 
 /// The document's left gutter. Wide enough that a hidden `### ` marker leaves
@@ -108,7 +170,7 @@ pub fn page_document(
     dark: bool,
     disabled: bool,
     commented: Vec<i64>,
-) -> Element<'_, PageAction> {
+) -> Element<'_, PageEvent> {
     let cursor = document.cursor().position;
     let editor = RichTextEditor::new(document, content_version(document))
         .id("page-document")
@@ -137,7 +199,10 @@ pub fn page_document(
     if disabled {
         return editor.into();
     }
-    editor.on_action(|action| action).into()
+    editor
+        .on_action(PageEvent::Action)
+        .on_line_press(line_press)
+        .into()
 }
 
 fn document_style(dark: bool, status: text_editor::Status) -> text_editor::Style {
@@ -185,7 +250,70 @@ fn content_version(document: &Content) -> ContentVersion {
     ContentVersion::new(0, hasher.finish())
 }
 
-/// Apply one interaction to the buffer.
+/// Apply one surface event to the buffer. Edits record an undo snapshot
+/// first (coalesced — see [`history`]); a checkbox tick is its own buffer
+/// edit; an opened link never touches the buffer (the handler owns the side
+/// effect).
+pub fn apply_page_event(document: Content, event: PageEvent) -> Content {
+    match event {
+        PageEvent::Action(action) => apply_page_action(document, action),
+        PageEvent::ToggleTodo(line) => toggle_todo(document, line),
+        PageEvent::OpenLink(_) => document,
+    }
+}
+
+/// Flip the `[ ]`/`[x]` box on `line`. The buffer is the only thing edited —
+/// the save tick reads the drift and plans `SetChecked` like any other edit.
+fn toggle_todo(mut document: Content, line: usize) -> Content {
+    let Some(row) = document.line(line) else {
+        return document;
+    };
+    let text = row.text.into_owned();
+    let Some(range) = todo_box_columns(&text) else {
+        return document;
+    };
+    history::record(|| (document.text(), document.cursor()));
+    let tick = range.start + 1;
+    let ticked = text[tick..].starts_with(['x', 'X']);
+    let replacement = match ticked {
+        true => " ",
+        false => "x",
+    };
+    replace_range(
+        &mut document,
+        Position { line, column: tick },
+        Position {
+            line,
+            column: tick + 1,
+        },
+        replacement,
+    );
+    document
+}
+
+/// The Cmd/Ctrl+Z / +Shift+Z route off the app's ONE keyboard subscription —
+/// the editor deliberately bubbles command-letter chords. An empty verdict is
+/// the identity, so the caller stays branch-free.
+pub fn page_history_key(
+    document: Content,
+    _logical: iced::keyboard::Key,
+    physical: iced::keyboard::key::Physical,
+    modifiers: iced::keyboard::Modifiers,
+    ready: bool,
+) -> Content {
+    use iced::keyboard::key::{Code, Physical};
+    let is_z = matches!(physical, Physical::Code(Code::KeyZ));
+    if !ready || !is_z || !modifiers.command() {
+        return document;
+    }
+    let restored = match modifiers.shift() {
+        false => history::undo(|| (document.text(), document.cursor())),
+        true => history::redo(|| (document.text(), document.cursor())),
+    };
+    restored.unwrap_or(document)
+}
+
+/// Apply one editor interaction to the buffer.
 ///
 /// The structural keys are intercepted BEFORE the native edit, because each is
 /// a different edit than the one the key would otherwise make: Enter after
@@ -203,6 +331,7 @@ pub fn apply_page_action(mut document: Content, action: PageAction) -> Content {
         document.perform(edit_action);
         return document;
     };
+    history::record(|| (document.text(), document.cursor()));
     let handled = match edit {
         Edit::Enter => close_fence(&mut document) || continue_list(&mut document),
         Edit::Backspace => remove_list_marker(&mut document),
@@ -630,9 +759,88 @@ mod tests {
             commented_lines(blocks.clone(), vec!["a\nb".into()]),
             vec![2, 3, 4, 5]
         );
-        // The caret in the code body anchors a comment on that block.
-        let content = typed("Title\npara\n```\na\nb\n```", 3, 1);
-        assert_eq!(caret_block_id(content, blocks), "a\nb");
+        // A caret line inside the code body anchors a comment on that block —
+        // resolved by LINE (Content::clone resets the cursor, so an
+        // editor-valued sync could never read it).
+        assert_eq!(block_at_line_target(blocks.clone(), 3), "a\nb");
+        assert_eq!(block_at_line_target(blocks, 0), "");
+    }
+
+    #[test]
+    fn a_press_on_the_todo_box_ticks_and_a_press_on_a_link_opens() {
+        use iced::widget::text_editor::Position;
+        // The box, not the bullet and not the text: columns 2..5 of the
+        // marker (`[`, tick, `]`).
+        let on_box = Position { line: 4, column: 3 };
+        assert!(matches!(
+            line_press("- [ ] ship it", on_box),
+            Some(PageEvent::ToggleTodo(4))
+        ));
+        let on_text = Position { line: 4, column: 8 };
+        assert!(line_press("- [ ] ship it", on_text).is_none());
+        assert!(line_press("- plain bullet", on_box).is_none());
+        // A press inside a web link opens it; other schemes stay text.
+        let line = "see https://duck.example/docs today";
+        let inside = Position { line: 1, column: 8 };
+        assert!(matches!(
+            line_press(line, inside),
+            Some(PageEvent::OpenLink(url)) if url == "https://duck.example/docs"
+        ));
+        let outside = Position { line: 1, column: 1 };
+        assert!(line_press(line, outside).is_none());
+    }
+
+    #[test]
+    fn a_todo_tick_is_one_buffer_edit_the_save_tick_can_read() {
+        let content = typed("Title\n- [ ] ship", 0, 0);
+        let ticked = apply_page_event(content, PageEvent::ToggleTodo(1));
+        assert_eq!(ticked.text(), "Title\n- [x] ship");
+        let unticked = apply_page_event(ticked, PageEvent::ToggleTodo(1));
+        assert_eq!(unticked.text(), "Title\n- [ ] ship");
+        // An open-link event never touches the buffer.
+        let same = apply_page_event(
+            typed("Title\nbody", 0, 0),
+            PageEvent::OpenLink("https://x".into()),
+        );
+        assert_eq!(same.text(), "Title\nbody");
+    }
+
+    #[test]
+    fn cmd_z_walks_the_history_and_shift_redoes() {
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::{Key, Modifiers};
+        history::reset();
+        let typed_doc = apply_page_event(
+            typed("Title\nbod", 1, 3),
+            PageEvent::Action(PageAction::Edit(Action::Edit(Edit::Insert('y')))),
+        );
+        assert_eq!(typed_doc.text(), "Title\nbody");
+        let undone = page_history_key(
+            typed_doc,
+            Key::Unidentified,
+            Physical::Code(Code::KeyZ),
+            Modifiers::COMMAND,
+            true,
+        );
+        assert_eq!(undone.text(), "Title\nbod");
+        let redone = page_history_key(
+            undone,
+            Key::Unidentified,
+            Physical::Code(Code::KeyZ),
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            true,
+        );
+        assert_eq!(redone.text(), "Title\nbody");
+        // Off the pages tab the chord is the identity.
+        let parked = page_history_key(
+            redone,
+            Key::Unidentified,
+            Physical::Code(Code::KeyZ),
+            Modifiers::COMMAND,
+            false,
+        );
+        assert_eq!(parked.text(), "Title\nbody");
+        history::reset();
     }
 
     #[test]

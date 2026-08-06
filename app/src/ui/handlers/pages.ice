@@ -454,12 +454,22 @@ on close_doc_tab(id)
 // resolves the list/indent behaviours in the buffer and NOTHING reaches the
 // node — the save tick below is the only write path, which is what keeps
 // typing at buffer speed on a consensus-backed document.
-on page_edited(action)
-  page_editor = apply_page_action(page_editor, action)
-  caret_comment_target = caret_block_id(page_editor, blocks)
+on page_edited(event)
+  page_editor = apply_page_event(page_editor, event)
+  caret_comment_target = block_at_line_target(blocks, editor_cursor_line(page_editor))
   // The refusal describes an edit that was already rolled back; the next
   // keystroke is the user moving on from it.
   page_refusal = ""
+  // A link press never touched the buffer — it is a hand-off to the OS.
+  page_link = page_link_of(event)
+  return if empty(page_link)
+  run open_external_url(page_link) -> external_url_opened _ | external_url_failed _
+
+on external_url_opened(_opened)
+  error = error
+
+on external_url_failed(cause)
+  error = cause.message
 
 // THE PAGE SAVES ON A GATED TICK, not per keystroke: the editor's edits land
 // in `page_editor` without passing through a handler on the way to the node,
