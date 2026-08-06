@@ -158,8 +158,6 @@ pub fn escape_target(
     channel_create_open: bool,
     thread_message_action: String,
     message_action: String,
-    block_actions_open: bool,
-    block_insert_open: bool,
     forge_repo_menu: bool,
 ) -> String {
     use iced::keyboard::{Key, key::Named};
@@ -179,30 +177,13 @@ pub fn escape_target(
     if message_action != "toolbar" {
         return "message_menu".into();
     }
-    if block_actions_open {
-        return "block_actions".into();
-    }
-    if block_insert_open {
-        return "block_insert".into();
-    }
+    // The pages block-actions menu and insert row used to sit here. The page
+    // document has neither: there is no transient layer over the canvas to
+    // dismiss, and the comments rail is a persistent panel with its own close.
     if forge_repo_menu {
         return "repo_menu".into();
     }
     String::new()
-}
-
-/// The slash menu: a draft starting with `/` filters the insertable block
-/// kinds by case-insensitive prefix (`/h` -> the headings). Empty when the
-/// draft is not a slash command.
-pub fn slash_kind_matches(draft: String, kinds: Vec<String>) -> Vec<String> {
-    let Some(needle) = draft.strip_prefix('/') else {
-        return Vec::new();
-    };
-    let needle = needle.trim().to_ascii_lowercase();
-    kinds
-        .into_iter()
-        .filter(|kind| kind.to_ascii_lowercase().starts_with(&needle))
-        .collect()
 }
 
 /// True when the live connection is in a state the shell should banner:

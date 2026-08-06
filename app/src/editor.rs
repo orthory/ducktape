@@ -225,94 +225,9 @@ fn composer_font(weight: Weight, style: FontStyle) -> Font {
     }
 }
 
-/// One structural key pressed in the pages block editor, carried through the
-/// editor's checked route. `action` is one of "split", "delete", "indent",
-/// "outdent", "escape" — classified in [`block_key_press`] where the modifiers
-/// and the block's shape are still known.
-#[derive(Clone, Debug, PartialEq)]
-pub struct BlockKeyEvent {
-    pub action: String,
-}
-
-/// The block editor's key binding: structural keys become [`BlockKeyEvent`]s,
-/// everything else keeps its native editing binding. Enter splits the block
-/// (Shift+Enter stays a newline); inside a Code block that inverts — Enter is
-/// a newline and Shift+Enter leaves. Backspace only turns structural on an
-/// EMPTY block with no children, because RemoveBlock takes the whole subtree.
-pub fn block_key_press(
-    press: text_editor::KeyPress,
-    kind: String,
-    empty: bool,
-    has_children: bool,
-) -> Option<text_editor::Binding<BlockKeyEvent>> {
-    let focused = matches!(press.status, text_editor::Status::Focused { .. });
-    if !focused {
-        return text_editor::Binding::from_key_press(press);
-    }
-    let shift = press.modifiers.shift();
-    let key = press.key.clone();
-    let custom = |action: &str| {
-        Some(text_editor::Binding::Custom(BlockKeyEvent {
-            action: action.into(),
-        }))
-    };
-    match key.as_ref() {
-        iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) => {
-            let newline_is_default = kind == "Code";
-            let splits = if newline_is_default { shift } else { !shift };
-            if splits {
-                custom("split")
-            } else {
-                text_editor::Binding::from_key_press(press)
-            }
-        }
-        iced::keyboard::Key::Named(iced::keyboard::key::Named::Backspace)
-            if empty && !has_children =>
-        {
-            custom("delete")
-        }
-        iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab) if shift => custom("outdent"),
-        iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab) => custom("indent"),
-        iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => custom("escape"),
-        _ => text_editor::Binding::from_key_press(press),
-    }
-}
-
-/// The block editor's highlighter seat: wraps the stock Ice `editor` widget
-/// with the same inline-markdown highlighter the composers use, so marks
-/// light up identically while typing a block and while typing a message.
-pub fn page_inline_marks<'a, Message: Clone + 'a>(
-    editor: text_editor::TextEditor<'a, text::highlighter::PlainText, Message>,
-) -> impl Into<Element<'a, Message>> {
-    editor.highlight_with::<InlineMarkdownHighlighter>((), stock_inline_format)
-}
-
-/// [`inline_format`] for the stock widget's format table, which carries a
-/// theme reference the custom widget's static table does not.
-fn stock_inline_format(kind: &Inline, _theme: &iced::Theme) -> text::highlighter::Format<Font> {
-    match kind {
-        Inline::Marker => text::highlighter::Format {
-            color: Some(MARK_DIM),
-            font: None,
-        },
-        Inline::Bold => text::highlighter::Format {
-            color: None,
-            font: Some(composer_font(Weight::Bold, FontStyle::Normal)),
-        },
-        Inline::Italic => text::highlighter::Format {
-            color: None,
-            font: Some(composer_font(Weight::Normal, FontStyle::Italic)),
-        },
-        Inline::Link => text::highlighter::Format {
-            color: Some(MARK_LINK),
-            font: None,
-        },
-    }
-}
-
 /// A renderer-parity inline mark, plus the marker glyphs themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Inline {
+pub enum Inline {
     Marker,
     Bold,
     Italic,
@@ -375,7 +290,7 @@ impl Highlighter for InlineMarkdownHighlighter {
 /// `http(s)://` runs, then `**`/`__` bold, then `*`/`_` italic; unmatched or
 /// empty fences stay plain. Ranges land on char boundaries by construction —
 /// the scanner only advances through `char_indices`.
-fn inline_marks(line: &str) -> Vec<(Range<usize>, Inline)> {
+pub fn inline_marks(line: &str) -> Vec<(Range<usize>, Inline)> {
     let mut marks = Vec::new();
     let mut at = 0;
     while at < line.len() {
@@ -564,112 +479,5 @@ mod tests {
         )));
         let document = apply_composer_event(document, enter);
         assert_eq!(document.line_count(), 2);
-    }
-
-    fn key_press(named: iced::keyboard::key::Named, shift: bool) -> text_editor::KeyPress {
-        let key = iced::keyboard::Key::Named(named);
-        text_editor::KeyPress {
-            key: key.clone(),
-            modified_key: key,
-            physical_key: iced::keyboard::key::Physical::Unidentified(
-                iced::keyboard::key::NativeCode::Unidentified,
-            ),
-            modifiers: if shift {
-                iced::keyboard::Modifiers::SHIFT
-            } else {
-                iced::keyboard::Modifiers::default()
-            },
-            text: None,
-            status: text_editor::Status::Focused { is_hovered: false },
-        }
-    }
-
-    fn action_of(binding: Option<text_editor::Binding<BlockKeyEvent>>) -> String {
-        let Some(text_editor::Binding::Custom(event)) = binding else {
-            return String::new();
-        };
-        event.action
-    }
-
-    #[test]
-    fn block_enter_splits_except_inside_code_where_it_inverts() {
-        use iced::keyboard::key::Named;
-        let press = |shift| key_press(Named::Enter, shift);
-        assert_eq!(
-            action_of(block_key_press(press(false), "Text".into(), false, false)),
-            "split"
-        );
-        // Shift+Enter stays the native newline binding.
-        assert!(matches!(
-            block_key_press(press(true), "Text".into(), false, false),
-            Some(text_editor::Binding::Enter)
-        ));
-        assert!(matches!(
-            block_key_press(press(false), "Code".into(), false, false),
-            Some(text_editor::Binding::Enter)
-        ));
-        assert_eq!(
-            action_of(block_key_press(press(true), "Code".into(), false, false)),
-            "split"
-        );
-    }
-
-    #[test]
-    fn block_backspace_deletes_only_an_empty_childless_block() {
-        use iced::keyboard::key::Named;
-        let press = || key_press(Named::Backspace, false);
-        assert_eq!(
-            action_of(block_key_press(press(), "Text".into(), true, false)),
-            "delete"
-        );
-        assert!(matches!(
-            block_key_press(press(), "Text".into(), false, false),
-            Some(text_editor::Binding::Backspace)
-        ));
-        assert!(matches!(
-            block_key_press(press(), "Text".into(), true, true),
-            Some(text_editor::Binding::Backspace)
-        ));
-    }
-
-    #[test]
-    fn block_tab_indents_and_escape_leaves() {
-        use iced::keyboard::key::Named;
-        assert_eq!(
-            action_of(block_key_press(
-                key_press(Named::Tab, false),
-                "Text".into(),
-                false,
-                false
-            )),
-            "indent"
-        );
-        assert_eq!(
-            action_of(block_key_press(
-                key_press(Named::Tab, true),
-                "Text".into(),
-                false,
-                false
-            )),
-            "outdent"
-        );
-        assert_eq!(
-            action_of(block_key_press(
-                key_press(Named::Escape, false),
-                "Text".into(),
-                false,
-                false
-            )),
-            "escape"
-        );
-    }
-
-    #[test]
-    fn block_keys_stay_native_when_the_editor_is_not_focused() {
-        use iced::keyboard::key::Named;
-        let mut press = key_press(Named::Enter, false);
-        press.status = text_editor::Status::Active;
-        // The default table also refuses unfocused presses, so nothing fires.
-        assert!(block_key_press(press, "Text".into(), false, false).is_none());
     }
 }

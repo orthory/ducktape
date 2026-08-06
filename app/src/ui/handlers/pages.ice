@@ -23,24 +23,18 @@ on clear_page_search
   page_search_hits = []
   page_searching = false
 
-on open_page_search_hit(page_id, block_id)
+on open_page_search_hit(page_id, _block_id)
   return if loading || mutation_phase != "idle"
   palette_open = false
   shell_tab = "pages"
   page_search_generation = page_search_generation + 1
   page_searching = false
-  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, trim(editor_text(block_editor)), selected_block_saved_text, block_autosave_status)
-  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_autosave_generation = block_autosave_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = true
   page_search_hits = []
-  selected_block_id = ""
-  hovered_block_id = ""
-  selected_block_kind = ""
-  selected_block_checked = false
-  block_actions_open = false
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -56,33 +50,21 @@ on open_page_search_hit(page_id, block_id)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_title_selected = false
-  block_editor = editor("")
-  selected_block_saved_text = ""
   block_autosave_status = "idle"
-  block_insert_after_id = ""
-  block_insert_open = !empty(block_draft)
   page_delete_armed = false
-  block_delete_armed = false
   error = ""
-  run load_page(connected_rpc, page_id, block_id) -> pages_updated _ | failed _
+  run load_page(connected_rpc, page_id) -> pages_updated _ | failed _
 
 on choose_page(id)
   return if loading || mutation_phase != "idle"
   page_search_generation = page_search_generation + 1
   page_searching = false
-  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, trim(editor_text(block_editor)), selected_block_saved_text, block_autosave_status)
-  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_autosave_generation = block_autosave_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = true
   page_search_hits = []
-  selected_block_id = ""
-  hovered_block_id = ""
-  selected_block_kind = ""
-  selected_block_checked = false
-  block_actions_open = false
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -98,16 +80,10 @@ on choose_page(id)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_title_selected = false
-  block_editor = editor("")
-  selected_block_saved_text = ""
   block_autosave_status = "idle"
-  block_insert_after_id = ""
-  block_insert_open = !empty(block_draft)
   page_delete_armed = false
-  block_delete_armed = false
   error = ""
-  run load_page(connected_rpc, id, "") -> pages_updated _ | failed _
+  run load_page(connected_rpc, id) -> pages_updated _ | failed _
 
 on create_page_submit
   return if loading || mutation_phase != "idle" || empty(trim(page_draft))
@@ -139,152 +115,14 @@ on delete_page_submit
   page_delete_armed = false
   error = ""
   run delete_page(connected_rpc, password, active_page) -> pages_mutated _ | mutation_failed _
-
-on new_block_kind_changed(next)
-  new_block_kind = next
-
-on pick_slash_kind(kind)
-  new_block_kind = kind
-  block_draft = ""
-  task widget focus #workspace-tabs/content/pages/block-insert-row(block_insert_after_id)/block-insert
-
-on block_entered(id)
-  hovered_block_id = id
-
-on block_exited(id)
-  return if hovered_block_id != id
-  hovered_block_id = ""
-
-// Captured per left press by `press-at` — see `chat_pointer_pressed` for why
-// this is not a `move=` stream.
-on pages_pointer_pressed(x, y)
-  pages_pointer_x = x
-  pages_pointer_y = y
-
-on pages_resized(_width, height)
-  pages_height = height
-
-on open_block_insert(key, after_id)
-  return if loading || empty(active_page)
-  block_insert_after_id = after_id
-  block_insert_open = true
-  task widget focus #workspace-tabs/content/pages/key(key)/block-insert-row(block_insert_after_id)/block-insert
-
-on open_root_block_insert
-  return if loading || empty(active_page)
-  block_insert_after_id = ""
-  block_insert_open = true
-  task widget focus #workspace-tabs/content/pages/block-insert-row(block_insert_after_id)/block-insert
-
-on close_block_insert
-  block_insert_open = false
-  block_insert_after_id = ""
-
-on use_orphaned_block_draft(draft)
-  return if loading || mutation_phase != "idle" || !empty(block_draft)
-  block_draft = draft
-  block_insert_after_id = selected_block_id
-  block_insert_open = true
-  orphaned_block_drafts = remove_recovered_draft(orphaned_block_drafts, block_draft)
-
-on discard_orphaned_block_draft(draft)
-  orphaned_block_drafts = remove_recovered_draft(orphaned_block_drafts, draft)
-
 on use_orphaned_comment_draft(draft)
-  return if loading || mutation_phase != "idle" || !empty(block_draft)
-  block_draft = draft
-  block_insert_after_id = selected_block_id
-  block_insert_open = true
-  orphaned_comment_drafts = remove_recovered_draft(orphaned_comment_drafts, block_draft)
+  return if loading || mutation_phase != "idle" || !empty(trim(block_comment_draft))
+  block_comment_draft = draft
+  block_comments_open = true
+  orphaned_comment_drafts = remove_recovered_draft(orphaned_comment_drafts, draft)
 
 on discard_orphaned_comment_draft(draft)
   orphaned_comment_drafts = remove_recovered_draft(orphaned_comment_drafts, draft)
-
-on add_block_submit
-  return if loading || empty(active_page) || (new_block_kind != "Divider" && empty(trim(block_draft)))
-  return if !empty(slash_kind_matches(block_draft, editable_block_kinds))
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  pending_block = block_draft
-  pending_block_id = fresh_operation_id("block")
-  block_draft = ""
-  blocks = optimistic_block(blocks, block_insert_after_id, new_block_kind, pending_block, pending_block_id)
-  error = ""
-  run add_block(connected_rpc, password, active_page, block_insert_after_id, new_block_kind, pending_block_id, pending_block) -> block_added _ | block_add_failed _
-
-on block_added(next)
-  pages = next.data.pages
-  return if active_page != next.page_id || next.data.active_page != next.page_id
-  blocks = merge_block_insert_result(next.data.blocks, blocks, active_page, next.data.active_page, next.operation_id)
-  block_insert_after_id = next.operation_id
-  active_page_title = next.data.active_page_title
-  active_page_parent = next.data.active_page_parent
-  // List kinds continue themselves; a heading, quote or code block hands the
-  // next row back to Text — the Notion cadence.
-  new_block_kind = follow_kind(new_block_kind)
-  error = ""
-  // The settle moved the insert row under the block it just made, which
-  // remounts the input — hand focus back so Enter-type-Enter keeps flowing.
-  block_focus_key = block_key_of(blocks, block_insert_after_id)
-  task widget focus #workspace-tabs/content/pages/key(block_focus_key)/block-insert-row(block_insert_after_id)/block-insert
-
-on block_add_failed(cause)
-  return if active_page != cause.scope_id
-  blocks = rollback_pending_block(blocks, cause.operation_id, cause.committed)
-  orphaned_block_drafts = remember_failed_block(orphaned_block_drafts, block_draft, cause.body, cause.committed)
-  block_draft = restore_draft(block_draft, cause.body, cause.committed)
-  error = cause.message
-  return if !cause.committed
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  run live_resync_load(connected_rpc, active_channel, active_page, "pages", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
-
-on select_block(key, id, kind, text, checked, open_actions)
-  block_menu_x = pages_pointer_x
-  block_menu_y = block_action_menu_y(pages_pointer_y, pages_height)
-  block_actions_open = open_actions
-  return if id == selected_block_id
-  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, trim(editor_text(block_editor)), selected_block_saved_text, block_autosave_status)
-  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
-  block_autosave_generation = block_autosave_generation + 1
-  block_comments_generation = block_comments_generation + 1
-  block_comments_open = false
-  block_comments_target = ""
-  block_comment_threads = []
-  block_comment_thread_total = 0
-  block_comment_threads_next_from = 0
-  block_comment_threads_has_more = false
-  block_comment_threads_loading = false
-  active_block_comment_thread = ""
-  block_thread_comments = []
-  block_thread_comments_next_from = 0
-  block_thread_comments_has_more = false
-  block_thread_comments_loading = false
-  block_comment_draft = ""
-  pending_block_comment = ""
-  selected_block_id = id
-  selected_block_kind = kind
-  selected_block_checked = checked
-  page_title_selected = false
-  block_editor = editor(text)
-  selected_block_saved_text = text
-  block_autosave_status = "idle"
-  block_delete_armed = false
-  return if open_actions
-  task widget focus #workspace-tabs/content/pages/key(key)/block(selected_block_id)/line/block-edit(selected_block_kind)
-
-on close_block_actions
-  block_actions_open = false
-
-on selected_block_kind_changed(next)
-  return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id) || next == selected_block_kind
-  selected_block_kind = next
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  mutation_phase = "block-kind"
-  error = ""
-  run save_block(connected_rpc, password, active_page, selected_block_id, selected_block_kind, trim(editor_text(block_editor))) -> pages_mutated _ | mutation_failed _
-
 // THE COMMENTS RAIL IS DOCUMENT-SCOPED. The artifact lists every comment on the
 // page under one `N comments` label and never involves a block selection
 // (Liquid Glass:940-941). `load_page_threads` asks the node's own plural
@@ -297,27 +135,34 @@ on selected_block_kind_changed(next)
 // block still LISTS here, but its comment page cannot be opened — the node
 // validates the thread's own target against the one asked for, and `ThreadRow`
 // reaches the app without it.
-on open_block_comments
+// One header control, so one handler: the open state flips first and every
+// rail field is reset from it, then the guard below decides whether there is
+// anything to load. Closing keeps the half-typed comment through the orphan
+// guard, exactly as the rail's own × does.
+on toggle_block_comments
   return if loading || mutation_phase != "idle" || empty(active_page)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_comments_generation = block_comments_generation + 1
-  block_actions_open = false
-  block_comments_open = true
-  block_comments_target = active_page
+  block_comments_open = !block_comments_open
+  block_comments_target = keep_str(block_comments_open, active_page, "")
   block_comment_threads = []
   block_comment_thread_total = 0
   block_comment_threads_next_from = 0
   block_comment_threads_has_more = false
-  block_comment_threads_loading = true
+  block_comment_threads_loading = block_comments_open
   active_block_comment_thread = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
   block_thread_comments_loading = false
+  block_comment_draft = ""
+  pending_block_comment = ""
   error = ""
+  return if !block_comments_open
   run load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on close_block_comments
-  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -464,121 +309,6 @@ on block_threads_recovery_failed(cause)
   block_comment_threads_loading = false
   mutation_phase = "idle"
   error = cause.message
-
-// THE BLOCK EDITOR SAVES ON A GATED TICK, not per keystroke: the stock
-// editor's edits land in `block_editor` without passing through a handler, so
-// dirtiness is the text's drift from `selected_block_saved_text` and the
-// subscribe block's `every` line only fires while that drift exists. Every
-// exit from editing (Enter, Esc, switching blocks or pages) still runs the
-// orphan-draft guard, so a keystroke can never outlive its block unsaved.
-on block_autosave_tick
-  return if loading || empty(selected_block_id) || selected_block_kind == "Divider"
-  let text = trim(editor_text(block_editor))
-  return if text == selected_block_saved_text
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  block_autosave_status = "saving"
-  block_autosave_generation = block_autosave_generation + 1
-  block_autosave_inflight_text = text
-  error = ""
-  run autosave_block_text(connected_rpc, password, selected_block_id, selected_block_kind, text, block_autosave_generation) -> block_text_saved _ | block_text_save_failed _
-
-on block_text_saved(next)
-  return if next.generation != block_autosave_generation
-  return if !next.written
-  block_autosave_status = "saved"
-  selected_block_saved_text = block_autosave_inflight_text
-
-on block_text_save_failed(cause)
-  return if cause.generation != block_autosave_generation
-  block_autosave_status = "error"
-  error = cause.message
-
-// THE STRUCTURAL KEYS. One editor route carries them; the classify hop is the
-// dispatch a flat handler cannot spell — state-only keys return on the Ok
-// route, node-backed keys on the Err route (an identity run, not a failure).
-on block_key(event)
-  return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id)
-  run classify_block_key(event) -> block_key_local _ | block_key_op _
-
-// "split" opens the insert row under the block with the continuing kind and
-// hands it focus; "escape" drops the selection (an unsaved draft goes to the
-// recovered-drafts plate — the orphan guard inside `block_key_step`). The
-// step is decided in Rust and applied field by field; the focus target of a
-// non-split key names a row that is not mounted, which is a no-op.
-on block_key_local(local)
-  return if loading || mutation_phase != "idle" || empty(selected_block_id)
-  block_key_action = local.action
-  let next = block_key_step(block_key_action, blocks, selected_block_id, selected_block_kind, selected_block_checked, block_insert_open, block_insert_after_id, new_block_kind, trim(editor_text(block_editor)), selected_block_saved_text, block_autosave_status, orphaned_block_drafts)
-  orphaned_block_drafts = next.orphaned
-  block_autosave_generation = block_autosave_generation + next.autosave_bump
-  selected_block_id = next.selected_id
-  selected_block_kind = next.selected_kind
-  selected_block_checked = next.selected_checked
-  block_editor = retained_block_editor(block_editor, next.selected_id)
-  selected_block_saved_text = retain_selected_string(selected_block_saved_text, next.selected_id)
-  block_autosave_status = "idle"
-  block_delete_armed = block_delete_armed && !empty(next.selected_id)
-  block_actions_open = block_actions_open && !empty(next.selected_id)
-  new_block_kind = next.insert_kind
-  block_insert_open = next.insert_open
-  block_insert_after_id = next.insert_after_id
-  block_focus_key = next.focus_key
-  task widget focus #workspace-tabs/content/pages/key(block_focus_key)/block-insert-row(block_insert_after_id)/block-insert
-
-// Backspace-on-empty, Tab and Shift+Tab against the node. Delete lands the
-// selection on the block above (`previous_block_id` rode along), so a
-// Backspace chain walks up the page; `pages_mutated` refocuses the editor.
-on block_key_op(op)
-  return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id)
-  block_key_action = op.action
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  mutation_phase = "block-key"
-  error = ""
-  run block_key_structure(connected_rpc, password, active_page, selected_block_id, block_key_action, previous_block_id(blocks, selected_block_id)) -> pages_mutated _ | mutation_failed _
-
-// The insert draft's markdown shorthand: `# ` through `### `, `- `, `1. `,
-// `[] `, `> `, three backticks and `---` convert the row's kind and strip
-// themselves — the slash menu's faster sibling.
-on block_draft_changed(next)
-  let formatted = autoformat_block_draft(next, new_block_kind)
-  block_draft = formatted.draft
-  new_block_kind = formatted.kind
-
-// ONE CLICK FINALIZES THE TICK. The artifact's todo box is the control itself
-// (Liquid Glass:920-921), so the tick carries the block it belongs to and needs
-// no selection round-trip; `checked` is the value being written, not the one
-// being read back.
-on set_todo_checked(id, checked)
-  return if loading || mutation_phase != "idle" || empty(active_page) || empty(id)
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  mutation_phase = "block-check"
-  error = ""
-  run set_block_checked(connected_rpc, password, active_page, id, checked) -> pages_mutated _ | mutation_failed _
-
-on move_block_submit(direction)
-  return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id)
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  mutation_phase = "block-move"
-  error = ""
-  run move_block(connected_rpc, password, active_page, selected_block_id, direction) -> pages_mutated _ | mutation_failed _
-
-on arm_block_delete
-  return if loading || mutation_phase != "idle" || empty(selected_block_id)
-  block_delete_armed = true
-
-on remove_block_submit
-  return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id) || !block_delete_armed
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  mutation_phase = "block-delete"
-  block_delete_armed = false
-  error = ""
-  run remove_block(connected_rpc, password, active_page, selected_block_id, previous_block_id(blocks, selected_block_id)) -> pages_mutated _ | mutation_failed _
-
 on pages_updated(next)
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
@@ -596,40 +326,43 @@ on pages_updated(next)
   block_comment_draft = ""
   pending_block_comment = ""
   pages = next.pages
+  // ONE install decision, decided against the PREVIOUS page identity and
+  // applied to buffer and baseline together: the incoming page's text lands
+  // when the page MOVED or a clean buffer actually differs; a dirty buffer on
+  // the SAME page is the user mid-typing through a reload, and a reload must
+  // never eat keystrokes.
+  page_landing = page_document_text(next.active_page_title, next.blocks)
+  page_install = install_decision(page_editor, active_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
-  selected_block_id = next.selected_block_id
-  selected_block_kind = next.selected_block_kind
-  selected_block_checked = next.selected_block_checked
-  page_title_selected = next.page_title_selected
-  block_editor = editor(next.selected_block_text)
-  selected_block_saved_text = next.selected_block_text
+  page_editor = installed_page_editor(page_editor, page_install, page_landing)
+  page_saved_text = keep_str(page_install, page_landing, page_saved_text)
+  page_refusal = ""
   block_autosave_status = "idle"
   block_autosave_generation = block_autosave_generation + 1
-  block_delete_armed = false
   loading = false
   error = ""
   doc_tabs = doc_tabs_with(doc_tabs, active_page)
   run save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 on pages_mutated(next)
-  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, trim(editor_text(block_editor)), selected_block_saved_text, block_autosave_status)
-  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_autosave_generation = block_autosave_generation + 1
   pages = next.pages
+  // The same one-decision install as `pages_updated` — create/delete moves
+  // the selection to another page, and the buffer must follow it; a mutation
+  // that stays on this page must not eat mid-flight keystrokes. Computed
+  // BEFORE the assignments so both reads see the pre-move state (the pair
+  // must move on one shared decision).
+  page_landing = page_document_text(next.active_page_title, next.blocks)
+  page_install = install_decision(page_editor, active_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
-  block_insert_open = block_insert_open && active_page == next.active_page
-  block_insert_after_id = refreshed_selected_block(next.blocks, block_insert_after_id)
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
   pending_page = ""
   page_create_open = false
-  block_actions_open = false
-  selected_block_id = next.selected_block_id
-  selected_block_kind = next.selected_block_kind
-  selected_block_checked = next.selected_block_checked
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -645,19 +378,13 @@ on pages_mutated(next)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_title_selected = next.page_title_selected
-  block_editor = editor(next.selected_block_text)
-  selected_block_saved_text = next.selected_block_text
+  page_editor = installed_page_editor(page_editor, page_install, page_landing)
+  page_saved_text = keep_str(page_install, page_landing, page_saved_text)
+  page_refusal = ""
   block_autosave_status = "idle"
   page_delete_armed = false
-  block_delete_armed = false
   mutation_phase = "idle"
   error = ""
-  // A mutation that keeps a selection (kind change, move, a Backspace delete
-  // landing on the block above) hands the caret back to that block's editor;
-  // with no selection the key is -1 and the task is a no-op.
-  block_focus_key = block_key_of(blocks, selected_block_id)
-  task widget focus #workspace-tabs/content/pages/key(block_focus_key)/block(selected_block_id)/line/block-edit(selected_block_kind)
 
 on doc_tabs_saved(_result)
   error = error
@@ -671,6 +398,81 @@ on close_doc_tab(id)
   active_page = next_doc_tab(doc_tabs, closing_doc_tab, active_page)
   doc_tabs = doc_tabs_without(doc_tabs, closing_doc_tab)
   closing_doc_tab = ""
+  // The same prologue as `choose_page`: `active_page` just moved under the
+  // buffer, and without `loading` the next 900ms tick would write the OLD
+  // page's text into the NEW page. `pages_updated` clears it and decides the
+  // install; closing a background tab reloads the same page, which the
+  // install decision keeps harmless for a dirty buffer.
+  block_autosave_generation = block_autosave_generation + 1
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  loading = true
   parallel
     run save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
-    run load_page(connected_rpc, active_page, "") -> pages_updated _ | failed _
+    run load_page(connected_rpc, active_page) -> pages_updated _ | failed _
+
+// THE DOCUMENT'S ONE EDIT ROUTE. Every key lands here: `apply_page_action`
+// resolves the list/indent behaviours in the buffer and NOTHING reaches the
+// node — the save tick below is the only write path, which is what keeps
+// typing at buffer speed on a consensus-backed document.
+on page_edited(action)
+  page_editor = apply_page_action(page_editor, action)
+  // The refusal describes an edit that was already rolled back; the next
+  // keystroke is the user moving on from it.
+  page_refusal = ""
+
+// THE PAGE SAVES ON A GATED TICK, not per keystroke: the editor's edits land
+// in `page_editor` without passing through a handler on the way to the node,
+// so dirtiness is the buffer's drift from `page_saved_text` and the subscribe
+// block's `every` line only exists while that drift does.
+on page_autosave_tick
+  return if loading || empty(active_page) || mutation_phase != "idle"
+  // One op chain at a time: a multi-op save routinely outlives the 900ms
+  // tick, and a second chain against the same page defeats the ordering
+  // rule the awaited loop exists for (backend/document.rs).
+  return if block_autosave_status == "saving"
+  let text = page_text(page_editor)
+  return if text == page_saved_text
+  // An open ``` swallows every line under it when parsed — the save waits
+  // for the close instead of writing (or refusing) a half-typed fence, and
+  // SAYS SO: a stale "✓ synced" over held-back text would be a lie.
+  let fence_open = has_unclosed_fence(text)
+  block_autosave_status = keep_str(!fence_open, block_autosave_status, "idle")
+  page_refusal = keep_str(!fence_open, page_refusal, "the ``` fence is open — close it to save")
+  return if fence_open
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  block_autosave_status = "saving"
+  block_autosave_generation = block_autosave_generation + 1
+  page_inflight_text = text
+  error = ""
+  run save_page_document(connected_rpc, password, active_page, text, block_autosave_generation) -> page_document_saved _ | page_document_save_failed _
+
+// The baseline is the node's own text after a write, and the submitted text
+// after a no-op — `saved_baseline` carries the reasoning. Either way anything
+// typed during the round trip stays dirty, and a depth change that takes one
+// `MoveBlock` per tick keeps ticking until the buffer and the node agree.
+on page_document_saved(next)
+  return if next.generation != block_autosave_generation
+  pages = next.data.pages
+  blocks = next.data.blocks
+  active_page_title = next.data.active_page_title
+  active_page_parent = next.data.active_page_parent
+  page_refusal = next.refusal
+  page_saved_text = saved_baseline(next.written, next.document, page_inflight_text)
+  block_autosave_status = "saved"
+  error = ""
+  return if empty(next.refusal)
+  // A REFUSED WRITE ROLLS THE BUFFER BACK — but only when nothing was typed
+  // since the tick submitted. Otherwise the buffer is kept (the newest words
+  // must survive), the baseline moves to the node's text, and the still-dirty
+  // buffer re-plans on the next tick with the refusal line explaining why.
+  let untouched = page_text(page_editor) == page_inflight_text
+  page_editor = rolled_back_editor(page_editor, untouched, next.document)
+  page_saved_text = next.document
+  block_autosave_status = "idle"
+
+on page_document_save_failed(cause)
+  return if cause.generation != block_autosave_generation
+  block_autosave_status = "error"
+  error = cause.message

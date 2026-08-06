@@ -19,13 +19,8 @@ extern crate::backend
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
   ChatSearchData(generation:i64, hits:[ChatSearchHit])
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
-  PageBlock(key:i64, id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64, mark_count:i64, spans:[ChatSpan])
-  BlockKeyLocal(action:str)
-  BlockKeyOp(action:str)
-  BlockKeyStep(selected_id:str, selected_kind:str, selected_checked:bool, insert_open:bool, insert_after_id:str, insert_kind:str, focus_key:i64, orphaned:[str], autosave_bump:i64)
-  BlockAutoformat(kind:str, draft:str)
-  PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, selected_block_id:str, selected_block_kind:str, selected_block_text:str, selected_block_checked:bool, page_title_selected:bool)
-  BlockInsertResult(data:PagesData, operation_id:str, page_id:str)
+  PageBlock(key:i64, id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64)
+  PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
   PageCommentThread(id:str, author:str, meta:str, resolved:bool, comment_count:i64)
   PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
   BlockThreadListData(generation:i64, target:str, from:i64, threads:[PageCommentThread], total:i64, next_from:i64, has_more:bool)
@@ -34,7 +29,10 @@ extern crate::backend
   PageSearchHit(page_id:str, block_id:str, kind:str, text:str)
   PageSearchData(generation:i64, hits:[PageSearchHit])
   PaletteSearchData(generation:i64, chat_hits:[ChatSearchHit], page_hits:[PageSearchHit])
-  AutosaveResult(generation:i64, written:bool)
+  // `refusal` is not a failure: the write was NOT attempted because carrying it
+  // out would have destroyed records. `document` is the canonical text either
+  // way — the buffer takes it, which is what rolls an illegal edit back.
+  DocumentSaveResult(generation:i64, written:bool, refusal:str, data:PagesData, document:str)
   WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
   BellItem(seq:i64, kind:str, body:str, source:str, height:i64, read:bool)
   BellDelta(kind:str, item:BellItem, up_to_seq:i64)
@@ -79,15 +77,14 @@ extern crate::backend
   sync oldest_message_seq(messages:[ChatMessage]) -> i64
   sync prepend_history(messages:[ChatMessage], older:[ChatMessage]) -> [ChatMessage]
   sync thread_offset_after_reply(offset:i64, has_more:bool, committed:bool) -> i64
-  sync optimistic_block(blocks:[PageBlock], after_id:str, kind:str, text:str, id:str) -> [PageBlock]
   sync merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
-  sync merge_block_insert_result(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
-  sync rollback_pending_block(blocks:[PageBlock], pending_id:str, committed:bool) -> [PageBlock]
-  sync remember_failed_block(drafts:[str], current:str, pending:str, committed:bool) -> [str]
+  sync restore_draft(current:str, pending:str, keep_pending:bool) -> str
+  // Chat's message/thread menus still place themselves this way; the name is
+  // the pages block menu it was written for, which no longer exists.
+  sync block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
   sync rollback_blocks(blocks:[PageBlock], keep_pending:bool) -> [PageBlock]
   sync append_page_comment_threads(threads:[PageCommentThread], next:[PageCommentThread]) -> [PageCommentThread]
   sync append_page_comments(comments:[PageComment], next:[PageComment]) -> [PageComment]
-  sync restore_draft(current:str, pending:str, keep_pending:bool) -> str
   sync remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
   sync network_slug(name:str) -> str
@@ -120,7 +117,7 @@ extern crate::backend
   sync connection_degraded(status:str) -> bool
   sync titlebar_inset() -> f64
   sync palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  sync escape_target(logical:key, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, block_actions_open:bool, block_insert_open:bool, forge_repo_menu:bool) -> str
+  sync escape_target(logical:key, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, forge_repo_menu:bool) -> str
   NavItem(id:str, title:str, icon:str, badge:i64, active:bool, live:bool)
   FsEntry(path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
@@ -264,7 +261,6 @@ extern crate::backend
   KindCount(kind:str, label:str, count:i64)
   ExplorerResults(generation:i64, hits:[ExplorerHit], kinds:[KindCount])
   search_workspace(rpc:str, text:str, generation:i64) -> ExplorerResults ! HydrationError
-  sync slash_kind_matches(draft:str, kinds:[str]) -> [str]
   sync doc_tabs_with(tabs:[str], page_id:str) -> [str]
   sync doc_tabs_without(tabs:[str], page_id:str) -> [str]
   DocTab(id:str, title:str, active:bool)
@@ -316,27 +312,13 @@ extern crate::backend
   sync thread_loading_after_refresh(loading:bool, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> bool
   sync retain_thread_messages(messages:[ChatMessage], root_seq:i64) -> [ChatMessage]
   sync cancel_autosaves(rpc:str, generation:i64) -> i64
-  sync refreshed_block_editor(document:editor, blocks:[PageBlock], selected_id:str, saved:str, autosave_status:str) -> editor
-  sync refreshed_block_saved(current:str, blocks:[PageBlock], selected_id:str, saved:str, autosave_status:str) -> str
-  sync retained_block_editor(document:editor, selected_id:str) -> editor
-  sync previous_block_id(blocks:[PageBlock], id:str) -> str
-  sync block_key_of(blocks:[PageBlock], id:str) -> i64
-  sync follow_kind(kind:str) -> str
-  sync block_key_step(action:str, blocks:[PageBlock], selected_id:str, selected_kind:str, selected_checked:bool, insert_open:bool, insert_after_id:str, insert_kind:str, current:str, saved:str, autosave_status:str, orphaned:[str]) -> BlockKeyStep
-  sync autoformat_block_draft(draft:str, kind:str) -> BlockAutoformat
-  classify_block_key(event:BlockKeyEvent) -> BlockKeyLocal ! BlockKeyOp
-  block_key_structure(rpc:str, password:str, page_id:str, block_id:str, action:str, select_id:str) -> PagesData ! AppError
-  sync remember_orphaned_block_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str, saved:str, autosave_status:str) -> [str]
   sync remember_orphaned_comment_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str) -> [str]
   sync remove_recovered_draft(drafts:[str], recovered:str) -> [str]
-  sync refreshed_selected_block(blocks:[PageBlock], selected_id:str) -> str
   sync retain_selected_string(value:str, selected_id:str) -> str
   sync retain_selected_i64(value:i64, selected_id:str) -> i64
   sync retain_selected_comment_threads(threads:[PageCommentThread], selected_id:str) -> [PageCommentThread]
   sync retain_selected_comments(comments:[PageComment], selected_id:str) -> [PageComment]
-  sync cancel_missing_block_autosave(rpc:str, generation:i64, blocks:[PageBlock], selected_id:str) -> i64
   sync scope_key(scope:str, id:str) -> str
-  sync block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
   sync reaction_palette() -> [str]
   sync keep_participants(loaded:bool, next:[HuddleParticipant], current:[HuddleParticipant]) -> [HuddleParticipant]
   sync huddle_recipient_nodes(roster:[HuddleParticipant]) -> [str]
@@ -369,20 +351,30 @@ extern crate::backend
   add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   search_chat(rpc:str, channel_id:str, text:str, generation:i64) -> ChatSearchData ! HydrationError
-  load_page(rpc:str, page_id:str, selected_block_id:str) -> PagesData ! AppError
+  load_page(rpc:str, page_id:str) -> PagesData ! AppError
   load_block_threads(rpc:str, target:str, from:i64, generation:i64) -> BlockThreadListData ! HydrationError
   load_page_threads(rpc:str, page_id:str, generation:i64) -> BlockThreadListData ! HydrationError
   load_block_comment_page(rpc:str, target:str, thread_id:str, from:i64, generation:i64) -> BlockCommentData ! HydrationError
   refresh_block_comments(rpc:str, target:str, thread_id:str, generation:i64) -> BlockCommentsRefreshData ! HydrationError
   post_block_comment(rpc:str, password:str, target:str, thread_id:str, text:str, generation:i64) -> BlockCommentData ! AppError
   create_page(rpc:str, password:str, title:str) -> PagesData ! AppError
-  autosave_page_title(rpc:str, password:str, page_id:str, title:str) -> bool ! AppError
   delete_page(rpc:str, password:str, page_id:str) -> PagesData ! AppError
-  add_block(rpc:str, password:str, page_id:str, after_id:str, kind:str, block_id:str, text:str) -> BlockInsertResult ! OptimisticMutationError
-  autosave_block_text(rpc:str, password:str, block_id:str, kind:str, text:str, generation:i64) -> AutosaveResult ! HydrationError
-  save_block(rpc:str, password:str, page_id:str, block_id:str, kind:str, text:str) -> PagesData ! AppError
-  set_block_checked(rpc:str, password:str, page_id:str, block_id:str, checked:bool) -> PagesData ! AppError
-  move_block(rpc:str, password:str, page_id:str, block_id:str, direction:str) -> PagesData ! AppError
-  remove_block(rpc:str, password:str, page_id:str, block_id:str, select_id:str) -> PagesData ! AppError
+  // THE PAGE'S ONE WRITE PATH. The edited buffer in, the module's own ops
+  // out — see backend/document.rs for the ordering rule and the refusal.
+  save_page_document(rpc:str, password:str, page_id:str, text:str, generation:i64) -> DocumentSaveResult ! HydrationError
+  // The buffer a page opens on: its TITLE as line 0, its blocks under it.
+  sync page_document_text(title:str, blocks:[PageBlock]) -> str
+  sync subpage_blocks(blocks:[PageBlock]) -> [PageBlock]
+  sync count_label(count:i64) -> str
+  // A live resync replaces the buffer ONLY when it is clean and the node's
+  // text differs; both read the same decision so buffer and baseline move
+  // together.
+  sync refreshed_page_editor(document:editor, title:str, blocks:[PageBlock], saved:str) -> editor
+  sync refreshed_page_saved(document:editor, title:str, blocks:[PageBlock], saved:str) -> str
+  sync saved_baseline(written:bool, canonical:str, submitted:str) -> str
+  sync install_decision(document:editor, current_page:str, next_page:str, saved:str, canonical:str) -> bool
+  sync installed_page_editor(document:editor, install:bool, canonical:str) -> editor
+  sync rolled_back_editor(document:editor, untouched:bool, canonical:str) -> editor
+  sync remember_orphaned_page_comment(drafts:[str], pages:[PageItem], target:str, draft:str) -> [str]
   search_pages(rpc:str, page_id:str, text:str, generation:i64) -> PageSearchData ! HydrationError
   palette_search(rpc:str, text:str, generation:i64) -> PaletteSearchData ! HydrationError

@@ -180,7 +180,10 @@ pub(crate) fn bounded_new_block_text(kind: BlockKind, text: String) -> Result<St
     } else {
         64 * 1024
     };
-    if text.trim().is_empty() {
+    // Only a page title must be non-empty. An empty BLOCK is a blank line —
+    // the thing Enter-Enter makes — and the node accepts it; rejecting it here
+    // put every save after a blank line into a permanent retry loop.
+    if kind == BlockKind::Page && text.trim().is_empty() {
         return Err(format!("{field} must not be empty"));
     }
     bounded_exact_text(text, field, limit)
@@ -196,89 +199,11 @@ pub(crate) fn bounded_updated_block_text(kind: BlockKind, text: String) -> Resul
     bounded_exact_text(text, "block text", 64 * 1024)
 }
 
-pub(crate) async fn debounced_page_text(
-    rpc: String,
-    mut password: String,
-    block_id: String,
-    text: String,
-) -> Result<bool, String> {
-    let key = format!("{rpc}\0{block_id}");
-    let ticket = begin_autosave(&key);
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    if !autosave_is_current(&key, ticket) {
-        password.zeroize();
-        return Ok(false);
-    }
-    // ponytail: one writer is enough before a live network; shard by RPC only if latency proves it.
-    let _writer = autosave_writer().lock().await;
-    if !autosave_is_current(&key, ticket) {
-        password.zeroize();
-        return Ok(false);
-    }
-    let result = async {
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "pages",
-            pages::encode_msg(&PageMsg::UpdateText {
-                block_id,
-                text: text.clone(),
-                marks: None,
-            }),
-            password,
-        )
-        .await
-    }
-    .await;
-    let current = finish_autosave(&key, ticket);
-    if !current {
-        return Ok(false);
-    }
-    result?;
-    Ok(true)
-}
-
-pub(crate) fn autosaves() -> &'static std::sync::Mutex<BTreeMap<String, u64>> {
-    static AUTOSAVES: OnceLock<std::sync::Mutex<BTreeMap<String, u64>>> = OnceLock::new();
-    AUTOSAVES.get_or_init(Default::default)
-}
-
-fn autosave_writer() -> &'static tokio::sync::Mutex<()> {
-    static WRITER: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    WRITER.get_or_init(Default::default)
-}
-
-pub fn cancel_autosaves(rpc: String, generation: i64) -> i64 {
-    let prefix = format!("{}\0", rpc.trim());
-    autosaves()
-        .lock()
-        .expect("autosave lock poisoned")
-        .retain(|key, _| !key.starts_with(&prefix));
+/// Bump the autosave generation so any in-flight save's reply is discarded.
+/// The debounce ticket map this once also swept died with
+/// `debounced_page_text` — the generation check is the whole mechanism now.
+pub fn cancel_autosaves(_rpc: String, generation: i64) -> i64 {
     generation.saturating_add(1)
-}
-
-pub(crate) fn begin_autosave(key: &str) -> u64 {
-    static TICKET: AtomicU64 = AtomicU64::new(1);
-    let ticket = TICKET.fetch_add(1, Ordering::Relaxed);
-    autosaves()
-        .lock()
-        .expect("autosave lock poisoned")
-        .insert(key.to_string(), ticket);
-    ticket
-}
-
-pub(crate) fn autosave_is_current(key: &str, ticket: u64) -> bool {
-    autosaves().lock().expect("autosave lock poisoned").get(key) == Some(&ticket)
-}
-
-pub(crate) fn finish_autosave(key: &str, ticket: u64) -> bool {
-    let mut autosaves = autosaves().lock().expect("autosave lock poisoned");
-    let is_current = autosaves.get(key) == Some(&ticket);
-    if !is_current {
-        return false;
-    }
-    autosaves.remove(key);
-    true
 }
 
 pub(crate) fn block_move(

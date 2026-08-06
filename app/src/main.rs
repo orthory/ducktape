@@ -4,6 +4,7 @@ mod backend;
 mod call;
 mod video;
 mod editor;
+mod pages;
 
 fn main() -> iced::Result {
     Ducktape::run()

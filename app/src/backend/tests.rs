@@ -889,8 +889,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
                   create: bool,
                   thread_action: &str,
                   action: &str,
-                  blocks: bool,
-                  insert: bool,
                   repo_menu: bool| {
         escape_target(
             escape.clone(),
@@ -899,8 +897,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             create,
             thread_action.into(),
             action.into(),
-            blocks,
-            insert,
             repo_menu,
         )
     };
@@ -915,48 +911,33 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             "more".into(),
             "more".into(),
             true,
-            true,
-            true,
         ),
         ""
     );
     // An open palette swallows Escape — palette_key_action owns it.
-    assert_eq!(target(true, true, true, "more", "more", true, true, true), "");
+    assert_eq!(target(true, true, true, "more", "more", true), "");
     // The ladder order is the z-order: bell over the create modal, menus
     // after both, thread menu over the stream's, popovers last.
+    assert_eq!(target(false, true, true, "more", "more", true), "bell");
     assert_eq!(
-        target(false, true, true, "more", "more", true, true, true),
-        "bell"
-    );
-    assert_eq!(
-        target(false, false, true, "more", "more", true, true, true),
+        target(false, false, true, "more", "more", true),
         "channel_create"
     );
     assert_eq!(
-        target(false, false, false, "more", "more", true, true, true),
+        target(false, false, false, "more", "more", true),
         "thread_menu"
     );
     assert_eq!(
-        target(false, false, false, "toolbar", "editing", true, true, true),
+        target(false, false, false, "toolbar", "editing", true),
         "message_menu"
     );
     assert_eq!(
-        target(false, false, false, "toolbar", "toolbar", true, true, true),
-        "block_actions"
-    );
-    assert_eq!(
-        target(false, false, false, "toolbar", "toolbar", false, true, true),
-        "block_insert"
-    );
-    assert_eq!(
-        target(false, false, false, "toolbar", "toolbar", false, false, true),
+        target(false, false, false, "toolbar", "toolbar", true),
         "repo_menu"
     );
-    // Nothing transient open → Escape is a no-op.
-    assert_eq!(
-        target(false, false, false, "toolbar", "toolbar", false, false, false),
-        ""
-    );
+    // Nothing transient open → Escape is a no-op. The pages rungs are gone
+    // with the menus they dismissed: the document has no transient layer.
+    assert_eq!(target(false, false, false, "toolbar", "toolbar", false), "");
 }
 
 #[test]
@@ -1321,70 +1302,6 @@ fn block_comment_posts_reuse_the_selected_thread() {
     assert!(comment_thread_id(" ".into()).is_err());
 }
 
-#[test]
-fn concurrent_blocks_preserve_pending_position_then_accept_canonical_order() {
-    let block = |id: &str, pending: bool| PageBlock {
-        key: page_block_key(id),
-        id: id.into(),
-        parent: "page".into(),
-        kind: "Text".into(),
-        text: id.into(),
-        pending,
-        checked: false,
-        prefix: String::new(),
-        child_count: 0,
-        mark_count: 0,
-        spans: Vec::new(),
-    };
-    let current = vec![block("x", false), block("a", true), block("b", true)];
-    let after_b = merge_block_insert_result(
-        vec![block("x", false), block("b", false)],
-        current,
-        "page".into(),
-        "page".into(),
-        "b".into(),
-    );
-    assert_eq!(
-        after_b
-            .iter()
-            .map(|block| block.id.as_str())
-            .collect::<Vec<_>>(),
-        ["x", "a", "b"]
-    );
-    assert!(after_b[1].pending);
-
-    let settled = merge_block_insert_result(
-        vec![block("x", false), block("b", false), block("a", false)],
-        after_b,
-        "page".into(),
-        "page".into(),
-        "a".into(),
-    );
-    assert_eq!(
-        settled
-            .iter()
-            .map(|block| block.id.as_str())
-            .collect::<Vec<_>>(),
-        ["x", "b", "a"]
-    );
-    assert!(settled.iter().all(|block| !block.pending));
-
-    let after_stale_response = merge_block_insert_result(
-        vec![block("x", false), block("b", false)],
-        settled,
-        "page".into(),
-        "page".into(),
-        "b".into(),
-    );
-    assert_eq!(
-        after_stale_response
-            .iter()
-            .map(|block| block.id.as_str())
-            .collect::<Vec<_>>(),
-        ["x", "b", "a"]
-    );
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn chat_and_pages_round_trip_over_signed_frames() {
     let storage = tempfile::tempdir().unwrap();
@@ -1464,16 +1381,9 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     assert_eq!(pages.blocks[0].text, "A signed page block");
 
     let origin = rpc.origin().to_string();
-    let selected_page = load_page(origin.clone(), "welcome".into(), "intro".into())
-        .await
-        .unwrap();
-    assert_eq!(selected_page.selected_block_id, "intro");
-    assert_eq!(selected_page.selected_block_text, "A signed page block");
-    let selected_title = load_page(origin.clone(), "welcome".into(), "welcome".into())
-        .await
-        .unwrap();
-    assert!(selected_title.page_title_selected);
-    assert!(selected_title.selected_block_id.is_empty());
+    let loaded_page = load_page(origin.clone(), "welcome".into()).await.unwrap();
+    assert_eq!(loaded_page.active_page, "welcome");
+    assert_eq!(loaded_page.blocks[0].text, "A signed page block");
     let workspace = connect(origin.clone()).await.unwrap();
     let mut live = live_events(origin.clone());
     let ready = live.next().await.unwrap();
@@ -1855,98 +1765,6 @@ fn hydration_retry_is_capped() {
 }
 
 #[test]
-fn page_block_keys_survive_refresh_reordering() {
-    let root = pages::Block {
-        id: "page".into(),
-        parent: None,
-        page: "page".into(),
-        kind: BlockKind::Page,
-        text: "Page".into(),
-        marks: Vec::new(),
-        checked: false,
-        children: Vec::new(),
-    };
-    let block = |id: &str| pages::Block {
-        id: id.into(),
-        parent: Some("page".into()),
-        page: "page".into(),
-        kind: BlockKind::Paragraph,
-        text: id.into(),
-        marks: Vec::new(),
-        checked: false,
-        children: Vec::new(),
-    };
-    let before = page_blocks(
-        vec![root.clone(), block("editing"), block("trailing")],
-        "page",
-    );
-    let editing_key = before
-        .iter()
-        .find(|block| block.id == "editing")
-        .unwrap()
-        .key;
-    let nested = pages::Block {
-        id: "nested".into(),
-        parent: Some("inserted".into()),
-        page: "page".into(),
-        kind: BlockKind::Paragraph,
-        text: "nested".into(),
-        marks: Vec::new(),
-        checked: false,
-        children: Vec::new(),
-    };
-    let after = page_blocks(
-        vec![
-            root,
-            block("inserted"),
-            nested,
-            block("trailing"),
-            block("editing"),
-        ],
-        "page",
-    );
-
-    assert_eq!(
-        after
-            .iter()
-            .find(|block| block.id == "editing")
-            .unwrap()
-            .key,
-        editing_key
-    );
-    assert_eq!(
-        after
-            .iter()
-            .map(|block| block.key)
-            .collect::<BTreeSet<_>>()
-            .len(),
-        after.len()
-    );
-
-    let optimistic = optimistic_block(
-        after,
-        "inserted".into(),
-        "Text".into(),
-        "pending".into(),
-        "block-pending".into(),
-    );
-    let pending = &optimistic[2];
-    assert_eq!(pending.id, "block-pending");
-    assert_eq!(pending.key, page_block_key(&pending.id));
-    assert_eq!(pending.parent, "page");
-    assert_eq!(optimistic[1].id, "nested");
-    assert_eq!(optimistic[3].id, "trailing");
-    assert_eq!(
-        optimistic
-            .iter()
-            .map(|block| block.key)
-            .collect::<BTreeSet<_>>()
-            .len(),
-        optimistic.len()
-    );
-}
-
-#[test]
 fn block_action_menu_stays_inside_the_page_viewport() {
     assert_eq!(block_action_menu_y(100.0, 500.0), 96.0);
     assert_eq!(block_action_menu_y(450.0, 500.0), 260.0);
@@ -1954,186 +1772,30 @@ fn block_action_menu_stays_inside_the_page_viewport() {
 }
 
 #[test]
-fn refresh_merges_only_clean_block_editors() {
-    let blocks = vec![PageBlock {
-        key: 0,
-        id: "block".into(),
-        parent: "page".into(),
-        kind: "Text".into(),
-        text: "remote".into(),
-        pending: false,
-        checked: false,
-        prefix: String::new(),
-        child_count: 0,
-        mark_count: 0,
-        spans: Vec::new(),
-    }];
-
-    // Dirty (text drifted from the saved baseline): buffer and baseline hold.
-    let dirty = iced::widget::text_editor::Content::with_text("local");
-    let kept = refreshed_block_editor(
-        dirty,
-        blocks.clone(),
-        "block".into(),
-        "old".into(),
-        "idle".into(),
-    );
-    assert_eq!(kept.text().trim_end(), "local");
+fn an_empty_block_is_writable_but_an_empty_page_title_is_not() {
+    // A blank line is what Enter-Enter makes; rejecting it put every save
+    // after one into a permanent retry loop.
     assert_eq!(
-        refreshed_block_saved(
-            "local".into(),
-            blocks.clone(),
-            "block".into(),
-            "old".into(),
-            "idle".into(),
-        ),
-        "old"
+        bounded_new_block_text(BlockKind::Paragraph, String::new()).unwrap(),
+        ""
     );
+    assert!(bounded_new_block_text(BlockKind::Page, String::new()).is_err());
+}
 
-    // Clean: both take the canonical text on the same decision.
-    let clean = iced::widget::text_editor::Content::with_text("old");
-    let refreshed = refreshed_block_editor(
-        clean,
-        blocks.clone(),
-        "block".into(),
-        "old".into(),
-        "saved".into(),
-    );
-    assert_eq!(refreshed.text().trim_end(), "remote");
+#[test]
+fn a_write_adopts_the_nodes_text_and_a_noop_adopts_the_submitted_text() {
+    // Written: the canonical baseline keeps a one-step-per-tick depth change
+    // ticking until buffer and node agree.
     assert_eq!(
-        refreshed_block_saved(
-            "old".into(),
-            blocks,
-            "block".into(),
-            "old".into(),
-            "saved".into(),
-        ),
-        "remote"
+        saved_baseline(true, "canonical".into(), "submitted".into()),
+        "canonical"
     );
-}
-
-#[test]
-fn typing_flow_helpers_walk_up_repeat_lists_and_name_keys() {
-    let block = |id: &str, pending: bool| PageBlock {
-        key: page_block_key(id),
-        id: id.into(),
-        parent: "page".into(),
-        kind: "Text".into(),
-        text: id.into(),
-        pending,
-        checked: false,
-        prefix: String::new(),
-        child_count: 0,
-        mark_count: 0,
-        spans: Vec::new(),
-    };
-    let blocks = vec![block("a", false), block("p", true), block("b", false)];
-    assert_eq!(previous_block_id(blocks.clone(), "b".into()), "a");
-    assert_eq!(previous_block_id(blocks.clone(), "a".into()), "");
-    assert_eq!(previous_block_id(blocks.clone(), "ghost".into()), "");
+    // No-op: `* item` and `- item` parse identically — a canonical baseline
+    // here would leave the tick firing forever over spelling.
     assert_eq!(
-        block_key_of(blocks.clone(), "a".into()),
-        page_block_key("a")
+        saved_baseline(false, "canonical".into(), "submitted".into()),
+        "submitted"
     );
-    assert_eq!(block_key_of(blocks, "ghost".into()), -1);
-
-    assert_eq!(follow_kind("Bullet".into()), "Bullet");
-    assert_eq!(follow_kind("Todo".into()), "Todo");
-    assert_eq!(follow_kind("Heading 1".into()), "Text");
-}
-
-#[test]
-fn block_key_step_split_opens_the_insert_row_and_escape_orphans() {
-    let block = PageBlock {
-        key: page_block_key("here"),
-        id: "here".into(),
-        parent: "page".into(),
-        kind: "Bullet".into(),
-        text: "typed".into(),
-        pending: false,
-        checked: false,
-        prefix: String::new(),
-        child_count: 0,
-        mark_count: 0,
-        spans: Vec::new(),
-    };
-    let split = block_key_step(
-        "split".into(),
-        vec![block.clone()],
-        "here".into(),
-        "Bullet".into(),
-        false,
-        false,
-        String::new(),
-        "Text".into(),
-        "typed".into(),
-        "typed".into(),
-        "saved".into(),
-        Vec::new(),
-    );
-    assert!(split.insert_open);
-    assert_eq!(split.insert_after_id, "here");
-    assert_eq!(split.insert_kind, "Bullet");
-    assert_eq!(split.focus_key, page_block_key("here"));
-    assert_eq!(split.selected_id, "here");
-    assert_eq!(split.autosave_bump, 0);
-
-    let escape = block_key_step(
-        "escape".into(),
-        vec![block],
-        "here".into(),
-        "Bullet".into(),
-        false,
-        false,
-        String::new(),
-        "Text".into(),
-        "typed while dirty".into(),
-        "saved text".into(),
-        "idle".into(),
-        Vec::new(),
-    );
-    assert!(escape.selected_id.is_empty());
-    assert_eq!(escape.autosave_bump, 1);
-    assert_eq!(escape.focus_key, -1);
-    assert_eq!(escape.orphaned, ["typed while dirty"]);
-}
-
-#[test]
-fn autoformat_converts_only_fresh_text_drafts() {
-    let formatted = autoformat_block_draft("# Title".into(), "Text".into());
-    assert_eq!(formatted.kind, "Heading 1");
-    assert_eq!(formatted.draft, "Title");
-    let deeper = autoformat_block_draft("### deep".into(), "Text".into());
-    assert_eq!(deeper.kind, "Heading 3");
-    assert_eq!(deeper.draft, "deep");
-    let todo = autoformat_block_draft("[] milk".into(), "Text".into());
-    assert_eq!(todo.kind, "Todo");
-    assert_eq!(todo.draft, "milk");
-    let divider = autoformat_block_draft("---".into(), "Text".into());
-    assert_eq!(divider.kind, "Divider");
-    assert!(divider.draft.is_empty());
-
-    // A chosen kind is never converted out from under the draft.
-    let code = autoformat_block_draft("# comment".into(), "Code".into());
-    assert_eq!(code.kind, "Code");
-    assert_eq!(code.draft, "# comment");
-    // No shorthand, no change.
-    let plain = autoformat_block_draft("hello".into(), "Text".into());
-    assert_eq!(plain.kind, "Text");
-    assert_eq!(plain.draft, "hello");
-}
-
-#[test]
-fn recovered_drafts_are_deduplicated_and_endpoint_scoped() {
-    let drafts = remember_orphaned_block_drafts(
-        vec!["local".into()],
-        Vec::new(),
-        "missing".into(),
-        "local".into(),
-        "local".into(),
-        "error".into(),
-    );
-    assert_eq!(drafts, ["local"]);
 }
 
 #[test]
@@ -2153,47 +1815,8 @@ fn page_updates_preserve_exact_text() {
 }
 
 #[test]
-fn autosave_keeps_only_the_latest_ticket() {
-    let key = "autosave-test";
-    let first = begin_autosave(key);
-    let latest = begin_autosave(key);
-    assert!(!autosave_is_current(key, first));
-    assert!(autosave_is_current(key, latest));
-    assert!(!finish_autosave(key, first));
-    assert!(finish_autosave(key, latest));
-    assert!(!autosave_is_current(key, latest));
-}
-
-#[test]
-fn reconnect_cancels_only_the_previous_endpoint_autosaves() {
-    let old_key = "http://old\0page";
-    let other_key = "http://other\0page";
-    let old_ticket = begin_autosave(old_key);
-    let other_ticket = begin_autosave(other_key);
-
+fn cancelling_autosaves_bumps_the_generation() {
     assert_eq!(cancel_autosaves("http://old".into(), 4), 5);
-    assert!(!autosave_is_current(old_key, old_ticket));
-    assert!(finish_autosave(other_key, other_ticket));
-}
-
-#[test]
-fn missing_block_cancels_only_its_own_autosave() {
-    let title_key = "http://missing-block-test\0page";
-    let block_key = "http://missing-block-test\0block";
-    let title_ticket = begin_autosave(title_key);
-    let block_ticket = begin_autosave(block_key);
-
-    assert_eq!(
-        cancel_missing_block_autosave(
-            "http://missing-block-test".into(),
-            4,
-            Vec::new(),
-            "block".into(),
-        ),
-        5
-    );
-    assert!(!autosave_is_current(block_key, block_ticket));
-    assert!(finish_autosave(title_key, title_ticket));
 }
 
 #[test]

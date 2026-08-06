@@ -686,11 +686,6 @@ pub(crate) async fn load_pages_data(
             active_page,
             active_page_title: String::new(),
             active_page_parent,
-            selected_block_id: String::new(),
-            selected_block_kind: String::new(),
-            selected_block_text: String::new(),
-            selected_block_checked: false,
-            page_title_selected: false,
         });
     }
     let wire_blocks = load_page_blocks(rpc, &active_page).await?;
@@ -705,11 +700,6 @@ pub(crate) async fn load_pages_data(
         active_page,
         active_page_title,
         active_page_parent,
-        selected_block_id: String::new(),
-        selected_block_kind: String::new(),
-        selected_block_text: String::new(),
-        selected_block_checked: false,
-        page_title_selected: false,
     })
 }
 
@@ -727,12 +717,10 @@ pub(crate) fn page_blocks(wire_blocks: Vec<pages::Block>, active_page: &str) -> 
             id: block.id,
             parent: block.parent.unwrap_or_default(),
             kind: block_kind_name(block.kind).into(),
-            spans: plain_rich_spans(&block.text),
             text: block.text,
             pending: false,
             checked: block.checked,
             child_count: count_i64(block.children.len()),
-            mark_count: count_i64(block.marks.len()),
         })
         .collect()
 }
@@ -753,33 +741,11 @@ pub(crate) fn page_block_key(id: &str) -> i64 {
     key
 }
 
-pub(crate) fn with_selected_block(mut pages: PagesData, selected_block_id: &str) -> PagesData {
-    if !selected_block_id.is_empty() && selected_block_id == pages.active_page {
-        pages.page_title_selected = true;
-        return pages;
-    }
-    let Some(block) = pages
-        .blocks
-        .iter()
-        .find(|block| block.id == selected_block_id)
-    else {
-        return pages;
-    };
-    pages.selected_block_id.clone_from(&block.id);
-    pages.selected_block_kind.clone_from(&block.kind);
-    pages.selected_block_text.clone_from(&block.text);
-    pages.selected_block_checked = block.checked;
-    pages
-}
-
 pub(crate) async fn load_selected_page_data(
     rpc: &RpcClient,
     page_id: &str,
-    block_id: &str,
 ) -> Result<PagesData, String> {
-    load_pages_data(rpc, Some(page_id))
-        .await
-        .map(|pages| with_selected_block(pages, block_id))
+    load_pages_data(rpc, Some(page_id)).await
 }
 
 pub(crate) async fn load_page_blocks(

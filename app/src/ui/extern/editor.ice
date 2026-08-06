@@ -13,10 +13,13 @@ extern crate::editor
   sync composer_submit_event() -> ComposerEvent
   sync composer_toggle_mark(document:editor, kind:str) -> editor
   sync composer_mark_shortcut(logical:key, physical:physical-key, modifiers:key-modifiers, chat_ready:bool) -> str
-  // The pages block editor's seams on the stock Ice `editor` widget: the
-  // structural keys become one checked event (classified in Rust where the
-  // modifiers are known), and the highlighter is the composers' own inline
-  // markdown table, so a block lights up exactly like a message draft.
-  BlockKeyEvent(action:str)
-  editor-binding block_key_press(kind:str, empty:bool, has_children:bool) -> BlockKeyEvent
-  editor-highlighter page_inline_marks()
+
+// THE PAGE DOCUMENT — one editor over the whole page, not one per block.
+// Every key is a pure buffer edit (`crate::pages`); nothing here writes to the
+// node. The dirty-gated tick in handlers/pages.ice is the only write path.
+extern crate::pages
+  PageAction()
+  component page_document(document:&editor, dark:bool, disabled:bool) -> PageAction
+  sync apply_page_action(document:editor, action:PageAction) -> editor
+  sync page_text(document:editor) -> str
+  sync has_unclosed_fence(text:str) -> bool
