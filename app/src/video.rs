@@ -11,15 +11,16 @@
 //! `encode_frame`/`store_peer_frame` — nothing else knows JPEG exists.
 //! MAX_FRAME_BYTES on the mesh is ~129 KB; 640×480 at the fixed q60 runs
 //! 30–60 KB.
-// ponytail: fixed 640x480-ish @ q60, ~12 fps, no rate-ladder response — wire
-// the RateHint → (fps, quality) ladder when real WANs complain.
+// ponytail: fixed 640x480-ish @ q60, ~25 fps, no rate-ladder response — wire
+// the RateHint → (fps, quality) ladder when real WANs complain; at this
+// cadence a q60 VGA stream runs ~1-2 MB/s, fine on a LAN/tailnet leg.
 //
 //! THREADING mirrors the audio leg: one OS thread owns the nokhwa camera
 //! (not `Send`), polls the camera toggle, opens the device only while it is
 //! on, and dies with the session's shutdown sender. Decoded peer frames land
-//! in a global store the `call_video_tiles` extern component reads; a 15 Hz
-//! ice tick republishes the store's generation so the panel repaints while
-//! frames move.
+//! in a global store the `call_video_tiles` extern component reads; a 25 Hz
+//! ice tick (gated on the huddle window being open) republishes the store's
+//! generation so the panel repaints while frames move.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -28,8 +29,12 @@ use std::sync::{Mutex, OnceLock};
 use chat::call_wire::{CapturedFrame, PeerFrame};
 use iced::Element;
 
-/// Capture cadence while the camera is on (~12 fps).
-const CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
+/// Capture cadence while the camera is on (~25 fps). The loop treats this as
+/// a DEADLINE, not a sleep: per-frame work (MJPEG decode, encode, preview
+/// repack) is subtracted from the wait, so the cadence holds as long as the
+/// work fits it — the old sleep-then-work loop added ~30-60 ms of work on
+/// top of its 80 ms sleep and delivered 5-9 fps.
+const CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
 /// The fixed v1 encode quality (see the ponytail note above).
 const JPEG_QUALITY: u8 = 60;
 /// Tile width in the strip; height follows the frame's aspect.
@@ -40,8 +45,11 @@ const TILE_WIDTH: f32 = 128.0;
 const CAPTURE_PIXEL_BUDGET: u32 = 640 * 480;
 /// Decoded-tile ceiling, in pixels: keeps a tile's RGBA under iced_wgpu's
 /// 2 MiB synchronous-upload cliff no matter what a peer ships — the sender
-/// bounds itself, but a peer is not trusted to.
-const TILE_PIXEL_BUDGET: u32 = 512 * 1024;
+/// bounds itself, but a peer is not trusted to. The cliff test is a STRICT
+/// `<` (iced_wgpu `image/cache.rs`), so the budget sits one pixel under the
+/// exact boundary: at 512·1024 px a frame's RGBA equals 2 MiB, takes the
+/// async path, and is not drawn the frame its handle first appears.
+const TILE_PIXEL_BUDGET: u32 = 512 * 1024 - 1;
 
 /// One 2×2 box-average pass over an interleaved `CHANNELS`-per-pixel image;
 /// odd edges clamp their second sample. Repeated until a budget holds — a
@@ -120,7 +128,7 @@ fn bump() {
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The store's write counter — the 15 Hz ice tick copies it into state so the
+/// The store's write counter — the 25 Hz ice tick copies it into state so the
 /// panel rebuilds exactly when a frame moved.
 pub fn latest_frame_generation() -> i64 {
     GENERATION.load(Ordering::Relaxed)
@@ -226,7 +234,7 @@ pub(crate) fn store_preview(rgb: &[u8], width: u32, height: u32) {
 }
 
 /// The camera thread body: poll the toggle, hold the device only while on,
-/// capture at ~12 fps, encode, hand frames to the session pump. Ends when
+/// capture at ~25 fps, encode, hand frames to the session pump. Ends when
 /// `shutdown` drops (the session's own teardown chain).
 pub(crate) fn camera_thread(
     frames: tokio::sync::mpsc::UnboundedSender<CapturedFrame>,
@@ -238,13 +246,21 @@ pub(crate) fn camera_thread(
 
     let mut camera: Option<nokhwa::Camera> = None;
     let started = std::time::Instant::now();
+    // The cadence is a rolling deadline: each pass waits only for whatever
+    // remains of CAPTURE_INTERVAL after the previous pass's work, so decode +
+    // encode time comes out of the interval instead of stretching it. A pass
+    // that overruns waits zero (recv_timeout still polls the channel) and the
+    // loop runs flat out at its real speed.
+    let mut next_capture = std::time::Instant::now();
     loop {
+        let wait = next_capture.saturating_duration_since(std::time::Instant::now());
         // The shutdown sender dropping is the session ending.
-        match shutdown.recv_timeout(CAPTURE_INTERVAL) {
+        match shutdown.recv_timeout(wait) {
             Ok(()) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
+        next_capture = std::time::Instant::now() + CAPTURE_INTERVAL;
         if !camera_enabled() {
             if camera.take().is_some() {
                 // Device released the moment the toggle goes off.
@@ -313,7 +329,7 @@ pub(crate) fn camera_thread(
 
 /// The tile strip the huddle panel mounts: every peer's latest frame plus the
 /// local preview, wrapped to the panel's width. Reads the global store; the
-/// `generation` prop only exists so ice rebuilds this mount when the 15 Hz
+/// `generation` prop only exists so ice rebuilds this mount when the 25 Hz
 /// tick sees a new frame.
 pub fn call_video_tiles(_generation: i64) -> Element<'static, ()> {
     let store = store().lock().expect("video store");
