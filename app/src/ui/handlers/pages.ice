@@ -412,8 +412,16 @@ on page_edited(action)
 // block's `every` line only exists while that drift does.
 on page_autosave_tick
   return if loading || empty(active_page) || mutation_phase != "idle"
+  // One op chain at a time: a multi-op save routinely outlives the 900ms
+  // tick, and a second chain against the same page defeats the ordering
+  // rule the awaited loop exists for (backend/document.rs).
+  return if block_autosave_status == "saving"
   let text = page_text(page_editor)
   return if text == page_saved_text
+  // An open ``` swallows every line under it when parsed — the save waits
+  // for the close instead of writing (or refusing) a half-typed fence. The
+  // editor closes the fence itself on Enter, so this state is transient.
+  return if has_unclosed_fence(text)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   block_autosave_status = "saving"
@@ -422,9 +430,10 @@ on page_autosave_tick
   error = ""
   run save_page_document(connected_rpc, password, active_page, text, block_autosave_generation) -> page_document_saved _ | page_document_save_failed _
 
-// The baseline moves to the text that WAS submitted, not to the buffer as it
-// stands now — anything typed during the round trip must stay dirty, or the
-// tick would go quiet on unsaved words.
+// The baseline is the node's own text after a write, and the submitted text
+// after a no-op — `saved_baseline` carries the reasoning. Either way anything
+// typed during the round trip stays dirty, and a depth change that takes one
+// `MoveBlock` per tick keeps ticking until the buffer and the node agree.
 on page_document_saved(next)
   return if next.generation != block_autosave_generation
   pages = next.data.pages
@@ -432,7 +441,7 @@ on page_document_saved(next)
   active_page_title = next.data.active_page_title
   active_page_parent = next.data.active_page_parent
   page_refusal = next.refusal
-  page_saved_text = page_inflight_text
+  page_saved_text = saved_baseline(next.written, next.document, page_inflight_text)
   block_autosave_status = "saved"
   error = ""
   return if empty(next.refusal)

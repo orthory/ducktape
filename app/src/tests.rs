@@ -1293,6 +1293,40 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert_eq!(app.connected_rpc, "http://node-b");
 }
 
+// The dirty gate makes the tick FIRE; these two guards make it WAIT. An
+// in-flight op chain must finish before the next starts (the awaited loop is
+// the ordering rule), and an open ``` must be closed before the buffer is
+// parsed — otherwise everything under it reads as one code block and the plan
+// removes the "vanished" lines.
+#[test]
+fn the_save_tick_waits_for_inflight_saves_and_open_fences() {
+    let (mut app, _) = Ducktape::__boot();
+    app.loading = false;
+    app.connected = true;
+    app.active_page = "page".into();
+    app.page_editor = compose("Title\nfresh body");
+    app.page_saved_text = "Title\nstale".into();
+    app.block_autosave_status = "saving".into();
+    let generation = app.block_autosave_generation;
+
+    let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
+    assert_eq!(app.block_autosave_generation, generation, "inflight guard");
+
+    app.block_autosave_status = "idle".into();
+    app.page_editor = compose("Title\n```\nstill typing");
+    let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
+    assert_eq!(app.block_autosave_generation, generation, "fence guard");
+
+    app.page_editor = compose("Title\n```\ndone\n```");
+    let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
+    assert_eq!(
+        app.block_autosave_generation,
+        generation + 1,
+        "a closed fence saves"
+    );
+    assert_eq!(app.block_autosave_status, "saving");
+}
+
 // Reconnect is the same-endpoint retry now — the picker owns endpoint
 // changes — so typed drafts survive it untouched.
 #[test]
@@ -1311,19 +1345,23 @@ fn same_endpoint_reconnect_preserves_unsent_drafts() {
 }
 
 #[test]
-fn page_title_and_block_actions_use_native_focus_and_overlay_paths() {
+fn the_page_surface_is_one_editor_with_no_click_to_edit_left() {
     let components = include_str!("ui/components/pages.ice");
     let handlers = include_str!("ui/handlers/pages.ice");
     let view = include_str!("ui/screens/pages.ice");
 
-    assert!(components.contains("task widget focus #title-input"));
+    // THE TITLE IS LINE 0 OF THE BUFFER, not a control. The click-to-edit
+    // title editor is gone the same way the click-to-edit blocks are; these
+    // stay as refusals so neither creeps back.
+    assert!(!components.contains("PageTitleEditor"));
+    assert!(!components.contains("task widget focus #title-input"));
     assert!(!components.contains("defer_focus"));
     assert!(!handlers.contains("focus_page_title"));
     assert!(!include_str!("ui/extern/backend.ice").contains("defer_focus"));
     // THE CANVAS HAS NO MENUS LEFT TO PLACE. The block-actions popover, its
     // pointer tracking and the insert row's type dropdown are gone with the
     // click-to-edit model — a page is one editor, and `# ` is the block-type
-    // menu. These stay as refusals so none of it creeps back.
+    // menu.
     assert!(!view.contains("pages_pointer_moved"));
     assert!(!view.contains("BlockActionsMenu"));
     assert!(!view.contains("block_menu_x"));
@@ -1332,10 +1370,8 @@ fn page_title_and_block_actions_use_native_focus_and_overlay_paths() {
     assert!(!components.contains("component DocumentBlock"));
     // The one overlay the surface still raises is the page-delete confirm.
     assert!(view.contains("overlay when=page_delete_armed"));
+    // The document column opens directly on the one editor.
     assert!(view.contains("extern page_document(page_editor, dark,"));
-    // The title opens the document column, with the body directly under it.
-    let column = view.split_once("col w=fill gap=8.0\n").unwrap().1;
-    assert!(column.trim_start().starts_with("PageTitleEditor rpc="));
 }
 
 #[test]

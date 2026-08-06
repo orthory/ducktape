@@ -180,7 +180,10 @@ pub(crate) fn bounded_new_block_text(kind: BlockKind, text: String) -> Result<St
     } else {
         64 * 1024
     };
-    if text.trim().is_empty() {
+    // Only a page title must be non-empty. An empty BLOCK is a blank line —
+    // the thing Enter-Enter makes — and the node accepts it; rejecting it here
+    // put every save after a blank line into a permanent retry loop.
+    if kind == BlockKind::Page && text.trim().is_empty() {
         return Err(format!("{field} must not be empty"));
     }
     bounded_exact_text(text, field, limit)

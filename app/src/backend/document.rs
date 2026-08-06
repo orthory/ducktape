@@ -82,6 +82,21 @@ fn refreshed_page_text(
     (canonical != saved).then_some(canonical)
 }
 
+/// The dirty baseline after a save settles.
+///
+/// A WRITE moves the baseline to the node's canonical text: anything typed
+/// during the round trip — or a depth change that converges one `MoveBlock`
+/// per tick — stays dirty and the next tick carries it. A NO-OP save adopts
+/// the submitted text instead: the buffer said the same thing in different
+/// spelling (`* item` for `- item`), and a canonical baseline there would
+/// leave the tick firing forever over a difference no op can close.
+pub fn saved_baseline(written: bool, canonical: String, submitted: String) -> String {
+    match written {
+        true => canonical,
+        false => submitted,
+    }
+}
+
 /// The document after a save attempt.
 ///
 /// `refusal` is not an error: the node is fine, the WRITE was not attempted
@@ -137,14 +152,25 @@ pub async fn save_page_document(
 
     // The title is line 0 of the same buffer but a page property on the wire,
     // so it gets its own write — before the body, so a rename lands even if a
-    // block op is refused after it.
+    // block op is refused after it. A DIRECT write, not `debounced_page_text`:
+    // the save tick is already the debounce, and the debouncer's supersede
+    // path returns Ok(false) — a silently dropped rename to a caller that
+    // does not read the bool.
     let title = document_title(&text);
     let title_moved = title != current.active_page_title;
     if title_moved {
         let bounded = bounded_exact_text(title, "page title", 512).map_err(failed)?;
-        debounced_page_text(rpc.clone(), password.clone(), page_id.clone(), bounded)
-            .await
-            .map_err(failed)?;
+        write(
+            &client,
+            &password,
+            PageMsg::UpdateText {
+                block_id: page_id.clone(),
+                text: bounded,
+                marks: None,
+            },
+        )
+        .await
+        .map_err(|cause| failed(app_error(cause).message))?;
     }
     if ops.is_empty() && !title_moved {
         return Ok(DocumentSaveResult {

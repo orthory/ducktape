@@ -1779,6 +1779,33 @@ fn block_action_menu_stays_inside_the_page_viewport() {
 }
 
 #[test]
+fn an_empty_block_is_writable_but_an_empty_page_title_is_not() {
+    // A blank line is what Enter-Enter makes; rejecting it put every save
+    // after one into a permanent retry loop.
+    assert_eq!(
+        bounded_new_block_text(BlockKind::Paragraph, String::new()).unwrap(),
+        ""
+    );
+    assert!(bounded_new_block_text(BlockKind::Page, String::new()).is_err());
+}
+
+#[test]
+fn a_write_adopts_the_nodes_text_and_a_noop_adopts_the_submitted_text() {
+    // Written: the canonical baseline keeps a one-step-per-tick depth change
+    // ticking until buffer and node agree.
+    assert_eq!(
+        saved_baseline(true, "canonical".into(), "submitted".into()),
+        "canonical"
+    );
+    // No-op: `* item` and `- item` parse identically — a canonical baseline
+    // here would leave the tick firing forever over spelling.
+    assert_eq!(
+        saved_baseline(false, "canonical".into(), "submitted".into()),
+        "submitted"
+    );
+}
+
+#[test]
 fn page_updates_preserve_exact_text() {
     assert_eq!(
         bounded_updated_block_text(BlockKind::Code, "  code\n".into()).unwrap(),

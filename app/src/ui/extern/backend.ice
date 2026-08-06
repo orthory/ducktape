@@ -163,7 +163,6 @@ extern crate::backend
   sync relative_time(unix_seconds:i64) -> str
   sync mmss(seconds:i64) -> str
   sync network_label(account_name:str, rpc:str) -> str
-  sync titlebar_lead() -> f64
   sync height_label(height:i64) -> str
   sync height_label_short(height:i64) -> str
   sync height_ago(then_height:i64, now_height:i64) -> str
@@ -376,6 +375,7 @@ extern crate::backend
   // together.
   sync refreshed_page_editor(document:editor, title:str, blocks:[PageBlock], saved:str) -> editor
   sync refreshed_page_saved(document:editor, title:str, blocks:[PageBlock], saved:str) -> str
+  sync saved_baseline(written:bool, canonical:str, submitted:str) -> str
   set_block_checked(rpc:str, password:str, page_id:str, block_id:str, checked:bool) -> PagesData ! AppError
   search_pages(rpc:str, page_id:str, text:str, generation:i64) -> PageSearchData ! HydrationError
   palette_search(rpc:str, text:str, generation:i64) -> PaletteSearchData ! HydrationError

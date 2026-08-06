@@ -172,9 +172,12 @@ fn render_line(line: &Line) -> String {
         "Callout" => "!> ",
         "Divider" => return format!("{indent}---"),
         "Code" => {
+            // `split`, not `lines`: a code body's trailing newline is content,
+            // and `lines()` eats it — the next save would then write the
+            // stripped text back as a permanent edit.
             let body: Vec<String> = line
                 .text
-                .lines()
+                .split('\n')
                 .map(|body| format!("{indent}{body}"))
                 .collect();
             let body = body.join("\n");
@@ -186,6 +189,20 @@ fn render_line(line: &Line) -> String {
         _ => "",
     };
     format!("{indent}{marker}{}", line.text)
+}
+
+/// True while the buffer holds an ODD number of fence lines — an open ``` with
+/// no close yet. Parsing such a buffer folds everything under the open fence
+/// into one Code block, and the plan would then REMOVE the blocks that
+/// "vanished"; the save tick waits instead. Line 0 is the title and is never
+/// parsed, so it does not count.
+pub fn has_unclosed_fence(text: &str) -> bool {
+    let fences = text
+        .lines()
+        .skip(1)
+        .filter(|line| line.trim_start_matches([' ', '\t']).starts_with(FENCE))
+        .count();
+    fences % 2 == 1
 }
 
 /// The document text, resolved back into lines. A fenced run folds into ONE
@@ -445,6 +462,32 @@ mod tests {
         };
         assert_eq!(render_line(&done), "- [x] shipped");
         assert_eq!(parse_document("- [x] shipped"), vec![done]);
+    }
+
+    #[test]
+    fn an_empty_line_is_an_empty_text_block_and_round_trips() {
+        // Enter-Enter — the most ordinary key in a document — makes a blank
+        // paragraph. It must be writable, not a save error.
+        assert_eq!(parse_document("one\n\ntwo").len(), 3);
+        assert_eq!(parse_document("one\n\ntwo")[1], line("Text", ""));
+        assert_eq!(render_line(&line("Text", "")), "");
+    }
+
+    #[test]
+    fn a_code_body_keeps_its_trailing_newline_through_the_round_trip() {
+        let code = line("Code", "x\n");
+        let rendered = render_line(&code);
+        assert_eq!(rendered, "```\nx\n\n```");
+        assert_eq!(parse_document(&rendered), vec![code]);
+    }
+
+    #[test]
+    fn an_open_fence_is_flagged_until_its_close_arrives() {
+        assert!(has_unclosed_fence("Title\n```\nlet x = 1;"));
+        assert!(!has_unclosed_fence("Title\n```\nlet x = 1;\n```"));
+        // Line 0 is the title, never parsed — backticks there do not count.
+        assert!(!has_unclosed_fence("``` in a title\nbody"));
+        assert!(!has_unclosed_fence(""));
     }
 
     #[test]

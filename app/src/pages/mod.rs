@@ -21,6 +21,12 @@
 pub mod markdown;
 pub mod sync;
 
+/// The `sync` predicate at the extern boundary, which hands values, not
+/// borrows.
+pub fn has_unclosed_fence(text: String) -> bool {
+    sync::has_unclosed_fence(&text)
+}
+
 use iced::advanced::text::Wrapping;
 use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text_editor::{self, Action, Content, Cursor, Edit, Position};
@@ -91,11 +97,21 @@ fn document_style(dark: bool, status: text_editor::Status) -> text_editor::Style
     }
 }
 
-/// See [`crate::editor::content_version`] — the Ice `editor` state is a bare
-/// `Content`, so the text's hash is the change key.
+/// The Ice `editor` state is a bare `Content` with no revision counter, so the
+/// text's hash is the change key — but hashed LINE BY LINE over the borrowed
+/// rope. `document.text()` allocates the whole document into a fresh `String`,
+/// and this runs on every view build; the chat composer can afford that
+/// (`crate::editor::content_version`), a page-length buffer cannot.
+// ponytail: still O(n) hashing per frame — an app-side revision counter plus
+// `change_hint` is the upgrade if profiling ever names this.
 fn content_version(document: &Content) -> ContentVersion {
     let mut hasher = std::hash::DefaultHasher::new();
-    document.text().hash(&mut hasher);
+    for index in 0..document.line_count() {
+        if let Some(line) = document.line(index) {
+            line.text.hash(&mut hasher);
+            hasher.write_u8(b'\n');
+        }
+    }
     ContentVersion::new(0, hasher.finish())
 }
 
@@ -118,7 +134,7 @@ pub fn apply_page_action(mut document: Content, action: PageAction) -> Content {
         return document;
     };
     let handled = match edit {
-        Edit::Enter => continue_list(&mut document),
+        Edit::Enter => close_fence(&mut document) || continue_list(&mut document),
         Edit::Backspace => remove_list_marker(&mut document),
         Edit::Indent => shift_indent(&mut document, 1),
         Edit::Unindent => shift_indent(&mut document, -1),
@@ -138,6 +154,40 @@ pub fn apply_page_action(mut document: Content, action: PageAction) -> Content {
 /// sit after, and it is not a line of the document.
 pub fn page_text(document: Content) -> String {
     document.text().trim_end_matches(['\n', '\r']).to_string()
+}
+
+/// Enter at the end of an UNMATCHED ``` line closes the fence: the newline is
+/// typed and a closing ``` appears below the caret, so typing continues INSIDE
+/// the fence and the save tick never reads the rest of the page as code. The
+/// reference editor auto-closes on the same gesture.
+fn close_fence(document: &mut Content) -> bool {
+    let cursor = document.cursor();
+    if cursor.selection.is_some() {
+        return false;
+    }
+    let Some(line) = document.line(cursor.position.line) else {
+        return false;
+    };
+    let text = line.text.into_owned();
+    let trimmed = text.trim_start_matches([' ', '\t']);
+    let at_line_end = cursor.position.column >= text.len();
+    if !trimmed.starts_with("```") || !at_line_end {
+        return false;
+    }
+    if !sync::has_unclosed_fence(&document.text()) {
+        return false;
+    }
+    let indent = &text[..text.len() - trimmed.len()];
+    let opened = format!("\n\n{indent}```");
+    replace_range(document, cursor.position, cursor.position, &opened);
+    document.move_to(Cursor {
+        position: Position {
+            line: cursor.position.line + 1,
+            column: indent.len(),
+        },
+        selection: None,
+    });
+    true
 }
 
 /// Enter on a list line carries the marker down; Enter on an EMPTY list item
@@ -395,6 +445,32 @@ mod tests {
     fn enter_outside_a_list_is_an_ordinary_newline() {
         let content = typed("plain", 0, 5);
         assert_eq!(press(content, Edit::Enter), "plain\n");
+    }
+
+    #[test]
+    fn enter_on_an_open_fence_closes_it_with_the_caret_inside() {
+        // Line 0 is the title, so the fence sits on line 1.
+        let content = typed("Title\n```", 1, 3);
+        let mut after = apply_page_action(content, PageAction::Edit(Action::Edit(Edit::Enter)));
+        assert_eq!(after.text(), "Title\n```\n\n```");
+        // The caret parks on the blank line between the fences.
+        assert_eq!(after.cursor().position.line, 2);
+        after.perform(Action::Edit(Edit::Insert('x')));
+        assert_eq!(after.text(), "Title\n```\nx\n```");
+    }
+
+    #[test]
+    fn enter_on_a_closing_fence_is_an_ordinary_newline() {
+        let content = typed("Title\n```\ncode\n```", 3, 3);
+        assert_eq!(press(content, Edit::Enter), "Title\n```\ncode\n```\n");
+    }
+
+    #[test]
+    fn a_nested_open_fence_closes_at_its_own_indent() {
+        let content = typed("Title\n  ```", 1, 5);
+        let after = apply_page_action(content, PageAction::Edit(Action::Edit(Edit::Enter)));
+        assert_eq!(after.text(), "Title\n  ```\n\n  ```");
+        assert_eq!(after.cursor().position.column, 2);
     }
 
     #[test]

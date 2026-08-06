@@ -22,3 +22,4 @@ extern crate::pages
   component page_document(document:&editor, dark:bool, disabled:bool) -> PageAction
   sync apply_page_action(document:editor, action:PageAction) -> editor
   sync page_text(document:editor) -> str
+  sync has_unclosed_fence(text:str) -> bool
