@@ -11,9 +11,10 @@
 //! `encode_frame`/`store_peer_frame` — nothing else knows JPEG exists.
 //! MAX_FRAME_BYTES on the mesh is ~129 KB; 640×480 at the fixed q60 runs
 //! 30–60 KB.
-// ponytail: fixed 640x480-ish @ q60, ~25 fps, no rate-ladder response — wire
-// the RateHint → (fps, quality) ladder when real WANs complain; at this
-// cadence a q60 VGA stream runs ~1-2 MB/s, fine on a LAN/tailnet leg.
+// ponytail: fixed 640x480-ish @ q60, wire ≤60 fps, no rate-ladder response —
+// ducktape is a private-network workspace app, so the generous ceiling is
+// deliberate (q60 VGA at 60 fps ≈ 2-4 MB/s per sender); wire the RateHint →
+// (fps, quality) ladder when a real WAN leg complains.
 //
 //! THREADING mirrors the audio leg: one OS thread owns the nokhwa camera
 //! (not `Send`), polls the camera toggle, opens the device only while it is
@@ -32,12 +33,14 @@ use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Shell, Widget, mouse, renderer};
 use iced::{Element, Event, Length, Rectangle, Size, window};
 
-/// Capture cadence while the camera is on (~25 fps). The loop treats this as
-/// a DEADLINE, not a sleep: per-frame work (MJPEG decode, encode, preview
-/// repack) is subtracted from the wait, so the cadence holds as long as the
-/// work fits it — the old sleep-then-work loop added ~30-60 ms of work on
-/// top of its 80 ms sleep and delivered 5-9 fps.
-const CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+/// Toggle/shutdown poll while no camera is open. With a camera open the loop
+/// paces itself at the NEGOTIATED MODE'S OWN RATE instead — the local preview
+/// runs at camera-native fps, decoupled from what the wire carries.
+const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(40);
+/// The wire's send floor: at most one encoded frame per this interval
+/// (~60 fps). A camera slower than this just sends every frame; a faster one
+/// is thinned to it. Display and preview are NOT gated by this.
+const WIRE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 /// The fixed v1 encode quality (see the ponytail note above).
 const JPEG_QUALITY: u8 = 60;
 /// Tile width in the strip; height follows the frame's aspect.
@@ -222,8 +225,9 @@ pub(crate) fn store_preview(rgb: &[u8], width: u32, height: u32) {
 }
 
 /// The camera thread body: poll the toggle, hold the device only while on,
-/// capture at ~25 fps, encode, hand frames to the session pump. Ends when
-/// `shutdown` drops (the session's own teardown chain).
+/// capture at the camera's native rate, thin the encode to the wire ceiling,
+/// hand frames to the session pump. Ends when `shutdown` drops (the
+/// session's own teardown chain).
 pub(crate) fn camera_thread(
     frames: tokio::sync::mpsc::UnboundedSender<CapturedFrame>,
     shutdown: std::sync::mpsc::Receiver<()>,
@@ -232,14 +236,18 @@ pub(crate) fn camera_thread(
     use nokhwa::pixel_format::RgbFormat;
     use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType, Resolution};
 
-    let mut camera: Option<nokhwa::Camera> = None;
+    // The open device plus its native frame interval — the pace the loop
+    // holds while it runs.
+    let mut camera: Option<(nokhwa::Camera, std::time::Duration)> = None;
     let started = std::time::Instant::now();
     // The cadence is a rolling deadline: each pass waits only for whatever
-    // remains of CAPTURE_INTERVAL after the previous pass's work, so decode +
+    // remains of the interval after the previous pass's work, so decode +
     // encode time comes out of the interval instead of stretching it. A pass
     // that overruns waits zero (recv_timeout still polls the channel) and the
     // loop runs flat out at its real speed.
     let mut next_capture = std::time::Instant::now();
+    // The wire thinning clock — see WIRE_INTERVAL.
+    let mut last_sent: Option<std::time::Instant> = None;
     loop {
         let wait = next_capture.saturating_duration_since(std::time::Instant::now());
         // The shutdown sender dropping is the session ending.
@@ -248,7 +256,8 @@ pub(crate) fn camera_thread(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
-        next_capture = std::time::Instant::now() + CAPTURE_INTERVAL;
+        // The idle pace; a pulled frame below re-arms at the camera's rate.
+        next_capture = std::time::Instant::now() + IDLE_POLL;
         if !camera_enabled() {
             if camera.take().is_some() {
                 // Device released the moment the toggle goes off.
@@ -273,7 +282,15 @@ pub(crate) fn camera_thread(
                 .or_else(|_| nokhwa::Camera::new(CameraIndex::Index(0), any))
                 .and_then(|mut device| device.open_stream().map(|()| device))
             {
-                Ok(device) => camera = Some(device),
+                Ok(device) => {
+                    // NATIVE CADENCE: the loop runs at the negotiated mode's
+                    // own rate, so the preview is as smooth as the camera —
+                    // the wire is thinned separately by WIRE_INTERVAL. The
+                    // clamp only guards a driver reporting 0 (or nonsense).
+                    let rate = device.frame_rate().clamp(1, 240);
+                    let native = std::time::Duration::from_secs_f64(1.0 / f64::from(rate));
+                    camera = Some((device, native));
+                }
                 Err(error) => {
                     // Surfaces as "live · camera: …" through the status fold.
                     let event = crate::call::CallEvent {
@@ -287,9 +304,10 @@ pub(crate) fn camera_thread(
                 }
             }
         }
-        let Some(device) = camera.as_mut() else {
+        let Some((device, native_interval)) = camera.as_mut() else {
             continue;
         };
+        next_capture = std::time::Instant::now() + *native_interval;
         let Ok(frame) = device.frame() else {
             continue;
         };
@@ -300,10 +318,18 @@ pub(crate) fn camera_thread(
         let rgb = decoded.into_raw();
         let (rgb, width, height) =
             shrink_to_budget::<3>(rgb, width, height, CAPTURE_PIXEL_BUDGET);
+        // The preview mirrors EVERY captured frame, before and regardless of
+        // the wire: the self-view has no bandwidth to respect, and a frame
+        // the encoder refuses (over the mesh cap) must not freeze it.
+        store_preview(&rgb, width, height);
+        let wire_due = last_sent.is_none_or(|at| at.elapsed() >= WIRE_INTERVAL);
+        if !wire_due {
+            continue;
+        }
         let Some(encoded) = encode_frame(&rgb, width as u16, height as u16) else {
             continue;
         };
-        store_preview(&rgb, width, height);
+        last_sent = Some(std::time::Instant::now());
         let captured = CapturedFrame {
             keyframe: true,
             ts_ms: started.elapsed().as_millis() as u32,
@@ -332,8 +358,10 @@ pub fn call_video_tiles() -> Element<'static, ()> {
 /// into rows on the strip's width.
 const TILE_HEIGHT: f32 = 96.0;
 const TILE_GAP: f32 = 8.0;
-/// The paint cadence while any tile is live — matches `CAPTURE_INTERVAL`.
-const REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+/// The paint ceiling while any tile is live (~60 Hz): high enough for a
+/// native-rate preview and full-rate peers; frames that didn't change
+/// between beats are Arc-cached handles the renderer draws for free.
+const REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 struct VideoStrip;
 
