@@ -125,13 +125,28 @@ mod tests {
     use iced::widget::text_editor::Position;
 
     fn snap(text: &str) -> (String, Cursor) {
+        snap_at(text, 0, 0)
+    }
+
+    fn snap_at(text: &str, line: usize, column: usize) -> (String, Cursor) {
         (
             text.into(),
             Cursor {
-                position: Position { line: 0, column: 0 },
+                position: Position { line, column },
                 selection: None,
             },
         )
+    }
+
+    #[test]
+    fn undo_and_redo_restore_the_recorded_cursor_not_the_origin() {
+        reset();
+        record(|| snap_at("one\ntwo\nthree", 2, 3));
+        let restored = undo(|| snap_at("one\ntwo\nthrXee", 2, 4)).expect("undo");
+        assert_eq!(restored.cursor().position, Position { line: 2, column: 3 });
+        let redone = redo(|| snap_at("one\ntwo\nthree", 2, 3)).expect("redo");
+        assert_eq!(redone.cursor().position, Position { line: 2, column: 4 });
+        reset();
     }
 
     #[test]

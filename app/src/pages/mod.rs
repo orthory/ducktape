@@ -823,6 +823,11 @@ mod tests {
             true,
         );
         assert_eq!(undone.text(), "Title\nbod");
+        // The caret returns to where the group STARTED, not to the origin.
+        assert_eq!(
+            undone.cursor().position,
+            iced::widget::text_editor::Position { line: 1, column: 3 }
+        );
         let redone = page_history_key(
             undone,
             Key::Unidentified,
@@ -831,6 +836,11 @@ mod tests {
             true,
         );
         assert_eq!(redone.text(), "Title\nbody");
+        // …and redo puts it back where the caret sat when Cmd+Z was pressed.
+        assert_eq!(
+            redone.cursor().position,
+            iced::widget::text_editor::Position { line: 1, column: 4 }
+        );
         // Off the pages tab the chord is the identity.
         let parked = page_history_key(
             redone,
