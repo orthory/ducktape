@@ -43,7 +43,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
     open_page_search_hit(str, str)
     use_orphaned_comment_draft(str)
     discard_orphaned_comment_draft(str)
-    page_edited(PageAction)
+    page_edited(PageEvent)
     toggle_block_comments()
     close_block_comments()
     open_block_comment_thread(str, str)

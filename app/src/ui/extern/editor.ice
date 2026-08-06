@@ -18,12 +18,14 @@ extern crate::editor
 // Every key is a pure buffer edit (`crate::pages`); nothing here writes to the
 // node. The dirty-gated tick in handlers/pages.ice is the only write path.
 extern crate::pages
-  PageAction()
-  component page_document(document:&editor, dark:bool, disabled:bool, commented:[i64]) -> PageAction
-  sync apply_page_action(document:editor, action:PageAction) -> editor
+  PageEvent()
+  component page_document(document:&editor, dark:bool, disabled:bool, commented:[i64]) -> PageEvent
+  sync apply_page_event(document:editor, event:PageEvent) -> editor
+  sync page_link_of(event:PageEvent) -> str
+  sync page_history_key(document:editor, logical:key, physical:physical-key, modifiers:key-modifiers, ready:bool) -> editor
   sync page_text(document:editor) -> str
   sync has_unclosed_fence(text:str) -> bool
-  sync caret_block_id(document:editor, blocks:[PageBlock]) -> str
+  sync block_at_line_target(blocks:[PageBlock], line:i64) -> str
   sync commented_lines(blocks:[PageBlock], targets:[str]) -> [i64]
   sync comment_anchor_label(blocks:[PageBlock], target:str, page_id:str) -> str
   sync comment_compose_hint(blocks:[PageBlock], target:str, page_id:str) -> str

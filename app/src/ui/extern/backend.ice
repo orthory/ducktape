@@ -361,6 +361,7 @@ extern crate::backend
   refresh_block_comments(rpc:str, target:str, thread_id:str, generation:i64) -> BlockCommentsRefreshData ! HydrationError
   post_block_comment(rpc:str, password:str, target:str, thread_id:str, text:str, generation:i64) -> BlockCommentData ! AppError
   resolve_comment_thread(rpc:str, password:str, thread_id:str, resolved:bool) -> bool ! AppError
+  open_external_url(url:str) -> bool ! AppError
   create_page(rpc:str, password:str, title:str) -> PagesData ! AppError
   delete_page(rpc:str, password:str, page_id:str) -> PagesData ! AppError
   // THE PAGE'S ONE WRITE PATH. The edited buffer in, the module's own ops

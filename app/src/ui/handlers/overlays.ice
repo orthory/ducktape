@@ -70,6 +70,10 @@ on global_key_pressed(event)
   // editor lets command-letter presses bubble on purpose, so its focus is
   // still on the draft when the mark lands; an empty verdict is a no-op.
   message_editor = composer_toggle_mark(message_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, (connected && shell_tab == "chat" && !palette_open)))
+  // The page document's undo/redo (Cmd/Ctrl+Z, +Shift+Z) — the editor
+  // bubbles command-letter chords on purpose; an off-pages press is the
+  // identity.
+  page_editor = page_history_key(page_editor, event.key, event.physical_key, event.modifiers, (connected && shell_tab == "pages" && !palette_open))
   palette_key = palette_key_action(event.key, event.physical_key, event.modifiers, palette_open)
   return if palette_key == "none"
   return if palette_key == "open" && !connected

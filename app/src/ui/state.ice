@@ -259,6 +259,7 @@ state
   // carrying an unresolved thread (the document's washes) and the caret's
   // own block (where a fresh comment anchors), tracked per edit.
   commented_block_ids:[str] = []
+  page_link = ""
   caret_comment_target = ""
   active_thread_target = ""
   page_inflight_text = ""
