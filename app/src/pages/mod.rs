@@ -49,6 +49,10 @@ pub fn page_document(document: &Content, dark: bool, disabled: bool) -> Element<
         .id("page-document")
         .placeholder("Write something… `#` for a heading, `-` for a list")
         .width(iced::Length::Fill)
+        // Fill, so the widget owns a FINITE viewport: its caret-reveal and
+        // scrolling are internal, and an outer scrollable would hand it
+        // infinite height and turn both into no-ops.
+        .height(iced::Length::Fill)
         .font(crate::Ducktape::default_font())
         .size(BODY_SIZE)
         .line_height(BODY_LINE_HEIGHT)
@@ -150,10 +154,12 @@ pub fn apply_page_action(mut document: Content, action: PageAction) -> Content {
 /// The document's text, for the save tick's dirty check and its plan.
 ///
 /// Owned, not borrowed: the `sync` extern boundary hands state fields by value.
-/// The trailing newline goes — `Content` always carries one for the caret to
-/// sit after, and it is not a line of the document.
+/// VERBATIM: iced 0.14's `Content::text()` joins lines without inventing a
+/// trailing newline, so a trailing newline here IS a final empty line — the
+/// empty paragraph a page can end on. Trimming it made every such page dirty
+/// on open, and the resulting plan REMOVED the block.
 pub fn page_text(document: Content) -> String {
-    document.text().trim_end_matches(['\n', '\r']).to_string()
+    document.text()
 }
 
 /// Enter at the end of an UNMATCHED ``` line closes the fence: the newline is
@@ -264,6 +270,12 @@ fn remove_list_marker(document: &mut Content) -> bool {
 
 /// Tab / Shift+Tab move the caret's line by one nesting step. Two spaces is
 /// the depth unit the block projection already speaks (`load::block_prefix`).
+///
+/// An indent the TREE cannot hold is refused (consumed as a no-op): line 0 is
+/// the title, the first body line has no sibling to move under, and any line
+/// may only go one step past the line above it — the module's `MoveBlock`
+/// rejects anything deeper, so allowing it here would strand the buffer at a
+/// depth no save can persist.
 fn shift_indent(document: &mut Content, steps: i32) -> bool {
     let cursor = document.cursor();
     let Some(line) = document.line(cursor.position.line) else {
@@ -272,6 +284,16 @@ fn shift_indent(document: &mut Content, steps: i32) -> bool {
     let text = line.text.into_owned();
     let indent = text.len() - text.trim_start_matches([' ', '\t']).len();
     if steps > 0 {
+        if cursor.position.line <= 1 {
+            return true;
+        }
+        let ceiling = document
+            .line(cursor.position.line - 1)
+            .map_or(0, |above| sync::split_indent(&above.text).0 + 1);
+        let deep_enough = sync::split_indent(&text).0 + 1 > ceiling;
+        if deep_enough {
+            return true;
+        }
         replace_range(
             document,
             Position {
@@ -487,8 +509,20 @@ mod tests {
 
     #[test]
     fn tab_nests_by_the_projection_s_own_two_space_step() {
-        let content = typed("- one", 0, 5);
-        assert_eq!(press(content, Edit::Indent), "  - one");
+        let content = typed("Title\n- a\n- one", 2, 5);
+        assert_eq!(press(content, Edit::Indent), "Title\n- a\n  - one");
+    }
+
+    #[test]
+    fn tab_refuses_a_depth_the_tree_cannot_hold() {
+        // The first body line has no sibling to move under…
+        let first = typed("Title\n- one", 1, 5);
+        assert_eq!(press(first, Edit::Indent), "Title\n- one");
+        // …and no line may go more than one step past the line above it.
+        let deep = typed("Title\n- a\n  - b", 2, 7);
+        assert_eq!(press(deep, Edit::Indent), "Title\n- a\n  - b");
+        let ladder = typed("Title\n- a\n- b", 2, 5);
+        assert_eq!(press(ladder, Edit::Indent), "Title\n- a\n  - b");
     }
 
     #[test]
@@ -500,8 +534,11 @@ mod tests {
     }
 
     #[test]
-    fn page_text_drops_the_buffer_s_trailing_newline() {
+    fn page_text_keeps_a_final_empty_line_because_it_is_a_block() {
+        // Trimming it made every page ending on an empty paragraph dirty on
+        // open — and the resulting plan REMOVED that block unprompted.
         let content = Content::with_text("one\ntwo\n");
-        assert_eq!(page_text(content), "one\ntwo");
+        assert_eq!(page_text(content), "one\ntwo\n");
+        assert_eq!(page_text(Content::with_text("one")), "one");
     }
 }

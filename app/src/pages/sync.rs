@@ -145,7 +145,10 @@ pub fn stored_lines(blocks: &[PageBlock]) -> Vec<StoredLine> {
             line: Line {
                 kind: block.kind.clone(),
                 text: block.text.clone(),
-                checked: block.checked,
+                // `SetKind` off Todo leaves the stored flag behind; reading it
+                // for other kinds would pair phantom ticks the plan can never
+                // reconcile (`SetChecked` is Todo-only on the node).
+                checked: block.kind == "Todo" && block.checked,
                 depth: block.prefix.len() / INDENT.len(),
             },
         })
@@ -205,16 +208,55 @@ pub fn has_unclosed_fence(text: &str) -> bool {
     fences % 2 == 1
 }
 
+/// A line's leading whitespace as nesting steps: two spaces or one tab per
+/// step, and a leftover odd space belongs to the TEXT — discarding it would
+/// eat a byte of pasted prose on every save.
+pub(crate) fn split_indent(raw: &str) -> (usize, &str) {
+    let mut steps = 0;
+    let mut pending = 0;
+    let mut consumed = 0;
+    for byte in raw.bytes() {
+        match byte {
+            b' ' => {
+                pending += 1;
+                if pending == 2 {
+                    steps += 1;
+                    pending = 0;
+                }
+            }
+            b'\t' => {
+                steps += 1;
+                pending = 0;
+            }
+            _ => break,
+        }
+        consumed += 1;
+    }
+    (steps, &raw[consumed - pending..])
+}
+
 /// The document text, resolved back into lines. A fenced run folds into ONE
 /// Code line carrying the body verbatim, which is why this cannot be a `map`.
+///
+/// `split('\n')`, never `lines()`: the final empty line of a document IS a
+/// block (the empty paragraph a page can end on), and `lines()` eats it — the
+/// plan would then remove that block just for having opened the page.
+///
+/// Depth is CLAMPED to the line above's depth + 1 (and the first line to 0):
+/// that is the only shape the tree can hold, and an unclamped depth becomes a
+/// `MoveBlock` the module rejects forever.
 pub fn parse_document(text: &str) -> Vec<Line> {
-    let mut lines = Vec::new();
-    let mut source = text.lines().peekable();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    let mut source = text.split('\n').peekable();
     while let Some(raw) = source.next() {
-        let trimmed = raw.trim_start_matches([' ', '\t']);
-        let depth = (raw.len() - trimmed.len()) / INDENT.len();
-        if !trimmed.starts_with(FENCE) {
-            lines.push(parse_line(raw, trimmed, depth));
+        let (steps, rest) = split_indent(raw);
+        let ceiling = lines.last().map_or(0, |line| line.depth + 1);
+        let depth = steps.min(ceiling);
+        if !rest.starts_with(FENCE) {
+            lines.push(parse_line(rest, depth));
             continue;
         }
         // A code body is VERBATIM past the fence's own indent. Trimming all
@@ -239,13 +281,14 @@ pub fn parse_document(text: &str) -> Vec<Line> {
     lines
 }
 
-fn parse_line(raw: &str, trimmed: &str, depth: usize) -> Line {
+fn parse_line(rest: &str, depth: usize) -> Line {
     let plain = |kind: &str, text: &str, checked: bool| Line {
         kind: kind.into(),
         text: text.into(),
         checked,
         depth,
     };
+    let trimmed = rest;
     if trimmed.trim_end() == "---" {
         return plain("Divider", "", false);
     }
@@ -270,17 +313,21 @@ fn parse_line(raw: &str, trimmed: &str, depth: usize) -> Line {
         let checked = marker.eq_ignore_ascii_case("- [x] ");
         return plain(kind, rest, checked);
     }
-    if let Some(rest) = ordered_content(trimmed) {
-        return plain("Number", rest, false);
+    if let Some(content) = ordered_content(trimmed) {
+        return plain("Number", content, false);
     }
-    plain("Text", raw.trim_start_matches([' ', '\t']), false)
+    plain("Text", rest, false)
 }
 
 /// `12. text` / `12) text` — the content past an ordered marker. The stored
-/// number is positional, so the digits themselves are not kept.
+/// number is positional, so the digits themselves are not kept — which is
+/// exactly why a LONG number is prose: "1997. A great year" written as a list
+/// item would come back as "1. A great year", destroying the year.
+// ponytail: <= 2 digits is a heuristic; carrying the start number through the
+// module is the upgrade if 100+-item lists ever matter.
 fn ordered_content(trimmed: &str) -> Option<&str> {
     let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 {
+    if digits == 0 || digits > 2 {
         return None;
     }
     let rest = trimmed.get(digits..)?;
@@ -312,34 +359,58 @@ pub fn document_plan(stored: &[StoredLine], wanted: &[Line]) -> DocumentPlan {
     let stored_middle = &stored[common_head..stored.len() - common_tail];
     let wanted_middle = &wanted[common_head..wanted.len() - common_tail];
 
-    // A block that still holds children cannot be removed — `RemoveBlock` takes
-    // the subtree with it. Refusing is the only honest answer; the caller
-    // resyncs and says so.
-    let doomed_parent = stored_middle
-        .iter()
-        .skip(wanted_middle.len())
-        .find(|stored| stored.has_children);
-    if let Some(parent) = doomed_parent {
-        return DocumentPlan {
-            ops: Vec::new(),
-            refusal: format!(
-                "\"{}\" still has sub-items — delete those first",
-                summarize(&parent.line.text)
-            ),
-        };
+    // A removal may take a parent ONLY when its whole subtree goes with it —
+    // `RemoveBlock` is defined to take the subtree, so deleting the lines of a
+    // nested list together is ONE remove on its root. A parent whose subtree
+    // extends past the removed run would take survivors with it; that is
+    // refused, and the caller resyncs and says so.
+    let doomed_end = common_head + stored_middle.len();
+    let survivors = stored_middle.len().min(wanted_middle.len());
+    for (offset, doomed) in stored_middle.iter().enumerate().skip(survivors) {
+        if !doomed.has_children {
+            continue;
+        }
+        let index = common_head + offset;
+        let subtree = stored[index + 1..]
+            .iter()
+            .take_while(|below| below.line.depth > doomed.line.depth)
+            .count();
+        let subtree_leaks = index + 1 + subtree > doomed_end;
+        if subtree_leaks {
+            return DocumentPlan {
+                ops: Vec::new(),
+                refusal: format!(
+                    "\"{}\" still has sub-items — delete those first",
+                    summarize(&doomed.line.text)
+                ),
+            };
+        }
     }
 
     let mut ops = Vec::new();
-    for (have, want) in stored_middle.iter().zip(wanted_middle) {
-        // Depth becomes a `MoveBlock` direction, never a guessed parent.
+    for (offset, (have, want)) in stored_middle.iter().zip(wanted_middle).enumerate() {
+        // Depth becomes a `MoveBlock` direction, never a guessed parent — and
+        // an indent is only asked for when the stored tree can PERFORM it (a
+        // previous sibling to move under). An unperformable step is deferred:
+        // the next tick re-plans against fresher state, and a plan that comes
+        // back empty settles the baseline instead of retrying forever.
         if have.line.depth != want.depth {
-            ops.push(BlockOp::Nest {
-                id: have.id.clone(),
-                direction: match want.depth > have.line.depth {
-                    true => "indent".into(),
-                    false => "outdent".into(),
-                },
-            });
+            let indent = want.depth > have.line.depth;
+            let previous_peer = stored[..common_head + offset]
+                .iter()
+                .rev()
+                .map(|earlier| earlier.line.depth)
+                .find(|depth| *depth <= have.line.depth);
+            let performable = !indent || previous_peer == Some(have.line.depth);
+            if performable {
+                ops.push(BlockOp::Nest {
+                    id: have.id.clone(),
+                    direction: match indent {
+                        true => "indent".into(),
+                        false => "outdent".into(),
+                    },
+                });
+            }
         }
         if have.line.text != want.text {
             ops.push(BlockOp::SetText {
@@ -353,14 +424,19 @@ pub fn document_plan(stored: &[StoredLine], wanted: &[Line]) -> DocumentPlan {
                 kind: want.kind.clone(),
             });
         }
-        if have.line.checked != want.checked {
+        // A tick is a Todo fact — on any other wanted kind there is nothing to
+        // reconcile, and the module rejects the op (`NotTodo`).
+        if want.kind == "Todo" && have.line.checked != want.checked {
             ops.push(BlockOp::SetChecked {
                 id: have.id.clone(),
                 checked: want.checked,
             });
         }
     }
-    for surplus in stored_middle.iter().skip(wanted_middle.len()) {
+    // REVERSE document order: a parent precedes its subtree in preorder, so
+    // walking backwards removes leaves first and every parent is childless by
+    // the time its own `Remove` lands — no op ever takes a survivor.
+    for surplus in stored_middle.iter().skip(survivors).rev() {
         ops.push(BlockOp::Remove {
             id: surplus.id.clone(),
         });
@@ -416,6 +492,13 @@ mod tests {
             text: text.into(),
             checked: false,
             depth: 0,
+        }
+    }
+
+    fn line_at(depth: usize, text: &str) -> Line {
+        Line {
+            depth,
+            ..line("Text", text)
         }
     }
 
@@ -502,13 +585,14 @@ mod tests {
 
     #[test]
     fn a_nested_code_block_loses_its_nesting_indent_and_keeps_its_own() {
+        let parent = line("Bullet", "setup");
         let code = Line {
             depth: 1,
             ..line("Code", "if x:\n    go()")
         };
-        let rendered = render_line(&code);
-        assert_eq!(rendered, "  ```\n  if x:\n      go()\n  ```");
-        assert_eq!(parse_document(&rendered), vec![code]);
+        let rendered = format!("{}\n{}", render_line(&parent), render_line(&code));
+        assert_eq!(rendered, "- setup\n  ```\n  if x:\n      go()\n  ```");
+        assert_eq!(parse_document(&rendered), vec![parent, code]);
     }
 
     #[test]
@@ -519,12 +603,63 @@ mod tests {
 
     #[test]
     fn depth_round_trips_as_two_spaces_per_level() {
-        let nested = Line {
-            depth: 2,
-            ..line("Bullet", "deep")
-        };
-        assert_eq!(render_line(&nested), "    - deep");
-        assert_eq!(parse_document("    - deep"), vec![nested]);
+        let ladder = "- a\n  - b\n    - c";
+        let parsed = parse_document(ladder);
+        assert_eq!(
+            parsed.iter().map(|l| l.depth).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .map(render_line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ladder
+        );
+    }
+
+    #[test]
+    fn depth_is_clamped_to_what_the_tree_can_hold() {
+        // An isolated deep line has nothing to nest under: the tree cannot
+        // represent it, and an unclamped depth becomes a MoveBlock the module
+        // rejects on every tick, forever.
+        assert_eq!(parse_document("    - deep")[0].depth, 0);
+        let jump = parse_document("- a\n        - way deep");
+        assert_eq!(jump[1].depth, 1);
+    }
+
+    #[test]
+    fn tabs_count_as_indent_steps_and_an_odd_space_stays_in_the_text() {
+        let tabbed = parse_document("- a\n\t- b");
+        assert_eq!(
+            tabbed[1],
+            Line {
+                depth: 1,
+                ..line("Bullet", "b")
+            }
+        );
+        // Three spaces: one step, and the odd space belongs to the text.
+        assert_eq!(split_indent("   x"), (1, " x"));
+        assert_eq!(parse_document("- a\n   x")[1], line_at(1, " x"));
+    }
+
+    #[test]
+    fn a_long_number_is_prose_because_its_digits_would_be_destroyed() {
+        // The stored ordered marker is positional — "1997." would come back
+        // as "1.", deleting the year. Two digits keep real lists working.
+        assert_eq!(
+            parse_document("1997. A great year")[0],
+            line("Text", "1997. A great year")
+        );
+        assert_eq!(parse_document("12. twelfth")[0], line("Number", "twelfth"));
+    }
+
+    #[test]
+    fn a_final_empty_line_is_a_block_and_survives_the_round_trip() {
+        let parsed = parse_document("one\n");
+        assert_eq!(parsed, vec![line("Text", "one"), line("Text", "")]);
+        assert_eq!(parse_document(""), Vec::new());
     }
 
     #[test]
@@ -659,16 +794,75 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_parent_is_refused_rather_than_taking_its_subtree() {
+    fn removing_a_parent_is_refused_when_its_subtree_survives() {
         let parent = StoredLine {
             has_children: true,
             ..stored("b", "Text", "parent of things")
         };
-        let have = vec![stored("a", "Text", "one"), parent];
-        let want = vec![line("Text", "one")];
+        let child = StoredLine {
+            line: line_at(1, "kept child"),
+            ..stored("c", "Text", "kept child")
+        };
+        let have = vec![stored("a", "Text", "one"), parent, child.clone()];
+        let want = vec![line("Text", "one"), child.line.clone()];
         let plan = document_plan(&have, &want);
         assert!(plan.ops.is_empty(), "a refused plan writes nothing");
         assert!(plan.refusal.contains("still has sub-items"), "{plan:?}");
+    }
+
+    #[test]
+    fn deleting_a_whole_subtree_together_is_allowed_leaves_first() {
+        let parent = StoredLine {
+            has_children: true,
+            ..stored("b", "Text", "parent")
+        };
+        let child = StoredLine {
+            line: line_at(1, "child"),
+            ..stored("c", "Text", "child")
+        };
+        let have = vec![stored("a", "Text", "one"), parent, child];
+        let want = vec![line("Text", "one")];
+        assert_eq!(
+            document_plan(&have, &want).ops,
+            vec![
+                BlockOp::Remove { id: "c".into() },
+                BlockOp::Remove { id: "b".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unperformable_indent_is_deferred_not_submitted() {
+        // The first body line has no previous sibling; the module would
+        // reject the MoveBlock forever. An empty plan lets the baseline
+        // settle instead.
+        let have = vec![stored("a", "Bullet", "one")];
+        let want = vec![Line {
+            depth: 1,
+            ..line("Bullet", "one")
+        }];
+        assert_eq!(document_plan(&have, &want).ops, Vec::new());
+    }
+
+    #[test]
+    fn unticking_a_todo_by_retyping_its_kind_writes_no_phantom_tick() {
+        let done = StoredLine {
+            line: Line {
+                checked: true,
+                ..line("Todo", "was done")
+            },
+            ..stored("a", "Todo", "was done")
+        };
+        let want = vec![line("Bullet", "was done")];
+        // Only the kind moves — SetChecked is Todo-only on the node, and a
+        // Bullet has no tick to reconcile.
+        assert_eq!(
+            document_plan(&[done], &want).ops,
+            vec![BlockOp::SetKind {
+                id: "a".into(),
+                kind: "Bullet".into(),
+            }]
+        );
     }
 
     #[test]

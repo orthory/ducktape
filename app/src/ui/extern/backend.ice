@@ -314,7 +314,6 @@ extern crate::backend
   sync cancel_autosaves(rpc:str, generation:i64) -> i64
   sync remember_orphaned_comment_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str) -> [str]
   sync remove_recovered_draft(drafts:[str], recovered:str) -> [str]
-  sync retain_drafts_for_endpoint(drafts:[str], current:str, next:str) -> [str]
   sync retain_selected_string(value:str, selected_id:str) -> str
   sync retain_selected_i64(value:i64, selected_id:str) -> i64
   sync retain_selected_comment_threads(threads:[PageCommentThread], selected_id:str) -> [PageCommentThread]
@@ -373,5 +372,9 @@ extern crate::backend
   sync refreshed_page_editor(document:editor, title:str, blocks:[PageBlock], saved:str) -> editor
   sync refreshed_page_saved(document:editor, title:str, blocks:[PageBlock], saved:str) -> str
   sync saved_baseline(written:bool, canonical:str, submitted:str) -> str
+  sync install_decision(document:editor, current_page:str, next_page:str, saved:str, canonical:str) -> bool
+  sync installed_page_editor(document:editor, install:bool, canonical:str) -> editor
+  sync rolled_back_editor(document:editor, untouched:bool, canonical:str) -> editor
+  sync remember_orphaned_page_comment(drafts:[str], pages:[PageItem], target:str, draft:str) -> [str]
   search_pages(rpc:str, page_id:str, text:str, generation:i64) -> PageSearchData ! HydrationError
   palette_search(rpc:str, text:str, generation:i64) -> PaletteSearchData ! HydrationError

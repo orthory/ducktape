@@ -1024,6 +1024,9 @@ fn thread_messages_mirror_the_main_action_system() {
     assert!(
         card.contains("-> emit(open_thread_message_actions, message.seq, message.body, message.rev)")
     );
+    assert!(card.contains(
+        "-> emit(open_thread_message_reactions, message.seq, message.body, message.rev)"
+    ));
     // A reply is the SAME message block as a timeline row — the rail mounts
     // the shared contents rather than a second spelling of them, so the
     // message redesign lands in both lanes at once.
@@ -1362,7 +1365,11 @@ fn the_page_surface_is_one_editor_with_no_click_to_edit_left() {
     // pointer tracking and the insert row's type dropdown are gone with the
     // click-to-edit model — a page is one editor, and `# ` is the block-type
     // menu.
-    assert!(!view.contains("pages_pointer_moved"));
+    assert!(!view.contains("pages_pointer"));
+    assert!(!view.contains("mouse move="));
+    assert!(!view.contains(
+        "scroll dir=vertical w=fill h=fill bar=hidden\n              box w=fill max-w=720.0"
+    ));
     assert!(!view.contains("BlockActionsMenu"));
     assert!(!view.contains("block_menu_x"));
     assert!(!view.contains("InlineBlockInsert"));

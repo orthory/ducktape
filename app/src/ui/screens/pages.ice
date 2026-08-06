@@ -183,56 +183,60 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
           if connected && !loading && empty(active_page)
             EmptyState title="No page selected" description="Create a page from the sidebar."
           if connected && !empty(active_page)
-            scroll dir=vertical w=fill h=fill bar=hidden
-              box w=fill max-w=720.0 mx=auto pl=22.0 pr=22.0 pt=26.0 pb=120.0
-                col w=fill gap=8.0
-                  if !empty(page_search_hits)
-                    box w=fill h=148.0 p=5.0 bg=elevated border=fg/8 border-w=1.0 r=9.0
-                      scroll dir=vertical w=fill h=fill
-                        col w=fill gap=1.0
-                          for hit in page_search_hits
-                            PageSearchResult hit=hit
-                              forward
-                                open_page_search_hit
-                  // A REFUSED WRITE SAYS SO, IN THE DOCUMENT. The buffer has
-                  // already been rolled back to the canonical text by the
-                  // time this paints, so the line explains a change that
-                  // just visibly undid itself.
-                  if !empty(page_refusal)
-                    box w=fill px=12.0 py=9.0 bg=alert_bg border=alert_line border-w=1.0 r=9.0
-                      text page_refusal w=fill size=12.5 wrap=word @text-alert_fg
-                  if !empty(orphaned_comment_drafts)
-                    box w=fill p=7.0 bg=elevated border=fg/9 border-w=1.0 r=9.0
-                      col w=fill gap=5.0
-                        text "Recovered drafts" size=13.0 font=medium @text-fg
-                        for recovered_comment in orphaned_comment_drafts
-                          row w=fill gap=5.0 align=center
-                            text recovered_comment w=fill size=13.5 @text-muted
-                            button "Use" label="Use as comment" disabled=(loading || mutation_phase != "idle") h=26.0 p=5.0 @ghost_action -> emit(use_orphaned_comment_draft, recovered_comment)
-                              active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
-                              hovered bg=fg/14
-                              pressed bg=fg/18
-                            button "Discard" disabled=(loading || mutation_phase != "idle") h=26.0 p=5.0 @danger_action -> emit(discard_orphaned_comment_draft, recovered_comment)
-                  // THE PAGE. One editor, the whole document — see the file
-                  // header. It is never disabled while connected: a page you
-                  // can read is a page you can type in.
-                  extern page_document(page_editor, dark, (loading || !connected)) #document -> emit(page_edited, _)
-                  // Subpages: navigation, listed rather than typed.
-                  if !empty(subpage_blocks(blocks))
-                    col w=fill gap=2.0 pt=18.0
-                      text "Subpages" size=10.5 wrap=none font=code_medium @text-hint
-                      for child in subpage_blocks(blocks)
-                        button label="Open subpage" description=child.text w=fill p=6.0 @ghost_action -> emit(choose_page, child.id)
-                          row w=fill gap=8.0 align=center
-                            Icon name="doc" tone="label" px=14.0
-                            if empty(child.text)
-                              text "Untitled" w=fill size=13.5 wrap=none font=medium @text-muted
-                            if !empty(child.text)
-                              text child.text w=fill size=13.5 wrap=none font=medium @text-fg
-                            text "›" size=13.0 wrap=none @text-label
-                          active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
-                          hovered bg=fg/4 text=fg border=fg/7
-                          pressed bg=fg/8 text=fg
+            // NO outer scroll: the editor owns a FINITE viewport and scrolls
+            // itself, which is what keeps its caret-reveal alive — an outer
+            // scrollable would hand it infinite height, and typing below the
+            // fold would walk the caret off screen with nothing following it.
+            box w=fill h=fill max-w=720.0 mx=auto pl=22.0 pr=22.0 pt=26.0 pb=18.0
+              col w=fill h=fill gap=8.0
+                if !empty(page_search_hits)
+                  box w=fill h=148.0 p=5.0 bg=elevated border=fg/8 border-w=1.0 r=9.0
+                    scroll dir=vertical w=fill h=fill
+                      col w=fill gap=1.0
+                        for hit in page_search_hits
+                          PageSearchResult hit=hit
+                            forward
+                              open_page_search_hit
+                // A REFUSED (or fence-held) WRITE SAYS SO, IN THE DOCUMENT.
+                // An untouched buffer was rolled back to the canonical text by
+                // the time this paints; a buffer the user kept typing into is
+                // preserved, and this line explains why it is not saving yet.
+                if !empty(page_refusal)
+                  box w=fill px=12.0 py=9.0 bg=alert_bg border=alert_line border-w=1.0 r=9.0
+                    text page_refusal w=fill size=12.5 wrap=word @text-alert_fg
+                if !empty(orphaned_comment_drafts)
+                  box w=fill p=7.0 bg=elevated border=fg/9 border-w=1.0 r=9.0
+                    col w=fill gap=5.0
+                      text "Recovered drafts" size=13.0 font=medium @text-fg
+                      for recovered_comment in orphaned_comment_drafts
+                        row w=fill gap=5.0 align=center
+                          text recovered_comment w=fill size=13.5 @text-muted
+                          button "Use" label="Use as comment" disabled=(loading || mutation_phase != "idle") h=26.0 p=5.0 @ghost_action -> emit(use_orphaned_comment_draft, recovered_comment)
+                            active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
+                            hovered bg=fg/14
+                            pressed bg=fg/18
+                          button "Discard" disabled=(loading || mutation_phase != "idle") h=26.0 p=5.0 @danger_action -> emit(discard_orphaned_comment_draft, recovered_comment)
+                // THE PAGE. One editor, the whole document — see the file
+                // header. It is never disabled while connected: a page you
+                // can read is a page you can type in. It FILLS the column
+                // and scrolls itself.
+                extern page_document(page_editor, dark, (loading || !connected)) #document -> emit(page_edited, _)
+                // Subpages: navigation, listed rather than typed.
+                if !empty(subpage_blocks(blocks))
+                  col w=fill gap=2.0 pt=10.0
+                    text "Subpages" size=10.5 wrap=none font=code_medium @text-hint
+                    for child in subpage_blocks(blocks)
+                      button label="Open subpage" description=child.text w=fill p=6.0 @ghost_action -> emit(choose_page, child.id)
+                        row w=fill gap=8.0 align=center
+                          Icon name="doc" tone="label" px=14.0
+                          if empty(child.text)
+                            text "Untitled" w=fill size=13.5 wrap=none font=medium @text-muted
+                          if !empty(child.text)
+                            text child.text w=fill size=13.5 wrap=none font=medium @text-fg
+                          text "›" size=13.0 wrap=none @text-label
+                        active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
+                        hovered bg=fg/4 text=fg border=fg/7
+                        pressed bg=fg/8 text=fg
           overlay when=page_delete_armed dismiss=emit(disarm_page_delete) backdrop=scrim p=30.0 align-x=center align-y=center
             content
               space w=fill h=fill

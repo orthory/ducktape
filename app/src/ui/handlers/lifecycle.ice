@@ -292,7 +292,7 @@ on live_resynced(next)
   channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
   pages = keep_pages(next.pages_loaded, next.pages, pages)
   blocks = keep_blocks(next.pages_loaded, merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, ""), blocks)
-  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, blocks, active_page, block_comment_draft)
+  orphaned_comment_drafts = remember_orphaned_page_comment(orphaned_comment_drafts, pages, block_comments_target, block_comment_draft)
   // THE COMMENTS RAIL IS DOCUMENT-SCOPED (handlers/pages.ice:300). Its anchor is
   // the PAGE it was opened on, never a block selection — keyed on
   // `selected_block_id` it closed itself, and threw the half-typed comment away,
@@ -496,7 +496,11 @@ on mutation_failed(cause)
   pending_page = ""
   error = cause.message
   return if !cause.committed
+  // The bump discards the in-flight save's reply, so ITS status reset can
+  // never arrive — bump and reset are one inseparable pair, or the "saving"
+  // guard holds the tick forever.
   block_autosave_generation = cancel_autosaves(connected_rpc, block_autosave_generation)
+  block_autosave_status = "idle"
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   run live_resync_load(connected_rpc, active_channel, active_page, "both", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _

@@ -389,19 +389,27 @@ pub fn remember_orphaned_comment_drafts(
     drafts
 }
 
+/// The live-resync twin of [`remember_orphaned_comment_drafts`]: the rail's
+/// anchor is the PAGE, so the half-typed comment is orphaned only when that
+/// page itself vanished from the index — never merely because a resync ran.
+pub fn remember_orphaned_page_comment(
+    mut drafts: Vec<String>,
+    pages: Vec<PageItem>,
+    target: String,
+    draft: String,
+) -> Vec<String> {
+    let page_gone = !target.is_empty() && !pages.iter().any(|page| page.id == target);
+    if page_gone {
+        append_recovered_draft(&mut drafts, draft);
+    }
+    drafts
+}
+
 pub fn remove_recovered_draft(mut drafts: Vec<String>, recovered: String) -> Vec<String> {
     if let Some(index) = drafts.iter().position(|draft| draft == &recovered) {
         drafts.remove(index);
     }
     drafts
-}
-
-pub fn retain_drafts_for_endpoint(
-    drafts: Vec<String>,
-    current: String,
-    next: String,
-) -> Vec<String> {
-    if current == next { drafts } else { Vec::new() }
 }
 
 pub fn retain_selected_string(value: String, selected_id: String) -> String {

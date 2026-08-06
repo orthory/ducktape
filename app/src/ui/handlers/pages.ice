@@ -326,14 +326,19 @@ on pages_updated(next)
   block_comment_draft = ""
   pending_block_comment = ""
   pages = next.pages
+  // ONE install decision, decided against the PREVIOUS page identity and
+  // applied to buffer and baseline together: the incoming page's text lands
+  // when the page MOVED or a clean buffer actually differs; a dirty buffer on
+  // the SAME page is the user mid-typing through a reload, and a reload must
+  // never eat keystrokes.
+  page_landing = page_document_text(next.active_page_title, next.blocks)
+  page_install = install_decision(page_editor, active_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
-  // A page LOAD always installs its own text: there is no draft to protect,
-  // because the buffer belonged to the page being left.
-  page_editor = editor(page_document_text(active_page_title, blocks))
-  page_saved_text = page_document_text(active_page_title, blocks)
+  page_editor = installed_page_editor(page_editor, page_install, page_landing)
+  page_saved_text = keep_str(page_install, page_landing, page_saved_text)
   page_refusal = ""
   block_autosave_status = "idle"
   block_autosave_generation = block_autosave_generation + 1
@@ -345,6 +350,13 @@ on pages_mutated(next)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_autosave_generation = block_autosave_generation + 1
   pages = next.pages
+  // The same one-decision install as `pages_updated` — create/delete moves
+  // the selection to another page, and the buffer must follow it; a mutation
+  // that stays on this page must not eat mid-flight keystrokes. Computed
+  // BEFORE the assignments so both reads see the pre-move state (the pair
+  // must move on one shared decision).
+  page_landing = page_document_text(next.active_page_title, next.blocks)
+  page_install = install_decision(page_editor, active_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
@@ -366,11 +378,9 @@ on pages_mutated(next)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  // A MUTATION MUST NOT EAT A KEYSTROKE. Creating a page or posting a comment
-  // does not touch this document, so the buffer is replaced only when it is
-  // clean AND the node's text actually differs.
-  page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
-  page_saved_text = refreshed_page_saved(page_editor, active_page_title, blocks, page_saved_text)
+  page_editor = installed_page_editor(page_editor, page_install, page_landing)
+  page_saved_text = keep_str(page_install, page_landing, page_saved_text)
+  page_refusal = ""
   block_autosave_status = "idle"
   page_delete_armed = false
   mutation_phase = "idle"
@@ -388,6 +398,15 @@ on close_doc_tab(id)
   active_page = next_doc_tab(doc_tabs, closing_doc_tab, active_page)
   doc_tabs = doc_tabs_without(doc_tabs, closing_doc_tab)
   closing_doc_tab = ""
+  // The same prologue as `choose_page`: `active_page` just moved under the
+  // buffer, and without `loading` the next 900ms tick would write the OLD
+  // page's text into the NEW page. `pages_updated` clears it and decides the
+  // install; closing a background tab reloads the same page, which the
+  // install decision keeps harmless for a dirty buffer.
+  block_autosave_generation = block_autosave_generation + 1
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  loading = true
   parallel
     run save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
     run load_page(connected_rpc, active_page) -> pages_updated _ | failed _
@@ -415,9 +434,12 @@ on page_autosave_tick
   let text = page_text(page_editor)
   return if text == page_saved_text
   // An open ``` swallows every line under it when parsed — the save waits
-  // for the close instead of writing (or refusing) a half-typed fence. The
-  // editor closes the fence itself on Enter, so this state is transient.
-  return if has_unclosed_fence(text)
+  // for the close instead of writing (or refusing) a half-typed fence, and
+  // SAYS SO: a stale "✓ synced" over held-back text would be a lie.
+  let fence_open = has_unclosed_fence(text)
+  block_autosave_status = keep_str(!fence_open, block_autosave_status, "idle")
+  page_refusal = keep_str(!fence_open, page_refusal, "the ``` fence is open — close it to save")
+  return if fence_open
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   block_autosave_status = "saving"
@@ -441,9 +463,12 @@ on page_document_saved(next)
   block_autosave_status = "saved"
   error = ""
   return if empty(next.refusal)
-  // A REFUSED WRITE ROLLS THE BUFFER BACK. The node holds the truth and the
-  // screen says why the edit did not stick.
-  page_editor = editor(next.document)
+  // A REFUSED WRITE ROLLS THE BUFFER BACK — but only when nothing was typed
+  // since the tick submitted. Otherwise the buffer is kept (the newest words
+  // must survive), the baseline moves to the node's text, and the still-dirty
+  // buffer re-plans on the next tick with the refusal line explaining why.
+  let untouched = page_text(page_editor) == page_inflight_text
+  page_editor = rolled_back_editor(page_editor, untouched, next.document)
   page_saved_text = next.document
   block_autosave_status = "idle"
 

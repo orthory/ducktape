@@ -82,6 +82,52 @@ fn refreshed_page_text(
     (canonical != saved).then_some(canonical)
 }
 
+/// The buffer a context change installs: the incoming page's canonical text
+/// when the page MOVED or the buffer is clean; the user's own buffer when they
+/// are mid-typing in the page that merely reloaded. One decision, computed
+/// once into a `let` and applied to buffer and baseline together.
+pub fn install_decision(
+    document: iced::widget::text_editor::Content,
+    current_page: String,
+    next_page: String,
+    saved: String,
+    canonical: String,
+) -> bool {
+    if current_page != next_page {
+        return true;
+    }
+    let clean = crate::pages::page_text(document) == saved;
+    // A clean, IDENTICAL buffer is left alone: a rebuilt `Content` throws the
+    // caret to the origin, and there is nothing to install.
+    clean && canonical != saved
+}
+
+pub fn installed_page_editor(
+    document: iced::widget::text_editor::Content,
+    install: bool,
+    canonical: String,
+) -> iced::widget::text_editor::Content {
+    match install {
+        true => iced::widget::text_editor::Content::with_text(&canonical),
+        false => document,
+    }
+}
+
+/// A refusal rolls the buffer back ONLY when nothing was typed since the tick
+/// submitted — otherwise the rollback would eat the user's newest words along
+/// with the refused edit. A kept buffer stays dirty against the canonical
+/// baseline, so the refusal re-plans (and re-explains) until resolved.
+pub fn rolled_back_editor(
+    document: iced::widget::text_editor::Content,
+    untouched: bool,
+    canonical: String,
+) -> iced::widget::text_editor::Content {
+    match untouched {
+        true => iced::widget::text_editor::Content::with_text(&canonical),
+        false => document,
+    }
+}
+
 /// The dirty baseline after a save settles.
 ///
 /// A WRITE moves the baseline to the node's canonical text: anything typed
@@ -194,13 +240,11 @@ pub async fn save_page_document(
         });
     }
 
-    // The head of the page, for an insert that anchors on nothing.
-    let page_head = current
-        .blocks
-        .first()
-        .filter(|block| block.kind == "Page")
-        .map(|block| block.id.clone())
-        .unwrap_or_else(|| page_id.clone());
+    // The head of the page, for an insert that anchors on nothing. ALWAYS the
+    // page's own record: `blocks` never contains it (`page_blocks` skips the
+    // wire head), so a lookup there could only ever find a SUBPAGE — and a
+    // first-line insert would land inside the child page.
+    let page_head = page_id.clone();
     let mut anchor = String::new();
 
     for (index, op) in ops.iter().enumerate() {

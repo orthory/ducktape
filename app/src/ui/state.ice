@@ -246,6 +246,10 @@ state
   // only exists while that drift does.
   page_editor:editor = ""
   page_saved_text = ""
+  // Scratch pair for the one-decision buffer install (E151: a run-route
+  // payload's fields do not type inside `let`, so the decision lands here).
+  page_landing = ""
+  page_install = false
   page_inflight_text = ""
   // Why a write was NOT attempted — see DocumentSaveResult. Cleared by the
   // next edit, because it describes an edit that has already been undone.
