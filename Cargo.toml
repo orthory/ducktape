@@ -526,3 +526,36 @@ opt-level = 3
 [profile.dev.package.argon2]
 opt-level = 3
 
+# The huddle's per-frame video codecs. Every captured frame pays an MJPEG
+# decode (mozjpeg's C, whose cc build inherits this profile's OPT_LEVEL) or a
+# YUYV conversion (nokhwa-core), a JPEG encode (jpeg-encoder), and every peer
+# frame a JPEG decode (zune-jpeg) — 25 times a second each. Unoptimized, the
+# encode alone runs 40-80 ms and eats the whole capture interval; that was
+# most of the "huddle video fps" report under `make dev`.
+[profile.dev.package.jpeg-encoder]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.zune-core]
+opt-level = 3
+
+[profile.dev.package.mozjpeg]
+opt-level = 3
+
+[profile.dev.package.mozjpeg-sys]
+opt-level = 3
+
+[profile.dev.package.nokhwa]
+opt-level = 2
+
+[profile.dev.package.nokhwa-core]
+opt-level = 2
+
+[profile.dev.package.nokhwa-bindings-linux]
+opt-level = 2
+
+[profile.dev.package.nokhwa-bindings-macos]
+opt-level = 2
+
