@@ -350,17 +350,28 @@ const fn rgb8(r: u8, g: u8, b: u8) -> Color {
     }
 }
 
+/// A plate color MUST be translucent: the runtime draws an opaque
+/// `line_highlight` above the glyphs (ducktape-ui bug, reproduced in the
+/// pinned `markdown-editor` example by making its wash opaque), so every
+/// plate here is a wash over the page instead of a solid.
+const fn wash(r: u8, g: u8, b: u8, a: f32) -> Color {
+    Color { a, ..rgb8(r, g, b) }
+}
+
 const LIGHT: Ink = Ink {
     body: rgb8(0x3a, 0x38, 0x33),
     strong: rgb8(0x26, 0x25, 0x1f),
     muted: rgb8(0x6b, 0x69, 0x62),
     marker: rgb8(0xb3, 0xb1, 0xa8),
     link: rgb8(0x5f, 0x7a, 0x9e),
-    code_ink: rgb8(0xc8, 0xc6, 0xbc),
-    code_plate: rgb8(0x26, 0x25, 0x1f),
-    code_line: rgb8(0x35, 0x33, 0x2c),
-    callout_plate: rgb8(0xfa, 0xf9, 0xf6),
-    callout_line: rgb8(0xef, 0xee, 0xe9),
+    // The chat message block landed here first (#927): a quiet wash with a
+    // hairline, never a dark slab — "black/26 was invisible in dark", and a
+    // dark slab swallowed its own ink here too.
+    code_ink: rgb8(0x3a, 0x38, 0x33),
+    code_plate: wash(0x3a, 0x38, 0x33, 0.05),
+    code_line: wash(0x3a, 0x38, 0x33, 0.10),
+    callout_plate: wash(0xa0, 0x5a, 0x3c, 0.06),
+    callout_line: wash(0xa0, 0x5a, 0x3c, 0.14),
 };
 
 const DARK: Ink = Ink {
@@ -369,11 +380,11 @@ const DARK: Ink = Ink {
     muted: rgb8(0xa8, 0xa6, 0x9c),
     marker: rgb8(0x6b, 0x6a, 0x61),
     link: rgb8(0x8f, 0xa9, 0xc9),
-    code_ink: rgb8(0xc8, 0xc6, 0xbc),
-    code_plate: rgb8(0x1a, 0x19, 0x16),
-    code_line: rgb8(0x2c, 0x2b, 0x25),
-    callout_plate: rgb8(0x23, 0x22, 0x1d),
-    callout_line: rgb8(0x2c, 0x2b, 0x26),
+    code_ink: rgb8(0xd4, 0xd2, 0xca),
+    code_plate: wash(0xd4, 0xd2, 0xca, 0.07),
+    code_line: wash(0xd4, 0xd2, 0xca, 0.12),
+    callout_plate: wash(0xc9, 0x8a, 0x63, 0.10),
+    callout_line: wash(0xc9, 0x8a, 0x63, 0.20),
 };
 
 fn ink(dark: bool) -> &'static Ink {
@@ -638,5 +649,41 @@ mod tests {
         );
         assert_eq!(hidden.color, Some(Color::TRANSPARENT));
         assert!(hidden.size.expect("a size").0 > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod plate_probe {
+    use super::*;
+
+    #[test]
+    fn the_code_body_line_keeps_full_size_ink() {
+        let mut hl = <DocumentHighlighter as Highlighter>::new(&Caret {
+            line: 0,
+            column: 0,
+            dark: false,
+        });
+        let lines = [
+            "Team Runbook v2",
+            "How we ship: branch off dev, PR, review, merge.",
+            "## Rules",
+            "- ship small",
+            "- test everything",
+            "- [ ] wire QA",
+            "```",
+            "cargo test -p ducktape-app",
+            "```",
+        ];
+        let mut all = Vec::new();
+        for line in lines {
+            all.push(hl.highlight_line(line).collect::<Vec<_>>());
+        }
+        let cargo = &all[7];
+        assert_eq!(cargo.len(), 1, "{cargo:?}");
+        assert!(matches!(cargo[0].1, Mark::CodeBody), "{cargo:?}");
+        let f = format(&cargo[0].1, false);
+        assert_eq!(f.size.map(|s| s.0), Some(CODE_SIZE));
+        assert!(f.color.expect("ink").a > 0.9, "opaque ink");
+        assert!(f.line_highlight.is_some());
     }
 }
