@@ -32,24 +32,42 @@
 // is how iced spells the artifact's `stopPropagation` on a nested control.
 // NOTE: the frozen signature carries no roster, so the artifact's overlapping
 // 18px face stack inside this pill cannot be drawn here (see the report).
-component HuddleLivePill(name:str, elapsed:str, muted:bool)
+component HuddleLivePill(name:str, elapsed:str, muted:bool, popped:bool)
   emits
     pop_huddle
+    focus_huddle
     leave_huddle_here
   box #root bg=toast_bg r=9.0 pl=9.0 pr=10.0 pt=5.0 pb=5.0
     row gap=8.0 align=center
-      button label=name @icon_action px-0px py-0px -> emit(pop_huddle)
-        row gap=8.0 align=center
-          PulseDot plate=6.0 tone="success"
-          text "LIVE" size=10.5 wrap=none font=code_medium @text-toast_fg
-          if !empty(elapsed)
-            text elapsed size=10.5 wrap=none font=code_medium @text-toast_fg
-          if muted
-            Icon name="mic-off" tone="caption" px=11.0
-          Icon name="popout" tone="caption" px=11.0
-        active bg=transparent text=toast_fg border=transparent border-w=1.0 r=6.0
-        hovered bg=ink_hover text=toast_fg
-        pressed bg=ink_hover text=toast_fg
+      // Two arms, one face: while the huddle window is up, the pill's click
+      // RAISES it instead of trying to open a second one (which a branch-free
+      // handler could only swallow as a no-op).
+      if !popped
+        button label=name @icon_action px-0px py-0px -> emit(pop_huddle)
+          row gap=8.0 align=center
+            PulseDot plate=6.0 tone="success"
+            text "LIVE" size=10.5 wrap=none font=code_medium @text-toast_fg
+            if !empty(elapsed)
+              text elapsed size=10.5 wrap=none font=code_medium @text-toast_fg
+            if muted
+              Icon name="mic-off" tone="caption" px=11.0
+            Icon name="popout" tone="caption" px=11.0
+          active bg=transparent text=toast_fg border=transparent border-w=1.0 r=6.0
+          hovered bg=ink_hover text=toast_fg
+          pressed bg=ink_hover text=toast_fg
+      if popped
+        button label="Focus the huddle window" @icon_action px-0px py-0px -> emit(focus_huddle)
+          row gap=8.0 align=center
+            PulseDot plate=6.0 tone="success"
+            text "LIVE" size=10.5 wrap=none font=code_medium @text-toast_fg
+            if !empty(elapsed)
+              text elapsed size=10.5 wrap=none font=code_medium @text-toast_fg
+            if muted
+              Icon name="mic-off" tone="caption" px=11.0
+            Icon name="popout" tone="caption" px=11.0
+          active bg=transparent text=toast_fg border=transparent border-w=1.0 r=6.0
+          hovered bg=ink_hover text=toast_fg
+          pressed bg=ink_hover text=toast_fg
       box w=1.0 h=14.0 bg=panel_tile
         space w=1.0 h=1.0
       button label="Leave the huddle" w=24.0 h=24.0 @icon_action px-0px py-0px -> emit(leave_huddle_here)

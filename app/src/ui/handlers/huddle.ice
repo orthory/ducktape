@@ -44,25 +44,24 @@ on video_tick
 // POPPING OPENS A REAL WINDOW, and the window's existence IS the popped
 // state — there is no `huddle_popped` bool to keep in step with it. Docking
 // closes it; so does the OS close button, which lands in `window_was_closed`
-// (handlers/lifecycle.ice) and clears `huddle_win` there.
-// ponytail: a second `pop_huddle` while the window is already open is a
-// no-op rather than a focus-raise — a handler has no if-blocks and window
-// tasks are terminal, so "open it or raise it" needs the two paths split.
-// The docked pill hides while the window lives; only the channel-header LIVE
-// pill can still reach this. Give that pill a `popped` prop when it bites.
+// (handlers/lifecycle.ice) and clears `huddle_win` there. The open-or-raise
+// split lives in the VIEW: the LIVE pill's `popped` prop routes its click to
+// `focus_huddle` while the window is up, so this guard is a belt, not a path.
 on pop_huddle
   return if huddle_win != none
   task window open huddle -> huddle_opened _
 
+on focus_huddle
+  task window focus target=window_target(huddle_win)
+
 on huddle_opened(id)
   huddle_win = some(id)
 
-// ponytail: a huddle that ends WITHOUT this window (another device leaves,
-// the node drops the seat) leaves the window up on an empty roster — its OS
-// close button is the only way out, and the docked pill correctly stays gone.
-// `huddle_joined` is folded in five places (handlers/chat.ice, lifecycle.ice)
-// and `assert_no_polling` forbids a watchdog tick, so the upgrade is one
-// appended `task window close target=window_target(huddle_win)` per fold.
+// A huddle that ends WITHOUT this window (another device leaves, the node
+// drops the seat) closes it from the folds: every `huddle_joined` fold in
+// handlers/chat.ice and lifecycle.ice ends with a
+// `window_target_unless(huddle_joined, huddle_win)` close — a no-op while
+// she is still in, the window's end the moment she is not.
 on dock_huddle
   task window close target=window_target(huddle_win)
 

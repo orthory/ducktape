@@ -34,6 +34,50 @@ const CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8
 const JPEG_QUALITY: u8 = 60;
 /// Tile width in the strip; height follows the frame's aspect.
 const TILE_WIDTH: f32 = 128.0;
+/// Capture ceiling, in pixels: the documented ~VGA budget whose q60 JPEG
+/// stays well under the mesh's MAX_FRAME_BYTES. A camera that only offers
+/// bigger modes is box-halved down to it before the encode.
+const CAPTURE_PIXEL_BUDGET: u32 = 640 * 480;
+/// Decoded-tile ceiling, in pixels: keeps a tile's RGBA under iced_wgpu's
+/// 2 MiB synchronous-upload cliff no matter what a peer ships — the sender
+/// bounds itself, but a peer is not trusted to.
+const TILE_PIXEL_BUDGET: u32 = 512 * 1024;
+
+/// One 2×2 box-average pass over an interleaved `CHANNELS`-per-pixel image;
+/// odd edges clamp their second sample. Repeated until a budget holds — a
+/// pass is one integer average per output byte, cheap enough for the capture
+/// thread and the decode's blocking task alike.
+fn halve<const CHANNELS: usize>(pixels: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
+    let (out_w, out_h) = ((width / 2).max(1), (height / 2).max(1));
+    let mut out = Vec::with_capacity(out_w as usize * out_h as usize * CHANNELS);
+    for y in 0..out_h {
+        let (y0, y1) = ((y * 2).min(height - 1), (y * 2 + 1).min(height - 1));
+        for x in 0..out_w {
+            let (x0, x1) = ((x * 2).min(width - 1), (x * 2 + 1).min(width - 1));
+            for channel in 0..CHANNELS {
+                let sample = |sx: u32, sy: u32| {
+                    u16::from(pixels[(sy * width + sx) as usize * CHANNELS + channel])
+                };
+                let sum = sample(x0, y0) + sample(x1, y0) + sample(x0, y1) + sample(x1, y1);
+                out.push((sum / 4) as u8);
+            }
+        }
+    }
+    (out, out_w, out_h)
+}
+
+/// Halve `pixels` until `width * height` fits `budget`.
+fn shrink_to_budget<const CHANNELS: usize>(
+    mut pixels: Vec<u8>,
+    mut width: u32,
+    mut height: u32,
+    budget: u32,
+) -> (Vec<u8>, u32, u32) {
+    while width * height > budget {
+        (pixels, width, height) = halve::<CHANNELS>(&pixels, width, height);
+    }
+    (pixels, width, height)
+}
 
 /// One decoded tile: the renderer handle, built ONCE per decoded frame, plus
 /// the capture size the tile's aspect ratio is computed from.
@@ -140,7 +184,11 @@ fn decode_frame(data: &[u8]) -> Option<TileFrame> {
         ));
     let pixels = decoder.decode().ok()?;
     let (width, height) = decoder.dimensions()?;
-    let (width, height) = (width as u32, height as u32);
+    // An oversized peer frame is bounded HERE, not trusted to have been
+    // bounded at its sender — above the renderer's upload cliff a fresh
+    // handle is skipped for a frame, which reads as the tile blinking.
+    let (pixels, width, height) =
+        shrink_to_budget::<4>(pixels, width as u32, height as u32, TILE_PIXEL_BUDGET);
     Some(TileFrame {
         width,
         height,
@@ -205,21 +253,20 @@ pub(crate) fn camera_thread(
         }
         if camera.is_none() {
             // 640×480 AT ITS HIGHEST FRAME RATE — the size this module has
-            // always documented, and now the size it actually asks for.
-            // `AbsoluteHighestFrameRate` meant "highest frame rate, then the
-            // HIGHEST resolution" (nokhwa-core `types.rs`), so a 720p/1080p
-            // webcam negotiated a mode whose q60 JPEG overruns the mesh's
-            // ~126 KiB `MAX_FRAME_BYTES` — `encode_frame` then returns `None`
-            // and the frame is dropped, preview included — and whose RGBA
-            // (3.7 MB at 720p) is over iced's 2 MiB synchronous-upload cliff.
-            // Both halves of that read as the tile blinking.
-            // ponytail: fixed VGA, no ladder — a camera with no 640×480 mode
-            // refuses to open (surfaced as "live · camera: …"); the upgrade
-            // path is a box-downsample in this loop, before the encode.
-            let requested = RequestedFormat::new::<RgbFormat>(
+            // always documented. `AbsoluteHighestFrameRate` alone meant
+            // "highest frame rate, then the HIGHEST resolution" (nokhwa-core
+            // `types.rs`), so a 720p/1080p webcam negotiated a mode whose q60
+            // JPEG overran the mesh's ~126 KiB `MAX_FRAME_BYTES` and whose
+            // RGBA blew iced's 2 MiB upload cliff — both read as blinking.
+            // A camera with no VGA mode falls back to that same request and
+            // the shrink below brings its frames onto the identical budget.
+            let vga = RequestedFormat::new::<RgbFormat>(
                 RequestedFormatType::HighestResolution(Resolution::new(640, 480)),
             );
-            match nokhwa::Camera::new(CameraIndex::Index(0), requested)
+            let any =
+                RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+            match nokhwa::Camera::new(CameraIndex::Index(0), vga)
+                .or_else(|_| nokhwa::Camera::new(CameraIndex::Index(0), any))
                 .and_then(|mut device| device.open_stream().map(|()| device))
             {
                 Ok(device) => camera = Some(device),
@@ -247,6 +294,8 @@ pub(crate) fn camera_thread(
         };
         let (width, height) = (decoded.width(), decoded.height());
         let rgb = decoded.into_raw();
+        let (rgb, width, height) =
+            shrink_to_budget::<3>(rgb, width, height, CAPTURE_PIXEL_BUDGET);
         let Some(encoded) = encode_frame(&rgb, width as u16, height as u16) else {
             continue;
         };
@@ -322,6 +371,25 @@ mod tests {
             &tile.handle,
             iced::widget::image::Handle::Rgba { pixels, .. } if pixels.len() == 64 * 48 * 4
         ));
+    }
+
+    #[test]
+    fn halving_boxes_pixels_and_respects_the_budget() {
+        // A 2×2 quad averages to its mean pixel.
+        let quad = [0, 0, 0, 40, 40, 40, 80, 80, 80, 120, 120, 120];
+        let (half, w, h) = halve::<3>(&quad, 2, 2);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(half, vec![60, 60, 60]);
+        // An oversized peer frame shrinks by whole halvings until the tile
+        // budget holds — 720p lands at 640×360, under the upload cliff.
+        let (pixels, w, h) =
+            shrink_to_budget::<4>(vec![7; 1280 * 720 * 4], 1280, 720, TILE_PIXEL_BUDGET);
+        assert_eq!((w, h), (640, 360));
+        assert_eq!(pixels.len(), 640 * 360 * 4);
+        assert!(pixels.iter().all(|&byte| byte == 7));
+        // A frame already inside the budget passes through untouched.
+        let (pixels, w, h) = shrink_to_budget::<3>(vec![9; 64 * 48 * 3], 64, 48, CAPTURE_PIXEL_BUDGET);
+        assert_eq!((w, h, pixels.len()), (64, 48, 64 * 48 * 3));
     }
 
     /// One global store, so this stays ONE test — and it carries the blink's
