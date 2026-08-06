@@ -543,32 +543,46 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   if active_channel_archived
                     button "Unarchive channel" disabled=(mutation_phase != "idle") w=fill h=30.0 p=6.0 @secondary_action -> emit(unarchive_channel_submit)
         if active_thread_seq > 0 && !channel_settings_open
-          box w=1.0 h=fill bg=fg/8
-            text ""
-          box w=300.0 h=fill p=12.0 bg=muted_bg
+          box w=1.0 h=fill bg=separator
+            space w=1.0 h=1.0
+          // THE RAIL IS A PANE, NOT A CARD: the artifact's 330px sidebar-toned
+          // plate with a 50px header bar and 16px body insets, mirroring the
+          // details drawer one `if` up — the old 300px muted_bg card with its
+          // own 12px air read as a third surface family.
+          box w=330.0 h=fill bg=sidebar
             stack w=fill h=fill
               sensor show=emit(thread_resized, _, _) resize=emit(thread_resized, _, _)
                 space w=fill h=fill
               mouse press-at=emit(thread_pointer_pressed, _, _)
-                col w=fill h=fill gap=8.0
-                  row w=fill h=28.0 gap=6.0 align=center
-                    if thread_target_seq <= 0
-                      text "Thread" w=fill size=14.0 font=display @text-fg
-                    if thread_target_seq > 0
-                      text "Thread result" w=fill size=14.0 font=display @text-fg
-                    text len(thread_messages) size=12.0 font=code @text-muted
-                    button label="Close thread" disabled=(mutation_phase != "idle") w=28.0 h=28.0 p=0.0 @icon_action -> emit(close_thread)
-                      box w=fill h=fill align-x=center align-y=center
-                        text "×" size=14.0
-                      active bg=transparent text=muted r=7.0
-                      hovered bg=fg/11 text=fg
-                      pressed bg=brand_bg
-                  Separator
+                col w=fill h=fill
+                  // The header carries the CHANNEL as its caption, not a reply
+                  // count — `len(thread_messages)` counts the root too, and the
+                  // honest count now lives in ThreadParentBlock's replies rule.
+                  // "Thread result" stays: it is the only signpost a
+                  // chat-search hit gets.
+                  box w=fill h=50.0 pl=16.0 pr=16.0
+                    row w=fill h=fill gap=7.0 align=center
+                      if thread_target_seq <= 0
+                        text "Thread" size=13.0 wrap=none font=display @text-fg
+                      if thread_target_seq > 0
+                        text "Thread result" size=13.0 wrap=none font=display @text-fg
+                      row gap=2.0 align=center
+                        if empty(active_dm_peer)
+                          text "#" size=11.0 wrap=none @text-caption
+                        text active_channel_name size=11.0 wrap=none @text-caption
+                      space w=fill
+                      button label="Close thread" disabled=(mutation_phase != "idle") w=24.0 h=24.0 p=0.0 @icon_action -> emit(close_thread)
+                        box w=fill h=fill align-x=center align-y=center
+                          text "×" size=14.0
+                        active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+                        hovered bg=fg/10 text=fg
+                        pressed bg=fg/15
+                  box w=fill h=1.0 bg=separator
+                    space w=1.0 h=1.0
                   scroll dir=vertical w=fill h=fill anchor-y=end auto=true
-                    // Same 6px off the scrollbar as the stream — the rail
-                    // draws the same code/quote slabs now, and they hugged
-                    // the right edge without it (#927).
-                    col w=fill gap=1.0 pr=6.0
+                    // The 16px right inset doubles as the scrollbar
+                    // clearance the code/quote slabs needed (#927).
+                    col w=fill gap=3.0 pl=16.0 pr=16.0 pt=12.0 pb=8.0
                       for thread_message in thread_messages
                         // THE ROOT GETS ITS OWN DIVIDED BLOCK. One
                         // loop, one discriminant: `active_thread_seq`
@@ -607,20 +621,30 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           hovered bg=fg/9 text=fg
                           pressed bg=brand_bg
                   if !empty(failed_reply_draft)
-                    row w=fill gap=6.0 align=center
-                      text "Unsent reply" w=fill size=12.5 @text-muted
-                      button "Restore" disabled=(!empty(trim(editor_text(reply_editor)))) h=26.0 p=5.0 @secondary_action -> emit(restore_failed_reply)
-                        active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
-                        hovered bg=fg/14
-                        pressed bg=fg/18
-                      button "×" label="Dismiss unsent reply" w=26.0 h=26.0 p=4.0 @ghost_action -> emit(dismiss_failed_reply)
-                        active bg=transparent text=muted r=7.0
-                        hovered bg=fg/10 text=fg
-                        pressed bg=fg/15
-                  box w=fill p=5.0 bg=transparent border=fg/12 border-w=1.0 r=7.0
-                    row w=fill gap=5.0 align=end
-                      extern rich_composer(reply_editor, "Reply…", (thread_loading || active_channel_archived), shift_held, 44.0, 150.0, 10.0) #reply -> emit(reply_composer_event, _)
-                      button "Send" label="Send reply" disabled=(thread_loading || active_channel_archived || empty(trim(editor_text(reply_editor)))) h=28.0 p=6.0 @primary_action -> emit(reply_composer_event, composer_submit_event())
+                    box w=fill pl=16.0 pr=16.0 pt=8.0
+                      row w=fill gap=6.0 align=center
+                        text "Unsent reply" w=fill size=12.5 @text-muted
+                        button "Restore" disabled=(!empty(trim(editor_text(reply_editor)))) h=26.0 p=5.0 @secondary_action -> emit(restore_failed_reply)
+                          active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
+                          hovered bg=fg/14
+                          pressed bg=fg/18
+                        button "×" label="Dismiss unsent reply" w=26.0 h=26.0 p=4.0 @ghost_action -> emit(dismiss_failed_reply)
+                          active bg=transparent text=muted r=7.0
+                          hovered bg=fg/10 text=fg
+                          pressed bg=fg/15
+                  // The stream's composer plate, in the rail's width: same
+                  // surface/control_line/r12 chrome and the same seat row —
+                  // hint left of Send — minus the format buttons, which the
+                  // 330px plate has no room to teach twice.
+                  box w=fill pl=16.0 pr=16.0 pt=10.0 pb=14.0
+                    box w=fill bg=surface border=control_line border-w=1.0 r=12.0 clip=true shadow=shadow_popover shadow-y=1.0 shadow-blur=2.0
+                      col w=fill
+                        extern rich_composer(reply_editor, "Reply…", (thread_loading || active_channel_archived), shift_held, 44.0, 150.0, 10.0) #reply -> emit(reply_composer_event, _)
+                        box w=fill pl=8.0 pr=8.0 pb=8.0
+                          row w=fill gap=2.0 align=center
+                            space w=fill
+                            text "↵ send · ⇧↵ newline" size=10.5 wrap=none font=code_medium @text-label
+                            button "Send" label="Send reply" disabled=(thread_loading || active_channel_archived || empty(trim(editor_text(reply_editor)))) h=28.0 p=6.0 @primary_action -> emit(reply_composer_event, composer_submit_event())
               overlay when=(thread_selected_seq > 0 && thread_message_action != "toolbar") dismiss=emit(clear_thread_message_selection) backdrop=transparent p=8.0 align-x=end align-y=start
                 content
                   space w=fill h=fill

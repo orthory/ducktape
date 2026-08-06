@@ -1560,7 +1560,14 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(SCREENS.contains("emit(switch_network)"));
     assert!(SCREENS.contains("input \"\" #key-password label=\"Key password\""));
     assert!(SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"));
-    assert!(SCREENS.contains("box w=fill p=5.0 bg=transparent border=fg/12"));
+    // Both chat composers wear the SAME plate now — the rail dropped its old
+    // transparent fg/12 frame for the stream's surface/control_line/r12 chrome.
+    assert_eq!(
+        SCREENS
+            .matches("box w=fill bg=surface border=control_line border-w=1.0 r=12.0 clip=true")
+            .count(),
+        2
+    );
     // the palette card moved into the overlay layer with the rest of the
     // window-level surfaces; the assertion follows the code it guards.
     let overlays = include_str!("ui/screens/overlays.ice");
