@@ -224,6 +224,19 @@ pub fn without_window(
 }
 
 pub async fn hub_state() -> HubState {
+    // Fire-and-forget CLI pre-warm. On macOS the FIRST exec of a freshly
+    // built binary pays Gatekeeper's whole-file assessment — measured 3.2 s
+    // on an M-series mini for the ~1 GB debug `ducktape`, 0.01 s once cached
+    // — and every rebuild mints a new binary, so every `make dev` session's
+    // first unlock (or first signed write) ate it. Spawning the signer here,
+    // while the launch window is still collecting a password, moves that
+    // one-time cost off the user's first click. Errors are irrelevant: if
+    // the binary is missing the real spawn will say so with its own message.
+    let _ = tokio::process::Command::new(ducktape_binary())
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
     let networks = known_networks();
     let forgotten = forgotten_workspaces();
     let hidden = registered_workspaces()
