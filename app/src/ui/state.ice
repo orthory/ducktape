@@ -270,6 +270,11 @@ state
   block_autosave_generation:i64 = 0
   orphaned_comment_drafts:[str] = []
   page_delete_armed = false
+  // Scratch, not a reading: whether the live resync in hand still answers for
+  // the page the app is on. A `let` cannot hold it — a run payload's fields do
+  // not type inside one (E151) — and it has to be computed before `active_page`
+  // moves, so it is a field the handler writes and reads in the same pass.
+  pages_answer_is_current = false
   page_search_draft = ""
   page_search_hits:[PageSearchHit] = []
   page_searching = false

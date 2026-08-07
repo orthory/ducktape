@@ -429,9 +429,17 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     assert!(lifecycle.contains("run live_resync_load(connected_rpc"));
     assert!(lifecycle.contains("run refresh_live_thread(connected_rpc"));
     assert!(lifecycle.contains("parallel\n    run refresh_live_thread("));
+    // Page-scoped state waits for a reply that answers for the page in hand —
+    // a resync issued before a mutation moved the selection speaks for a
+    // document nobody is on.
     assert!(lifecycle.contains(
-        "active_page_title = keep_str(next.pages_loaded, next.active_page_title, active_page_title)"
+        "active_page_title = keep_str(pages_answer_is_current, next.active_page_title, active_page_title)"
     ));
+    assert!(lifecycle.contains(
+        "pages_answer_is_current = next.pages_loaded && pages_reply_answers_current(next.pages, next.active_page, active_page)"
+    ));
+    // The page LIST is never stale — it is the whole index either way.
+    assert!(lifecycle.contains("pages = keep_pages(next.pages_loaded, next.pages, pages)"));
     // A live resync must never install remote text over a buffer the user is
     // still typing in; the buffer and its dirty baseline move on ONE decision.
     assert!(lifecycle.contains("page_editor = refreshed_page_editor("));

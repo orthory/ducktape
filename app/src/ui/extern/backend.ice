@@ -298,6 +298,7 @@ extern crate::backend
   sync keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
   sync keep_roster(joined:bool, next:[HuddleParticipant]) -> [HuddleParticipant]
   sync keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
+  sync pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
   sync keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
   sync keep_str(loaded:bool, next:str, current:str) -> str
   sync keep_bool(loaded:bool, next:bool, current:bool) -> bool

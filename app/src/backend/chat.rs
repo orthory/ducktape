@@ -936,14 +936,34 @@ pub async fn create_page(
             "pages",
             pages::encode_msg(&PageMsg::CreatePage {
                 page_id: page_id.clone(),
-                title,
+                title: title.clone(),
             }),
             password,
         )
         .await?;
-        load_pages_data(&rpc, Some(&page_id))
+        let mut data = load_pages_data(&rpc, Some(&page_id))
             .await
-            .map_err(committed_error)
+            .map_err(committed_error)?;
+        // LAND ON THE PAGE THAT WAS JUST MADE. `submit_frame` returns when the
+        // node ACCEPTS a transaction, not when it applies one, so this reload
+        // reads an index that does not have the new page yet — measured, not
+        // assumed: the reload asked for the new id, was handed the first page
+        // in the list instead, and reported the new id absent from that list.
+        // `load_pages_data` is right to drop an id it cannot see (a live
+        // refresh or a save can legitimately name a page that has since been
+        // deleted, and must follow the fallback). This is the one caller that
+        // KNOWS its id is good, so the correction belongs here: press Enter on
+        // a title and you are on that page, not on whichever one sorts first.
+        // Its body arrives with the next refresh.
+        if data.active_page != page_id {
+            data.active_page = page_id;
+            data.active_page_title = title;
+            data.active_page_parent = String::new();
+            data.blocks = Vec::new();
+            data.comment_thread_total = 0;
+            data.commented_block_ids = Vec::new();
+        }
+        Ok(data)
     }
     .await
 }
