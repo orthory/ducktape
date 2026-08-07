@@ -26,7 +26,22 @@ on forge_open_repo(name)
   forge_item_number = 0
   forge_item_diff = ""
   forge_generation = forge_generation + 1
-  run load_forge_repo(connected_rpc, forge_repo, forge_generation) -> forge_repo_loaded _ | forge_failed _
+  // THE CODE TAB LOADS ITS OWN CONTENT NOW. Opening a repo landed on Code with
+  // an empty file tree and a line reading "Pick Code again to browse this
+  // repository" — the screen asking to be clicked on the tab it was already
+  // showing, because only `select_forge_tab` ever fired the tree read. Same
+  // reset block as that handler, and the two loads go out together.
+  forge_tab = "code"
+  forge_code_generation = forge_code_generation + 1
+  forge_tree_path = ""
+  forge_tree_entries = []
+  forge_file_path = ""
+  forge_file_text = ""
+  forge_file_binary = false
+  forge_file_truncated = false
+  parallel
+    run load_forge_repo(connected_rpc, forge_repo, forge_generation) -> forge_repo_loaded _ | forge_failed _
+    run forge_tree(connected_rpc, forge_repo, "", "", forge_code_generation) -> forge_tree_loaded _ | forge_code_failed _
 
 on forge_repo_loaded(next)
   return if next.generation != forge_generation

@@ -224,6 +224,7 @@ extern crate::backend
   sync forge_repo_row(repos:[ForgeRepo], name:str) -> ForgeRepo
   sync forge_stats(files:i64, additions:i64, deletions:i64) -> str
   DiffLine(kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
+  sync forge_push_command(rpc:str) -> str
   sync diff_lines(diff:str) -> [DiffLine]
   SourceLine(number:str, text:str)
   sync source_lines(text:str) -> [SourceLine]

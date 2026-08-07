@@ -37,6 +37,27 @@ fn the_rail_seats_exactly_the_eight_module_screens() {
 }
 
 #[test]
+fn the_forge_hint_is_a_command_that_actually_pushes() {
+    // Verified end to end against a live node: a push to a NEW lowercase name
+    // creates the repo, and an uppercase one 404s the ref advertisement because
+    // `forge::norm_repo` accepts `[a-z0-9._-]` only — so the placeholder has to
+    // be a name the reader can paste unchanged.
+    let hint = forge_push_command("http://127.0.0.1:38259".into());
+    assert_eq!(
+        hint,
+        "git remote add ducktape http://127.0.0.1:38259/forge/my-repo && git push ducktape main"
+    );
+    let placeholder = hint
+        .split("/forge/")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .expect("the hint names a repo");
+    assert!(forge::norm_repo(placeholder).is_ok());
+    // A trailing slash on the endpoint must not double up in the URL.
+    assert_eq!(forge_push_command("http://127.0.0.1:38259/".into()), hint);
+}
+
+#[test]
 fn the_stored_tab_list_forgets_pages_that_are_gone() {
     let pages = ["welcome", "runbook"]
         .into_iter()

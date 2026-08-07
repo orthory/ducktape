@@ -6,7 +6,7 @@
 // one family, and the guards in main.rs name several of its members verbatim.
 // Everything outside that family drops the redundant `forge_` prefix.
 
-component ForgeScreen(org:str, about:str, tier:str, repos:[ForgeRepo], open_repo:str, repo_menu:bool, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_entries:[TreeEntry], file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], answered:bool, discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, shift_held:bool)
+component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], open_repo:str, repo_menu:bool, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_entries:[TreeEntry], file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], answered:bool, discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, shift_held:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -45,8 +45,44 @@ component ForgeScreen(org:str, about:str, tier:str, repos:[ForgeRepo], open_repo
               about
               repos=len(repos)
               tier
+          // NOT `EmptyPlate`: this screen has no "new repository" button and
+          // never will, because forge IS a git remote — a repo comes into
+          // existence when a push lands on it. Saying only that a repo
+          // "appears here once it is created" and naming no way to create one
+          // is a dead end, so the plate carries the command with this
+          // workspace's own endpoint already in it.
           if empty(repos) && answered
-            EmptyPlate message="No repos — a consensus-backed repo appears here once it is created."
+            box
+              with
+                w=fill
+                p=30.0
+                align-x=center
+                bg=transparent
+                border=border
+                border-w=1.0
+                r=12.0
+              col
+                with
+                  gap=10.0
+                  align=center
+                text "No repos yet. Forge is a git remote — a repo appears when a push lands on it."
+                  with
+                    size=13.0
+                    @text-meta
+                box
+                  with
+                    px=12.0
+                    py=8.0
+                    bg=muted_bg
+                    border=border
+                    border-w=1.0
+                    r=8.0
+                  text forge_push_command(connected_rpc)
+                    with
+                      size=12.0
+                      wrap=word-or-glyph
+                      font=code
+                      @text-accent_fg
           if !empty(repos)
             grid min-cell=380.0 gap=13.0
               for repo in repos
@@ -239,7 +275,11 @@ component ForgeScreen(org:str, about:str, tier:str, repos:[ForgeRepo], open_repo
                             pl=16.0
                             pr=16.0
                             pt=8.0
-                          text "Pick Code again to browse this repository."
+                          // Reached only by an UNBORN repo now that opening one
+                          // loads its tree: a repo with no push on it has no
+                          // files to list, and saying so beats asking the
+                          // reader to click the tab they are already on.
+                          text "Nothing committed on this branch yet."
                             with
                               w=fill
                               size=11.5
