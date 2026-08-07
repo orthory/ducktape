@@ -936,8 +936,12 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         .0;
     // Hover is DRAW-TIME: the `hover` widget reveals the toolbar under the
     // cursor with no enter/exit routes and no hovered state — a cached lazy
-    // row keeps native-latency hover.
-    assert!(toolbar.contains("hover tint=row_hover r=9.0"));
+    // row keeps native-latency hover. `open=menu_open` is the one exception,
+    // and it is the ANCHOR CONTRACT: while the ♡/⋯ card this row opened is
+    // up, the toolbar it hangs off stays, however far the pointer went.
+    assert!(toolbar.contains("hover tint=row_hover r=9.0 open=menu_open"));
+    let stream = inlined(include_str!("ui/screens/chat.ice"));
+    assert!(stream.contains("MessageCard message selected=true menu_open=true"));
     assert!(toolbar.contains("if !message.deleted && !message.pending"));
     assert!(!toolbar.contains("&& hovered"));
     assert!(!toolbar.contains("mouse enter="));
@@ -1088,7 +1092,9 @@ fn thread_messages_mirror_the_main_action_system() {
         .split_once("component ThreadMessageCard")
         .unwrap()
         .1;
-    assert!(card.contains("hover tint=row_hover r=9.0"));
+    // `open=menu_open` is the toolbar's anchor contract: the reveal outlives
+    // the pointer for exactly as long as the card it opened is up.
+    assert!(card.contains("hover tint=row_hover r=9.0 open=menu_open"));
     assert!(
         card.contains(
             "-> emit(open_thread_message_actions, message.seq, message.body, message.rev)"
@@ -1109,7 +1115,13 @@ fn thread_messages_mirror_the_main_action_system() {
     // The rail's settle ✓ is real now: the card takes the fade as a prop and
     // `thread_send_flash_id` anchors it from the screen's flash arm. (`card`
     // starts right after the component name, so the signature is its head.)
-    assert!(card.starts_with("(message:ChatMessage, selected:bool, disabled:bool, flash:f64)"));
+    assert!(card.starts_with(
+        "(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool, flash:f64)"
+    ));
+    // `menu_open` cannot be `selected` here: in the rail `selected` marks the
+    // deep-link TARGET reply, not the row whose action card is open.
+    let chat_screen_rail = inlined(include_str!("ui/screens/chat.ice"));
+    assert!(chat_screen_rail.contains("menu_open=(thread_message.seq == thread_selected_seq)"));
     // No open-thread action from inside a thread you are already reading. The
     // shared contents still declare the event (their reply pill emits it) so
     // the card forwards it, but the rail's toolbar has no seat for it — and a

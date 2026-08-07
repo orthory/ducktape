@@ -588,6 +588,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   with
                                     message
                                     selected=true
+                                    menu_open=true
                                     disabled=loading
                                     flash=0.0
                                   forward
@@ -602,6 +603,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   with
                                     message
                                     selected=false
+                                    menu_open=false
                                     disabled=false
                                     flash=send_flash_value
                                   forward
@@ -617,6 +619,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                     with
                                       message=cached_message
                                       selected=false
+                                      menu_open=false
                                       disabled=false
                                       flash=0.0
                                     forward
@@ -1510,6 +1513,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                             with
                               message=thread_message
                               selected=(thread_message.seq == thread_target_seq)
+                              menu_open=(thread_message.seq == thread_selected_seq)
                               disabled=loading
                               flash=send_flash_value
                             forward
@@ -1523,6 +1527,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                             with
                               message=thread_message
                               selected=(thread_message.seq == thread_target_seq)
+                              menu_open=(thread_message.seq == thread_selected_seq)
                               disabled=loading
                               flash=0.0
                             forward
