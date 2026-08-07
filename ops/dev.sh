@@ -3,7 +3,8 @@
 #
 # Ensures the "demo" workspace exists (first run seeds it via ops/demo-seed.sh;
 # DEV_RESEED=1 forces a fresh seed), starts its node when nothing is serving
-# the workspace's http endpoint, then runs the desktop app in the foreground.
+# the workspace's http endpoint, initializes its forge with ducktape's own
+# repository (ops/dogfood-forge.sh), then runs the desktop app in the foreground.
 # Ctrl-C quits the app and LEAVES THE NODE RUNNING for the next iteration —
 # `make demo-clear` is the teardown.
 set -uo pipefail
@@ -54,6 +55,14 @@ else
   disown "$NODE_PID"
   log "node up (pid $NODE_PID, log $WSDIR/dev-node.log)"
 fi
+
+# The forge module starts empty, so a fresh demo node hosts no repo at all.
+# Seed it with ducktape's own source (the `make dogfood-forge` script, pointed
+# at THIS workspace's node) — idempotent, so later laps just refresh it.
+# Non-fatal: an offline box cannot `git fetch origin`, and the app dev loop
+# should not depend on that.
+DUCKTAPE_DEV_FORGE_URL="$URL" bash "$SCRIPT_DIR/dogfood-forge.sh" ||
+  log "forge init failed — run \`make dogfood-forge\` when origin is reachable"
 
 log "launching the app — Ctrl-C quits the app, the node stays up"
 exec cargo run -p ducktape-app
