@@ -150,11 +150,15 @@ component MemberDetail(member:MemberRow, admin:bool)
                 w=fill
                 pt=16.0
                 gap=8.0
-              // your own row's only action: the key you hand someone to invite you
+              // The attached node's own row: its VALIDATOR key, which is what
+              // an operator hands over to be admitted to a valset. Not "your
+              // key" — the identity that signs what you write is a different
+              // one (Settings calls it YOUR IDENTITY), and this client can be
+              // attached to a node it does not own.
               if member.is_this_node
-                button -> emit(copy_to_clipboard, member.key, "Key copied")
+                button -> emit(copy_to_clipboard, member.key, "Node key copied")
                   with
-                    label="Copy your key"
+                    label="Copy this node's key"
                     w=fill
                     @secondary_action
                     @px-12px
@@ -162,7 +166,7 @@ component MemberDetail(member:MemberRow, admin:bool)
                     @rounded-9px
                   PanelActionLabel
                     with
-                      label="Copy your key"
+                      label="Copy this node's key"
                       tag=""
                       danger=false
               // an agent is paused and resumed by its OWNER, immediately — no ballot
@@ -333,9 +337,15 @@ component MemberFactRow(label:str, value:str)
           wrap=none
           font=code_medium
           @text-meta
+      // `word-or-glyph`, because the value is usually a 64-character hex key
+      // and word wrapping cannot break an unbroken token: the text's minimum
+      // intrinsic width became the whole key, which pushed this card wider
+      // than the 312px panel and let the pane clip cut the key mid-digit at
+      // the window edge. A key you cannot read in full is not a key.
       text value
         with
           w=fill
           size=11.0
+          wrap=word-or-glyph
           font=code_medium
           @text-secondary_fg
