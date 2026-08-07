@@ -1095,6 +1095,19 @@ pub fn source_lines(text: String) -> Vec<SourceLine> {
 
 /// Split a unified patch into painted rows, tracking both line counters
 /// across hunk headers.
+/// The command that makes a repo. Forge IS a git remote — there is no "new
+/// repository" button anywhere, because a repo comes into existence when a push
+/// lands on it. An empty Forge screen that does not say so is a dead end: it
+/// tells the reader a repo "appears here once it is created" and names no way
+/// to create one.
+pub fn forge_push_command(rpc: String) -> String {
+    let endpoint = rpc.trim_end_matches('/');
+    // `my-repo`, not `NAME`: `forge::norm_repo` accepts `[a-z0-9._-]` only, so
+    // an uppercase placeholder pasted verbatim 404s the ref advertisement and
+    // git reports "repository not found" — a hint that teaches the wrong thing.
+    format!("git remote add ducktape {endpoint}/forge/my-repo && git push ducktape main")
+}
+
 pub fn diff_lines(diff: String) -> Vec<DiffLine> {
     let mut rows = Vec::new();
     let mut old_no = 0i64;

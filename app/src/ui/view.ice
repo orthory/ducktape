@@ -352,6 +352,7 @@ view
             with
               org=network_name
               about=account_bio
+              connected_rpc
               tier=member_tier(members_rows)
               repos=forge_repos
               open_repo=forge_repo
