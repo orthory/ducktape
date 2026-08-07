@@ -833,13 +833,20 @@ pub(crate) fn encode_wire(payload: &serde_json::Value) -> Vec<u8> {
 }
 
 /// The first grapheme of a display name, upper-cased, for an avatar plate.
+/// The single-glyph avatar label for a name — EMPTY when there is no name.
+///
+/// It used to fall back to `?`, and the only principal that reaches the
+/// fallback is an account nobody has named yet: its avatar sits in the corner
+/// of the module rail, and a `?` in a circle there does not read as "unnamed",
+/// it reads as HELP. `PrincipalPlate` draws an empty string as a bare plate,
+/// which is what an identity with no name looks like.
 pub fn initial_of(name: impl AsRef<str>) -> String {
     name.as_ref()
         .trim()
         .chars()
         .next()
         .map(|first| first.to_uppercase().to_string())
-        .unwrap_or_else(|| "?".into())
+        .unwrap_or_default()
 }
 
 /// The local user's inbox queue, when a key exists.

@@ -37,6 +37,37 @@ fn the_rail_seats_exactly_the_eight_module_screens() {
 }
 
 #[test]
+fn the_stored_tab_list_forgets_pages_that_are_gone() {
+    let pages = ["welcome", "runbook"]
+        .into_iter()
+        .map(|id| PageItem {
+            id: id.into(),
+            title: String::new(),
+            parent: String::new(),
+            prefix: String::new(),
+            child_count: 0,
+        })
+        .collect::<Vec<_>>();
+    let stored = ["welcome", "deleted-1", "runbook", "deleted-2"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    // `doc_tab_rows` already hides a dead tab when it draws; this is what keeps
+    // the PERSISTED list — and the count Settings reads off it — honest.
+    assert_eq!(
+        doc_tabs_pruned(stored, pages.clone()),
+        ["welcome", "runbook"]
+    );
+    assert!(doc_tabs_pruned(Vec::new(), pages).is_empty());
+
+    // An unnamed principal gets a bare plate, never a `?` — that glyph in the
+    // rail's corner reads as HELP, not as "nobody has named this account".
+    assert_eq!(initial_of(""), "");
+    assert_eq!(initial_of("   "), "");
+    assert_eq!(initial_of("quackbot"), "Q");
+}
+
+#[test]
 fn a_stale_pages_reply_does_not_move_the_reader() {
     let listed = |ids: &[&str]| {
         ids.iter()

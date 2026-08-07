@@ -165,6 +165,7 @@ extern crate::backend
   sync height_label(height:i64) -> str
   sync height_label_short(height:i64) -> str
   sync height_ago(then_height:i64, now_height:i64) -> str
+  sync doc_tabs_pruned(tabs:[str], pages:[PageItem]) -> [str]
   sync initial_of(name:str) -> str
   sync initials_of(name:str) -> str
   NodeLogLine(cursor:str, line:str)
