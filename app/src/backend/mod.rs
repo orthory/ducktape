@@ -203,7 +203,7 @@ pub struct PagesData {
     pub comment_thread_total: i64,
     /// The block ids carrying at least one unresolved thread, for the
     /// commented-line washes in the document.
-    pub commented_block_ids: Vec<String>,
+    pub commented_block_hits: Vec<String>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -298,7 +298,7 @@ pub struct WorkspaceData {
     pub active_page_title: String,
     pub active_page_parent: String,
     pub comment_thread_total: i64,
-    pub commented_block_ids: Vec<String>,
+    pub commented_block_hits: Vec<String>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]

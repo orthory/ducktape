@@ -179,12 +179,19 @@ pub fn page_opens_comments(event: PageEvent) -> bool {
 /// The first line of each commented run — where a margin badge sits.
 // ponytail: two ADJACENT commented blocks merge into one run and share one
 // badge; split on block spans if that ever reads wrong.
-fn comment_marks(commented: &[i64]) -> Vec<usize> {
+/// One chip per commented block, carrying HOW MANY threads sit on it.
+///
+/// `hits` holds the target of every unresolved thread, repeats and all (see
+/// `backend::load::commented_targets`), so counting a block's entries IS its
+/// thread count. The chip rides the block's FIRST line: a block can wrap over
+/// several document lines and one plate per visual row would be a column of
+/// identical badges down the margin.
+fn comment_marks(blocks: &[crate::backend::PageBlock], hits: &[String]) -> Vec<(usize, usize)> {
     let mut marks = Vec::new();
-    for (index, &line) in commented.iter().enumerate() {
-        let run_start = index == 0 || commented[index - 1] != line - 1;
-        if run_start && line >= 0 {
-            marks.push(line as usize);
+    for (id, start, _len) in sync::line_spans(blocks) {
+        let count = hits.iter().filter(|hit| *hit == &id).count();
+        if count > 0 {
+            marks.push((start, count));
         }
     }
     marks
@@ -202,10 +209,12 @@ pub fn page_document(
     document: &Content,
     dark: bool,
     disabled: bool,
-    commented: Vec<i64>,
+    blocks: Vec<crate::backend::PageBlock>,
+    hits: Vec<String>,
 ) -> Element<'_, PageEvent> {
     let cursor = document.cursor().position;
-    let marks = comment_marks(&commented);
+    let commented = commented_lines(blocks.clone(), hits.clone());
+    let marks = comment_marks(&blocks, &hits);
     let editor = RichTextEditor::new(document, content_version(document))
         .id("page-document")
         .placeholder("Write something… `#` for a heading, `-` for a list")
@@ -1018,10 +1027,45 @@ mod tests {
         assert_eq!(block_at_line_target(blocks, 0), "");
     }
 
+    /// THE CHIP CARRIES ITS COUNT, AND THE COUNT IS THE REPETITION IN `hits`.
+    /// Both folds that build `hits` used to `dedup()`, so the number was thrown
+    /// away three layers before the chip that needed it and every commented
+    /// line drew the same three dots.
     #[test]
-    fn margin_badges_sit_on_the_first_line_of_each_commented_run() {
-        assert_eq!(comment_marks(&[2, 3, 4, 5, 9]), vec![2, 9]);
-        assert_eq!(comment_marks(&[]), Vec::<usize>::new());
+    fn margin_badges_sit_on_the_first_line_of_a_block_and_count_its_threads() {
+        let block = |kind: &str, text: &str| crate::backend::PageBlock {
+            key: 0,
+            id: text.into(),
+            parent: String::new(),
+            kind: kind.into(),
+            text: text.into(),
+            pending: false,
+            checked: false,
+            prefix: String::new(),
+            child_count: 0,
+        };
+        // `para` is line 1; the code block owns lines 2..=5 (fence, two body
+        // lines, fence) and its chip rides line 2, not one per wrapped row.
+        let blocks = vec![block("Text", "para"), block("Code", "a\nb")];
+        let hits = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+
+        assert_eq!(
+            comment_marks(&blocks, &hits(&["para", "a\nb"])),
+            vec![(1, 1), (2, 1)],
+            "one thread each"
+        );
+        // Three threads on the code block, one on the paragraph.
+        assert_eq!(
+            comment_marks(&blocks, &hits(&["a\nb", "para", "a\nb", "a\nb"])),
+            vec![(1, 1), (2, 3)],
+            "the repetition IS the count"
+        );
+        // A block nobody commented on gets no chip at all.
+        assert_eq!(comment_marks(&blocks, &hits(&["para"])), vec![(1, 1)]);
+        assert_eq!(comment_marks(&blocks, &[]), Vec::new());
+        // A hit naming a block that is gone marks nothing.
+        assert_eq!(comment_marks(&blocks, &hits(&["deleted"])), Vec::new());
+
         assert!(page_opens_comments(PageEvent::OpenComments));
         assert!(!page_opens_comments(PageEvent::OpenLink("x".into())));
     }

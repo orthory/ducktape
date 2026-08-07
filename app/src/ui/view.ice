@@ -262,7 +262,7 @@ view
               page_refusal
               doc_tabs
               blocks
-              commented_block_ids
+              commented_block_hits
               caret_comment_target
               active_thread_target
               orphaned_comment_drafts

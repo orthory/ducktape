@@ -282,7 +282,7 @@ pub struct LiveRefresh {
     pub active_page_title: String,
     pub active_page_parent: String,
     pub comment_thread_total: i64,
-    pub commented_block_ids: Vec<String>,
+    pub commented_block_hits: Vec<String>,
 }
 
 /// `planes` is `chat` | `pages` | `both` — the flat Ice surface's
@@ -323,7 +323,7 @@ pub async fn live_resync_load(
             active_page_title: String::new(),
             active_page_parent: String::new(),
             comment_thread_total: 0,
-            commented_block_ids: Vec::new(),
+            commented_block_hits: Vec::new(),
         };
         let load_chat = planes == "chat" || planes == "both";
         let load_pages = planes == "pages" || planes == "both";
@@ -373,7 +373,7 @@ pub async fn live_resync_load(
             refresh.active_page_title = pages.active_page_title;
             refresh.active_page_parent = pages.active_page_parent;
             refresh.comment_thread_total = pages.comment_thread_total;
-            refresh.commented_block_ids = pages.commented_block_ids;
+            refresh.commented_block_hits = pages.commented_block_hits;
         }
         Ok(refresh)
     }

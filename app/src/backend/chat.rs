@@ -965,7 +965,7 @@ pub async fn create_page(
             data.active_page_parent = String::new();
             data.blocks = Vec::new();
             data.comment_thread_total = 0;
-            data.commented_block_ids = Vec::new();
+            data.commented_block_hits = Vec::new();
         }
         Ok(data)
     }
@@ -1011,7 +1011,7 @@ pub async fn delete_page(
             data.active_page_parent = String::new();
             data.blocks = Vec::new();
             data.comment_thread_total = 0;
-            data.commented_block_ids = Vec::new();
+            data.commented_block_hits = Vec::new();
         }
         Ok(data)
     }

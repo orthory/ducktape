@@ -419,8 +419,9 @@ pub fn commented_targets_of(threads: Vec<PageCommentThread>, page_id: String) ->
         .filter(|thread| !thread.resolved && thread.target != page_id)
         .map(|thread| thread.target)
         .collect();
+    // NOT deduplicated — see `load::commented_targets`. The repetition is the
+    // per-line thread count the margin chip spells.
     targets.sort();
-    targets.dedup();
     targets
 }
 
