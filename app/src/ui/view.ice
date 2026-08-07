@@ -75,6 +75,7 @@ view
           account=account_name
           agent_live=any_agent_active(agents_rows)
           tier=member_tier(members_rows)
+          answered=members_answered
           root_hash=node_root_hash
           consensus_view=node_view_label
           quorum=node_quorum_label
@@ -438,6 +439,7 @@ view
               settings_key_path
               settings_open_tabs
               members_rows
+              members_answered
               members_validators
               members_residents
               account_id

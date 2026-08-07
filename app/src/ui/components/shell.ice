@@ -150,7 +150,7 @@ component StatusPill(degraded:bool, loading:bool)
 // no state field holds them) and the 26-bar sparkline (it needs the newest 26
 // of a 100-block window with a clamped bar height, and neither a slice nor a
 // clamp exists as a helper). Both are named in the handoff report.
-component StatusCard(degraded:bool, loading:bool, height:i64, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
+component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
   box #root
     with
       w=284.0
@@ -198,12 +198,28 @@ component StatusCard(degraded:bool, loading:bool, height:i64, tier:str, root_has
               font=display
               @text-primary
         space w=fill
-        text tier
-          with
-            size=10.5
-            wrap=none
-            font=code_medium
-            @text-meta
+        // Same empty answer Settings guards on: an empty tier is not a
+        // standing, it is the roster not having answered — say so instead of
+        // leaving the slot blank. But `answered` is what separates the two
+        // readings an empty tier collapses: the roster load is kicked off at
+        // the END of hydration, AFTER `loading` goes false, so on every cold
+        // start there is a window where nothing has answered yet. Alarming
+        // through it made "standing unknown" the normal boot state and cost
+        // the words their meaning.
+        if !empty(tier)
+          text tier
+            with
+              size=10.5
+              wrap=none
+              font=code_medium
+              @text-meta
+        if empty(tier) && answered
+          text "standing unknown"
+            with
+              size=10.5
+              wrap=none
+              font=code_medium
+              @text-meta
       text height_label(height)
         with
           size=14.0
@@ -309,7 +325,7 @@ component StatusCard(degraded:bool, loading:bool, height:i64, tier:str, root_has
             w=fill
             gap=14.0
             align=center
-          text "duckfs gc"
+          text "checkpoint"
             with
               size=10.5
               wrap=none
@@ -398,7 +414,7 @@ component BellBadge(count:i64, sev:str, plate:f64)
 // 40px: a 39px bar over its 1px rule. This bar exists only in the console
 // window — the launch window wears the OS's own chrome — so the chip and the
 // right cluster are unconditional now.
-component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
+component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
   emits
     toggle_bell
     switch_network
@@ -445,6 +461,7 @@ component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_ba
                 with
                   degraded
                   loading
+                  answered
                   height
                   tier
                   root_hash
@@ -818,7 +835,7 @@ component ScreenHeader(title:str, meta:str)
         bg=separator
       space w=1.0 h=1.0
 
-component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
+component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
   emits
     select_shell_tab(str)
     toggle_bell
@@ -841,6 +858,7 @@ component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degra
             bell_badge=bell_count
             bell_sev
             tier
+            answered
             root_hash
             consensus_view
             quorum

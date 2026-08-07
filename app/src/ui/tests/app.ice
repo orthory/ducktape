@@ -54,6 +54,7 @@ test palette_escape_contract
         account=""
         agent_live=false
         tier="validator"
+        answered=true
         root_hash=""
         consensus_view="—"
         quorum="—"
@@ -183,6 +184,7 @@ test minimum_window_layout_contract
         account=""
         agent_live=false
         tier="validator"
+        answered=true
         root_hash=""
         consensus_view="—"
         quorum="—"

@@ -332,7 +332,7 @@ on onboarding_invite_minted(blob)
 
 on copy_onboarding_invite
   return if empty(invite_link)
-  toast = "Invite link copied"
+  toast = "Invite copied"
   toast_tone = "info"
   toast_age = 0
   task clipboard write invite_link

@@ -1202,7 +1202,7 @@ component LiveScreen(name:str, invite:str, height:i64, peers_live:i64, peers_tot
             @px-0px
             @py-9px
             @rounded-9px
-          text "Copy link"
+          text "Copy invite"
             with
               w=fill
               size=12.0
@@ -1211,7 +1211,13 @@ component LiveScreen(name:str, invite:str, height:i64, peers_live:i64, peers_tot
               font=display
               @text-primary_fg
     box w=fill pt=14.0
-      text "Only a device holding this invite can join, and a member still has to approve it."
+      // The blob IS the admission decision: minting signs a single-use bearer token
+      // that whoever redeems it first spends automatically through the join gate —
+      // no member approval follows, so promising one made a forwardable credential
+      // read as gated. The window is the other half of the terms: the handler mints
+      // with `mint_invite(.., 7)` and the TTL is signed INSIDE the blob, so a holder
+      // on day 8 is refused with nothing here left to re-open it.
+      text "Whoever holds this invite can join — it is single-use and expires 7 days from minting, so send it to one device."
         with
           w=fill
           size=12.0
@@ -1442,7 +1448,7 @@ component JoinScreen(busy:bool, error:str)
           JoinPhaseRow
             with
               phase_name="parked"
-              note="waits until a member approves this device"
+              note="waits for the invite to be redeemed through the join gate"
               tone="next"
           JoinPhaseRow
             with

@@ -1577,7 +1577,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     let shell = inlined(include_str!("ui/components/shell.ice"));
     // the shell is titlebar + optional degradation banner over the panes.
     assert!(shell.contains(
-        "component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)"
+        "component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)"
     ));
     // The bar exists only in the console window now — the launch window
     // wears OS chrome — so the chip and the status/bell cluster are

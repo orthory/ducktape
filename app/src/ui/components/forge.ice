@@ -84,18 +84,22 @@ component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str)
             wrap=none
             font=code_medium
             @text-meta
-        text "·"
-          with
-            size=10.5
-            wrap=none
-            font=code_medium
-            @text-meta
-        text tier
-          with
-            size=10.5
-            wrap=none
-            font=code_medium
-            @text-meta
+        // An empty tier is the roster not having answered, not a standing.
+        // The separator goes with it — kept alone it dangles off the repo
+        // count with nothing behind it.
+        if !empty(tier)
+          text "·"
+            with
+              size=10.5
+              wrap=none
+              font=code_medium
+              @text-meta
+          text tier
+            with
+              size=10.5
+              wrap=none
+              font=code_medium
+              @text-meta
     if !empty(about)
       box w=fill max-w=680.0
         text about

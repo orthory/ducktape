@@ -61,10 +61,11 @@ component NodeBuildRow(version:str, last:bool)
 //
 // The `_` arm is NOT a guest card. Anything that is not one of the three
 // standings means we do not know this node's, so the card says so rather than
-// telling a validator's operator they are a read-only guest. NOTE: today
-// `member_tier` folds "no row for this node" into `"guest"`, so an unanswered
-// roster still lands on the guest card; it must answer `""` for an unmatched
-// roster for this arm to catch the case it exists for.
+// telling a validator's operator they are a read-only guest. `member_tier`
+// answers `""` for a roster that has not answered at all — `load_members` is
+// one of thirteen parallel loads and can be the only one that fails — and that
+// is what lands here. A roster that DID answer and holds no row for this node
+// is a real guest, and still lands on the guest card.
 component NodeAccessCard(tier:str, admin:bool)
   col #root w=fill gap=9.0
     GroupLabel label="YOUR ACCESS"
