@@ -2,16 +2,33 @@ on search_pages_submit
   return if page_searching || empty(trim(page_search_draft))
   page_searching = true
   page_search_hits = []
+  // The query the zero-hit plate will speak for, captured at the last place
+  // the draft and the sent string are known to match — the full rationale
+  // lives on the plate arm in `screens/pages.ice`.
+  page_search_query = trim(page_search_draft)
   error = ""
-  run replace lane=page_search search_pages(connected_rpc, "", trim(page_search_draft)) -> page_search_loaded _ | page_search_failed _
+  run replace lane=page_search search_pages(connected_rpc, "", page_search_query) -> page_search_loaded _ | page_search_failed _
 
+// AN EMPTY QUERY MEANS NO SEARCH IS STANDING — every dismissal path clears
+// `page_search_query`, so this guard is the install decision for a reply the
+// dismissal could not invalidate: `close_doc_tab` rides an active/background
+// decision a lane invalidate cannot ride, and without the guard its late
+// reply restored the hits float over the tab just landed on and clobbered
+// `error` (or, on the failure route, raised a banner for a search nobody is
+// waiting on).
 on page_search_loaded(next)
+  return if empty(page_search_query)
   page_search_hits = next.hits
   page_searching = false
   error = ""
 
 on page_search_failed(cause)
+  return if empty(page_search_query)
   page_searching = false
+  // A FAILED SEARCH FOUND NOTHING BECAUSE IT NEVER RAN. Dropping the query
+  // takes the plate down; `error` carries the cause to the console column's
+  // banner (nothing sits over it here — unlike the palette, see its arm).
+  page_search_query = ""
   error = cause.message
 
 on clear_page_search
@@ -19,6 +36,7 @@ on clear_page_search
   page_search_draft = ""
   page_search_hits = []
   page_searching = false
+  page_search_query = ""
 
 on open_page_search_hit(page_id, _block_id)
   return if loading || mutation_phase != MutationPhase.idle
@@ -37,6 +55,7 @@ on open_page_search_hit(page_id, _block_id)
   hydration_retry_attempt = 0
   loading = true
   page_search_hits = []
+  page_search_query = ""
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -90,6 +109,7 @@ on choose_page(id)
   hydration_retry_attempt = 0
   loading = true
   page_search_hits = []
+  page_search_query = ""
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -439,6 +459,22 @@ on pages_updated(next)
   run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 on pages_mutated(next)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
+  // A create/delete moves the selection to another page — a navigation, so the
+  // search answer is dismissed with it, hits included, and the lane is
+  // invalidated so a reply in flight cannot put them back. A DISMISSAL POLICY,
+  // not a truth requirement: page search passes an EMPTY scope and is
+  // workspace-wide, so the answer would still be true here. The reason to drop
+  // it is that a card left floating over the page you just landed on is in the
+  // way. NOT hoisted into `pages_updated`: that also fires on a plain same-page
+  // refresh, which would clear a standing search you are still reading.
+  invalidate lane=page_search
+  // THE INVALIDATE MUST LOWER THE FLAG WITH IT: the dropped reply was the only
+  // thing that would ever clear `page_searching`, and the input is
+  // `disabled=(!connected || page_searching)` — the field would stay dead with
+  // no spinner and no explanation.
+  page_searching = false
+  page_search_hits = []
+  page_search_query = ""
   invalidate lane=page_autosave
   pages = next.pages
   // The same one-decision install as `pages_updated` — create/delete moves
@@ -499,6 +535,19 @@ on doc_tabs_loaded(tabs)
 
 on close_doc_tab(id)
   return if loading || mutation_phase != MutationPhase.idle
+  // THE SAME DECISION `next_doc_tab` MAKES, read here before `active_page`
+  // moves under it: that function returns `active` UNCHANGED when the closed
+  // tab is not the active one, so closing a BACKGROUND tab navigates nowhere
+  // and an unconditional dismissal would take down a search answer the user is
+  // still reading. Only the closure that actually moves the selection is a
+  // navigation, and only it dismisses. A lane invalidate cannot ride a
+  // decision, so a reply already in flight is dropped on ARRIVAL instead: both
+  // reply handlers return early on an empty `page_search_query`, and the
+  // active-close empties it below.
+  let closing_active = id == active_page
+  page_searching = keep_bool(closing_active, false, page_searching)
+  page_search_hits = keep_page_hits(closing_active, [], page_search_hits)
+  page_search_query = keep_str(closing_active, "", page_search_query)
   active_page = next_doc_tab(doc_tabs, id, active_page)
   block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
   active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)

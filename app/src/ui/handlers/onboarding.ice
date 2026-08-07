@@ -305,6 +305,16 @@ on console_opened(id)
   page_search_draft = ""
   page_search_hits = []
   page_searching = false
+  page_search_query = ""
+  // The palette's readings name the network being left too: hits from the
+  // previous network are live, clickable rows that would render — and route —
+  // on the new one if the palette is up. Scrubbed like its chat and pages
+  // siblings; the open flag is not touched, matching this handler's doctrine
+  // of resetting readings rather than closing surfaces.
+  palette_draft = ""
+  palette_chat_hits = []
+  palette_page_hits = []
+  palette_search_phase = SearchPhase.idle
   // Forge's open repo, tracker item, code reading and drafts all name
   // the network being left. The new endpoint may even have the same repo/item
   // names, so identity strings cannot make any of these safe to retain.

@@ -312,7 +312,12 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               active bg=surface value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
               hovered bg=muted_bg border=control_line
               disabled bg=transparent value=muted
-            if search_phase != SearchPhase.idle
+            // THE FLOAT'S GATE, OR THE FIELD'S: phase alone left un-clearable
+            // text on every path that parks idle with a draft standing —
+            // `chat_search_failed`, the picker dismissals, `channel_created`.
+            // The button clears both the float and the field, so either
+            // earns it.
+            if search_phase != SearchPhase.idle || !empty(trim(search_draft))
               button -> emit(clear_chat_search)
                 with
                   label="Clear message search"

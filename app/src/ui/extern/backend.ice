@@ -351,6 +351,7 @@ extern crate::backend
   pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
   pure keep_roster(joined:bool, next:[HuddleParticipant]) -> [HuddleParticipant]
   pure keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
+  pure keep_page_hits(loaded:bool, next:[PageSearchHit], current:[PageSearchHit]) -> [PageSearchHit]
   pure pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
   pure keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
   pure apply_page_text(blocks:[PageBlock], delta:PagesDelta) -> [PageBlock]

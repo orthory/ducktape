@@ -669,6 +669,18 @@ on channel_created(next)
   // Superseded by a later switch — see `chat_updated`. The mutation still
   // committed; the live stream owns whatever room the reader chose instead.
   return if next.generation != chat_generation
+  // A CREATE LANDS YOU IN THE NEW CHANNEL — a navigation, and arriving
+  // somewhere new DISMISSES the search answer, exactly the way `choose_channel`
+  // and `choose_dm` already do: the lane invalidate drops a reply in flight
+  // (which was the only thing that would ever move the phase again), and the
+  // phase goes idle with it. A policy, not a truth claim — the search is
+  // workspace-wide, so its answer stays true in the new room; the reason to
+  // drop it is that the float is in the way. NOT hoisted into `chat_updated`:
+  // that also fires on a plain same-room refresh, which would clear a standing
+  // search you are still reading.
+  invalidate lane=chat_search
+  chat_search_phase = SearchPhase.idle
+  chat_search_hits = []
   // A brand-new channel's latest page IS the whole channel — see
   // `chat_hit_loaded`.
   history_view = false
