@@ -513,114 +513,93 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   sensor show=emit(chat_resized, _, _) resize=emit(chat_resized, _, _)
                     space w=fill h=fill
                   mouse press-at=emit(chat_pointer_pressed, _, _)
-                    scroll
-                      with
-                        dir=vertical
-                        w=fill
-                        h=fill
-                        anchor-y=end
-                        auto=true
-                      col
+                    // A CONVERSATION GROWS UP FROM THE COMPOSER. `anchor-y=end`
+                    // pins the scroll OFFSET, which does nothing until there is
+                    // something to scroll — a channel with four messages in it
+                    // left them stranded at the top of an 800px column with
+                    // 350px of dead background between the last one and the
+                    // composer. `h=shrink` lets the scrollable take only the
+                    // height its content needs (still capped by the box's
+                    // limits, so a long timeline scrolls exactly as before) and
+                    // `align-y=end` drops that block onto the composer.
+                    box w=fill h=fill align-y=end
+                      scroll
                         with
+                          dir=vertical
                           w=fill
-                          gap=3.0
-                          pr=6.0
-                        if has_older_history
-                          box
-                            with
-                              w=fill
-                              align-x=center
-                              pt=4.0
-                              pb=8.0
-                            button "Load older messages" -> emit(load_more_history)
+                          h=shrink
+                          anchor-y=end
+                          auto=true
+                        col
+                          with
+                            w=fill
+                            gap=3.0
+                            pr=6.0
+                          if has_older_history
+                            box
                               with
-                                disabled=(history_loading || mutation_phase != "idle")
-                                h=30.0
-                                p=6.0
-                                @secondary_action
-                              active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=8.0
-                              hovered bg=fg/10 text=fg border=fg/14
-                              pressed bg=fg/14 text=fg
-                        for message in messages
-                          col w=fill gap=0.0
-                            if unread_boundary > 0 && message.seq == unread_marker_seq
-                              row
+                                w=fill
+                                align-x=center
+                                pt=4.0
+                                pb=8.0
+                              button "Load older messages" -> emit(load_more_history)
                                 with
-                                  w=fill
-                                  gap=8.0
-                                  align=center
-                                  pt=8.0
-                                  pb=2.0
-                                box
+                                  disabled=(history_loading || mutation_phase != "idle")
+                                  h=30.0
+                                  p=6.0
+                                  @secondary_action
+                                active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=8.0
+                                hovered bg=fg/10 text=fg border=fg/14
+                                pressed bg=fg/14 text=fg
+                          for message in messages
+                            col w=fill gap=0.0
+                              if unread_boundary > 0 && message.seq == unread_marker_seq
+                                row
                                   with
                                     w=fill
-                                    h=1.0
-                                    bg=brand/40
-                                  text ""
-                                text "New messages"
-                                  with
-                                    size=12.5
-                                    wrap=none
-                                    @text-brand
-                                box
-                                  with
-                                    w=fill
-                                    h=1.0
-                                    bg=brand/40
-                                  text ""
-                            // LAZY OFF THE HOT PATH. A quiet row rebuilds
-                            // only when its MESSAGE changes; ONLY the selected
-                            // row is built live, because its card reads the
-                            // selection. Hover costs no arm at all now — the
-                            // toolbar reveal is the `hover` widget's draw-time
-                            // check inside MessageCard, so a cached row keeps
-                            // it at native latency.
-                            //
-                            // A message in flight LOOKS like a message: no
-                            // dashed frame, no restyle — send-state lives in
-                            // MessageContents' right-edge lane (pending dot,
-                            // then the settle ✓ fading out). The flash arm is
-                            // the one live mount that carries the animated
-                            // opacity; every other unselected row stays lazy.
-                            if message.seq == selected_message_seq
-                              stack #message(message.id) w=fill
-                                MessageCard
-                                  with
-                                    message
-                                    selected=true
-                                    menu_open=true
-                                    disabled=loading
-                                    flash=0.0
-                                  forward
-                                    add_reaction_at
-                                    remove_reaction_at
-                                    open_thread_for
-                                    open_message_reactions
-                                    open_message_actions
-                            if message.seq != selected_message_seq && message.id == send_flash_id
-                              stack #message(message.id) w=fill
-                                MessageCard
-                                  with
-                                    message
-                                    selected=false
-                                    menu_open=false
-                                    disabled=false
-                                    flash=send_flash_value
-                                  forward
-                                    add_reaction_at
-                                    remove_reaction_at
-                                    open_thread_for
-                                    open_message_reactions
-                                    open_message_actions
-                            if message.seq != selected_message_seq && message.id != send_flash_id
-                              lazy message as cached_message
-                                stack #message(cached_message.id) w=fill
+                                    gap=8.0
+                                    align=center
+                                    pt=8.0
+                                    pb=2.0
+                                  box
+                                    with
+                                      w=fill
+                                      h=1.0
+                                      bg=brand/40
+                                    text ""
+                                  text "New messages"
+                                    with
+                                      size=12.5
+                                      wrap=none
+                                      @text-brand
+                                  box
+                                    with
+                                      w=fill
+                                      h=1.0
+                                      bg=brand/40
+                                    text ""
+                              // LAZY OFF THE HOT PATH. A quiet row rebuilds
+                              // only when its MESSAGE changes; ONLY the selected
+                              // row is built live, because its card reads the
+                              // selection. Hover costs no arm at all now — the
+                              // toolbar reveal is the `hover` widget's draw-time
+                              // check inside MessageCard, so a cached row keeps
+                              // it at native latency.
+                              //
+                              // A message in flight LOOKS like a message: no
+                              // dashed frame, no restyle — send-state lives in
+                              // MessageContents' right-edge lane (pending dot,
+                              // then the settle ✓ fading out). The flash arm is
+                              // the one live mount that carries the animated
+                              // opacity; every other unselected row stays lazy.
+                              if message.seq == selected_message_seq
+                                stack #message(message.id) w=fill
                                   MessageCard
                                     with
-                                      message=cached_message
-                                      selected=false
-                                      menu_open=false
-                                      disabled=false
+                                      message
+                                      selected=true
+                                      menu_open=true
+                                      disabled=loading
                                       flash=0.0
                                     forward
                                       add_reaction_at
@@ -628,6 +607,37 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                       open_thread_for
                                       open_message_reactions
                                       open_message_actions
+                              if message.seq != selected_message_seq && message.id == send_flash_id
+                                stack #message(message.id) w=fill
+                                  MessageCard
+                                    with
+                                      message
+                                      selected=false
+                                      menu_open=false
+                                      disabled=false
+                                      flash=send_flash_value
+                                    forward
+                                      add_reaction_at
+                                      remove_reaction_at
+                                      open_thread_for
+                                      open_message_reactions
+                                      open_message_actions
+                              if message.seq != selected_message_seq && message.id != send_flash_id
+                                lazy message as cached_message
+                                  stack #message(cached_message.id) w=fill
+                                    MessageCard
+                                      with
+                                        message=cached_message
+                                        selected=false
+                                        menu_open=false
+                                        disabled=false
+                                        flash=0.0
+                                      forward
+                                        add_reaction_at
+                                        remove_reaction_at
+                                        open_thread_for
+                                        open_message_reactions
+                                        open_message_actions
                   overlay
                     with
                       when=(selected_message_seq > 0 && message_action != "toolbar")
@@ -1487,6 +1497,12 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       h=1.0
                       bg=separator
                     space w=1.0 h=1.0
+                  // STAYS TOP-ANCHORED, unlike the channel timeline. A thread
+                  // is read from its ROOT down; pushing a short thread to the
+                  // bottom of the rail would strand the message it is about in
+                  // the middle of the pane with dead space above it. A channel
+                  // is a running feed anchored at now, which is why that one
+                  // grows up from its composer and this one does not.
                   scroll
                     with
                       dir=vertical
