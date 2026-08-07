@@ -183,7 +183,7 @@ component PageCommentThreadButton(thread:PageCommentThread, anchor:str)
           size=12.0
           line-h=1.55
           wrap=word
-          @text-panel_tile
+          @text-accent_fg
     active bg=surface text=fg border=card_line border-w=1.0 r=11.0
     hovered bg=card_wash_hover text=fg border=control_line
     pressed bg=card_wash text=fg border=control_line
@@ -232,4 +232,4 @@ component PageCommentCard(comment:PageComment)
           size=12.0
           line-h=1.55
           wrap=word
-          @text-panel_tile
+          @text-accent_fg

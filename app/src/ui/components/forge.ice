@@ -1598,7 +1598,7 @@ component DiffRow(line:DiffLine)
                   size=12.0
                   wrap=none
                   font=code
-                  @text-panel_tile
+                  @text-accent_fg
             box
               with
                 w=fill
@@ -1611,7 +1611,7 @@ component DiffRow(line:DiffLine)
                   size=12.0
                   wrap=none
                   font=code
-                  @text-panel_tile
+                  @text-accent_fg
 
 // ── REVIEWS ───────────────────────────────────────────────────────────────
 
@@ -1708,7 +1708,7 @@ component ReviewCard(review:ForgeReview)
                 w=fill
                 size=12.0
                 line-h=1.55
-                @text-panel_tile
+                @text-accent_fg
 
 // The verdict in its own tone: approval is the success ink, a change request is
 // the refusal ink, a comment is neither.
