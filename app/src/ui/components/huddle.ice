@@ -229,86 +229,96 @@ component HuddleDockedPill(channel:str, elapsed:str)
       hovered bg=ink_hover text=toast_fg
       pressed bg=ink_hover text=toast_fg
 
-// ONE PARTICIPANT, on the dark panel. The human/agent shape rule holds — circle
-// vs rounded square — but the plates are the panel's own dark steps, not the
-// paper avatar tokens, so `PrincipalAvatar` is deliberately not reused here.
-// The width is fixed so exactly two tiles fit the panel's wrapping row: the
-// huddle window's 300px minimum less its 13px insets leaves 274, and
-// 128 + 8 + 128 is 264.
+// ONE PARTICIPANT. The human/agent shape rule — circle vs rounded square — is
+// `PrincipalAvatar`'s, and this file reuses it now that the panel is a normal
+// themed surface rather than a dark plate: the hand-drawn 34px steps this
+// component used to carry were the SAME two shapes in the panel's own inks,
+// and a second copy of a shape rule is a second thing to keep in step.
+//
+// NO FIXED WIDTH. The tile fills its grid cell and the panel's
+// `grid min-cell=` owns the column count, so one roster renders 2 tiles at the
+// window's 320px minimum and 3-4 on a widened window instead of stranding
+// 400px of background beside a 128px card.
 component HuddleTile(person:HuddleParticipant, muted:bool)
+  // `h=fill` + `align-y=center` because the grid gives every cell the same
+  // SQUARE box: without them the avatar/name pair clings to the top edge and
+  // each tile carries a third of itself as empty plate.
   box #root
     with
-      w=128.0
+      w=fill
+      h=fill
       pl=8.0
       pr=8.0
       pt=12.0
       pb=12.0
-      bg=ink_hover
+      align-y=center
+      bg=elevated
+      border=card_line
+      border-w=1.0
       r=11.0
     col
       with
         w=fill
-        gap=6.0
+        gap=7.0
         align=center
-      if person.is_agent
-        box
-          with
-            w=34.0
-            h=34.0
-            align-x=center
-            align-y=center
-            bg=accent_fg
-            r=10.0
-          text person.initials
-            with
-              size=11.0
-              wrap=none
-              font=code_medium
-              @text-ink_soft
-      if !person.is_agent
-        box
-          with
-            w=34.0
-            h=34.0
-            align-x=center
-            align-y=center
-            bg=panel_tile
-            r=17.0
-          text person.initials
-            with
-              size=12.0
-              wrap=none
-              font=display
-              @text-ink_soft
+      PrincipalAvatar
+        with
+          initials=person.initials
+          is_agent=person.is_agent
+          plate=34.0
+          ink=13.0
+          ring=""
+      text person.label
+        with
+          size=12.0
+          wrap=none
+          font=medium
+          @text-fg
       // `is_you` is resolved against the same user bytes `signed_write` authors
       // with, so the self tile is marked with the 9px caption the artifact uses
       // for `you` in its member rows — the huddle grid otherwise renders four
-      // identical tiles and never says which one is her.
-      row gap=4.0 align=center
-        if muted
-          Icon
-            with
-              name="mic-off"
-              tone="caption"
-              px=10.0
-        text person.label
-          with
-            size=12.0
-            wrap=none
-            font=medium
-            @text-chevron_idle
-        if person.is_you
-          text "you"
-            with
-              size=9.0
-              wrap=none
-              font=medium
-              @text-caption
+      // identical tiles and never says which one is her. It rides its OWN line
+      // under the name with the mute mark: a 116px cell cannot hold a label,
+      // an icon and a badge on one row without pushing one of them out.
+      if (person.is_you || muted)
+        row gap=4.0 align=center
+          if muted
+            Icon
+              with
+                name="mic-off"
+                tone="danger"
+                px=10.0
+          if person.is_you
+            text "you"
+              with
+                size=9.0
+                wrap=none
+                font=medium
+                @text-caption
 
-// THE POPPED PANEL — the whole content of the huddle's own OS window. Two
-// bands: the header with its dock button, and the body (elapsed + roster grid
-// + controls). See the file header for the four bands the artifact has that
-// this one honestly refuses to draw.
+// THE POPPED PANEL — the whole content of the huddle's own OS window, and the
+// one surface here that is a WINDOW rather than a pill. Three bands, and the
+// middle one takes the fill:
+//
+//   header (live mark · clock · #channel · dock)   — shrink, on `sidebar`
+//   [status strip, only when the call says something the clock does not]
+//   stage (video strip + roster grid), SCROLLING   — h=fill, on `bg`
+//   controls (mic · camera · open · Leave)         — shrink, on `sidebar`
+//
+// It used to be one top-anchored shrink column inside a `clip=true` box: a
+// 320x460 window spent its bottom 250px on empty background, a 560x700 one
+// spent 500, and a roster too tall for the panel pushed the controls THROUGH
+// the clip — a six-person huddle you could not leave. Height is the whole fix:
+// exactly one band carries `h=fill`, and it is the one with the people in it.
+//
+// The panel wears the app's own light/dark surfaces (`bg`/`sidebar`/`elevated`)
+// and NOT the `toast_*` pair it used to. Those tokens are deliberately the
+// INVERSE of the surface — right for a pill floating over the console, wrong
+// for a whole window: in dark mode the huddle came up as a cream panel with
+// near-invisible `ink_hover` tiles while every other window went dark.
+//
+// See the file header for the four bands the artifact has that this one
+// honestly refuses to draw.
 //
 // IT DRAWS NO WINDOW CHROME. It used to be a 296px card pinned in the
 // console's corner, wearing three hand-drawn traffic lights as costume; it is
@@ -327,250 +337,303 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
     leave_huddle_here
     toggle_call_mute
     toggle_call_camera
-  box #root
+  // No `bg=` on the root: the window's own background IS the app background
+  // (`bg app_background` in app.ice), so the stage band is the bare window and
+  // only the two chrome bands paint a plate over it.
+  col #root
     with
       w=fill
       h=fill
-      bg=toast_bg
-      clip=true
-    col w=fill
-      box
+    // BAND 1 — THE HEADER, and the ONLY place the clock and the channel are
+    // named. It used to be two bands: a mono "Huddle · <channel>" title over a
+    // separate clock row whose right end printed the word `live` beside a
+    // pulse dot that already said it. One row, read left to right: the live
+    // mark, the running clock, whose channel, dock.
+    box
+      with
+        w=fill
+        pl=13.0
+        pr=9.0
+        pt=9.0
+        pb=9.0
+        bg=sidebar
+      row
         with
           w=fill
-          pl=11.0
-          pr=11.0
-          pt=9.0
-          pb=9.0
-        row
+          gap=8.0
+          align=center
+        PulseDot plate=7.0 tone="success"
+        if !empty(elapsed)
+          text elapsed
+            with
+              size=13.0
+              wrap=none
+              font=code_semibold
+              @text-fg
+        if empty(elapsed)
+          text "LIVE"
+            with
+              size=13.0
+              wrap=none
+              font=code_semibold
+              @text-fg
+        // THE CHANNEL NAME IS CLIPPED, not merely given `w=fill`. A channel
+        // name is user-sized and `wrap=none` text lays out one line at its
+        // INTRINSIC width whatever box it was allotted — `w=fill` decides how
+        // much room the row hands it, never how much it draws. Only a
+        // `clip=true` ancestor cuts the overflow, which is why the channel
+        // list's own rows survive the same names (their 236px pane clips).
+        // Without this box the name painted straight through the dock button.
+        box
           with
             w=fill
-            gap=9.0
-            align=center
-          text "Huddle ·"
-            with
-              size=10.5
-              wrap=none
-              font=code_medium
-              @text-ink_soft
-          text channel
-            with
-              w=fill
-              size=10.5
-              wrap=none
-              font=code_medium
-              @text-ink_soft
-          button -> emit(dock_huddle)
-            with
-              label="Dock the huddle window"
-              @icon_action
-              @p-4px
-            Icon
+            clip=true
+          row gap=3.0 align=center
+            text "#"
               with
-                name="collapse"
-                tone="caption"
-                px=12.0
-            active bg=transparent text=caption border=transparent border-w=1.0 r=5.0
-            hovered bg=ink_hover text=toast_fg
-            pressed bg=ink_hover text=toast_fg
-      box
-        with
-          w=fill
-          h=1.0
-          bg=accent_fg
-        space w=1.0 h=1.0
+                size=12.0
+                wrap=none
+                font=display
+                @text-hint
+            text channel
+              with
+                size=12.0
+                wrap=none
+                font=display
+                @text-muted
+        button -> emit(dock_huddle)
+          with
+            label="Dock the huddle window"
+            @icon_action
+            @p-5px
+          Icon
+            with
+              name="collapse"
+              tone="muted"
+              px=12.0
+          active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+          hovered bg=subtle text=fg
+          pressed bg=subtle text=fg
+    box
+      with
+        w=fill
+        h=1.0
+        bg=separator
+      space w=1.0 h=1.0
+    // The call's own word — connecting, a device note, or the hub's refusal
+    // prose. A bare `live` is NOT drawn: the pulse dot and the running clock
+    // one band up are the same sentence, and this strip exists to say the
+    // thing they cannot.
+    if !empty(status) && (status != "live")
       box
         with
           w=fill
           pl=13.0
           pr=13.0
-          pt=13.0
-          pb=11.0
-        col w=fill gap=12.0
-          row gap=8.0 align=center
-            PulseDot plate=6.0 tone="success"
-            if !empty(elapsed)
-              text elapsed
+          pt=7.0
+          pb=7.0
+          bg=subtle
+        text status
+          with
+            w=fill
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-caption
+    // BAND 2 — THE STAGE, and the band that takes the fill. Everything the
+    // panel is FOR lives here, so it grows with the window instead of leaving
+    // the bottom 70% of a 560x700 window as empty background, and it SCROLLS:
+    // a six-person roster used to push the controls off a clipped panel with
+    // no way to reach them.
+    scroll
+      with
+        dir=vertical
+        w=fill
+        h=fill
+      col
+        with
+          w=fill
+          gap=10.0
+          pl=12.0
+          pr=12.0
+          pt=12.0
+          pb=12.0
+        // The video strip: every live camera's latest frame (peers first,
+        // the local preview last), only while any camera is on. The widget
+        // repaints itself — mounting it is the whole contract.
+        if video_live
+          extern call_video_tiles()
+        // `max-cell` owns the column count so no tile carries a width: 2
+        // columns at the window's 320px minimum, 4 at 560. It is the MAX and
+        // not the min because the min form stretches a lone tile across the
+        // whole stage — one person in a widened huddle got a 534px-wide,
+        // 100px-tall bar with a 34px avatar adrift in it.
+        grid max-cell=168.0 gap=8.0
+          for person in roster
+            HuddleTile
+              with
+                person
+                muted=keep_bool(person.is_you, muted, call_peer_muted(peers, person.node))
+    box
+      with
+        w=fill
+        h=1.0
+        bg=separator
+      space w=1.0 h=1.0
+    // BAND 3 — THE CONTROLS, pinned to the bottom of the window on their own
+    // plate. Two groups, one gap: what this device is doing (mic, camera, jump
+    // to the channel) on the left, and the one destructive action on the
+    // right. `Leave` is the only SOLID danger control in the window — a muted
+    // mic wears the soft danger plate, so the eye can still tell the button
+    // that ends the call from the one that mutes it.
+    box
+      with
+        w=fill
+        pl=12.0
+        pr=12.0
+        pt=10.0
+        pb=10.0
+        bg=sidebar
+      row
+        with
+          w=fill
+          gap=7.0
+          align=center
+        if !muted
+          button -> emit(toggle_call_mute)
+            with
+              label="Mute the microphone"
+              w=32.0
+              h=32.0
+              @icon_action
+              @px-0px
+              @py-0px
+            box
+              with
+                w=fill
+                h=fill
+                align-x=center
+                align-y=center
+              Icon
                 with
-                  size=12.0
-                  wrap=none
-                  font=code_semibold
-                  @text-toast_fg
-            if empty(elapsed)
-              text "LIVE"
+                  name="mic"
+                  tone="muted"
+                  px=14.0
+            active bg=elevated text=fg border=control_line border-w=1.0 r=9.0
+            hovered bg=subtle text=fg border=control_line_hover
+            pressed bg=subtle text=fg
+        if muted
+          button -> emit(toggle_call_mute)
+            with
+              label="Unmute the microphone"
+              w=32.0
+              h=32.0
+              @icon_action
+              @px-0px
+              @py-0px
+            box
+              with
+                w=fill
+                h=fill
+                align-x=center
+                align-y=center
+              Icon
                 with
-                  size=12.0
-                  wrap=none
-                  font=code_semibold
-                  @text-toast_fg
-            space w=fill
-            // The call's own word: connecting → live (with any device note),
-            // or the hub's refusal prose — the "Voice connection failed."
-            // black hole this panel used to be.
-            if !empty(status)
-              text status
+                  name="mic-off"
+                  tone="danger"
+                  px=14.0
+            active bg=danger_bg text=danger border=danger_line border-w=1.0 r=9.0
+            hovered bg=danger_bg text=danger border=danger
+            pressed bg=danger_bg text=danger
+        if !camera
+          button -> emit(toggle_call_camera)
+            with
+              label="Turn the camera on"
+              w=32.0
+              h=32.0
+              @icon_action
+              @px-0px
+              @py-0px
+            box
+              with
+                w=fill
+                h=fill
+                align-x=center
+                align-y=center
+              Icon
                 with
-                  size=10.5
-                  wrap=none
-                  font=code_medium
-                  @text-caption
-          // The video strip: every live camera's latest frame (peers first,
-          // the local preview last), only while any camera is on. The widget
-          // repaints itself — mounting it is the whole contract.
-          if video_live
-            extern call_video_tiles()
-          row wrap
+                  name="camera-off"
+                  tone="muted"
+                  px=14.0
+            active bg=elevated text=fg border=control_line border-w=1.0 r=9.0
+            hovered bg=subtle text=fg border=control_line_hover
+            pressed bg=subtle text=fg
+        if camera
+          button -> emit(toggle_call_camera)
+            with
+              label="Turn the camera off"
+              w=32.0
+              h=32.0
+              @icon_action
+              @px-0px
+              @py-0px
+            box
+              with
+                w=fill
+                h=fill
+                align-x=center
+                align-y=center
+              Icon
+                with
+                  name="camera"
+                  tone="ink"
+                  px=14.0
+            active bg=subtle text=fg border=control_line_hover border-w=1.0 r=9.0
+            hovered bg=subtle text=fg border=control_line_hover
+            pressed bg=subtle text=fg
+        // The channel is NAMED in the header, so this is a glyph and not the
+        // window's loudest element: `open # <channel>` spelled out was wider
+        // than both media controls together and grew without bound with the
+        // channel name, which is what pushed `Leave` off a narrow panel.
+        button -> emit(huddle_go_channel)
+          with
+            label="Open the huddle channel"
+            w=32.0
+            h=32.0
+            @icon_action
+            @px-0px
+            @py-0px
+          box
             with
               w=fill
-              gap=8.0
-              wrap-gap=8.0
-            for person in roster
-              HuddleTile
-                with
-                  person
-                  muted=keep_bool(person.is_you, muted, call_peer_muted(peers, person.node))
-          row
-            with
-              w=fill
-              gap=7.0
-              align=center
-            if !muted
-              button -> emit(toggle_call_mute)
-                with
-                  label="Mute the microphone"
-                  w=32.0
-                  h=32.0
-                  @icon_action
-                  @px-0px
-                  @py-0px
-                box
-                  with
-                    w=fill
-                    h=fill
-                    align-x=center
-                    align-y=center
-                  Icon
-                    with
-                      name="mic"
-                      tone="caption"
-                      px=14.0
-                active bg=ink_hover text=chevron_idle border=transparent border-w=1.0 r=9.0
-                hovered bg=strong_ink text=toast_fg
-                pressed bg=strong_ink text=toast_fg
-            if muted
-              button -> emit(toggle_call_mute)
-                with
-                  label="Unmute the microphone"
-                  w=32.0
-                  h=32.0
-                  @icon_action
-                  @px-0px
-                  @py-0px
-                box
-                  with
-                    w=fill
-                    h=fill
-                    align-x=center
-                    align-y=center
-                  Icon
-                    with
-                      name="mic-off"
-                      tone="danger"
-                      px=14.0
-                active bg=danger_solid text=primary_fg border=transparent border-w=1.0 r=9.0
-                hovered bg=danger_solid_hover text=primary_fg
-                pressed bg=danger_solid_hover text=primary_fg
-            if !camera
-              button -> emit(toggle_call_camera)
-                with
-                  label="Turn the camera on"
-                  w=32.0
-                  h=32.0
-                  @icon_action
-                  @px-0px
-                  @py-0px
-                box
-                  with
-                    w=fill
-                    h=fill
-                    align-x=center
-                    align-y=center
-                  Icon
-                    with
-                      name="camera"
-                      tone="caption"
-                      px=14.0
-                active bg=ink_hover text=chevron_idle border=transparent border-w=1.0 r=9.0
-                hovered bg=strong_ink text=toast_fg
-                pressed bg=strong_ink text=toast_fg
-            if camera
-              button -> emit(toggle_call_camera)
-                with
-                  label="Turn the camera off"
-                  w=32.0
-                  h=32.0
-                  @icon_action
-                  @px-0px
-                  @py-0px
-                box
-                  with
-                    w=fill
-                    h=fill
-                    align-x=center
-                    align-y=center
-                  Icon
-                    with
-                      name="camera"
-                      tone="ink"
-                      px=14.0
-                active bg=success_dot/25 text=toast_fg border=transparent border-w=1.0 r=9.0
-                hovered bg=strong_ink text=toast_fg
-                pressed bg=strong_ink text=toast_fg
-            button -> emit(huddle_go_channel)
+              h=fill
+              align-x=center
+              align-y=center
+            Icon
               with
-                label="Open the huddle channel"
-                @icon_action
-                @px-11px
-                @py-0px
-              box h=32.0 align-y=center
-                row gap=3.0 align=center
-                  text "open"
-                    with
-                      size=12.0
-                      wrap=none
-                      font=medium
-                      @text-chevron_idle
-                  text "#"
-                    with
-                      size=12.0
-                      wrap=none
-                      font=medium
-                      @text-ink_soft
-                  text channel
-                    with
-                      size=12.0
-                      wrap=none
-                      font=medium
-                      @text-chevron_idle
-              active bg=ink_hover text=chevron_idle border=transparent border-w=1.0 r=9.0
-              hovered bg=strong_ink text=toast_fg
-              pressed bg=strong_ink text=toast_fg
-            space w=fill
-            button -> emit(leave_huddle_here)
+                name="nav-chat"
+                tone="muted"
+                px=14.0
+          active bg=elevated text=fg border=control_line border-w=1.0 r=9.0
+          hovered bg=subtle text=fg border=control_line_hover
+          pressed bg=subtle text=fg
+        space w=fill
+        button -> emit(leave_huddle_here)
+          with
+            label="Leave the huddle"
+            @icon_action
+            @px-13px
+            @py-0px
+          box h=32.0 align-y=center
+            text "Leave"
               with
-                label="Leave the huddle"
-                @icon_action
-                @px-13px
-                @py-0px
-              box h=32.0 align-y=center
-                text "Leave"
-                  with
-                    size=12.0
-                    wrap=none
-                    font=display
-                    @text-primary_fg
-              active bg=danger_solid text=primary_fg border=transparent border-w=1.0 r=9.0
-              hovered bg=danger_solid_hover text=primary_fg
-              pressed bg=danger_solid_hover text=primary_fg
+                size=12.0
+                wrap=none
+                font=display
+                @text-primary_fg
+          active bg=danger_solid text=primary_fg border=transparent border-w=1.0 r=9.0
+          hovered bg=danger_solid_hover text=primary_fg
+          pressed bg=danger_solid_hover text=primary_fg
 
 // "A CALL IS LIVE, BUT NOT HERE" — the channel-header affordance for the huddle
 // running in another channel. Clicking jumps to it; the pulse dot is the same
