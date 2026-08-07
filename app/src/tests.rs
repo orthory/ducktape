@@ -1559,7 +1559,9 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // the viewport moves everything below it, and a bottom-anchored offset is
     // what carries the visible rows along with it. The two travel together —
     // the thread rail's own scroll sits further down the file, past the split.
-    assert!(above.contains("scroll dir=vertical w=fill h=fill anchor-y=end auto=true"));
+    // `h=shrink` is the composer-anchored height: the virtual column reports a
+    // whole-list estimate, so a long timeline still hits the box's cap.
+    assert!(above.contains("scroll dir=vertical w=fill h=shrink anchor-y=end auto=true"));
 }
 
 #[test]
