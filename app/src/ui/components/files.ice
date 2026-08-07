@@ -210,11 +210,12 @@ component ObjectTableHeader()
     box
       with
         w=fill
+        h=50.0
         px=20.0
-        py=9.0
       row
         with
           w=fill
+          h=fill
           gap=12.0
           align=center
         text "NAME"
@@ -240,11 +241,13 @@ component ObjectTableHeader()
             wrap=none
             font=code_semibold
             @text-gutter_ink
+    // `separator`, not `elevated`: at 50px this rule meets the duckfs pane's
+    // rule at the seam, and one line cannot change colour halfway across.
     box
       with
         w=fill
         h=1.0
-        bg=elevated
+        bg=separator
       space w=1.0 h=1.0
 
 // One entry. A directory opens; a file selects into the object panel. Only a

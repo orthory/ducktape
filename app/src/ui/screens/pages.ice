@@ -423,14 +423,30 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
             // itself, which is what keeps its caret-reveal alive — an outer
             // scrollable would hand it infinite height, and typing below the
             // fold would walk the caret off screen with nothing following it.
+            //
+            // THE TWO PADDINGS ARE UNEQUAL BECAUSE THE EDITOR'S ARE. It keeps
+            // its affordances inside its own padding, and the two sides are
+            // not the same width: 46 of hover gutter (two buttons) on the
+            // left against 28 of comment margin (one mark) on the right, +2 of
+            // breathing room each side. Equal padding here therefore hung the
+            // text 18px right of the surface it sits on, and the page read as
+            // if it were sliding off. 22 + 48 == 40 + 30.
+            //
+            // The surface itself is LEFT-ANCHORED in a pane wider than 766 —
+            // it carried an `mx=auto` that never ran, because the ice margin
+            // family is honoured on FLEX ITEMS ONLY and this is a `stack`
+            // child. Dropped rather than left to read as a promise. Centring
+            // it needs a lever ice does not have here: `justify=center` sizes
+            // the item to content, and a `box align-x=center` cannot centre a
+            // `w=fill` child. Only shows above 1040 window width; the pane is
+            // narrower than the surface at the console's minimum.
             box
               with
                 w=fill
                 h=fill
                 max-w=766.0
-                mx=auto
                 pl=22.0
-                pr=22.0
+                pr=40.0
                 pt=26.0
                 pb=18.0
               col
