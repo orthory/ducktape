@@ -225,12 +225,19 @@ pub struct ChatDelta {
 ///
 /// `origin_kind` is `external` | `module` | `system` with `origin_id` as the
 /// feed row carries it (external ids arrive as rendered user handles).
+/// `height` is the block the op was applied in — the only stamp a chat row
+/// carries, since the chain has no wall clock. The op payload does not hold it
+/// (the validator assigns it), so it arrives from the live stream beside the
+/// payload and is written onto the row here. Without it a live-arriving message
+/// renders with no stamp at all until the next full load re-reads it from the
+/// index, which is what your own message did the moment you sent it.
 pub fn delta_from_op(
     payload: &[u8],
     assigned: Option<&serde_json::Value>,
     origin_kind: &str,
     origin_id: Option<&str>,
     current_user: Option<&[u8]>,
+    height: u64,
 ) -> Result<Option<ChatDelta>, String> {
     let msg = decode_msg(payload)?;
     let origin = origin_tag(origin_kind, origin_id);
@@ -282,7 +289,7 @@ pub fn delta_from_op(
                 seq,
                 message_id,
                 author: index::author(&origin, as_agent.as_deref()),
-                height: 0,
+                height,
                 time: 0,
                 blocks,
                 text: String::new(),
@@ -324,6 +331,10 @@ pub fn delta_from_op(
                 seq,
                 message_id: String::new(),
                 author: index::author(&origin, None),
+                // An edit's stamp is the ORIGINAL post's block, never the
+                // edit's — and `apply_edit_content` copies only body/blocks/
+                // rev/edited/meta off this carrier, so the row on screen keeps
+                // the height it was posted at. Left 0 deliberately.
                 height: 0,
                 time: 0,
                 blocks,
@@ -1475,6 +1486,39 @@ mod tests {
         let thread = apply_chat_thread(vec![root], delta, "general".into(), 1);
         assert_eq!(thread[0].reply_count, 2, "the rail's replies rule reads this");
         assert!(thread.iter().any(|message| message.seq == 3));
+    }
+
+    #[test]
+    fn a_live_post_carries_the_block_it_was_applied_in() {
+        // The block height is the only stamp a chat row has, and the op payload
+        // does not carry it — a live-arriving message used to render with none
+        // until a full reload re-read it from the index, which is what your own
+        // message did the instant you sent it.
+        let payload = serde_json::to_vec(&ChatMsg::PostMessage {
+            channel_id: "general".into(),
+            message_id: "m1".into(),
+            blocks: vec![Block::Paragraph(vec![Span {
+                text: "hi".into(),
+                marks: Vec::new(),
+            }])],
+            thread: None,
+            as_agent: None,
+        })
+        .expect("a PostMessage encodes");
+        let assigned = serde_json::json!({ "posted": { "seq": 7 } });
+        let delta = delta_from_op(
+            &payload,
+            Some(&assigned),
+            "external",
+            Some("ext:ab"),
+            None,
+            276_199,
+        )
+        .expect("a well-formed op folds")
+        .expect("a post is visible to the UI");
+
+        assert_eq!(delta.kind, "posted");
+        assert_eq!(delta.message.height, 276_199);
     }
 
     #[test]

@@ -123,6 +123,7 @@ async fn folded_update(rpc: &str, module: &str, op: ducktape_rpc::StreamOp) -> O
                 origin_kind,
                 op.origin.id.as_deref(),
                 current_user.as_deref(),
+                op.height,
             );
             let mut delta = match folded {
                 Ok(Some(delta)) => delta,
