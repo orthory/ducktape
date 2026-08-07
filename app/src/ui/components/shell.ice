@@ -736,28 +736,29 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
 // The header every screen sidebar wears: a 13.5px title, a machine count, and
 // an optional trailing control the caller fills.
 //
-// NOT MOUNTED YET, and every call site is in view.ice. The Pages sidebar head
-// is already this component spelled out by hand — same pl/pr 14, pt 14, pb 11,
-// same 8.0 row gap, same title and count steps, same separator rule — with the
-// New-page button in what is this component's slot; it collapses to
-// `SidebarHeader title="Pages" count=len(pages)` with that button as the slot
-// child. The Chat sidebar head is the same geometry but interleaves a
+// MOUNTED by the Pages sidebar (screens/pages.ice), with the New-page button in
+// the slot. The Chat sidebar head is the same geometry but interleaves a
 // connection dot BETWEEN the title and the count, which this signature cannot
 // express (the slot is past the `space w=fill`), so chat either keeps its
 // hand-rolled head or the dot moves to the trailing slot — a design call, not
 // a mechanical one. The Files screen has no sidebar at all yet.
+//
+// **50px, not padding-sized.** It used to be pt 14 / pb 11 around the title, so
+// the rule under it landed at 44 while the pane header it meets across the
+// separator lands at 51 (50 + its own rule) — a 7px step at the seam, on every
+// screen that pairs the two. The height is the contract; the padding follows.
 component SidebarHeader(title:str, count:i64)
   col #root w=fill
     box
       with
         w=fill
+        h=50.0
         pl=14.0
         pr=14.0
-        pt=14.0
-        pb=11.0
       row
         with
           w=fill
+          h=fill
           gap=8.0
           align=center
         text title

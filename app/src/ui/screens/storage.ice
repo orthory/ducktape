@@ -161,13 +161,18 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
           // subdirectories rendered a blank 206px column that reads as a
           // broken pane rather than an empty one. The subtitle states
           // what duckfs IS and needs no reading to back it.
+          //
+          // 50px like every other pane header, and like `ObjectTableHeader`
+          // across the separator: padding-sized, the two-line title stood 57
+          // tall against the table header's 30, so the two rules that meet at
+          // this seam were 27px apart.
           box
             with
               w=fill
+              h=50.0
               pl=14.0
               pr=14.0
-              pt=14.0
-              pb=11.0
+              align-y=center
             col w=fill gap=2.0
               text "duckfs"
                 with
@@ -599,11 +604,16 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                 active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                 hovered bg=row_hover text=fg
                 pressed bg=elevated text=fg
+    // 24 horizontally, matching the head above it — at `p=18` the ledger and
+    // every card in it stood 6px left of the query box they answer.
     col
       with
         w=fill
         h=fill
-        p=18.0
+        pl=24.0
+        pr=24.0
+        pt=18.0
+        pb=18.0
         gap=11.0
       // RESULTS TAKE THE SCREEN while a query stands; the block ledger
       // is what the screen falls back to. A hit is a READING, not a
