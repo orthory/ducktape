@@ -424,6 +424,15 @@ on pages_mutated(next)
   page_delete_armed = false
   mutation_phase = "idle"
   error = ""
+  // THE SAME TWO LINES `pages_updated` ENDS ON. A mutation moves the selection
+  // exactly as a pick does — a create lands on the page it just made — so the
+  // page it lands on belongs in the tab bar. Without them a created page was
+  // selected in the sidebar and titled in the header while the tab bar still
+  // showed only the documents opened before it. A tab whose page is gone needs
+  // no removal here: `doc_tab_rows` resolves every tab against the live page
+  // list and drops the ones it cannot find.
+  doc_tabs = doc_tabs_with(doc_tabs, active_page)
+  run save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 
 on doc_tabs_saved(_result)
   error = error
