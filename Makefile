@@ -16,8 +16,10 @@ all:
 
 ## the app dev loop: seed the "demo" localnet if it does not exist yet
 ## (DEV_RESEED=1 forces a fresh seed), start its node when it is not already
-## serving, then run the desktop app against it in the foreground. Ctrl-C
-## quits the app and leaves the node running; `make demo-clear` tears down.
+## serving, sync ducktape's own repo into that node's forge (dogfood-forge —
+## non-fatal when origin is unreachable), then run the desktop app against it
+## in the foreground. Ctrl-C quits the app and leaves the node running;
+## `make demo-clear` tears down.
 dev:
 	@bash ops/dev.sh
 
