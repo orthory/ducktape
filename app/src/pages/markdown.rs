@@ -67,13 +67,21 @@ pub struct Caret {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mark {
     Title,
-    Marker { hidden: bool, style: Style },
+    Marker {
+        hidden: bool,
+        style: Style,
+    },
     Body(Style),
     ListMarker(Style),
     /// A todo's `[ ]`/`[x]` — drawn as a checkbox (the span highlight is the
     /// box), never as bracket glyphs.
-    Tick { checked: bool, style: Style },
-    Fence { hidden: bool },
+    Tick {
+        checked: bool,
+        style: Style,
+    },
+    Fence {
+        hidden: bool,
+    },
     CodeBody,
 }
 
@@ -288,6 +296,21 @@ fn highlight(
     };
 
     let mut marks = Vec::new();
+    // The leading indent is LAYOUT, not syntax: a COLLAPSED marker run that
+    // starts at 0 swallows it, and a nested item then draws flush with its
+    // parent. It gets its own full-width run ahead of every hidden marker.
+    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let marker_collapses =
+        ticked || matches!(prefix, Prefix::Heading(_) | Prefix::Quote | Prefix::Callout);
+    if indent > 0 && marker_collapses {
+        marks.push((
+            0..indent,
+            Mark::Marker {
+                hidden: false,
+                style,
+            },
+        ));
+    }
     // The marker run. A list keeps its own — it IS the bullet the reader
     // sees — but a todo's bullet yields to the checkbox: the `- ` reveals
     // only under the caret and the `[ ]` run IS the box, always.
@@ -297,7 +320,7 @@ fn highlight(
             false => marks.push((0..content, Mark::ListMarker(style))),
             true => {
                 marks.push((
-                    0..content - 4,
+                    indent..content - 4,
                     Mark::Marker {
                         hidden: !on_caret_line,
                         style,
@@ -320,7 +343,7 @@ fn highlight(
             },
         )),
         Prefix::Heading(_) | Prefix::Quote | Prefix::Callout => marks.push((
-            0..content,
+            indent..content,
             Mark::Marker {
                 hidden: !on_caret_line,
                 style,
@@ -799,6 +822,37 @@ mod tests {
         let body = format(&marks[2].1, false);
         assert!(body.strikethrough.is_some());
         assert_eq!(body.color, Some(LIGHT.muted));
+    }
+
+    /// The nesting step is the leading whitespace itself, so a collapsed marker
+    /// run must not start at column 0 — a nested todo drew flush with its
+    /// parent while the `- ` run swallowed the indent.
+    #[test]
+    fn a_collapsed_marker_leaves_the_indent_at_full_width() {
+        let full_width = |marks: &[(Range<usize>, Mark)]| {
+            let indent = marks
+                .iter()
+                .find(|(range, _)| *range == (0..2))
+                .expect("an indent run");
+            let size = format(&indent.1, false).size;
+            assert!(
+                size.is_none_or(|size| size.0 > HIDDEN_SIZE),
+                "the indent collapsed: {marks:?}"
+            );
+        };
+        let (todo, _) = highlight("  - [ ] nested", false, false, false);
+        full_width(&todo);
+        assert_eq!(todo[1].0, 2..4);
+        assert!(matches!(todo[1].1, Mark::Marker { hidden: true, .. }));
+
+        let (heading, _) = highlight("  ## nested", false, false, false);
+        full_width(&heading);
+        assert_eq!(heading[1].0, 2..5);
+
+        // A visible list marker already carried its own indent.
+        let (bullet, _) = highlight("  - nested", false, false, false);
+        assert_eq!(bullet[0].0, 0..4);
+        assert!(matches!(bullet[0].1, Mark::ListMarker(_)));
     }
 
     #[test]

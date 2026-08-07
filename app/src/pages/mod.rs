@@ -484,7 +484,53 @@ fn continue_list(document: &mut Content) -> bool {
     }
     let carried = format!("\n{}", marker.next_prefix(&text));
     replace_range(document, cursor.position, cursor.position, &carried);
+    // The inserted item TOOK the next number; without this the item below it
+    // keeps the same one and the list reads 1, 2, 2.
+    if let Some(number) = marker.ordered {
+        let depth = sync::split_indent(&text).0;
+        renumber_run(document, cursor.position.line + 2, depth, number + 2);
+    }
     true
+}
+
+/// Ordered numbers are positional, so an insert or a removal shifts every item
+/// below it. Rewrites the run starting at `from` — deeper lines belong to an
+/// item and are stepped over, and the run ends at the first line that is
+/// shallower or is not an ordered item at `depth`.
+///
+/// The caret is parked back where it was: `replace_range` moves it, and every
+/// line touched here is BELOW the caret's own, so its position never changed.
+fn renumber_run(document: &mut Content, from: usize, depth: usize, start: u64) {
+    let caret = document.cursor();
+    let mut number = start;
+    let mut index = from;
+    while let Some(line) = document.line(index) {
+        let text = line.text.into_owned();
+        let (steps, rest) = sync::split_indent(&text);
+        if steps > depth {
+            index += 1;
+            continue;
+        }
+        let Some(digits) = sync::ordered_digits(rest).filter(|_| steps == depth) else {
+            break;
+        };
+        let column = text.len() - rest.len();
+        replace_range(
+            document,
+            Position {
+                line: index,
+                column,
+            },
+            Position {
+                line: index,
+                column: column + digits,
+            },
+            &number.to_string(),
+        );
+        number += 1;
+        index += 1;
+    }
+    document.move_to(caret);
 }
 
 /// Backspace at the first character of a list item's CONTENT deletes the
@@ -601,6 +647,9 @@ struct ListMarker {
     indent: usize,
     content: usize,
     next: String,
+    /// The number this item wears, when it is an ordered one — what the run
+    /// below has to be counted up from.
+    ordered: Option<u64>,
 }
 
 impl ListMarker {
@@ -613,8 +662,8 @@ fn list_marker(text: &str) -> Option<ListMarker> {
     let trimmed = text.trim_start_matches([' ', '\t']);
     let indent = text.len() - trimmed.len();
     let bytes = trimmed.as_bytes();
-    let (mut cursor, next) = match *bytes.first()? {
-        bullet @ (b'-' | b'+' | b'*') => (1, format!("{} ", char::from(bullet))),
+    let (mut cursor, next, ordered) = match *bytes.first()? {
+        bullet @ (b'-' | b'+' | b'*') => (1, format!("{} ", char::from(bullet)), None),
         byte if byte.is_ascii_digit() => {
             let digits = bytes
                 .iter()
@@ -631,6 +680,7 @@ fn list_marker(text: &str) -> Option<ListMarker> {
                     "{} ",
                     number.saturating_add(1).to_string() + &char::from(delimiter).to_string()
                 ),
+                Some(number),
             )
         }
         _ => return None,
@@ -651,12 +701,14 @@ fn list_marker(text: &str) -> Option<ListMarker> {
             indent,
             content: indent + cursor,
             next: format!("{next}[ ] "),
+            ordered,
         });
     }
     Some(ListMarker {
         indent,
         content: indent + cursor,
         next,
+        ordered,
     })
 }
 
@@ -717,6 +769,28 @@ mod tests {
     fn enter_increments_an_ordered_marker() {
         let content = typed("3. three", 0, 8);
         assert_eq!(press(content, Edit::Enter), "3. three\n4. ");
+    }
+
+    #[test]
+    fn enter_renumbers_the_ordered_run_below_the_new_item() {
+        let content = typed("1. one\n2. two\n3. three", 0, 6);
+        assert_eq!(press(content, Edit::Enter), "1. one\n2. \n3. two\n4. three");
+    }
+
+    #[test]
+    fn renumbering_steps_over_children_and_stops_at_the_run_s_end() {
+        // A deeper line belongs to the item above it and keeps its own count…
+        let nested = typed("1. one\n  1. child\n2. two\nplain\n9. apart", 0, 6);
+        assert_eq!(
+            press(nested, Edit::Enter),
+            "1. one\n2. \n  1. child\n3. two\nplain\n9. apart"
+        );
+    }
+
+    #[test]
+    fn a_bullet_run_below_is_left_alone() {
+        let content = typed("- one\n- two", 0, 5);
+        assert_eq!(press(content, Edit::Enter), "- one\n- \n- two");
     }
 
     #[test]

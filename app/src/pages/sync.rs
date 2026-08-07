@@ -119,19 +119,49 @@ pub fn document_body(text: &str) -> Vec<Line> {
 
 /// The document text for a page's blocks, title excluded.
 pub fn page_markdown(blocks: &[PageBlock]) -> String {
-    let lines: Vec<String> = blocks
+    let lines: Vec<String> = rendered_blocks(blocks)
+        .into_iter()
+        .map(|(_, rendered)| rendered)
+        .collect();
+    lines.join("\n")
+}
+
+/// Every prose block as `(id, markdown)`, in document order.
+///
+/// An ordered marker is POSITIONAL — the stored block carries no number (see
+/// [`ordered_content`]) — so the run's count is recomputed here rather than
+/// read back. Rendering every Number as `1. ` made a saved list reopen as
+/// "1. 1. 1.".
+fn rendered_blocks(blocks: &[PageBlock]) -> Vec<(String, String)> {
+    let mut counts: Vec<usize> = Vec::new();
+    blocks
         .iter()
         .filter(|block| is_prose(block))
         .map(|block| {
-            render_line(&Line {
+            let line = Line {
                 kind: block.kind.clone(),
                 text: block.text.clone(),
                 checked: block.checked,
                 depth: block.prefix.len() / INDENT.len(),
-            })
+            };
+            let ordinal = ordinal(&mut counts, &line);
+            (block.id.clone(), render_line(&line, ordinal))
         })
-        .collect();
-    lines.join("\n")
+        .collect()
+}
+
+/// The number an ordered item wears: its 1-based place in the run at its OWN
+/// depth. Any other kind ends the run at that depth, and going shallower drops
+/// every deeper count — a nested list restarts at 1 under each parent.
+fn ordinal(counts: &mut Vec<usize>, line: &Line) -> usize {
+    counts.truncate(line.depth + 1);
+    counts.resize(line.depth + 1, 0);
+    let count = &mut counts[line.depth];
+    *count = match line.kind == "Number" {
+        true => *count + 1,
+        false => 0,
+    };
+    *count
 }
 
 /// The stored shape of a page's prose, in document order.
@@ -156,14 +186,15 @@ pub fn stored_lines(blocks: &[PageBlock]) -> Vec<StoredLine> {
 }
 
 /// One block as its markdown line (or lines — a Code block is a fence).
-fn render_line(line: &Line) -> String {
+/// `ordinal` is the number a Number block wears; every other kind ignores it.
+fn render_line(line: &Line, ordinal: usize) -> String {
     let indent = INDENT.repeat(line.depth);
     let marker = match line.kind.as_str() {
         "Heading 1" => "# ",
         "Heading 2" => "## ",
         "Heading 3" => "### ",
         "Bullet" => "- ",
-        "Number" => "1. ",
+        "Number" => return format!("{indent}{ordinal}. {}", line.text),
         "Todo" => match line.checked {
             true => "- [x] ",
             false => "- [ ] ",
@@ -200,15 +231,9 @@ fn render_line(line: &Line) -> String {
 pub fn line_spans(blocks: &[PageBlock]) -> Vec<(String, usize, usize)> {
     let mut spans = Vec::new();
     let mut next = 1;
-    for block in blocks.iter().filter(|block| is_prose(block)) {
-        let rendered = render_line(&Line {
-            kind: block.kind.clone(),
-            text: block.text.clone(),
-            checked: block.checked,
-            depth: block.prefix.len() / INDENT.len(),
-        });
+    for (id, rendered) in rendered_blocks(blocks) {
         let lines = rendered.split('\n').count();
-        spans.push((block.id.clone(), next, lines));
+        spans.push((id, next, lines));
         next += lines;
     }
     spans
@@ -349,20 +374,28 @@ fn parse_line(rest: &str, depth: usize) -> Line {
     plain("Text", rest, false)
 }
 
-/// `12. text` / `12) text` — the content past an ordered marker. The stored
-/// number is positional, so the digits themselves are not kept — which is
-/// exactly why a LONG number is prose: "1997. A great year" written as a list
-/// item would come back as "1. A great year", destroying the year.
-// ponytail: <= 2 digits is a heuristic; carrying the start number through the
-// module is the upgrade if 100+-item lists ever matter.
-fn ordered_content(trimmed: &str) -> Option<&str> {
+/// The digit count of an ordered marker (`12. ` / `12) `), or `None` when the
+/// line does not wear one. Capped at three digits so a YEAR stays prose:
+/// "1997. A great year" as a list item would come back renumbered, destroying
+/// the year. Three, not two, because the render side now writes the real
+/// position — a 100-item list must survive its own round trip.
+// ponytail: 999 items is the ceiling; carrying the start number through the
+// module is the upgrade if longer lists ever matter.
+pub(crate) fn ordered_digits(trimmed: &str) -> Option<usize> {
     let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 || digits > 2 {
+    if digits == 0 || digits > 3 {
         return None;
     }
     let rest = trimmed.get(digits..)?;
     let rest = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')'))?;
-    rest.strip_prefix(' ')
+    rest.starts_with(' ').then_some(digits)
+}
+
+/// `12. text` / `12) text` — the content past an ordered marker. The stored
+/// number is positional, so the digits themselves are not kept.
+fn ordered_content(trimmed: &str) -> Option<&str> {
+    let digits = ordered_digits(trimmed)?;
+    trimmed.get(digits + 2..)
 }
 
 /// The writes that carry `stored` to `wanted`.
@@ -541,6 +574,42 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_number_run_reopens_counting_up() {
+        let blocks = [
+            block("Number", "one", 0),
+            block("Number", "child", 1),
+            block("Number", "sibling", 1),
+            block("Number", "two", 0),
+            block("Text", "plain", 0),
+            block("Number", "apart", 0),
+        ];
+        assert_eq!(
+            page_markdown(&blocks),
+            "1. one\n  1. child\n  2. sibling\n2. two\nplain\n1. apart"
+        );
+        // …and the reopened text is what the parser reads back.
+        assert_eq!(
+            parse_document(&page_markdown(&blocks))
+                .iter()
+                .map(|line| line.kind.clone())
+                .collect::<Vec<_>>(),
+            vec!["Number", "Number", "Number", "Number", "Text", "Number"]
+        );
+    }
+
+    #[test]
+    fn a_hundred_item_run_still_reads_back_as_a_list_and_a_year_does_not() {
+        assert_eq!(
+            parse_document("100. hundredth")[0],
+            line("Number", "hundredth")
+        );
+        assert_eq!(
+            parse_document("1997. A great year")[0],
+            line("Text", "1997. A great year")
+        );
+    }
+
+    #[test]
     fn every_block_kind_survives_a_round_trip() {
         let kinds = [
             ("Text", "plain"),
@@ -557,7 +626,7 @@ mod tests {
         ];
         for (kind, text) in kinds {
             let source = line(kind, text);
-            let rendered = render_line(&source);
+            let rendered = render_line(&source, 1);
             let parsed = parse_document(&rendered);
             assert_eq!(
                 parsed,
@@ -573,7 +642,7 @@ mod tests {
             checked: true,
             ..line("Todo", "shipped")
         };
-        assert_eq!(render_line(&done), "- [x] shipped");
+        assert_eq!(render_line(&done, 1), "- [x] shipped");
         assert_eq!(parse_document("- [x] shipped"), vec![done]);
     }
 
@@ -583,13 +652,13 @@ mod tests {
         // paragraph. It must be writable, not a save error.
         assert_eq!(parse_document("one\n\ntwo").len(), 3);
         assert_eq!(parse_document("one\n\ntwo")[1], line("Text", ""));
-        assert_eq!(render_line(&line("Text", "")), "");
+        assert_eq!(render_line(&line("Text", ""), 1), "");
     }
 
     #[test]
     fn a_code_body_keeps_its_trailing_newline_through_the_round_trip() {
         let code = line("Code", "x\n");
-        let rendered = render_line(&code);
+        let rendered = render_line(&code, 1);
         assert_eq!(rendered, "```\nx\n\n```");
         assert_eq!(parse_document(&rendered), vec![code]);
     }
@@ -606,7 +675,7 @@ mod tests {
     #[test]
     fn a_multi_line_code_block_folds_back_into_one_block() {
         let code = line("Code", "fn main() {\n    go();\n}");
-        let rendered = render_line(&code);
+        let rendered = render_line(&code, 1);
         assert_eq!(rendered, "```\nfn main() {\n    go();\n}\n```");
         // The body's OWN indentation is content, not layout — a round trip
         // that reformats it has eaten the user's code.
@@ -620,7 +689,7 @@ mod tests {
             depth: 1,
             ..line("Code", "if x:\n    go()")
         };
-        let rendered = format!("{}\n{}", render_line(&parent), render_line(&code));
+        let rendered = format!("{}\n{}", render_line(&parent, 1), render_line(&code, 1));
         assert_eq!(rendered, "- setup\n  ```\n  if x:\n      go()\n  ```");
         assert_eq!(parse_document(&rendered), vec![parent, code]);
     }
@@ -642,7 +711,7 @@ mod tests {
         assert_eq!(
             parsed
                 .iter()
-                .map(render_line)
+                .map(|line| render_line(line, 1))
                 .collect::<Vec<_>>()
                 .join("\n"),
             ladder
