@@ -837,12 +837,27 @@ fn container_depth_uses_only_shared_design_roles() {
     );
     assert_eq!(card.border.radius, tokens.radius.card.into());
     assert_eq!(card.shadow, iced::Shadow::default());
+    // OPAQUE. iced has no backdrop blur, so a glass role over a menu is just
+    // transparency: the sentence behind an item and the item's own label draw
+    // through each other.
     assert_eq!(
         raised.background,
-        Some(iced::Background::Color(tokens.glass.regular))
+        Some(iced::Background::Color(tokens.palette.popover))
+    );
+    assert_eq!(raised.background.map(alpha_of), Some(1.0));
+    assert_eq!(
+        raised_style(&iced::Theme::Dark).background.map(alpha_of),
+        Some(1.0)
     );
     assert_eq!(raised.border.radius, tokens.radius.card.into());
     assert_eq!(raised.shadow, tokens.elevation.popover);
+}
+
+fn alpha_of(background: iced::Background) -> f32 {
+    let iced::Background::Color(color) = background else {
+        panic!("a depth role paints a flat colour");
+    };
+    color.a
 }
 
 #[test]
