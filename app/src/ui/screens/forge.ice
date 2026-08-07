@@ -672,7 +672,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                                   w=fill
                                   size=12.0
                                   line-h=1.55
-                                  @text-panel_tile
+                                  @text-accent_fg
                           button "Remove" -> emit(forge_comment_drop, staged.anchor)
                             with
                               label="Remove staged comment"

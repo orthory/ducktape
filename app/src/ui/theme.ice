@@ -126,7 +126,6 @@ theme contract AppTheme
   diff_del_fg
   diff_hunk_bg
   panel_tile
-  panel_tile_lit
   danger_soft
   tree_folder
   kind_page
@@ -269,7 +268,6 @@ palette app for AppTheme
   diff_hunk_bg #f6f3f9
   // The dark tiles a panel header and a file tree fold use.
   panel_tile #4a4843
-  panel_tile_lit #57554d
   danger_soft #e0918a
   tree_folder #a08a5a
   // EXPLORER — one ink + one plate per result kind, so kind reads before text.
@@ -409,7 +407,6 @@ palette app_dark for AppTheme
   diff_hunk_bg #262330
   // Panel tiles read one step LIGHTER than their surface in the dark reading.
   panel_tile #2e2d28
-  panel_tile_lit #37362f
   danger_soft #a05c55
   tree_folder #c0a86e
   // EXPLORER
