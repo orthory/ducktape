@@ -680,47 +680,12 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                   pr=10.0
                   gap=1.0
                 for block in blocks
-                  button -> emit(select_explorer_block, block.height)
+                  ExplorerBlockRow
                     with
-                      label="Inspect block"
-                      w=fill
-                      p=6.0
-                      @ghost_action
-                    row
-                      with
-                        w=fill
-                        h=fill
-                        gap=8.0
-                        align=center
-                      text block.height
-                        with
-                          size=12.0
-                          wrap=none
-                          font=code
-                          @text-fg
-                      text block.hash
-                        with
-                          w=fill
-                          size=12.0
-                          wrap=none
-                          font=code
-                          @text-muted
-                      // `1 op` / `3 ops`, not a bare `1`. The three columns
-                      // carry no header, and of the three only this one is
-                      // unreadable without one — a height and a hash say what
-                      // they are. Labelling the VALUE beats a header row here:
-                      // the height column is variable width, so any header
-                      // would need a magic fixed width that a seven-digit
-                      // chain outgrows.
-                      text plural(block.op_count, "op", "ops")
-                        with
-                          size=12.0
-                          wrap=none
-                          font=code
-                          @text-muted
-                    active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
-                    hovered bg=row_hover text=fg
-                    pressed bg=accent
+                      block
+                      selected=(block.height == selected)
+                    forward
+                      select_explorer_block
           box
             with
               w=fill
@@ -796,3 +761,79 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                                 font=code
                                 @text-muted
                           text op.payload size=13.5 @text-fg
+
+// ONE BLOCK IN THE CHAIN LIST, AND WHETHER IT IS THE ONE YOU OPENED. The row
+// carried no selected state at all: clicking filled the detail pane on the
+// right and left the list identical to the pixel, measured — the only visible
+// difference was `hovered`, which follows the pointer, not the selection. In a
+// list where every row is a height and a truncated hash there is no landmark to
+// re-find your place by, so losing the mark means reading hex until it matches.
+//
+// `tree_selected` is the token the Forge file tree already uses for exactly
+// this, and it is the one NAMED for it. Note the app has not settled here: the
+// Files tree reaches for `subtle` instead, a plate 2.3/255 away in dark — two
+// tokens, one meaning. Unifying them touches two other screens and is left for
+// a design pass rather than smuggled in behind an Explorer fix.
+//
+// The plate is LIGHTER than the surface, which is the direction every selected
+// row in this app moves; the measured lift here is +13/255, against the chat
+// sidebar's +19 for its active channel.
+component ExplorerBlockRow(block:ExplorerBlock, selected:bool)
+  emits
+    select_explorer_block(i64)
+  col #root w=fill
+    if selected
+      button -> emit(select_explorer_block, block.height)
+        with
+          label="Inspect block"
+          w=fill
+          p=6.0
+          @ghost_action
+        ExplorerBlockFace block=block
+        active bg=tree_selected text=fg border=transparent border-w=1.0 r=7.0
+        hovered bg=row_hover text=fg
+        pressed bg=accent
+    if !selected
+      button -> emit(select_explorer_block, block.height)
+        with
+          label="Inspect block"
+          w=fill
+          p=6.0
+          @ghost_action
+        ExplorerBlockFace block=block
+        active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
+        hovered bg=row_hover text=fg
+        pressed bg=accent
+
+// The row's three columns, in one place so the two plates cannot drift apart.
+component ExplorerBlockFace(block:ExplorerBlock)
+  row #root
+    with
+      w=fill
+      h=fill
+      gap=8.0
+      align=center
+    text block.height
+      with
+        size=12.0
+        wrap=none
+        font=code
+        @text-fg
+    text block.hash
+      with
+        w=fill
+        size=12.0
+        wrap=none
+        font=code
+        @text-muted
+    // `1 op` / `3 ops`, not a bare `1`. The three columns carry no header, and
+    // of the three only this one is unreadable without one — a height and a
+    // hash say what they are. Labelling the VALUE beats a header row here: the
+    // height column is variable width, so any header would need a magic fixed
+    // width that a seven-digit chain outgrows.
+    text plural(block.op_count, "op", "ops")
+      with
+        size=12.0
+        wrap=none
+        font=code
+        @text-muted
