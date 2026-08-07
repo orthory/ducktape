@@ -244,6 +244,9 @@ pub fn page_document(
         .on_action(PageEvent::Action)
         .on_line_press(line_press)
         .margin_marks(marks, |_| PageEvent::OpenComments)
+        // The chip is painted inside the widget, so it can take no ice
+        // `label=` tooltip — this is the only thing that names it.
+        .margin_label("Open comments")
         // Line 0 is the title — it takes no gutter, like the reference
         // editor's title row.
         .on_gutter(|line, button| (line > 0).then_some(PageEvent::Gutter(line, button)))
@@ -389,6 +392,17 @@ pub fn apply_page_action(mut document: Content, action: PageAction) -> Content {
         return document;
     };
     history::record(|| (document.text(), document.cursor()));
+    // A key that can MOVE a line owes the ordered runs a recount; typing a
+    // character into one cannot, and must not pay for the walk.
+    let structural = matches!(
+        edit,
+        Edit::Enter
+            | Edit::Backspace
+            | Edit::Delete
+            | Edit::Indent
+            | Edit::Unindent
+            | Edit::Paste(_)
+    );
     let handled = match edit {
         Edit::Enter => close_fence(&mut document) || continue_list(&mut document),
         Edit::Backspace => remove_list_marker(&mut document),
@@ -396,10 +410,14 @@ pub fn apply_page_action(mut document: Content, action: PageAction) -> Content {
         Edit::Unindent => shift_indent(&mut document, -1),
         _ => false,
     };
-    if handled {
-        return document;
+    if !handled {
+        document.perform(edit_action);
     }
-    document.perform(edit_action);
+    if structural {
+        let landed = document.cursor().position.line;
+        let from = list_start(&document, landed);
+        renumber_below(&mut document, from);
+    }
     document
 }
 
@@ -485,6 +503,86 @@ fn continue_list(document: &mut Content) -> bool {
     let carried = format!("\n{}", marker.next_prefix(&text));
     replace_range(document, cursor.position, cursor.position, &carried);
     true
+}
+
+/// The first line of the list the edit landed in. Numbering is positional, so
+/// a run can only be counted from its own start — seeding from "the number on
+/// the line above" would propagate whatever number was already wrong.
+fn list_start(document: &Content, line: usize) -> usize {
+    let mut start = line.min(document.line_count().saturating_sub(1));
+    while start > 0 {
+        let Some(above) = document.line(start - 1) else {
+            break;
+        };
+        if list_marker(&above.text).is_none() {
+            break;
+        }
+        start -= 1;
+    }
+    start
+}
+
+/// Re-count every ordered run from `from` down, one counter per depth.
+///
+/// An ordered marker is POSITIONAL — the store keeps no number (see
+/// [`sync::parse_document`]) — so any number the buffer shows that is not the
+/// item's position is one the next reload silently corrects. Every structural
+/// key routes through here rather than each one doing its own arithmetic.
+///
+/// A shallower line drops every deeper counter, so a nested list restarts at 1
+/// under each parent; a line that is not an ordered item ends the run at its
+/// own depth, and the next item there starts a NEW run at 1 — which is exactly
+/// what backspacing a marker out of the middle of a list leaves behind.
+///
+/// It walks to the end of the document rather than stopping at the first
+/// paragraph: a run below one can still be a run this edit split off.
+// ponytail: O(lines) per structural key. A page is tens of lines and only a
+// line whose number actually moved is rewritten; bound it to the edited run if
+// documents ever get long enough to feel it.
+fn renumber_below(document: &mut Content, from: usize) {
+    let mut caret = document.cursor();
+    let mut counts: Vec<u64> = Vec::new();
+    let mut index = from;
+    while let Some(line) = document.line(index) {
+        let text = line.text.into_owned();
+        let (depth, rest) = sync::split_indent(&text);
+        counts.truncate(depth + 1);
+        counts.resize(depth + 1, 0);
+        let Some(digits) = sync::ordered_digits(rest) else {
+            counts[depth] = 0;
+            index += 1;
+            continue;
+        };
+        counts[depth] += 1;
+        let number = counts[depth].to_string();
+        let column = text.len() - rest.len();
+        if number.len() != digits {
+            // The caret sits on this line and past the marker: widening or
+            // narrowing the number carries the caret with it.
+            let past_marker =
+                index == caret.position.line && caret.position.column >= column + digits;
+            if past_marker {
+                caret.position.column = caret
+                    .position
+                    .column
+                    .saturating_add_signed(number.len() as isize - digits as isize);
+            }
+        }
+        replace_range(
+            document,
+            Position {
+                line: index,
+                column,
+            },
+            Position {
+                line: index,
+                column: column + digits,
+            },
+            &number,
+        );
+        index += 1;
+    }
+    document.move_to(caret);
 }
 
 /// Backspace at the first character of a list item's CONTENT deletes the
@@ -715,8 +813,72 @@ mod tests {
 
     #[test]
     fn enter_increments_an_ordered_marker() {
-        let content = typed("3. three", 0, 8);
-        assert_eq!(press(content, Edit::Enter), "3. three\n4. ");
+        let content = typed("1. one\n2. two", 1, 6);
+        assert_eq!(press(content, Edit::Enter), "1. one\n2. two\n3. ");
+    }
+
+    #[test]
+    fn enter_renumbers_the_ordered_run_below_the_new_item() {
+        let content = typed("1. one\n2. two\n3. three", 0, 6);
+        assert_eq!(press(content, Edit::Enter), "1. one\n2. \n3. two\n4. three");
+    }
+
+    #[test]
+    fn renumbering_steps_over_children_and_stops_at_the_run_s_end() {
+        // A deeper line belongs to the item above it and counts on its own;
+        // the paragraph ends the run, so what follows is a NEW list at 1.
+        let nested = typed("1. one\n  1. child\n2. two\nplain\n9. apart", 0, 6);
+        assert_eq!(
+            press(nested, Edit::Enter),
+            "1. one\n2. \n  1. child\n3. two\nplain\n1. apart"
+        );
+    }
+
+    #[test]
+    fn a_bullet_run_below_is_left_alone() {
+        let content = typed("- one\n- two", 0, 5);
+        assert_eq!(press(content, Edit::Enter), "- one\n- \n- two");
+    }
+
+    #[test]
+    fn backspacing_a_marker_out_restarts_the_run_below_it() {
+        // "two" stops being an item, so what is left below it is a NEW list.
+        let content = typed("1. one\n2. two\n3. three", 1, 3);
+        assert_eq!(press(content, Edit::Backspace), "1. one\ntwo\n1. three");
+    }
+
+    #[test]
+    fn tab_recounts_both_the_run_it_left_and_the_one_it_joined() {
+        // Line 0 is the title, so the list starts on line 1.
+        let content = typed("Title\n1. one\n2. two\n3. three", 2, 6);
+        // "two" nests under "one" as its first child, and "three" takes the
+        // number "two" gave up.
+        assert_eq!(
+            press(content, Edit::Indent),
+            "Title\n1. one\n  1. two\n2. three"
+        );
+    }
+
+    #[test]
+    fn shift_tab_lifts_an_item_back_into_the_run_above_it() {
+        let content = typed("1. one\n  1. two\n  2. three", 2, 9);
+        assert_eq!(press(content, Edit::Unindent), "1. one\n  1. two\n2. three");
+    }
+
+    #[test]
+    fn joining_two_items_recounts_what_is_left() {
+        // Backspace at column 0 merges the line up — one item fewer.
+        let content = typed("1. one\n2. two\n3. three", 1, 0);
+        assert_eq!(press(content, Edit::Backspace), "1. one2. two\n2. three");
+    }
+
+    #[test]
+    fn a_run_is_counted_from_its_own_start_not_from_the_number_above() {
+        // Typing "5." does not buy a list that starts at five: the store keeps
+        // no number, so the buffer has to show the position it will come back
+        // as.
+        let content = typed("5. one\n9. two", 0, 6);
+        assert_eq!(press(content, Edit::Enter), "1. one\n2. \n3. two");
     }
 
     #[test]
