@@ -625,6 +625,16 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                           wrap=none
                           font=code
                           @text-input
+                    // The waiting arm above is keyed on the UNFILTERED ring, so
+                    // a filter that matches nothing left this 420px console
+                    // blank — indistinguishable from a log stream that died.
+                    if !empty(node_log_lines) && empty(filter_log_lines(node_log_lines, node_log_filter))
+                      text "No lines match this filter."
+                        with
+                          size=12.0
+                          wrap=none
+                          font=code
+                          @text-input
                     for line in filter_log_lines(node_log_lines, node_log_filter)
                       LogLine parts=split_log_line(line.line)
           _

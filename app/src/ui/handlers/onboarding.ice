@@ -171,6 +171,11 @@ on console_opened(id)
   mutation_phase = "idle"
   channels = []
   messages = []
+  // Same abandoned request, same dead button — see `choose_channel`, and worse
+  // here: this points the app at a DIFFERENT node, so the page requested from
+  // the old `connected_rpc` may never answer and "Load older" would stay dead
+  // in the new network for the rest of the session.
+  history_loading = false
   channel_reads = []
   unread_boundary = 0
   unread_marker_seq = 0

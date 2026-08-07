@@ -283,7 +283,13 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
                           @text-fg
               if empty(diff_from)
                 col w=fill gap=8.0
-                  GroupLabel label="SNAPSHOTS"
+                  // The eyebrow labels a list, so it only earns its place once
+                  // there is one: hung over nothing it reads as a load that
+                  // failed. Same trade as the "No differences." arm above.
+                  if !empty(history)
+                    GroupLabel label="SNAPSHOTS"
+                  if empty(history)
+                    text "No snapshots yet." size=12.5 @text-caption
                   for snapshot in history
                     box
                       with

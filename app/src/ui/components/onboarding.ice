@@ -1256,11 +1256,18 @@ component InviteValue(invite:str)
           font=code_medium
           @text-hint
     if !empty(invite)
+      // `word-or-glyph`, because the invite is a several-hundred-character
+      // duck-emoji + base64 token carrying no space: word wrapping has nothing
+      // to break on, so the run's minimum intrinsic width became the whole blob
+      // and it drew straight past this 428px card in a 480x680 window that does
+      // not scroll. Same ruling MemberFactRow made for public keys — the box
+      // grows taller and the value stays readable end to end, which is the
+      // point of the screen: an invite you cannot read in full is not an invite.
       text invite
         with
           w=fill
           size=11.0
-          wrap=none
+          wrap=word-or-glyph
           font=code_medium
           @text-secondary_fg
 

@@ -338,10 +338,16 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
                                 p=6.0
                                 @ghost_action
                               col w=fill gap=1.0
+                                // `wrap=none` does not ellipsize — it lays the whole message body
+                                // out as one run and the panel edge merely clips the draw, mid-glyph
+                                // and with no marker, so a term matched late in a long message is
+                                // never on screen. `hit.text` is the FULL body (backend/chat.rs
+                                // copies it verbatim, no snippet), so the hit row has to wrap it —
+                                // the way components/chat.ice renders this same ChatSearchHit.
                                 text hit.text
                                   with
                                     size=13.0
-                                    wrap=none
+                                    wrap=word-or-glyph
                                     @text-fg
                                 text hit.meta
                                   with
@@ -368,10 +374,12 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
                                 p=6.0
                                 @ghost_action
                               col w=fill gap=1.0
+                                // Same clip as the message hits above: a block's text is arbitrary
+                                // page prose, and the match can sit anywhere in it.
                                 text hit.text
                                   with
                                     size=13.0
-                                    wrap=none
+                                    wrap=word-or-glyph
                                     @text-fg
                                 text hit.kind
                                   with
