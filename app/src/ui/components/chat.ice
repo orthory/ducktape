@@ -189,9 +189,14 @@ component RichLine(block:ChatBlock)
       gap-y=4.0
       items=start
     for span in block.spans
+      // `word-or-glyph` on every run: a flex wraps BETWEEN spans, so a single
+      // unbroken token — a hash, a base64 invite, a long URL — is one span
+      // wider than the column, and word wrapping cannot break it. It ran off
+      // the message column and the pane clipped the tail away.
       if span.highlight
         text span.text
           with
+            wrap=word-or-glyph
             size=13.5
             line-h=1.55
             font=medium
@@ -199,6 +204,7 @@ component RichLine(block:ChatBlock)
       if !span.highlight && span.bold && span.italic
         text span.text
           with
+            wrap=word-or-glyph
             size=13.5
             line-h=1.55
             font=strongitalic
@@ -206,6 +212,7 @@ component RichLine(block:ChatBlock)
       if !span.highlight && span.bold && !span.italic
         text span.text
           with
+            wrap=word-or-glyph
             size=13.5
             line-h=1.55
             font=strong
@@ -213,6 +220,7 @@ component RichLine(block:ChatBlock)
       if !span.highlight && !span.bold && span.italic
         text span.text
           with
+            wrap=word-or-glyph
             size=13.5
             line-h=1.55
             font=italic
@@ -220,6 +228,7 @@ component RichLine(block:ChatBlock)
       if !span.highlight && !span.bold && !span.italic
         text span.text
           with
+            wrap=word-or-glyph
             size=13.5
             line-h=1.55
             @text-accent_fg
@@ -256,7 +265,7 @@ component MessageBody(message:ChatMessage)
                 size=12.0
                 line-h=1.5
                 font=code
-                wrap=word
+                wrap=word-or-glyph
                 @text-fg
       // A quote is a LEFT BAR, not a box — boxed it was indistinguishable
       // from a code slab at a glance. The bar wears the warm accent hairline
@@ -279,7 +288,7 @@ component MessageBody(message:ChatMessage)
                   w=fill
                   size=13.5
                   line-h=1.45
-                  wrap=word
+                  wrap=word-or-glyph
                   @text-fg
           box
             with
@@ -297,7 +306,7 @@ component MessageBody(message:ChatMessage)
               w=fill
               size=13.5
               line-h=1.55
-              wrap=word
+              wrap=word-or-glyph
               @text-accent_fg
 
 // People are round, agents are 8px-rounded squares. The artifact never mixes
@@ -866,7 +875,7 @@ component ChatSearchResult(hit:ChatSearchHit)
         with
           w=fill
           size=13.5
-          wrap=word
+          wrap=word-or-glyph
           @text-fg
     active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
     hovered bg=fg/6 text=fg border=fg/9
