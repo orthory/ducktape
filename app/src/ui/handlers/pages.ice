@@ -380,7 +380,7 @@ on pages_updated(next)
   block_autosave_generation = block_autosave_generation + 1
   loading = false
   error = ""
-  doc_tabs = doc_tabs_with(doc_tabs, active_page)
+  doc_tabs = doc_tabs_with(doc_tabs_pruned(doc_tabs, pages), active_page)
   run save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 on pages_mutated(next)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
@@ -431,7 +431,7 @@ on pages_mutated(next)
   // showed only the documents opened before it. A tab whose page is gone needs
   // no removal here: `doc_tab_rows` resolves every tab against the live page
   // list and drops the ones it cannot find.
-  doc_tabs = doc_tabs_with(doc_tabs, active_page)
+  doc_tabs = doc_tabs_with(doc_tabs_pruned(doc_tabs, pages), active_page)
   run save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 
 on doc_tabs_saved(_result)

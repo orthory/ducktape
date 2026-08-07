@@ -278,6 +278,17 @@ pub fn doc_tab_rows(tabs: Vec<String>, pages: Vec<PageItem>, active: String) -> 
         .collect()
 }
 
+/// Drop tabs whose page is gone. `doc_tab_rows` already resolves every tab
+/// against the live page list when it draws, so a dead id is invisible in the
+/// bar — but the PERSISTED list kept them forever, and Settings counts that
+/// list: `Open page tabs 11` beside a bar showing two. Pruning where the pages
+/// land keeps the stored list and its count honest.
+pub fn doc_tabs_pruned(tabs: Vec<String>, pages: Vec<PageItem>) -> Vec<String> {
+    tabs.into_iter()
+        .filter(|tab| pages.iter().any(|page| page.id == *tab))
+        .collect()
+}
+
 /// The tab to activate after closing one: the last remaining tab, or empty.
 pub fn next_doc_tab(tabs: Vec<String>, closed: String, active: String) -> String {
     if closed != active {
