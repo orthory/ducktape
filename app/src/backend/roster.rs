@@ -117,8 +117,23 @@ pub fn members_is_admin(rows: Vec<MemberRow>) -> bool {
         .any(|row| row.is_this_node && row.role == "validator")
 }
 
-/// This node's standing: `validator` | `resident` | `guest`.
+/// This node's standing: `validator` | `resident` | `guest`, or `""` when the
+/// roster has not answered.
+///
+/// The empty answer is load-bearing. `load_members` is one of thirteen parallel
+/// loads, so it can be the only one that fails, and folding its silence into
+/// `guest` told a validator's operator — with no error anywhere on screen —
+/// that this device may not post. `""` lights the STANDING UNKNOWN arm in
+/// node.ice instead.
+///
+/// An empty vec is the only unanswered signal a pure row function has, and it
+/// is a sound one: an answered roster always carries the chain's own
+/// validators. So a roster that DID answer and holds no row for this node is a
+/// real guest and still reads `guest` — the guest card is not collateral here.
 pub fn member_tier(rows: Vec<MemberRow>) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
     rows.iter()
         .find(|row| row.is_this_node)
         .map_or_else(|| "guest".into(), |row| row.role.clone())

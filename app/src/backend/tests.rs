@@ -769,7 +769,12 @@ fn the_roster_answers_admin_tier_and_filters() {
     ];
     assert!(members_is_admin(rows.clone()));
     assert_eq!(member_tier(rows.clone()), "validator");
-    assert_eq!(member_tier(Vec::new()), "guest");
+    // the two halves of "no row for this node", kept apart: an unanswered
+    // roster is unknown, an answered one without this node is a real guest.
+    assert_eq!(member_tier(Vec::new()), "");
+    let mut answered_without_this_node = rows.clone();
+    answered_without_this_node[0].is_this_node = false;
+    assert_eq!(member_tier(answered_without_this_node), "guest");
     assert_eq!(filter_members(rows.clone(), "agents".into()).len(), 1);
     assert_eq!(filter_members(rows.clone(), "humans".into()).len(), 2);
     assert_eq!(filter_members(rows.clone(), "validators".into()).len(), 1);
@@ -2404,4 +2409,18 @@ fn bell_badge_takes_the_worst_unread_severity() {
         "warning"
     );
     assert_eq!(bell_worst_severity(Vec::new()), "info");
+}
+
+#[test]
+fn a_refused_key_password_reaches_the_screen_as_a_sentence() {
+    // Verbatim what the key tool hands the app on a mistyped unlock password —
+    // the mapping keys on the CLI's own `WRONG_PASSWORD_ERR` text.
+    let refused =
+        user_error("ducktape user key unlock refused: FATAL: corrupt or wrong password".into());
+    assert_eq!(
+        refused,
+        "That password did not open this device's key. Check it and try again."
+    );
+    // A module's own sentence still flows through untouched.
+    assert_eq!(user_error("post is empty".into()), "post is empty");
 }

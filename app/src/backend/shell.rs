@@ -379,11 +379,15 @@ fn workspace_init(chain_id: &str) -> Result<WorkspaceInit, String> {
 /// Run one `ducktape` verb and return its stdout's last non-empty line — the
 /// CLI's machine value (diagnostics ride stderr).
 async fn ducktape_cli(args: &[&str]) -> Result<String, String> {
+    // Name the `<noun> <verb>` head only. The tail is values, and `node join`
+    // carries the whole invite blob — hundreds of characters that, echoed into
+    // the banner's fixed column, push the CLI's actual reason off the bottom.
+    let verb = args[..args.len().min(2)].join(" ");
     let mut command = tokio::process::Command::new(ducktape_binary());
     command.args(args).kill_on_drop(true);
     let output = tokio::time::timeout(CLI_TIMEOUT, command.output())
         .await
-        .map_err(|_| format!("ducktape {} timed out", args.join(" ")))?
+        .map_err(|_| format!("ducktape {verb} timed out"))?
         .map_err(|error| {
             format!(
                 "could not start the ducktape CLI ({error}); build node-bin or set DUCKTAPE_BIN"
@@ -392,8 +396,7 @@ async fn ducktape_cli(args: &[&str]) -> Result<String, String> {
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "ducktape {} refused: {}",
-            args.join(" "),
+            "ducktape {verb} refused: {}",
             bounded_detail(&detail)
         ));
     }
@@ -403,7 +406,7 @@ async fn ducktape_cli(args: &[&str]) -> Result<String, String> {
         .rev()
         .find(|line| !line.trim().is_empty())
         .map(|line| line.trim().to_string())
-        .ok_or_else(|| format!("ducktape {} returned nothing", args.join(" ")))
+        .ok_or_else(|| format!("ducktape {verb} returned nothing"))
 }
 
 /// One provisioning step. `state` is `done` | `running` | `pending` | `blocked`.
@@ -484,12 +487,11 @@ pub fn provision_progress(
                         .dir
                         .as_ref()
                         .is_some_and(|dir| dir.join("network.toml").is_file());
-                    // The artifact's step tail is "invite links available",
-                    // rendered in English to match the shell.
-                    Some((
-                        registered_step(3, "Workspace ready · invite links available", ready),
-                        state,
-                    ))
+                    // No tail: this step proves only that `network.toml` exists,
+                    // and what a member later copies is an opaque invite blob with
+                    // no URI form — the artifact's "invite links available" promised
+                    // a link nothing in this flow mints.
+                    Some((registered_step(3, "Workspace ready", ready), state))
                 }
                 3 => {
                     // the app attaches to a node it does not supervise: the

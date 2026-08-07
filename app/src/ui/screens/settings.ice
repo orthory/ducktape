@@ -9,7 +9,7 @@
 // fact families, and the prefix is what says which loader a reading came from.
 // `settings_height` (the facts reading) and `block_height` (the live head) are
 // two different numbers and would collide as one word.
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_height:i64, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_validators:i64, members_residents:i64, account_id:str, bind account_name_draft:str, account_renaming:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], block_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_height:i64, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, members_validators:i64, members_residents:i64, account_id:str, bind account_name_draft:str, account_renaming:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], block_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
   emits
     select_shell_tab(str)
     reconnect()
@@ -241,11 +241,19 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                   // The badge carries STANDING on this network — validator,
                   // resident, guest — not whether a local key is bound. The
                   // artifact's ADMIN/MAINTAINER words name authority this
-                  // chain does not grant, so the app keeps its own.
+                  // chain does not grant, so the app keeps its own. An empty
+                  // tier is not a standing — it is the roster not having
+                  // answered — so it says so instead of drawing a bare pill,
+                  // but only once the roster HAS answered: `member_tier`
+                  // returns "" for "no answer yet" and for "answered, not
+                  // listed" alike, and the load starts after hydration clears
+                  // `loading`, so an ungated alarm fires on every cold start.
                   if members_is_admin(members_rows)
                     Badge.Secondary label=member_tier(members_rows)
-                  if !members_is_admin(members_rows)
+                  if !members_is_admin(members_rows) && !empty(member_tier(members_rows))
                     Badge.Outline label=member_tier(members_rows)
+                  if empty(member_tier(members_rows)) && members_answered
+                    Badge.Outline label="standing unknown"
                 // The key line says WHICH keypair this is and that it lives
                 // on this device — the custody clause the artifact carries.
                 row
@@ -265,12 +273,16 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                       wrap=none
                       font=code_medium
                       @text-hint
-                  text member_tier(members_rows)
-                    with
-                      size=10.5
-                      wrap=none
-                      font=code_medium
-                      @text-hint
+                  // Same empty answer the badge above guards on: an unanswered
+                  // roster has no standing to name here. The separator stays —
+                  // it still parts the key from the custody clause.
+                  if !empty(member_tier(members_rows))
+                    text member_tier(members_rows)
+                      with
+                        size=10.5
+                        wrap=none
+                        font=code_medium
+                        @text-hint
                   text "keypair on this device"
                     with
                       size=10.5

@@ -402,6 +402,13 @@ pub(crate) fn user_error(message: String) -> String {
     if key_unreadable {
         return "This device's user key is missing or unreadable. Check Settings.".into();
     }
+    // The key tool's AEAD cannot tell a wrong password from a damaged key file,
+    // so one sentence has to serve both; init/restore/unlock all refuse through
+    // here, and the raw `FATAL: …` line is the app's first screen otherwise.
+    let password_refused = message.contains("corrupt or wrong password");
+    if password_refused {
+        return "That password did not open this device's key. Check it and try again.".into();
+    }
     let node_slow = message.contains("timed out");
     if node_slow {
         return "The node did not answer in time. Retry in a moment.".into();

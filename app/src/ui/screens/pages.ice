@@ -610,11 +610,18 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
             content
               space w=fill h=fill
             layer
+              // NAME WHAT ACTUALLY DIES. `RemoveBlock` walks the whole subtree
+              // and purges the comment threads on every descendant, so the
+              // subpages listed right above this overlay go with it. The title
+              // is line 0 of the editable doc and may be saved empty, so the
+              // fallback sits HERE — `load.rs` feeds that same string to the
+              // editor buffer, where "Untitled" would be written back as a
+              // real title.
               ConfirmDelete
                 with
                   title="Delete this page"
-                  subject=active_page_title
-                  note="The page and every block on it are deleted for every member. This cannot be undone from the app."
+                  subject=keep_str(!empty(active_page_title), active_page_title, "Untitled")
+                  note="Everything nested under it goes too — its blocks, any subpages beneath them, and every comment thread on any of it — for every member. This cannot be undone from the app."
                   action="Delete page"
                   busy=(mutation_phase != "idle")
                 events
