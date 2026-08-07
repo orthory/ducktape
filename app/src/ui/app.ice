@@ -18,9 +18,19 @@ daemon Ducktape
     resizable false
   // The console. Same window the single-window app declared, now a named
   // template `open_network_submit` instantiates.
+  // `min-size` is NOT a taste number — it is the arithmetic of the fixed
+  // chrome this console draws. The widest screen is chat with a rail open:
+  // 74 workspace rail + 1 + 236 channel list + 1 + 330 thread rail = 643px
+  // that never yields, leaving the message column whatever is left. At the
+  // old 820 that was 177px — a composer whose Send button fell off the
+  // window and a sentence wrapped over eleven lines. 1040 leaves 397, and it
+  // clears every other screen's worst case too (pages 612 + editor, roster
+  // 74+312, files 74+306). No `responsive` breakpoint: the only honest
+  // alternative is suppressing a rail, and a console that silently drops the
+  // pane you just opened is worse than one that will not get that small.
   window console
     size 1280 800
-    min-size 820 540
+    min-size 1040 540
     position centered
     platform macos
       title-hidden true
@@ -29,9 +39,13 @@ daemon Ducktape
   // The huddle, popped out. It keeps REAL chrome — no `platform macos` block
   // here — because the OS close button IS the dock control; the console is
   // the one window that trades its titlebar away to draw its own.
+  // The panel scrolls its stage now, so no roster can push the controls out;
+  // the minimum only has to hold the two chrome bands plus one row of tiles.
+  // 340 = 42 header + 52 controls + 2 rules + ~190 of stage, and the width
+  // never goes under the size the window ships at.
   window huddle
     size 320 460
-    min-size 300 260
+    min-size 320 340
 
 use "extern/backend.ice"
 use "extern/editor.ice"

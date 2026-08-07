@@ -342,13 +342,26 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         wrap=none
                         font=medium
                         @text-hint
+                  // THE TITLE IS BOUNDED, because it is the one thing in this
+                  // row that a USER sizes. Everything after it — the badges,
+                  // the huddle control, the member count, the ⋯ that is the
+                  // only mouse route to Channel details — is shrink-sized, so
+                  // a `wrap=none` title claiming its full intrinsic width
+                  // pushes them past the row's bounds: a channel named at
+                  // length rendered the live-huddle pill as a BLANK plate you
+                  // could still click, and dropped ⋯ entirely. The window's
+                  // `min-size` bounds the other axis; this bounds this one.
                   if empty(active_dm_peer)
-                    text active_channel_name
+                    box
                       with
-                        size=14.0
-                        wrap=none
-                        font=display
-                        @text-fg
+                        w=fill
+                        clip=true
+                      text active_channel_name
+                        with
+                          size=14.0
+                          wrap=none
+                          font=display
+                          @text-fg
                   if active_channel_archived
                     Badge.Outline label="Archived"
                   if active_channel_members_only
@@ -401,7 +414,12 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           size=12.0
                           wrap=none
                           @text-caption
-                  space w=fill
+                  // No `space w=fill` here any more: the TITLE is the row's
+                  // flexible child now, so the slack it used to hand the
+                  // spacer is the slack the title yields back when the name
+                  // is long. Two fill children would split it and put the
+                  // title back in the business of claiming width.
+                  //
                   // No StatusPill here: the titlebar pill is on screen at the
                   // same moment, and the same word twice reads as two systems.
                   button -> emit(toggle_channel_settings)
