@@ -101,7 +101,19 @@ pub fn is_prose(block: &PageBlock) -> bool {
 pub fn page_document_text(title: &str, blocks: &[PageBlock]) -> String {
     let body = page_markdown(blocks);
     match body.is_empty() {
-        true => title.to_string(),
+        // A PAGE WITH NO BLOCKS STILL NEEDS A BODY LINE TO TYPE INTO. Without
+        // the newline the buffer is exactly one line — the title — so a fresh
+        // page has nowhere else for the caret to be: clicking into the empty
+        // space below the heading leaves it at the end of line 0, and the first
+        // sentence the reader types is appended to the TITLE, silently renaming
+        // their page in the sidebar, the tab and the header. Measured on a
+        // newly created page, not theorised.
+        //
+        // This costs nothing downstream: `document_body` splits at the first
+        // newline and `parse_document("")` returns no lines, so a page opened
+        // and left alone still serializes zero blocks. The blank line lives in
+        // the buffer, never in the document.
+        true => format!("{title}\n"),
         false => format!("{title}\n{body}"),
     }
 }
@@ -1018,11 +1030,38 @@ mod tests {
     }
 
     #[test]
-    fn a_title_only_page_has_no_body_and_no_stray_blank_line() {
+    fn a_title_only_page_opens_with_a_body_line_to_type_into() {
+        // This asserted `"Just a title"` with no trailing newline, on the
+        // grounds that the blank line was stray. It was not stray, it was the
+        // only place the caret could go: with a one-line buffer a click in the
+        // empty space below the heading leaves the caret at the end of line 0,
+        // so the first words typed on a new page are appended to its title.
         let text = page_document_text("Just a title", &[]);
-        assert_eq!(text, "Just a title");
+        assert_eq!(text, "Just a title\n");
         assert_eq!(document_title(&text), "Just a title");
+        // The line is in the BUFFER only — the document still holds no blocks,
+        // so opening a page and leaving it alone writes nothing.
         assert_eq!(document_body(&text), Vec::new());
+    }
+
+    /// THE DEFECT THE BODY LINE EXISTS FOR. Typing on a fresh page must reach
+    /// the body, not the heading. With a one-line buffer the caret has nowhere
+    /// else to be, so the sentence lands on line 0 and `document_title` — which
+    /// is simply `lines().next()` — reports the page renamed.
+    #[test]
+    fn the_first_words_typed_on_a_new_page_are_not_its_title() {
+        let opened = page_document_text("Untitled note", &[]);
+        // What an editor does with a caret on the last line: append there.
+        let typed = format!("{opened}hello from the body");
+
+        assert_eq!(
+            document_title(&typed),
+            "Untitled note",
+            "typing in the body must not rename the page"
+        );
+        let body = document_body(&typed);
+        assert_eq!(body.len(), 1, "the sentence is a body line of its own");
+        assert!(format!("{body:?}").contains("hello from the body"));
     }
 
     #[test]
