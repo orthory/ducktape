@@ -40,13 +40,13 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
                     size=13.0
                     wrap=none
                     @text-label
-              text channel.name
-                with
-                  w=fill
-                  size=13.0
-                  wrap=none
-                  font=medium
-                  @text-fg
+              box w=fill clip=true
+                text channel.name
+                  with
+                    size=13.0
+                    wrap=none
+                    font=medium
+                    @text-fg
               if channel.archived
                 text "archived"
                   with
@@ -97,21 +97,21 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
                     wrap=none
                     @text-label
               if unread
-                text channel.name
-                  with
-                    w=fill
-                    size=13.0
-                    wrap=none
-                    font=medium
-                    @text-fg
+                box w=fill clip=true
+                  text channel.name
+                    with
+                      size=13.0
+                      wrap=none
+                      font=medium
+                      @text-fg
               if !unread
-                text channel.name
-                  with
-                    w=fill
-                    size=13.0
-                    wrap=none
-                    font=medium
-                    @text-muted
+                box w=fill clip=true
+                  text channel.name
+                    with
+                      size=13.0
+                      wrap=none
+                      font=medium
+                      @text-muted
               if channel.archived
                 text "archived"
                   with
@@ -500,26 +500,12 @@ component MessageContents(message:ChatMessage, flash:f64)
                       name="nav-chat"
                       tone="accent"
                       px=12.0
-                  text message.reply_count
+                  text plural(message.reply_count, "reply", "replies")
                     with
                       size=11.0
                       wrap=none
                       font=code_medium
                       @text-brand
-                  if message.reply_count == 1
-                    text "reply"
-                      with
-                        size=11.0
-                        wrap=none
-                        font=code_medium
-                        @text-brand
-                  if message.reply_count != 1
-                    text "replies"
-                      with
-                        size=11.0
-                        wrap=none
-                        font=code_medium
-                        @text-brand
               active bg=surface text=brand border=border border-w=1.0 r=8.0
               hovered bg=muted_bg text=brand border=control_line
               pressed bg=elevated text=brand
@@ -988,26 +974,12 @@ component ThreadParentBlock(message:ChatMessage)
           align=center
           pt=13.0
           pb=4.0
-        text message.reply_count
+        text plural(message.reply_count, "reply", "replies")
           with
             size=10.5
             wrap=none
             font=code_medium
             @text-label
-        if message.reply_count == 1
-          text "reply"
-            with
-              size=10.5
-              wrap=none
-              font=code_medium
-              @text-label
-        if message.reply_count != 1
-          text "replies"
-            with
-              size=10.5
-              wrap=none
-              font=code_medium
-              @text-label
 
 // The EVENT INSPECTOR was built here and mounted nowhere, so it is deleted
 // rather than left as a panel no user can reach. What it needed was a lookup

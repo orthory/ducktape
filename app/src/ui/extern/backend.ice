@@ -144,6 +144,7 @@ extern crate::backend
   sync size_label(bytes:i64) -> str
   sync shell_nav(tab:str, approvals:i64, agent_live:bool) -> [NavItem]
   sync open_proposals(rows:[ProposalRow]) -> i64
+  sync plural(count:i64, one:str, many:str) -> str
   sync members_summary(validators:i64, residents:i64) -> str
   sync agents_summary(rows:[AgentRow]) -> str
   sync proposals_summary(rows:[ProposalRow]) -> str

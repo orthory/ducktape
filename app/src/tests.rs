@@ -2789,8 +2789,12 @@ fn unread_indicators_are_wired_client_local_only() {
             .contains("component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)")
     );
     assert!(components.contains("if unread\n                box w=7.0 h=7.0 bg=brand r=3.5"));
+    // The name rides a `box w=fill clip=true`: `wrap=none` text lays out at its
+    // INTRINSIC width whatever box it is given, so an unclipped long channel
+    // name inflated the whole row past the 236px pane and the pane's own clip
+    // sliced the row plate square through its rounded corner.
     assert!(components.contains(
-        "if unread\n                text channel.name w=fill size=13.0 wrap=none font=medium @text-fg"
+        "if unread\n                box w=fill clip=true\n                  text channel.name size=13.0 wrap=none font=medium @text-fg"
     ));
 
     let screen = inlined(include_str!("ui/screens/chat.ice"));

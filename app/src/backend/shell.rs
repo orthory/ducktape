@@ -11,9 +11,21 @@ pub struct NavItem {
     pub live: bool,
 }
 
+/// `1 repository` / `3 repositories` — the ONE place a count and its noun are
+/// joined. English has no rule that derives the plural (repository/repositories,
+/// directory/directories), so both forms are stated by the caller. Every
+/// count label goes through here; a bare `format!("{n} agents")` renders the
+/// `1 agents` the register-machine subtitles used to show.
+pub fn plural(count: i64, one: String, many: String) -> String {
+    let noun = if count == 1 { one } else { many };
+    format!("{count} {noun}")
+}
+
 /// `3 validators · 2 residents` — the machine subtitle beside the Members title.
 pub fn members_summary(validators: i64, residents: i64) -> String {
-    format!("{validators} validators · {residents} residents")
+    let left = plural(validators, "validator".into(), "validators".into());
+    let right = plural(residents, "resident".into(), "residents".into());
+    format!("{left} · {right}")
 }
 
 /// `4 agents · 2 working` — the Agents title's machine subtitle. `working` is
@@ -21,7 +33,8 @@ pub fn members_summary(validators: i64, residents: i64) -> String {
 /// default and would report every registered agent as busy forever.
 pub fn agents_summary(rows: Vec<AgentRow>) -> String {
     let working = rows.iter().filter(|row| row.live).count();
-    format!("{} agents · {working} working", rows.len())
+    let registered = plural(count_i64(rows.len()), "agent".into(), "agents".into());
+    format!("{registered} · {working} working")
 }
 
 /// `12 open · 3 settled` — the Approvals title's machine subtitle.
@@ -84,7 +97,8 @@ pub fn tally_note(approvals: i64, required: i64) -> String {
     if remaining <= 0 {
         return "quorum met".into();
     }
-    format!("{approvals} approvals · {remaining} more for quorum")
+    let have = plural(approvals, "approval".into(), "approvals".into());
+    format!("{have} · {remaining} more for quorum")
 }
 
 /// The approve button leans forward at the last vote: `Approve →`.

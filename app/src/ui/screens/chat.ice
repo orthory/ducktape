@@ -468,7 +468,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 EmptyState
                   with
                     title="No messages yet"
-                    description="Create a channel or start the conversation."
+                    description="Nobody has posted here. Send the first message below."
               if connected && loading && empty(messages)
                 box
                   with

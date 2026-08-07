@@ -73,19 +73,19 @@ component DmRow(peer:DmPeer, selected:bool)
         ink=8.0
         ring=""
     if selected
-      text peer.name
-        with
-          w=fill
-          size=13.0
-          wrap=none
-          @text-fg
+      box w=fill clip=true
+        text peer.name
+          with
+            size=13.0
+            wrap=none
+            @text-fg
     if !selected
-      text peer.name
-        with
-          w=fill
-          size=13.0
-          wrap=none
-          @text-muted
+      box w=fill clip=true
+        text peer.name
+          with
+            size=13.0
+            wrap=none
+            @text-muted
     if peer.is_agent
       // NOT the AGENT badge: that one is ink-on-white at 9px. This is the
       // hairline-grey chip the artifact reserves for the sidebar.

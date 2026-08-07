@@ -37,6 +37,17 @@ fn the_rail_seats_exactly_the_eight_module_screens() {
 }
 
 #[test]
+fn a_count_of_one_takes_the_singular_noun() {
+    assert_eq!(plural(1, "agent".into(), "agents".into()), "1 agent");
+    assert_eq!(plural(0, "agent".into(), "agents".into()), "0 agents");
+    assert_eq!(plural(2, "agent".into(), "agents".into()), "2 agents");
+    // the register subtitles that used to read `1 agents` / `1 validators`.
+    assert_eq!(members_summary(1, 0), "1 validator · 0 residents");
+    assert_eq!(members_summary(3, 2), "3 validators · 2 residents");
+    assert_eq!(tally_note(1, 4), "1 approval · 3 more for quorum");
+}
+
+#[test]
 fn quorum_dots_count_the_frozen_rule_not_the_electorate() {
     // three of the four REQUIRED signatures are in, inside a six-node pool.
     let dots = quorum_dots(3, 4);
