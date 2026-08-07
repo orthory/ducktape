@@ -429,6 +429,7 @@ view
             with
               account_name
               network_name
+              connected_rpc
               settings_endpoint
               settings_node_key
               settings_height
