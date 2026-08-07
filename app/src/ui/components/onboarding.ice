@@ -609,7 +609,7 @@ component NetworksScreen(networks:[HubNetwork], selected:str, hidden:i64, busy:b
                     size=13.5
                     wrap=none
                     @text-caption
-              text "Materializes this device's node from an invite blob."
+              text "Materializes this device's node from an invite."
                 with
                   w=fill
                   size=12.0
@@ -1395,7 +1395,11 @@ component JoinScreen(busy:bool, error:str)
           line-h=1.5
           @text-caption
     box w=fill pt=20.0
-      text "INVITE BLOB"
+      // `INVITE`, not `INVITE BLOB`. Every other eyebrow on these screens is
+      // plain English — PASSWORD, RECOVERY PHRASE, NETWORKS — and this one sat
+      // under a heading that had just called the same thing "an invite". "Blob"
+      // is what the wire calls it, not what the person pasting it calls it.
+      text "INVITE"
         with
           size=10.0
           wrap=none
@@ -1413,7 +1417,7 @@ component JoinScreen(busy:bool, error:str)
           r=10.0
         input "" #join-invite <-> blob
           with
-            label="Invite blob"
+            label="Invite"
             hint="🦆AAAA…"
             disabled=busy
             submit=emit(join_network_submit, blob)
