@@ -102,10 +102,18 @@ pub fn card_style(theme: &iced::Theme) -> iced::widget::container::Style {
 }
 
 /// Floating menu/popover surface, derived from the shared design tokens.
+///
+/// `popover`, not `glass.regular`: glass is a TRANSLUCENT role that only reads
+/// as a material when the renderer blurs what is behind it, and **iced has no
+/// backdrop blur** — the app window is opaque for exactly that reason. Painted
+/// without one, a 62%-alpha plate over a message just lets the message through
+/// it, so the sentence under a menu item and the item's own label overlapped
+/// and both became hard to read. `popover` is the design system's own opaque
+/// floating surface; the border and `elevation.popover` carry the lift.
 pub fn raised_style(theme: &iced::Theme) -> iced::widget::container::Style {
     let tokens = app_tokens(theme);
     iced::widget::container::Style {
-        background: Some(iced::Background::Color(tokens.glass.regular)),
+        background: Some(iced::Background::Color(tokens.palette.popover)),
         border: iced::Border {
             color: tokens.palette.border,
             width: 1.0,

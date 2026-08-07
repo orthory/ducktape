@@ -842,10 +842,13 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                       hovered bg=fg/10
                                       pressed bg=fg/15
                           if message_action == "editing"
+                            // NO max-w: this float is painted OVER the row it
+                            // edits, so anything narrower than the column
+                            // leaves the tail of the old message showing
+                            // beside the field.
                             box
                               with
                                 w=fill
-                                max-w=520.0
                                 p=3.0
                                 style=raised_style()
                               row
@@ -1812,7 +1815,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         box
                           with
                             w=fill
-                            max-w=520.0
                             p=3.0
                             style=raised_style()
                           row
