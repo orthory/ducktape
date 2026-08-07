@@ -244,6 +244,9 @@ pub fn page_document(
         .on_action(PageEvent::Action)
         .on_line_press(line_press)
         .margin_marks(marks, |_| PageEvent::OpenComments)
+        // The chip is painted inside the widget, so it can take no ice
+        // `label=` tooltip — this is the only thing that names it.
+        .margin_label("Open comments")
         // Line 0 is the title — it takes no gutter, like the reference
         // editor's title row.
         .on_gutter(|line, button| (line > 0).then_some(PageEvent::Gutter(line, button)))
