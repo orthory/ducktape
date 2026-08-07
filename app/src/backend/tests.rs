@@ -89,6 +89,34 @@ fn the_stored_tab_list_forgets_pages_that_are_gone() {
 }
 
 #[test]
+fn deleting_a_page_takes_its_subtree_with_it() {
+    let page = |id: &str, parent: &str| PageItem {
+        id: id.into(),
+        title: String::new(),
+        parent: parent.into(),
+        prefix: String::new(),
+        child_count: 0,
+    };
+    // root -> child -> grandchild, plus an unrelated sibling tree.
+    let pages = vec![
+        page("root", ""),
+        page("child", "root"),
+        page("grandchild", "child"),
+        page("other", ""),
+        page("other-child", "other"),
+    ];
+    let doomed = descendants_of(&pages, "root");
+    // `RemoveBlock` takes the whole subtree, so the correction has to as well —
+    // taking only the named row would leave orphans pointing at a gone parent.
+    assert!(doomed.contains("root") && doomed.contains("child") && doomed.contains("grandchild"));
+    assert!(!doomed.contains("other") && !doomed.contains("other-child"));
+    assert_eq!(doomed.len(), 3);
+    // A leaf takes only itself, and an id the index never had takes only itself.
+    assert_eq!(descendants_of(&pages, "grandchild").len(), 1);
+    assert_eq!(descendants_of(&pages, "gone").len(), 1);
+}
+
+#[test]
 fn a_stale_pages_reply_does_not_move_the_reader() {
     let listed = |ids: &[&str]| {
         ids.iter()

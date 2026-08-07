@@ -991,9 +991,50 @@ pub async fn delete_page(
             password,
         )
         .await?;
-        load_pages_data(&rpc, None).await.map_err(committed_error)
+        let mut data = load_pages_data(&rpc, None)
+            .await
+            .map_err(committed_error)?;
+        // DROP WHAT WAS JUST DELETED. Same acceptance-vs-application gap as
+        // `create_page`, read the other way round: this reload can still see
+        // the removed page, so it stayed in the sidebar, stayed selectable,
+        // and re-installed its blocks into the editor when picked — a document
+        // the network no longer has. `RemoveBlock` deletes the whole SUBTREE
+        // (pages/src/store.rs walks children with no page-kind stop), so every
+        // descendant goes with it, not just the row that was asked for.
+        let doomed = descendants_of(&data.pages, &page_id);
+        data.pages.retain(|page| !doomed.contains(&page.id));
+        if doomed.contains(&data.active_page) {
+            // Re-resolve exactly as `load_pages_data` would have, had the index
+            // already caught up: the first surviving page, or nothing.
+            data.active_page = data.pages.first().map(|page| page.id.clone()).unwrap_or_default();
+            data.active_page_title = String::new();
+            data.active_page_parent = String::new();
+            data.blocks = Vec::new();
+            data.comment_thread_total = 0;
+            data.commented_block_ids = Vec::new();
+        }
+        Ok(data)
     }
     .await
+}
+
+/// A page id and every page beneath it. `RemoveBlock` takes the subtree, so a
+/// caller correcting a stale read has to take the same set or it leaves orphans
+/// pointing at a parent that is gone.
+pub(crate) fn descendants_of(pages: &[PageItem], root: &str) -> BTreeSet<String> {
+    let mut doomed = BTreeSet::from([root.to_string()]);
+    // The index is not depth-ordered, so sweep until nothing new is added.
+    loop {
+        let before = doomed.len();
+        for page in pages {
+            if doomed.contains(&page.parent) {
+                doomed.insert(page.id.clone());
+            }
+        }
+        if doomed.len() == before {
+            return doomed;
+        }
+    }
 }
 
 pub async fn search_pages(

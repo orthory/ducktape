@@ -538,6 +538,51 @@ pub async fn load_chat_hit(
     .map_err(app_error)
 }
 
+/// Land on the channel that was just made.
+///
+/// `submit_frame` returns when the node ACCEPTS a transaction, not when it
+/// applies one, so a reload issued immediately after can read an index that
+/// does not hold the new channel yet. `load_chat_data` is RIGHT to drop a
+/// requested id it cannot see and fall back to `channels.first()` — a live
+/// refresh can legitimately name a channel that has since been archived away —
+/// so the correction belongs in the callers that know their id is good.
+///
+/// The fallback is not cosmetic here. Opening a DM left the DM header on
+/// screen while `active_channel` pointed at whatever unrelated public room
+/// sorted first, so the composer under that header posted into it.
+///
+/// `members` is seeded rather than left for the refresh because `post_gate`
+/// refuses a members-only channel the viewer is not seated in: an empty list
+/// would gate the composer of the DM you just opened.
+fn landed_on_channel(
+    mut data: ChatData,
+    channel_id: String,
+    name: String,
+    members_only: bool,
+    members: Vec<ChatMember>,
+) -> ChatData {
+    if data.active_channel == channel_id {
+        return data;
+    }
+    data.active_channel = channel_id;
+    data.active_channel_name = name;
+    data.active_channel_archived = false;
+    data.active_channel_members_only = members_only;
+    data.active_channel_huddle_count = 0;
+    data.huddle_roster = Vec::new();
+    data.channel_members = members;
+    data.messages = Vec::new();
+    data.selected_message_seq = 0;
+    data.selected_message_rev = 0;
+    data.selected_message_body = String::new();
+    data.active_thread_seq = 0;
+    data.thread_target_seq = 0;
+    data.thread_messages = Vec::new();
+    data.thread_next_reply_offset = 0;
+    data.thread_has_more = false;
+    data
+}
+
 pub async fn create_channel(
     rpc: String,
     password: String,
@@ -546,6 +591,7 @@ pub async fn create_channel(
 ) -> Result<ChatData, AppError> {
     async {
         let name = bounded_text(name, "channel name", 128)?;
+        let landing_name = name.clone();
         let channel_id = fresh_id("channel");
         let rpc = rpc_client(&rpc)?;
         signed_write(
@@ -562,9 +608,16 @@ pub async fn create_channel(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
+        let data = load_chat_data(&rpc, Some(&channel_id))
             .await
-            .map_err(committed_error)
+            .map_err(committed_error)?;
+        Ok(landed_on_channel(
+            data,
+            channel_id,
+            landing_name,
+            members_only,
+            Vec::new(),
+        ))
     }
     .await
 }
@@ -691,6 +744,7 @@ pub async fn open_dm(
             .await
             .ok_or_else(|| "this device has no user key — a DM needs one".to_string())?;
         let channel_id = dm_channel_id(hex_encode(&me), hex_encode(&peer));
+        let peer_name = short_label(&hex_encode(&peer));
         let client = rpc_client(&rpc)?;
         let existing = load_chat_data(&client, Some(&channel_id)).await?;
         if existing.active_channel == channel_id {
@@ -701,12 +755,21 @@ pub async fn open_dm(
             "chat",
             chat::encode_msg(&ChatMsg::CreateChannel {
                 channel_id: channel_id.clone(),
-                name: short_label(&hex_encode(&peer)),
+                name: peer_name.clone(),
                 post_policy: PostPolicy::MembersOnly,
             }),
             password.clone(),
         )
         .await?;
+        let seated = [&me, &peer]
+            .map(|key| {
+                let handle = hex_encode(key);
+                ChatMember {
+                    label: short_label(&handle),
+                    key: handle,
+                }
+            })
+            .to_vec();
         for member in [me, peer] {
             signed_write(
                 &client,
@@ -721,9 +784,10 @@ pub async fn open_dm(
             .await
             .map_err(committed_error)?;
         }
-        load_chat_data(&client, Some(&channel_id))
+        let data = load_chat_data(&client, Some(&channel_id))
             .await
-            .map_err(committed_error)
+            .map_err(committed_error)?;
+        Ok(landed_on_channel(data, channel_id, peer_name, true, seated))
     }
     .await
 }
