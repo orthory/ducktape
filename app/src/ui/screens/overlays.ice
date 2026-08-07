@@ -310,69 +310,75 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
             if searching
               text "Searching…" size=12.5 @text-muted
             if !empty(chat_hits) || !empty(page_hits)
-              scroll
-                with
-                  dir=vertical
-                  w=fill
-                  h=380.0
-                col w=fill gap=4.0
-                  if !empty(chat_hits)
-                    box w=fill pl=4.0
-                      text "MESSAGES"
-                        with
-                          size=10.0
-                          font=code_semibold
-                          @text-muted
-                    col w=fill gap=1.0
-                      for hit in chat_hits
-                        button -> emit(open_chat_search_hit, hit.channel_id, hit.root_seq, hit.seq)
-                          with
-                            label="Open message"
-                            w=fill
-                            p=6.0
-                            @ghost_action
-                          col w=fill gap=1.0
-                            text hit.text
+              // HUGS ITS RESULTS, up to a ceiling. A flat `h=380.0` meant one
+              // hit sat at the top of a 380px panel with the rest of it empty —
+              // the palette claimed a third of the window to show a single line.
+              // `h=shrink` under a `max-h` box grows with the list and stops
+              // before the palette outgrows the window.
+              box w=fill max-h=380.0
+                scroll
+                  with
+                    dir=vertical
+                    w=fill
+                    h=shrink
+                  col w=fill gap=4.0
+                      if !empty(chat_hits)
+                        box w=fill pl=4.0
+                          text "MESSAGES"
+                            with
+                              size=10.0
+                              font=code_semibold
+                              @text-muted
+                        col w=fill gap=1.0
+                          for hit in chat_hits
+                            button -> emit(open_chat_search_hit, hit.channel_id, hit.root_seq, hit.seq)
                               with
-                                size=13.0
-                                wrap=none
-                                @text-fg
-                            text hit.meta
+                                label="Open message"
+                                w=fill
+                                p=6.0
+                                @ghost_action
+                              col w=fill gap=1.0
+                                text hit.text
+                                  with
+                                    size=13.0
+                                    wrap=none
+                                    @text-fg
+                                text hit.meta
+                                  with
+                                    size=11.0
+                                    wrap=none
+                                    font=code_medium
+                                    @text-muted
+                              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                              hovered bg=row_hover text=fg
+                              pressed bg=accent
+                      if !empty(page_hits)
+                        box w=fill pl=4.0
+                          text "PAGES"
+                            with
+                              size=10.0
+                              font=code_semibold
+                              @text-muted
+                        col w=fill gap=1.0
+                          for hit in page_hits
+                            button -> emit(open_page_search_hit, hit.page_id, hit.block_id)
                               with
-                                size=11.0
-                                wrap=none
-                                font=code_medium
-                                @text-muted
-                          active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-                          hovered bg=row_hover text=fg
-                          pressed bg=accent
-                  if !empty(page_hits)
-                    box w=fill pl=4.0
-                      text "PAGES"
-                        with
-                          size=10.0
-                          font=code_semibold
-                          @text-muted
-                    col w=fill gap=1.0
-                      for hit in page_hits
-                        button -> emit(open_page_search_hit, hit.page_id, hit.block_id)
-                          with
-                            label="Open page"
-                            w=fill
-                            p=6.0
-                            @ghost_action
-                          col w=fill gap=1.0
-                            text hit.text
-                              with
-                                size=13.0
-                                wrap=none
-                                @text-fg
-                            text hit.kind
-                              with
-                                size=12.0
-                                wrap=none
-                                font=code
-                                @text-muted
-                          active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-                          hovered bg=row_hover text=fg
-                          pressed bg=accent
+                                label="Open page"
+                                w=fill
+                                p=6.0
+                                @ghost_action
+                              col w=fill gap=1.0
+                                text hit.text
+                                  with
+                                    size=13.0
+                                    wrap=none
+                                    @text-fg
+                                text hit.kind
+                                  with
+                                    size=12.0
+                                    wrap=none
+                                    font=code
+                                    @text-muted
+                              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                              hovered bg=row_hover text=fg
+                              pressed bg=accent
