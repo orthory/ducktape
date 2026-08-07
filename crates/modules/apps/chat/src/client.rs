@@ -897,7 +897,7 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
     ChatMessage {
         id: row.message_id,
         seq: number_i64(row.seq),
-        author: author_name(&row.author),
+        author: author_display(&row.author, current_user),
         meta,
         body: if row.deleted {
             "Message deleted".into()
@@ -1115,6 +1115,21 @@ pub fn author_handle(author: &AuthorRef) -> String {
 
 /// The display name for a rendered author string (`user:{id}`,
 /// `agent:{module}/{agent}`, `module:{id}`, or `system`).
+/// The author label a READER sees: `you` for the reader's own writing, the
+/// rendered handle otherwise.
+///
+/// Every other surface in the shell already says `you` — the huddle roster, the
+/// member roster — while the timeline printed the reader's own messages as
+/// `user 3f8dc828…`, a hex nobody recognises as themselves. The plain
+/// [`author_name`] stays for the places that render an author with no reader in
+/// frame (a page comment's opener, a wire label).
+pub fn author_display(author: &str, current_user: Option<&[u8]>) -> String {
+    match authored_by_user(author, current_user) {
+        true => "you".into(),
+        false => author_name(author),
+    }
+}
+
 pub fn author_name(author: &str) -> String {
     match author.split_once(':') {
         Some(("user", id)) => format!("user {}", short_label(id)),
@@ -1486,6 +1501,25 @@ mod tests {
         let thread = apply_chat_thread(vec![root], delta, "general".into(), 1);
         assert_eq!(thread[0].reply_count, 2, "the rail's replies rule reads this");
         assert!(thread.iter().any(|message| message.seq == 3));
+    }
+
+    #[test]
+    fn a_reader_sees_their_own_writing_as_you() {
+        let me = vec![0xab; 32];
+        let mine = format!("user:{}", hex_encode(&me));
+        let theirs = format!("user:{}", hex_encode(&[0xcd; 32]));
+
+        assert_eq!(author_display(&mine, Some(&me)), "you");
+        // The same row read by anyone else is still the handle.
+        assert_eq!(author_display(&mine, Some(&[0xcd; 32])), author_name(&mine));
+        assert_eq!(author_display(&theirs, Some(&me)), author_name(&theirs));
+        // No local key (the boot race) renders nobody as `you`.
+        assert_eq!(author_display(&mine, None), author_name(&mine));
+        // An agent is never the reader.
+        assert_eq!(
+            author_display("agent:demo/quackbot", Some(&me)),
+            "@quackbot"
+        );
     }
 
     #[test]
