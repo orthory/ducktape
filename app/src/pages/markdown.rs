@@ -48,6 +48,10 @@ const CODE_PLATE_PAD: f32 = 15.0;
 /// shaped run and takes the caret's column with it. The reference uses the
 /// same hair-width value for the same reason.
 const HIDDEN_SIZE: f32 = 0.01;
+/// One nesting step, as left padding. The two spaces the depth is SPELLED
+/// with measure ~8px in the body face — legible as "something is different",
+/// useless as "this item belongs to that one".
+const NEST_STEP: f32 = 22.0;
 
 /// Where the caret is, and which palette is being painted. The whole point of
 /// carrying it into the highlighter is the marker reveal: syntax on the caret's
@@ -73,6 +77,9 @@ pub enum Mark {
     },
     Body(Style),
     ListMarker(Style),
+    /// A line's leading whitespace. Collapsed to nothing — the nesting step
+    /// it stands for is painted as the line's left padding instead.
+    Indent(Style),
     /// A todo's `[ ]`/`[x]` — drawn as a checkbox (the span highlight is the
     /// box), never as bracket glyphs.
     Tick {
@@ -98,6 +105,10 @@ pub struct Style {
     pub commented: bool,
     /// A checked todo's content — muted and struck through.
     pub done: bool,
+    /// The line's nesting depth. It is drawn as LEFT PADDING rather than as
+    /// the two literal spaces it is spelled with — a space of the body face
+    /// is ~4px, which reads as no nesting at all.
+    pub indent: u8,
 }
 
 /// The block shape a line's leading bytes declare. `Body` is the absence of a
@@ -292,24 +303,17 @@ fn highlight(
         divider: prefix == Prefix::Divider,
         commented,
         done: ticked_done,
+        indent: super::sync::split_indent(line).0.min(u8::MAX.into()) as u8,
         ..Style::default()
     };
 
     let mut marks = Vec::new();
-    // The leading indent is LAYOUT, not syntax: a COLLAPSED marker run that
-    // starts at 0 swallows it, and a nested item then draws flush with its
-    // parent. It gets its own full-width run ahead of every hidden marker.
+    // The leading indent is LAYOUT, not syntax. It gets its own run so that no
+    // marker run starts at column 0 — a COLLAPSED marker that did swallowed
+    // the indent with it, and the nested item drew flush with its parent.
     let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
-    let marker_collapses =
-        ticked || matches!(prefix, Prefix::Heading(_) | Prefix::Quote | Prefix::Callout);
-    if indent > 0 && marker_collapses {
-        marks.push((
-            0..indent,
-            Mark::Marker {
-                hidden: false,
-                style,
-            },
-        ));
+    if indent > 0 && prefix != Prefix::Divider {
+        marks.push((0..indent, Mark::Indent(style)));
     }
     // The marker run. A list keeps its own — it IS the bullet the reader
     // sees — but a todo's bullet yields to the checkbox: the `- ` reveals
@@ -317,7 +321,7 @@ fn highlight(
     match prefix {
         Prefix::Body => {}
         Prefix::List => match ticked {
-            false => marks.push((0..content, Mark::ListMarker(style))),
+            false => marks.push((indent..content, Mark::ListMarker(style))),
             true => {
                 marks.push((
                     indent..content - 4,
@@ -514,6 +518,30 @@ fn code_plate(ink: &Ink) -> TextHighlight {
 
 /// The paint for one run. This is the whole visual contract of the surface.
 pub fn format(mark: &Mark, dark: bool) -> Format {
+    let mut format = paint(mark, dark);
+    // Depth is padding, not glyphs. Every run of the line asks for the same
+    // inset: the layout takes it from the LAST run that wants one, and a code
+    // plate or callout tile further along would otherwise drop it.
+    format.line_padding.left += nest(mark);
+    format
+}
+
+/// The nesting inset a run's line is owed.
+fn nest(mark: &Mark) -> f32 {
+    let style = match *mark {
+        Mark::Indent(style)
+        | Mark::Body(style)
+        | Mark::ListMarker(style)
+        | Mark::Marker { style, .. }
+        | Mark::Tick { style, .. } => style,
+        // The title is line 0 and a fence keeps the indentation it is written
+        // with — neither nests.
+        Mark::Title | Mark::Fence { .. } | Mark::CodeBody => return 0.0,
+    };
+    f32::from(style.indent) * NEST_STEP
+}
+
+fn paint(mark: &Mark, dark: bool) -> Format {
     let ink = ink(dark);
     match *mark {
         Mark::Title => Format {
@@ -553,6 +581,17 @@ pub fn format(mark: &Mark, dark: bool) -> Format {
             color: Some(ink.muted),
             ..body_format(style, ink)
         },
+        Mark::Indent(style) => {
+            let mut format = body_format(style, ink);
+            format.strikethrough = None;
+            format.color = Some(Color::TRANSPARENT);
+            format.size = Some(Pixels(HIDDEN_SIZE));
+            // A line that is NOTHING but indent has no other run to carry its
+            // height, so this one holds the body metrics absolutely — the same
+            // job the tick does beside a collapsed bullet.
+            format.line_height = Some(LineHeight::Absolute(Pixels(BODY_SIZE * BODY_LINE_HEIGHT)));
+            format
+        }
         Mark::Tick { checked, style } => {
             // The bracket glyphs are scaffolding: the box the reader sees is
             // the span highlight drawn around them — an outline until the
@@ -824,35 +863,49 @@ mod tests {
         assert_eq!(body.color, Some(LIGHT.muted));
     }
 
-    /// The nesting step is the leading whitespace itself, so a collapsed marker
-    /// run must not start at column 0 — a nested todo drew flush with its
-    /// parent while the `- ` run swallowed the indent.
+    /// The nesting step is drawn as the line's left padding, not as the two
+    /// spaces it is spelled with — those are ~8px and read as no nesting. The
+    /// spaces themselves collapse so the step is exactly one `NEST_STEP`.
     #[test]
-    fn a_collapsed_marker_leaves_the_indent_at_full_width() {
-        let full_width = |marks: &[(Range<usize>, Mark)]| {
+    fn a_nested_line_is_inset_by_padding_and_its_indent_glyphs_collapse() {
+        let inset = |marks: &[(Range<usize>, Mark)], steps: f32| {
             let indent = marks
                 .iter()
                 .find(|(range, _)| *range == (0..2))
                 .expect("an indent run");
-            let size = format(&indent.1, false).size;
-            assert!(
-                size.is_none_or(|size| size.0 > HIDDEN_SIZE),
-                "the indent collapsed: {marks:?}"
-            );
+            let format = format(&indent.1, false);
+            assert_eq!(format.size, Some(Pixels(HIDDEN_SIZE)), "{marks:?}");
+            assert_eq!(format.line_padding.left, steps * NEST_STEP, "{marks:?}");
         };
+
         let (todo, _) = highlight("  - [ ] nested", false, false, false);
-        full_width(&todo);
+        inset(&todo, 1.0);
+        assert!(matches!(todo[0].1, Mark::Indent(_)));
         assert_eq!(todo[1].0, 2..4);
         assert!(matches!(todo[1].1, Mark::Marker { hidden: true, .. }));
 
+        // Every run of the line asks for the same inset, so a later run with
+        // its own padding cannot drop it.
         let (heading, _) = highlight("  ## nested", false, false, false);
-        full_width(&heading);
+        inset(&heading, 1.0);
         assert_eq!(heading[1].0, 2..5);
+        for (_, mark) in &heading {
+            assert_eq!(format(mark, false).line_padding.left, NEST_STEP);
+        }
 
-        // A visible list marker already carried its own indent.
-        let (bullet, _) = highlight("  - nested", false, false, false);
-        assert_eq!(bullet[0].0, 0..4);
-        assert!(matches!(bullet[0].1, Mark::ListMarker(_)));
+        let (bullet, _) = highlight("    - deeper", false, false, false);
+        assert!(matches!(bullet[0].1, Mark::Indent(_)));
+        assert_eq!(
+            format(&bullet[0].1, false).line_padding.left,
+            2.0 * NEST_STEP
+        );
+        assert_eq!(bullet[1].0, 4..6);
+        assert!(matches!(bullet[1].1, Mark::ListMarker(_)));
+
+        // A line at the margin asks for nothing and gets no indent run.
+        let (flat, _) = highlight("- flat", false, false, false);
+        assert_eq!(flat[0].0, 0..2);
+        assert_eq!(format(&flat[0].1, false).line_padding.left, 0.0);
     }
 
     #[test]
