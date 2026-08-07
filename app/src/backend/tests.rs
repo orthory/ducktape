@@ -2185,25 +2185,6 @@ fn reply_settle_flash_mirrors_the_stream_for_the_thread_rail() {
 }
 
 #[test]
-fn leaving_chat_prunes_scrollback_to_one_load() {
-    let mut messages = Vec::new();
-    for seq in 0..(CHAT_TIMELINE_ROOT_LIMIT + 50) {
-        messages = optimistic_message(messages, format!("m{seq}"), format!("id-{seq}"));
-    }
-    // Staying on chat keeps the paged-in scrollback…
-    let kept = trim_timeline_on_leave("chat".into(), messages.clone());
-    assert_eq!(kept.len(), CHAT_TIMELINE_ROOT_LIMIT + 50);
-    // …and leaving prunes to one load's worth, newest rows surviving.
-    let trimmed = trim_timeline_on_leave("pages".into(), messages);
-    assert_eq!(trimmed.len(), CHAT_TIMELINE_ROOT_LIMIT);
-    assert_eq!(
-        trimmed.last().unwrap().body,
-        format!("m{}", CHAT_TIMELINE_ROOT_LIMIT + 49)
-    );
-    assert_eq!(trimmed.first().unwrap().body, "m50");
-}
-
-#[test]
 fn send_settle_flash_fires_only_for_own_pending_rows() {
     let pending = optimistic_message(Vec::new(), "hello".into(), "message-a".into());
     let mut settled_row = pending[0].clone();

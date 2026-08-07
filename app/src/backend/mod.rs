@@ -58,16 +58,18 @@ const PROVISION_PATIENCE: u32 = 8;
 /// The voting window a membership proposal opens with, in consensus seconds —
 /// the same value the CLI's membership ceremony uses.
 const GOVERNANCE_VOTING_PERIOD: u64 = 1_000_000;
-/// How many thread roots one timeline load mounts. This number IS the cost of
-/// switching into chat: the shell routes modules with a `match tab`, so the
-/// inactive screen is not built at all and every row's lazy cache dies with it
-/// — coming back pays one cold widget build plus one cold text layout per row,
-/// on the UI thread, in one frame. The viewport shows ~15 rows, so 40 is ~2.5
-/// screens of scrollback and "Load older messages" pages in the rest.
+/// How many thread roots a timeline load asks for before it stops spending
+/// round trips. This is a REQUEST bound, not a render bound: the timeline is
+/// virtualized (`virtual-row` on the message column), so rows the viewport
+/// cannot see are never laid out and mounting more of them is free. What is
+/// not free is the walk that fetches them — each step is a `MessagesRange`
+/// RPC. Once a walk has this many roots in hand it has enough to fill several
+/// screens, so it stops asking and leaves the rest to "Load older messages".
 ///
-/// ponytail: a knob, not a measured optimum — raise it when the timeline
-/// virtualizes and the mount stops being linear in it.
-const CHAT_TIMELINE_ROOT_LIMIT: usize = 40;
+/// Whatever the page that crossed the quota carried over it is kept: the rows
+/// already came over the wire, and discarding them only to fetch them again on
+/// the next click is pure waste.
+const CHAT_TIMELINE_ROOT_QUOTA: usize = 40;
 /// The chat view clamps one message page to 256 rows (default 50, max 256), so
 /// the timeline walk steps in 256-row pages.
 const CHAT_VIEW_PAGE_LIMIT: u64 = 256;

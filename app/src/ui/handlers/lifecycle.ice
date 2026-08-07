@@ -487,10 +487,6 @@ on select_shell_tab(next)
   // she is away, then hand the stale claim straight back on the return trip.
   // Every handler that writes `shell_tab` retires it, linted in tests.rs.
   composer_focus = "none"
-  // Leaving Chat prunes paged-in scrollback to one load's worth: the return
-  // trip cold-rebuilds every mounted row in one frame, so the mount cost must
-  // not compound with how far she once paged back. "Load older" re-earns it.
-  messages = trim_timeline_on_leave(next, messages)
   has_older_history = history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   // A hydration error belongs to the pane that raised it. Leaving it up after
