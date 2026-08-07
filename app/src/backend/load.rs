@@ -37,7 +37,7 @@ pub(crate) async fn load_workspace(
         active_page_title: pages.active_page_title,
         active_page_parent: pages.active_page_parent,
         comment_thread_total: pages.comment_thread_total,
-        commented_block_ids: pages.commented_block_ids,
+        commented_block_hits: pages.commented_block_hits,
     })
 }
 
@@ -695,7 +695,7 @@ pub(crate) async fn load_pages_data(
             active_page_title: String::new(),
             active_page_parent,
             comment_thread_total: 0,
-            commented_block_ids: Vec::new(),
+            commented_block_hits: Vec::new(),
         });
     }
     let wire_blocks = load_page_blocks(rpc, &active_page).await?;
@@ -710,7 +710,7 @@ pub(crate) async fn load_pages_data(
     let block_ids: Vec<String> = blocks.iter().map(|block| block.id.clone()).collect();
     let threads = query_page_thread_rows(rpc, &active_page, &block_ids).await?;
     let comment_thread_total = count_i64(threads.len());
-    let commented_block_ids = commented_targets(&active_page, &threads);
+    let commented_block_hits = commented_targets(&active_page, &threads);
     Ok(PagesData {
         pages,
         blocks,
@@ -718,7 +718,7 @@ pub(crate) async fn load_pages_data(
         active_page_title,
         active_page_parent,
         comment_thread_total,
-        commented_block_ids,
+        commented_block_hits,
     })
 }
 
@@ -739,8 +739,14 @@ pub(crate) async fn query_page_thread_rows(
     Ok(groups.into_iter().flat_map(|group| group.threads).collect())
 }
 
-/// The BLOCK ids carrying an unresolved thread — the page's own id is not a
-/// line, so it never marks one.
+/// ONE ENTRY PER UNRESOLVED THREAD, not per block — the repetition IS the
+/// count the margin chip spells. This deduplicated, which threw the count away
+/// three layers before the chip that needed it: every commented line drew the
+/// same three dots whether it carried one stray note or a whole argument, and
+/// the only way to tell them apart was to open the rail and read it.
+///
+/// The page's own id is not a line, so it never marks one. Sorted so equal
+/// targets sit together and the fold that counts them is a single pass.
 pub(crate) fn commented_targets(page_id: &str, threads: &[ThreadRow]) -> Vec<String> {
     let mut targets: Vec<String> = threads
         .iter()
@@ -748,7 +754,6 @@ pub(crate) fn commented_targets(page_id: &str, threads: &[ThreadRow]) -> Vec<Str
         .map(|thread| thread.target.clone())
         .collect();
     targets.sort();
-    targets.dedup();
     targets
 }
 

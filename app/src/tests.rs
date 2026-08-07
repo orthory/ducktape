@@ -174,7 +174,7 @@ fn live_refresh(
         active_page: active_page.into(),
         active_page_title: active_page.into(),
         comment_thread_total: 0,
-        commented_block_ids: Vec::new(),
+        commented_block_hits: Vec::new(),
         active_page_parent: String::new(),
     }
 }
@@ -2399,8 +2399,14 @@ fn block_comments_dock_a_rail_beside_the_document() {
     // thread opened with the page id is refused by the node.
     assert!(handlers.contains("on open_block_comment_thread(id, target)"));
     // The document wears its comment story: washes from the load, resolve
-    // available from the open thread.
-    assert!(pages.contains("commented_lines(blocks, commented_block_ids)"));
+    // available from the open thread. The editor is handed the BLOCKS and the
+    // raw hit list rather than a precomputed line set, because the chip in the
+    // margin spells how many threads sit on the line and the count is the
+    // repetition in `commented_block_hits` — a precomputed `[i64]` of lines
+    // has already thrown it away.
+    assert!(pages.contains(
+        "page_document(page_editor, dark, (loading || !connected), blocks, commented_block_hits)"
+    ));
     assert!(pages.contains("-> emit(resolve_thread_submit, true)"));
 }
 

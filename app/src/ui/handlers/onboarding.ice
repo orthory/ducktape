@@ -238,7 +238,7 @@ on console_opened(id)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  commented_block_ids = []
+  commented_block_hits = []
   caret_comment_target = ""
   page_editor = editor("")
   page_saved_text = ""

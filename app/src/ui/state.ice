@@ -258,7 +258,7 @@ state
   // The page's comment story, live from every page load: the block ids
   // carrying an unresolved thread (the document's washes) and the caret's
   // own block (where a fresh comment anchors), tracked per edit.
-  commented_block_ids:[str] = []
+  commented_block_hits:[str] = []
   page_link = ""
   caret_comment_target = ""
   active_thread_target = ""

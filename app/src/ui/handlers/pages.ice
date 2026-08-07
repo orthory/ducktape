@@ -187,7 +187,7 @@ on block_threads_loaded(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = next.threads
   block_comment_thread_total = next.total
-  commented_block_ids = commented_targets_of(next.threads, active_page)
+  commented_block_hits = commented_targets_of(next.threads, active_page)
   block_comment_threads_next_from = next.next_from
   block_comment_threads_has_more = next.has_more
   block_comment_threads_loading = false
@@ -374,7 +374,7 @@ on pages_updated(next)
   page_saved_text = keep_str(page_install, page_landing, page_saved_text)
   page_refusal = ""
   block_comment_thread_total = next.comment_thread_total
-  commented_block_ids = next.commented_block_ids
+  commented_block_hits = next.commented_block_hits
   caret_comment_target = ""
   block_autosave_status = "idle"
   block_autosave_generation = block_autosave_generation + 1
@@ -419,7 +419,7 @@ on pages_mutated(next)
   page_saved_text = keep_str(page_install, page_landing, page_saved_text)
   page_refusal = ""
   block_comment_thread_total = next.comment_thread_total
-  commented_block_ids = next.commented_block_ids
+  commented_block_hits = next.commented_block_hits
   block_autosave_status = "idle"
   page_delete_armed = false
   mutation_phase = "idle"
