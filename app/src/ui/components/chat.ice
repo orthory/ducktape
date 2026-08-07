@@ -537,7 +537,7 @@ component MessageContents(message:ChatMessage, flash:f64)
               style=icon_tint("success-tick")
               opacity=flash
 
-component MessageCard(message:ChatMessage, selected:bool, disabled:bool, flash:f64)
+component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool, flash:f64)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -549,7 +549,13 @@ component MessageCard(message:ChatMessage, selected:bool, disabled:bool, flash:f
   // rebuild per row crossing. A cached lazy row keeps its toolbar at native
   // latency; that is the whole point (the state-driven version left the
   // highlight trailing the cursor by the queued rebuilds).
-  hover tint=row_hover r=9.0
+  //
+  // `open=` is the one thing the cursor does NOT decide. The ♡ and ⋯ buttons
+  // open a card anchored on this row; `menu_open` is that card's own
+  // openness, handed back so the toolbar dies WITH it. Without it the next
+  // mouse move erased the toolbar and left the emoji picker pointing at a
+  // button that was no longer there.
+  hover tint=row_hover r=9.0 open=menu_open
     stack w=fill
       if message.deleted
         box
@@ -719,15 +725,17 @@ component MessageCard(message:ChatMessage, selected:bool, disabled:bool, flash:f
 // `open_thread_for` is forwarded only because `MessageContents` declares it:
 // it fires from the reply pill, and a reply carries no replies
 // (`reply_count` only ever climbs on a root), so the pill never renders here.
-component ThreadMessageCard(message:ChatMessage, selected:bool, disabled:bool, flash:f64)
+component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool, flash:f64)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
-  // Same draw-time hover as MessageCard — see the note there.
-  hover tint=row_hover r=9.0
+  // Same draw-time hover as MessageCard — see the note there. `menu_open` is
+  // a prop of its own and not `selected` because in the rail `selected` means
+  // the deep-link TARGET reply, which is not the row whose menu is up.
+  hover tint=row_hover r=9.0 open=menu_open
     stack w=fill
       if message.deleted
         box
