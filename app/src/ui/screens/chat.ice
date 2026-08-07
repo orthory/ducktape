@@ -1373,6 +1373,12 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   pt=10.0
                   pb=12.0
                 col w=fill
+                  // A SOFT danger plate, not `@danger_action`. Every other
+                  // `@danger_action` in the app confirms a destroy — Delete
+                  // message, Discard draft. Archiving is the same toggle as the
+                  // `Unarchive channel` button that replaces it, and wearing the
+                  // loudest control in the app made a reversible state change
+                  // read as the point of no return.
                   if !active_channel_archived
                     button "Archive channel" -> emit(archive_channel_submit)
                       with
@@ -1380,7 +1386,10 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         w=fill
                         h=30.0
                         p=6.0
-                        @danger_action
+                        @secondary_action
+                      active bg=danger_zone_bg text=danger border=danger_zone_line border-w=1.0 r=9.0
+                      hovered bg=danger_bg text=danger border=danger_line
+                      pressed bg=danger_line text=fg
                   if active_channel_archived
                     button "Unarchive channel" -> emit(unarchive_channel_submit)
                       with
