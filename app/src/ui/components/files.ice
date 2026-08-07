@@ -158,25 +158,19 @@ component CrumbBar(path:str, dirs:i64, files:i64)
             gap=4.0
             align=center
             pl=4.0
-          text files
+          text plural(files, "file", "files")
             with
               size=11.0
               wrap=none
               font=code
               @text-hint
-          text "files ·"
+          text "·"
             with
               size=11.0
               wrap=none
               font=code
               @text-hint
-          text dirs
-            with
-              size=11.0
-              wrap=none
-              font=code
-              @text-hint
-          text "dirs"
+          text plural(dirs, "dir", "dirs")
             with
               size=11.0
               wrap=none

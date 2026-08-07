@@ -35,12 +35,12 @@ component PageButton(page:PageItem, selected:bool)
               name="doc"
               tone="label"
               px=14.0
-          text page.title
-            with
-              w=fill
-              size=12.5
-              wrap=none
-              @text-fg
+          box w=fill clip=true
+            text page.title
+              with
+                size=12.5
+                wrap=none
+                @text-fg
         active bg=subtle text=fg border=transparent border-w=1.0 r=7.0
         hovered bg=rail_hover text=fg
         pressed bg=subtle text=fg
@@ -69,12 +69,12 @@ component PageButton(page:PageItem, selected:bool)
               name="doc"
               tone="label"
               px=14.0
-          text page.title
-            with
-              w=fill
-              size=12.5
-              wrap=none
-              @text-muted
+          box w=fill clip=true
+            text page.title
+              with
+                size=12.5
+                wrap=none
+                @text-muted
         active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
         hovered bg=rail_hover text=fg
         pressed bg=subtle text=fg

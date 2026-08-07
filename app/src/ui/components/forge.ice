@@ -78,13 +78,13 @@ component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str)
             @text-brand_fg
       space w=fill
       row gap=5.0 align=center
-        text repos
+        text plural(repos, "repository", "repositories")
           with
             size=10.5
             wrap=none
             font=code_medium
             @text-meta
-        text "repositories ·"
+        text "·"
           with
             size=10.5
             wrap=none
