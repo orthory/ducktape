@@ -321,7 +321,6 @@ state
   node_last_finalized:i64 = 0
   node_checkpoint:i64 = 0
   node_tab = "overview"
-  status_card_open = false
   // ROSTER — members and agents share one screen, so they share one filter.
   members_filter = "all"
   members_selected = ""

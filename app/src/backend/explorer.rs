@@ -142,22 +142,42 @@ pub fn palette_key_action(
 }
 
 /// The surface Escape dismisses — the TOPMOST transient layer only, and the
-/// ladder's order IS the z-order. Menus, popovers, the create modal and the
-/// bell close; persistent rails (thread, comments, the channel drawer) keep
-/// their explicit × — closing one from a global key would also have to
-/// adjudicate its half-typed drafts. The palette is absent on purpose:
-/// `palette_key_action` owns its keys, and an open palette swallows Escape.
+/// ladder's order IS the z-order. Menus, popovers, the create modal, the bell
+/// and the channel drawer close; the thread and comments rails keep their
+/// explicit × — closing one from a global key would also have to adjudicate
+/// its half-typed drafts. The drawer carries no such debt: its only opener
+/// re-seeds `channel_name_draft` from the live channel name on every open, so
+/// an Escape close leaks nothing its × doesn't. The palette is absent on
+/// purpose: `palette_key_action` owns its keys, and an open palette swallows
+/// Escape.
+///
+/// RUNG CORRECTNESS DEPENDS ON `shell_tab`. Every rung below is scoped to the
+/// tab whose screen actually mounts its surface, because no tab switch clears
+/// any of this state — `select_shell_tab` writes `shell_tab` and nothing else.
+/// A flag left set on the tab you came from names a layer that is no longer on
+/// screen, and Escape then "closes" an invisible surface while the visible one
+/// stays up. Which scope a rung gets is read off `view.ice`'s slot layout, not
+/// guessed: `slot chat` / `slot pages` / `slot forge` sit inside
+/// `match tab`, so ChatScreen, PagesScreen and ForgeScreen are per-tab mounts,
+/// while `slot palette` and `slot bell` sit OUTSIDE it — the bell and the
+/// create modal ride every tab and their rungs stay global on purpose.
 //
-// One argument per closable surface: the Ice extern surface is flat, and the
-// ladder must see every layer at once to name the topmost.
+// One argument per closable surface plus the tab that scopes them: the Ice
+// extern surface is flat, and the ladder must see every layer at once to name
+// the topmost. Scoping lives HERE rather than in the call site's argument list
+// — a conjunction per caller is one guard per rung to forget, and three of
+// these rungs were already wrong that way.
 #[allow(clippy::too_many_arguments)]
 pub fn escape_target(
     logical: iced::keyboard::Key,
+    shell_tab: String,
     palette_open: bool,
     bell_open: bool,
     channel_create_open: bool,
     thread_message_action: String,
     message_action: String,
+    channel_settings_open: bool,
+    page_delete_armed: bool,
     forge_repo_menu: bool,
 ) -> String {
     use iced::keyboard::{Key, key::Named};
@@ -165,22 +185,48 @@ pub fn escape_target(
     if not_escape || palette_open {
         return String::new();
     }
+    let on_chat = shell_tab == "chat";
+    let on_pages = shell_tab == "pages";
+    let on_forge = shell_tab == "forge";
+    // Window-level layers: `view.ice` mounts both outside the tab match, so
+    // they stay on screen across a switch and answer Escape from any tab.
     if bell_open {
         return "bell".into();
     }
     if channel_create_open {
         return "channel_create".into();
     }
-    if thread_message_action != "toolbar" {
+    if on_chat && thread_message_action != "toolbar" {
         return "thread_menu".into();
     }
-    if message_action != "toolbar" {
+    if on_chat && message_action != "toolbar" {
         return "message_menu".into();
     }
-    // The pages block-actions menu and insert row used to sit here. The page
-    // document has neither: there is no transient layer over the canvas to
-    // dismiss, and the comments rail is a persistent panel with its own close.
-    if forge_repo_menu {
+    // Under both message menus: the drawer is a rail beside the stream, and a ⋯
+    // menu opened while it is out floats over that stream, not under the rail.
+    // Two facts put the thread rungs above out of the way while the drawer is
+    // out, and only the second makes this rung reachable: the THREAD RAIL's
+    // view condition (`active_thread_seq > 0 && !channel_settings_open`) hides
+    // that rail while the drawer is out — the drawer's own condition is
+    // `channel_settings_open && !empty(active_channel)` — AND
+    // `toggle_channel_settings` clears the rail's menu state on the way in.
+    // Hiding alone was never enough — visibility is not ladder state, and an
+    // unmounted menu whose `thread_message_action` still reads non-"toolbar"
+    // answers Escape from a rung above this one.
+    if on_chat && channel_settings_open {
+        return "channel_settings".into();
+    }
+    // The pages block-actions menu and insert row used to sit here. The delete
+    // confirmation is the one transient layer the document still has: an
+    // `overlay` with `backdrop=scrim` over the canvas. The `overlay` widget
+    // does not answer Escape by itself — the structurally identical create
+    // modal needs its own rung too — so without this one the scrim could only
+    // be dismissed by its Cancel button or a backdrop click. The comments rail
+    // stays out of the ladder: it is a persistent panel with its own close.
+    if on_pages && page_delete_armed {
+        return "page_delete".into();
+    }
+    if on_forge && forge_repo_menu {
         return "repo_menu".into();
     }
     String::new()

@@ -192,6 +192,13 @@ on console_opened(id)
   message_editor = editor("")
   failed_message_draft = ""
   failed_reply_draft = ""
+  // THE RAIL'S OWN FOUR — same block, same reason as `reconnect`: an unmounted
+  // ⋯ menu whose `thread_message_action` still reads non-"toolbar" answers
+  // Escape from a rung above the drawer's.
+  thread_selected_seq = 0
+  thread_selected_rev = 0
+  thread_message_action = "toolbar"
+  thread_edit_draft = ""
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []

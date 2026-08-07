@@ -1254,6 +1254,33 @@ fn thread_action_state_is_independent_of_the_main_message_menu() {
 }
 
 #[test]
+fn opening_the_channel_drawer_takes_the_thread_menu_down_with_the_rail() {
+    let (mut app, _) = Ducktape::__boot();
+    app.mutation_phase = "idle".into();
+    app.active_channel = "general".into();
+    app.active_thread_seq = 1;
+    app.thread_pointer_y = 400.0;
+    app.thread_height = 500.0;
+    let _ = app.__update(__DucktapeMessage::OpenThreadMessageActions(
+        2,
+        "reply".into(),
+        3,
+    ));
+    assert_eq!(app.thread_message_action, "more");
+
+    let _ = app.__update(__DucktapeMessage::ToggleChannelSettings);
+    assert!(app.channel_settings_open);
+    assert_eq!(app.active_thread_seq, 0);
+    // The rail's ⋯ menu is a rung ABOVE channel_settings in the Escape ladder,
+    // and the drawer's view condition only stops drawing the rail — left set,
+    // the first Escape answers "thread_menu" and dismisses nothing visible.
+    assert_eq!(app.thread_selected_seq, 0);
+    assert_eq!(app.thread_selected_rev, 0);
+    assert_eq!(app.thread_message_action, "toolbar");
+    assert!(app.thread_edit_draft.is_empty());
+}
+
+#[test]
 fn opening_another_thread_invalidates_the_pending_thread() {
     let (mut app, _) = Ducktape::__boot();
     app.mutation_phase = "idle".into();

@@ -40,6 +40,14 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // The rail's ⋯ menu goes down with the rail, so its state must go too — the
+  // same four `toggle_channel_settings` clears, for the same reason:
+  // `escape_target` reads `thread_message_action` whether or not the rail is
+  // mounted, so an unmounted menu would eat the first Escape.
+  thread_selected_seq = 0
+  thread_selected_rev = 0
+  thread_message_action = "toolbar"
+  thread_edit_draft = ""
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -82,6 +90,12 @@ on choose_channel(id)
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // Same four as `open_chat_search_hit` above: the rail's menu state outlives
+  // the rail unless the room switch clears it.
+  thread_selected_seq = 0
+  thread_selected_rev = 0
+  thread_message_action = "toolbar"
+  thread_edit_draft = ""
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -119,6 +133,12 @@ on choose_dm(peer_key)
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // Same four as `open_chat_search_hit` above: the rail's menu state outlives
+  // the rail unless the room switch clears it.
+  thread_selected_seq = 0
+  thread_selected_rev = 0
+  thread_message_action = "toolbar"
+  thread_edit_draft = ""
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -160,6 +180,15 @@ on toggle_channel_settings
   channel_settings_open = !channel_settings_open
   channel_name_draft = active_channel_name
   return if !channel_settings_open
+  // The rail's ⋯ menu goes down with the rail — `open_thread_for` clears the
+  // same four when it takes the drawer down. Leaving them set unmounts the menu
+  // but not its state, and `escape_target` reads `thread_message_action` ABOVE
+  // the channel_settings rung: the first Escape would answer "thread_menu" and
+  // dismiss a menu that is no longer on screen.
+  thread_selected_seq = 0
+  thread_selected_rev = 0
+  thread_message_action = "toolbar"
+  thread_edit_draft = ""
   thread_generation = thread_generation + 1
   live_thread_generation = live_thread_generation + 1
   active_thread_seq = 0

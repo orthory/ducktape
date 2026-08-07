@@ -95,6 +95,16 @@ on reconnect
   selected_message_rev = 0
   message_action = "toolbar"
   message_edit_draft = ""
+  // THE RAIL'S OWN FOUR, the same block every other rail-dropper carries. This
+  // one cleared the message four beside it and stopped there, which is the
+  // wrong shape: dropping the rail unmounts its ⋯ menu but not its state, and
+  // `escape_target` reads `thread_message_action` on a rung ABOVE the drawer's
+  // — the first Escape after a reconnect would answer "thread_menu" and
+  // dismiss a menu that is no longer on screen.
+  thread_selected_seq = 0
+  thread_selected_rev = 0
+  thread_message_action = "toolbar"
+  thread_edit_draft = ""
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []

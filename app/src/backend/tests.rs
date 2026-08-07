@@ -1030,24 +1030,47 @@ fn palette_keys_use_logical_escape_and_physical_shortcut() {
     );
 }
 
+/// Every tab `view.ice` can route to. The ladder is checked against ALL of
+/// them, because the bug class this guards is a rung answering from a tab whose
+/// screen never mounted its surface.
+const SHELL_TABS: [&str; 9] = [
+    "chat",
+    "pages",
+    "files",
+    "members",
+    "agents",
+    "forge",
+    "governance",
+    "settings",
+    "explorer",
+];
+
 #[test]
 fn escape_ladder_names_the_topmost_transient_layer_only() {
     use iced::keyboard::{Key, key::Named};
 
     let escape = Key::Named(Named::Escape);
-    let target = |palette: bool,
+    // Everything open at once, on one tab: the ladder must still name exactly
+    // one layer, and which one is the z-order.
+    let target = |tab: &str,
+                  palette: bool,
                   bell: bool,
                   create: bool,
                   thread_action: &str,
                   action: &str,
+                  settings: bool,
+                  page_delete: bool,
                   repo_menu: bool| {
         escape_target(
             escape.clone(),
+            tab.into(),
             palette,
             bell,
             create,
             thread_action.into(),
             action.into(),
+            settings,
+            page_delete,
             repo_menu,
         )
     };
@@ -1056,39 +1079,193 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     assert_eq!(
         escape_target(
             Key::Character("x".into()),
+            "chat".into(),
             false,
             true,
             true,
             "more".into(),
             "more".into(),
             true,
+            true,
+            true,
         ),
         ""
     );
     // An open palette swallows Escape — palette_key_action owns it.
-    assert_eq!(target(true, true, true, "more", "more", true), "");
-    // The ladder order is the z-order: bell over the create modal, menus
-    // after both, thread menu over the stream's, popovers last.
-    assert_eq!(target(false, true, true, "more", "more", true), "bell");
     assert_eq!(
-        target(false, false, true, "more", "more", true),
+        target("chat", true, true, true, "more", "more", true, true, true),
+        ""
+    );
+    // The ladder order is the z-order, read on the tab that mounts each layer:
+    // bell over the create modal, menus after both, thread menu over the
+    // stream's, the channel drawer under the menus that float over it,
+    // popovers last.
+    assert_eq!(
+        target("chat", false, true, true, "more", "more", true, true, true),
+        "bell"
+    );
+    assert_eq!(
+        target("chat", false, false, true, "more", "more", true, true, true),
         "channel_create"
     );
     assert_eq!(
-        target(false, false, false, "more", "more", true),
+        target("chat", false, false, false, "more", "more", true, true, true),
         "thread_menu"
     );
     assert_eq!(
-        target(false, false, false, "toolbar", "editing", true),
+        target(
+            "chat", false, false, false, "toolbar", "editing", true, true, true
+        ),
         "message_menu"
     );
     assert_eq!(
-        target(false, false, false, "toolbar", "toolbar", true),
+        target(
+            "chat", false, false, false, "toolbar", "toolbar", true, true, true
+        ),
+        "channel_settings"
+    );
+    assert_eq!(
+        target(
+            "pages", false, false, false, "toolbar", "toolbar", false, true, true
+        ),
+        "page_delete"
+    );
+    assert_eq!(
+        target(
+            "forge", false, false, false, "toolbar", "toolbar", false, false, true
+        ),
         "repo_menu"
     );
-    // Nothing transient open → Escape is a no-op. The pages rungs are gone
-    // with the menus they dismissed: the document has no transient layer.
-    assert_eq!(target(false, false, false, "toolbar", "toolbar", false), "");
+    // Nothing transient open → Escape is a no-op.
+    for tab in SHELL_TABS {
+        assert_eq!(
+            target(
+                tab, false, false, false, "toolbar", "toolbar", false, false, false
+            ),
+            "",
+            "{tab}"
+        );
+    }
+}
+
+#[test]
+fn escape_rungs_answer_only_on_the_tab_that_mounts_them() {
+    use iced::keyboard::{Key, key::Named};
+
+    // Each per-tab rung: the flag that raises it, the verdict it must produce,
+    // and the ONE tab whose screen mounts that surface. `view.ice` puts
+    // `slot chat` / `slot pages` / `slot forge` inside `match tab`, so these
+    // surfaces are unmounted everywhere else — while their flags survive a tab
+    // switch untouched, which is exactly what made this class of bug possible.
+    struct Rung {
+        verdict: &'static str,
+        owner: &'static str,
+        thread_action: &'static str,
+        action: &'static str,
+        settings: bool,
+        page_delete: bool,
+        repo_menu: bool,
+    }
+    const CLOSED: Rung = Rung {
+        verdict: "",
+        owner: "",
+        thread_action: "toolbar",
+        action: "toolbar",
+        settings: false,
+        page_delete: false,
+        repo_menu: false,
+    };
+
+    let escape = Key::Named(Named::Escape);
+    let scoped = [
+        Rung {
+            verdict: "thread_menu",
+            owner: "chat",
+            thread_action: "more",
+            ..CLOSED
+        },
+        Rung {
+            verdict: "message_menu",
+            owner: "chat",
+            action: "more",
+            ..CLOSED
+        },
+        Rung {
+            verdict: "channel_settings",
+            owner: "chat",
+            settings: true,
+            ..CLOSED
+        },
+        Rung {
+            verdict: "page_delete",
+            owner: "pages",
+            page_delete: true,
+            ..CLOSED
+        },
+        Rung {
+            verdict: "repo_menu",
+            owner: "forge",
+            repo_menu: true,
+            ..CLOSED
+        },
+    ];
+
+    for rung in scoped {
+        for tab in SHELL_TABS {
+            let answered = escape_target(
+                escape.clone(),
+                tab.into(),
+                false,
+                false,
+                false,
+                rung.thread_action.into(),
+                rung.action.into(),
+                rung.settings,
+                rung.page_delete,
+                rung.repo_menu,
+            );
+            let expected = if tab == rung.owner { rung.verdict } else { "" };
+            assert_eq!(answered, expected, "{} on {tab}", rung.verdict);
+        }
+    }
+
+    // The two WINDOW-level layers are deliberately NOT scoped: `view.ice`
+    // mounts `slot palette` (the create modal) and `slot bell` outside the tab
+    // match, so both stay on screen across a switch and must keep answering.
+    for tab in SHELL_TABS {
+        assert_eq!(
+            escape_target(
+                escape.clone(),
+                tab.into(),
+                false,
+                true,
+                true,
+                "toolbar".into(),
+                "toolbar".into(),
+                false,
+                false,
+                false,
+            ),
+            "bell",
+            "{tab}"
+        );
+        assert_eq!(
+            escape_target(
+                escape.clone(),
+                tab.into(),
+                false,
+                false,
+                true,
+                "toolbar".into(),
+                "toolbar".into(),
+                false,
+                false,
+                false,
+            ),
+            "channel_create",
+            "{tab}"
+        );
+    }
 }
 
 #[test]
@@ -2423,4 +2600,63 @@ fn a_refused_key_password_reaches_the_screen_as_a_sentence() {
     );
     // A module's own sentence still flows through untouched.
     assert_eq!(user_error("post is empty".into()), "post is empty");
+}
+
+/// The four lines that take the thread rail's ⋯ menu down with the rail. Ice
+/// has no way to share a statement block between handlers — SPEC.md §4 gives
+/// `statement` only assignments, `let`, `return if` and the task forms, and a
+/// `bind` prop like `thread_edit_draft` must be a direct app state, so the four
+/// cannot collapse into one struct assignment either. This array is therefore
+/// the single definition of the reset, and the test below is what makes the
+/// seven copies obey it. Drop a line here and every site is re-checked.
+const THREAD_MENU_RESET: [&str; 4] = [
+    "thread_selected_seq = 0",
+    "thread_selected_rev = 0",
+    "thread_message_action = \"toolbar\"",
+    "thread_edit_draft = \"\"",
+];
+
+#[test]
+fn every_rail_dropper_takes_the_threads_menu_state_with_it() {
+    // Dropping the rail unmounts its ⋯ menu but not its state, and
+    // `escape_target` reads `thread_message_action` on a rung ABOVE the
+    // drawer's — a site that zeroes `active_thread_seq` and stops there leaves
+    // an invisible menu to eat the next Escape. Two of the seven did exactly
+    // that. The shape is load-bearing and the language cannot enforce it, so
+    // this source lint does.
+    let handlers = [
+        ("chat.ice", include_str!("../ui/handlers/chat.ice")),
+        ("lifecycle.ice", include_str!("../ui/handlers/lifecycle.ice")),
+        (
+            "onboarding.ice",
+            include_str!("../ui/handlers/onboarding.ice"),
+        ),
+    ];
+
+    let mut droppers = Vec::new();
+    for (file, source) in handlers {
+        // Handlers start at column 0 with `on <name>`; their bodies are
+        // indented, so splitting on that prefix yields one body per handler.
+        for block in source.split("\non ") {
+            let drops_the_rail = block
+                .lines()
+                .any(|line| line.trim() == "active_thread_seq = 0");
+            if !drops_the_rail {
+                continue;
+            }
+            let name = block.lines().next().unwrap_or("?");
+            let name = name.split('(').next().unwrap_or(name).trim();
+            for line in THREAD_MENU_RESET {
+                assert!(
+                    block.lines().any(|body| body.trim() == line),
+                    "{file}: `on {name}` drops the thread rail without `{line}`"
+                );
+            }
+            droppers.push(format!("{file}:{name}"));
+        }
+    }
+
+    // Pins the count so a NEW rail-dropper cannot be added without being seen
+    // here — the assertions above are vacuous for a site that does not exist.
+    assert_eq!(droppers.len(), 7, "rail-droppers found: {droppers:?}");
 }

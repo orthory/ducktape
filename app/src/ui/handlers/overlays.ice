@@ -54,7 +54,11 @@ on global_key_pressed(event)
   // every closable flag self-selects against the verdict: the handler
   // grammar has no branches, so the keepers ARE the routing. Sits before
   // the palette block, whose open path must end in its focus task.
-  escape_key = escape_target(event.key, palette_open, bell_open, channel_create_open, thread_message_action, message_action, forge_repo_menu)
+  // `shell_tab` is passed WHOLE and the fn scopes every rung against it. It
+  // used to be one conjunction here on the drawer argument, which fixed one
+  // rung and left its three chat-only siblings answering from other tabs —
+  // scoping belongs where the ladder can see all of it at once.
+  escape_key = escape_target(event.key, shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, forge_repo_menu)
   bell_open = bell_open && escape_key != "bell"
   channel_create_open = channel_create_open && escape_key != "channel_create"
   thread_selected_seq = keep_i64(escape_key == "thread_menu", 0, thread_selected_seq)
@@ -65,6 +69,15 @@ on global_key_pressed(event)
   selected_message_rev = keep_i64(escape_key == "message_menu", 0, selected_message_rev)
   message_action = keep_str(escape_key == "message_menu", "toolbar", message_action)
   message_edit_draft = keep_str(escape_key == "message_menu", "", message_edit_draft)
+  // No draft keeper beside this one: the drawer's only opener re-seeds
+  // `channel_name_draft` from the live channel name, so an Escape close cannot
+  // carry a half-typed rename into the next open — same as its ×.
+  channel_settings_open = channel_settings_open && escape_key != "channel_settings"
+  // The page delete confirmation is a real transient layer — `pages.ice`
+  // mounts it as an `overlay` with `backdrop=scrim` — and the widget does not
+  // answer Escape on its own, so the scrim needs this keeper the same way the
+  // create modal above needs its own.
+  page_delete_armed = page_delete_armed && escape_key != "page_delete"
   forge_repo_menu = forge_repo_menu && escape_key != "repo_menu"
   // The composer's formatting chords (Cmd/Ctrl+B/I, +Shift+C, +Shift+9). The
   // editor lets command-letter presses bubble on purpose, so its focus is
