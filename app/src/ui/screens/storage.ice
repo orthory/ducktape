@@ -699,7 +699,14 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                           wrap=none
                           font=code
                           @text-muted
-                      text block.op_count
+                      // `1 op` / `3 ops`, not a bare `1`. The three columns
+                      // carry no header, and of the three only this one is
+                      // unreadable without one — a height and a hash say what
+                      // they are. Labelling the VALUE beats a header row here:
+                      // the height column is variable width, so any header
+                      // would need a magic fixed width that a seven-digit
+                      // chain outgrows.
+                      text plural(block.op_count, "op", "ops")
                         with
                           size=12.0
                           wrap=none
