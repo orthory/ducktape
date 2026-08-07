@@ -35,9 +35,15 @@ component GovernanceScreen(rows:[ProposalRow], voting:str, admin:bool, answered:
             with
               reason="Approval votes are cast by this network's validators, and this node does not hold validator standing."
               next="You can still read every proposal and follow its tally while it runs."
-        // Empty means nothing OPEN. A workspace whose every decision settled
-        // still gets the plate, not a silent screen.
-        if open_proposals(rows) <= 0 && answered
+        // Empty means nothing OPEN, and that is TWO different facts. One plate
+        // for both claimed a history that may never have happened: on a fresh
+        // network the header reads `0 open · 0 settled` while the plate said
+        // every decision was finalized — asserting decisions nobody ever made.
+        // A workspace whose every decision settled still gets its own plate,
+        // never a silent screen.
+        if empty(rows) && answered
+          EmptyPlate message="No proposals yet — a membership or configuration change opens the first one."
+        if open_proposals(rows) <= 0 && !empty(rows) && answered
           EmptyPlate message="No proposals waiting — every decision on this network is finalized."
         if open_proposals(rows) > 0
           col w=fill gap=12.0

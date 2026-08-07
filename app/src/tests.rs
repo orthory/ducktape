@@ -2716,6 +2716,53 @@ fn reconnect_recovers_active_drafts_for_the_same_endpoint() {
     assert_eq!(app.orphaned_comment_drafts, ["unfinished comment"]);
 }
 
+/// "NOTHING OPEN" IS TWO DIFFERENT FACTS AND THE PLATE MUST NOT CONFLATE THEM.
+/// One message served both, so a workspace that had never held a vote read
+/// `0 open · 0 settled` in its header and "every decision on this network is
+/// finalized" in its body — asserting a history of decisions nobody ever made.
+/// Driven on the running app: the demo network shows exactly that.
+///
+/// Pinned as COMPLEMENTARY CONDITIONS, not as copy. Asserting the sentences
+/// alone would stay green if both arms fired at once, or if the new arm were
+/// unreachable.
+#[test]
+fn approvals_tells_a_first_run_apart_from_a_finished_one() {
+    let source = inlined(include_str!("ui/screens/governance.ice"));
+    let arms: Vec<&str> = source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("if ") && line.contains("answered"))
+        .map(|line| line.trim())
+        .collect();
+
+    assert!(
+        arms.contains(&"if empty(rows) && answered"),
+        "a network with no proposals at all needs its own arm, found {arms:?}"
+    );
+    assert!(
+        arms.contains(&"if open_proposals(rows) <= 0 && !empty(rows) && answered"),
+        "the settled arm must exclude the empty case, found {arms:?}"
+    );
+
+    // The two plates must never be able to fire together: the first requires an
+    // empty list, the second an inhabited one.
+    let first_run = source
+        .split("if empty(rows) && answered")
+        .nth(1)
+        .expect("first-run arm");
+    assert!(
+        first_run.contains("No proposals yet"),
+        "the first-run plate says nothing has happened yet"
+    );
+    assert!(
+        !first_run
+            .split("EmptyPlate")
+            .nth(1)
+            .unwrap_or("")
+            .contains("finalized"),
+        "the first-run plate must not claim decisions were finalized"
+    );
+}
+
 /// A LIST THAT DRIVES A DETAIL PANE MUST SAY WHICH ROW IT IS SHOWING. The
 /// Explorer's block rows carried `active bg=transparent` on BOTH states, so
 /// clicking a row filled the pane on the right and left the list identical to
