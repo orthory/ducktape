@@ -178,12 +178,22 @@ component MemberRowCard(member:MemberRow)
                 wrap=none
                 font=display
                 @text-fg
-            // the artifact writes `you` in SANS medium and the key line in mono
-            // regular. The type-scale guard fixes the SIZE only and asserts no
-            // size→face pairing (main.rs), so the face here is a free choice;
-            // these steps are the nearest ones on the scale.
+            // `this node`, NOT `you`. The flag is `is_this_node` — the row's
+            // key equals the key of the node this client is ATTACHED to — and
+            // a client can attach to a node it does not own (the picker keeps
+            // remote endpoints), which would have marked a stranger's
+            // validator as the person reading the screen. The human identity
+            // is a different key entirely: the one Settings calls YOUR
+            // IDENTITY and the one that signs every message in chat. This
+            // roster lists validators, residents and agents, so it never
+            // contains that key at all.
+            //
+            // The artifact writes the chip in SANS medium and the key line in
+            // mono regular. The type-scale guard fixes the SIZE only and
+            // asserts no size→face pairing (main.rs), so the face here is a
+            // free choice; these steps are the nearest ones on the scale.
             if member.is_this_node
-              text "you"
+              text "this node"
                 with
                   size=9.5
                   wrap=none
