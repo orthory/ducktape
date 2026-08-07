@@ -453,6 +453,23 @@ pub fn keep_pages(loaded: bool, next: Vec<PageItem>, current: Vec<PageItem>) -> 
     if loaded { next } else { current }
 }
 
+/// Does this pages reply still answer for the page the app is on?
+///
+/// A live resync is issued with whatever page was active AT THE TIME and then
+/// runs several queries. A mutation landing in between leaves the reply
+/// speaking for a document nobody is looking at — measured on a page create:
+/// the create's own reload corrected the selection to the new page, and a
+/// resync issued a moment earlier for the OLD page answered afterwards and
+/// pulled the reader back to it. Its blocks, title and comment counts are all
+/// for that other document, so none of them may land.
+///
+/// Two replies are still current: one that resolved to the page the app is on,
+/// and one whose index no longer holds that page at all — there the reply's
+/// fallback is the honest answer and the app must follow it.
+pub fn pages_reply_answers_current(pages: Vec<PageItem>, replied: String, current: String) -> bool {
+    current.is_empty() || replied == current || !pages.iter().any(|page| page.id == current)
+}
+
 pub fn keep_strs(loaded: bool, next: Vec<String>, current: Vec<String>) -> Vec<String> {
     if loaded { next } else { current }
 }

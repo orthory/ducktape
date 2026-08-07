@@ -295,8 +295,15 @@ on live_resynced(next)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
+  // A resync carries whatever page was active WHEN IT WAS ISSUED and takes
+  // several queries to answer, so a mutation landing in between leaves it
+  // speaking for a document nobody is on — measured on a page create. The page
+  // LIST is never stale (it is the whole index either way) and still lands
+  // unconditionally; everything scoped to ONE page waits for a reply that
+  // answers for the page in hand.
+  pages_answer_is_current = next.pages_loaded && pages_reply_answers_current(next.pages, next.active_page, active_page)
   pages = keep_pages(next.pages_loaded, next.pages, pages)
-  blocks = keep_blocks(next.pages_loaded, merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, ""), blocks)
+  blocks = keep_blocks(pages_answer_is_current, merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, ""), blocks)
   orphaned_comment_drafts = remember_orphaned_page_comment(orphaned_comment_drafts, pages, block_comments_target, block_comment_draft)
   // THE COMMENTS RAIL IS DOCUMENT-SCOPED (handlers/pages.ice:300). Its anchor is
   // the PAGE it was opened on, never a block selection — keyed on
@@ -304,7 +311,7 @@ on live_resynced(next)
   // the moment the user clicked off the block whose ⋮ menu opened it. So the
   // target is the one thing reconciled against the page identity here, and every
   // other rail field keys on the target: one line decides the whole rail.
-  block_comments_target = retain_for_endpoint(block_comments_target, active_page, keep_str(next.pages_loaded, next.active_page, active_page))
+  block_comments_target = retain_for_endpoint(block_comments_target, active_page, keep_str(pages_answer_is_current, next.active_page, active_page))
   block_comments_open = block_comments_open && !empty(block_comments_target)
   block_comment_threads = retain_selected_comment_threads(block_comment_threads, block_comments_target)
   block_comment_thread_total = retain_selected_i64(block_comment_thread_total, block_comments_target)
@@ -318,12 +325,12 @@ on live_resynced(next)
   block_thread_comments_loading = block_thread_comments_loading && !empty(block_comments_target)
   block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)
   pending_block_comment = retain_selected_string(pending_block_comment, block_comments_target)
-  page_delete_armed = page_delete_armed && active_page == keep_str(next.pages_loaded, next.active_page, active_page)
-  block_comment_thread_total = keep_i64(next.pages_loaded, next.comment_thread_total, block_comment_thread_total)
-  commented_block_ids = keep_strs(next.pages_loaded, next.commented_block_ids, commented_block_ids)
-  active_page = keep_str(next.pages_loaded, next.active_page, active_page)
-  active_page_title = keep_str(next.pages_loaded, next.active_page_title, active_page_title)
-  active_page_parent = keep_str(next.pages_loaded, next.active_page_parent, active_page_parent)
+  page_delete_armed = page_delete_armed && active_page == keep_str(pages_answer_is_current, next.active_page, active_page)
+  block_comment_thread_total = keep_i64(pages_answer_is_current, next.comment_thread_total, block_comment_thread_total)
+  commented_block_ids = keep_strs(pages_answer_is_current, next.commented_block_ids, commented_block_ids)
+  active_page = keep_str(pages_answer_is_current, next.active_page, active_page)
+  active_page_title = keep_str(pages_answer_is_current, next.active_page_title, active_page_title)
+  active_page_parent = keep_str(pages_answer_is_current, next.active_page_parent, active_page_parent)
   // AFTER the title lands, because the title is line 0 of the buffer. The
   // canonical text only replaces the buffer when the editor is CLEAN and the
   // text actually differs — a rebuilt `Content` throws the cursor to the

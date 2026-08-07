@@ -37,6 +37,46 @@ fn the_rail_seats_exactly_the_eight_module_screens() {
 }
 
 #[test]
+fn a_stale_pages_reply_does_not_move_the_reader() {
+    let listed = |ids: &[&str]| {
+        ids.iter()
+            .map(|id| PageItem {
+                id: (*id).into(),
+                title: String::new(),
+                parent: String::new(),
+                prefix: String::new(),
+                child_count: 0,
+            })
+            .collect::<Vec<_>>()
+    };
+    // Resolved to the page in hand — current.
+    assert!(pages_reply_answers_current(
+        listed(&["a", "b"]),
+        "a".into(),
+        "a".into()
+    ));
+    // Issued for `a` before the reader moved to `b`, answered after: `b` is
+    // right there in the index the reply just read, so the reply is stale.
+    assert!(!pages_reply_answers_current(
+        listed(&["a", "b"]),
+        "a".into(),
+        "b".into()
+    ));
+    // The page the reader is on is GONE — the fallback is the honest answer.
+    assert!(pages_reply_answers_current(
+        listed(&["a"]),
+        "a".into(),
+        "b".into()
+    ));
+    // Nothing selected yet: anything the reply offers is an improvement.
+    assert!(pages_reply_answers_current(
+        listed(&["a"]),
+        "a".into(),
+        String::new()
+    ));
+}
+
+#[test]
 fn a_count_of_one_takes_the_singular_noun() {
     assert_eq!(plural(1, "agent".into(), "agents".into()), "1 agent");
     assert_eq!(plural(0, "agent".into(), "agents".into()), "0 agents");
