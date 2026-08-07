@@ -2716,6 +2716,56 @@ fn reconnect_recovers_active_drafts_for_the_same_endpoint() {
     assert_eq!(app.orphaned_comment_drafts, ["unfinished comment"]);
 }
 
+/// A LIST THAT DRIVES A DETAIL PANE MUST SAY WHICH ROW IT IS SHOWING. The
+/// Explorer's block rows carried `active bg=transparent` on BOTH states, so
+/// clicking a row filled the pane on the right and left the list identical to
+/// the pixel — measured on the running app at 36.78/255 before and after the
+/// click, pointer parked away. The only visible response was `hovered`, which
+/// follows the pointer rather than the selection. In a list whose every row is a
+/// height and a truncated hash there is no landmark to re-find your place by.
+///
+/// Pinned as a DIFFERENCE, not as a colour: asserting `tree_selected` alone
+/// would stay green if the unselected arm adopted it too, which is the same
+/// both-arms-identical bug in a new coat.
+#[test]
+fn the_explorer_marks_the_block_row_whose_detail_is_open() {
+    let source = inlined(include_str!("ui/screens/storage.ice"));
+    let row = source
+        .split("component ExplorerBlockRow")
+        .nth(1)
+        .expect("ExplorerBlockRow is declared")
+        .split("\ncomponent ")
+        .next()
+        .expect("component body");
+
+    let selected = row.split("if !selected").next().expect("selected arm");
+    let unselected = row.split("if !selected").nth(1).expect("unselected arm");
+
+    assert!(
+        selected.contains("active bg=tree_selected"),
+        "the open row wears a plate"
+    );
+    assert!(
+        unselected.contains("active bg=transparent"),
+        "every other row stays flat"
+    );
+    // The whole point: the two arms must not paint the same thing.
+    let plate_of = |arm: &str| {
+        arm.lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("active bg=")
+                    .map(|rest| rest.split_whitespace().next().unwrap_or("").to_owned())
+            })
+            .expect("each arm sets active bg=")
+    };
+    assert_ne!(
+        plate_of(selected),
+        plate_of(unselected),
+        "a selected row that paints the unselected plate marks nothing"
+    );
+}
+
 /// BOTH COMPOSERS RE-ASK THE GATE AT APPLY TIME, AND BOTH ARE PINNED HERE. A
 /// composer's `disabled=` was decided a frame ago, so a channel that went
 /// archived — or a members-only roster that dropped her — between the keystroke
