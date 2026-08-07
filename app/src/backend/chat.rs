@@ -606,6 +606,10 @@ pub async fn search_chat(
     text: String,
     generation: i64,
 ) -> Result<ChatSearchData, HydrationError> {
+    // The reader, for the same `you` rendering the timeline does — a search hit
+    // was showing the RAW wire author (`user:3f8dc8…773`, the full 64-hex key
+    // with its prefix) as the row's headline, above the text it matched.
+    let current_user = local_user_key().await;
     let result = async {
         let text = bounded_text(text, "search", 512)?;
         let rpc = rpc_client(&rpc)?;
@@ -639,7 +643,7 @@ pub async fn search_chat(
                     channel_id: hit.channel_id,
                     seq: number_i64(hit.seq),
                     root_seq: number_i64(hit.thread.unwrap_or(hit.seq)),
-                    author: hit.author,
+                    author: author_display(&hit.author, current_user.as_deref()),
                     text: hit.text,
                     meta: format!("#{}", hit.seq),
                 })
