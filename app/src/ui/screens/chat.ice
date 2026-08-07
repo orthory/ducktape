@@ -1615,6 +1615,15 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   // surface/control_line/r12 chrome and the same seat row —
                   // hint left of Send — minus the format buttons, which the
                   // 330px plate has no room to teach twice.
+                  //
+                  // And the same REFUSAL, which it used to skip: editor and Send
+                  // carry the stream's `!connected || !empty(post_gate(…))` terms
+                  // verbatim, or a channel the module will refuse still buys an
+                  // optimistic append and a rollback under a raw 400.
+                  // `active_channel_archived` drops out because post_gate's
+                  // `channel_archived` arm IS that case (see ComposerGate) — one
+                  // discriminant, not two. The reason SENTENCE stays mounted once,
+                  // over the stream's plate: 330px has no room to say it twice.
                   box
                     with
                       w=fill
@@ -1634,7 +1643,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         shadow-y=1.0
                         shadow-blur=2.0
                       col w=fill
-                        extern rich_composer(reply_editor, "Reply…", (thread_loading || active_channel_archived), shift_held, 44.0, 150.0, 10.0) #reply -> emit(reply_composer_event, _)
+                        extern rich_composer(reply_editor, "Reply…", (thread_loading || !connected || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key))), shift_held, 44.0, 150.0, 10.0) #reply -> emit(reply_composer_event, _)
                         box
                           with
                             w=fill
@@ -1657,7 +1666,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                             button "Send" -> emit(reply_composer_event, composer_submit_event())
                               with
                                 label="Send reply"
-                                disabled=(thread_loading || active_channel_archived || empty(trim(editor_text(reply_editor))))
+                                disabled=(thread_loading || !connected || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)) || empty(trim(editor_text(reply_editor))))
                                 h=28.0
                                 @primary_action
                                 @px-11px

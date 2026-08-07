@@ -166,8 +166,14 @@ on forge_merge_submit
   run merge_forge_pr(connected_rpc, password, forge_repo, forge_item_number, forge_item_source_branch, forge_item_source_oid, forge_item_target_oid) -> forge_merged _ | forge_merge_failed _
 
 on forge_merged(next)
-  return if next.repo != forge_repo || next.number != forge_item_number
+  // RELEASED ABOVE THE IDENTITY CHECK, the same shape as `history_loaded`.
+  // This guard is on repo+number rather than on a generation, and
+  // `forge_close_item` zeroes `forge_item_number` — so closing an item mid-merge
+  // dropped the ONLY reply that lowers this flag, and `forge_merge_submit`
+  // returns early on it: the Merge button stayed disabled for the rest of the
+  // session. The body below still belongs to the item that asked.
   forge_merge_busy = false
+  return if next.repo != forge_repo || next.number != forge_item_number
   forge_merge_conflicts = next.conflicts
   error = ""
 
@@ -229,6 +235,12 @@ on forge_refreshed(next)
 // The breadcrumb home. Nothing else clears `forge_repo`, so without this the
 // repo grid is unreachable for the rest of the session once a repo is opened.
 on forge_close_repo
+  // Closing RETIRES the in-flight load the same way opening does. Every forge
+  // loader guards on generation equality only, so without this bump a
+  // `load_forge_repo` still in flight answers with the number the guard is
+  // still comparing against and `forge_repo_loaded` re-assigns `forge_repo` —
+  // dropping the user back into the repo they just left.
+  forge_generation = forge_generation + 1
   forge_repo = ""
   forge_branches = []
   forge_items = []
@@ -245,6 +257,10 @@ on forge_toggle_repo_menu
   forge_repo_menu = !forge_repo_menu
 
 on forge_close_item
+  // Same retirement as the close above: `forge_item_loaded` re-assigns
+  // `forge_item_number` from a reply that only has to match the generation, so
+  // an unbumped close reopens the item the moment the load lands.
+  forge_generation = forge_generation + 1
   forge_item_number = 0
   forge_item_diff = ""
   forge_item_channel = ""

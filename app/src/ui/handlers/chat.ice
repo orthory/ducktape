@@ -29,6 +29,10 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   shell_tab = "chat"
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
+  // Same abandoned request, same dead button — see `choose_channel`. This route
+  // lands in a DIFFERENT channel via `chat_hit_loaded`, so the page still in
+  // flight belongs to the room she jumped out of.
+  history_loading = false
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = true
@@ -68,6 +72,12 @@ on choose_channel(id)
   active_channel_name = channel_display_name(channels, active_channel, active_channel_name)
   messages = []
   has_older_history = false
+  // THE FLAG BELONGS TO THE REQUEST, AND THE REQUEST BELONGS TO THE ROOM YOU
+  // LEFT. `load_more_history` returns early on it and nothing else here lowers
+  // it, so "Load older" is dead in the room you land in until the abandoned
+  // page lands — forever if it hangs. `history_loaded` drops that page on its
+  // channel check anyway.
+  history_loading = false
   unread_marker_seq = 0
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
@@ -106,6 +116,8 @@ on choose_dm(peer_key)
   // immediately; the DM header already derives from `dm_peers`.
   messages = []
   has_older_history = false
+  // Same abandoned request, same dead button — see `choose_channel`.
+  history_loading = false
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   hydration_generation = hydration_generation + 1
@@ -140,6 +152,11 @@ on create_channel_submit
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = "channel"
+  // Creating lands you IN the new channel (`channel_created` moves
+  // `active_channel`), so the page in flight for the room you were reading is
+  // abandoned here. `mutation_phase` masks the dead button only until the
+  // create settles.
+  history_loading = false
   pending_channel = trim(channel_draft)
   channel_draft = ""
   error = ""
@@ -249,7 +266,9 @@ on composer_mark(kind)
 on chat_composer_event(event)
   message_editor = apply_composer_event(message_editor, event)
   return if !composer_submits(event)
-  return if loading || empty(active_channel) || active_channel_archived || empty(trim(editor_text(message_editor)))
+  // Same apply-time re-read as `reply_composer_event` below: the composer's
+  // `disabled=` was decided a frame ago.
+  return if loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)) || empty(trim(editor_text(message_editor)))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   pending_message = trim(editor_text(message_editor))
@@ -610,10 +629,18 @@ on load_more_history
 
 on history_loaded(next)
   return if next.generation != history_generation || !history_loading
+  // A page belongs to the channel that asked for it. Only `load_more_history`
+  // bumps `history_generation` — switching channels does not — so the
+  // generation guard alone lets a page still in flight for #a prepend into #b's
+  // timeline. Same channel check `message_sent` makes on its own late arrival.
+  // The flag is released ABOVE that guard: a page dropped for landing in the
+  // wrong room must still free the button, or "Load older" stays dead in the
+  // room she switched to.
+  history_loading = false
+  return if next.channel_id != active_channel
   messages = prepend_history(messages, next.messages)
   has_older_history = history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
-  history_loading = false
   error = ""
 
 on history_failed(cause)
@@ -730,10 +757,16 @@ on reaction_failed(cause)
   hydration_retry_attempt = 0
   run live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
+// A composer's `disabled=` is decided at RENDER time; this runs at APPLY time,
+// and the refusal can change in between — a subscription drop flips `connected`,
+// an archive or a members-only delta lands, and the frame that drew a live Send
+// is already stale. Re-read the gate here or the reply is optimistically
+// appended, refused by the module, and rolled back under a raw 400. Same terms
+// as the view; `settings_user_key` is what the screen mounts as `user_key`.
 on reply_composer_event(event)
   reply_editor = apply_composer_event(reply_editor, event)
   return if !composer_submits(event)
-  return if loading || thread_loading || empty(active_channel) || active_channel_archived || active_thread_seq <= 0 || empty(trim(editor_text(reply_editor)))
+  return if loading || thread_loading || !connected || empty(active_channel) || active_thread_seq <= 0 || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)) || empty(trim(editor_text(reply_editor)))
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0

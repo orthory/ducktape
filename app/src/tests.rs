@@ -748,6 +748,280 @@ fn unrelated_resyncs_keep_an_initial_thread_load_alive() {
     assert!(!refresh.thread_loading);
 }
 
+/// A HISTORY PAGE BELONGS TO THE CHANNEL THAT ASKED FOR IT. Only
+/// `load_more_history` bumps `history_generation` — nothing that moves
+/// `active_channel` does — so the generation guard ALONE let a page still in
+/// flight for #a prepend into #b's timeline, merging one room's scrollback into
+/// another's with no error and no way to tell. `HistoryPageData` carries the
+/// channel it was requested for and the reducer checks it.
+///
+/// The flag is released ABOVE that check: a page dropped for landing in the
+/// wrong room must still free "Load older", which `load_more_history` refuses
+/// while `history_loading` stands.
+#[test]
+fn a_history_page_prepends_only_into_the_channel_that_asked_for_it() {
+    let (mut app, _) = Ducktape::__boot();
+    app.loading = false;
+    app.mutation_phase = "idle".into();
+    app.active_channel = "a".into();
+    app.messages = vec![message(10, "a-ten", false)];
+    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+    assert!(app.history_loading);
+    let in_flight = app.history_generation;
+
+    // The reader is on #b by the time the page lands. `active_channel` moves
+    // under an open request on the resync, the search-hit and the create routes
+    // too, and NONE of them bump `history_generation`.
+    app.active_channel = "b".into();
+    app.messages = vec![message(10, "b-ten", false)];
+    let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
+        generation: in_flight,
+        channel_id: "a".into(),
+        messages: vec![message(1, "a-one", false)],
+    }));
+    assert_eq!(
+        app.messages.len(),
+        1,
+        "a page for #a must not prepend into #b's timeline"
+    );
+    assert_eq!(app.messages[0].body, "b-ten");
+    assert!(
+        !app.history_loading,
+        "the dropped page still frees `Load older` in the room she is in"
+    );
+
+    // The same page stamped for #b IS #b's history, and prepends.
+    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+    let in_flight = app.history_generation;
+    let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
+        generation: in_flight,
+        channel_id: "b".into(),
+        messages: vec![message(1, "b-one", false)],
+    }));
+    assert_eq!(app.messages.len(), 2);
+    assert_eq!(app.messages[0].body, "b-one");
+    assert!(!app.history_loading);
+
+    // AND THE FLAG DOES NOT SURVIVE ANY ROUTE THAT ABANDONS ITS REQUEST.
+    // `load_more_history` returns early on it, so until the abandoned page lands
+    // — forever if it hangs — "Load older" is dead in the room she lands in.
+    // Every LAUNCH that starts a room transition is here, not just the two
+    // channel pickers: the search hit and the create both land in a different
+    // room, and the reconnect and the console open drop the socket the page was
+    // requested on, so those two may never answer at all.
+    for abandoning in [
+        __DucktapeMessage::ChooseChannel("b".into()),
+        __DucktapeMessage::ChooseDm("peer".into()),
+        __DucktapeMessage::OpenChatSearchHit("b".into(), 7, 7),
+        __DucktapeMessage::CreateChannelSubmit,
+        __DucktapeMessage::Reconnect,
+        __DucktapeMessage::ConsoleOpened(iced::window::Id::unique()),
+    ] {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.mutation_phase = "idle".into();
+        app.active_channel = "a".into();
+        app.messages = vec![message(10, "a-ten", false)];
+        // `create_channel_submit` refuses an empty draft; the rest ignore it.
+        app.channel_draft = "new-room".into();
+        let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+        assert!(
+            app.history_loading,
+            "the route must start with a live request"
+        );
+        let route = format!("{abandoning:?}");
+        let _ = app.__update(abandoning);
+        assert!(
+            !app.history_loading,
+            "{route} abandons the request, so it must release the flag"
+        );
+    }
+}
+
+/// A RESYNC IS THE ONE DROPPER THAT MUST ASK. Every other route that abandons a
+/// history request is a launch the reader drove, so it clears the flag flatly.
+/// `live_resynced` is server-driven and moves `active_channel` on its own, so a
+/// flat clear would strand a page that is still legitimately coming: the reducer
+/// refuses any page arriving with the flag already down (`|| !history_loading`),
+/// which would drop it silently and leave the timeline short.
+#[test]
+fn a_resync_releases_load_older_only_when_it_moves_the_room() {
+    for (landing, expected) in [("a", true), ("b", false)] {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.mutation_phase = "idle".into();
+        app.active_channel = "a".into();
+        app.messages = vec![message(10, "a-ten", false)];
+        let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+        assert!(app.history_loading);
+
+        let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+            app.hydration_generation,
+            landing,
+            vec![message(10, "ten", false)],
+            "",
+            Vec::new(),
+        )));
+        assert_eq!(
+            app.history_loading,
+            expected,
+            "a resync landing on #{landing} from #a must {} the flag",
+            if expected { "keep" } else { "release" }
+        );
+    }
+}
+
+/// THE ROUTE LIST IS THE INVARIANT, SO THE ROUTE LIST IS PINNED. A ninth handler
+/// that moves the reader between rooms has to decide whether it abandons a
+/// history request, and nothing about writing one would prompt that thought —
+/// which is exactly how the five uncovered routes above got written. This fails
+/// the build on a new mover so the decision is forced, rather than trusting the
+/// next author to remember an invariant spread across three files.
+///
+/// LAUNCHES clear the flag themselves. LANDINGS do not, and must not be added
+/// here without checking that every launch reaching them already cleared it:
+/// `chat_updated` answers the two pickers, `chat_hit_loaded` answers the search
+/// hit, `channel_created` answers the create, `workspace_connected` answers the
+/// reconnect. `live_resynced` is a landing with NO launch behind it, which is
+/// why it is the one that asks.
+#[test]
+fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
+    const HANDLERS: &str = concat!(
+        include_str!("ui/handlers/chat.ice"),
+        include_str!("ui/handlers/lifecycle.ice"),
+        include_str!("ui/handlers/onboarding.ice"),
+    );
+
+    let mut handler = "";
+    let mut movers: Vec<&str> = Vec::new();
+    for line in HANDLERS.lines() {
+        if let Some(rest) = line.strip_prefix("on ") {
+            handler = rest.split('(').next().unwrap_or(rest).trim();
+        }
+        if line.trim_start().starts_with("active_channel = ") {
+            movers.push(handler);
+        }
+    }
+    movers.sort_unstable();
+    movers.dedup();
+
+    assert_eq!(
+        movers,
+        [
+            "channel_created",
+            "chat_hit_loaded",
+            "chat_updated",
+            "choose_channel",
+            "console_opened",
+            "live_resynced",
+            "reconnect",
+            "workspace_connected",
+        ],
+        "a handler started or stopped moving `active_channel`: decide whether it \
+         abandons an in-flight history page, then update this list"
+    );
+
+    // And the launches genuinely carry the clear — a mover list alone would pass
+    // with every clear deleted.
+    for launch in [
+        "choose_channel",
+        "choose_dm",
+        "open_chat_search_hit",
+        "create_channel_submit",
+        "reconnect",
+        "console_opened",
+    ] {
+        let body = HANDLERS
+            .split(&format!("\non {launch}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{launch} is a handler"))
+            .split("\non ")
+            .next()
+            .expect("handler body");
+        assert!(
+            body.contains("history_loading = false"),
+            "{launch} abandons a history request and must release the flag"
+        );
+    }
+}
+
+/// CLOSING RETIRES THE LOAD THAT WOULD REOPEN WHAT YOU JUST LEFT. Every forge
+/// loader guards on generation equality alone, so a close that did not bump the
+/// generation answered its own in-flight read: `forge_repo_loaded` re-assigns
+/// `forge_repo` and `forge_item_loaded` re-assigns `forge_item_number`, dropping
+/// the user straight back into the repo or item they had just backed out of.
+///
+/// `forge_merged` is the one reply NOT keyed on the generation — it is guarded on
+/// repo + number, and `forge_close_item` zeroes the number. It therefore releases
+/// `forge_merge_busy` ABOVE that check: this reply is the only thing that lowers
+/// the flag and `forge_merge_submit` returns early on it, so closing an item
+/// mid-merge left the Merge button disabled for the rest of the session.
+#[test]
+fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+
+    let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("core".into()));
+    let in_flight = app.forge_generation;
+    let _ = app.__update(__DucktapeMessage::ForgeCloseRepo);
+    assert!(app.forge_repo.is_empty());
+    let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
+        generation: in_flight,
+        repo: "core".into(),
+        branches: vec!["main".into()],
+        items: Vec::new(),
+    }));
+    assert!(
+        app.forge_repo.is_empty(),
+        "a closed repo must not be reopened by the load it left in flight"
+    );
+    assert!(app.forge_branches.is_empty());
+
+    // The same retirement one level in.
+    let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("core".into()));
+    let _ = app.__update(__DucktapeMessage::ForgeOpenItem(7));
+    let in_flight = app.forge_generation;
+    let _ = app.__update(__DucktapeMessage::ForgeCloseItem);
+    assert_eq!(app.forge_item_number, 0);
+    let _ = app.__update(__DucktapeMessage::ForgeItemLoaded(backend::ForgeItemData {
+        generation: in_flight,
+        repo: "core".into(),
+        number: 7,
+        title: "a pull request".into(),
+        ..backend::ForgeItemData::default()
+    }));
+    assert_eq!(
+        app.forge_item_number, 0,
+        "a closed item must not be reopened by the load it left in flight"
+    );
+    assert!(app.forge_item_title.is_empty());
+
+    // AND THE MERGE FLAG COMES DOWN EVEN THOUGH ITS ITEM IS GONE.
+    let (mut merging, _) = Ducktape::__boot();
+    merging.connected = true;
+    merging.connected_rpc = "http://node".into();
+    merging.forge_repo = "core".into();
+    merging.forge_item_number = 7;
+    let _ = merging.__update(__DucktapeMessage::ForgeMergeSubmit);
+    assert!(merging.forge_merge_busy);
+    let _ = merging.__update(__DucktapeMessage::ForgeCloseItem);
+    let _ = merging.__update(__DucktapeMessage::ForgeMerged(backend::ForgeMergeOutcome {
+        repo: "core".into(),
+        number: 7,
+        merged: false,
+        merge_oid: String::new(),
+        conflicts: vec!["app/src/main.rs".into()],
+    }));
+    assert!(
+        !merging.forge_merge_busy,
+        "closing an item mid-merge must not disable Merge for the rest of the session"
+    );
+    // The identity check still guards the BODY: that outcome describes an item
+    // nobody has open, so nothing of it is rendered.
+    assert!(merging.forge_merge_conflicts.is_empty());
+}
+
 #[test]
 fn ready_events_and_stale_searches_do_not_rehydrate_navigation() {
     let (mut chat, _) = Ducktape::__boot();
@@ -2440,6 +2714,86 @@ fn reconnect_recovers_active_drafts_for_the_same_endpoint() {
     // heading for the node on the save tick, and it is reinstalled from the
     // node's own text on the next load.
     assert_eq!(app.orphaned_comment_drafts, ["unfinished comment"]);
+}
+
+/// BOTH COMPOSERS RE-ASK THE GATE AT APPLY TIME, AND BOTH ARE PINNED HERE. A
+/// composer's `disabled=` was decided a frame ago, so a channel that went
+/// archived — or a members-only roster that dropped her — between the keystroke
+/// and the Enter would otherwise let the send through and surface as a server
+/// rejection she cannot act on. The optimistic row is the tell: it is written
+/// BEFORE the request, so a refused send that still appends one has skipped the
+/// gate.
+#[test]
+fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
+    // The two reasons `post_gate` names, each driven through both composers.
+    for (reason, archived, members_only) in
+        [("channel_archived", true, false), ("members_only", false, true)]
+    {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.active_channel = "general".into();
+        app.active_channel_archived = archived;
+        app.active_channel_members_only = members_only;
+        // Empty roster: she is not seated, which is what `members_only` refuses.
+        app.channel_members = Vec::new();
+        app.settings_user_key = "me".into();
+
+        app.message_editor = compose("into the void");
+        let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+            editor::composer_submit_event(),
+        ));
+        assert!(
+            app.messages.is_empty(),
+            "the main composer must refuse a {reason} channel at apply time"
+        );
+        assert!(app.pending_message.is_empty());
+        // The words are still hers — a refusal is not a discard.
+        assert_eq!(composer(&app), "into the void");
+
+        app.active_thread_seq = 7;
+        app.reply_editor = compose("into the void");
+        let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+            editor::composer_submit_event(),
+        ));
+        assert!(
+            app.thread_messages.is_empty(),
+            "the reply composer must refuse a {reason} channel at apply time"
+        );
+        assert!(app.pending_reply.is_empty());
+        assert_eq!(reply_composer(&app), "into the void");
+    }
+
+    // AND THE GATE IS NOT A BLANKET REFUSAL: seated in the same members-only
+    // channel, both composers send. Without this the asserts above would pass
+    // against a composer that refused everything.
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.active_channel_members_only = true;
+    app.channel_members = vec![backend::ChatMember {
+        key: "me".into(),
+        label: "me".into(),
+    }];
+    app.settings_user_key = "me".into();
+
+    app.message_editor = compose("hello");
+    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+        editor::composer_submit_event(),
+    ));
+    assert_eq!(app.messages.len(), 1, "a seated member still posts");
+
+    app.active_thread_seq = 7;
+    app.reply_editor = compose("hello back");
+    let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+        editor::composer_submit_event(),
+    ));
+    assert_eq!(
+        app.thread_messages.len(),
+        1,
+        "a seated member still replies"
+    );
 }
 
 #[test]

@@ -80,6 +80,9 @@ on reconnect
   channels = []
   messages = []
   has_older_history = false
+  // Same abandoned request, same dead button — see `choose_channel`. A reconnect
+  // drops the socket the page was requested on, so it may never answer at all.
+  history_loading = false
   channel_reads = []
   unread_boundary = 0
   active_channel = ""
@@ -254,6 +257,13 @@ on live_resynced(next)
   channel_reads = initial_channel_reads(channels, channel_reads)
   messages = keep_messages(next.chat_loaded, merge_pending_messages(next.messages, messages, active_channel, next.active_channel, ""), messages)
   has_older_history = history_has_older(messages)
+  // A resync can move the room WITHOUT a launch that abandoned the request, so
+  // this is the one dropper that must ask. Conditional, not a flat clear: a
+  // same-channel resync leaves a legitimate page in flight, and `history_loaded`
+  // refuses any page that arrives with the flag already down. Same shape as
+  // `thread_has_more` below, and it must read `active_channel` while it is still
+  // the OLD room.
+  history_loading = history_loading && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel)
   failed_message_draft = remember_failed_draft(failed_message_draft, "channel", message_draft, active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel))
   selected_message_seq = refreshed_required_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), selected_message_seq)
   failed_message_draft = remember_failed_draft(failed_message_draft, message_action, message_edit_draft, selected_message_seq > 0 || message_action != "editing")

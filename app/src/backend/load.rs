@@ -221,6 +221,7 @@ pub async fn load_older_messages(
     result
         .map(|messages| HistoryPageData {
             generation,
+            channel_id,
             messages,
         })
         .map_err(|message| HydrationError {
@@ -350,11 +351,15 @@ async fn walk_roots_back(
     Ok(roots)
 }
 
-/// One page of older history, returned to the reducer with the generation that
-/// requested it so a stale load can be discarded.
+/// One page of older history, returned to the reducer with the generation AND
+/// the channel that requested it, so a stale load can be discarded. The channel
+/// carries because a channel switch does not bump the history generation — the
+/// generation alone cannot tell the reducer this page belongs to the room the
+/// reader already left.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct HistoryPageData {
     pub generation: i64,
+    pub channel_id: String,
     pub messages: Vec<ChatMessage>,
 }
 

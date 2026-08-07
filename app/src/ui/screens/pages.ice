@@ -178,13 +178,25 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                   h=fill
                   gap=9.0
                   align=center
-                text active_page_title
+                // THE TITLE IS BOUNDED, because it is the one thing in this
+                // row a USER sizes. `wrap=none` lays the glyphs out at their
+                // intrinsic width, and with no clipping ancestor a long title
+                // simply keeps drawing — straight over the page search box,
+                // the Comments button and the actions after it, which stay
+                // clickable under paint they no longer own. The `box w=fill
+                // clip=true` is the bound: the box takes the row's slack and
+                // cuts the draw at its edge, the same shape the channel name
+                // sits in in chat.ice.
+                box
                   with
                     w=fill
-                    size=13.5
-                    wrap=none
-                    font=display
-                    @text-fg
+                    clip=true
+                  text active_page_title
+                    with
+                      size=13.5
+                      wrap=none
+                      font=display
+                      @text-fg
                 // DOCUMENT ACTIONS BELONG IN THE DOCUMENT HEADER. The
                 // artifact's B1 bar is title + meta + the sync chip.
                 // The parent crumb takes the artifact's `pgMeta` seat.
