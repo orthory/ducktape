@@ -2720,3 +2720,91 @@ fn a_page_search_hit_names_the_page_it_came_from() {
         "the pages search panel names the page instead of printing a raw block id"
     );
 }
+
+/// A node whose page SEARCH answers and whose page LIST refuses — the exact
+/// split the title join has to survive. Answers one request per connection and
+/// closes, so the two views of a search never share a socket. Returns its
+/// origin.
+async fn node_with_a_broken_page_list() -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// The request is in hand once the body reaches its declared length.
+    fn request_is_complete(request: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(request);
+        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+            return false;
+        };
+        let declared = head
+            .to_lowercase()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("content-length:")?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .unwrap_or(0);
+        body.len() >= declared
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the stub node");
+    let origin = format!("http://{}", listener.local_addr().expect("stub address"));
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            while let Ok(read) = stream.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request_is_complete(&request) {
+                    break;
+                }
+            }
+            // Both views POST to `/v1/index/pages/view`; only the body says
+            // which one this is. Shapes copied from the live demo node.
+            let asked_for_the_index = String::from_utf8_lossy(&request).contains("list_pages");
+            let (status, body) = match asked_for_the_index {
+                true => ("500 Internal Server Error", "pages index unavailable"),
+                false => (
+                    "200 OK",
+                    r#"{"hits":[{"block_id":"block-1","page_id":"page-1","parent":"page-1","kind":"paragraph","text":"Tail paragraph after the list","height":1,"time":1}]}"#,
+                ),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    origin
+}
+
+/// A FAILED TITLE LOOKUP DEGRADES THE LABEL, NOT THE RESULTS. #1003 joined the
+/// page index onto the hits with `?`, so a `ListPages` failure — a SECOND round
+/// trip, made after the node had already answered the search — turned a
+/// successful search into an `Err`. Both readers discard that silently: the
+/// Explorer's `if let Ok(pages)` (backend/search.rs) drops every page hit from
+/// a workspace search, and the palette keeps only whichever leg survived. A
+/// decoration must never destroy the payload.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_title_lookup_keeps_the_page_hits_it_could_not_name() {
+    let rpc = node_with_a_broken_page_list().await;
+    let data = search_pages(rpc, String::new(), "tail".into(), 7)
+        .await
+        .expect("a search the node answered must not fail on its title lookup");
+
+    assert_eq!(data.generation, 7);
+    assert_eq!(data.hits.len(), 1, "the hit the search returned survives");
+    assert_eq!(data.hits[0].text, "Tail paragraph after the list");
+    assert_eq!(data.hits[0].page_id, "page-1");
+    assert_eq!(data.hits[0].block_id, "block-1");
+    // Only the LABEL degrades, onto the same fallback an unresolvable page id
+    // already takes in `titled_page_hits`.
+    assert_eq!(data.hits[0].page_title, "Untitled");
+}
