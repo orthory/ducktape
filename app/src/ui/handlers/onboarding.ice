@@ -267,7 +267,7 @@ on console_opened(id)
   parallel
     task window close target=window_target(onboarding_win)
     run remember_network(connected_rpc) -> network_remembered _
-    run connect(connected_rpc) -> workspace_connected _ | failed _
+    run connect(connected_rpc, 0, hydration_generation) -> workspace_connected _ | connect_failed _
 
 on network_remembered(_written)
   error = error

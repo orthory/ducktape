@@ -2,10 +2,28 @@ use super::*;
 use ::chat;
 use ::forge;
 
-pub async fn connect(rpc: String) -> Result<WorkspaceData, AppError> {
+/// `attempt` backs the connect off exactly as `live_resync_load` backs off a
+/// live sync — 1s doubling to a 16s cap. The steady-state path has always
+/// retried forever; the connect that GETS you there gave up after one failure,
+/// which is the wrong way round. A transient failure is not rare: a `/v1/query`
+/// can block until the node writes its next checkpoint (issue #1018), which is
+/// longer than the RPC client's 30s timeout, so a healthy node hands the
+/// console an "error sending request" often enough to matter.
+///
+/// `generation` rides through to the reply so a connect answering for an
+/// endpoint you have since left is dropped unread — the same guard the page
+/// and chat planes learned in #970.
+pub async fn connect(
+    rpc: String,
+    attempt: i64,
+    generation: i64,
+) -> Result<WorkspaceData, HydrationError> {
+    if attempt > 0 {
+        tokio::time::sleep(retry_delay(u32::try_from(attempt).unwrap_or(u32::MAX))).await;
+    }
     let result = async {
         let rpc = rpc_client(&rpc)?;
-        load_workspace(&rpc, None, None, 0).await
+        load_workspace(&rpc, None, None, generation).await
     }
     .await;
     // SAY WHAT ACTUALLY FAILED. This threw the cause away with `|_|` and
@@ -20,9 +38,15 @@ pub async fn connect(rpc: String) -> Result<WorkspaceData, AppError> {
     // through: it names the signer, the key, a refused password, a slow node
     // and a garbled reply, and falls through to the raw message rather than
     // inventing one.
-    result.map_err(|cause| AppError {
+    // A GENERATION, NOT AN `AppError`. The failure arm retries, so it must be
+    // able to tell ITS OWN failure from one belonging to a connect chain that
+    // has since been abandoned — otherwise two chains both retry forever and
+    // each one's generation bump can reject the other's success. `AppError`
+    // carries `committed`, which a read has no use for; `HydrationError` is
+    // what every other loader here already fails with.
+    result.map_err(|cause| HydrationError {
+        generation,
         message: user_error(cause.to_string()),
-        committed: false,
     })
 }
 

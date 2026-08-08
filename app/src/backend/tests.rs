@@ -1856,7 +1856,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     let loaded_page = load_page(origin.clone(), "welcome".into()).await.unwrap();
     assert_eq!(loaded_page.active_page, "welcome");
     assert_eq!(loaded_page.blocks[0].text, "A signed page block");
-    let workspace = connect(origin.clone()).await.unwrap();
+    let workspace = connect(origin.clone(), 0, 0).await.unwrap();
     let mut live = live_events(origin.clone());
     let ready = live.next().await.unwrap();
     assert_eq!(ready.kind, "ready");
