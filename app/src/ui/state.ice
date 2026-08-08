@@ -251,6 +251,14 @@ state
   // only exists while that drift does.
   page_editor:editor = ""
   page_saved_text = ""
+  // WHICH PAGE THE BUFFER AND `blocks` ACTUALLY HOLD — not which page the
+  // reader picked. `active_page` moves the instant she clicks (the switch has
+  // to be visible before the round trip); this one moves only where a load
+  // installs the text, so `install_decision` can still tell a page MOVE from a
+  // same-page refresh. Overloading the two was what made a click repaint
+  // nothing for seconds — and moving `active_page` alone would have made every
+  // switch look like a refresh, which a dirty buffer refuses.
+  buffer_page = ""
   // Scratch pair for the one-decision buffer install (E151: a run-route
   // payload's fields do not type inside `let`, so the decision lands here).
   page_landing = ""

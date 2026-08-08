@@ -61,6 +61,24 @@ on choose_page(id)
   page_search_generation = page_search_generation + 1
   page_searching = false
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
+  // THE SWITCH IS VISIBLE NOW — the same choreography as `choose_channel`. The
+  // clicked page takes the sidebar highlight and the header title, and the
+  // previous document leaves the pane, before the round trip: a click that
+  // repaints nothing for the seconds a page load takes reads as a dead app.
+  // Only `active_page` moves; `buffer_page` stays where the text came from,
+  // which is what keeps the landing load a MOVE rather than a refresh.
+  // Re-clicking the page already open moves nothing, so a same-page reload
+  // still meets a buffer that the install decision can protect.
+  let page_moved = id != active_page
+  active_page = id
+  active_page_title = page_display_title(pages, id, active_page_title)
+  active_page_parent = keep_str(page_moved, "", active_page_parent)
+  blocks = keep_blocks(page_moved, [], blocks)
+  // The buffer and its baseline move together, always — a blank buffer with a
+  // stale baseline would read as dirty and the save tick would write it back.
+  page_editor = installed_page_editor(page_editor, page_moved, "")
+  page_saved_text = keep_str(page_moved, "", page_saved_text)
+  buffer_page = keep_str(page_moved, "", buffer_page)
   block_autosave_generation = block_autosave_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -359,19 +377,23 @@ on pages_updated(next)
   block_comment_draft = ""
   pending_block_comment = ""
   pages = next.pages
-  // ONE install decision, decided against the PREVIOUS page identity and
-  // applied to buffer and baseline together: the incoming page's text lands
-  // when the page MOVED or a clean buffer actually differs; a dirty buffer on
-  // the SAME page is the user mid-typing through a reload, and a reload must
-  // never eat keystrokes.
+  // ONE install decision, decided against the page the BUFFER holds — never
+  // against `active_page`, which moved to the clicked page the moment it was
+  // clicked — and applied to buffer and baseline together: the incoming page's
+  // text lands when the page MOVED or a clean buffer actually differs; a dirty
+  // buffer on the SAME page is the user mid-typing through a reload, and a
+  // reload must never eat keystrokes.
   page_landing = page_document_text(next.active_page_title, next.blocks)
-  page_install = install_decision(page_editor, active_page, next.active_page, page_saved_text, page_landing)
-  blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
+  page_install = install_decision(page_editor, buffer_page, next.active_page, page_saved_text, page_landing)
+  blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
   page_editor = installed_page_editor(page_editor, page_install, page_landing)
   page_saved_text = keep_str(page_install, page_landing, page_saved_text)
+  // The buffer now holds THIS page. Unconditional on purpose: the install is
+  // refused only when the decision already found the page unchanged.
+  buffer_page = next.active_page
   page_refusal = ""
   block_comment_thread_total = next.comment_thread_total
   commented_block_hits = next.commented_block_hits
@@ -392,8 +414,8 @@ on pages_mutated(next)
   // BEFORE the assignments so both reads see the pre-move state (the pair
   // must move on one shared decision).
   page_landing = page_document_text(next.active_page_title, next.blocks)
-  page_install = install_decision(page_editor, active_page, next.active_page, page_saved_text, page_landing)
-  blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
+  page_install = install_decision(page_editor, buffer_page, next.active_page, page_saved_text, page_landing)
+  blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
@@ -417,6 +439,7 @@ on pages_mutated(next)
   pending_block_comment = ""
   page_editor = installed_page_editor(page_editor, page_install, page_landing)
   page_saved_text = keep_str(page_install, page_landing, page_saved_text)
+  buffer_page = next.active_page
   page_refusal = ""
   block_comment_thread_total = next.comment_thread_total
   commented_block_hits = next.commented_block_hits
