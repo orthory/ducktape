@@ -520,3 +520,39 @@ test settings_keyboard_scroll_contract
   expect body.scroll_y > 0.0
   key home
   expect body.scroll_y ~= 0.0
+  // A FOCUSED WIDGET'S KEY NEVER ARRIVES — the `status=ignored` half of the
+  // arbitration, and the half that does NOT cover the arrows. Put the caret in
+  // Settings' rename field and Home belongs to the field: iced's `text_input`
+  // captures it (iced_widget-0.14.2/src/text_input.rs:1119), the subscription
+  // never fires, and the scrolled pane holds where it is.
+  key end
+  expect body.scroll_y > 0.0
+  focus #workspace-tabs/content/settings/settings-body/account-rename
+  key home
+  expect body.scroll_y > 0.0
+  // AN ARROW IS NOT THE PANE'S KEY. Same caret — but `text_input` falls Up/Down
+  // through to `_ => {}` (text_input.rs:1245) WITHOUT capturing, so these DO
+  // arrive and the router itself has to refuse them. Asserted off the top of
+  // the pane so a stolen step in either direction moves a visible pixel: this
+  // is the press that scrolled the page out from under a live caret.
+  scroll-to body 0.0 30.0
+  expect body.scroll_y ~= 30.0
+  key arrow-down
+  expect body.scroll_y ~= 30.0
+  key arrow-up
+  expect body.scroll_y ~= 30.0
+  // …and with nothing focused either. The pane never claims an arrow, because
+  // nothing here can tell one meant for a caret from one meant for the page.
+  blur
+  key arrow-down
+  expect body.scroll_y ~= 30.0
+  // NOTHING MOVES UNDER A TRANSIENT LAYER. The bell panel is over the content;
+  // a Page Down with it open used to scroll the screen BEHIND it.
+  dispatch toggle_bell
+  key page-down
+  expect body.scroll_y ~= 30.0
+  key end
+  expect body.scroll_y ~= 30.0
+  dispatch toggle_bell
+  key page-down
+  expect body.scroll_y > 30.0

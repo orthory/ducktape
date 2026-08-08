@@ -185,18 +185,19 @@ pub fn palette_key_action(
     "none".into()
 }
 
-/// The surface Escape dismisses — the TOPMOST transient layer only, and the
-/// ladder's order IS the z-order. Menus, popovers, the create modal and the
-/// bell close; persistent rails (thread, comments, the channel drawer) keep
-/// their explicit × — closing one from a global key would also have to
-/// adjudicate its half-typed drafts. The palette is absent on purpose:
-/// `palette_key_action` owns its keys, and an open palette swallows Escape.
+/// The transient layer currently over the console's content — the TOPMOST one
+/// only — or `""` when the content itself is the frontmost thing on screen.
+/// The order IS the z-order.
+///
+/// ONE enumeration, two readers. Escape asks it which surface to close;
+/// the keyboard scroll asks it only whether anything at all sits over the pane
+/// it would otherwise move. Every keyboard route that ignores this list routes
+/// a key at the screen BEHIND the layer the reader is looking at.
 //
-// One argument per closable surface: the Ice extern surface is flat, and the
-// ladder must see every layer at once to name the topmost.
+// One argument per layer: the Ice extern surface is flat, and the reading must
+// see every layer at once to name the topmost.
 #[allow(clippy::too_many_arguments)]
-pub fn escape_target(
-    logical: iced::keyboard::Key,
+pub fn topmost_overlay(
     palette_open: bool,
     bell_open: bool,
     channel_create_open: bool,
@@ -205,10 +206,8 @@ pub fn escape_target(
     channel_settings_open: bool,
     forge_repo_menu: bool,
 ) -> String {
-    use iced::keyboard::{Key, key::Named};
-    let not_escape = logical != Key::Named(Named::Escape);
-    if not_escape || palette_open {
-        return String::new();
+    if palette_open {
+        return "palette".into();
     }
     if bell_open {
         return "bell".into();
@@ -239,6 +238,45 @@ pub fn escape_target(
     String::new()
 }
 
+/// The surface Escape dismisses — the topmost transient layer, minus the one
+/// rung Escape does not own. Menus, popovers, the create modal and the bell
+/// close; persistent rails (thread, comments, the channel drawer) keep their
+/// explicit × — closing one from a global key would also have to adjudicate
+/// its half-typed drafts.
+#[allow(clippy::too_many_arguments)]
+pub fn escape_target(
+    logical: iced::keyboard::Key,
+    palette_open: bool,
+    bell_open: bool,
+    channel_create_open: bool,
+    thread_message_action: String,
+    message_action: String,
+    channel_settings_open: bool,
+    forge_repo_menu: bool,
+) -> String {
+    use iced::keyboard::{Key, key::Named};
+    let not_escape = logical != Key::Named(Named::Escape);
+    if not_escape {
+        return String::new();
+    }
+    let topmost = topmost_overlay(
+        palette_open,
+        bell_open,
+        channel_create_open,
+        thread_message_action,
+        message_action,
+        channel_settings_open,
+        forge_repo_menu,
+    );
+    // `palette_key_action` owns the palette's keys — an open palette swallows
+    // Escape, so the ladder yields rather than naming a rung.
+    let palette_owns_it = topmost == "palette";
+    if palette_owns_it {
+        return String::new();
+    }
+    topmost
+}
+
 /// One keyboard "page", in pixels. iced's scrollable reports its viewport only
 /// through `on_scroll`, so a pane that has never been scrolled cannot tell us
 /// its own height and there is nothing to page BY — a constant is the only
@@ -248,41 +286,53 @@ pub fn escape_target(
 /// never skip past unread content. Undershooting costs a keypress; overshooting
 /// loses text.
 const KEY_PAGE_STEP: f64 = 400.0;
-/// One arrow-key step: about three lines of body text.
-const KEY_LINE_STEP: f64 = 60.0;
 /// Larger than any content the console can stack. `scroll_by` clamps the result
 /// to the pane's own extent, so this IS Home/End — no content measurement, no
 /// second operation kind.
 const KEY_SCROLL_EXTREME: f64 = 1.0e9;
 
 /// The vertical scroll, in pixels, that a key press asks the console's content
-/// pane for — `0.0` for every key that is not a scroll key.
+/// pane for — `0.0` for every key the pane does not own.
 ///
 /// iced's `scrollable` answers the wheel, the drag rail and touch; it has no
 /// focus and no keyboard handling at all (0.14's widget matches on
-/// `Event::Keyboard` only to track modifiers for shift-wheel), so Page
-/// Down/Up, Home/End and the arrows moved nothing anywhere in the console. The
-/// app is the only layer that can route them, and the subscription that feeds
-/// this one is `status=ignored`: a key a focused widget already consumed —
-/// Home inside a text field, an arrow inside an open combo box — never reaches
-/// here, so the pane scroll is strictly the fallback for a key nothing wanted.
+/// `Event::Keyboard` only to track modifiers for shift-wheel), so the app is
+/// the only layer that can route a keyboard scroll at one. THIS is the whole
+/// decision — three conditions, in one place, rather than a guard per key:
 ///
-/// Any modifier disqualifies the press. Chords belong to their own routers
-/// (`palette_key_action`, the composer marks, the page history), and a
-/// keyboard-selection chord like Shift+PageDown must not also move the pane.
+/// 1. **A focused widget's key is not the pane's.** The subscription feeding
+///    this is `status=ignored`, so anything a focused widget consumed never
+///    arrives — which covers Home/End (iced's `text_input` captures both,
+///    `text_input.rs:1119`/`1139`) and every key the rich composers take. It
+///    does NOT cover the arrows: single-line `text_input` falls through
+///    Up/Down to `_ => {}` (`text_input.rs:1245`) without capturing them, so a
+///    pane that claimed an arrow scrolled the page out from under a live
+///    caret. Nothing in this stack can read widget focus (ui-lang has no focus
+///    predicate — see the same note on `composer_focus`), so the pane cannot
+///    tell an arrow meant for an input from one meant for itself, and an arrow
+///    inside an input belongs to the input. The pane claims only Page Up/Down
+///    and Home/End: keys no focused widget in this console owns silently.
+/// 2. **A transient layer's key is not the pane's.** `topmost_overlay` is the
+///    reading — with the palette or the bell up, the pane the reader can see
+///    is not the one this would move.
+/// 3. **A chord is not the pane's.** Any modifier disqualifies the press;
+///    chords belong to their own routers (`palette_key_action`, the composer
+///    marks, the page history), and a keyboard-selection chord like
+///    Shift+PageDown must not also move the pane.
 pub fn content_scroll_step(
     logical: iced::keyboard::Key,
     modifiers: iced::keyboard::Modifiers,
+    overlay: String,
 ) -> f64 {
     use iced::keyboard::{Key, key::Named};
-    if !modifiers.is_empty() {
+    let layer_over_the_pane = !overlay.is_empty();
+    let chord = !modifiers.is_empty();
+    if layer_over_the_pane || chord {
         return 0.0;
     }
     match logical {
         Key::Named(Named::PageDown) => KEY_PAGE_STEP,
         Key::Named(Named::PageUp) => -KEY_PAGE_STEP,
-        Key::Named(Named::ArrowDown) => KEY_LINE_STEP,
-        Key::Named(Named::ArrowUp) => -KEY_LINE_STEP,
         Key::Named(Named::End) => KEY_SCROLL_EXTREME,
         Key::Named(Named::Home) => -KEY_SCROLL_EXTREME,
         _ => 0.0,
