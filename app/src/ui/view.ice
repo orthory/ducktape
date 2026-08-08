@@ -596,17 +596,23 @@ view
                             size=12.5
                             wrap=none
                             @text-primary
-                        text bell_unread
-                          with
-                            size=10.5
-                            wrap=none
-                            font=code_medium
-                            @text-meta
-                        text "unread"
-                          with
-                            size=12.5
-                            wrap=none
-                            @text-meta
+                        // NOT `0 unread` OVER "Nothing yet". The panel below
+                        // already says the inbox is empty; a zero beside it is
+                        // the same nothing said twice, and louder. `Mark all
+                        // read` is already gated the same way.
+                        if bell_unread > 0
+                          text count_label(bell_unread)
+                            with
+                              size=10.5
+                              wrap=none
+                              font=code_medium
+                              @text-meta
+                        if bell_unread > 0
+                          text "unread"
+                            with
+                              size=12.5
+                              wrap=none
+                              @text-meta
                         space w=fill
                         button "Mark all read" -> mark_bell_read_submit
                           with

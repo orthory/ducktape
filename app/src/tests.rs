@@ -3027,6 +3027,64 @@ fn approvals_tells_a_first_run_apart_from_a_finished_one() {
     );
 }
 
+/// A ZERO IS A CLAIM, AND THIS APP SAYS IT WITH BLANK. `count_label` returns
+/// "" below one and every count in the app routes through it — except two,
+/// which printed the digit right beside a plate that had just said the same
+/// thing in words:
+///
+///   - the bell read `Alerts 0 unread` directly above "Nothing yet — mentions
+///     and deliveries land here", while its own `Mark all read` was already
+///     gated on `bell_unread <= 0`;
+///   - Channel details read `MEMBERS 0` above "No members added."
+#[test]
+fn the_two_counts_that_printed_a_zero_now_say_nothing() {
+    assert_eq!(backend::count_label(0), "", "the convention");
+    assert_eq!(backend::count_label(3), "3");
+
+    // The GATE is the load-bearing half — with it, the digit never reaches the
+    // screen at zero whatever formats it. Both the number and the word "unread"
+    // must carry it, or the panel reads a bare "unread".
+    let view = inlined(include_str!("ui/view.ice"));
+    let alerts = view
+        .split("text \"Alerts\"")
+        .nth(1)
+        .expect("the bell's Alerts header")
+        .split("space w=fill")
+        .next()
+        .expect("header region");
+    assert_eq!(
+        alerts.matches("if bell_unread > 0").count(),
+        2,
+        "the count and the word both stand down at zero"
+    );
+    assert!(
+        alerts.contains("count_label(bell_unread)"),
+        "and the digit routes through the app's own blank-at-zero label"
+    );
+
+    // Scoped to the drawer's MEMBERS eyebrow. The OTHER member count in this
+    // file — the `· N added` run in the channel header — is already correct: it
+    // sits under `if !empty(channel_members)` and its comment says why
+    // ("`· 0 added` on every normal channel is noise"). A file-wide negative
+    // would flag that one too, which is how this assertion first failed.
+    let chat = inlined(include_str!("ui/screens/chat.ice"));
+    let eyebrow = chat
+        .split("Eyebrow label=\"MEMBERS\"")
+        .nth(1)
+        .expect("the drawer's MEMBERS eyebrow")
+        .split("Eyebrow ")
+        .next()
+        .expect("eyebrow region");
+    assert!(
+        eyebrow.contains("count_label(len(channel_members))"),
+        "the member eyebrow blanks at zero like every other count"
+    );
+    assert!(
+        !eyebrow.contains("text len(channel_members)"),
+        "the raw len is what printed `0`"
+    );
+}
+
 /// AN EMPTY STATE MAY ONLY NAME A MECHANISM THAT EXISTS. Forge's two tracker
 /// plates each promised a route into the list, and one of them was wrong while
 /// the other named nothing at all:
