@@ -1030,6 +1030,49 @@ fn palette_keys_use_logical_escape_and_physical_shortcut() {
     );
 }
 
+/// A SEARCH HIT SAYS WHICH ROOM IT IS IN, ONCE. The hit's `meta` was
+/// `#{seq}` — the message's sequence number, rendered exactly like a channel,
+/// because every channel in this app is written `# General`. So a palette row
+/// read `#1` and the reader could not tell whether that was a room, a position,
+/// or which of four channels the message actually lived in.
+///
+/// Three surfaces render `hit.meta` — the palette, the chat sidebar and the
+/// Explorer — and only the Explorer composed the channel in, at its own call
+/// site. The room now lives in `meta` itself, so all three agree and the
+/// Explorer stops composing (which would have printed it twice).
+#[test]
+fn a_search_hit_names_its_room_exactly_once() {
+    const CHAT: &str = include_str!("chat.rs");
+    let hit = CHAT
+        .split("ChatSearchHit {")
+        .nth(1)
+        .expect("the search hit mapping")
+        .split("})")
+        .next()
+        .expect("mapping body");
+    assert!(
+        hit.contains(r#"meta: format!("{} · #{}", hit.channel_id, hit.seq)"#),
+        "the room comes first, then the sequence"
+    );
+
+    const SEARCH: &str = include_str!("search.rs");
+    let message_arm = SEARCH
+        .split("kind: \"message\".into(),")
+        .nth(1)
+        .expect("the message hit arm")
+        .split("});")
+        .next()
+        .expect("arm body");
+    assert!(
+        message_arm.contains("meta: hit.meta,"),
+        "the Explorer carries the meta through"
+    );
+    assert!(
+        !message_arm.contains("hit.channel_id, hit.meta"),
+        "composing the channel again is what printed it twice"
+    );
+}
+
 /// AN UNREAD HEIGHT SAYS SO. Settings' node block leaves every string reading
 /// blank at its default — node key, data directory, key state, key path — and
 /// then printed `h 0` for the block height, a measured zero for a chain sitting

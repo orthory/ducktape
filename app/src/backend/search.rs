@@ -110,7 +110,9 @@ pub async fn search_workspace(
             // and `system` in search.
             title: hit.author,
             snippet: hit.text,
-            meta: format!("{} · {}", hit.channel_id, hit.meta),
+            // `hit.meta` already reads `general · #12` — see backend/chat.rs.
+            // Composing the channel again here printed it twice.
+            meta: hit.meta,
             target: hit.channel_id,
         }));
     }

@@ -640,12 +640,20 @@ pub async fn search_chat(
             hits: hits
                 .into_iter()
                 .map(|hit| ChatSearchHit {
+                    // THE ROOM COMES FIRST, because it is the thing a hit is
+                    // missing. `#12` alone reads as a CHANNEL in this app —
+                    // every channel is written `# General` — while it is
+                    // actually the message's sequence number, and the channel
+                    // it was found in went unsaid in both the palette and the
+                    // sidebar. Every renderer of a hit shows `meta`, so the
+                    // room belongs in it rather than composed at one call site
+                    // (which is what the Explorer was doing alone).
+                    meta: format!("{} · #{}", hit.channel_id, hit.seq),
                     channel_id: hit.channel_id,
                     seq: number_i64(hit.seq),
                     root_seq: number_i64(hit.thread.unwrap_or(hit.seq)),
                     author: author_display(&hit.author, current_user.as_deref()),
                     text: hit.text,
-                    meta: format!("#{}", hit.seq),
                 })
                 .collect(),
         })
