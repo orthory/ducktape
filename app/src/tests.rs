@@ -3177,6 +3177,107 @@ fn forge_empty_states_name_only_routes_that_exist() {
     );
 }
 
+/// THE EXPLORER NAMES WHAT IT SHOWS. Three defects on one screen, all the same
+/// shape — the pixels were right and the words were absent or false.
+///
+/// The header claimed the list holds "the blocks this node verified for
+/// itself". It does not. `GET /v1/blocks` serves the derived-index rows, and
+/// `bin/noded`'s projection writes NO row for a block whose members are all the
+/// `consensus.nop` heartbeat ("a pure nop/idle block — the explorer hides it").
+/// Measured against the demo node: `/v1/status` height 419718, while the
+/// hundred rows `/v1/blocks` served spanned heights 102907-366045 — a
+/// hundred-row "recent" window covering 263k heights, which no lag explains. A
+/// reader comparing the top row against the height in the titlebar concludes
+/// the node is fifty thousand blocks behind.
+///
+/// The op detail then printed two values nobody named: `chat(+0m/+0e)`, whose
+/// units are spelled out only in `crates/kernel/host`, and a hash that differs
+/// from the row's hash on the left because one is the frame id and the other
+/// the op payload digest.
+///
+/// This pins the DERIVATION and the LABEL SITES rather than the sentences: the
+/// copy may be rewritten, but a count must carry its noun, a value must carry
+/// its name, and one set must not have two names on one screen.
+#[test]
+fn the_explorer_names_what_it_shows() {
+    // The dispatch trace, fed the `operations` shape `bin/noded`'s projection
+    // serves. Both units appear once singular and once plural, so a hand-rolled
+    // `{n} msgs` that skips the `plural` seam fails here.
+    let hops = vec![
+        serde_json::json!({
+            "module": "chat", "origin": "external",
+            "emitted_msgs": 1, "emitted_events": 0,
+        }),
+        serde_json::json!({
+            "module": "tagging", "origin": "module:chat",
+            "emitted_msgs": 0, "emitted_events": 2,
+        }),
+    ];
+    assert_eq!(
+        backend::explorer_trace(Some(&hops)),
+        "chat · 1 msg · 0 events → tagging · 0 msgs · 2 events",
+        "every count in the trace names what it counts"
+    );
+
+    let explorer = SCREENS
+        .split_once("component ExplorerScreen(")
+        .expect("the Explorer screen exists")
+        .1;
+    let explorer = explorer
+        .split_once("\ncomponent ")
+        .map_or(explorer, |(body, _)| body);
+
+    // ONE SET, ONE NAME. The subtitle and the "No blocks yet" plate describe
+    // the same list and had drifted — only the plate knew the list is filtered.
+    // The clause lives here once so a rewrite has to move both sites together.
+    const SET: &str = "locks that carried operations";
+    for (site, opener) in [
+        ("subtitle", "ScreenTitle title=\"Explorer\" detail=\""),
+        (
+            "empty plate",
+            "EmptyState title=\"No blocks yet\" description=\"",
+        ),
+    ] {
+        let sentence = explorer
+            .split_once(opener)
+            .unwrap_or_else(|| panic!("the Explorer {site} is where it was"))
+            .1
+            .split_once('"')
+            .expect("a quoted string closes")
+            .0;
+        assert!(
+            sentence.contains(SET),
+            "the Explorer {site} describes the block list as `{sentence}` \
+             instead of naming the set the node actually serves"
+        );
+    }
+
+    // AND EVERY VALUE IN THE OP DETAIL CARRIES ITS NAME. `by` was already
+    // right and is pinned with the two that were not, so the rule reads as a
+    // rule instead of an exception for these two fields.
+    let detail = explorer
+        .split_once("for op in explorer_ops_at(ops, selected)")
+        .expect("the op detail pane iterates the selected block's ops")
+        .1;
+    for (label, value) in [
+        ("op", "text op.op_hash"),
+        ("by", "text op.proposer"),
+        ("dispatch", "text op.trace"),
+    ] {
+        let named = format!("text \"{label}\"");
+        let label_at = detail
+            .find(&named)
+            .unwrap_or_else(|| panic!("`{value}` is drawn with no `{named}` beside it"));
+        let value_at = detail
+            .find(value)
+            .unwrap_or_else(|| panic!("the op detail no longer draws `{value}`"));
+        assert!(
+            label_at < value_at,
+            "`{named}` must precede `{value}`, or it labels something else"
+        );
+    }
+}
+
 /// A LIST THAT DRIVES A DETAIL PANE MUST SAY WHICH ROW IT IS SHOWING. The
 /// Explorer's block rows carried `active bg=transparent` on BOTH states, so
 /// clicking a row filled the pane on the right and left the list identical to

@@ -94,8 +94,16 @@ fn explorer_payload(payload: &serde_json::Value) -> String {
     preview
 }
 
-/// The dispatch trace summary: `module(+msgs/+events)` per hop.
-fn explorer_trace(operations: Option<&Vec<serde_json::Value>>) -> String {
+/// The dispatch trace summary: one hop per module the op reached, each naming
+/// what it emitted. The counts come straight off `host::DispatchRecord` —
+/// `emitted_msgs` is "count of follow-up `Msg`s this dispatch emitted (the
+/// causal fan-out)", `emitted_events` "count of observability `Event`s" — so
+/// the units are spelled the way the fields are named. This rendered
+/// `chat(+0m/+0e)` before, a private shorthand nothing on the screen expanded:
+/// `m`/`e` are not words, and a reader who has not read `crates/kernel/host`
+/// has no way to recover them. The counts join their nouns through `plural`,
+/// the app's one count-label seam, so `1 msg` never renders as `1 msgs`.
+pub(crate) fn explorer_trace(operations: Option<&Vec<serde_json::Value>>) -> String {
     let Some(operations) = operations else {
         return String::new();
     };
@@ -105,7 +113,9 @@ fn explorer_trace(operations: Option<&Vec<serde_json::Value>>) -> String {
             let module = op["module"].as_str().unwrap_or("?");
             let msgs = op["emitted_msgs"].as_i64().unwrap_or(0);
             let events = op["emitted_events"].as_i64().unwrap_or(0);
-            format!("{module}(+{msgs}m/+{events}e)")
+            let emitted_msgs = plural(msgs, "msg".into(), "msgs".into());
+            let emitted_events = plural(events, "event".into(), "events".into());
+            format!("{module} · {emitted_msgs} · {emitted_events}")
         })
         .collect::<Vec<_>>()
         .join(" → ")
