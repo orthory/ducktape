@@ -352,15 +352,23 @@ on live_resynced(next)
   let resynced_saved = refreshed_page_saved(page_editor, active_page_title, blocks, page_saved_text)
   page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
   page_saved_text = resynced_saved
-  // The buffer's own page follows the buffer, and ONLY when the buffer moved.
+  // The buffer's own page follows the buffer, and only when this resync
+  // actually carried page news AND the buffer moved with it.
+  //
   // A dirty buffer refused the refresh above and still belongs to the page it
   // was typed in — a resync that lands on another page (this one was deleted)
-  // must not claim it, or the next load would read the switch as a refresh,
-  // keep the old text, and the save tick would write it into a page nobody
-  // typed it on. A clean buffer either just took this page's text or is about
-  // to on the next load, which reinstalls whenever the text differs.
+  // must not claim it, or the next load would read the switch as a refresh and
+  // keep the old text under the new page's title.
+  //
+  // `pages_answer_is_current` is the other half and it is the load-bearing one.
+  // A CHAT-ONLY resync arrives with `pages_loaded == false`, so `blocks` keeps
+  // whatever it holds — which, in the window `choose_page` opens, is empty —
+  // and the refresh above canonicalises `title + []` into a document that never
+  // came from the node. Claiming that as the new page's buffer hands
+  // `page_autosave_tick` a fabricated document it is willing to write: the
+  // page would be overwritten with a blank one it never loaded.
   let resynced_buffer_is_clean = page_text(page_editor) == page_saved_text
-  buffer_page = keep_str(resynced_buffer_is_clean, active_page, buffer_page)
+  buffer_page = keep_str(resynced_buffer_is_clean && pages_answer_is_current, active_page, buffer_page)
   error = ""
   block_comments_generation = block_comments_generation + 1
   live_thread_generation = live_thread_generation + 1

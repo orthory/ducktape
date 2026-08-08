@@ -1761,6 +1761,41 @@ fn reading_alpha() -> Ducktape {
     app
 }
 
+/// A CHAT-ONLY RESYNC MUST NOT CLAIM THE PAGE IT CARRIES NO NEWS ABOUT. The
+/// click blanks the pane and moves `active_page`; a resync that arrives with
+/// `pages_loaded == false` keeps the empty `blocks` and canonicalises
+/// `title + []` into a document the node never sent. Stamping `buffer_page`
+/// for that fabrication hands `page_autosave_tick` a blank document it is
+/// willing to write over the real page.
+#[test]
+fn a_chat_only_resync_does_not_claim_the_page_it_never_loaded() {
+    let mut app = reading_alpha();
+    let _ = app.__update(__DucktapeMessage::ChoosePage("beta".into()));
+    assert!(app.buffer_page.is_empty(), "the click released the buffer");
+
+    let mut chat_only = live_refresh(app.hydration_generation, "", Vec::new(), "", Vec::new());
+    chat_only.pages_loaded = false;
+    chat_only.active_page = String::new();
+    let _ = app.__update(__DucktapeMessage::LiveResynced(chat_only));
+
+    assert!(
+        app.buffer_page.is_empty(),
+        "a resync carrying no page news must not claim the page as the buffer's"
+    );
+
+    // And the tick still refuses, which is the consequence that matters.
+    let _ = app.__update(__DucktapeMessage::Failed(backend::AppError {
+        message: "node blip".into(),
+        committed: false,
+    }));
+    app.page_editor = compose("h");
+    let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
+    assert_eq!(
+        app.block_autosave_status, "idle",
+        "a fabricated buffer must never be saved into a real page"
+    );
+}
+
 /// A FAILED LOAD MUST NOT LET THE BLANK PANE EAT THE PAGE IT NEVER OPENED.
 /// The optimistic switch moves `active_page` and blanks the buffer before the
 /// round trip. If the load then FAILS, `on failed` clears `loading` without
