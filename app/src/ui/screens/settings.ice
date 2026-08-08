@@ -28,7 +28,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
     set_appearance_dark()
   state
     key_pw = ""
-  scroll
+  scroll #settings-body
     with
       dir=vertical
       w=fill

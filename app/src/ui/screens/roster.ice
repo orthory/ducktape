@@ -125,7 +125,7 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
             with
               message="No members here yet — validators, residents and registered agents appear as they join."
       if connected && !empty(filter_members(rows, filter))
-        scroll
+        scroll #members-body
           with
             dir=vertical
             w=fill
@@ -225,7 +225,7 @@ component AgentsScreen(rows:[AgentRow], connected:bool, answered:bool)
           with
             message="No agents registered — a registered agent appears here with its capability and grants."
     if connected && !empty(rows)
-      scroll
+      scroll #agents-body
         with
           dir=vertical
           w=fill

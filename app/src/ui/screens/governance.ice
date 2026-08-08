@@ -18,7 +18,7 @@ component GovernanceScreen(rows:[ProposalRow], voting:str, admin:bool, connected
       row gap=0.0
         if connected && open_proposals(rows) > 0
           CountChip label=pending_label(rows)
-    scroll
+    scroll #approvals-body
       with
         dir=vertical
         w=fill

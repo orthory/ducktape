@@ -378,3 +378,145 @@ test palette_overlay_contract
   expect palette_draft == "duck"
   key escape
   expect !palette_open
+
+preset ui_settings_scroll
+  state
+    shell_tab = "settings"
+    status = "Offline"
+    connected = false
+    loading = false
+    mutation_phase = "idle"
+    error = ""
+
+// KEYBOARD SCROLL. iced's scrollable answers the wheel and the drag rail only
+// — it has no focus and no key handling — so Page Down over Settings moved
+// nothing, and neither did Home/End or the arrows on any screen. The whole
+// chain is under test: the `status=ignored` key subscription, the
+// `content_scroll_step` verdict, and the `scroll-by` operation landing on the
+// pane. The mount is the REAL id path the handler names
+// (`#workspace-tabs/content/settings/settings-body`) — a scaffold that merely
+// imitated that path would stay green while the shipping app stayed dead.
+test settings_keyboard_scroll_contract
+  preset ui_settings_scroll
+  viewport 1120 460
+  mount
+    WorkspaceTabs #workspace-tabs
+      with
+        network="testnet"
+        status
+        height=84912
+        loading
+        degraded=false
+        tab=shell_tab
+        bell_count=0
+        bell_sev="info"
+        approvals=0
+        account=""
+        agent_live=false
+        tier="validator"
+        answered=true
+        root_hash=""
+        consensus_view="—"
+        quorum="—"
+        reachable="—"
+        last_finalized=0
+        checkpoint=0
+      events
+        select_shell_tab -> select_shell_tab _
+        toggle_bell -> toggle_bell
+        switch_network -> switch_network
+
+      huddle:
+        space w=1.0 h=1.0
+      notice:
+        space w=1.0 h=1.0
+      chat:
+        space w=1.0 h=1.0
+      pages:
+        space w=1.0 h=1.0
+      files:
+        space w=1.0 h=1.0
+      members:
+        space w=1.0 h=1.0
+      agents:
+        space w=1.0 h=1.0
+      forge:
+        space w=1.0 h=1.0
+      governance:
+        space w=1.0 h=1.0
+      settings:
+        SettingsScreen account_name_draft<->account_name_draft node_log_filter<->node_log_filter #settings
+          with
+            account_name
+            network_name
+            connected_rpc
+            settings_endpoint
+            settings_node_key
+            settings_height
+            settings_data_dir
+            settings_key_state
+            settings_key_path
+            settings_open_tabs
+            members_rows
+            members_answered
+            members_validators
+            members_residents
+            account_id
+            account_renaming
+            account_bound
+            account_members
+            account_nodes
+            appearance
+            password
+            status
+            loading
+            connected
+            mutation_phase
+            node_tab
+            module_rows
+            block_height
+            node_checkpoint
+            node_last_finalized
+            node_reachable_label
+            node_quorum_label
+            node_version
+            node_root_hash
+            node_peers
+            node_log_lines
+          events
+            select_shell_tab -> select_shell_tab _
+            reconnect -> reconnect
+            account_name_draft_changed -> account_name_draft_changed _
+            account_rename_submit -> account_rename_submit
+            copy_to_clipboard -> copy_to_clipboard _ _
+            settings_clear_tabs -> settings_clear_tabs
+            switch_network -> switch_network
+            settings_unlock_submit -> settings_unlock_submit _
+            lock_session -> lock_session
+            forget_workspace_submit -> forget_workspace_submit
+            select_node_tab -> select_node_tab _
+            open_node_modules -> open_node_modules
+            node_log_filter_changed -> node_log_filter_changed _
+            set_appearance_light -> set_appearance_light
+            set_appearance_dark -> set_appearance_dark
+      explorer:
+        space w=1.0 h=1.0
+      palette:
+        space w=1.0 h=1.0
+      bell:
+        space w=1.0 h=1.0
+  target body = #workspace-tabs/content/settings/settings-body
+  expect body.content_height > body.visible_height
+  expect body.scroll_y ~= 0.0
+  key escape
+  expect body.scroll_y ~= 0.0
+  chord shift page-down
+  expect body.scroll_y ~= 0.0
+  key page-down
+  expect body.scroll_y > 0.0
+  key page-up
+  expect body.scroll_y ~= 0.0
+  key end
+  expect body.scroll_y > 0.0
+  key home
+  expect body.scroll_y ~= 0.0

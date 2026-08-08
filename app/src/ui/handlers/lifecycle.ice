@@ -490,6 +490,13 @@ subscribe
   // Video has NO subscription: the tile strip is a self-redrawing widget
   // that repaints only its own window at the capture cadence.
   keyboard press when (connected || palette_open) -> global_key_pressed _
+  // THE PANE SCROLL'S KEYS ARE THE LEFTOVERS. `status=ignored` is the whole
+  // arbitration: a key a focused widget already took — Home in a text field,
+  // an arrow in an open list — never arrives, so this can claim Page/Home/End
+  // and the arrows without stealing them from anything. Ungated on purpose:
+  // the launch and huddle windows mount no content pane, and a scroll
+  // operation whose target is not on screen is a no-op.
+  keyboard press status=ignored -> content_scroll_key _
   keyboard modifiers -> modifiers_changed _
   window file-dropped -> fs_file_dropped _
   // A daemon outlives its windows, so process exit is an explicit decision:

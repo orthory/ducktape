@@ -336,7 +336,7 @@ view
               fs_cancel_edit -> fs_cancel_edit
               fs_save_edit -> fs_save_edit
         members:
-          MembersScreen
+          MembersScreen #members
             with
               rows=members_rows
               validators=members_validators
@@ -353,7 +353,7 @@ view
               agent_set_status -> agent_set_status _ _
               gov_propose -> gov_propose _ _
         agents:
-          AgentsScreen rows=agents_rows connected answered=agents_answered
+          AgentsScreen rows=agents_rows connected answered=agents_answered #agents
         forge:
           ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
             with
@@ -422,7 +422,7 @@ view
               forge_comment_drop -> forge_comment_drop _
               note_composer_event -> forge_composer_event _
         governance:
-          GovernanceScreen
+          GovernanceScreen #governance
             with
               rows=gov_rows
               voting=gov_voting
@@ -433,7 +433,7 @@ view
               gov_vote -> gov_vote _ _
               gov_execute -> gov_execute _
         settings:
-          SettingsScreen account_name_draft<->account_name_draft node_log_filter<->node_log_filter
+          SettingsScreen account_name_draft<->account_name_draft node_log_filter<->node_log_filter #settings
             with
               account_name
               network_name
