@@ -447,6 +447,7 @@ view
               members_residents
               account_id
               account_renaming
+              account_bound
               account_members
               account_nodes
               appearance

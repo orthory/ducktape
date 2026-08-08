@@ -3027,6 +3027,44 @@ fn approvals_tells_a_first_run_apart_from_a_finished_one() {
     );
 }
 
+/// ACCOUNT FACTS ONLY WHEN THERE IS AN ACCOUNT. With no account bound,
+/// `load_account` returns zeros for every field, and the identity card printed
+/// `0 keys 0 nodes` one line under "· validator keypair on this device" — a
+/// count of the ACCOUNT's keys reading as a count of THIS DEVICE's, and the two
+/// contradicting each other inside one card.
+///
+/// `account_bound` is the fact that tells an empty account from no account. It
+/// was already in state, already gating the Rename submit, and simply was not
+/// given to the screen.
+#[test]
+fn the_identity_card_counts_only_a_bound_account() {
+    let settings = inlined(include_str!("ui/screens/settings.ice"));
+    assert!(
+        settings.contains("account_bound:bool"),
+        "the screen has to be handed the fact before it can use it"
+    );
+    let card = settings
+        .split("if account_bound")
+        .nth(1)
+        .expect("the counts sit under the bound gate")
+        .split("\n        col ")
+        .next()
+        .expect("card region");
+    for reading in ["account_members", "account_nodes", "Copy key"] {
+        assert!(
+            card.contains(reading),
+            "{reading} is an account reading and belongs under the gate"
+        );
+    }
+
+    // And view.ice actually passes it, or the screen renders a default.
+    let view = inlined(include_str!("ui/view.ice"));
+    assert!(
+        view.contains("account_bound"),
+        "the mount has to supply it"
+    );
+}
+
 /// A ZERO IS A CLAIM, AND THIS APP SAYS IT WITH BLANK. `count_label` returns
 /// "" below one and every count in the app routes through it — except two,
 /// which printed the digit right beside a plate that had just said the same
