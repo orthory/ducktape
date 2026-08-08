@@ -289,6 +289,11 @@ async fn search_forge_items(rpc: &str, needle: &str, generation: i64) -> Vec<Exp
     // paid ten round trips inside the one leg that was already the slowest.
     // Each is independent; the results are zipped back onto their repo so the
     // rows keep the repo list's order.
+    //
+    // ponytail: unbounded fan-out, one in-flight request per repo. Fine for the
+    // workspaces this console is built for (the demo has three); if a workspace
+    // ever carries enough repos for the burst to matter, bound it with a
+    // semaphore or chunk the iterator — do not go back to serial.
     let loaded = iced::futures::future::join_all(
         forge
             .repos
