@@ -158,6 +158,7 @@ pub fn escape_target(
     channel_create_open: bool,
     thread_message_action: String,
     message_action: String,
+    channel_settings_open: bool,
     forge_repo_menu: bool,
 ) -> String {
     use iced::keyboard::{Key, key::Named};
@@ -176,6 +177,14 @@ pub fn escape_target(
     }
     if message_action != "toolbar" {
         return "message_menu".into();
+    }
+    // BELOW both message menus, which float over the drawer, and above the
+    // repo menu, which lives on another tab. The drawer had no rung at all: it
+    // shipped with an `×` and no keyboard exit while every other overlay in the
+    // app answered Escape. Measured on the running app — Escape over an open
+    // Channel details changed exactly zero pixels.
+    if channel_settings_open {
+        return "channel_settings".into();
     }
     // The pages block-actions menu and insert row used to sit here. The page
     // document has neither: there is no transient layer over the canvas to
