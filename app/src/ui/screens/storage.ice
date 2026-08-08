@@ -8,7 +8,7 @@
 // leaves as a named event that `view.ice` routes back to the handler of the
 // same name.
 
-component FilesScreen(path:str, entries:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, delete_target:str, history_open:bool, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str)
+component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, delete_target:str, history_open:bool, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str)
   emits
     fs_open_dir(str)
     fs_open_file(str)
@@ -29,12 +29,15 @@ component FilesScreen(path:str, entries:[FsEntry], connected:bool, loading:bool,
     // THE CRUMB BAR, not a screen header: where you are, what is here,
     // and who may write under it. The counts are pure folds over the
     // listing already on screen — never a second `files_ls` — and they
-    // go silent with the node down rather than folding an unfetched
-    // listing into `0 files · 0 dirs`.
+    // go silent rather than counting a listing that is not this path's:
+    // with the node down nobody asked, and mid-navigation the rows still
+    // belong to the directory you left. The crumb has already moved, so
+    // `0 files · 1 dir` beside it would be the OLD directory's tally
+    // printed under the NEW directory's name.
     CrumbBar
       with
         path
-        meta=fs_counts_summary(connected, entries)
+        meta=fs_counts_summary(connected, listed, entries)
       forward
         fs_open_dir
     // WHERE THE WRITE CONTROLS LIVE — decided here, once. The artifact's
@@ -207,9 +210,11 @@ component FilesScreen(path:str, entries:[FsEntry], connected:bool, loading:bool,
                 pt=8.0
                 pb=8.0
                 gap=1.0
-              // "No folders here." is a reading of a listing; with the node
-              // down there is no listing, and the main pane already says so.
-              if connected && fs_dir_count(entries) <= 0
+              // "No folders here." is a reading of a listing; without one for
+              // THIS path there is nothing to read — the node is down, or the
+              // rows still describe the directory you just left — and the main
+              // pane already says so.
+              if connected && listed && fs_dir_count(entries) <= 0
                 box
                   with
                     w=fill
@@ -220,8 +225,9 @@ component FilesScreen(path:str, entries:[FsEntry], connected:bool, loading:bool,
                   text "No folders here." size=11.0 @text-hint
               // The tree itself is the same reading. Its empty case stood down
               // above and the listing beside it did not, so the sidebar kept
-              // drawing folders from a duckfs nobody could reach.
-              if connected
+              // drawing folders from a duckfs nobody could reach — and, after
+              // a navigation, folders that live somewhere else.
+              if connected && listed
                 for entry in entries
                   if entry.kind == "dir"
                     FsTreeRow
@@ -357,10 +363,16 @@ component FilesScreen(path:str, entries:[FsEntry], connected:bool, loading:bool,
         if connected && !history_open
           col w=fill h=fill
             ObjectTableHeader
-            if empty(entries) && !loading
+            // Both arms read the listing, so both wait for one that belongs to
+            // the path in the crumb. Until it lands the pane holds only its
+            // header — the write bar above carries the "Loading…" word, and a
+            // plate that said "Empty directory" or a list of the previous
+            // directory's objects would each be a claim about a path nobody
+            // has answered for yet.
+            if listed && empty(entries)
               box w=fill p=22.0
                 EmptyPlate message="Empty directory — nothing is committed under this path."
-            if !empty(entries)
+            if listed && !empty(entries)
               scroll
                 with
                   dir=vertical

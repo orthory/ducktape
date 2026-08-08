@@ -32,6 +32,7 @@ on fs_listed(next)
   return if next.generation != fs_generation
   fs_loading = false
   fs_path = next.path
+  fs_listed_path = next.path
   fs_entries = next.entries
 
 on fs_previewed(next)

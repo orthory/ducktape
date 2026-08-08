@@ -198,7 +198,13 @@ state
   node_log_filter = ""
   node_peers:[PeerRow] = []
   node_peers_generation:i64 = 0
+  // `fs_path` is the path you ASKED for — stamped on the click so the crumb
+  // moves at once. `fs_listed_path` is the path the rows in `fs_entries`
+  // actually describe, stamped only by an answered listing. They differ for the
+  // whole of a navigation, and everything that READS the rows must say so;
+  // same split as `active_page`/`buffer_page` in the pages plane.
   fs_path = "/shared"
+  fs_listed_path = ""
   fs_entries:[FsEntry] = []
   fs_generation:i64 = 0
   fs_loading = false
