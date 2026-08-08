@@ -292,6 +292,9 @@ extern crate::backend
   sync apply_chat_members(members:[ChatMember], delta:ChatDelta, active_channel:str) -> [ChatMember]
   sync thread_offset_after_live(offset:i64, has_more:bool, delta:ChatDelta, active_channel:str, root:i64) -> i64
   sync channel_display_name(channels:[ChatChannel], channel:str, current:str) -> str
+  // The pages twin of `channel_display_name`: the header title of a page that
+  // has only just been clicked, read from the list already in hand.
+  sync page_display_title(pages:[PageItem], page:str, current:str) -> str
   sync channel_flag_archived(channels:[ChatChannel], channel:str, current:bool) -> bool
   sync channel_flag_members_only(channels:[ChatChannel], channel:str, current:bool) -> bool
   sync channel_live_huddle_count(channels:[ChatChannel], channel:str, current:i64) -> i64

@@ -242,6 +242,7 @@ on console_opened(id)
   caret_comment_target = ""
   page_editor = editor("")
   page_saved_text = ""
+  buffer_page = ""
   page_inflight_text = ""
   page_refusal = ""
   block_autosave_status = "idle"

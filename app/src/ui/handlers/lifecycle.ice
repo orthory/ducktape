@@ -139,6 +139,7 @@ on reconnect
   pending_block_comment = ""
   page_editor = editor("")
   page_saved_text = ""
+  buffer_page = ""
   page_refusal = ""
   block_autosave_status = "idle"
   page_delete_armed = false
@@ -176,10 +177,13 @@ on workspace_connected(next)
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
   pages = next.pages
-  blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
+  blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
+  // The blocks in hand are this page's, and every route into a connect blanks
+  // the buffer first — so this is the page the document state belongs to.
+  buffer_page = next.active_page
   connected = true
   loading = false
   mutation_phase = "idle"
@@ -313,7 +317,7 @@ on live_resynced(next)
   // answers for the page in hand.
   pages_answer_is_current = next.pages_loaded && pages_reply_answers_current(next.pages, next.active_page, active_page)
   pages = keep_pages(next.pages_loaded, next.pages, pages)
-  blocks = keep_blocks(pages_answer_is_current, merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, ""), blocks)
+  blocks = keep_blocks(pages_answer_is_current, merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, ""), blocks)
   orphaned_comment_drafts = remember_orphaned_page_comment(orphaned_comment_drafts, pages, block_comments_target, block_comment_draft)
   // THE COMMENTS RAIL IS DOCUMENT-SCOPED (handlers/pages.ice:300). Its anchor is
   // the PAGE it was opened on, never a block selection — keyed on
@@ -348,6 +352,23 @@ on live_resynced(next)
   let resynced_saved = refreshed_page_saved(page_editor, active_page_title, blocks, page_saved_text)
   page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
   page_saved_text = resynced_saved
+  // The buffer's own page follows the buffer, and only when this resync
+  // actually carried page news AND the buffer moved with it.
+  //
+  // A dirty buffer refused the refresh above and still belongs to the page it
+  // was typed in — a resync that lands on another page (this one was deleted)
+  // must not claim it, or the next load would read the switch as a refresh and
+  // keep the old text under the new page's title.
+  //
+  // `pages_answer_is_current` is the other half and it is the load-bearing one.
+  // A CHAT-ONLY resync arrives with `pages_loaded == false`, so `blocks` keeps
+  // whatever it holds — which, in the window `choose_page` opens, is empty —
+  // and the refresh above canonicalises `title + []` into a document that never
+  // came from the node. Claiming that as the new page's buffer hands
+  // `page_autosave_tick` a fabricated document it is willing to write: the
+  // page would be overwritten with a blank one it never loaded.
+  let resynced_buffer_is_clean = page_text(page_editor) == page_saved_text
+  buffer_page = keep_str(resynced_buffer_is_clean && pages_answer_is_current, active_page, buffer_page)
   error = ""
   block_comments_generation = block_comments_generation + 1
   live_thread_generation = live_thread_generation + 1

@@ -1682,6 +1682,8 @@ fn the_save_tick_waits_for_inflight_saves_and_open_fences() {
     app.loading = false;
     app.connected = true;
     app.active_page = "page".into();
+    // The buffer is this page's — the tick refuses one that is not.
+    app.buffer_page = "page".into();
     app.page_editor = compose("Title\nfresh body");
     app.page_saved_text = "Title\nstale".into();
     app.block_autosave_status = "saving".into();
@@ -1703,6 +1705,262 @@ fn the_save_tick_waits_for_inflight_saves_and_open_fences() {
         "a closed fence saves"
     );
     assert_eq!(app.block_autosave_status, "saving");
+}
+
+fn page_item(id: &str, title: &str) -> backend::PageItem {
+    backend::PageItem {
+        id: id.into(),
+        title: title.into(),
+        parent: String::new(),
+        prefix: String::new(),
+        child_count: 0,
+    }
+}
+
+fn page_block(id: &str, page: &str, text: &str) -> backend::PageBlock {
+    backend::PageBlock {
+        key: 0,
+        id: id.into(),
+        parent: page.into(),
+        kind: "Text".into(),
+        text: text.into(),
+        pending: false,
+        checked: false,
+        prefix: String::new(),
+        child_count: 0,
+    }
+}
+
+fn page_load(id: &str, title: &str, body: &str) -> backend::PagesData {
+    backend::PagesData {
+        pages: vec![page_item("alpha", "Alpha"), page_item("beta", "Beta")],
+        blocks: vec![page_block(&format!("{id}-1"), id, body)],
+        active_page: id.into(),
+        active_page_title: title.into(),
+        active_page_parent: String::new(),
+        comment_thread_total: 0,
+        commented_block_hits: Vec::new(),
+    }
+}
+
+/// The app on Alpha, its document loaded and its buffer clean.
+fn reading_alpha() -> Ducktape {
+    let (mut app, _) = Ducktape::__boot();
+    app.loading = false;
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.pages = vec![page_item("alpha", "Alpha"), page_item("beta", "Beta")];
+    app.doc_tabs = vec!["alpha".into(), "beta".into()];
+    app.active_page = "alpha".into();
+    app.active_page_title = "Alpha".into();
+    app.active_page_parent = "Root".into();
+    app.blocks = vec![page_block("alpha-1", "alpha", "alpha body")];
+    app.page_editor = compose("Alpha\nalpha body");
+    app.page_saved_text = "Alpha\nalpha body".into();
+    app.buffer_page = "alpha".into();
+    app
+}
+
+/// AN ERROR MUST NOT ASSERT A DIAGNOSIS IT HAS NOT MADE. `connect` discarded
+/// the real cause with `map_err(|_| …)` and said "Could not connect. Check the
+/// endpoint and node." — the one thing the reader can act on, and wrong
+/// whenever the node is answering fine and the failure is a timeout, an
+/// unreadable reply or a broken signer. Measured while debugging this screen:
+/// the node served `/v1/status` in under a millisecond and the app still said
+/// to go check it.
+///
+/// Pinned as a source shape because the failure is an async RPC round trip with
+/// no seam to fake here; `user_error` itself is covered by its own tests.
+#[test]
+fn connect_reports_the_cause_instead_of_guessing_at_it() {
+    const LIVE: &str = include_str!("backend/live.rs");
+    let connect = LIVE
+        .split("pub async fn connect(")
+        .nth(1)
+        .expect("connect is declared")
+        .split("\npub ")
+        .next()
+        .expect("connect body");
+
+    assert!(
+        connect.contains("user_error(cause.to_string())"),
+        "connect must route its cause through the translator the rest of the app uses"
+    );
+    assert!(
+        !connect.contains("map_err(|_|"),
+        "throwing the cause away is what made this error a guess"
+    );
+    // NOT asserted: that the old sentence is absent from the function. The
+    // comment above the fix quotes it to explain what was wrong, and a sweep
+    // over source text cannot tell a message from the prose about it — the
+    // check would fail on its own documentation.
+}
+
+/// A CHAT-ONLY RESYNC MUST NOT CLAIM THE PAGE IT CARRIES NO NEWS ABOUT. The
+/// click blanks the pane and moves `active_page`; a resync that arrives with
+/// `pages_loaded == false` keeps the empty `blocks` and canonicalises
+/// `title + []` into a document the node never sent. Stamping `buffer_page`
+/// for that fabrication hands `page_autosave_tick` a blank document it is
+/// willing to write over the real page.
+#[test]
+fn a_chat_only_resync_does_not_claim_the_page_it_never_loaded() {
+    let mut app = reading_alpha();
+    let _ = app.__update(__DucktapeMessage::ChoosePage("beta".into()));
+    assert!(app.buffer_page.is_empty(), "the click released the buffer");
+
+    let mut chat_only = live_refresh(app.hydration_generation, "", Vec::new(), "", Vec::new());
+    chat_only.pages_loaded = false;
+    chat_only.active_page = String::new();
+    let _ = app.__update(__DucktapeMessage::LiveResynced(chat_only));
+
+    assert!(
+        app.buffer_page.is_empty(),
+        "a resync carrying no page news must not claim the page as the buffer's"
+    );
+
+    // And the tick still refuses, which is the consequence that matters.
+    let _ = app.__update(__DucktapeMessage::Failed(backend::AppError {
+        message: "node blip".into(),
+        committed: false,
+    }));
+    app.page_editor = compose("h");
+    let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
+    assert_eq!(
+        app.block_autosave_status, "idle",
+        "a fabricated buffer must never be saved into a real page"
+    );
+}
+
+/// A FAILED LOAD MUST NOT LET THE BLANK PANE EAT THE PAGE IT NEVER OPENED.
+/// The optimistic switch moves `active_page` and blanks the buffer before the
+/// round trip. If the load then FAILS, `on failed` clears `loading` without
+/// clearing `connected` or putting `active_page` back — so the reader is left
+/// looking at an empty, fully typable document under the new page's title.
+///
+/// One keystroke there used to reach the 900ms save tick, which wrote
+/// `page_text(page_editor)` into `active_page`. Saving an empty document
+/// against a real page is a `RemoveBlock` for every line it had: the page would
+/// be destroyed by the act of failing to open it, and the reader would never
+/// have seen a line of it.
+#[test]
+fn a_failed_page_load_cannot_save_the_blank_pane_over_the_page() {
+    let mut app = reading_alpha();
+
+    let _ = app.__update(__DucktapeMessage::ChoosePage("beta".into()));
+    let _ = app.__update(__DucktapeMessage::Failed(backend::AppError {
+        message: "node blip".into(),
+        committed: false,
+    }));
+
+    // The pane is live and typable: this is the state the guard must survive,
+    // not one it can assume away.
+    assert!(!app.loading, "the failure released the load");
+    assert!(app.connected, "the failure did not disconnect");
+    assert_eq!(app.active_page, "beta");
+    assert!(
+        app.buffer_page.is_empty(),
+        "no load landed, so the buffer belongs to no page"
+    );
+
+    app.page_editor = compose("h");
+    let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
+
+    // The tick must refuse: the buffer is not Beta's.
+    assert_eq!(
+        app.block_autosave_status, "idle",
+        "a buffer that belongs to no page must never be saved into one"
+    );
+    assert!(app.pending_page.is_empty());
+}
+
+// A CLICK MUST REPAINT ON THE CLICK. The page load is several round trips; the
+// sidebar highlight, the header title and the document cannot wait for it, or
+// the app reads as dead for seconds. Everything asserted here is the state of
+// the very next frame — nothing has landed yet.
+#[test]
+fn a_page_click_repaints_before_the_load_lands() {
+    let mut app = reading_alpha();
+
+    let _ = app.__update(__DucktapeMessage::ChoosePage("beta".into()));
+
+    assert_eq!(app.active_page, "beta", "the sidebar highlight moves now");
+    assert_eq!(
+        app.active_page_title, "Beta",
+        "the header title comes from the page list already in hand"
+    );
+    assert!(
+        app.active_page_parent.is_empty(),
+        "the breadcrumb of the page she left must not hang over the new one"
+    );
+    assert!(
+        app.blocks.is_empty(),
+        "the previous document's blocks must leave the pane"
+    );
+    assert!(
+        page_document_text(&app).is_empty(),
+        "the previous document's text must leave the pane"
+    );
+    assert!(app.loading, "the load is still in flight");
+    // The buffer is honest about holding nothing: `buffer_page` is what the
+    // install decision reads, and the baseline moves with the buffer so an
+    // empty pane never reads as dirty to the save tick.
+    assert!(app.buffer_page.is_empty());
+    assert!(app.page_saved_text.is_empty());
+}
+
+// `buffer_page`, not `active_page`, is what the install decision compares.
+// Closing the front tab moves the selection while the buffer is still the old
+// page's and still DIRTY — read against `active_page` the landing document is
+// a same-page refresh, the dirty buffer refuses it, and Beta opens showing
+// Alpha's text.
+#[test]
+fn the_landing_document_installs_when_the_page_actually_moved() {
+    let mut app = reading_alpha();
+    app.page_editor = compose("Alpha\nalpha body, still typing");
+
+    let _ = app.__update(__DucktapeMessage::CloseDocTab("alpha".into()));
+    assert_eq!(app.active_page, "beta", "the tab close moved the selection");
+    assert_eq!(app.buffer_page, "alpha", "the buffer is still Alpha's");
+
+    let _ = app.__update(__DucktapeMessage::PagesUpdated(page_load(
+        "beta",
+        "Beta",
+        "beta body",
+    )));
+
+    assert_eq!(page_document_text(&app), "Beta\nbeta body");
+    assert_eq!(app.page_saved_text, "Beta\nbeta body");
+    assert_eq!(app.buffer_page, "beta");
+    assert_eq!(app.blocks.len(), 1);
+    assert_eq!(app.blocks[0].id, "beta-1");
+}
+
+// THE KEYSTROKE-EATING GUARD, which the split must not cost us: a reload of
+// the page the user is typing in leaves her words alone — even when the text
+// it carries is genuinely newer than the baseline (somebody else edited the
+// page). A same-page refresh whose text merely equals the baseline would
+// install nothing anyway, and would prove nothing here.
+#[test]
+fn a_refresh_never_overwrites_a_dirty_buffer_on_the_same_page() {
+    let mut app = reading_alpha();
+    app.page_editor = compose("Alpha\nalpha body, still typing");
+
+    let _ = app.__update(__DucktapeMessage::PagesUpdated(page_load(
+        "alpha",
+        "Alpha",
+        "alpha body, edited by somebody else",
+    )));
+
+    assert_eq!(
+        page_document_text(&app),
+        "Alpha\nalpha body, still typing",
+        "a reload must never eat keystrokes"
+    );
+    assert_eq!(
+        app.page_saved_text, "Alpha\nalpha body",
+        "the baseline stays with the buffer — the drift is what makes the next tick save"
+    );
+    assert_eq!(app.buffer_page, "alpha");
 }
 
 // Reconnect is the same-endpoint retry now — the picker owns endpoint

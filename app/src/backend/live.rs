@@ -8,8 +8,20 @@ pub async fn connect(rpc: String) -> Result<WorkspaceData, AppError> {
         load_workspace(&rpc, None, None, 0).await
     }
     .await;
-    result.map_err(|_| AppError {
-        message: "Could not connect. Check the endpoint and node.".into(),
+    // SAY WHAT ACTUALLY FAILED. This threw the cause away with `|_|` and
+    // asserted a diagnosis it had not made: "Check the endpoint and node" is
+    // the one thing the reader can act on, and it is wrong whenever the node is
+    // answering fine and the failure is a timeout, an unreadable reply, or a
+    // broken signer. Measured while debugging this very screen — the node was
+    // serving `/v1/status` in under a millisecond and the app still said to go
+    // check it.
+    //
+    // `user_error` is the translator the rest of the app already routes
+    // through: it names the signer, the key, a refused password, a slow node
+    // and a garbled reply, and falls through to the raw message rather than
+    // inventing one.
+    result.map_err(|cause| AppError {
+        message: user_error(cause.to_string()),
         committed: false,
     })
 }

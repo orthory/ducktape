@@ -225,6 +225,16 @@ pub fn channel_display_name(
         .map_or(current, |row| row.name.clone())
 }
 
+/// The clicked page's title, from the index the sidebar is already drawn from
+/// — the header has to move with the click, not with the round trip. Falls
+/// back to the current title while the id is not in the list yet.
+pub fn page_display_title(pages: Vec<PageItem>, page: String, current: String) -> String {
+    pages
+        .iter()
+        .find(|row| row.id == page)
+        .map_or(current, |row| row.title.clone())
+}
+
 pub fn channel_flag_archived(channels: Vec<ChatChannel>, channel: String, current: bool) -> bool {
     channels
         .iter()
