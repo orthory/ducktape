@@ -126,6 +126,7 @@ extern crate::backend
   FsHistory(generation:i64, snapshots:[FsSnapshot])
   sync fs_dir_count(entries:[FsEntry]) -> i64
   sync fs_file_count(entries:[FsEntry]) -> i64
+  sync fs_counts_summary(connected:bool, entries:[FsEntry]) -> str
   sync fs_parent(path:str) -> str
   sync fs_child(path:str, name:str) -> str
   files_mkdir(rpc:str, path:str) -> bool ! AppError
@@ -145,9 +146,9 @@ extern crate::backend
   sync shell_nav(tab:str, approvals:i64, agent_live:bool) -> [NavItem]
   sync open_proposals(rows:[ProposalRow]) -> i64
   sync plural(count:i64, one:str, many:str) -> str
-  sync members_summary(validators:i64, residents:i64) -> str
-  sync agents_summary(rows:[AgentRow]) -> str
-  sync proposals_summary(rows:[ProposalRow]) -> str
+  sync members_summary(connected:bool, validators:i64, residents:i64) -> str
+  sync agents_summary(connected:bool, rows:[AgentRow]) -> str
+  sync proposals_summary(connected:bool, rows:[ProposalRow]) -> str
   QuorumSeat(filled:bool)
   sync quorum_dots(approvals:i64, required:i64) -> [QuorumSeat]
   sync tally_label(approvals:i64, required:i64) -> str

@@ -38,7 +38,7 @@
 // (validator / resident / guest) — the artifact's viewer/maintainer/admin
 // vocabulary does not exist in this product, so the chain's own word is what
 // gets printed. `about` is the workspace bio, not an invented tagline.
-component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str)
+component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str, connected:bool)
   col #root w=fill gap=7.0
     row
       with
@@ -77,29 +77,33 @@ component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str)
             font=code_semibold
             @text-brand_fg
       space w=fill
-      row gap=5.0 align=center
-        text plural(repos, "repository", "repositories")
-          with
-            size=10.5
-            wrap=none
-            font=code_medium
-            @text-meta
-        // An empty tier is the roster not having answered, not a standing.
-        // The separator goes with it — kept alone it dangles off the repo
-        // count with nothing behind it.
-        if !empty(tier)
-          text "·"
+      // The repo count and the standing are both READINGS, so neither is
+      // printed off a node that answered nothing: `0 repositories` beside a
+      // dead connection reads as "this org has no repos".
+      if connected
+        row gap=5.0 align=center
+          text plural(repos, "repository", "repositories")
             with
               size=10.5
               wrap=none
               font=code_medium
               @text-meta
-          text tier
-            with
-              size=10.5
-              wrap=none
-              font=code_medium
-              @text-meta
+          // An empty tier is the roster not having answered, not a standing.
+          // The separator goes with it — kept alone it dangles off the repo
+          // count with nothing behind it.
+          if !empty(tier)
+            text "·"
+              with
+                size=10.5
+                wrap=none
+                font=code_medium
+                @text-meta
+            text tier
+              with
+                size=10.5
+                wrap=none
+                font=code_medium
+                @text-meta
     if !empty(about)
       box w=fill max-w=680.0
         text about

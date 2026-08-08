@@ -98,7 +98,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                       wrap=none
                       @text-accent_fg
                   space w=fill
-                  text members_summary(members_validators, members_residents)
+                  text members_summary(connected, members_validators, members_residents)
                     with
                       size=12.0
                       wrap=none

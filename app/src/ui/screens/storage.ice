@@ -8,7 +8,7 @@
 // leaves as a named event that `view.ice` routes back to the handler of the
 // same name.
 
-component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:str, preview_path:str, delete_target:str, history_open:bool, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str)
+component FilesScreen(path:str, entries:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, delete_target:str, history_open:bool, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str)
   emits
     fs_open_dir(str)
     fs_open_file(str)
@@ -28,12 +28,13 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
   col w=fill h=fill
     // THE CRUMB BAR, not a screen header: where you are, what is here,
     // and who may write under it. The counts are pure folds over the
-    // listing already on screen — never a second `files_ls`.
+    // listing already on screen — never a second `files_ls` — and they
+    // go silent with the node down rather than folding an unfetched
+    // listing into `0 files · 0 dirs`.
     CrumbBar
       with
         path
-        dirs=fs_dir_count(entries)
-        files=fs_file_count(entries)
+        meta=fs_counts_summary(connected, entries)
       forward
         fs_open_dir
     // WHERE THE WRITE CONTROLS LIVE — decided here, once. The artifact's
@@ -206,7 +207,9 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
                 pt=8.0
                 pb=8.0
                 gap=1.0
-              if fs_dir_count(entries) <= 0
+              // "No folders here." is a reading of a listing; with the node
+              // down there is no listing, and the main pane already says so.
+              if connected && fs_dir_count(entries) <= 0
                 box
                   with
                     w=fill
@@ -231,7 +234,20 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
           bg=separator
         space w=1.0 h=1.0
       col w=fill h=fill
-        if history_open
+        // NOT CONNECTED IS NOT EMPTY. The listing and the snapshot log both
+        // arrive over the node; with it down this pane used to plate "Empty
+        // directory — nothing is committed under this path.", which is a claim
+        // about CONTENT made from a request that never went out. Same words
+        // Chat and Pages use, so the six data screens read as one app. The
+        // crumb bar and the write bar above stay — they are how the reader
+        // gets back out.
+        if !connected
+          box w=fill h=fill p=22.0
+            EmptyState
+              with
+                title="Not connected"
+                description="Click the network name in the titlebar to pick or reconnect a network."
+        if connected && history_open
           scroll
             with
               dir=vertical
@@ -334,7 +350,7 @@ component FilesScreen(path:str, entries:[FsEntry], loading:bool, bind new_name:s
                             pressed bg=subtle
                         if !empty(snapshot.message)
                           text snapshot.message size=13.5 @text-fg
-        if !history_open
+        if connected && !history_open
           col w=fill h=fill
             ObjectTableHeader
             if empty(entries) && !loading
@@ -646,7 +662,15 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
             EmptyPlate message="Nothing of that kind matched — the other chips still hold results."
       if empty(hits) && !searching && !empty(trim(query))
         EmptyPlate message="Nothing matched that query in this workspace."
-      if empty(hits) && empty(blocks) && !loading && empty(trim(query))
+      // NOT CONNECTED IS NOT EMPTY. `connected` already disables the query box
+      // above; the ledger below it still asserted "No blocks yet" off a node
+      // that answered nothing. The head and the query box stay.
+      if !connected
+        EmptyState
+          with
+            title="Not connected"
+            description="Click the network name in the titlebar to pick or reconnect a network."
+      if connected && empty(hits) && empty(blocks) && !loading && empty(trim(query))
         EmptyState
           with
             title="No blocks yet"

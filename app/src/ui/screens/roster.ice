@@ -7,7 +7,7 @@
 // That is the whole contract; the bodies below are the ones that used to sit
 // inline in the view's `members:` and `agents:` slots, unchanged.
 
-component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:str, selected:str, admin:bool, answered:bool)
+component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:str, selected:str, admin:bool, connected:bool, answered:bool)
   emits
     pick_members_filter(str)
     open_member(str)
@@ -16,7 +16,7 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
     gov_propose(str, str)
   row w=fill h=fill
     col w=fill h=fill
-      ScreenHeader title="Members" meta=members_summary(validators, residents)
+      ScreenHeader title="Members" meta=members_summary(connected, validators, residents)
         // NO INVITE BUTTON YET. `mint_invite` exists in the backend, but nothing
         // routes the mint itself, so the button would open a modal with no act
         // in it.
@@ -95,7 +95,22 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
             h=1.0
             bg=separator
           space w=1.0 h=1.0
-      if empty(filter_members(rows, filter)) && answered
+      // NOT CONNECTED IS NOT EMPTY. `answered` is "the roster replied", and it
+      // stays true across a node going down — so the plate below went on
+      // claiming nobody is on this network off a roster read minutes ago and
+      // now unreadable. The header and the filter strip stay: they are how the
+      // reader gets back out.
+      if !connected
+        box
+          with
+            w=fill
+            h=fill
+            p=22.0
+          EmptyState
+            with
+              title="Not connected"
+              description="Click the network name in the titlebar to pick or reconnect a network."
+      if connected && empty(filter_members(rows, filter)) && answered
         box
           with
             w=fill
@@ -104,7 +119,7 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
           EmptyPlate
             with
               message="No members here yet — validators, residents and registered agents appear as they join."
-      if !empty(filter_members(rows, filter))
+      if connected && !empty(filter_members(rows, filter))
         scroll
           with
             dir=vertical
@@ -154,9 +169,9 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
               agent_set_status
               gov_propose
 
-component AgentsScreen(rows:[AgentRow], answered:bool)
+component AgentsScreen(rows:[AgentRow], connected:bool, answered:bool)
   col w=fill h=fill
-    ScreenHeader title="Agents" meta=agents_summary(rows)
+    ScreenHeader title="Agents" meta=agents_summary(connected, rows)
       space w=1.0 h=1.0
     // The registry explainer. The artifact states the whole model in this
     // one strip and the English UI never did: the registry is the record of
@@ -182,7 +197,20 @@ component AgentsScreen(rows:[AgentRow], answered:bool)
           h=1.0
           bg=separator
         space w=1.0 h=1.0
-    if empty(rows) && answered
+    // NOT CONNECTED IS NOT EMPTY — the registry lives on chain and nothing
+    // read it. The explainer strip above stays (it states the MODEL, not a
+    // reading); the plate that says the register is empty does not.
+    if !connected
+      box
+        with
+          w=fill
+          h=fill
+          p=22.0
+        EmptyState
+          with
+            title="Not connected"
+            description="Click the network name in the titlebar to pick or reconnect a network."
+    if connected && empty(rows) && answered
       box
         with
           w=fill
@@ -191,7 +219,7 @@ component AgentsScreen(rows:[AgentRow], answered:bool)
         EmptyPlate
           with
             message="No agents registered — a registered agent appears here with its capability and grants."
-    if !empty(rows)
+    if connected && !empty(rows)
       scroll
         with
           dir=vertical

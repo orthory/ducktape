@@ -162,8 +162,8 @@ fn a_count_of_one_takes_the_singular_noun() {
     assert_eq!(plural(0, "agent".into(), "agents".into()), "0 agents");
     assert_eq!(plural(2, "agent".into(), "agents".into()), "2 agents");
     // the register subtitles that used to read `1 agents` / `1 validators`.
-    assert_eq!(members_summary(1, 0), "1 validator · 0 residents");
-    assert_eq!(members_summary(3, 2), "3 validators · 2 residents");
+    assert_eq!(members_summary(true, 1, 0), "1 validator · 0 residents");
+    assert_eq!(members_summary(true, 3, 2), "3 validators · 2 residents");
     assert_eq!(tally_note(1, 4), "1 approval · 3 more for quorum");
 }
 

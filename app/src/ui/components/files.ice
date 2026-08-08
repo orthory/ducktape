@@ -107,17 +107,23 @@ component FsTreeFace(name:str, depth:f64, dimmed:bool)
 //
 // MOUNTED at the head of the Files arm in view.ice, replacing
 // `ScreenHeader title="Files" meta=fs_path` and wired `fs_open_dir ->
-// fs_open_dir _`. `path` is `fs_path`; the two counts are `fs_dir_count` /
-// `fs_file_count` (backend.rs), pure folds over the already-resident
-// `fs_entries` — Ice cannot filter a list by field, and a second listing call
-// to count what is already on screen would be a lie waiting to go stale.
+// fs_open_dir _`. `path` is `fs_path`; `meta` is `fs_counts_summary`
+// (backend/storage.rs), a pure fold over the already-resident `fs_entries` —
+// Ice cannot filter a list by field, and a second listing call to count what is
+// already on screen would be a lie waiting to go stale.
+//
+// THE COUNTS ARE ONE `str`, NOT TWO `i64`, because with the node down there is
+// no honest number to render: the fold over an empty listing said `0 files ·
+// 0 dirs` and the reader read it as "my files are gone". `fs_counts_summary`
+// returns "" while disconnected and the run disappears with it — a separator
+// hung between two absent counts is the same claim in punctuation.
 //
 // The root crumb navigates; the segments do not. Ice's expression language has
 // no string split (len/empty/trim/some are the whole builtin set), and the
 // frozen signature carries the path as one `str` rather than a segment list, so
 // a per-segment crumb cannot be built from these props. The path prints as one
 // mono run beside a root crumb that does navigate.
-component CrumbBar(path:str, dirs:i64, files:i64)
+component CrumbBar(path:str, meta:str)
   emits
     fs_open_dir(str)
   col #root w=fill
@@ -153,29 +159,14 @@ component CrumbBar(path:str, dirs:i64, files:i64)
               wrap=none
               font=code_semibold
               @text-primary
-        row
-          with
-            gap=4.0
-            align=center
-            pl=4.0
-          text plural(files, "file", "files")
-            with
-              size=11.0
-              wrap=none
-              font=code
-              @text-hint
-          text "·"
-            with
-              size=11.0
-              wrap=none
-              font=code
-              @text-hint
-          text plural(dirs, "dir", "dirs")
-            with
-              size=11.0
-              wrap=none
-              font=code
-              @text-hint
+        if !empty(meta)
+          box pl=4.0
+            text meta
+              with
+                size=11.0
+                wrap=none
+                font=code
+                @text-hint
         space w=fill
         // duckfs write authority, stated in full rather than per-path, in the
         // terms check_authority actually uses (crates/duckfs/core/src/paths.rs).

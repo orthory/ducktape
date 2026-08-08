@@ -2999,18 +2999,18 @@ fn approvals_tells_a_first_run_apart_from_a_finished_one() {
         .collect();
 
     assert!(
-        arms.contains(&"if empty(rows) && answered"),
+        arms.contains(&"if connected && empty(rows) && answered"),
         "a network with no proposals at all needs its own arm, found {arms:?}"
     );
     assert!(
-        arms.contains(&"if open_proposals(rows) <= 0 && !empty(rows) && answered"),
+        arms.contains(&"if connected && open_proposals(rows) <= 0 && !empty(rows) && answered"),
         "the settled arm must exclude the empty case, found {arms:?}"
     );
 
     // The two plates must never be able to fire together: the first requires an
     // empty list, the second an inhabited one.
     let first_run = source
-        .split("if empty(rows) && answered")
+        .split("if connected && empty(rows) && answered")
         .nth(1)
         .expect("first-run arm");
     assert!(
@@ -3570,4 +3570,171 @@ fn unread_indicators_are_wired_client_local_only() {
     let backend_ice = inlined(include_str!("ui/extern/backend.ice"));
     assert!(!backend_ice.contains("read_cursor"));
     assert!(!backend_ice.contains("mark_read(rpc"));
+}
+
+/// THE "Not connected" WORDING, ONCE. Every data screen swaps its empty-state
+/// claim for this exact plate, so the console reads as one app rather than eight
+/// dialects of "I don't know".
+const NOT_CONNECTED_PLATE: &str = concat!(
+    "EmptyState title=\"Not connected\" ",
+    "description=\"Click the network name in the titlebar to pick or reconnect a network.\""
+);
+
+/// A SCREEN THAT CANNOT REACH THE NODE MUST NOT REPORT ON ITS CONTENTS. With the
+/// node down the status bar already says "Connection degraded · Offline", and the
+/// bodies used to answer underneath it with `0 files · 0 dirs` and "Empty
+/// directory — nothing is committed under this path." — a claim about CONTENT
+/// made from a request that never went out. Chat and Pages already got this
+/// right; the other six asserted an emptiness nobody measured.
+///
+/// THE SCREEN LIST IS THE INVARIANT, SO THE SCREEN LIST IS PINNED. A ninth data
+/// screen has to decide what it says with the node down, and nothing about
+/// writing one would prompt that thought — which is exactly how six of them got
+/// written. This fails the build on a new screen so the decision is forced.
+/// Exemptions are named with their reason, never left implicit.
+#[test]
+fn every_data_screen_answers_a_dead_node_with_not_connected() {
+    /// The one screen that is NOT a reading of the network: Settings is the
+    /// endpoint, the key, the appearance and the node's own diagnostics, and it
+    /// is where a reader goes to fix the connection. Blanking it would hide the
+    /// repair from the person doing the repairing.
+    const EXEMPT: [&str; 1] = ["SettingsScreen"];
+
+    let mut screens: Vec<&str> = SCREENS
+        .lines()
+        .filter_map(|line| line.strip_prefix("component "))
+        .map(|rest| rest.split('(').next().unwrap_or(rest).trim())
+        .filter(|name| name.ends_with("Screen"))
+        .collect();
+    screens.sort_unstable();
+
+    assert_eq!(
+        screens,
+        [
+            "AgentsScreen",
+            "ChatScreen",
+            "ExplorerScreen",
+            "FilesScreen",
+            "ForgeScreen",
+            "GovernanceScreen",
+            "MembersScreen",
+            "PagesScreen",
+            "SettingsScreen",
+        ],
+        "a screen appeared or vanished: decide what it says with the node down, \
+         then add it here or to EXEMPT with a reason"
+    );
+
+    // Scoped to each component's OWN body — a sweep over the whole file would
+    // pass on six screens off Chat's single arm.
+    for screen in screens.iter().filter(|name| !EXEMPT.contains(name)) {
+        let body = SCREENS
+            .split(&format!("\ncomponent {screen}("))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{screen} is a component"))
+            .split("\ncomponent ")
+            .next()
+            .expect("component body");
+        assert!(
+            body.contains("if !connected\n"),
+            "{screen} draws readings of a network it may not be able to reach, \
+             so it needs an `if !connected` arm in place of its empty-state claim"
+        );
+        assert!(
+            body.contains(NOT_CONNECTED_PLATE),
+            "{screen} must use the shared \"Not connected\" wording verbatim"
+        );
+    }
+}
+
+/// AND THE HEADER SUBTITLES ARE CLAIMS TOO — the subtler half. `Agents 0 agents ·
+/// 0 working` is a measured zero about a register nobody read, and it sits ABOVE
+/// the body arm above, so it survives it. Every subtitle fold takes `connected`
+/// as its first argument and returns "" without it; this pins that no call site
+/// can quietly drop the guard.
+#[test]
+fn every_header_subtitle_is_gated_on_the_connection() {
+    let sites: Vec<&str> = SCREENS
+        .match_indices("_summary(")
+        .map(|(at, _)| {
+            let head = SCREENS[..at]
+                .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+                .map_or(0, |before| before + 1);
+            let close = at + SCREENS[at..].find(')').expect("a call site closes");
+            &SCREENS[head..=close]
+        })
+        .collect();
+
+    assert_eq!(
+        sites,
+        [
+            "proposals_summary(connected, rows)",
+            "members_summary(connected, validators, residents)",
+            "agents_summary(connected, rows)",
+            "members_summary(connected, members_validators, members_residents)",
+            "fs_counts_summary(connected, entries)",
+        ],
+        "a header subtitle folds rows only a live node delivers: pass `connected` \
+         first so it says nothing rather than a confident zero"
+    );
+}
+
+/// THE BEHAVIOUR THE SWEEPS ABOVE ONLY SPELL. Boot the console, drop the
+/// connection, and the four subtitles go silent instead of reporting the zeros
+/// an unfetched listing folds to.
+#[test]
+fn a_disconnected_console_reports_no_counts_at_all() {
+    let (mut app, _) = Ducktape::__boot();
+    app.members_validators = 1;
+    app.fs_entries = vec![backend::FsEntry {
+        path: "/shared/notes".into(),
+        name: "notes".into(),
+        kind: "file".into(),
+        size: 0,
+        object: String::new(),
+    }];
+
+    app.connected = true;
+    assert_eq!(
+        backend::members_summary(app.connected, app.members_validators, app.members_residents),
+        "1 validator · 0 residents"
+    );
+    assert_eq!(
+        backend::agents_summary(app.connected, app.agents_rows.clone()),
+        "0 agents · 0 working"
+    );
+    assert_eq!(
+        backend::proposals_summary(app.connected, app.gov_rows.clone()),
+        "0 open · 0 settled"
+    );
+    assert_eq!(
+        backend::fs_counts_summary(app.connected, app.fs_entries.clone()),
+        "1 file · 0 dirs"
+    );
+
+    // The node goes down. Everything above was a reading; none of it is one now.
+    app.connected = false;
+    for (screen, meta) in [
+        (
+            "Members",
+            backend::members_summary(app.connected, app.members_validators, app.members_residents),
+        ),
+        (
+            "Agents",
+            backend::agents_summary(app.connected, app.agents_rows.clone()),
+        ),
+        (
+            "Approvals",
+            backend::proposals_summary(app.connected, app.gov_rows.clone()),
+        ),
+        (
+            "Files",
+            backend::fs_counts_summary(app.connected, app.fs_entries.clone()),
+        ),
+    ] {
+        assert_eq!(
+            meta, "",
+            "{screen} printed `{meta}` off a node that answered nothing"
+        );
+    }
 }

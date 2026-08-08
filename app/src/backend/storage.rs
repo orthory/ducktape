@@ -25,6 +25,20 @@ pub fn fs_file_count(entries: Vec<FsEntry>) -> i64 {
     count_i64(entries.iter().filter(|entry| entry.kind != "dir").count())
 }
 
+/// `12 files · 3 dirs` — the crumb bar's own subtitle, and "" with the node
+/// down. An unfetched listing folds to `0 files · 0 dirs`, which reads as "this
+/// path is empty" when the truth is "nobody asked". Same rule as the register
+/// subtitles in backend/shell.rs: say nothing rather than something false.
+pub fn fs_counts_summary(connected: bool, entries: Vec<FsEntry>) -> String {
+    if !connected {
+        return String::new();
+    }
+    let file_count = fs_file_count(entries.clone());
+    let files = plural(file_count, "file".into(), "files".into());
+    let dirs = plural(fs_dir_count(entries), "dir".into(), "dirs".into());
+    format!("{files} · {dirs}")
+}
+
 /// One committed duckfs snapshot.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct FsSnapshot {
