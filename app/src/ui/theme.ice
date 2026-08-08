@@ -102,7 +102,7 @@ theme contract AppTheme
   card_wash_hover
   unread_wash
   brand_wash
-  tree_selected
+  selected_row
   warning_plate
   pending_line
   control_line_hover
@@ -232,12 +232,18 @@ palette app for AppTheme
   scrim #28262257
   // WASHES — the tint a row or card takes when it is hovered, unread, or
   // selected. Each is one notch off the surface it sits on, never a grey.
+  //
+  // `selected_row` is the ONE plate that means "this is the row/tab you are
+  // on", everywhere: chat channels, DMs, pages, both file trees, the object
+  // list, the repo switcher, the nav rail, the Explorer blocks, the node
+  // matrix head. It is NOT `subtle` — that is the track/pressed grey, and the
+  // two sat 2.3/255 apart in dark until they were settled.
   bg_wash #f7f6f2
   card_wash #faf9f6
   card_wash_hover #fcfbf9
   unread_wash #fbfaf7
   brand_wash #fdf8f3
-  tree_selected #f0ece1
+  selected_row #f0ece1
   warning_plate #f4e7c8
   // Two more lines: the dashed outline of anything not yet settled, and the
   // step a control's border takes under the cursor.
@@ -381,7 +387,7 @@ palette app_dark for AppTheme
   card_wash_hover #262520
   unread_wash #262418
   brand_wash #2a221b
-  tree_selected #35322a
+  selected_row #35322a
   warning_plate #453a1e
   pending_line #3f3e36
   control_line_hover #45443c

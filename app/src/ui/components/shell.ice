@@ -559,7 +559,7 @@ component ConnectionBanner(status:str)
           @text-caption
 
 // One rail entry: a 58px capsule holding a 19px glyph over a 9.5px label. The
-// selected state is a `subtle` tint capsule, never a second sheet of glass.
+// selected state is a `selected_row` tint capsule, never a second sheet of glass.
 // Forge alone wears a live dot while an agent is running.
 component RailButton(item:NavItem)
   emits
@@ -589,9 +589,9 @@ component RailButton(item:NavItem)
               wrap=none
               font=display
               @text-strong_ink
-        active bg=subtle text=fg border=transparent border-w=1.0 r=10.0
+        active bg=selected_row text=fg border=transparent border-w=1.0 r=10.0
         hovered bg=rail_hover text=fg
-        pressed bg=subtle text=fg
+        pressed bg=selected_row text=fg
     if !item.active
       button -> emit(select_shell_tab, item.id)
         with
@@ -711,9 +711,9 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
               name="gear"
               tone="ink"
               px=18.0
-          active bg=subtle text=fg border=transparent border-w=1.0 r=9.0
+          active bg=selected_row text=fg border=transparent border-w=1.0 r=9.0
           hovered bg=rail_hover text=fg
-          pressed bg=subtle text=fg
+          pressed bg=selected_row text=fg
       if tab != "settings"
         button -> emit(select_shell_tab, "settings")
           with

@@ -330,8 +330,8 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
                 wrap=none
                 font=display
                 @text-primary
-        active bg=elevated text=fg border=transparent border-w=1.0 r=8.0
-        hovered bg=elevated text=fg
+        active bg=selected_row text=fg border=transparent border-w=1.0 r=8.0
+        hovered bg=selected_row text=fg
         pressed bg=subtle text=fg
     if !active
       button -> emit(forge_open_repo, repo.name)
@@ -493,12 +493,12 @@ component ForgeTreeDirRow(name:str, depth:f64, open:bool)
         font=display
         @text-accent_fg
 
-// One file row. Selected wears `tree_selected` and the ink steps forward; the
+// One file row. Selected wears `selected_row` and the ink steps forward; the
 // file name is mono on both, because a path is a machine value.
 component ForgeTreeFileRow(name:str, depth:f64, selected:bool)
   col #root w=fill
     if selected
-      box w=fill bg=tree_selected
+      box w=fill bg=selected_row
         ForgeTreeFileFace
           with
             name

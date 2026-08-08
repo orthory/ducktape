@@ -62,8 +62,8 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
                     bg=success_dot
                     r=3.5
                   space w=1.0 h=1.0
-          active bg=subtle text=fg border=transparent border-w=1.0 r=7.0
-          hovered bg=subtle text=fg
+          active bg=selected_row text=fg border=transparent border-w=1.0 r=7.0
+          hovered bg=selected_row text=fg
           pressed bg=rail_hover text=fg
       if !selected
         button -> emit(choose_channel, channel.id)
@@ -371,8 +371,10 @@ component ReactionChip(reaction:ChatReaction, seq:i64)
                 wrap=none
                 font=code_medium
                 @text-brand
-        active bg=tree_selected text=brand border=brand_line border-w=1.0 r=11.0
-        hovered bg=tree_selected text=brand border=brand
+        // A chip you are IN, not a row you are ON: brand ink over the brand
+        // plate, so `selected_row` keeps meaning exactly one thing.
+        active bg=brand_bg text=brand border=brand_line border-w=1.0 r=11.0
+        hovered bg=brand_bg text=brand border=brand
         pressed bg=warning_plate text=brand border=brand
     if !reaction.reacted_by_me
       button -> emit(add_reaction_at, seq, reaction.emoji)

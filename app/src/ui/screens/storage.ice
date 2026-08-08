@@ -799,11 +799,9 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
 // list where every row is a height and a truncated hash there is no landmark to
 // re-find your place by, so losing the mark means reading hex until it matches.
 //
-// `tree_selected` is the token the Forge file tree already uses for exactly
-// this, and it is the one NAMED for it. Note the app has not settled here: the
-// Files tree reaches for `subtle` instead, a plate 2.3/255 away in dark — two
-// tokens, one meaning. Unifying them touches two other screens and is left for
-// a design pass rather than smuggled in behind an Explorer fix.
+// `selected_row` is the token the Forge file tree already uses for exactly
+// this, and it is the one NAMED for it. The app has since settled: every
+// surface that marks a current row reads this token and nothing else.
 //
 // The plate is LIGHTER than the surface, which is the direction every selected
 // row in this app moves; the measured lift here is +13/255, against the chat
@@ -820,7 +818,7 @@ component ExplorerBlockRow(block:ExplorerBlock, selected:bool)
           p=6.0
           @ghost_action
         ExplorerBlockFace block=block
-        active bg=tree_selected text=fg border=transparent border-w=1.0 r=7.0
+        active bg=selected_row text=fg border=transparent border-w=1.0 r=7.0
         hovered bg=row_hover text=fg
         pressed bg=accent
     if !selected

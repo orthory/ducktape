@@ -808,8 +808,8 @@ component NetworkRow(row:HubNetwork, selected:bool, busy:bool)
                     wrap=none
                     font=code_medium
                     @text-hint
-          active bg=subtle text=fg border=primary border-w=1.5 r=11.0
-          hovered bg=subtle text=fg
+          active bg=selected_row text=fg border=primary border-w=1.5 r=11.0
+          hovered bg=selected_row text=fg
           pressed bg=rail_hover text=fg
         box
           with
