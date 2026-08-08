@@ -1030,6 +1030,31 @@ fn palette_keys_use_logical_escape_and_physical_shortcut() {
     );
 }
 
+/// AN UNREAD HEIGHT SAYS SO. Settings' node block leaves every string reading
+/// blank at its default — node key, data directory, key state, key path — and
+/// then printed `h 0` for the block height, a measured zero for a chain sitting
+/// at ~398,000. Driven with the node down.
+///
+/// `height_label` already had the vocabulary: a negative height is `h —`. The
+/// field simply defaulted to 0, which is a reading rather than the absence of
+/// one, so the state default is now the sentinel the label understands.
+#[test]
+fn an_unread_block_height_is_not_reported_as_zero() {
+    assert_eq!(height_label(-1), "h —", "the no-reading sentinel");
+    assert_ne!(
+        height_label(0),
+        "h —",
+        "zero is a real height and must keep reading as one"
+    );
+
+    // The state default is what Settings shows before any node fact lands.
+    const STATE: &str = include_str!("../ui/state.ice");
+    assert!(
+        STATE.contains("settings_height:i64 = -1"),
+        "an unread height must default to the sentinel, not to a measured zero"
+    );
+}
+
 /// A DISPLAY NAME MUST NOT BE FORMATTED TWICE. `search_chat` already runs the
 /// wire author through `author_display`, so an Explorer hit arrives holding
 /// "you", "user 48cedb0d…" or "@quackbot". The Explorer then ran `author_name`
