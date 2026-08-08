@@ -2151,6 +2151,57 @@ fn block_moves_follow_visible_sibling_order() {
     );
 }
 
+/// A cold start used to open on `channels.first()` — wire order is by ID, so
+/// the demo workspace landed on an empty `channel-1786073…` and the console
+/// said "No messages yet" with three populated rooms listed under it.
+#[test]
+fn a_cold_start_lands_on_a_room_with_something_in_it() {
+    let channel = |id: &str, head: i64, archived: bool| ChatChannel {
+        id: id.into(),
+        name: id.into(),
+        archived,
+        members_only: false,
+        huddle_count: 0,
+        head_seq: head,
+    };
+    let landing = |channels: &[ChatChannel]| {
+        landing_channel(channels)
+            .map(|channel| channel.id.clone())
+            .unwrap_or_default()
+    };
+
+    // The demo's own shape: the empty room sorts first by ID.
+    let demo = vec![
+        channel("channel-1786073", 0, false),
+        channel("engineering", 46, false),
+        channel("general", 9, false),
+    ];
+    assert_eq!(landing(&demo), "engineering");
+
+    // An archived room is not a landing even when it is the only one with
+    // traffic — you cannot post into it.
+    let archived_history = vec![channel("archive", 500, true), channel("general", 0, false)];
+    assert_eq!(landing(&archived_history), "general");
+
+    // Every room empty, and every room archived: still land somewhere.
+    assert_eq!(
+        landing(&[channel("a", 0, false), channel("b", 0, false)]),
+        "a"
+    );
+    assert_eq!(
+        landing(&[channel("a", 0, true), channel("b", 5, true)]),
+        "a"
+    );
+    assert_eq!(landing(&[]), "");
+
+    // The chooser is only worth anything if the loader routes through it.
+    const LOAD: &str = include_str!("load.rs");
+    assert!(
+        LOAD.contains(".or_else(|| landing_channel(&channels).map(|channel| channel.id.clone()))"),
+        "load_chat_data falls back through the chooser, not through .first()"
+    );
+}
+
 #[test]
 fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
     let channel = |id: &str, head: i64| ChatChannel {
