@@ -83,8 +83,6 @@ on members_loaded(next)
   return if next.generation != members_generation
   members_answered = true
   members_rows = next.members
-  members_validators = next.validators
-  members_residents = next.residents
 
 on members_failed(cause)
   return if cause.generation != members_generation

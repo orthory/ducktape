@@ -4435,9 +4435,9 @@ fn every_header_subtitle_is_gated_on_the_connection() {
         sites,
         [
             "proposals_summary(connected, rows)",
-            "members_summary(connected, validators, residents)",
+            "members_summary(connected, rows)",
             "agents_summary(connected, rows)",
-            "members_summary(connected, members_validators, members_residents)",
+            "members_summary(connected, members_rows)",
             "fs_counts_summary(connected, listed, entries)",
         ],
         "a header subtitle folds rows only a live node delivers: pass `connected` \
@@ -4451,7 +4451,15 @@ fn every_header_subtitle_is_gated_on_the_connection() {
 #[test]
 fn a_disconnected_console_reports_no_counts_at_all() {
     let (mut app, _) = Ducktape::__boot();
-    app.members_validators = 1;
+    app.members_rows = vec![backend::MemberRow {
+        key: "aa".into(),
+        label: "aa".into(),
+        role: "validator".into(),
+        is_this_node: true,
+        is_agent: false,
+        model: String::new(),
+        live: true,
+    }];
     app.fs_entries = vec![backend::FsEntry {
         path: "/shared/notes".into(),
         name: "notes".into(),
@@ -4462,8 +4470,8 @@ fn a_disconnected_console_reports_no_counts_at_all() {
 
     app.connected = true;
     assert_eq!(
-        backend::members_summary(app.connected, app.members_validators, app.members_residents),
-        "1 validator · 0 residents"
+        backend::members_summary(app.connected, app.members_rows.clone()),
+        "1 human · 0 agents"
     );
     assert_eq!(
         backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
@@ -4488,7 +4496,7 @@ fn a_disconnected_console_reports_no_counts_at_all() {
     for (screen, meta) in [
         (
             "Members",
-            backend::members_summary(app.connected, app.members_validators, app.members_residents),
+            backend::members_summary(app.connected, app.members_rows.clone()),
         ),
         (
             "Agents",

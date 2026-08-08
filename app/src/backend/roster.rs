@@ -21,8 +21,6 @@ pub struct MemberRow {
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct MembersData {
     pub generation: i64,
-    pub validators: i64,
-    pub residents: i64,
     pub members: Vec<MemberRow>,
 }
 
@@ -34,15 +32,10 @@ pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, H
         let node_key = client.status().await?.public_key;
         let live_keys = live_peer_keys(&client).await;
         let mut members = Vec::new();
-        let mut counts = (0i64, 0i64);
         for (query, role) in [("validators", "validator"), ("residents", "resident")] {
             let reply: serde_json::Value =
                 client.query("valset", &serde_json::json!(query)).await?;
             let keys = reply[query].as_array().cloned().unwrap_or_default();
-            match role {
-                "validator" => counts.0 = count_i64(keys.len()),
-                _ => counts.1 = count_i64(keys.len()),
-            }
             for key in keys {
                 let hex = hex_encode(&json_bytes(&key));
                 let is_this_node = hex == node_key;
@@ -78,8 +71,6 @@ pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, H
         }
         Ok(MembersData {
             generation,
-            validators: counts.0,
-            residents: counts.1,
             members,
         })
     }

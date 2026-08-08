@@ -148,7 +148,7 @@ extern crate::backend
   sync shell_nav(tab:str, approvals:i64, agent_live:bool) -> [NavItem]
   sync open_proposals(rows:[ProposalRow]) -> i64
   sync plural(count:i64, one:str, many:str) -> str
-  sync members_summary(connected:bool, validators:i64, residents:i64) -> str
+  sync members_summary(connected:bool, rows:[MemberRow]) -> str
   sync agents_summary(connected:bool, rows:[AgentRow]) -> str
   sync proposals_summary(connected:bool, rows:[ProposalRow]) -> str
   QuorumSeat(filled:bool)
@@ -253,7 +253,7 @@ extern crate::backend
   governance_execute(rpc:str, password:str, proposal_id:str) -> bool ! AppError
   governance_propose(rpc:str, password:str, action:str, target_key:str) -> bool ! AppError
   MemberRow(key:str, label:str, role:str, is_this_node:bool, is_agent:bool, model:str, live:bool)
-  MembersData(generation:i64, validators:i64, residents:i64, members:[MemberRow])
+  MembersData(generation:i64, members:[MemberRow])
   load_members(rpc:str, generation:i64) -> MembersData ! HydrationError
   sync members_is_admin(rows:[MemberRow]) -> bool
   sync member_tier(rows:[MemberRow]) -> str

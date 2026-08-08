@@ -162,8 +162,6 @@ fn a_count_of_one_takes_the_singular_noun() {
     assert_eq!(plural(0, "agent".into(), "agents".into()), "0 agents");
     assert_eq!(plural(2, "agent".into(), "agents".into()), "2 agents");
     // the register subtitles that used to read `1 agents` / `1 validators`.
-    assert_eq!(members_summary(true, 1, 0), "1 validator · 0 residents");
-    assert_eq!(members_summary(true, 3, 2), "3 validators · 2 residents");
     assert_eq!(tally_note(1, 4), "1 approval · 3 more for quorum");
 }
 
@@ -220,14 +218,24 @@ fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
         object: String::new(),
     };
 
+    let human = MemberRow {
+        key: "aa".into(),
+        label: "aa".into(),
+        is_agent: false,
+        role: "validator".into(),
+        is_this_node: false,
+        model: String::new(),
+        live: true,
+    };
+
     // Nothing there: the plate on each screen says it in words.
-    assert_eq!(members_summary(true, 0, 0), "");
+    assert_eq!(members_summary(true, Vec::new()), "");
     assert_eq!(agents_summary(true, Vec::new()), "");
     assert_eq!(proposals_summary(true, Vec::new()), "");
     assert_eq!(fs_counts_summary(true, true, Vec::new()), "");
 
     // Something there: every subtitle speaks, zeros included.
-    assert_eq!(members_summary(true, 1, 0), "1 validator · 0 residents");
+    assert_eq!(members_summary(true, vec![human]), "1 human · 0 agents");
     assert_eq!(
         agents_summary(true, vec![agent(false)]),
         "1 agent · 0 working"
@@ -858,6 +866,50 @@ fn the_roster_answers_admin_tier_and_filters() {
     assert_eq!(filter_members(rows.clone(), "humans".into()).len(), 2);
     assert_eq!(filter_members(rows.clone(), "validators".into()).len(), 1);
     assert_eq!(filter_members(rows, "all".into()).len(), 3);
+}
+
+/// THE HEADER COUNTS THE LIST IT SITS ABOVE. `members_summary` used to fold the
+/// two VALSET queries — validators and residents — while the roster under it
+/// also draws every registered agent, which holds no valset standing at all. On
+/// the demo workspace that printed `1 validator · 0 residents` over two rows:
+/// both numbers true, the sentence not, because it measured a different set
+/// than the one on screen. The subtitle now splits the rows on `is_agent`, the
+/// same predicate the Humans / Agents chips use, so its two counts partition
+/// the list and sum to the All chip.
+#[test]
+fn the_members_subtitle_folds_the_rows_the_screen_lists() {
+    let member = |key: &str, role: &str| MemberRow {
+        key: key.into(),
+        label: key.into(),
+        is_agent: role == "agent",
+        role: role.into(),
+        is_this_node: false,
+        model: String::new(),
+        live: true,
+    };
+    let rows = vec![
+        member("aa", "validator"),
+        member("bb", "resident"),
+        member("triage", "agent"),
+    ];
+    assert_eq!(members_summary(true, rows.clone()), "2 humans · 1 agent");
+    // singulars, and the count that used to be the whole subtitle.
+    assert_eq!(
+        members_summary(true, rows[..1].to_vec()),
+        "1 human · 0 agents"
+    );
+
+    // The invariant under the wording: every number in the subtitle is a slice
+    // of the list, so they add up to the row count. The valset fold never did.
+    let counted: usize = members_summary(true, rows.clone())
+        .split(" · ")
+        .filter_map(|part| part.split(' ').next()?.parse::<usize>().ok())
+        .sum();
+    assert_eq!(
+        counted,
+        rows.len(),
+        "the Members subtitle must sum to the roster printed under it"
+    );
 }
 
 #[test]

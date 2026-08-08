@@ -37,14 +37,30 @@ pub fn plural(count: i64, one: String, many: String) -> String {
 /// A zero that sits BESIDE a real reading stays — `1 agent · 0 working` is the
 /// sentence doing its job.
 ///
-/// `3 validators · 2 residents` — the machine subtitle beside the Members title.
-pub fn members_summary(connected: bool, validators: i64, residents: i64) -> String {
-    let roster_is_empty = validators <= 0 && residents <= 0;
-    if !connected || roster_is_empty {
+/// `2 humans · 1 agent` — the machine subtitle beside the Members title, and
+/// the same reading in Settings' network card.
+///
+/// IT FOLDS THE ROWS IT IS PRINTED ABOVE. This used to fold the valset queries
+/// instead — validators plus residents — while the list under it also draws the
+/// registered agents, which hold no valset standing at all. Both numbers were
+/// true and the sentence they formed was not: a demo workspace read
+/// `1 validator · 0 residents` above two rows, and "residents" is a word the
+/// screen never says anywhere else. `is_agent` is the one split the screen
+/// itself makes — the Humans / Agents chips are `filter_members` over exactly
+/// that field — so these two counts partition the list and sum to the All chip
+/// beside them. The validator count is not lost: it is its own chip, and every
+/// row carries its role marker.
+pub fn members_summary(connected: bool, rows: Vec<MemberRow>) -> String {
+    if !connected || rows.is_empty() {
         return String::new();
     }
-    let left = plural(validators, "validator".into(), "validators".into());
-    let right = plural(residents, "resident".into(), "residents".into());
+    let agents = rows.iter().filter(|row| row.is_agent).count();
+    let left = plural(
+        count_i64(rows.len() - agents),
+        "human".into(),
+        "humans".into(),
+    );
+    let right = plural(count_i64(agents), "agent".into(), "agents".into());
     format!("{left} · {right}")
 }
 

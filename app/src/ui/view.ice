@@ -339,8 +339,6 @@ view
           MembersScreen #members
             with
               rows=members_rows
-              validators=members_validators
-              residents=members_residents
               filter=members_filter
               selected=members_selected
               admin=members_is_admin(members_rows)
@@ -447,8 +445,6 @@ view
               settings_open_tabs
               members_rows
               members_answered
-              members_validators
-              members_residents
               account_id
               account_renaming
               account_bound
