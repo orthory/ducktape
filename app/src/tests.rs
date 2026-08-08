@@ -3069,6 +3069,25 @@ fn the_identity_card_counts_only_a_bound_account() {
     // And view.ice actually passes it, or the screen renders a default.
     let view = inlined(include_str!("ui/view.ice"));
     assert!(view.contains("account_bound"), "the mount has to supply it");
+
+    // THE SEPARATOR BELONGS TO THE KEY. #998 stopped the card counting an
+    // account that does not exist; the dot that had joined those counts stayed
+    // ungated, and an unbound account has no `account_id` either — so the line
+    // led with it: `· validator keypair on this device`. Every other separator
+    // in the console is gated by the run it introduces (forge.ice's repo-count
+    // dot carries the reasoning in its own comment).
+    let key_line = settings
+        .split_once("text account_id")
+        .expect("the key line")
+        .1
+        .split_once(r#"text "keypair on this device""#)
+        .expect("the custody clause closes it")
+        .0;
+    let dot = key_line.find(r#"text "·""#).expect("the separator");
+    let guard = key_line
+        .find("if !empty(account_id)")
+        .expect("the separator's guard");
+    assert!(guard < dot, "the dot is gated by the key it introduces");
 }
 
 /// A ZERO IS A CLAIM, AND THIS APP SAYS IT WITH BLANK. `count_label` returns
