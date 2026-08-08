@@ -851,16 +851,32 @@ pub(crate) fn readme_about(mirror: &git2::Repository, commit: &git2::Commit) -> 
     let Some(text) = found else {
         return String::new();
     };
-    let prose = text.lines().map(str::trim).find(|line| {
+    let lines = text.lines().map(str::trim).collect::<Vec<_>>();
+    let opens_prose = |line: &&&str| {
         let empty = line.is_empty();
         let heading = line.starts_with('#');
         let badge = line.starts_with('[') || line.starts_with('!');
         !empty && !heading && !badge
-    });
-    let prose = prose.unwrap_or_default();
+    };
+    let Some(start) = lines.iter().position(|line| opens_prose(&line)) else {
+        return String::new();
+    };
+    // The whole paragraph, not its first physical line. A README is hard
+    // wrapped, so taking one line ended this repo's own card mid-clause —
+    // "…one BFT-replicated state machine that" — which reads as a UI
+    // truncation and carries no ellipsis to say so. A blank line ends the
+    // paragraph, which is what a paragraph IS; a wrapped continuation may
+    // legitimately begin with a bracket, so only the OPENING line is screened
+    // for headings and badges.
+    let prose = lines[start..]
+        .iter()
+        .take_while(|line| !line.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
     match prose.char_indices().nth(200) {
         Some((cut, _)) => format!("{}…", &prose[..cut]),
-        None => prose.to_string(),
+        None => prose,
     }
 }
 
