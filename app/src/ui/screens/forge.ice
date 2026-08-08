@@ -25,10 +25,25 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
     forge_comment_drop(str)
     note_composer_event(ComposerEvent)
   col w=fill h=fill
+    // NOT CONNECTED IS NOT EMPTY, and the arm sits ABOVE both seats because
+    // both of them read. `connected` already disabled every act here, while the
+    // overview went on plating "No repos yet" — handing out a push command — off
+    // a forge nobody queried, and an open repo went on showing empty Code / Pull
+    // requests / Issues lists. Same words Chat and Pages use.
+    if !connected
+      box
+        with
+          w=fill
+          h=fill
+          p=22.0
+        EmptyState
+          with
+            title="Not connected"
+            description="Click the network name in the titlebar to pick or reconnect a network."
     // THE REPO OVERVIEW. Reachable again: `forge_close_repo` clears the open
     // repo, which nothing did before — once a repo was opened the grid was
     // gone for the rest of the session.
-    if empty(open_repo)
+    if connected && empty(open_repo)
       scroll
         with
           dir=vertical
@@ -45,6 +60,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
               about
               repos=len(repos)
               tier
+              connected
           // NOT `EmptyPlate`: this screen has no "new repository" button and
           // never will, because forge IS a git remote — a repo comes into
           // existence when a push lands on it. Saying only that a repo
@@ -89,7 +105,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 RepoCard repo=repo
                   forward
                     forge_open_repo
-    if !empty(open_repo)
+    if connected && !empty(open_repo)
       col w=fill h=fill
         box
           with

@@ -303,6 +303,7 @@ view
             with
               path=fs_path
               entries=fs_entries
+              connected
               loading=fs_loading
               preview_path=fs_preview_path
               delete_target=fs_delete_target
@@ -339,6 +340,7 @@ view
               filter=members_filter
               selected=members_selected
               admin=members_is_admin(members_rows)
+              connected
               answered=members_answered
             events
               pick_members_filter -> pick_members_filter _
@@ -347,7 +349,7 @@ view
               agent_set_status -> agent_set_status _ _
               gov_propose -> gov_propose _ _
         agents:
-          AgentsScreen rows=agents_rows answered=agents_answered
+          AgentsScreen rows=agents_rows connected answered=agents_answered
         forge:
           ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
             with
@@ -421,6 +423,7 @@ view
               rows=gov_rows
               voting=gov_voting
               admin=members_is_admin(members_rows)
+              connected
               answered=gov_answered
             events
               gov_vote -> gov_vote _ _

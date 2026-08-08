@@ -21,8 +21,18 @@ pub fn plural(count: i64, one: String, many: String) -> String {
     format!("{count} {noun}")
 }
 
+/// A HEADER SUBTITLE IS A MEASUREMENT, AND A DISCONNECTED APP MEASURED NOTHING.
+/// Every `*_summary` below folds rows that only a live node can deliver, so with
+/// the node down they all read `0 … · 0 …` — a claim about content, asserted off
+/// a listing nobody fetched. They take `connected` and say nothing instead, the
+/// same trade `count_label` (backend/document.rs) and `member_tier`
+/// (backend/roster.rs) already make: silence over a confident zero.
+///
 /// `3 validators · 2 residents` — the machine subtitle beside the Members title.
-pub fn members_summary(validators: i64, residents: i64) -> String {
+pub fn members_summary(connected: bool, validators: i64, residents: i64) -> String {
+    if !connected {
+        return String::new();
+    }
     let left = plural(validators, "validator".into(), "validators".into());
     let right = plural(residents, "resident".into(), "residents".into());
     format!("{left} · {right}")
@@ -31,14 +41,20 @@ pub fn members_summary(validators: i64, residents: i64) -> String {
 /// `4 agents · 2 working` — the Agents title's machine subtitle. `working` is
 /// runs in flight, not `AgentStatus::Active`: Active is the registration
 /// default and would report every registered agent as busy forever.
-pub fn agents_summary(rows: Vec<AgentRow>) -> String {
+pub fn agents_summary(connected: bool, rows: Vec<AgentRow>) -> String {
+    if !connected {
+        return String::new();
+    }
     let working = rows.iter().filter(|row| row.live).count();
     let registered = plural(count_i64(rows.len()), "agent".into(), "agents".into());
     format!("{registered} · {working} working")
 }
 
 /// `12 open · 3 settled` — the Approvals title's machine subtitle.
-pub fn proposals_summary(rows: Vec<ProposalRow>) -> String {
+pub fn proposals_summary(connected: bool, rows: Vec<ProposalRow>) -> String {
+    if !connected {
+        return String::new();
+    }
     let open = rows.iter().filter(|row| row.open).count();
     format!("{open} open · {} settled", rows.len() - open)
 }

@@ -7,7 +7,7 @@
 // That is the whole contract; the bodies below are the ones that used to sit
 // inline in the view's `members:` and `agents:` slots, unchanged.
 
-component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:str, selected:str, admin:bool, answered:bool)
+component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:str, selected:str, admin:bool, connected:bool, answered:bool)
   emits
     pick_members_filter(str)
     open_member(str)
@@ -16,7 +16,7 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
     gov_propose(str, str)
   row w=fill h=fill
     col w=fill h=fill
-      ScreenHeader title="Members" meta=members_summary(validators, residents)
+      ScreenHeader title="Members" meta=members_summary(connected, validators, residents)
         // NO INVITE BUTTON YET. `mint_invite` exists in the backend, but nothing
         // routes the mint itself, so the button would open a modal with no act
         // in it.
@@ -24,78 +24,98 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
       // All / Humans / Agents / Validators. `filter_members` owns the
       // predicate so the strip and the list can never disagree.
       col w=fill
-        box
-          with
-            w=fill
-            pl=22.0
-            pr=22.0
-            pt=12.0
-            pb=12.0
-          row
+        // EVERY CHIP CARRIES A COUNT, and a count is a reading. With the node
+        // down these fold a roster nobody fetched, so the strip stands down
+        // with the list it filters rather than offering `All 2` over a plate
+        // that says the network is unreachable.
+        if connected
+          box
             with
               w=fill
-              gap=7.0
-              align=center
-            button -> emit(pick_members_filter, "all")
+              pl=22.0
+              pr=22.0
+              pt=12.0
+              pb=12.0
+            row
               with
-                label="Show every member"
-                p=0.0
-                @ghost_action
-              FilterChip
+                w=fill
+                gap=7.0
+                align=center
+              button -> emit(pick_members_filter, "all")
                 with
-                  label="All"
-                  count=len(rows)
-                  selected=(filter == "all")
-              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-              hovered bg=row_hover text=fg
-              pressed bg=elevated text=fg
-            button -> emit(pick_members_filter, "humans")
-              with
-                label="Show people only"
-                p=0.0
-                @ghost_action
-              FilterChip
+                  label="Show every member"
+                  p=0.0
+                  @ghost_action
+                FilterChip
+                  with
+                    label="All"
+                    count=len(rows)
+                    selected=(filter == "all")
+                active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                hovered bg=row_hover text=fg
+                pressed bg=elevated text=fg
+              button -> emit(pick_members_filter, "humans")
                 with
-                  label="Humans"
-                  count=len(filter_members(rows, "humans"))
-                  selected=(filter == "humans")
-              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-              hovered bg=row_hover text=fg
-              pressed bg=elevated text=fg
-            button -> emit(pick_members_filter, "agents")
-              with
-                label="Show agents only"
-                p=0.0
-                @ghost_action
-              FilterChip
+                  label="Show people only"
+                  p=0.0
+                  @ghost_action
+                FilterChip
+                  with
+                    label="Humans"
+                    count=len(filter_members(rows, "humans"))
+                    selected=(filter == "humans")
+                active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                hovered bg=row_hover text=fg
+                pressed bg=elevated text=fg
+              button -> emit(pick_members_filter, "agents")
                 with
-                  label="Agents"
-                  count=len(filter_members(rows, "agents"))
-                  selected=(filter == "agents")
-              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-              hovered bg=row_hover text=fg
-              pressed bg=elevated text=fg
-            button -> emit(pick_members_filter, "validators")
-              with
-                label="Show validators only"
-                p=0.0
-                @ghost_action
-              FilterChip
+                  label="Show agents only"
+                  p=0.0
+                  @ghost_action
+                FilterChip
+                  with
+                    label="Agents"
+                    count=len(filter_members(rows, "agents"))
+                    selected=(filter == "agents")
+                active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                hovered bg=row_hover text=fg
+                pressed bg=elevated text=fg
+              button -> emit(pick_members_filter, "validators")
                 with
-                  label="Validators"
-                  count=len(filter_members(rows, "validators"))
-                  selected=(filter == "validators")
-              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-              hovered bg=row_hover text=fg
-              pressed bg=elevated text=fg
-            space w=fill
+                  label="Show validators only"
+                  p=0.0
+                  @ghost_action
+                FilterChip
+                  with
+                    label="Validators"
+                    count=len(filter_members(rows, "validators"))
+                    selected=(filter == "validators")
+                active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                hovered bg=row_hover text=fg
+                pressed bg=elevated text=fg
+              space w=fill
         box
           with
             w=fill
             h=1.0
             bg=separator
           space w=1.0 h=1.0
-      if empty(filter_members(rows, filter)) && answered
+      // NOT CONNECTED IS NOT EMPTY. `answered` is "the roster replied", and it
+      // stays true across a node going down — so the plate below went on
+      // claiming nobody is on this network off a roster read minutes ago and
+      // now unreadable. The header and the filter strip stay: they are how the
+      // reader gets back out.
+      if !connected
+        box
+          with
+            w=fill
+            h=fill
+            p=22.0
+          EmptyState
+            with
+              title="Not connected"
+              description="Click the network name in the titlebar to pick or reconnect a network."
+      if connected && empty(filter_members(rows, filter)) && answered
         box
           with
             w=fill
@@ -104,7 +124,7 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
           EmptyPlate
             with
               message="No members here yet — validators, residents and registered agents appear as they join."
-      if !empty(filter_members(rows, filter))
+      if connected && !empty(filter_members(rows, filter))
         scroll
           with
             dir=vertical
@@ -144,7 +164,7 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
                     active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
                     hovered bg=row_hover text=fg
                     pressed bg=elevated text=fg
-    if !empty(selected)
+    if connected && !empty(selected)
       for member in rows
         if member.key == selected
           MemberDetail member=member admin=admin
@@ -154,9 +174,9 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
               agent_set_status
               gov_propose
 
-component AgentsScreen(rows:[AgentRow], answered:bool)
+component AgentsScreen(rows:[AgentRow], connected:bool, answered:bool)
   col w=fill h=fill
-    ScreenHeader title="Agents" meta=agents_summary(rows)
+    ScreenHeader title="Agents" meta=agents_summary(connected, rows)
       space w=1.0 h=1.0
     // The registry explainer. The artifact states the whole model in this
     // one strip and the English UI never did: the registry is the record of
@@ -182,7 +202,20 @@ component AgentsScreen(rows:[AgentRow], answered:bool)
           h=1.0
           bg=separator
         space w=1.0 h=1.0
-    if empty(rows) && answered
+    // NOT CONNECTED IS NOT EMPTY — the registry lives on chain and nothing
+    // read it. The explainer strip above stays (it states the MODEL, not a
+    // reading); the plate that says the register is empty does not.
+    if !connected
+      box
+        with
+          w=fill
+          h=fill
+          p=22.0
+        EmptyState
+          with
+            title="Not connected"
+            description="Click the network name in the titlebar to pick or reconnect a network."
+    if connected && empty(rows) && answered
       box
         with
           w=fill
@@ -191,7 +224,7 @@ component AgentsScreen(rows:[AgentRow], answered:bool)
         EmptyPlate
           with
             message="No agents registered — a registered agent appears here with its capability and grants."
-    if !empty(rows)
+    if connected && !empty(rows)
       scroll
         with
           dir=vertical
