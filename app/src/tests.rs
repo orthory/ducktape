@@ -1761,6 +1761,41 @@ fn reading_alpha() -> Ducktape {
     app
 }
 
+/// AN ERROR MUST NOT ASSERT A DIAGNOSIS IT HAS NOT MADE. `connect` discarded
+/// the real cause with `map_err(|_| …)` and said "Could not connect. Check the
+/// endpoint and node." — the one thing the reader can act on, and wrong
+/// whenever the node is answering fine and the failure is a timeout, an
+/// unreadable reply or a broken signer. Measured while debugging this screen:
+/// the node served `/v1/status` in under a millisecond and the app still said
+/// to go check it.
+///
+/// Pinned as a source shape because the failure is an async RPC round trip with
+/// no seam to fake here; `user_error` itself is covered by its own tests.
+#[test]
+fn connect_reports_the_cause_instead_of_guessing_at_it() {
+    const LIVE: &str = include_str!("backend/live.rs");
+    let connect = LIVE
+        .split("pub async fn connect(")
+        .nth(1)
+        .expect("connect is declared")
+        .split("\npub ")
+        .next()
+        .expect("connect body");
+
+    assert!(
+        connect.contains("user_error(cause.to_string())"),
+        "connect must route its cause through the translator the rest of the app uses"
+    );
+    assert!(
+        !connect.contains("map_err(|_|"),
+        "throwing the cause away is what made this error a guess"
+    );
+    // NOT asserted: that the old sentence is absent from the function. The
+    // comment above the fix quotes it to explain what was wrong, and a sweep
+    // over source text cannot tell a message from the prose about it — the
+    // check would fail on its own documentation.
+}
+
 /// A CHAT-ONLY RESYNC MUST NOT CLAIM THE PAGE IT CARRIES NO NEWS ABOUT. The
 /// click blanks the pane and moves `active_page`; a resync that arrives with
 /// `pages_loaded == false` keeps the empty `blocks` and canonicalises
