@@ -96,8 +96,28 @@ pub async fn search_workspace(
             kinds: Vec::new(),
         });
     }
+    // SIX INDEPENDENT SOURCES, ONE WAIT. They were awaited one after another, so
+    // a search cost their SUM — and the forge leg alone is a repo list plus one
+    // load per repo. Nothing here reads anything another leg produces, which is
+    // exactly the case `load_workspace` (backend/load.rs) already fans out with
+    // its own note: "Concurrent, the console opens on the slowest leg, not their
+    // sum." `palette_search` twenty lines above does the same for its two.
+    //
+    // This is a READ fan-out. The `join_all` ban in backend/document.rs is about
+    // the WRITE chain, where an op built on the block before it must land after
+    // it; no ordering exists between these.
+    //
+    // The extend order below is the ORDER ON SCREEN and is unchanged.
+    let (chat, pages, forge, files, tasks, runs) = tokio::join!(
+        search_chat(rpc.clone(), String::new(), text.clone(), generation),
+        search_pages(rpc.clone(), String::new(), text.clone(), generation),
+        search_forge_items(&rpc, &needle, generation),
+        search_files(&rpc, text.trim()),
+        search_tasks(&rpc, &needle),
+        load_agent_runs(rpc.clone(), String::new(), generation),
+    );
     let mut hits = Vec::new();
-    if let Ok(chat) = search_chat(rpc.clone(), String::new(), text.clone(), generation).await {
+    if let Ok(chat) = chat {
         hits.extend(chat.hits.into_iter().map(|hit| ExplorerHit {
             kind: "message".into(),
             code: "ms".into(),
@@ -116,7 +136,7 @@ pub async fn search_workspace(
             target: hit.channel_id,
         }));
     }
-    if let Ok(pages) = search_pages(rpc.clone(), String::new(), text.clone(), generation).await {
+    if let Ok(pages) = pages {
         hits.extend(pages.hits.into_iter().map(|hit| ExplorerHit {
             kind: "page".into(),
             code: "pg".into(),
@@ -132,10 +152,10 @@ pub async fn search_workspace(
             target: hit.page_id,
         }));
     }
-    hits.extend(search_forge_items(&rpc, &needle, generation).await);
-    hits.extend(search_files(&rpc, text.trim()).await);
-    hits.extend(search_tasks(&rpc, &needle).await);
-    if let Ok(runs) = load_agent_runs(rpc, String::new(), generation).await {
+    hits.extend(forge);
+    hits.extend(files);
+    hits.extend(tasks);
+    if let Ok(runs) = runs {
         hits.extend(
             runs.runs
                 .into_iter()
@@ -265,9 +285,20 @@ async fn search_forge_items(rpc: &str, needle: &str, generation: i64) -> Vec<Exp
     let Ok(forge) = load_forge(rpc.to_string(), generation).await else {
         return Vec::new();
     };
+    // One load per repo, and they were serial too — a workspace with ten repos
+    // paid ten round trips inside the one leg that was already the slowest.
+    // Each is independent; the results are zipped back onto their repo so the
+    // rows keep the repo list's order.
+    let loaded = iced::futures::future::join_all(
+        forge
+            .repos
+            .iter()
+            .map(|repo| load_forge_repo(rpc.to_string(), repo.name.clone(), generation)),
+    )
+    .await;
     let mut hits = Vec::new();
-    for repo in forge.repos {
-        let Ok(data) = load_forge_repo(rpc.to_string(), repo.name.clone(), generation).await else {
+    for (repo, data) in forge.repos.iter().zip(loaded) {
+        let Ok(data) = data else {
             continue;
         };
         hits.extend(

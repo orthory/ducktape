@@ -1161,6 +1161,84 @@ fn palette_keys_use_logical_escape_and_physical_shortcut() {
     );
 }
 
+/// A SEARCH COSTS ITS SLOWEST SOURCE, NOT THEIR SUM. `search_workspace` awaited
+/// six independent sources one after another, and its forge leg awaited one load
+/// per repo inside that — so a workspace search paid roughly
+/// `chat + pages + (1 + repos) + files + tasks + runs` round trips end to end.
+/// Nothing here reads what another leg produced.
+///
+/// The shape is the guarantee, so the shape is what is pinned: one `tokio::join!`
+/// naming all six, a `join_all` over the repos, and no leg left awaiting alone.
+/// The extend order after the join is the order on screen and is asserted too —
+/// a fan-out that silently reordered the results would be a different defect.
+///
+/// This does NOT contradict the `join_all` ban in backend/document.rs: that one
+/// guards the WRITE chain, where an op built on the block before it must land
+/// after it.
+#[test]
+fn a_workspace_search_waits_on_its_sources_together() {
+    const SEARCH: &str = include_str!("search.rs");
+    let workspace = SEARCH
+        .split_once("pub async fn search_workspace(")
+        .expect("the workspace search")
+        .1
+        .split_once("\nasync fn ")
+        .expect("it ends")
+        .0;
+
+    let join = workspace
+        .split_once("tokio::join!(")
+        .expect("the six sources are awaited together")
+        .1
+        .split_once(");")
+        .expect("the join closes")
+        .0;
+    for leg in [
+        "search_chat(",
+        "search_pages(",
+        "search_forge_items(",
+        "search_files(",
+        "search_tasks(",
+        "load_agent_runs(",
+    ] {
+        assert!(
+            join.contains(leg),
+            "{leg} must be joined, not awaited alone"
+        );
+    }
+
+    // The screen order survives the fan-out.
+    let order: Vec<usize> = [
+        "if let Ok(chat)",
+        "if let Ok(pages)",
+        "hits.extend(forge)",
+        "hits.extend(files)",
+        "hits.extend(tasks)",
+        "if let Ok(runs)",
+    ]
+    .iter()
+    .map(|mark| workspace.find(mark).unwrap_or_else(|| panic!("{mark}")))
+    .collect();
+    assert!(
+        order.windows(2).all(|pair| pair[0] < pair[1]),
+        "the results are extended in the order the screen shows them"
+    );
+
+    // And the forge leg's own per-repo walk fans out too.
+    let forge = SEARCH
+        .split_once("async fn search_forge_items(")
+        .expect("the forge leg")
+        .1;
+    assert!(
+        forge.contains("join_all("),
+        "one load per repo, awaited together"
+    );
+    assert!(
+        !forge.contains("for repo in forge.repos {"),
+        "the serial repo walk is gone"
+    );
+}
+
 /// A SEARCH HIT SAYS WHICH ROOM IT IS IN, ONCE. The hit's `meta` was
 /// `#{seq}` — the message's sequence number, rendered exactly like a channel,
 /// because every channel in this app is written `# General`. So a palette row
