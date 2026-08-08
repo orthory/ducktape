@@ -3177,8 +3177,8 @@ fn forge_empty_states_name_only_routes_that_exist() {
     );
 }
 
-/// THE EXPLORER NAMES WHAT IT SHOWS. Three defects on one screen, all the same
-/// shape — the pixels were right and the words were absent or false.
+/// THE EXPLORER NAMES WHAT IT SHOWS. Several defects on one screen, all the
+/// same shape — the pixels were right and the words were absent or false.
 ///
 /// The header claimed the list holds "the blocks this node verified for
 /// itself". It does not. `GET /v1/blocks` serves the derived-index rows, and
@@ -3190,14 +3190,19 @@ fn forge_empty_states_name_only_routes_that_exist() {
 /// reader comparing the top row against the height in the titlebar concludes
 /// the node is fifty thousand blocks behind.
 ///
+/// Naming the set truthfully then obliges the list to HOLD that set in every
+/// role, which it did not: a node following from a checkpoint writes one
+/// op-less boundary row, and that row printed `0 ops` under the new sentence.
+///
 /// The op detail then printed two values nobody named: `chat(+0m/+0e)`, whose
 /// units are spelled out only in `crates/kernel/host`, and a hash that differs
 /// from the row's hash on the left because one is the frame id and the other
 /// the op payload digest.
 ///
-/// This pins the DERIVATION and the LABEL SITES rather than the sentences: the
-/// copy may be rewritten, but a count must carry its noun, a value must carry
-/// its name, and one set must not have two names on one screen.
+/// This pins the DERIVATION, the SET, and the LABEL SITES rather than the
+/// sentences: the copy may be rewritten, but a count must carry its noun, a
+/// value must carry its name, one set must not have two names on one screen,
+/// and no row may contradict the name the screen prints over it.
 #[test]
 fn the_explorer_names_what_it_shows() {
     // The dispatch trace, fed the `operations` shape `bin/noded`'s projection
@@ -3252,15 +3257,53 @@ fn the_explorer_names_what_it_shows() {
         );
     }
 
+    // AND NO ROW MAY CONTRADICT THAT SENTENCE — which is a claim about the
+    // DATA, not about the copy, because `/v1/blocks` is not uniformly filtered.
+    // Three of its four row writers drop an op-less block; the fourth,
+    // `boundary_block_row` (`bin/node/src/explorer.rs`, applied in
+    // `replica/park.rs`), writes the follower's ascension tip with `hash: ""`
+    // and no ops. `bin/node/src/main.rs` routes every key that is neither a
+    // validator nor seated by the checkpoint into `replica::run` — every joined
+    // member until promotion — so that row drew a blank hash and `0 ops`
+    // directly under the subtitle asserted above, and opened to an empty pane.
+    let served = [
+        serde_json::json!({
+            "height": 41, "hash": "", "commit_hash": "aa11bb22cc33dd44", "ops": [],
+        }),
+        serde_json::json!({
+            "height": 42, "hash": "ee55ff66aa77bb88", "commit_hash": "cc99dd00ee11ff22",
+            "ops": [{
+                "proposer": "abc123def456789a", "disposition": "applied", "target": "chat",
+                "op_hash": "0f1e2d3c4b5a6978", "payload": "hi", "operations": hops,
+            }],
+        }),
+    ];
+    let window = backend::explorer_window(0, &served);
+    assert_eq!(
+        window
+            .blocks
+            .iter()
+            .map(|block| (block.height, block.op_count))
+            .collect::<Vec<_>>(),
+        vec![(42, 1)],
+        "the Explorer listed a block carrying no operations under a subtitle \
+         that says every row carried some"
+    );
+    assert!(
+        window.ops.iter().all(|op| op.height == 42),
+        "an op was attributed to a block the list does not hold"
+    );
+
     // AND EVERY VALUE IN THE OP DETAIL CARRIES ITS NAME. `by` was already
     // right and is pinned with the two that were not, so the rule reads as a
-    // rule instead of an exception for these two fields.
+    // rule instead of an exception for these two fields. `hash` and not `op`:
+    // the list's third column already spends `op` as a count noun (`1 op`).
     let detail = explorer
         .split_once("for op in explorer_ops_at(ops, selected)")
         .expect("the op detail pane iterates the selected block's ops")
         .1;
     for (label, value) in [
-        ("op", "text op.op_hash"),
+        ("hash", "text op.op_hash"),
         ("by", "text op.proposer"),
         ("dispatch", "text op.trace"),
     ] {

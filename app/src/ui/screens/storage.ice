@@ -785,7 +785,21 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                             // and an unlabelled hex that changes when you open
                             // a row reads as a contradiction. The label form is
                             // the `by` beside the proposer, one row down.
-                            text "op"
+                            //
+                            // `hash`, not `op`: this pane sits beside a list
+                            // whose third column counts `1 op` / `3 ops`, and
+                            // one screen must not spend the same word on a
+                            // count noun and a field name. Inside an op card
+                            // `hash` can only mean this op's, and the block
+                            // hash it could be confused with carries no label
+                            // to collide with. The row costs 14px more than
+                            // `op` did and has room: at the 1040 minimum the
+                            // pane is 1040 − 74 rail − 48 screen padding − 340
+                            // list − 10 gap − 18 box − 18 card = 532px, against
+                            // ~293px of `wrap=none` intrinsics (target, badge,
+                            // label, 13-char digest, four 8px gaps). Arithmetic,
+                            // not a screenshot — this branch was not run.
+                            text "hash"
                               with
                                 size=11.0
                                 wrap=none

@@ -403,13 +403,22 @@ pub struct BlocksParams {
     pub limit: Option<usize>,
 }
 
-/// GET /v1/blocks — recent non-empty blocks, oldest-first: `{"blocks":[…]}`.
+/// GET /v1/blocks — the recent rows this node kept, oldest-first:
+/// `{"blocks":[…]}`.
 ///
 /// reads the index store's durable blocks database directly (no actor
 /// round-trip), the same discipline as the other `/v1/index/*` reads — so
 /// history survives a restart. heartbeat nops never get a row, so an empty
 /// reply means no real ops have finalized, not an idle chain. a handle with
 /// no index store configured serves the same "no blocks yet" shape.
+///
+/// NOT uniformly non-empty, and a reader that assumes so is wrong: the block
+/// writers drop an op-less block, but [`indexer::IndexStore::apply_block_record`]
+/// exists for a follower that observes BOUNDARIES rather than sealed frames,
+/// and `bin/node`'s `boundary_block_row` writes one such row (empty `hash`,
+/// empty `ops`) at each ascension tip. it is a truthful record of what that
+/// node saw; a consumer that presents these rows as blocks-with-content owes
+/// its own filter.
 pub(crate) async fn blocks(
     State(handle): State<NodeHandle>,
     Query(params): Query<BlocksParams>,
