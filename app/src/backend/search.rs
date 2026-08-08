@@ -101,7 +101,14 @@ pub async fn search_workspace(
         hits.extend(chat.hits.into_iter().map(|hit| ExplorerHit {
             kind: "message".into(),
             code: "ms".into(),
-            title: author_name(&hit.author),
+            // `hit.author` IS ALREADY A DISPLAY NAME — `search_chat` runs it
+            // through `author_display`, which yields "you", "user 48cedb0d…" or
+            // "@quackbot". Running `author_name` over that a second time found
+            // no `user:`/`agent:` prefix to split and fell through its `_` arm,
+            // so EVERY message hit in the Explorer was attributed to "system".
+            // Driven: the same message reads `user 48cedb0d…` in the timeline
+            // and `system` in search.
+            title: hit.author,
             snippet: hit.text,
             meta: format!("{} · {}", hit.channel_id, hit.meta),
             target: hit.channel_id,

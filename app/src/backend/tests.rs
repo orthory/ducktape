@@ -1030,6 +1030,52 @@ fn palette_keys_use_logical_escape_and_physical_shortcut() {
     );
 }
 
+/// A DISPLAY NAME MUST NOT BE FORMATTED TWICE. `search_chat` already runs the
+/// wire author through `author_display`, so an Explorer hit arrives holding
+/// "you", "user 48cedb0d…" or "@quackbot". The Explorer then ran `author_name`
+/// over that a SECOND time; none of those strings carries a `user:`/`agent:`
+/// prefix to split, so every one fell through to the `_` arm and every message
+/// hit in workspace search was attributed to "system".
+///
+/// Driven: the same message reads `user 48cedb0d…` in the timeline and `system`
+/// in Explorer search.
+#[test]
+fn a_search_hits_author_is_not_reformatted_into_system() {
+    // What `search_chat` hands the Explorer, for each kind of author.
+    for displayed in ["you", "user 48cedb0d…", "@quackbot", "chat"] {
+        assert_eq!(
+            author_name(displayed),
+            "system",
+            "a second pass over a display name loses it — this is why the hit \
+             must carry `hit.author` through untouched"
+        );
+    }
+
+    // And the first pass is the one that is correct.
+    assert_eq!(author_display("user:48cedb0d131f", None), "user 48cedb0d…");
+    assert_eq!(author_name("agent:demo/quackbot"), "@quackbot");
+
+    // The call site itself, pinned: the message arm must carry the author
+    // through, never re-format it. Without this the assertions above hold
+    // while the Explorer goes on printing "system".
+    const SEARCH: &str = include_str!("search.rs");
+    let message_arm = SEARCH
+        .split("kind: \"message\".into(),")
+        .nth(1)
+        .expect("the message hit arm")
+        .split("});")
+        .next()
+        .expect("arm body");
+    assert!(
+        message_arm.contains("title: hit.author,"),
+        "the message hit carries the display name it was handed"
+    );
+    assert!(
+        !message_arm.contains("author_name("),
+        "re-formatting it is what produced `system`"
+    );
+}
+
 #[test]
 fn escape_ladder_names_the_topmost_transient_layer_only() {
     use iced::keyboard::{Key, key::Named};
