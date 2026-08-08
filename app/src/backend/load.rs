@@ -49,6 +49,25 @@ fn tip_from_status(status: NodeStatus) -> Result<Tip, String> {
     })
 }
 
+/// Where a cold start lands when nothing was asked for. The wire orders
+/// channels by ID, so "the first one" is an accident of naming — in the demo
+/// workspace it is a `channel-1786073…` created minutes ago with nothing in it,
+/// and the console opens on "No messages yet" while three rooms carrying
+/// hundreds of messages sit under it. Land on somewhere with something to read.
+///
+/// Each fallback answers a workspace the one above it cannot: every room empty,
+/// then every room archived. The last rung keeps the old behaviour so a landing
+/// still happens rather than the console opening on no channel at all.
+pub(crate) fn landing_channel(channels: &[ChatChannel]) -> Option<&ChatChannel> {
+    let has_traffic = |channel: &&ChatChannel| !channel.archived && channel.head_seq > 0;
+    let is_open = |channel: &&ChatChannel| !channel.archived;
+    channels
+        .iter()
+        .find(has_traffic)
+        .or_else(|| channels.iter().find(is_open))
+        .or_else(|| channels.first())
+}
+
 pub(crate) async fn load_chat_data(
     rpc: &RpcClient,
     requested: Option<&str>,
@@ -96,7 +115,7 @@ pub(crate) async fn load_chat_data(
     let active_channel = requested
         .filter(|id| channels.iter().any(|channel| channel.id == *id))
         .map(str::to_string)
-        .or_else(|| channels.first().map(|channel| channel.id.clone()))
+        .or_else(|| landing_channel(&channels).map(|channel| channel.id.clone()))
         .unwrap_or_default();
     let active_channel_name = channels
         .iter()
