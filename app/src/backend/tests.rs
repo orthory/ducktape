@@ -1040,6 +1040,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
                   create: bool,
                   thread_action: &str,
                   action: &str,
+                  drawer: bool,
                   repo_menu: bool| {
         escape_target(
             escape.clone(),
@@ -1048,6 +1049,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             create,
             thread_action.into(),
             action.into(),
+            drawer,
             repo_menu,
         )
     };
@@ -1062,33 +1064,49 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             "more".into(),
             "more".into(),
             true,
+            true,
         ),
         ""
     );
     // An open palette swallows Escape — palette_key_action owns it.
-    assert_eq!(target(true, true, true, "more", "more", true), "");
+    assert_eq!(target(true, true, true, "more", "more", true, true), "");
     // The ladder order is the z-order: bell over the create modal, menus
     // after both, thread menu over the stream's, popovers last.
-    assert_eq!(target(false, true, true, "more", "more", true), "bell");
     assert_eq!(
-        target(false, false, true, "more", "more", true),
+        target(false, true, true, "more", "more", true, true),
+        "bell"
+    );
+    assert_eq!(
+        target(false, false, true, "more", "more", true, true),
         "channel_create"
     );
     assert_eq!(
-        target(false, false, false, "more", "more", true),
+        target(false, false, false, "more", "more", true, true),
         "thread_menu"
     );
     assert_eq!(
-        target(false, false, false, "toolbar", "editing", true),
+        target(false, false, false, "toolbar", "editing", true, true),
         "message_menu"
     );
+    // THE DRAWER SITS BETWEEN THEM. Both message menus float over Channel
+    // details, so they win; the repo menu lives on another tab, so it loses.
+    // It had no rung at all — an `×` and no keyboard exit, while every other
+    // overlay answered Escape. Measured: Escape over an open drawer changed
+    // exactly zero pixels on the running app.
     assert_eq!(
-        target(false, false, false, "toolbar", "toolbar", true),
+        target(false, false, false, "toolbar", "toolbar", true, true),
+        "channel_settings"
+    );
+    assert_eq!(
+        target(false, false, false, "toolbar", "toolbar", false, true),
         "repo_menu"
     );
     // Nothing transient open → Escape is a no-op. The pages rungs are gone
     // with the menus they dismissed: the document has no transient layer.
-    assert_eq!(target(false, false, false, "toolbar", "toolbar", false), "");
+    assert_eq!(
+        target(false, false, false, "toolbar", "toolbar", false, false),
+        ""
+    );
 }
 
 #[test]
