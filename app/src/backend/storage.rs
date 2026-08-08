@@ -33,7 +33,7 @@ pub fn fs_file_count(entries: Vec<FsEntry>) -> i64 {
 /// register subtitles in backend/shell.rs: say nothing rather than something
 /// false.
 pub fn fs_counts_summary(connected: bool, listed: bool, entries: Vec<FsEntry>) -> String {
-    if !connected || !listed {
+    if !connected || !listed || entries.is_empty() {
         return String::new();
     }
     let file_count = fs_file_count(entries.clone());

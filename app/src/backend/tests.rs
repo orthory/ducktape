@@ -167,6 +167,85 @@ fn a_count_of_one_takes_the_singular_noun() {
     assert_eq!(tally_note(1, 4), "1 approval · 3 more for quorum");
 }
 
+/// A SUBTITLE THAT COUNTS NOTHING, OVER A PLATE THAT ALREADY SAID SO. Approvals
+/// read `0 open · 0 settled` directly above "No proposals yet — a membership or
+/// configuration change opens the first one." Both halves of the subtitle were
+/// zero, so it repeated the plate in digits. #996 settled the rule for the
+/// bell's `0 unread` and Channel details' `MEMBERS 0`; these four folds are the
+/// sites it did not reach, and each of their screens plates the empty case in
+/// words already.
+///
+/// A zero BESIDE a real reading is a different thing and stays: `1 agent ·
+/// 0 working` is the sentence doing its job.
+#[test]
+fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
+    let agent = |live: bool| AgentRow {
+        id: "agent-1".into(),
+        name: "Quackbot".into(),
+        initials: "QU".into(),
+        capability: "mock-llm-1".into(),
+        status: "active".into(),
+        owner_key: String::new(),
+        owner_handle: String::new(),
+        created_at: 0,
+        is_mine: false,
+        live,
+        tools: 0,
+        secrets: 0,
+        subagent_budget: 0,
+        allowed_actions: Vec::new(),
+        skills: Vec::new(),
+        caps: Vec::new(),
+    };
+    let proposal = |open: bool| ProposalRow {
+        id: "proposal-1".into(),
+        action: "add_resident".into(),
+        detail: String::new(),
+        proposer: String::new(),
+        status: "open".into(),
+        deadline: 0,
+        approvals: 0,
+        rejections: 0,
+        rule: "threshold".into(),
+        required_yes: 1,
+        electorate: 1,
+        open,
+        settled_height: 0,
+    };
+    let entry = FsEntry {
+        path: "/shared/notes".into(),
+        name: "notes".into(),
+        kind: "file".into(),
+        size: 0,
+        object: String::new(),
+    };
+
+    // Nothing there: the plate on each screen says it in words.
+    assert_eq!(members_summary(true, 0, 0), "");
+    assert_eq!(agents_summary(true, Vec::new()), "");
+    assert_eq!(proposals_summary(true, Vec::new()), "");
+    assert_eq!(fs_counts_summary(true, true, Vec::new()), "");
+
+    // Something there: every subtitle speaks, zeros included.
+    assert_eq!(members_summary(true, 1, 0), "1 validator · 0 residents");
+    assert_eq!(
+        agents_summary(true, vec![agent(false)]),
+        "1 agent · 0 working"
+    );
+    assert_eq!(
+        proposals_summary(true, vec![proposal(true)]),
+        "1 open · 0 settled"
+    );
+    assert_eq!(
+        proposals_summary(true, vec![proposal(false)]),
+        "0 open · 1 settled"
+    );
+    assert_eq!(
+        fs_counts_summary(true, true, vec![entry]),
+        "1 file · 0 dirs"
+    );
+}
+
 #[test]
 fn quorum_dots_count_the_frozen_rule_not_the_electorate() {
     // three of the four REQUIRED signatures are in, inside a six-node pool.
