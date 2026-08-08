@@ -88,6 +88,28 @@ on global_key_pressed(event)
   return if !palette_open
   task widget focus #workspace-tabs/overlays/palette-input
 
+// THE CONTENT PANE'S KEYBOARD SCROLL. iced's scrollable has no focus and no
+// key handling, so Page Down over Settings moved nothing — and neither did
+// Home, End or the arrows, on any screen. One decide-fn turns the press into
+// a pixel delta and every full-pane content scroll takes the same delta: the
+// shell mounts exactly ONE of these at a time (`match tab` in WorkspaceTabs),
+// and `scroll-by` against a pane that is not on screen is a no-op, so naming
+// them all IS the routing — the same shape as the escape ladder above, where
+// the keepers do the dispatch.
+//
+// The multi-pane screens (chat, pages, files, forge, the explorer) are absent
+// on purpose: they show two or three scrolls side by side and nothing here can
+// say which one the reader means. Giving them a keyboard scroll is a focus
+// design, not a bug fix, and guessing a pane would move the wrong one.
+on content_scroll_key(event)
+  content_scroll = content_scroll_step(event.key, event.modifiers)
+  return if content_scroll == 0.0
+  parallel
+    task widget scroll-by #workspace-tabs/content/settings/settings-body 0.0 content_scroll
+    task widget scroll-by #workspace-tabs/content/governance/approvals-body 0.0 content_scroll
+    task widget scroll-by #workspace-tabs/content/members/members-body 0.0 content_scroll
+    task widget scroll-by #workspace-tabs/content/agents/agents-body 0.0 content_scroll
+
 on palette_changed(next)
   palette_draft = next
   palette_generation = palette_generation + 1
@@ -110,6 +132,9 @@ state
   // The escape ladder's verdict for the keepers above — state, not `let`:
   // the checker cannot type a subscription payload's field inside a let.
   escape_key = ""
+  // Same reason as `escape_key`: a subscription payload's field cannot be
+  // typed inside a `let`.
+  content_scroll = 0.0
   explorer_hits:[ExplorerHit] = []
   explorer_kinds:[KindCount] = []
   explorer_searching = false

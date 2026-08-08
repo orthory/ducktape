@@ -195,6 +195,56 @@ pub fn escape_target(
     String::new()
 }
 
+/// One keyboard "page", in pixels. iced's scrollable reports its viewport only
+/// through `on_scroll`, so a pane that has never been scrolled cannot tell us
+/// its own height and there is nothing to page BY — a constant is the only
+/// reading available. It is deliberately shorter than the shortest content band
+/// the console can render (the window's own minimum is 820x540, less a 40px
+/// titlebar and a 50px screen header), so Page Down always overlaps and can
+/// never skip past unread content. Undershooting costs a keypress; overshooting
+/// loses text.
+const KEY_PAGE_STEP: f64 = 400.0;
+/// One arrow-key step: about three lines of body text.
+const KEY_LINE_STEP: f64 = 60.0;
+/// Larger than any content the console can stack. `scroll_by` clamps the result
+/// to the pane's own extent, so this IS Home/End — no content measurement, no
+/// second operation kind.
+const KEY_SCROLL_EXTREME: f64 = 1.0e9;
+
+/// The vertical scroll, in pixels, that a key press asks the console's content
+/// pane for — `0.0` for every key that is not a scroll key.
+///
+/// iced's `scrollable` answers the wheel, the drag rail and touch; it has no
+/// focus and no keyboard handling at all (0.14's widget matches on
+/// `Event::Keyboard` only to track modifiers for shift-wheel), so Page
+/// Down/Up, Home/End and the arrows moved nothing anywhere in the console. The
+/// app is the only layer that can route them, and the subscription that feeds
+/// this one is `status=ignored`: a key a focused widget already consumed —
+/// Home inside a text field, an arrow inside an open combo box — never reaches
+/// here, so the pane scroll is strictly the fallback for a key nothing wanted.
+///
+/// Any modifier disqualifies the press. Chords belong to their own routers
+/// (`palette_key_action`, the composer marks, the page history), and a
+/// keyboard-selection chord like Shift+PageDown must not also move the pane.
+pub fn content_scroll_step(
+    logical: iced::keyboard::Key,
+    modifiers: iced::keyboard::Modifiers,
+) -> f64 {
+    use iced::keyboard::{Key, key::Named};
+    if !modifiers.is_empty() {
+        return 0.0;
+    }
+    match logical {
+        Key::Named(Named::PageDown) => KEY_PAGE_STEP,
+        Key::Named(Named::PageUp) => -KEY_PAGE_STEP,
+        Key::Named(Named::ArrowDown) => KEY_LINE_STEP,
+        Key::Named(Named::ArrowUp) => -KEY_LINE_STEP,
+        Key::Named(Named::End) => KEY_SCROLL_EXTREME,
+        Key::Named(Named::Home) => -KEY_SCROLL_EXTREME,
+        _ => 0.0,
+    }
+}
+
 /// True when the live connection is in a state the shell should banner:
 /// the stream is down, retrying, or a resync failed and is backing off.
 pub fn connection_degraded(status: String) -> bool {
