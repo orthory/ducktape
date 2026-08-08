@@ -25,12 +25,15 @@ pub fn fs_file_count(entries: Vec<FsEntry>) -> i64 {
     count_i64(entries.iter().filter(|entry| entry.kind != "dir").count())
 }
 
-/// `12 files · 3 dirs` — the crumb bar's own subtitle, and "" with the node
-/// down. An unfetched listing folds to `0 files · 0 dirs`, which reads as "this
-/// path is empty" when the truth is "nobody asked". Same rule as the register
-/// subtitles in backend/shell.rs: say nothing rather than something false.
-pub fn fs_counts_summary(connected: bool, entries: Vec<FsEntry>) -> String {
-    if !connected {
+/// `12 files · 3 dirs` — the crumb bar's own subtitle, and "" whenever the rows
+/// on hand are not this path's. A listing nobody fetched folds to
+/// `0 files · 0 dirs`, which reads as "this path is empty" when the truth is
+/// "nobody asked"; a listing fetched for the directory you just LEFT folds to
+/// that directory's tally, printed under the new one's name. Same rule as the
+/// register subtitles in backend/shell.rs: say nothing rather than something
+/// false.
+pub fn fs_counts_summary(connected: bool, listed: bool, entries: Vec<FsEntry>) -> String {
+    if !connected || !listed {
         return String::new();
     }
     let file_count = fs_file_count(entries.clone());

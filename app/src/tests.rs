@@ -3904,6 +3904,116 @@ fn a_disconnected_screen_stands_its_registers_down_too() {
     }
 }
 
+/// A DIRECTORY YOU HAVE NOT LISTED HAS NO CONTENTS TO REPORT. Measured live:
+/// clicking `reports` inside `/shared` moved the crumb to
+/// `duckfs /shared/reports` while the rows below it, and the `0 files · 1 dir`
+/// beside the crumb, still described `/shared`. Both were `/shared`'s reading,
+/// printed under `/shared/reports`'s name — and `/shared/reports` is in fact
+/// empty, so every word of it was wrong.
+///
+/// `fs_path` is the path asked for (the crumb moves on the click, deliberately
+/// — a click that repaints nothing reads as a dead app). `fs_listed_path` is
+/// the path the rows describe. Same split as `active_page`/`buffer_page`.
+#[test]
+fn the_files_pane_reports_only_a_directory_it_has_listed() {
+    let entry = |path: &str, kind: &str| backend::FsEntry {
+        path: path.into(),
+        name: path.rsplit('/').next().unwrap_or(path).into(),
+        kind: kind.into(),
+        size: 0,
+        object: String::new(),
+    };
+    let listing = |generation: i64, path: &str, entries: Vec<backend::FsEntry>| {
+        __DucktapeMessage::FsListed(backend::FsListing {
+            generation,
+            path: path.into(),
+            entries,
+        })
+    };
+
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    let _ = app.__update(listing(
+        app.fs_generation,
+        "/shared",
+        vec![entry("/shared/reports", "dir")],
+    ));
+    assert_eq!(
+        app.fs_listed_path, app.fs_path,
+        "the listing answered for it"
+    );
+    assert_eq!(
+        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+        "0 files · 1 dir"
+    );
+
+    // Navigate. The crumb moves at once; the rows have not.
+    let _ = app.__update(__DucktapeMessage::FsOpenDir("/shared/reports".into()));
+    assert_eq!(
+        app.fs_path, "/shared/reports",
+        "the crumb moves on the click"
+    );
+    assert_eq!(
+        app.fs_listed_path, "/shared",
+        "the rows still describe where you came from"
+    );
+    assert_ne!(
+        app.fs_listed_path, app.fs_path,
+        "`listed` is false for the whole of the navigation, and every reading \
+         of `entries` on the screen is gated on it"
+    );
+    assert_eq!(
+        backend::fs_counts_summary(app.connected, false, app.fs_entries.clone()),
+        "",
+        "no tally for a directory nobody has answered for"
+    );
+
+    // The answer lands and the two agree again.
+    let _ = app.__update(listing(app.fs_generation, "/shared/reports", Vec::new()));
+    assert_eq!(app.fs_listed_path, app.fs_path);
+    assert_eq!(
+        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+        "0 files · 0 dirs"
+    );
+
+    // A same-path refresh — what a write kicks off — must NOT blank the pane:
+    // the rows on hand still describe the path in the crumb.
+    let _ = app.__update(listing(
+        app.fs_generation,
+        "/shared/reports",
+        vec![entry("/shared/reports/q3.md", "file")],
+    ));
+    assert_eq!(app.fs_listed_path, app.fs_path, "a refresh never disagrees");
+
+    // And the screen actually gates on it, at every reading of the rows.
+    let storage = inlined(include_str!("ui/screens/storage.ice"));
+    let files = storage
+        .split_once("component FilesScreen(")
+        .expect("the screen")
+        .1
+        .split_once("\ncomponent ")
+        .expect("the screen ends")
+        .0;
+    assert!(
+        files.contains("listed:bool"),
+        "the screen is handed the fact"
+    );
+    for gate in [
+        "meta=fs_counts_summary(connected, listed, entries)",
+        "if connected && listed && fs_dir_count(entries) <= 0",
+        "if connected && listed",
+        "if listed && empty(entries)",
+        "if listed && !empty(entries)",
+    ] {
+        assert!(files.contains(gate), "ungated reading of the rows: {gate}");
+    }
+    let view = inlined(include_str!("ui/view.ice"));
+    assert!(
+        view.contains("listed=(fs_listed_path == fs_path)"),
+        "the mount has to compute it"
+    );
+}
+
 /// AND THE HEADER SUBTITLES ARE CLAIMS TOO — the subtler half. `Agents 0 agents ·
 /// 0 working` is a measured zero about a register nobody read, and it sits ABOVE
 /// the body arm above, so it survives it. Every subtitle fold takes `connected`
@@ -3929,7 +4039,7 @@ fn every_header_subtitle_is_gated_on_the_connection() {
             "members_summary(connected, validators, residents)",
             "agents_summary(connected, rows)",
             "members_summary(connected, members_validators, members_residents)",
-            "fs_counts_summary(connected, entries)",
+            "fs_counts_summary(connected, listed, entries)",
         ],
         "a header subtitle folds rows only a live node delivers: pass `connected` \
          first so it says nothing rather than a confident zero"
@@ -3965,7 +4075,7 @@ fn a_disconnected_console_reports_no_counts_at_all() {
         "0 open · 0 settled"
     );
     assert_eq!(
-        backend::fs_counts_summary(app.connected, app.fs_entries.clone()),
+        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
         "1 file · 0 dirs"
     );
 
@@ -3986,7 +4096,7 @@ fn a_disconnected_console_reports_no_counts_at_all() {
         ),
         (
             "Files",
-            backend::fs_counts_summary(app.connected, app.fs_entries.clone()),
+            backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
         ),
     ] {
         assert_eq!(

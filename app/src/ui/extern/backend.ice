@@ -126,7 +126,7 @@ extern crate::backend
   FsHistory(generation:i64, snapshots:[FsSnapshot])
   sync fs_dir_count(entries:[FsEntry]) -> i64
   sync fs_file_count(entries:[FsEntry]) -> i64
-  sync fs_counts_summary(connected:bool, entries:[FsEntry]) -> str
+  sync fs_counts_summary(connected:bool, listed:bool, entries:[FsEntry]) -> str
   sync fs_parent(path:str) -> str
   sync fs_child(path:str, name:str) -> str
   files_mkdir(rpc:str, path:str) -> bool ! AppError

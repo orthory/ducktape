@@ -302,6 +302,9 @@ view
           FilesScreen new_name<->fs_new_name draft<->fs_editor
             with
               path=fs_path
+              // Do the rows on hand describe the path in the crumb? Every
+              // reading of `entries` on that screen is gated on this.
+              listed=(fs_listed_path == fs_path)
               entries=fs_entries
               connected
               loading=fs_loading
