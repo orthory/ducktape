@@ -218,15 +218,19 @@ component FilesScreen(path:str, entries:[FsEntry], connected:bool, loading:bool,
                     pt=6.0
                     pb=6.0
                   text "No folders here." size=11.0 @text-hint
-              for entry in entries
-                if entry.kind == "dir"
-                  FsTreeRow
-                    with
-                      entry
-                      selected=false
-                      depth=0.0
-                    forward
-                      fs_open_dir
+              // The tree itself is the same reading. Its empty case stood down
+              // above and the listing beside it did not, so the sidebar kept
+              // drawing folders from a duckfs nobody could reach.
+              if connected
+                for entry in entries
+                  if entry.kind == "dir"
+                    FsTreeRow
+                      with
+                        entry
+                        selected=false
+                        depth=0.0
+                      forward
+                        fs_open_dir
       box
         with
           w=1.0
@@ -462,7 +466,7 @@ component FilesScreen(path:str, entries:[FsEntry], connected:bool, loading:bool,
                                   size=12.0
                                   font=code
                                   @text-fg
-      if !empty(preview_path)
+      if connected && !empty(preview_path)
         for entry in entries
           if entry.path == preview_path
             // `changed_by` / `changed_height` are fed the "not answered"
@@ -589,7 +593,7 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
       // The kind filter itself is client-side over hits already in
       // hand: a second round trip to narrow a list you are holding is
       // waste.
-      if !empty(kinds)
+      if connected && !empty(kinds)
         box w=fill max-w=860.0
           flex
             with
@@ -641,7 +645,7 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
       // is what the screen falls back to. A hit is a READING, not a
       // route: nothing here dispatches on `hit.target` yet, so the card
       // is not wrapped in a button that would go nowhere.
-      if !empty(hits)
+      if connected && !empty(hits)
         scroll
           with
             dir=vertical
@@ -656,11 +660,11 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
       // every kind — so the pane it opens says so instead of going
       // blank. The count is read back off the same strip the chip came
       // from; there is no second source to disagree with.
-      if !empty(hits)
+      if connected && !empty(hits)
         for kind_count in kinds
           if kind == kind_count.kind && kind_count.count <= 0
             EmptyPlate message="Nothing of that kind matched — the other chips still hold results."
-      if empty(hits) && !searching && !empty(trim(query))
+      if connected && empty(hits) && !searching && !empty(trim(query))
         EmptyPlate message="Nothing matched that query in this workspace."
       // NOT CONNECTED IS NOT EMPTY. `connected` already disables the query box
       // above; the ledger below it still asserted "No blocks yet" off a node
@@ -675,7 +679,9 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
           with
             title="No blocks yet"
             description="Non-empty blocks appear here as they finalize."
-      if empty(hits) && !empty(blocks)
+      // The ledger itself, which the plate above replaces rather than sits
+      // over: with the node down these are blocks from a chain nobody read.
+      if connected && empty(hits) && !empty(blocks)
         row
           with
             w=fill

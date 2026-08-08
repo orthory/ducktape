@@ -3647,6 +3647,94 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
     }
 }
 
+/// AND THE PLATE IS ONLY HALF OF IT — the arms BESIDE it must stand down too.
+/// The first cut gated each screen's empty-state claim and left its POPULATED
+/// arms open, so a screen rendered "Not connected" and the stale register
+/// underneath it at the same time: Approvals showed the plate above three vote
+/// cards with live Approve buttons, Members showed it beside a detail panel
+/// carrying Promote and Remove, and Explorer showed it under a strip of search
+/// hits nobody had run. No register is ever cleared on disconnect — they are
+/// only overwritten by a successful load — so `connected == false` is routinely
+/// reached with a full set of stale rows in hand.
+///
+/// The invariant, stated mechanically: a screen may touch a LIST-TYPED register
+/// prop only under a `connected` gate, or on a line that carries `connected`
+/// itself (a header subtitle folding rows through `members_summary(connected,
+/// rows)` is already honest).
+#[test]
+fn a_disconnected_screen_stands_its_registers_down_too() {
+    const EXEMPT: [&str; 1] = ["SettingsScreen"];
+
+    for source in [
+        include_str!("ui/screens/governance.ice"),
+        include_str!("ui/screens/roster.ice"),
+        include_str!("ui/screens/storage.ice"),
+        include_str!("ui/screens/forge.ice"),
+    ] {
+        for chunk in source.split("\ncomponent ").skip(1) {
+            let name = chunk.split('(').next().unwrap_or("").trim();
+            if !name.ends_with("Screen") || EXEMPT.contains(&name) {
+                continue;
+            }
+            // The registers are the list-typed params of the screen's own
+            // signature — the readings only a live node can deliver.
+            // AFTER the opening paren: splitting the whole head on `,` leaves
+            // the first param as `GovernanceScreen(rows`, whose name never
+            // matches a word in the body — which silently disarmed the check
+            // for every screen whose only register is its first param.
+            let signature = chunk
+                .split(')')
+                .next()
+                .unwrap_or("")
+                .split_once('(')
+                .map(|(_, params)| params)
+                .unwrap_or("");
+            let registers: Vec<&str> = signature
+                .split(',')
+                .filter(|param| param.contains(":["))
+                .filter_map(|param| param.split(':').next())
+                .map(|name| name.trim().trim_start_matches("bind "))
+                .filter(|name| !name.is_empty())
+                .collect();
+            assert!(!registers.is_empty(), "{name} has no register to guard");
+
+            // Walk the body tracking which `if` arms are open above each line;
+            // a line is covered when it, or any arm enclosing it, says
+            // `connected`.
+            let mut open: Vec<(usize, bool)> = Vec::new();
+            for line in chunk.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.is_empty() || trimmed.starts_with("//") {
+                    continue;
+                }
+                let indent = line.len() - trimmed.len();
+                open.retain(|(at, _)| *at < indent);
+                let says_connected = line.contains("connected");
+                if trimmed.starts_with("if ") {
+                    open.push((indent, says_connected));
+                }
+                let covered = says_connected || open.iter().any(|(_, gated)| *gated);
+                if covered {
+                    continue;
+                }
+                // Prose is not a register read: the Explorer's own subtitle
+                // says "read the blocks this node verified", and a screen may
+                // describe what it shows while showing nothing.
+                let code: String = trimmed.split('"').step_by(2).collect::<Vec<_>>().join(" ");
+                if let Some(register) = registers.iter().find(|reg| {
+                    code.split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .any(|word| word == **reg)
+                }) {
+                    panic!(
+                        "{name} touches `{register}` with no `connected` gate above it:\n  {trimmed}\n\
+                         a register nobody could read must not be drawn beside the \"Not connected\" plate"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// AND THE HEADER SUBTITLES ARE CLAIMS TOO — the subtler half. `Agents 0 agents ·
 /// 0 working` is a measured zero about a register nobody read, and it sits ABOVE
 /// the body arm above, so it survives it. Every subtitle fold takes `connected`

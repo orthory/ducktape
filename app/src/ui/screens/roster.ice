@@ -24,71 +24,76 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
       // All / Humans / Agents / Validators. `filter_members` owns the
       // predicate so the strip and the list can never disagree.
       col w=fill
-        box
-          with
-            w=fill
-            pl=22.0
-            pr=22.0
-            pt=12.0
-            pb=12.0
-          row
+        // EVERY CHIP CARRIES A COUNT, and a count is a reading. With the node
+        // down these fold a roster nobody fetched, so the strip stands down
+        // with the list it filters rather than offering `All 2` over a plate
+        // that says the network is unreachable.
+        if connected
+          box
             with
               w=fill
-              gap=7.0
-              align=center
-            button -> emit(pick_members_filter, "all")
+              pl=22.0
+              pr=22.0
+              pt=12.0
+              pb=12.0
+            row
               with
-                label="Show every member"
-                p=0.0
-                @ghost_action
-              FilterChip
+                w=fill
+                gap=7.0
+                align=center
+              button -> emit(pick_members_filter, "all")
                 with
-                  label="All"
-                  count=len(rows)
-                  selected=(filter == "all")
-              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-              hovered bg=row_hover text=fg
-              pressed bg=elevated text=fg
-            button -> emit(pick_members_filter, "humans")
-              with
-                label="Show people only"
-                p=0.0
-                @ghost_action
-              FilterChip
+                  label="Show every member"
+                  p=0.0
+                  @ghost_action
+                FilterChip
+                  with
+                    label="All"
+                    count=len(rows)
+                    selected=(filter == "all")
+                active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                hovered bg=row_hover text=fg
+                pressed bg=elevated text=fg
+              button -> emit(pick_members_filter, "humans")
                 with
-                  label="Humans"
-                  count=len(filter_members(rows, "humans"))
-                  selected=(filter == "humans")
-              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-              hovered bg=row_hover text=fg
-              pressed bg=elevated text=fg
-            button -> emit(pick_members_filter, "agents")
-              with
-                label="Show agents only"
-                p=0.0
-                @ghost_action
-              FilterChip
+                  label="Show people only"
+                  p=0.0
+                  @ghost_action
+                FilterChip
+                  with
+                    label="Humans"
+                    count=len(filter_members(rows, "humans"))
+                    selected=(filter == "humans")
+                active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                hovered bg=row_hover text=fg
+                pressed bg=elevated text=fg
+              button -> emit(pick_members_filter, "agents")
                 with
-                  label="Agents"
-                  count=len(filter_members(rows, "agents"))
-                  selected=(filter == "agents")
-              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-              hovered bg=row_hover text=fg
-              pressed bg=elevated text=fg
-            button -> emit(pick_members_filter, "validators")
-              with
-                label="Show validators only"
-                p=0.0
-                @ghost_action
-              FilterChip
+                  label="Show agents only"
+                  p=0.0
+                  @ghost_action
+                FilterChip
+                  with
+                    label="Agents"
+                    count=len(filter_members(rows, "agents"))
+                    selected=(filter == "agents")
+                active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                hovered bg=row_hover text=fg
+                pressed bg=elevated text=fg
+              button -> emit(pick_members_filter, "validators")
                 with
-                  label="Validators"
-                  count=len(filter_members(rows, "validators"))
-                  selected=(filter == "validators")
-              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-              hovered bg=row_hover text=fg
-              pressed bg=elevated text=fg
-            space w=fill
+                  label="Show validators only"
+                  p=0.0
+                  @ghost_action
+                FilterChip
+                  with
+                    label="Validators"
+                    count=len(filter_members(rows, "validators"))
+                    selected=(filter == "validators")
+                active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                hovered bg=row_hover text=fg
+                pressed bg=elevated text=fg
+              space w=fill
         box
           with
             w=fill
@@ -159,7 +164,7 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
                     active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
                     hovered bg=row_hover text=fg
                     pressed bg=elevated text=fg
-    if !empty(selected)
+    if connected && !empty(selected)
       for member in rows
         if member.key == selected
           MemberDetail member=member admin=admin

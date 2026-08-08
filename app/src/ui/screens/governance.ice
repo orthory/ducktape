@@ -16,7 +16,7 @@ component GovernanceScreen(rows:[ProposalRow], voting:str, admin:bool, connected
       // The chip counts what is WAITING. Finalized rows have their own
       // section below and are never folded into this number.
       row gap=0.0
-        if open_proposals(rows) > 0
+        if connected && open_proposals(rows) > 0
           CountChip label=pending_label(rows)
     scroll
       with
@@ -56,7 +56,7 @@ component GovernanceScreen(rows:[ProposalRow], voting:str, admin:bool, connected
           EmptyPlate message="No proposals yet — a membership or configuration change opens the first one."
         if connected && open_proposals(rows) <= 0 && !empty(rows) && answered
           EmptyPlate message="No proposals waiting — every decision on this network is finalized."
-        if open_proposals(rows) > 0
+        if connected && open_proposals(rows) > 0
           col w=fill gap=12.0
             for proposal in rows
               if proposal.open
@@ -66,7 +66,7 @@ component GovernanceScreen(rows:[ProposalRow], voting:str, admin:bool, connected
                     gov_execute
         // The FINALIZED eyebrow is gated on the settled subset, never on the
         // combined register — otherwise it hangs over nothing.
-        if !empty(settled_proposals(rows))
+        if connected && !empty(settled_proposals(rows))
           col w=fill gap=10.0
             GroupLabel label="RECENTLY FINALIZED"
             for proposal in settled_proposals(rows)
