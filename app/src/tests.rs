@@ -2119,7 +2119,16 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(bar.contains("NetworkChip name=network"));
     assert!(!bar.contains("phase"));
     assert!(shell.contains("component ConnectionBanner(status:str)"));
-    assert!(shell.contains("if degraded\n          ConnectionBanner status=status"));
+    // The degradation band rides in the CONTENT column, below the rail row —
+    // mounted above it, it pushed the whole nav rail down by its own height
+    // whenever the connection wobbled, so a click at a remembered rail position
+    // landed one item off. Pin the order, not the indent.
+    let tabs = shell.split_once("component WorkspaceTabs(").unwrap().1;
+    let rail_at = tabs.find("NavRail #rail").expect("the rail mounts here");
+    let banner_at = tabs
+        .find("ConnectionBanner status=status")
+        .expect("the band mounts here");
+    assert!(banner_at > rail_at, "the band must not sit above the rail");
     assert!(shell.contains("box #root w=74.0 h=fill pt=13.0 pb=10.0 bg=rail"));
     // The status tooltip ALWAYS overflows the window's right edge, and iced
     // snaps an overflowing tip hard against it. The paper therefore belongs to

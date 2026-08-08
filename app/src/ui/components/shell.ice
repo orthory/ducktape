@@ -520,6 +520,9 @@ component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_ba
 // an ALERT row in the bell. Neither carries the node's own words yet, so the
 // band stays — restyled onto the alert family so it reads as one severity
 // vocabulary with the dot above it rather than as a second red language.
+// It is mounted INSIDE the content column, beside the error notice: above the
+// panes it would displace the nav rail every time the connection wobbled, and a
+// rail that moves under the pointer sends a remembered click to the wrong screen.
 component ConnectionBanner(status:str)
   box #root
     with
@@ -868,8 +871,6 @@ component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degra
           forward
             toggle_bell
             switch_network
-        if degraded
-          ConnectionBanner status=status
         row w=fill h=fill
           NavRail #rail
             with
@@ -892,6 +893,8 @@ component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degra
               bg=bg
               clip=true
             col w=fill h=fill
+              if degraded
+                ConnectionBanner status=status
               slot notice
               match tab
                 "chat"
