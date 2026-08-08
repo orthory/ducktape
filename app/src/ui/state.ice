@@ -170,7 +170,12 @@ state
   forge_generation:i64 = 0
   settings_endpoint = ""
   settings_node_key = ""
-  settings_height:i64 = 0
+  // -1, NOT 0 — `height_label` renders a negative as `h —` and that is what an
+  // UNREAD height is. At 0 the Settings row printed `h 0` for a chain at
+  // ~398,000 while every string reading beside it (node key, data directory)
+  // sat correctly blank at its own default. A measured zero is a claim; this
+  // field has to be able to say it has no reading.
+  settings_height:i64 = -1
   settings_data_dir = ""
   settings_key_path = ""
   settings_key_state = ""
