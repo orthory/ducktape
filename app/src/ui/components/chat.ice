@@ -881,6 +881,125 @@ component ChatSearchResult(hit:ChatSearchHit)
     hovered bg=fg/6 text=fg border=fg/9
     pressed bg=fg/10 text=fg border=fg/13
 
+// THE FORMAT SEAT — one row, mounted by BOTH chat composers. The marks are the
+// renderer's own grammar, so a button inserts exactly what typing the fence
+// would; the same table the Cmd/Ctrl chords carry.
+//
+// It is a component because the thread rail had NO toolbar: a reply could be
+// formatted only by someone who already knew the chord, and a second authored
+// copy of the row is a second thing to drift.
+//
+// The event is `mark`, not `composer_mark`: the two mounts route it to
+// DIFFERENT editors through an `events` block, which a same-name `forward`
+// cannot express.
+//
+// The root is a bare `row` at INTRINSIC width (~115px) — no `w=fill`. The
+// caller owns the seat's `space w=fill` and its Send, so the 330px rail's
+// `clip=true` has nothing to slice.
+component ComposerMarks(disabled:bool)
+  emits
+    mark(str)
+  row #root
+    with
+      gap=2.0
+      align=center
+    button -> emit(mark, "bold")
+      with
+        label="Bold"
+        disabled=disabled
+        w=26.0
+        h=24.0
+        p=0.0
+        @ghost_action
+      box
+        with
+          w=fill
+          h=fill
+          align-x=center
+          align-y=center
+        text "B"
+          with
+            size=12.5
+            wrap=none
+            font=strong
+            @text-muted
+      active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+      hovered bg=fg/8 text=fg
+      pressed bg=fg/12 text=fg
+    button -> emit(mark, "italic")
+      with
+        label="Italic"
+        disabled=disabled
+        w=26.0
+        h=24.0
+        p=0.0
+        @ghost_action
+      box
+        with
+          w=fill
+          h=fill
+          align-x=center
+          align-y=center
+        text "I"
+          with
+            size=12.5
+            wrap=none
+            font=italic
+            @text-muted
+      active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+      hovered bg=fg/8 text=fg
+      pressed bg=fg/12 text=fg
+    box
+      with
+        w=1.0
+        h=14.0
+        bg=separator
+      space w=1.0 h=1.0
+    button -> emit(mark, "code")
+      with
+        label="Code block"
+        disabled=disabled
+        w=26.0
+        h=24.0
+        p=0.0
+        @ghost_action
+      box
+        with
+          w=fill
+          h=fill
+          align-x=center
+          align-y=center
+        Icon
+          with
+            name="code-brackets"
+            tone="muted"
+            px=13.0
+      active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+      hovered bg=fg/8 text=fg
+      pressed bg=fg/12 text=fg
+    button -> emit(mark, "quote")
+      with
+        label="Quote"
+        disabled=disabled
+        w=26.0
+        h=24.0
+        p=0.0
+        @ghost_action
+      box
+        with
+          w=fill
+          h=fill
+          align-x=center
+          align-y=center
+        Icon
+          with
+            name="quote"
+            tone="muted"
+            px=13.0
+      active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+      hovered bg=fg/8 text=fg
+      pressed bg=fg/12 text=fg
+
 // THE REFUSED COMPOSER. `post_gate` names the refusal; this turns the token
 // into the sentence, and every sentence names the move that clears it. An
 // empty reason renders nothing at all — the composer itself is the else arm.

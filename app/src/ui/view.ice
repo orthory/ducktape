@@ -238,6 +238,7 @@ view
               restore_failed_reply -> restore_failed_reply
               dismiss_failed_reply -> dismiss_failed_reply
               reply_composer_event -> reply_composer_event _
+              reply_composer_mark -> reply_composer_mark _
               chat_resized -> chat_resized _ _
               thread_resized -> thread_resized _ _
 

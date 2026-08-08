@@ -68,6 +68,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
     restore_failed_reply()
     dismiss_failed_reply()
     reply_composer_event(ComposerEvent)
+    reply_composer_mark(str)
     chat_resized(f64, f64)
     thread_resized(f64, f64)
   row w=fill h=fill
@@ -1057,8 +1058,9 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               col w=fill
                 extern rich_composer(message_editor, "Message the channel…", (loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key))), shift_held, 44.0, 150.0, 10.0) #message -> emit(composer_event, _)
                 // The Slack seat: format controls on the left, send on the
-                // right, one row under the input. The marks are the renderer's
-                // own grammar — the buttons insert what typing the fence would.
+                // right, one row under the input. `ComposerMarks` is the SAME
+                // row the rail's composer mounts — it moved into a component
+                // the day the rail stopped going without one.
                 box
                   with
                     w=fill
@@ -1070,102 +1072,11 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       w=fill
                       gap=2.0
                       align=center
-                    button -> emit(composer_mark, "bold")
+                    ComposerMarks
                       with
-                        label="Bold"
                         disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)))
-                        w=26.0
-                        h=24.0
-                        p=0.0
-                        @ghost_action
-                      box
-                        with
-                          w=fill
-                          h=fill
-                          align-x=center
-                          align-y=center
-                        text "B"
-                          with
-                            size=12.5
-                            wrap=none
-                            font=strong
-                            @text-muted
-                      active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-                      hovered bg=fg/8 text=fg
-                      pressed bg=fg/12 text=fg
-                    button -> emit(composer_mark, "italic")
-                      with
-                        label="Italic"
-                        disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)))
-                        w=26.0
-                        h=24.0
-                        p=0.0
-                        @ghost_action
-                      box
-                        with
-                          w=fill
-                          h=fill
-                          align-x=center
-                          align-y=center
-                        text "I"
-                          with
-                            size=12.5
-                            wrap=none
-                            font=italic
-                            @text-muted
-                      active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-                      hovered bg=fg/8 text=fg
-                      pressed bg=fg/12 text=fg
-                    box
-                      with
-                        w=1.0
-                        h=14.0
-                        bg=separator
-                      space w=1.0 h=1.0
-                    button -> emit(composer_mark, "code")
-                      with
-                        label="Code block"
-                        disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)))
-                        w=26.0
-                        h=24.0
-                        p=0.0
-                        @ghost_action
-                      box
-                        with
-                          w=fill
-                          h=fill
-                          align-x=center
-                          align-y=center
-                        Icon
-                          with
-                            name="code-brackets"
-                            tone="muted"
-                            px=13.0
-                      active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-                      hovered bg=fg/8 text=fg
-                      pressed bg=fg/12 text=fg
-                    button -> emit(composer_mark, "quote")
-                      with
-                        label="Quote"
-                        disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)))
-                        w=26.0
-                        h=24.0
-                        p=0.0
-                        @ghost_action
-                      box
-                        with
-                          w=fill
-                          h=fill
-                          align-x=center
-                          align-y=center
-                        Icon
-                          with
-                            name="quote"
-                            tone="muted"
-                            px=13.0
-                      active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-                      hovered bg=fg/8 text=fg
-                      pressed bg=fg/12 text=fg
+                      events
+                        mark -> emit(composer_mark, _)
                     space w=fill
                     text "↵ send · ⇧↵ newline"
                       with
@@ -1615,9 +1526,15 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           hovered bg=fg/10 text=fg
                           pressed bg=fg/15
                   // The stream's composer plate, in the rail's width: same
-                  // surface/control_line/r12 chrome and the same seat row —
-                  // hint left of Send — minus the format buttons, which the
-                  // 330px plate has no room to teach twice.
+                  // surface/control_line/r12 chrome, the same `ComposerMarks`
+                  // row, the same Send.
+                  //
+                  // WHAT THE 330px BUYS THE MARKS WITH is the `↵ send · ⇧↵
+                  // newline` hint, not the buttons: 282px of seat cannot hold
+                  // marks (~115) + hint (~120) + Send (~54) at once. The hint
+                  // is a LABEL for behaviour both composers already share, and
+                  // the stream's plate is on screen beside the rail saying it;
+                  // the marks are the only visible door to formatting a reply.
                   //
                   // And the same REFUSAL, which it used to skip: editor and Send
                   // carry the stream's `!connected || !empty(post_gate(…))` terms
@@ -1658,14 +1575,12 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               w=fill
                               gap=2.0
                               align=center
-                            space w=fill
-                            text "↵ send · ⇧↵ newline"
+                            ComposerMarks
                               with
-                                size=10.5
-                                wrap=none
-                                font=code_medium
-                                @text-label
-                            space w=8.0
+                                disabled=(thread_loading || !connected || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)))
+                              events
+                                mark -> emit(reply_composer_mark, _)
+                            space w=fill
                             button "Send" -> emit(reply_composer_event, composer_submit_event())
                               with
                                 label="Send reply"
