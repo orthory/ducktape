@@ -188,7 +188,6 @@ state
   // ~398,000 while every string reading beside it (node key, data directory)
   // sat correctly blank at its own default. A measured zero is a claim; this
   // field has to be able to say it has no reading.
-  settings_height:i64 = -1
   settings_data_dir = ""
   settings_key_path = ""
   settings_key_state = ""
@@ -352,6 +351,10 @@ state
   // absent reading must print `—`, never a measured `0`.
   node_last_finalized:i64 = 0
   node_checkpoint:i64 = 0
+  // The head AS THE FACTS DOCUMENT SAW IT — the only height the Settings
+  // screen shows, so its network card and its node tile can never disagree and
+  // a checkpoint can never outrun the head it is printed beside.
+  node_height:i64 = -1
   node_tab = "overview"
   status_card_open = false
   // ROSTER — members and agents share one screen, so they share one filter.

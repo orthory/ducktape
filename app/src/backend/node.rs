@@ -7,7 +7,6 @@ pub struct SettingsFacts {
     pub generation: i64,
     pub endpoint: String,
     pub node_key: String,
-    pub height: i64,
     pub key_path: String,
     pub key_state: String,
     /// this workspace's directory on this device — the NETWORK card's Data dir.
@@ -52,7 +51,6 @@ pub async fn load_settings_facts(
             generation,
             endpoint: rpc,
             node_key: short_label(&status.public_key),
-            height: i64::try_from(status.height).unwrap_or(i64::MAX),
             key_path,
             key_state,
             data_dir,
@@ -236,6 +234,14 @@ pub struct NodeFacts {
     /// rather than a plain `0`, which both renderers already print as `—`.
     pub last_finalized_at: i64,
     pub checkpoint_height: i64,
+    /// The chain head AS THIS DOCUMENT SAW IT. The Settings screen used to put
+    /// three heights on one page from three different `/v1/status` calls — the
+    /// network card's, the live register's and this document's checkpoint — and
+    /// a checkpoint sampled later than the head it is compared against renders
+    /// as CHECKPOINT h 422,563 above HEIGHT h 422,553, which the node itself
+    /// can never be in (measured on one sample: checkpoint 118 BEHIND head).
+    /// One card, one sample.
+    pub height: i64,
     pub peers_live: i64,
     pub peers_total: i64,
 }
@@ -264,6 +270,7 @@ pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, 
             checkpoint_height: operations["storage"]["checkpoint_height"]
                 .as_i64()
                 .unwrap_or(UNMEASURED),
+            height: status["height"].as_i64().unwrap_or(UNMEASURED),
             peers_live: count_i64(
                 peers
                     .iter()

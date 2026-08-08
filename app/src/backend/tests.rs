@@ -1224,8 +1224,37 @@ fn an_unread_block_height_is_not_reported_as_zero() {
     // The state default is what Settings shows before any node fact lands.
     const STATE: &str = include_str!("../ui/state.ice");
     assert!(
-        STATE.contains("settings_height:i64 = -1"),
+        STATE.contains("node_height:i64 = -1"),
         "an unread height must default to the sentinel, not to a measured zero"
+    );
+
+    // AND THE SCREEN SHOWS EXACTLY ONE OF THEM. It used to carry three heights
+    // from three separate `/v1/status` calls — the network card's own
+    // `settings_height`, the live `block_height` register on the node tile, and
+    // the checkpoint from a third document. Two disagreed by thousands of
+    // blocks under one word, and the third let the tile print a CHECKPOINT
+    // higher than the HEIGHT beside it, which the node can never be in.
+    assert!(
+        !STATE.contains("settings_height"),
+        "a second height register is the defect, not a feature"
+    );
+    // Scoped to the component BODY, not the file: the header comment above it
+    // names `block_height` while explaining why the screen no longer reads it,
+    // and a whole-file negative would flag that prose as the defect it
+    // describes.
+    const SETTINGS: &str = include_str!("../ui/screens/settings.ice");
+    let screen = SETTINGS
+        .split_once("component SettingsScreen(")
+        .expect("the screen")
+        .1;
+    assert!(
+        !screen.contains("block_height"),
+        "the live head belongs to the titlebar; this screen reads the facts document"
+    );
+    assert_eq!(
+        screen.matches("node_height").count(),
+        3,
+        "one prop, and the two rows that read it"
     );
 }
 

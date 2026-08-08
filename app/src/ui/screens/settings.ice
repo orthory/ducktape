@@ -7,9 +7,15 @@
 // The `settings_*` / `node_*` / `account_*` / `members_*` prefixes are KEPT.
 // They are not redundant with the screen name — this one surface carries four
 // fact families, and the prefix is what says which loader a reading came from.
-// `settings_height` (the facts reading) and `block_height` (the live head) are
-// two different numbers and would collide as one word.
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_height:i64, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], block_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
+// THIS SCREEN SHOWS ONE HEIGHT, AND IT IS `node_height` — the head as the FACTS
+// document saw it, the same document the checkpoint beside it comes from. It
+// used to show two, from two different `/v1/status` calls: the network card's
+// own `settings_height` and the live `block_height` register, which disagreed
+// by thousands of blocks under one word. And because the checkpoint was
+// sampled by a THIRD call, the node tile could print CHECKPOINT h 422,563
+// above HEIGHT h 422,553 — an order the node itself can never be in. The
+// titlebar keeps `block_height`: that seat's job IS the live head.
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
   emits
     select_shell_tab(str)
     reconnect()
@@ -73,7 +79,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
               KeyValueRow
                 with
                   label="Block height"
-                  value=height_label(settings_height)
+                  value=height_label(node_height)
                   last=false
               KeyValueRow
                 with
@@ -663,7 +669,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                 StatCard
                   with
                     label="HEIGHT"
-                    value=height_label_short(block_height)
+                    value=height_label_short(node_height)
                     note=""
                 StatCard
                   with

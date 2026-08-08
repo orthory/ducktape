@@ -452,7 +452,7 @@ test settings_keyboard_scroll_contract
             connected_rpc
             settings_endpoint
             settings_node_key
-            settings_height
+            node_height
             settings_data_dir
             settings_key_state
             settings_key_path
@@ -472,7 +472,6 @@ test settings_keyboard_scroll_contract
             mutation_phase
             node_tab
             module_rows
-            block_height
             node_checkpoint
             node_last_finalized
             node_reachable_label
