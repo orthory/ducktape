@@ -1111,7 +1111,17 @@ pub async fn search_pages(
         // The titles live one view over, in the same index — this is the very
         // call the pages sidebar makes. Paid once per search that matched
         // something, never on the empty keystrokes that dominate the palette.
-        let index = load_page_index(&rpc).await?;
+        //
+        // A LABEL IS DECORATION AND MUST NEVER DESTROY THE PAYLOAD. Taking `?`
+        // here turned a search the node had already ANSWERED into an `Err`, and
+        // both readers throw those away without a word: the Explorer's
+        // `if let Ok(pages)` (backend/search.rs) drops every page hit from a
+        // workspace search, and the palette keeps whichever leg survived. So one
+        // failed `ListPages` — a second round trip, on a paged view, after the
+        // search already returned — silently emptied page results that existed.
+        // An index we could not read leaves every hit on the "Untitled"
+        // fallback `titled_page_hits` already takes for an unknown page id.
+        let index = load_page_index(&rpc).await.unwrap_or_default();
         Ok(PageSearchData {
             generation,
             hits: titled_page_hits(hits, index),
