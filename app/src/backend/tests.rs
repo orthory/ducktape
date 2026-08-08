@@ -2633,3 +2633,90 @@ fn a_refused_key_password_reaches_the_screen_as_a_sentence() {
     // A module's own sentence still flows through untouched.
     assert_eq!(user_error("post is empty".into()), "post is empty");
 }
+
+/// A PAGE HIT NAMES ITS PAGE, AND SAYS EACH THING ONCE. The index's hit row
+/// carries a `page_id` and no title, so nothing downstream could name the page
+/// a match came from: the Explorer set BOTH its row title and its snippet to
+/// `hit.text` — the same sentence printed twice — and its only metadata was
+/// the block kind (`pages · Text`), which is true of nearly every hit. The
+/// palette printed that bare kind too, and the pages search panel printed the
+/// raw `block_id`.
+///
+/// The title is now joined in at the producer, so all three surfaces agree —
+/// the shape #997 used for the chat hit's room.
+#[test]
+fn a_page_search_hit_names_the_page_it_came_from() {
+    let row = |page_id: &str, text: &str| pages::index::PageBlockRow {
+        block_id: format!("block-{text}"),
+        page_id: page_id.into(),
+        parent: Some(page_id.into()),
+        kind: BlockKind::Paragraph,
+        text: text.into(),
+        children: Vec::new(),
+        height: 1,
+        time: 1,
+    };
+    let page = |id: &str, title: &str| PageRow {
+        id: id.into(),
+        title: title.into(),
+        parent: None,
+    };
+
+    let hits = titled_page_hits(
+        vec![
+            row("page-1", "Tail paragraph after the list"),
+            row("page-2", "second mention"),
+            // A page the index does not carry, and one with no title at all.
+            row("page-gone", "orphan mention"),
+            row("page-3", "untitled mention"),
+        ],
+        vec![
+            page("page-1", "Design QA"),
+            page("page-2", "Team Runbook"),
+            page("page-3", ""),
+        ],
+    );
+
+    assert_eq!(hits[0].page_title, "Design QA");
+    assert_eq!(hits[1].page_title, "Team Runbook");
+    // The sidebar calls a titleless page "Untitled"; a hit must not read
+    // differently, and a missing page must not read blank.
+    assert_eq!(hits[2].page_title, "Untitled");
+    assert_eq!(hits[3].page_title, "Untitled");
+    // The join must not disturb what the row already carried.
+    assert_eq!(hits[0].text, "Tail paragraph after the list");
+    assert_eq!(hits[0].page_id, "page-1");
+    assert_eq!(hits[0].kind, "Text");
+
+    // THE CALL SITES. A pure join proves nothing about what the surfaces
+    // render, and the Explorer's double print lived at ITS call site.
+    const SEARCH: &str = include_str!("search.rs");
+    let page_arm = SEARCH
+        .split("kind: \"page\".into(),")
+        .nth(1)
+        .expect("the page hit arm")
+        .split("}));")
+        .next()
+        .expect("arm body");
+    assert!(
+        page_arm.contains("title: hit.page_title,") && page_arm.contains("snippet: hit.text,"),
+        "the Explorer heads a page hit with its page and keeps the block text as the snippet"
+    );
+    assert!(
+        !page_arm.contains("title: hit.text"),
+        "titling the row with the block text is what printed the same sentence twice"
+    );
+
+    // The palette and the pages search panel render the same hit type; #997's
+    // lesson is that a fix at one surface leaves the siblings broken.
+    const PALETTE: &str = include_str!("../ui/screens/overlays.ice");
+    const PANEL: &str = include_str!("../ui/components/pages.ice");
+    assert!(
+        PALETTE.contains("text hit.page_title"),
+        "the palette's page hit names its page"
+    );
+    assert!(
+        PANEL.contains("text hit.page_title") && !PANEL.contains("text hit.block_id"),
+        "the pages search panel names the page instead of printing a raw block id"
+    );
+}

@@ -853,7 +853,7 @@ pub(crate) async fn load_page_blocks(
     }
 }
 
-async fn load_page_index(rpc: &RpcClient) -> Result<Vec<PageRow>, String> {
+pub(crate) async fn load_page_index(rpc: &RpcClient) -> Result<Vec<PageRow>, String> {
     let mut pages = Vec::new();
     let mut after: Option<String> = None;
     loop {

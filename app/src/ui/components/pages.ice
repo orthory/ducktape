@@ -94,13 +94,17 @@ component PageSearchResult(hit:PageSearchHit)
           w=fill
           gap=7.0
           align=center
-        text hit.kind
+        // THE PAGE, THEN THE BLOCK KIND. The left slot named the kind and the
+        // right slot printed the raw `block_id` — an opaque `block-1786…` that
+        // says nothing to a reader — while the one fact a hit needs, the page
+        // it was found in, went unsaid.
+        text hit.page_title
           with
             w=fill
             size=10.5
             font=code_medium
             @text-muted
-        text hit.block_id
+        text hit.kind
           with
             size=12.0
             wrap=none
