@@ -4216,12 +4216,14 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
         "no tally for a directory nobody has answered for"
     );
 
-    // The answer lands and the two agree again.
+    // The answer lands and the two agree again. The directory is empty, so the
+    // tally stays silent — the pane's own plate says "Empty directory" in
+    // words, and a subtitle of nothing but zeros repeats it in digits.
     let _ = app.__update(listing(app.fs_generation, "/shared/reports", Vec::new()));
     assert_eq!(app.fs_listed_path, app.fs_path);
     assert_eq!(
         backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
-        "0 files · 0 dirs"
+        ""
     );
 
     // A same-path refresh — what a write kicks off — must NOT blank the pane:
@@ -4232,6 +4234,11 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
         vec![entry("/shared/reports/q3.md", "file")],
     ));
     assert_eq!(app.fs_listed_path, app.fs_path, "a refresh never disagrees");
+    assert_eq!(
+        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+        "1 file · 0 dirs",
+        "and it speaks again as soon as there is something to count"
+    );
 
     // And the screen actually gates on it, at every reading of the rows.
     let storage = inlined(include_str!("ui/screens/storage.ice"));
@@ -4315,16 +4322,21 @@ fn a_disconnected_console_reports_no_counts_at_all() {
         "1 validator · 0 residents"
     );
     assert_eq!(
+        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+        "1 file · 0 dirs"
+    );
+    // The two registers this boot leaves EMPTY are silent while connected too —
+    // an all-zero subtitle repeats, in digits, the plate that already said
+    // "No agents registered" / "No proposals yet". `a_subtitle_that_is_all_zeros_
+    // says_nothing_at_all` (backend/tests.rs) is where the speaking case is
+    // proved with real rows; here they are empty on purpose.
+    assert_eq!(
         backend::agents_summary(app.connected, app.agents_rows.clone()),
-        "0 agents · 0 working"
+        ""
     );
     assert_eq!(
         backend::proposals_summary(app.connected, app.gov_rows.clone()),
-        "0 open · 0 settled"
-    );
-    assert_eq!(
-        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
-        "1 file · 0 dirs"
+        ""
     );
 
     // The node goes down. Everything above was a reading; none of it is one now.

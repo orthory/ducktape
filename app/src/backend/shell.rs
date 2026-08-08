@@ -28,9 +28,19 @@ pub fn plural(count: i64, one: String, many: String) -> String {
 /// same trade `count_label` (backend/document.rs) and `member_tier`
 /// (backend/roster.rs) already make: silence over a confident zero.
 ///
+/// AND AN ALL-ZERO PAIR IS THE SAME NOISE ONE STEP LATER. Every one of these
+/// screens plates the empty case in words — "No proposals yet…", "No agents
+/// registered…", "No members here yet…", "Empty directory…" — so a subtitle
+/// reading `0 open · 0 settled` over the top of it says the same nothing twice,
+/// in digits. #996 settled the rule for the bell and the member count: gate the
+/// digit AND its word together. These four were the sites it did not reach.
+/// A zero that sits BESIDE a real reading stays — `1 agent · 0 working` is the
+/// sentence doing its job.
+///
 /// `3 validators · 2 residents` — the machine subtitle beside the Members title.
 pub fn members_summary(connected: bool, validators: i64, residents: i64) -> String {
-    if !connected {
+    let roster_is_empty = validators <= 0 && residents <= 0;
+    if !connected || roster_is_empty {
         return String::new();
     }
     let left = plural(validators, "validator".into(), "validators".into());
@@ -42,7 +52,7 @@ pub fn members_summary(connected: bool, validators: i64, residents: i64) -> Stri
 /// runs in flight, not `AgentStatus::Active`: Active is the registration
 /// default and would report every registered agent as busy forever.
 pub fn agents_summary(connected: bool, rows: Vec<AgentRow>) -> String {
-    if !connected {
+    if !connected || rows.is_empty() {
         return String::new();
     }
     let working = rows.iter().filter(|row| row.live).count();
@@ -52,7 +62,7 @@ pub fn agents_summary(connected: bool, rows: Vec<AgentRow>) -> String {
 
 /// `12 open · 3 settled` — the Approvals title's machine subtitle.
 pub fn proposals_summary(connected: bool, rows: Vec<ProposalRow>) -> String {
-    if !connected {
+    if !connected || rows.is_empty() {
         return String::new();
     }
     let open = rows.iter().filter(|row| row.open).count();
