@@ -121,8 +121,6 @@ state
   gov_answered = false
   forge_answered = false
   members_rows:[MemberRow] = []
-  members_validators:i64 = 0
-  members_residents:i64 = 0
   members_generation:i64 = 0
   gov_rows:[ProposalRow] = []
   gov_generation:i64 = 0

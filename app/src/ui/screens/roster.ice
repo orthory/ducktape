@@ -7,7 +7,7 @@
 // That is the whole contract; the bodies below are the ones that used to sit
 // inline in the view's `members:` and `agents:` slots, unchanged.
 
-component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:str, selected:str, admin:bool, connected:bool, answered:bool)
+component MembersScreen(rows:[MemberRow], filter:str, selected:str, admin:bool, connected:bool, answered:bool)
   emits
     pick_members_filter(str)
     open_member(str)
@@ -16,7 +16,10 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
     gov_propose(str, str)
   row w=fill h=fill
     col w=fill h=fill
-      ScreenHeader title="Members" meta=members_summary(connected, validators, residents)
+      // THE SUBTITLE FOLDS `rows`, not the valset queries — same list, same
+      // split as the Humans / Agents chips below it, so the header and the
+      // strip can never disagree about what is on this screen.
+      ScreenHeader title="Members" meta=members_summary(connected, rows)
         // NO INVITE BUTTON YET. `mint_invite` exists in the backend, but nothing
         // routes the mint itself, so the button would open a modal with no act
         // in it.

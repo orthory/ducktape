@@ -459,8 +459,6 @@ test settings_keyboard_scroll_contract
             settings_open_tabs
             members_rows
             members_answered
-            members_validators
-            members_residents
             account_id
             account_renaming
             account_bound
