@@ -1324,7 +1324,10 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         align=center
                       Eyebrow label="MEMBERS" note=""
                       space w=fill
-                      text len(channel_members)
+                      // Blank at zero, like every other count in this app —
+                      // the plate under this eyebrow already says "No members
+                      // added", so a `0` beside it repeats it in digits.
+                      text count_label(len(channel_members))
                         with
                           size=10.5
                           wrap=none
