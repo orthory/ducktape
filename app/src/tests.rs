@@ -3059,10 +3059,7 @@ fn the_identity_card_counts_only_a_bound_account() {
 
     // And view.ice actually passes it, or the screen renders a default.
     let view = inlined(include_str!("ui/view.ice"));
-    assert!(
-        view.contains("account_bound"),
-        "the mount has to supply it"
-    );
+    assert!(view.contains("account_bound"), "the mount has to supply it");
 }
 
 /// A ZERO IS A CLAIM, AND THIS APP SAYS IT WITH BLANK. `count_label` returns
