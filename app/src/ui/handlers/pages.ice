@@ -27,6 +27,8 @@ on open_page_search_hit(page_id, _block_id)
   return if loading || mutation_phase != "idle"
   palette_open = false
   shell_tab = "pages"
+  // Same tab-move rule as `select_shell_tab`.
+  composer_focus = "none"
   page_search_generation = page_search_generation + 1
   page_searching = false
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
@@ -118,6 +120,9 @@ on create_page_submit
 on toggle_page_create
   page_create_open = !page_create_open
   return if !page_create_open
+  // Same rule as chat's menus: a `task widget focus` is the app moving the
+  // caret by hand, so the chat composers' claim on it dies here.
+  composer_focus = "none"
   task widget focus #workspace-tabs/content/pages/new-page
 
 on arm_page_delete

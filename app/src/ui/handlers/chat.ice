@@ -55,6 +55,8 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   reply_draft = ""
   reply_editor = editor("")
   pending_reply = ""
+  // Both composers are rebuilt under the caret and the tab moved besides.
+  composer_focus = "none"
   error = ""
   run load_chat_hit(connected_rpc, channel_id, root_seq, target_seq) -> chat_hit_loaded _ | failed _
 
@@ -103,6 +105,8 @@ on choose_channel(id)
   reply_draft = ""
   reply_editor = editor("")
   pending_reply = ""
+  // A new room's composer is a new box: the caret does not come with it.
+  composer_focus = "none"
   error = ""
   run load_chat(connected_rpc, active_channel) -> chat_updated _ | failed _
 
@@ -142,6 +146,8 @@ on choose_dm(peer_key)
   reply_draft = ""
   reply_editor = editor("")
   pending_reply = ""
+  // Same new box as `choose_channel`.
+  composer_focus = "none"
   error = ""
   // Reads the peer back from state: `active_dm_peer = peer_key` above already
   // moved the payload, so passing `peer_key` here would be a use after move.
@@ -274,10 +280,13 @@ on reply_composer_mark(kind)
   reply_editor = composer_toggle_mark(reply_editor, kind)
 
 on chat_composer_event(event)
-  // WHICH COMPOSER THE CHORD MEANS. Every editor interaction — a click into
-  // one included — lands in one of these two handlers, so the last one to run
-  // names the composer the caret is in. Nothing else can: the chord arrives on
-  // the app's ONE keyboard subscription, which cannot see widget focus.
+  // THE CLAIM. Every editor interaction — a click into one included — lands in
+  // one of these two handlers, so they are the only two things that may say
+  // the caret is in a composer; the chord arrives on the app's ONE keyboard
+  // subscription, which cannot see widget focus. A claim lasts until a handler
+  // that moves the caret RETIRES it (grep `composer_focus = "none"`), because
+  // the editor widget drops its own focus on any press landing outside it and
+  // publishes nothing when it does.
   composer_focus = "message"
   message_editor = apply_composer_event(message_editor, event)
   return if !composer_submits(event)
@@ -472,6 +481,11 @@ on open_thread_message_actions(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = "more"
   thread_edit_draft = body
+  // THE MENU TAKES THE CARET — the focus task below is the app moving it by
+  // hand, and dismissing the menu does not move it back. Every handler with a
+  // `task widget focus` retires the discriminant for exactly this reason;
+  // `tests.rs` lints the rule so a ninth one cannot forget it.
+  composer_focus = "none"
   sequential
     task widget focus #workspace-tabs/content/chat/thread-action-focus
     task widget focus-next
@@ -483,6 +497,7 @@ on open_thread_message_reactions(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = "reactions"
   thread_edit_draft = body
+  composer_focus = "none"
   sequential
     task widget focus #workspace-tabs/content/chat/thread-reaction-focus
     task widget focus-next
@@ -493,6 +508,7 @@ on arm_thread_message_delete(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = "delete"
   thread_edit_draft = body
+  composer_focus = "none"
   sequential
     task widget focus #workspace-tabs/content/chat/thread-delete-focus
     task widget focus-next
@@ -503,6 +519,7 @@ on begin_thread_message_edit(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = "editing"
   thread_edit_draft = body
+  composer_focus = "none"
   task widget focus #workspace-tabs/content/chat/thread-edit
 
 on clear_thread_message_selection
@@ -536,6 +553,7 @@ on open_message_actions(seq, body, rev)
   selected_message_rev = rev
   message_action = "more"
   message_edit_draft = body
+  composer_focus = "none"
   sequential
     task widget focus #workspace-tabs/content/chat/message-action-focus
     task widget focus-next
@@ -547,6 +565,7 @@ on open_message_reactions(seq, body, rev)
   selected_message_rev = rev
   message_action = "reactions"
   message_edit_draft = body
+  composer_focus = "none"
   sequential
     task widget focus #workspace-tabs/content/chat/message-reaction-focus
     task widget focus-next
@@ -557,6 +576,7 @@ on arm_message_delete(seq, body, rev)
   selected_message_rev = rev
   message_action = "delete"
   message_edit_draft = body
+  composer_focus = "none"
   sequential
     task widget focus #workspace-tabs/content/chat/message-delete-focus
     task widget focus-next
@@ -567,6 +587,7 @@ on begin_message_edit(seq, body, rev)
   selected_message_rev = rev
   message_action = "editing"
   message_edit_draft = body
+  composer_focus = "none"
   task widget focus #workspace-tabs/content/chat/message-edit
 
 // THE INSPECTOR IS THE FINALITY MARK'S TARGET. The shield in the hover bar and
@@ -595,10 +616,11 @@ on open_thread_for(seq)
   reply_draft = ""
   reply_editor = editor("")
   pending_reply = ""
-  // A rail that just opened has an UNTOUCHED reply composer, so the chord
-  // still means the stream's — otherwise the previous thread's "reply" would
-  // outlive it and steer the first Cmd+B into an empty box.
-  composer_focus = "message"
+  // A rail that just opened has an UNTOUCHED reply composer, and the click
+  // that opened it was on a message row, not on either editor — so the caret
+  // is in NEITHER. Without this the previous thread's "reply" outlives it and
+  // steers the first Cmd+B into an empty box.
+  composer_focus = "none"
   error = ""
   run load_thread(connected_rpc, active_channel, seq, 0, 0, thread_generation) -> thread_loaded _ | thread_failed _
 
@@ -688,6 +710,8 @@ on close_thread
   reply_draft = ""
   reply_editor = editor("")
   pending_reply = ""
+  // The composer the caret may have been in is gone from the tree.
+  composer_focus = "none"
 
 on edit_message_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0 || empty(trim(message_edit_draft))

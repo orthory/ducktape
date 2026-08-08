@@ -84,12 +84,28 @@ state
   message_draft = ""
   message_editor:editor = ""
   reply_editor:editor = ""
-  // WHICH CHAT COMPOSER THE FORMATTING CHORD MEANS — "message" or "reply".
-  // The chord rides the app's ONE keyboard subscription, which sees no widget
-  // focus, so the two composer-event handlers stamp this as they run (a click
-  // into an editor is one of those events). Read only together with
-  // `active_thread_seq > 0`: a closed rail can never be the target.
-  composer_focus = "message"
+  // WHICH CHAT COMPOSER HOLDS THE CARET — "message", "reply", or "none".
+  // The formatting chord rides the app's ONE keyboard subscription, which sees
+  // no widget focus, so this stands in for focus the app cannot read: the two
+  // composer-event handlers CLAIM it (a click into an editor is one of those
+  // events) and every handler that moves the caret away RETIRES it to "none",
+  // on which the chord marks neither composer. Boot is "none" on purpose —
+  // nothing is focused before the first click, and a mark into an unfocused
+  // draft is the very defect this discriminant exists to prevent.
+  //
+  // The retire set is the whole contract, so it is linted, not remembered:
+  // `every_handler_that_moves_the_caret_retires_the_composer_focus` in
+  // app/src/tests.rs fails the build on a new focus mover or tab mover that
+  // has not said where the caret went.
+  //
+  // ponytail: the retires cover every caret move the app can OBSERVE — a focus
+  // task, a tab move, a composer rebuilt or unmounted. A press on an ordinary
+  // widget (the sidebar's search box, a reaction chip) also drops the editor's
+  // focus and is invisible from here: the widget publishes nothing, and the
+  // pane's `press-at` observer runs AFTER its child, so it can only clobber a
+  // fresh claim, never retire a stale one. Upgrade path is a widget-level blur
+  // route (or a focus query) in ducktape-ui — not another app-side proxy.
+  composer_focus = "none"
   pending_message = ""
   pending_message_id = ""
   // The transient settle ✓: `send_flash_id` anchors it to the row whose

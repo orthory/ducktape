@@ -418,6 +418,11 @@ on live_thread_refresh_failed(cause)
 
 on select_shell_tab(next)
   shell_tab = next
+  // A TAB MOVE UNMOUNTS THE CHAT COMPOSERS, so the caret they claimed is gone
+  // — and a `shell_tab == "chat"` term on the chord could only mute it while
+  // she is away, then hand the stale claim straight back on the return trip.
+  // Every handler that writes `shell_tab` retires it, linted in tests.rs.
+  composer_focus = "none"
   // Leaving Chat prunes paged-in scrollback to one load's worth: the return
   // trip cold-rebuilds every mounted row in one frame, so the mount cost must
   // not compound with how far she once paged back. "Load older" re-earns it.

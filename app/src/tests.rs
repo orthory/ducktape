@@ -3705,6 +3705,138 @@ fn a_thread_reply_takes_marks_from_its_own_toolbar_and_the_chord() {
     assert_eq!(reply_composer(&app), reply_before);
 }
 
+/// A CLAIM ON THE CARET HAS TO DIE WHEN THE CARET LEAVES. `composer_focus`
+/// stands in for widget focus the app cannot read: the rich editor drops its
+/// own focus on any press landing outside it (`rich_text_editor.rs` sets
+/// `state.focus = None` in the else-arm of its press handler) and publishes
+/// NOTHING when it does. So a discriminant stamped on entry is honest only for
+/// as long as the set of handlers that retire it is complete — and #1005
+/// shipped the claim with no retire at all, leaving Cmd+B marking the reply
+/// draft while the caret sat in an inline edit box, on another tab, or in a
+/// channel two switches away.
+///
+/// The enforcement is two MECHANICAL rules, not a remembered list, because the
+/// hole was never in a route that existed — it was in the one nobody thought to
+/// write. A handler carrying a `task widget focus` moves the caret by hand; a
+/// handler writing `shell_tab` unmounts the composer under it. Either one must
+/// say where the caret went. The pinned set then catches everything the two
+/// rules cannot name, `open_thread_for`'s reset included: deleting that line
+/// used to fail nothing.
+#[test]
+fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
+    // THE BEHAVIOUR, on the route the rules are about: a claim, then a handler
+    // that takes the caret with the rail still open — so neither the
+    // `active_thread_seq > 0` gate nor the tab gate can save it — then the
+    // chord. It must mark NEITHER draft.
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.shell_tab = "chat".into();
+    app.active_channel = "general".into();
+    app.active_thread_seq = 7;
+    let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+        editor::ComposerEvent::Apply(editor::RichAction::Edit(
+            iced::widget::text_editor::Action::Move(iced::widget::text_editor::Motion::DocumentEnd),
+        )),
+    ));
+    let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "hello".into(), 2));
+    app.message_editor = compose("channel draft");
+    app.reply_editor = compose("reply draft");
+    app.reply_editor
+        .perform(iced::widget::text_editor::Action::SelectAll);
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
+        iced::keyboard::key::Code::KeyB,
+    )));
+    assert_eq!(
+        reply_composer(&app),
+        "reply draft",
+        "the caret is in the inline edit box, so Cmd+B is not a reply edit"
+    );
+    assert_eq!(
+        composer(&app),
+        "channel draft",
+        "and it is not a channel edit either — a retired claim marks neither"
+    );
+
+    // THE RULES. Every handler file, so a focus mover added to a screen nobody
+    // is thinking about today still has to answer.
+    const HANDLERS: [(&str, &str); 10] = [
+        ("chat", include_str!("ui/handlers/chat.ice")),
+        ("files", include_str!("ui/handlers/files.ice")),
+        ("forge", include_str!("ui/handlers/forge.ice")),
+        ("huddle", include_str!("ui/handlers/huddle.ice")),
+        ("lifecycle", include_str!("ui/handlers/lifecycle.ice")),
+        ("node", include_str!("ui/handlers/node.ice")),
+        ("onboarding", include_str!("ui/handlers/onboarding.ice")),
+        ("overlays", include_str!("ui/handlers/overlays.ice")),
+        ("pages", include_str!("ui/handlers/pages.ice")),
+        ("roster", include_str!("ui/handlers/roster.ice")),
+    ];
+
+    let mut handler = String::new();
+    let mut moves_the_caret: Vec<String> = Vec::new();
+    let mut writes_the_focus: Vec<String> = Vec::new();
+    for (file, source) in HANDLERS {
+        for line in source.lines() {
+            if let Some(rest) = line.strip_prefix("on ") {
+                handler = format!("{file}::{}", rest.split('(').next().unwrap_or(rest).trim());
+            }
+            let statement = line.trim_start();
+            if statement.starts_with("task widget focus") || statement.starts_with("shell_tab = ") {
+                moves_the_caret.push(handler.clone());
+            }
+            if statement.starts_with("composer_focus = ") {
+                writes_the_focus.push(handler.clone());
+            }
+        }
+    }
+    moves_the_caret.sort();
+    moves_the_caret.dedup();
+    writes_the_focus.sort();
+    writes_the_focus.dedup();
+
+    let silent: Vec<&String> = moves_the_caret
+        .iter()
+        .filter(|mover| !writes_the_focus.contains(mover))
+        .collect();
+    assert!(
+        silent.is_empty(),
+        "these handlers move the caret (`task widget focus`) or unmount the \
+         composer under it (`shell_tab = `) without saying where the caret \
+         went — assign `composer_focus` in each, \"none\" unless it really \
+         lands in a chat composer: {silent:?}"
+    );
+
+    assert_eq!(
+        writes_the_focus,
+        [
+            "chat::arm_message_delete",
+            "chat::arm_thread_message_delete",
+            "chat::begin_message_edit",
+            "chat::begin_thread_message_edit",
+            "chat::chat_composer_event",
+            "chat::choose_channel",
+            "chat::choose_dm",
+            "chat::close_thread",
+            "chat::open_chat_search_hit",
+            "chat::open_message_actions",
+            "chat::open_message_reactions",
+            "chat::open_thread_for",
+            "chat::open_thread_message_actions",
+            "chat::open_thread_message_reactions",
+            "chat::reply_composer_event",
+            "huddle::huddle_go_channel",
+            "lifecycle::select_shell_tab",
+            "overlays::global_key_pressed",
+            "pages::open_page_search_hit",
+            "pages::toggle_page_create",
+        ],
+        "a handler started or stopped speaking for the caret: exactly two may \
+         CLAIM it (the two composer-event handlers), everyone else here RETIRES \
+         it — decide which yours is, then update this list"
+    );
+}
+
 /// One Cmd/Ctrl chord, shaped the way the keyboard subscription delivers it.
 fn command_chord(code: iced::keyboard::key::Code) -> __IceKeyPress {
     __IceKeyPress {
