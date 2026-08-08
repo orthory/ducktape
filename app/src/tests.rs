@@ -3027,6 +3027,54 @@ fn approvals_tells_a_first_run_apart_from_a_finished_one() {
     );
 }
 
+/// AN EMPTY STATE MAY ONLY NAME A MECHANISM THAT EXISTS. Forge's two tracker
+/// plates each promised a route into the list, and one of them was wrong while
+/// the other named nothing at all:
+///
+///   - "a PR **pushed to** this repo appears here" — a push does not open a PR.
+///     The only production emitter of `ForgeMsg::OpenPr` is the runs sink
+///     (`crates/modules/apps/runs/src/sink.rs`), reached from `response.rs`
+///     when a run with a PR sink DELIVERS. A push can update an already-open
+///     PR; it cannot open one.
+///   - "an issue opened against this repo appears here" — passive, naming
+///     neither who opens it nor from where. `OpenIssue` has NO production
+///     sender at all: only the tests and the demo seeder emit it, there is no
+///     CLI verb, and the Code tab on the same screen says the app is view only.
+///
+/// The third plate on this screen has always done it right — the repo overview
+/// says forge IS a git remote and prints the push command — so this is the
+/// house style, not a new one.
+#[test]
+fn forge_empty_states_name_only_routes_that_exist() {
+    let forge = inlined(include_str!("ui/screens/forge.ice"));
+
+    assert!(
+        forge.contains("No pull requests — an agent run opens one when it delivers its work."),
+        "a PR comes from a delivering run, not from a push"
+    );
+    assert!(
+        !forge.contains("a PR pushed to this repo"),
+        "the push route was never real"
+    );
+    assert!(
+        forge.contains("No issues — this app reads the tracker but cannot open one yet."),
+        "nothing in the shipped surface opens an issue; say so rather than implying a route"
+    );
+
+    // AND THE CODE PANE MUST NOT SEND THE READER TO AN EMPTY TREE. The sidebar
+    // says "Nothing committed on this branch yet" while the pane beside it said
+    // "Pick a file from the tree to read it" — two claims about the same tree,
+    // in the same frame.
+    assert!(
+        forge.contains("if empty(file_path) && empty(tree_entries)"),
+        "the no-file pane splits on whether there is a tree to pick from"
+    );
+    assert!(
+        forge.contains("Nothing is committed on this branch yet, so there is no file to read."),
+        "an unborn repo says why there is nothing to read"
+    );
+}
+
 /// A LIST THAT DRIVES A DETAIL PANE MUST SAY WHICH ROW IT IS SHOWING. The
 /// Explorer's block rows carried `active bg=transparent` on BOTH states, so
 /// clicking a row filled the pane on the right and left the list identical to
