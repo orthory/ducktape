@@ -37,8 +37,8 @@ component DmButton(peer:DmPeer, selected:bool)
               pt=6.0
               pb=6.0
             DmRow peer=peer selected=true
-          active bg=subtle text=fg border=transparent border-w=1.0 r=7.0
-          hovered bg=subtle text=fg
+          active bg=selected_row text=fg border=transparent border-w=1.0 r=7.0
+          hovered bg=selected_row text=fg
           pressed bg=rail_hover text=fg
       if !selected
         button -> emit(choose_dm, peer.key)

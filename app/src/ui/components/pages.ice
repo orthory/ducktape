@@ -41,9 +41,9 @@ component PageButton(page:PageItem, selected:bool)
                 size=12.5
                 wrap=none
                 @text-fg
-        active bg=subtle text=fg border=transparent border-w=1.0 r=7.0
+        active bg=selected_row text=fg border=transparent border-w=1.0 r=7.0
         hovered bg=rail_hover text=fg
-        pressed bg=subtle text=fg
+        pressed bg=selected_row text=fg
     if !selected
       button -> emit(choose_page, page.id)
         with

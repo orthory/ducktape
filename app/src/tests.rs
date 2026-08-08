@@ -3205,7 +3205,7 @@ fn forge_empty_states_name_only_routes_that_exist() {
 /// follows the pointer rather than the selection. In a list whose every row is a
 /// height and a truncated hash there is no landmark to re-find your place by.
 ///
-/// Pinned as a DIFFERENCE, not as a colour: asserting `tree_selected` alone
+/// Pinned as a DIFFERENCE, not as a colour: asserting `selected_row` alone
 /// would stay green if the unselected arm adopted it too, which is the same
 /// both-arms-identical bug in a new coat.
 #[test]
@@ -3223,7 +3223,7 @@ fn the_explorer_marks_the_block_row_whose_detail_is_open() {
     let unselected = row.split("if !selected").nth(1).expect("unselected arm");
 
     assert!(
-        selected.contains("active bg=tree_selected"),
+        selected.contains("active bg=selected_row"),
         "the open row wears a plate"
     );
     assert!(
@@ -3244,6 +3244,152 @@ fn the_explorer_marks_the_block_row_whose_detail_is_open() {
         plate_of(selected),
         plate_of(unselected),
         "a selected row that paints the unselected plate marks nothing"
+    );
+}
+
+/// ONE TOKEN MEANS "THIS IS THE ROW YOU ARE ON". The Forge file tree marked its
+/// selected row with `tree_selected`; the Files tree marked its own with
+/// `subtle` — #35322a against #31302b, 2.3/255 apart in dark. Nobody saw the
+/// difference, which IS the defect: two tokens for one meaning drift apart the
+/// moment either is retuned. `subtle` could never have been the selection plate
+/// anyway, because it is also the PRESSED plate on those very components —
+/// pressing an unselected channel painted it the colour of the selected one.
+/// Thirteen surfaces mark a current row; ten of them were split across `subtle`
+/// and `elevated`. All thirteen now read one token, named for the meaning it
+/// carries rather than for the first tree that needed it: `selected_row`.
+///
+/// Pinned as the CONVENTION in two halves, because neither holds alone:
+///   - NEGATIVE, self-extending: no arm that opens on "this is the current one"
+///     may rest on `subtle` or `elevated`. This is the half that fails on the
+///     NEXT surface someone writes, which a pin on any one call site cannot.
+///   - COVERAGE: the set of sources carrying the token is fixed, so a surface
+///     cannot quietly slide off the convention onto some third plate.
+///
+/// Marks that are not a plate at all rest on their own tokens ON PURPOSE and
+/// are commented where they live: the tab underline and the filter chip invert
+/// to ink, the matrix cell takes the faintest wash because its column HEAD
+/// already wears the mark, and the huddle camera toggle is an engaged control
+/// rather than a row you navigated to.
+#[test]
+fn every_current_row_marker_rests_on_one_selection_token() {
+    // Every arm that opens on "this is the current one", paired with each
+    // plate it RESTS on: the `bg=` of the arm's own first node, and any
+    // button's `active bg=` inside it. `hovered`/`pressed` are not resting
+    // plates, and a descendant's dot or badge is not the row's plate.
+    fn current_row_plates(source: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut out = Vec::new();
+        for (at, line) in lines.iter().enumerate() {
+            let Some(cond) = line.trim().strip_prefix("if ") else {
+                continue;
+            };
+            // A negation is the OTHER arm; a comparison is a count guard
+            // (`if selected > 0`), not a selection.
+            let names_the_current_one = cond
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|word| word == "selected" || word == "active");
+            let opens_a_marker = names_the_current_one && !cond.contains(['!', '<', '>']);
+            if !opens_a_marker {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let arm: Vec<&&str> = lines[at + 1..]
+                .iter()
+                .take_while(|body| {
+                    body.trim().is_empty() || body.len() - body.trim_start().len() > indent
+                })
+                .collect();
+            let plate_of = |text: &str| {
+                text.split_whitespace()
+                    .find_map(|token| token.strip_prefix("bg="))
+                    .map(str::to_owned)
+            };
+            let own_plate = arm
+                .iter()
+                .find(|body| !body.trim().is_empty())
+                .and_then(|body| plate_of(body));
+            let button_plates = arm
+                .iter()
+                .filter(|body| body.trim().starts_with("active "))
+                .filter_map(|body| plate_of(body));
+            for plate in own_plate.into_iter().chain(button_plates) {
+                out.push((cond.to_owned(), plate));
+            }
+        }
+        out
+    }
+
+    // EVERY authored ice source, each paired with its own path so a failure
+    // names the file. The scan must see all of them: a source left out is a
+    // surface the convention stops covering.
+    macro_rules! ice_sources {
+        ($($path:literal),* $(,)?) => { [$(($path, include_str!($path))),*] };
+    }
+    let sources = ice_sources![
+        "ui/components/chat.ice",
+        "ui/components/dm.ice",
+        "ui/components/files.ice",
+        "ui/components/forge.ice",
+        "ui/components/huddle.ice",
+        "ui/components/icon.ice",
+        "ui/components/kit.ice",
+        "ui/components/node.ice",
+        "ui/components/onboarding.ice",
+        "ui/components/overlay.ice",
+        "ui/components/pages.ice",
+        "ui/components/patterns.ice",
+        "ui/components/roster.ice",
+        "ui/components/shell.ice",
+        "ui/screens/chat.ice",
+        "ui/screens/forge.ice",
+        "ui/screens/governance.ice",
+        "ui/screens/overlays.ice",
+        "ui/screens/pages.ice",
+        "ui/screens/roster.ice",
+        "ui/screens/settings.ice",
+        "ui/screens/storage.ice",
+        "ui/view.ice",
+    ];
+
+    let mut carriers: Vec<&str> = Vec::new();
+    for (name, raw) in sources {
+        // `with` blocks fold back onto their node line, so a plate and the
+        // node it paints stay ONE line however the source was wrapped.
+        let source = inlined(raw);
+        if source.contains("bg=selected_row") {
+            carriers.push(name);
+        }
+        for (cond, plate) in current_row_plates(&source) {
+            assert!(
+                plate != "subtle" && plate != "elevated",
+                "{name}: `if {cond}` marks the current row with `{plate}` — \
+                 that is the track grey / the raised surface, not `selected_row`"
+            );
+        }
+    }
+
+    // The surfaces that mark a current row, all of them, on one token: the
+    // channel and the DM you are reading, the page you are editing, the tree
+    // directory and the open object, the tree file and the repo switcher, the
+    // matrix column head, the network you picked, the nav rail tab and
+    // Settings, the member whose card is open, the Explorer block you
+    // inspected. A source that drops off this list has either lost its mark or
+    // invented a second token for it; both are the bug this test exists for.
+    assert_eq!(
+        carriers,
+        [
+            "ui/components/chat.ice",
+            "ui/components/dm.ice",
+            "ui/components/files.ice",
+            "ui/components/forge.ice",
+            "ui/components/node.ice",
+            "ui/components/onboarding.ice",
+            "ui/components/pages.ice",
+            "ui/components/shell.ice",
+            "ui/screens/roster.ice",
+            "ui/screens/storage.ice",
+        ],
+        "every surface that marks a current row reads `selected_row`"
     );
 }
 

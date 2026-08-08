@@ -149,8 +149,8 @@ component MembersScreen(rows:[MemberRow], validators:i64, residents:i64, filter:
                       p=0.0
                       @ghost_action
                     MemberRowCard member=member
-                    active bg=elevated text=fg border=transparent border-w=1.0 r=9.0
-                    hovered bg=elevated text=fg
+                    active bg=selected_row text=fg border=transparent border-w=1.0 r=9.0
+                    hovered bg=selected_row text=fg
                     pressed bg=subtle text=fg
                 if member.key != selected
                   button -> emit(open_member, member.key)

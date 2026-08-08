@@ -588,6 +588,10 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
                   name="camera"
                   tone="ink"
                   px=14.0
+            // `subtle`, not `selected_row`: this is a 32px media TOGGLE that
+            // is engaged, one step up from its own off state (`elevated`) —
+            // the same class as the mic's `danger_bg` beside it, not a row in
+            // a list you navigated to.
             active bg=subtle text=fg border=control_line_hover border-w=1.0 r=9.0
             hovered bg=subtle text=fg border=control_line_hover
             pressed bg=subtle text=fg

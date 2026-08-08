@@ -506,7 +506,7 @@ component MatrixHead(label:str, active:bool)
           pt=10.0
           pb=10.0
           align-x=center
-          bg=tree_selected
+          bg=selected_row
         text label
           with
             size=9.5
@@ -549,6 +549,10 @@ component MatrixRow(label:str, v:bool, f:bool, l:bool, tier:str)
       MatrixCell on=f active=(tier == "resident")
       MatrixCell on=l active=(tier == "guest")
 
+// DELIBERATELY NOT `selected_row`: the head above already wears the selection
+// plate, and the cells only have to show how far that column reaches. Repeating
+// the full plate down the column made the mark itself unreadable, so the body
+// takes the faintest wash there is and the head keeps the mark.
 component MatrixCell(on:bool, active:bool)
   col #root
     if active

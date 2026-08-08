@@ -47,8 +47,8 @@ component FsTreeRow(entry:FsEntry, selected:bool, depth:f64)
             name=entry.name
             depth
             dimmed=false
-        active bg=subtle text=fg border=transparent border-w=1.0 r=7.0
-        hovered bg=subtle
+        active bg=selected_row text=fg border=transparent border-w=1.0 r=7.0
+        hovered bg=selected_row
         pressed bg=rail_hover
     if !selected
       button -> emit(fs_open_dir, entry.path)
@@ -261,8 +261,8 @@ component ObjectRow(entry:FsEntry, selected:bool)
           p=0.0
           @ghost_action
         ObjectRowFace entry=entry
-        active bg=elevated text=fg border=transparent border-w=1.0 r=0.0
-        hovered bg=elevated
+        active bg=selected_row text=fg border=transparent border-w=1.0 r=0.0
+        hovered bg=selected_row
         pressed bg=subtle
     if entry.kind != "dir" && !selected
       button -> emit(fs_open_file, entry.path)
