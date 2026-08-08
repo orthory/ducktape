@@ -259,11 +259,26 @@ on join_huddle_submit
 // A toolbar mark is an edit, not a send: wrap the selection (or park the
 // cursor inside a fresh marker pair) and hand the editor back. The same
 // disabled gate as the editor guards the buttons in the view.
+// The two mark handlers are the ONLY unambiguous route: the button names its
+// editor at the mount, so no focus reading is involved. The chord in
+// `handlers/overlays.ice` has no such luxury and reads `composer_focus`.
 on composer_mark(kind)
   return if loading || !connected || empty(active_channel)
   message_editor = composer_toggle_mark(message_editor, kind)
 
+// Its rail twin. `thread_loading` replaces `loading` and the open-rail check
+// replaces the channel check, matching the reply composer's own gate; a mark
+// is a local edit, so `post_gate` stays out of it exactly as it does above.
+on reply_composer_mark(kind)
+  return if thread_loading || !connected || active_thread_seq <= 0
+  reply_editor = composer_toggle_mark(reply_editor, kind)
+
 on chat_composer_event(event)
+  // WHICH COMPOSER THE CHORD MEANS. Every editor interaction — a click into
+  // one included — lands in one of these two handlers, so the last one to run
+  // names the composer the caret is in. Nothing else can: the chord arrives on
+  // the app's ONE keyboard subscription, which cannot see widget focus.
+  composer_focus = "message"
   message_editor = apply_composer_event(message_editor, event)
   return if !composer_submits(event)
   // Same apply-time re-read as `reply_composer_event` below: the composer's
@@ -580,6 +595,10 @@ on open_thread_for(seq)
   reply_draft = ""
   reply_editor = editor("")
   pending_reply = ""
+  // A rail that just opened has an UNTOUCHED reply composer, so the chord
+  // still means the stream's — otherwise the previous thread's "reply" would
+  // outlive it and steer the first Cmd+B into an empty box.
+  composer_focus = "message"
   error = ""
   run load_thread(connected_rpc, active_channel, seq, 0, 0, thread_generation) -> thread_loaded _ | thread_failed _
 
@@ -764,6 +783,7 @@ on reaction_failed(cause)
 // appended, refused by the module, and rolled back under a raw 400. Same terms
 // as the view; `settings_user_key` is what the screen mounts as `user_key`.
 on reply_composer_event(event)
+  composer_focus = "reply"
   reply_editor = apply_composer_event(reply_editor, event)
   return if !composer_submits(event)
   return if loading || thread_loading || !connected || empty(active_channel) || active_thread_seq <= 0 || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)) || empty(trim(editor_text(reply_editor)))

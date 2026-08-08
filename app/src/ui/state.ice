@@ -75,6 +75,12 @@ state
   message_draft = ""
   message_editor:editor = ""
   reply_editor:editor = ""
+  // WHICH CHAT COMPOSER THE FORMATTING CHORD MEANS — "message" or "reply".
+  // The chord rides the app's ONE keyboard subscription, which sees no widget
+  // focus, so the two composer-event handlers stamp this as they run (a click
+  // into an editor is one of those events). Read only together with
+  // `active_thread_seq > 0`: a closed rail can never be the target.
+  composer_focus = "message"
   pending_message = ""
   pending_message_id = ""
   // The transient settle ✓: `send_flash_id` anchors it to the row whose

@@ -3307,6 +3307,107 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
     );
 }
 
+/// A REPLY IS FORMATTABLE, through both of the doors the stream's composer has.
+///
+/// The rail's composer had NEITHER: no toolbar (the seat row was hint + Send),
+/// and the Cmd/Ctrl chord — supposedly the keyboard half of the same table —
+/// was hard-wired to `message_editor` in `handlers/overlays.ice`. The chord
+/// rides the app's ONE global key subscription, which sees no widget focus, so
+/// Cmd+B pressed with the caret in a thread reply wrapped the CHANNEL draft
+/// instead: a silent write into a composer the user was not looking at.
+///
+/// Both halves are pinned because they are separate mechanisms with the same
+/// failure. The toolbar half needs its MOUNTS asserted too: `ComposerMarks` is
+/// one component seated twice, and the two seats must route to DIFFERENT
+/// editors — a same-name `forward` would have collapsed them back onto one,
+/// which is exactly the defect in miniature.
+#[test]
+fn a_thread_reply_takes_marks_from_its_own_toolbar_and_the_chord() {
+    // THE MOUNTS. Two seats of one component, two routes.
+    assert_eq!(SCREENS.matches("ComposerMarks disabled=(").count(), 2);
+    assert!(SCREENS.contains("mark -> emit(composer_mark, _)"));
+    assert!(SCREENS.contains("mark -> emit(reply_composer_mark, _)"));
+
+    // THE TOOLBAR half: the rail's Bold wraps the REPLY and nothing else.
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.shell_tab = "chat".into();
+    app.active_channel = "general".into();
+    app.active_thread_seq = 7;
+    app.message_editor = compose("channel draft");
+    app.reply_editor = compose("reply draft");
+    app.reply_editor
+        .perform(iced::widget::text_editor::Action::SelectAll);
+    let _ = app.__update(__DucktapeMessage::ReplyComposerMark("bold".into()));
+    assert_eq!(reply_composer(&app), "**reply draft**");
+    assert_eq!(
+        composer(&app),
+        "channel draft",
+        "the stream draft is not the reply's"
+    );
+
+    // THE CHORD half, caret in the reply. A click into an editor arrives as a
+    // composer event — that event is what stamps the focus the subscription
+    // cannot read, so drive it rather than poking the field.
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.shell_tab = "chat".into();
+    app.active_channel = "general".into();
+    app.active_thread_seq = 7;
+    let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+        editor::ComposerEvent::Apply(editor::RichAction::Edit(
+            iced::widget::text_editor::Action::Move(iced::widget::text_editor::Motion::DocumentEnd),
+        )),
+    ));
+    app.message_editor = compose("channel draft");
+    app.reply_editor = compose("reply draft");
+    app.reply_editor
+        .perform(iced::widget::text_editor::Action::SelectAll);
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
+        iced::keyboard::key::Code::KeyB,
+    )));
+    assert_eq!(reply_composer(&app), "**reply draft**");
+    assert_eq!(
+        composer(&app),
+        "channel draft",
+        "Cmd+B in a reply is not a channel edit"
+    );
+
+    // AND IT IS NOT A BLANKET REDIRECT: the same chord with the caret back in
+    // the stream's composer still marks the stream's draft, rail open or not.
+    // Without this arm the asserts above would pass against a chord that had
+    // simply been rewired to the reply editor.
+    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+        editor::ComposerEvent::Apply(editor::RichAction::Edit(
+            iced::widget::text_editor::Action::Move(iced::widget::text_editor::Motion::DocumentEnd),
+        )),
+    ));
+    app.message_editor = compose("channel draft");
+    app.message_editor
+        .perform(iced::widget::text_editor::Action::SelectAll);
+    let reply_before = reply_composer(&app);
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
+        iced::keyboard::key::Code::KeyB,
+    )));
+    assert_eq!(composer(&app), "**channel draft**");
+    assert_eq!(reply_composer(&app), reply_before);
+}
+
+/// One Cmd/Ctrl chord, shaped the way the keyboard subscription delivers it.
+fn command_chord(code: iced::keyboard::key::Code) -> __IceKeyPress {
+    __IceKeyPress {
+        key: iced::keyboard::Key::Unidentified,
+        modified_key: iced::keyboard::Key::Unidentified,
+        physical_key: iced::keyboard::key::Physical::Code(code),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::COMMAND,
+        text: None,
+        repeat: false,
+    }
+}
+
 #[test]
 fn failed_optimistic_send_rolls_back_and_restores_the_draft() {
     let (mut app, _) = Ducktape::__boot();

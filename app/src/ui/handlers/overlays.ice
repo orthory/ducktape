@@ -70,7 +70,15 @@ on global_key_pressed(event)
   // The composer's formatting chords (Cmd/Ctrl+B/I, +Shift+C, +Shift+9). The
   // editor lets command-letter presses bubble on purpose, so its focus is
   // still on the draft when the mark lands; an empty verdict is a no-op.
-  message_editor = composer_toggle_mark(message_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, (connected && shell_tab == "chat" && !palette_open)))
+  //
+  // ONE chord, TWO composers: the subscription is global and sees no widget
+  // focus, so `composer_focus` (stamped by whichever composer last took an
+  // event) picks the target and the other arm's gate goes false — the two
+  // lines are exclusive, never both. Without the split, Cmd+B pressed with the
+  // caret in a thread reply silently bolded the CHANNEL draft instead.
+  let reply_chord = active_thread_seq > 0 && composer_focus == "reply"
+  message_editor = composer_toggle_mark(message_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, (connected && shell_tab == "chat" && !palette_open && !reply_chord)))
+  reply_editor = composer_toggle_mark(reply_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, (connected && shell_tab == "chat" && !palette_open && reply_chord)))
   // The page document's undo/redo (Cmd/Ctrl+Z, +Shift+Z) — the editor
   // bubbles command-letter chords on purpose; an off-pages press is the
   // identity.
