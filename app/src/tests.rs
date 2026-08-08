@@ -3719,9 +3719,14 @@ fn a_thread_reply_takes_marks_from_its_own_toolbar_and_the_chord() {
 /// hole was never in a route that existed — it was in the one nobody thought to
 /// write. A handler carrying a `task widget focus` moves the caret by hand; a
 /// handler writing `shell_tab` unmounts the composer under it. Either one must
-/// say where the caret went. The pinned set then catches everything the two
-/// rules cannot name, `open_thread_for`'s reset included: deleting that line
-/// used to fail nothing.
+/// RETIRE — `"none"` and nothing else, since a mover by definition took the
+/// caret somewhere that is not a chat composer. The pinned set then catches
+/// everything the two rules cannot name, `open_thread_for`'s reset included:
+/// deleting that line used to fail nothing.
+///
+/// Every rule here records the VALUE and not merely the assignment. A retire
+/// flipped to `"message"` is a claim on a composer the caret is not in — the
+/// exact defect — and a lint that only counted assignments called that green.
 #[test]
 fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
     // THE BEHAVIOUR, on the route the rules are about: a claim, then a handler
@@ -3758,6 +3763,44 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
         "and it is not a channel edit either — a retired claim marks neither"
     );
 
+    // THE SAME BEHAVIOUR ON THE RAIL'S OWN OPEN, which is where the VALUE of a
+    // retire is load-bearing. `open_thread_for` inherits whatever the channel
+    // composer claimed, and the click that opened the rail landed on a message
+    // row — the caret is in NEITHER box. The rail is open, so `"reply"` is as
+    // live as `"message"` here: every wrong value this one line could carry
+    // marks a draft, which is why the assertion is on both drafts and not on
+    // the presence of the line.
+    let (mut rail, _) = Ducktape::__boot();
+    rail.connected = true;
+    rail.loading = false;
+    rail.shell_tab = "chat".into();
+    rail.active_channel = "general".into();
+    let _ = rail.__update(__DucktapeMessage::ChatComposerEvent(
+        editor::ComposerEvent::Apply(editor::RichAction::Edit(
+            iced::widget::text_editor::Action::Move(iced::widget::text_editor::Motion::DocumentEnd),
+        )),
+    ));
+    let _ = rail.__update(__DucktapeMessage::OpenThreadFor(7));
+    rail.message_editor = compose("channel draft");
+    rail.reply_editor = compose("reply draft");
+    rail.message_editor
+        .perform(iced::widget::text_editor::Action::SelectAll);
+    let _ = rail.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
+        iced::keyboard::key::Code::KeyB,
+    )));
+    assert_eq!(
+        composer(&rail),
+        "channel draft",
+        "opening the rail moved the caret off the channel composer, so Cmd+B \
+         is not a channel edit"
+    );
+    assert_eq!(
+        reply_composer(&rail),
+        "reply draft",
+        "and the rail's own composer never had it either — the click landed on \
+         a message row"
+    );
+
     // THE RULES. Every handler file, so a focus mover added to a screen nobody
     // is thinking about today still has to answer.
     const HANDLERS: [(&str, &str); 10] = [
@@ -3773,8 +3816,27 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
         ("roster", include_str!("ui/handlers/roster.ice")),
     ];
 
+    // `app.ice` is the real registry; the list above is a hand copy of it, and
+    // an eleventh handler file would otherwise ship unscanned.
+    for line in include_str!("ui/app.ice").lines() {
+        let Some(rest) = line.trim_start().strip_prefix("use \"handlers/") else {
+            continue;
+        };
+        let Some(file) = rest.strip_suffix(".ice\"") else {
+            continue;
+        };
+        assert!(
+            HANDLERS.iter().any(|(scanned, _)| *scanned == file),
+            "app.ice registers handlers/{file}.ice and this lint does not read \
+             it — add it to HANDLERS, or the next focus mover lands there \
+             unchecked"
+        );
+    }
+
     let mut handler = String::new();
     let mut moves_the_caret: Vec<String> = Vec::new();
+    // Handler AND value: `composer_focus = "message"` in a retire is the defect
+    // itself, so recording only the handler name pins nothing worth pinning.
     let mut writes_the_focus: Vec<String> = Vec::new();
     for (file, source) in HANDLERS {
         for line in source.lines() {
@@ -3785,8 +3847,8 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
             if statement.starts_with("task widget focus") || statement.starts_with("shell_tab = ") {
                 moves_the_caret.push(handler.clone());
             }
-            if statement.starts_with("composer_focus = ") {
-                writes_the_focus.push(handler.clone());
+            if let Some(value) = statement.strip_prefix("composer_focus = ") {
+                writes_the_focus.push(format!("{handler} = {}", value.trim()));
             }
         }
     }
@@ -3797,43 +3859,46 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
 
     let silent: Vec<&String> = moves_the_caret
         .iter()
-        .filter(|mover| !writes_the_focus.contains(mover))
+        .filter(|mover| !writes_the_focus.contains(&format!("{mover} = \"none\"")))
         .collect();
     assert!(
         silent.is_empty(),
         "these handlers move the caret (`task widget focus`) or unmount the \
-         composer under it (`shell_tab = `) without saying where the caret \
-         went — assign `composer_focus` in each, \"none\" unless it really \
-         lands in a chat composer: {silent:?}"
+         composer under it (`shell_tab = `) without RETIRING the claim on it — \
+         each needs `composer_focus = \"none\"`, and \"none\" is the only \
+         honest value: a mover took the caret somewhere that is not a chat \
+         composer: {silent:?}"
     );
 
     assert_eq!(
         writes_the_focus,
         [
-            "chat::arm_message_delete",
-            "chat::arm_thread_message_delete",
-            "chat::begin_message_edit",
-            "chat::begin_thread_message_edit",
-            "chat::chat_composer_event",
-            "chat::choose_channel",
-            "chat::choose_dm",
-            "chat::close_thread",
-            "chat::open_chat_search_hit",
-            "chat::open_message_actions",
-            "chat::open_message_reactions",
-            "chat::open_thread_for",
-            "chat::open_thread_message_actions",
-            "chat::open_thread_message_reactions",
-            "chat::reply_composer_event",
-            "huddle::huddle_go_channel",
-            "lifecycle::select_shell_tab",
-            "overlays::global_key_pressed",
-            "pages::open_page_search_hit",
-            "pages::toggle_page_create",
+            "chat::arm_message_delete = \"none\"",
+            "chat::arm_thread_message_delete = \"none\"",
+            "chat::begin_message_edit = \"none\"",
+            "chat::begin_thread_message_edit = \"none\"",
+            "chat::chat_composer_event = \"message\"",
+            "chat::choose_channel = \"none\"",
+            "chat::choose_dm = \"none\"",
+            "chat::close_thread = \"none\"",
+            "chat::open_chat_search_hit = \"none\"",
+            "chat::open_message_actions = \"none\"",
+            "chat::open_message_reactions = \"none\"",
+            "chat::open_thread_for = \"none\"",
+            "chat::open_thread_message_actions = \"none\"",
+            "chat::open_thread_message_reactions = \"none\"",
+            "chat::reply_composer_event = \"reply\"",
+            "huddle::huddle_go_channel = \"none\"",
+            "lifecycle::select_shell_tab = \"none\"",
+            "onboarding::console_opened = \"none\"",
+            "overlays::global_key_pressed = \"none\"",
+            "pages::open_page_search_hit = \"none\"",
+            "pages::toggle_page_create = \"none\"",
         ],
-        "a handler started or stopped speaking for the caret: exactly two may \
-         CLAIM it (the two composer-event handlers), everyone else here RETIRES \
-         it — decide which yours is, then update this list"
+        "a handler started, stopped, or CHANGED what it says about the caret: \
+         exactly two may CLAIM it (the two composer-event handlers, and only \
+         with their own composer's name), everyone else here RETIRES it to \
+         \"none\" — decide which yours is, then update this list"
     );
 }
 

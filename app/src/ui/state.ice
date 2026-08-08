@@ -95,16 +95,25 @@ state
   //
   // The retire set is the whole contract, so it is linted, not remembered:
   // `every_handler_that_moves_the_caret_retires_the_composer_focus` in
-  // app/src/tests.rs fails the build on a new focus mover or tab mover that
-  // has not said where the caret went.
+  // app/src/tests.rs pins the VALUE every writer assigns, and fails the build
+  // on a new focus mover or tab mover that has not retired the claim.
   //
-  // ponytail: the retires cover every caret move the app can OBSERVE — a focus
-  // task, a tab move, a composer rebuilt or unmounted. A press on an ordinary
-  // widget (the sidebar's search box, a reaction chip) also drops the editor's
-  // focus and is invisible from here: the widget publishes nothing, and the
-  // pane's `press-at` observer runs AFTER its child, so it can only clobber a
-  // fresh claim, never retire a stale one. Upgrade path is a widget-level blur
-  // route (or a focus query) in ducktape-ui — not another app-side proxy.
+  // TWO of the three classes are mechanical: a `task widget focus` and a
+  // `shell_tab` write are both visible in the source, so the lint derives them.
+  // The third is a NAMED list — the handlers whose click lands on something
+  // that is not an editor while replacing the composer under it (a channel row,
+  // a DM row, a message row, the rail's close, the network chip in
+  // `onboarding::console_opened`). It cannot be derived from "rebuilds a
+  // composer", because that is not the same fact: sending a message rebuilds
+  // the box and the caret stays right in it. Those five are pinned by name and
+  // value instead.
+  //
+  // ponytail: what is left uncovered is a press on an ordinary widget (the
+  // sidebar's search box, a reaction chip). It drops the editor's focus and is
+  // invisible from here: the widget publishes nothing, and the pane's
+  // `press-at` observer runs AFTER its child, so it can only clobber a fresh
+  // claim, never retire a stale one. Upgrade path is a widget-level blur route
+  // (or a focus query) in ducktape-ui — not another app-side proxy.
   composer_focus = "none"
   pending_message = ""
   pending_message_id = ""

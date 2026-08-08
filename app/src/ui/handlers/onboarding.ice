@@ -209,6 +209,14 @@ on console_opened(id)
   reply_draft = ""
   reply_editor = editor("")
   pending_reply = ""
+  // Both composers above are new empty boxes now, and the click that got here
+  // was on the titlebar's network chip or Settings' "Switch network" — not on
+  // an editor. `shell_tab` SURVIVES the switch, so without this a stale
+  // "message" rides into the new workspace and the first Cmd+B marks a draft
+  // that no longer exists. Neither mechanical rule in
+  // `every_handler_that_moves_the_caret_retires_the_composer_focus` reaches
+  // here (no focus task, no `shell_tab` write); the pinned list does.
+  composer_focus = "none"
   pending_channel = ""
   pending_message = ""
   chat_search_draft = ""
