@@ -2472,7 +2472,7 @@ fn about_skips_headings_and_badges_and_names_the_language() {
         &[
             (
                 "README.md",
-                "# ducktape\n\n[![badge](x)](y)\n\nThe consensus core.\nMore prose.\n",
+                "# ducktape\n\n[![badge](x)](y)\n\nThe consensus core.\nMore prose.\n\nA second paragraph.\n",
             ),
             ("a.rs", "fn a() {}\n"),
             ("b.rs", "fn b() {}\n"),
@@ -2481,8 +2481,34 @@ fn about_skips_headings_and_badges_and_names_the_language() {
     );
     let commit = mirror_commit_at(&mirror, "").unwrap();
 
-    assert_eq!(readme_about(&mirror, &commit), "The consensus core.");
+    // The whole first paragraph, rejoined — a README is hard wrapped, and
+    // taking one physical line ended this repo's own card mid-clause with no
+    // ellipsis to say it had been cut. The blank line still ends it.
+    assert_eq!(
+        readme_about(&mirror, &commit),
+        "The consensus core. More prose."
+    );
     assert_eq!(dominant_language(&commit), "Rust");
+}
+
+/// The card's about line is capped at 200 characters and says so with an
+/// ellipsis. Rejoining a wrapped paragraph is what makes the cap reachable —
+/// this repo's own opening paragraph is 202 characters across three lines, and
+/// before the rejoin no card could ever have shown the mark.
+#[test]
+fn a_long_about_line_is_cut_at_two_hundred_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let wrapped = "A consensus-based workplace super-app: one BFT-replicated state machine that\nhosts isolated product modules - pages, forge, chat, agent workflows - the\nway CosmWasm isolates contracts, but in native Rust.\n";
+    let mirror = browsable_mirror(&dir, &[("README.md", wrapped), ("a.rs", "fn a() {}\n")]);
+    let commit = mirror_commit_at(&mirror, "").unwrap();
+
+    let about = readme_about(&mirror, &commit);
+    assert_eq!(about.chars().count(), 201, "200 characters plus the mark");
+    assert!(about.ends_with('…'), "a cut line says it was cut");
+    assert!(
+        about.starts_with("A consensus-based workplace super-app: one BFT-replicated state machine that hosts isolated"),
+        "the wrap is rejoined with a single space, not a newline: {about}"
+    );
 }
 
 // An unborn repo has no head oid to resolve, so the card gets nothing —
