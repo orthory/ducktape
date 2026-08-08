@@ -267,15 +267,22 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                       wrap=none
                       font=code_medium
                       @text-hint
-                  text "·"
-                    with
-                      size=10.5
-                      wrap=none
-                      font=code_medium
-                      @text-hint
+                  // The separator belongs to the KEY, which an unbound account
+                  // does not have: `load_account` answers "" for every field
+                  // until one is bound, and drawn unconditionally the dot led
+                  // the line — `· validator keypair on this device`. Every
+                  // other separator in the console is gated by the run it
+                  // introduces (forge.ice's repo-count dot says so in its own
+                  // comment); this one was the exception.
+                  if !empty(account_id)
+                    text "·"
+                      with
+                        size=10.5
+                        wrap=none
+                        font=code_medium
+                        @text-hint
                   // Same empty answer the badge above guards on: an unanswered
-                  // roster has no standing to name here. The separator stays —
-                  // it still parts the key from the custody clause.
+                  // roster has no standing to name here.
                   if !empty(member_tier(members_rows))
                     text member_tier(members_rows)
                       with
