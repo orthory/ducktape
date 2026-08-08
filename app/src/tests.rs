@@ -1682,6 +1682,8 @@ fn the_save_tick_waits_for_inflight_saves_and_open_fences() {
     app.loading = false;
     app.connected = true;
     app.active_page = "page".into();
+    // The buffer is this page's — the tick refuses one that is not.
+    app.buffer_page = "page".into();
     app.page_editor = compose("Title\nfresh body");
     app.page_saved_text = "Title\nstale".into();
     app.block_autosave_status = "saving".into();
@@ -1757,6 +1759,48 @@ fn reading_alpha() -> Ducktape {
     app.page_saved_text = "Alpha\nalpha body".into();
     app.buffer_page = "alpha".into();
     app
+}
+
+/// A FAILED LOAD MUST NOT LET THE BLANK PANE EAT THE PAGE IT NEVER OPENED.
+/// The optimistic switch moves `active_page` and blanks the buffer before the
+/// round trip. If the load then FAILS, `on failed` clears `loading` without
+/// clearing `connected` or putting `active_page` back — so the reader is left
+/// looking at an empty, fully typable document under the new page's title.
+///
+/// One keystroke there used to reach the 900ms save tick, which wrote
+/// `page_text(page_editor)` into `active_page`. Saving an empty document
+/// against a real page is a `RemoveBlock` for every line it had: the page would
+/// be destroyed by the act of failing to open it, and the reader would never
+/// have seen a line of it.
+#[test]
+fn a_failed_page_load_cannot_save_the_blank_pane_over_the_page() {
+    let mut app = reading_alpha();
+
+    let _ = app.__update(__DucktapeMessage::ChoosePage("beta".into()));
+    let _ = app.__update(__DucktapeMessage::Failed(backend::AppError {
+        message: "node blip".into(),
+        committed: false,
+    }));
+
+    // The pane is live and typable: this is the state the guard must survive,
+    // not one it can assume away.
+    assert!(!app.loading, "the failure released the load");
+    assert!(app.connected, "the failure did not disconnect");
+    assert_eq!(app.active_page, "beta");
+    assert!(
+        app.buffer_page.is_empty(),
+        "no load landed, so the buffer belongs to no page"
+    );
+
+    app.page_editor = compose("h");
+    let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
+
+    // The tick must refuse: the buffer is not Beta's.
+    assert_eq!(
+        app.block_autosave_status, "idle",
+        "a buffer that belongs to no page must never be saved into one"
+    );
+    assert!(app.pending_page.is_empty());
 }
 
 // A CLICK MUST REPAINT ON THE CLICK. The page load is several round trips; the

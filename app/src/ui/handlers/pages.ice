@@ -522,6 +522,16 @@ on external_url_failed(cause)
 // block's `every` line only exists while that drift does.
 on page_autosave_tick
   return if loading || empty(active_page) || mutation_phase != "idle"
+  // NEVER WRITE A BUFFER INTO A PAGE IT DOES NOT BELONG TO. `active_page` moves
+  // the instant the reader clicks; the buffer only becomes that page's when a
+  // load lands and stamps `buffer_page`. Between those two moments the pane is
+  // blank, and it stays typable if the load FAILS — `on failed` clears
+  // `loading` without clearing `connected` or putting `active_page` back. One
+  // keystroke into that blank pane used to reach this tick, and a save of an
+  // empty document against a real page is a `RemoveBlock` for every line it
+  // had: the page the reader never got to see would be destroyed by the act of
+  // failing to open it.
+  return if active_page != buffer_page
   // One op chain at a time: a multi-op save routinely outlives the 900ms
   // tick, and a second chain against the same page defeats the ordering
   // rule the awaited loop exists for (backend/document.rs).
