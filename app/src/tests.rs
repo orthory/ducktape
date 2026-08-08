@@ -1058,6 +1058,7 @@ fn ready_events_and_stale_searches_do_not_rehydrate_navigation() {
             generation: 8,
             hits: vec![backend::PageSearchHit {
                 page_id: "old".into(),
+                page_title: "Old page".into(),
                 block_id: "old-block".into(),
                 kind: "Text".into(),
                 text: "stale".into(),

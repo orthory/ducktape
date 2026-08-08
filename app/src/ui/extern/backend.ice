@@ -26,7 +26,7 @@ extern crate::backend
   BlockThreadListData(generation:i64, target:str, from:i64, threads:[PageCommentThread], total:i64, next_from:i64, has_more:bool)
   BlockCommentData(generation:i64, target:str, thread_id:str, from:i64, comments:[PageComment], next_from:i64, has_more:bool)
   BlockCommentsRefreshData(generation:i64, target:str, threads:[PageCommentThread], total:i64, threads_next_from:i64, threads_has_more:bool, thread_id:str, comments:[PageComment], comments_next_from:i64, comments_has_more:bool)
-  PageSearchHit(page_id:str, block_id:str, kind:str, text:str)
+  PageSearchHit(page_id:str, page_title:str, block_id:str, kind:str, text:str)
   PageSearchData(generation:i64, hits:[PageSearchHit])
   PaletteSearchData(generation:i64, chat_hits:[ChatSearchHit], page_hits:[PageSearchHit])
   // `refusal` is not a failure: the write was NOT attempted because carrying it

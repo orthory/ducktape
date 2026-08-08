@@ -381,12 +381,29 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
                                     size=13.0
                                     wrap=word-or-glyph
                                     @text-fg
-                                text hit.kind
+                                // The metadata line names the PAGE, then the
+                                // block kind — it read a bare `Text` before,
+                                // which is true of nearly every hit and told
+                                // the reader nothing about where the match is.
+                                // Same shape as components/pages.ice renders
+                                // this same PageSearchHit.
+                                row
                                   with
-                                    size=12.0
-                                    wrap=none
-                                    font=code
-                                    @text-muted
+                                    w=fill
+                                    gap=7.0
+                                    align=center
+                                  text hit.page_title
+                                    with
+                                      w=fill
+                                      size=12.0
+                                      font=code_medium
+                                      @text-muted
+                                  text hit.kind
+                                    with
+                                      size=12.0
+                                      wrap=none
+                                      font=code
+                                      @text-muted
                               active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                               hovered bg=row_hover text=fg
                               pressed bg=accent

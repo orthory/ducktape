@@ -1045,6 +1045,39 @@ pub(crate) fn descendants_of(pages: &[PageItem], root: &str) -> BTreeSet<String>
     }
 }
 
+/// Every hit joined to the TITLE of the page it lives in.
+///
+/// A hit row from the index names only its page id, so every surface that
+/// rendered one had to say something else instead: the Explorer printed the
+/// block text as BOTH the row's title and its snippet, the palette showed a
+/// bare block kind, and the pages search panel showed an opaque block id.
+/// None of the three said which page the match was in.
+pub(crate) fn titled_page_hits(
+    hits: Vec<pages::index::PageBlockRow>,
+    index: Vec<PageRow>,
+) -> Vec<PageSearchHit> {
+    let titles = index
+        .into_iter()
+        .map(|page| (page.id, page.title))
+        .collect::<BTreeMap<_, _>>();
+    hits.into_iter()
+        .map(|hit| PageSearchHit {
+            // An untitled page reads "Untitled" in the sidebar (`page_items`),
+            // so a hit must not read differently. A page id the index does not
+            // carry takes the same fallback rather than a blank run.
+            page_title: titles
+                .get(&hit.page_id)
+                .filter(|title| !title.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "Untitled".to_string()),
+            page_id: hit.page_id,
+            block_id: hit.block_id,
+            kind: block_kind_name(hit.kind).into(),
+            text: hit.text,
+        })
+        .collect()
+}
+
 pub async fn search_pages(
     rpc: String,
     page_id: String,
@@ -1069,17 +1102,19 @@ pub async fn search_pages(
         let pages::index::PagesViewReply::Hits(hits) = reply else {
             return Err("page search returned an invalid reply".into());
         };
+        if hits.is_empty() {
+            return Ok(PageSearchData {
+                generation,
+                hits: Vec::new(),
+            });
+        }
+        // The titles live one view over, in the same index — this is the very
+        // call the pages sidebar makes. Paid once per search that matched
+        // something, never on the empty keystrokes that dominate the palette.
+        let index = load_page_index(&rpc).await?;
         Ok(PageSearchData {
             generation,
-            hits: hits
-                .into_iter()
-                .map(|hit| PageSearchHit {
-                    page_id: hit.page_id,
-                    block_id: hit.block_id,
-                    kind: block_kind_name(hit.kind).into(),
-                    text: hit.text,
-                })
-                .collect(),
+            hits: titled_page_hits(hits, index),
         })
     }
     .await;

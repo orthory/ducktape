@@ -120,7 +120,13 @@ pub async fn search_workspace(
         hits.extend(pages.hits.into_iter().map(|hit| ExplorerHit {
             kind: "page".into(),
             code: "pg".into(),
-            title: hit.text.clone(),
+            // THE ROW'S HEADING IS THE PAGE, the block text is the snippet
+            // beneath it — the shape every other hit here already has (a
+            // message row heads with its author, a forge row with its item).
+            // Both were `hit.text`, so a page hit printed the same sentence
+            // twice and the only metadata it carried was the block KIND, which
+            // never said which page the match came from.
+            title: hit.page_title,
             snippet: hit.text,
             meta: format!("pages · {}", hit.kind),
             target: hit.page_id,

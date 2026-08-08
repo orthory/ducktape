@@ -266,6 +266,10 @@ pub struct BlockCommentsRefreshData {
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PageSearchHit {
     pub page_id: String,
+    /// The title of the page the block lives in. The index's hit row carries
+    /// only `page_id`, so without this join no surface could name the page a
+    /// match came from — see [`titled_page_hits`].
+    pub page_title: String,
     pub block_id: String,
     pub kind: String,
     pub text: String,
