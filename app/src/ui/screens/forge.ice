@@ -356,7 +356,14 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     // The reader's three states, each with its own true
                     // reason. Nothing here claims a file is empty.
                     col w=fill
-                      if empty(file_path)
+                      // A TREE WITH NOTHING IN IT IS NOT A TREE TO PICK FROM.
+                      // The sidebar already says "Nothing committed on this
+                      // branch yet"; telling the reader to pick a file from it
+                      // in the same breath sends them looking for something
+                      // that screen has just said does not exist.
+                      if empty(file_path) && empty(tree_entries)
+                        ForgeCodeEmpty name="" note="Nothing is committed on this branch yet, so there is no file to read."
+                      if empty(file_path) && !empty(tree_entries)
                         ForgeCodeEmpty name="" note="Pick a file from the tree to read it."
                       if !empty(file_path) && file_binary
                         ForgeCodeEmpty
@@ -390,14 +397,14 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 ForgeTrackerList
                   with
                     items=filter_forge_items(items, "issue")
-                    empty_message="No issues — an issue opened against this repo appears here."
+                    empty_message="No issues — this app reads the tracker but cannot open one yet."
                   forward
                     forge_open_item
               _
                 ForgeTrackerList
                   with
                     items=filter_forge_items(items, "pr")
-                    empty_message="No pull requests — a PR pushed to this repo appears here."
+                    empty_message="No pull requests — an agent run opens one when it delivers its work."
                   forward
                     forge_open_item
             // NO GATE NOTE HERE. `ForgeGateNote` told a resident the
