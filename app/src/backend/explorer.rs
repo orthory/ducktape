@@ -34,42 +34,76 @@ pub async fn load_explorer(rpc: String, generation: i64) -> Result<ExplorerData,
     async {
         let rpc = rpc_client(&rpc)?;
         let rows = rpc.blocks(100).await?;
-        let mut blocks = Vec::with_capacity(rows.len());
-        let mut ops = Vec::new();
-        for row in &rows {
-            let height = row["height"].as_i64().unwrap_or(0);
-            let row_ops = row["ops"].as_array().cloned().unwrap_or_default();
-            blocks.push(ExplorerBlock {
-                height,
-                hash: short_digest(row["hash"].as_str().unwrap_or_default()),
-                commit: short_digest(row["commit_hash"].as_str().unwrap_or_default()),
-                op_count: count_i64(row_ops.len()),
-            });
-            for op in row_ops {
-                ops.push(ExplorerOp {
-                    height,
-                    proposer: short_digest(op["proposer"].as_str().unwrap_or_default()),
-                    target: op["target"].as_str().unwrap_or_default().to_string(),
-                    disposition: op["disposition"].as_str().unwrap_or_default().to_string(),
-                    op_hash: short_digest(op["op_hash"].as_str().unwrap_or_default()),
-                    payload: explorer_payload(&op["payload"]),
-                    trace: explorer_trace(op["operations"].as_array()),
-                });
-            }
-        }
-        blocks.reverse();
-        ops.reverse();
-        Ok(ExplorerData {
-            generation,
-            blocks,
-            ops,
-        })
+        Ok(explorer_window(generation, &rows))
     }
     .await
     .map_err(|message: String| HydrationError {
         generation,
         message: user_error(message),
     })
+}
+
+/// The `GET /v1/blocks` rows as the screen holds them — newest first, and
+/// OP-CARRYING ONLY.
+///
+/// The endpoint is NOT uniformly filtered, which is the whole reason this gate
+/// lives here. Three of the four writers of a block row drop a block that
+/// carried nothing: `bin/noded`'s projection stores `record: None` when
+/// `ops.is_empty()`, `bin/node`'s boot fold re-runs the identical gate, and the
+/// embedded daemon lane is one-op-per-block by construction. The fourth does
+/// not. A node that follows from a checkpoint writes ONE `boundary_block_row`
+/// (`bin/node/src/explorer.rs`, applied in `replica/park.rs`) at its ascension
+/// tip, with `hash: ""` and `ops: []` — the boundary it verified, not a block
+/// it folded. That is not an exotic lane: `bin/node/src/main.rs` routes every
+/// key that is neither a validator nor seated by the checkpoint into
+/// `replica::run`, which is every joined member until promotion, and on a fresh
+/// join that row is the ONLY row until the first op-carrying block finalizes.
+///
+/// Displayed, it is a row that contradicts its own screen: a blank hash column
+/// and `0 ops` directly under a subtitle saying these are the blocks that
+/// carried operations, and clicking it opens an empty detail pane, because
+/// `explorer_ops_at` has nothing to hand it. Its two real fields are not lost
+/// by dropping it — the height and the root hash are what the titlebar's status
+/// card already prints (`height_label` and `app-hash`). The node keeps writing
+/// the row: it is a truthful record of the one thing a follower observed, and
+/// it carries the blocks watermark (`IndexStore::apply_block_record`). The
+/// reader of a set is the one that has to agree with the name it prints.
+pub(crate) fn explorer_window(generation: i64, rows: &[serde_json::Value]) -> ExplorerData {
+    let mut blocks = Vec::with_capacity(rows.len());
+    let mut ops = Vec::new();
+    for row in rows {
+        let height = row["height"].as_i64().unwrap_or(0);
+        let row_ops = row["ops"].as_array().map(Vec::as_slice).unwrap_or_default();
+        // the follower's boundary marker (and any future op-less row): not a
+        // block that carried operations, so not in a list that says it is.
+        if row_ops.is_empty() {
+            continue;
+        }
+        blocks.push(ExplorerBlock {
+            height,
+            hash: short_digest(row["hash"].as_str().unwrap_or_default()),
+            commit: short_digest(row["commit_hash"].as_str().unwrap_or_default()),
+            op_count: count_i64(row_ops.len()),
+        });
+        for op in row_ops {
+            ops.push(ExplorerOp {
+                height,
+                proposer: short_digest(op["proposer"].as_str().unwrap_or_default()),
+                target: op["target"].as_str().unwrap_or_default().to_string(),
+                disposition: op["disposition"].as_str().unwrap_or_default().to_string(),
+                op_hash: short_digest(op["op_hash"].as_str().unwrap_or_default()),
+                payload: explorer_payload(&op["payload"]),
+                trace: explorer_trace(op["operations"].as_array()),
+            });
+        }
+    }
+    blocks.reverse();
+    ops.reverse();
+    ExplorerData {
+        generation,
+        blocks,
+        ops,
+    }
 }
 
 /// First 12 hex chars of a digest — the explorer's display form.
@@ -94,8 +128,16 @@ fn explorer_payload(payload: &serde_json::Value) -> String {
     preview
 }
 
-/// The dispatch trace summary: `module(+msgs/+events)` per hop.
-fn explorer_trace(operations: Option<&Vec<serde_json::Value>>) -> String {
+/// The dispatch trace summary: one hop per module the op reached, each naming
+/// what it emitted. The counts come straight off `host::DispatchRecord` —
+/// `emitted_msgs` is "count of follow-up `Msg`s this dispatch emitted (the
+/// causal fan-out)", `emitted_events` "count of observability `Event`s" — so
+/// the units are spelled the way the fields are named. This rendered
+/// `chat(+0m/+0e)` before, a private shorthand nothing on the screen expanded:
+/// `m`/`e` are not words, and a reader who has not read `crates/kernel/host`
+/// has no way to recover them. The counts join their nouns through `plural`,
+/// the app's one count-label seam, so `1 msg` never renders as `1 msgs`.
+pub(crate) fn explorer_trace(operations: Option<&Vec<serde_json::Value>>) -> String {
     let Some(operations) = operations else {
         return String::new();
     };
@@ -105,7 +147,9 @@ fn explorer_trace(operations: Option<&Vec<serde_json::Value>>) -> String {
             let module = op["module"].as_str().unwrap_or("?");
             let msgs = op["emitted_msgs"].as_i64().unwrap_or(0);
             let events = op["emitted_events"].as_i64().unwrap_or(0);
-            format!("{module}(+{msgs}m/+{events}e)")
+            let emitted_msgs = plural(msgs, "msg".into(), "msgs".into());
+            let emitted_events = plural(events, "event".into(), "events".into());
+            format!("{module} · {emitted_msgs} · {emitted_events}")
         })
         .collect::<Vec<_>>()
         .join(" → ")

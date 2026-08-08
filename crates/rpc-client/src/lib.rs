@@ -246,8 +246,11 @@ impl Client {
         decode_json(response).await
     }
 
-    /// Read the recent non-empty block rows (`GET /v1/blocks`), oldest-first
-    /// — the explorer surface. Rows are the node's own JSON projection.
+    /// Read the recent block rows (`GET /v1/blocks`), oldest-first — the
+    /// explorer surface. Rows are the node's own JSON projection, and they are
+    /// NOT all op-carrying: a node following from a checkpoint records its
+    /// ascension boundary as a row with an empty `hash` and no `ops`. Filter
+    /// for what you present (the app's `explorer_window` does).
     pub async fn blocks(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
         let mut url = self.url("v1/blocks")?;
         url.set_query(Some(&format!("limit={limit}")));

@@ -510,10 +510,21 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
         pr=24.0
         pt=22.0
         gap=16.0
+      // THE LEDGER IS NOT THE CHAIN, and this line used to say it was. It
+      // claimed "the blocks this node verified for itself" while the rows
+      // below are the node's op-carrying blocks ONLY: `GET /v1/blocks` serves
+      // the derived-index rows, and `bin/noded`'s projection stores `None` for
+      // a block whose members are all the `consensus.nop` heartbeat — "a pure
+      // nop/idle block — the explorer hides it". Measured on the demo node:
+      // `/v1/status` height 419718, and the hundred rows `/v1/blocks` served
+      // spanned heights 102907-366045 — a hundred-row "recent" window covering
+      // 263k heights, which no lag explains. A reader who compares the newest
+      // row against the height in the titlebar concludes the node is fifty
+      // thousand blocks behind. The list was right; the sentence was wrong.
       ScreenTitle
         with
           title="Explorer"
-          detail="Search everything this workspace has recorded, or read the blocks this node verified for itself — newest first, each one openable for the ops it carried."
+          detail="Search everything this workspace has recorded, or read the blocks that carried operations — an idle block keeps no row, so heights skip — newest first, each one openable for the ops it carried."
       // THE QUERY BOX, on the artifact's own 1.5px ink outline.
       box w=fill max-w=860.0
         row
@@ -687,10 +698,14 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
             title="Not connected"
             description="Click the network name in the titlebar to pick or reconnect a network."
       if connected && empty(hits) && empty(blocks) && !loading && empty(trim(query))
+        // Same set, same words as the subtitle above. This plate already said
+        // "non-empty", which was right and was the only place on the screen
+        // that knew — two dialects for one set is how the subtitle drifted
+        // without anyone noticing.
         EmptyState
           with
             title="No blocks yet"
-            description="Non-empty blocks appear here as they finalize."
+            description="Blocks that carried operations appear here as they finalize."
       // The ledger itself, which the plate above replaces rather than sits
       // over: with the node down these are blocks from a chain nobody read.
       if connected && empty(hits) && !empty(blocks)
@@ -773,6 +788,35 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                                 @text-fg
                             StatusBadge label=op.disposition
                             space w=fill
+                            // TWO HASHES, ONE SCREEN, NEITHER NAMED. The list
+                            // on the left prints `block.hash` (the frame id);
+                            // this prints `op.op_hash` (the sha256 of the op
+                            // payload — `project_root_op` keys it by
+                            // `put_chunk`, which is also the `GET
+                            // /v1/files/blob/{op_hash}` key). They never match,
+                            // and an unlabelled hex that changes when you open
+                            // a row reads as a contradiction. The label form is
+                            // the `by` beside the proposer, one row down.
+                            //
+                            // `hash`, not `op`: this pane sits beside a list
+                            // whose third column counts `1 op` / `3 ops`, and
+                            // one screen must not spend the same word on a
+                            // count noun and a field name. Inside an op card
+                            // `hash` can only mean this op's, and the block
+                            // hash it could be confused with carries no label
+                            // to collide with. The row costs 14px more than
+                            // `op` did and has room: at the 1040 minimum the
+                            // pane is 1040 − 74 rail − 48 screen padding − 340
+                            // list − 10 gap − 18 box − 18 card = 532px, against
+                            // ~293px of `wrap=none` intrinsics (target, badge,
+                            // label, 13-char digest, four 8px gaps). Arithmetic,
+                            // not a screenshot — this branch was not run.
+                            text "hash"
+                              with
+                                size=11.0
+                                wrap=none
+                                font=code_medium
+                                @text-muted
                             text op.op_hash
                               with
                                 size=12.0
@@ -796,12 +840,30 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                                 wrap=none
                                 font=code
                                 @text-muted
+                          // `chat(+0m/+0e)` sat here naked. `dispatch` is the
+                          // word this screen's own "Select a block" plate
+                          // already uses for it ("Its operations and dispatch
+                          // traces appear here"); the units come out of
+                          // `explorer_trace` now instead of being a legend the
+                          // reader has to have been told.
                           if !empty(op.trace)
-                            text op.trace
+                            row
                               with
-                                size=12.0
-                                font=code
-                                @text-muted
+                                w=fill
+                                gap=8.0
+                                align=start
+                              text "dispatch"
+                                with
+                                  size=11.0
+                                  wrap=none
+                                  font=code_medium
+                                  @text-muted
+                              text op.trace
+                                with
+                                  w=fill
+                                  size=12.0
+                                  font=code
+                                  @text-muted
                           text op.payload size=13.5 @text-fg
 
 // ONE BLOCK IN THE CHAIN LIST, AND WHETHER IT IS THE ONE YOU OPENED. The row
