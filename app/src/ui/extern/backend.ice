@@ -117,8 +117,9 @@ extern crate::backend
   sync connection_degraded(status:str) -> bool
   sync titlebar_inset() -> f64
   sync palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
+  sync topmost_overlay(palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, channel_settings_open:bool, forge_repo_menu:bool) -> str
   sync escape_target(logical:key, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, channel_settings_open:bool, forge_repo_menu:bool) -> str
-  sync content_scroll_step(logical:key, modifiers:key-modifiers) -> f64
+  sync content_scroll_step(logical:key, modifiers:key-modifiers, overlay:str) -> f64
   NavItem(id:str, title:str, icon:str, badge:i64, active:bool, live:bool)
   FsEntry(path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
