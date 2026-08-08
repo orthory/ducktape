@@ -218,14 +218,24 @@ fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
         object: String::new(),
     };
 
+    let human = MemberRow {
+        key: "aa".into(),
+        label: "aa".into(),
+        is_agent: false,
+        role: "validator".into(),
+        is_this_node: false,
+        model: String::new(),
+        live: true,
+    };
+
     // Nothing there: the plate on each screen says it in words.
-    assert_eq!(members_summary(true, 0, 0), "");
+    assert_eq!(members_summary(true, Vec::new()), "");
     assert_eq!(agents_summary(true, Vec::new()), "");
     assert_eq!(proposals_summary(true, Vec::new()), "");
     assert_eq!(fs_counts_summary(true, true, Vec::new()), "");
 
     // Something there: every subtitle speaks, zeros included.
-    assert_eq!(members_summary(true, 1, 0), "1 validator · 0 residents");
+    assert_eq!(members_summary(true, vec![human]), "1 human · 0 agents");
     assert_eq!(
         agents_summary(true, vec![agent(false)]),
         "1 agent · 0 working"
