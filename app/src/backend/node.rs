@@ -214,7 +214,7 @@ pub fn split_log_line(line: String) -> LogParts {
 
 /// The node's consensus/storage facts — everything `/v1/status` publishes that
 /// the two-field `Status` type drops, plus the mesh sample's live/total.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct NodeFacts {
     pub generation: i64,
     /// The daemon's build version, verbatim off `/v1/status` (its own
@@ -246,27 +246,34 @@ pub struct NodeFacts {
 /// Load the node facts from the raw status document.
 /// A section the node omits for its role stays `None` — the status projection
 /// leaves it out rather than filling it with misleading numbers, and so do we.
+/// The facts a `/v1/status` document carries — the ONE reader, shared by the
+/// HTTP load and the pushed `status` snapshot, for the same reason
+/// [`peer_rows`] is shared.
+fn node_facts(status: &serde_json::Value, generation: i64) -> NodeFacts {
+    let operations = &status["operations"];
+    let consensus = &operations["consensus"];
+    NodeFacts {
+        generation,
+        version: status["version"].as_str().unwrap_or_default().to_string(),
+        root_hash: status["root_hash"].as_str().unwrap_or_default().to_string(),
+        view: consensus["view"].as_i64(),
+        quorum: consensus["quorum"].as_i64(),
+        reachable_validators: consensus["reachable_validators"].as_i64(),
+        last_finalized_at: operations["last_finalized_at"]
+            .as_i64()
+            .unwrap_or(UNMEASURED),
+        checkpoint_height: operations["storage"]["checkpoint_height"]
+            .as_i64()
+            .unwrap_or(UNMEASURED),
+        height: served_height(&status["height"]),
+    }
+}
+
 pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, HydrationError> {
     async {
         let client = rpc_client(&rpc)?;
         let status = client.status_json().await?;
-        let operations = &status["operations"];
-        let consensus = &operations["consensus"];
-        Ok(NodeFacts {
-            generation,
-            version: status["version"].as_str().unwrap_or_default().to_string(),
-            root_hash: status["root_hash"].as_str().unwrap_or_default().to_string(),
-            view: consensus["view"].as_i64(),
-            quorum: consensus["quorum"].as_i64(),
-            reachable_validators: consensus["reachable_validators"].as_i64(),
-            last_finalized_at: operations["last_finalized_at"]
-                .as_i64()
-                .unwrap_or(UNMEASURED),
-            checkpoint_height: operations["storage"]["checkpoint_height"]
-                .as_i64()
-                .unwrap_or(UNMEASURED),
-            height: served_height(&status["height"]),
-        })
+        Ok(node_facts(&status, generation))
     }
     .await
     .map_err(|message: String| HydrationError {
@@ -342,27 +349,148 @@ pub struct PeersData {
     pub peers: Vec<PeerRow>,
 }
 
+/// One pushed overview sample, as the console consumes it.
+///
+/// Each frame carries ONE half — the node samples the two topics
+/// independently — so the flags say which half this frame actually answered
+/// and the view keeps the other. That is deliberate over buffering both here:
+/// if one topic is refused (a daemon with no metrics exposition serves no
+/// peers), the other must still go live rather than wait forever for a
+/// partner that is never coming.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NodeOverview {
+    pub peers_answered: bool,
+    pub peers: Vec<PeerRow>,
+    pub facts_answered: bool,
+    pub facts: NodeFacts,
+}
+
+/// THE NODE'S OWN TWO PLANES, PUSHED.
+///
+/// Peers and node status have no op behind them — nothing in the index names
+/// a mesh connection or a checkpoint height — so no module stream can carry
+/// them, and they were the console's last two cold surfaces, refreshed only
+/// by a connect or a tab switch.
+///
+/// The SUBSCRIPTION is the cost control, which is why this is a stream and not
+/// a timer. `/v1/peers` composes its sample by encoding the node's whole
+/// metrics registry (8144 lines, 485 KB on a demo node) and parsing ten
+/// families back out — measured at ~10 ms a call. The node re-samples only
+/// while this subscription is held, so the Ice `when` gate on the overview tab
+/// IS the whole budget: leave the tab and the sampling stops, at the source.
+///
+/// Reconnects on its own, like the log stream beside it, so a node restart
+/// re-lights the table without a tab bounce.
+pub fn node_overview(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeOverview> {
+    struct State {
+        rpc: String,
+        stream: Option<
+            iced::futures::stream::BoxStream<
+                'static,
+                ducktape_rpc::Result<ducktape_rpc::NodeSnapshot>,
+            >,
+        >,
+        retry_attempt: u32,
+    }
+    iced::futures::stream::unfold(
+        State {
+            rpc,
+            stream: None,
+            retry_attempt: 0,
+        },
+        |mut state| async move {
+            loop {
+                if state.stream.is_none() && state.retry_attempt > 0 {
+                    tokio::time::sleep(retry_delay(state.retry_attempt)).await;
+                }
+                if state.stream.is_none() {
+                    let Ok(rpc) = rpc_client(&state.rpc) else {
+                        state.retry_attempt = state.retry_attempt.saturating_add(1);
+                        continue;
+                    };
+                    match rpc.node_snapshots().await {
+                        Ok(stream) => state.stream = Some(stream),
+                        Err(_) => {
+                            state.retry_attempt = state.retry_attempt.saturating_add(1);
+                            continue;
+                        }
+                    }
+                }
+                match state
+                    .stream
+                    .as_mut()
+                    .expect("stream initialized")
+                    .next()
+                    .await
+                {
+                    Some(Ok(snapshot)) => {
+                        state.retry_attempt = 0;
+                        return Some((overview_from(snapshot), state));
+                    }
+                    // A dropped socket is not a reason to blank the table: the
+                    // rows on screen were true when they were sampled. Rebuild
+                    // the subscription and keep them until a fresher sample
+                    // replaces them.
+                    Some(Err(_)) | None => {
+                        state.stream = None;
+                        state.retry_attempt = state.retry_attempt.saturating_add(1);
+                    }
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
+/// One snapshot, read with the SAME readers the HTTP loads use.
+fn overview_from(snapshot: ducktape_rpc::NodeSnapshot) -> NodeOverview {
+    match snapshot {
+        ducktape_rpc::NodeSnapshot::Peers(view) => NodeOverview {
+            peers_answered: true,
+            peers: peer_rows(&view),
+            ..NodeOverview::default()
+        },
+        ducktape_rpc::NodeSnapshot::Status(status) => NodeOverview {
+            facts_answered: true,
+            // the generation is the HTTP loads' stale-reply guard; a PUSH
+            // answers no request, so there is nothing for it to be stale
+            // against. `-1` is the app's own "not a reply" reading.
+            facts: node_facts(&status, -1),
+            ..NodeOverview::default()
+        },
+    }
+}
+
+/// The peer rows a `/v1/peers` document carries — the ONE reader, shared by
+/// the HTTP load and the pushed `peers` snapshot. A second copy of these key
+/// names is exactly how the table came to read three the node never served.
+///
+/// THE KEYS THE NODE ACTUALLY SERVES. This read `key`/`height`/`live` and
+/// `bin/noded/src/peers.rs` serves none of the three, so every row rendered a
+/// blank name, a zero, and an offline dot — for peers that were connected.
+fn peer_rows(reply: &serde_json::Value) -> Vec<PeerRow> {
+    reply["peers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|peer| PeerRow {
+            key: short_label(peer["peer"].as_str().unwrap_or_default()),
+            role: peer["role"].as_str().unwrap_or_default().to_string(),
+            live: peer["connected"].as_bool().unwrap_or(false),
+        })
+        .collect()
+}
+
 /// Load the peers standing view.
 pub async fn load_peers(rpc: String, generation: i64) -> Result<PeersData, HydrationError> {
     async {
         let rpc = rpc_client(&rpc)?;
         let reply = rpc.peers().await?;
-        let peers = reply["peers"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            // THE KEYS THE NODE ACTUALLY SERVES. This read `key`/`height`/`live`
-            // and `bin/noded/src/peers.rs` serves none of the three, so every
-            // row rendered a blank name, a zero, and an offline dot — for peers
-            // that were connected.
-            .map(|peer| PeerRow {
-                key: short_label(peer["peer"].as_str().unwrap_or_default()),
-                role: peer["role"].as_str().unwrap_or_default().to_string(),
-                live: peer["connected"].as_bool().unwrap_or(false),
-            })
-            .collect();
-        Ok(PeersData { generation, peers })
+        Ok(PeersData {
+            generation,
+            peers: peer_rows(&reply),
+        })
     }
     .await
     .map_err(|message: String| HydrationError {

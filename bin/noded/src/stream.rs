@@ -383,6 +383,25 @@ pub enum TailItem {
         time_ms: u64,
         text: String,
     },
+    /// one direct-peer sample — the SAME view `GET /v1/peers` composes, pushed
+    /// per heartbeat tick while the `peers` topic is subscribed. `time_ms` is
+    /// the server-side sample instant, the denominator a client needs to derive
+    /// per-peer message rates from the cumulative counters inside.
+    ///
+    /// distinct from [`Self::Metrics`] under `untagged` by its required
+    /// `peers` field, which no other variant carries.
+    Peers {
+        time_ms: u64,
+        peers: crate::peers::PeersView,
+    },
+    /// one node-status snapshot — the same projection `GET /v1/status` serves.
+    /// Free to sample: it is a read of the cell the owning actor publishes at
+    /// each boundary, with no registry encode behind it (unlike its two
+    /// sibling snapshot topics). Distinguished under `untagged` by `status`.
+    Status {
+        time_ms: u64,
+        status: Box<crate::NodeStatus>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -842,6 +861,16 @@ enum TopicState {
     Metrics {
         sampled_ms: u64,
     },
+    /// the peer-sample SNAPSHOT topic, same contract as [`Self::Metrics`]:
+    /// every wakeup re-composes the whole sample, so the cursor is bookkeeping
+    /// and the topic never lags.
+    Peers {
+        sampled_ms: u64,
+    },
+    /// the node-status SNAPSHOT topic, same contract again.
+    Status {
+        sampled_ms: u64,
+    },
 }
 
 impl TopicState {
@@ -852,7 +881,9 @@ impl TopicState {
             | Self::RunOutput { seq, .. }
             | Self::Term { seq, .. }
             | Self::TermCommand { seq, .. } => seq.to_string(),
-            Self::Metrics { sampled_ms } => sampled_ms.to_string(),
+            Self::Metrics { sampled_ms }
+            | Self::Peers { sampled_ms }
+            | Self::Status { sampled_ms } => sampled_ms.to_string(),
         }
     }
 }
@@ -904,7 +935,10 @@ impl TopicState {
             Wake::RunOutput => matches!(self, Self::RunOutput { .. }),
             Wake::Term => matches!(self, Self::Term { .. }),
             Wake::TermCommand => matches!(self, Self::TermCommand { .. }),
-            Wake::Tick => matches!(self, Self::Metrics { .. }),
+            Wake::Tick => matches!(
+                self,
+                Self::Metrics { .. } | Self::Peers { .. } | Self::Status { .. }
+            ),
         }
     }
 }
@@ -1472,6 +1506,10 @@ const FILES_WATCH_TOPIC: &str = "files:watch";
 const LOGS_TOPIC: &str = "logs";
 /// the metrics-exposition snapshot topic.
 const METRICS_TOPIC: &str = "metrics";
+/// the direct-peer snapshot topic — the same sample `GET /v1/peers` composes.
+const PEERS_TOPIC: &str = "peers";
+/// the node-status snapshot topic — the same projection `GET /v1/status` serves.
+const STATUS_TOPIC: &str = "status";
 const MODULE_PREFIX: &str = "module:";
 const RUN_OUTPUT_PREFIX: &str = "run-output:";
 /// checked before [`TERM_PREFIX`] for readability only — the two diverge at the
@@ -1502,6 +1540,10 @@ enum Topic<'a> {
     Term(&'a str),
     /// the Prometheus exposition, re-sampled per heartbeat.
     Metrics,
+    /// the direct-peer sample, re-sampled per heartbeat.
+    Peers,
+    /// the node-status projection, re-sampled per heartbeat.
+    Status,
 }
 
 /// what a caller must have proved to hold a topic handle.
@@ -1541,6 +1583,8 @@ impl<'a> Topic<'a> {
             FILES_WATCH_TOPIC => Some(Self::FilesWatch),
             LOGS_TOPIC => Some(Self::Logs),
             METRICS_TOPIC => Some(Self::Metrics),
+            PEERS_TOPIC => Some(Self::Peers),
+            STATUS_TOPIC => Some(Self::Status),
             _ => None,
         }
     }
@@ -1569,6 +1613,8 @@ impl<'a> Topic<'a> {
             Self::FilesWatch => Admission::Public,
             Self::Logs => Admission::Public,
             Self::Metrics => Admission::Public,
+            Self::Peers => Admission::Public,
+            Self::Status => Admission::Public,
             Self::RunOutput(_) => Admission::Workspace,
             Self::TermCommand(_) => Admission::Workspace,
             Self::Term(_) => Admission::Workspace,
@@ -1683,6 +1729,8 @@ fn prepare_topic(
         Topic::TermCommand(session) => prepare_term_command(topic, session, resume),
         Topic::Term(session) => prepare_term(topic, session, resume),
         Topic::Metrics => prepare_metrics(),
+        Topic::Peers => prepare_peers(),
+        Topic::Status => prepare_status(),
     }
 }
 
@@ -1791,6 +1839,18 @@ fn prepare_metrics() -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
     Ok((TopicState::Metrics { sampled_ms: 0 }, None))
 }
 
+/// same snapshot contract as [`prepare_metrics`]: no replay, no resume point.
+#[allow(clippy::result_large_err)]
+fn prepare_peers() -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
+    Ok((TopicState::Peers { sampled_ms: 0 }, None))
+}
+
+/// same snapshot contract again.
+#[allow(clippy::result_large_err)]
+fn prepare_status() -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
+    Ok((TopicState::Status { sampled_ms: 0 }, None))
+}
+
 /// the seq a ring-backed topic starts from: the caller's resume cursor, or the
 /// bottom of the ring.
 #[allow(clippy::result_large_err)]
@@ -1859,7 +1919,19 @@ async fn catch_up(
         // lane (an await); every cursor-scan topic stays on the sync path.
         let result = match state {
             TopicState::Metrics { .. } => catch_up_metrics(&topic, state, handle).await,
-            _ => catch_up_topic(&topic, state, store.as_ref(), &hub),
+            TopicState::Peers { .. } => catch_up_peers(&topic, state, handle).await,
+            TopicState::Status { .. } => catch_up_status(&topic, state, handle).await,
+            // EVERY cursor-scan variant named, no `_`. A fourth snapshot topic
+            // must fail the build here rather than fall through to the sync
+            // path — where the natural "fix" is the do-nothing arm in
+            // `catch_up_topic`, giving a topic that subscribes cleanly and
+            // never delivers a frame. That is exactly what `files:watch` was.
+            TopicState::Module { .. }
+            | TopicState::FilesWatch { .. }
+            | TopicState::Logs { .. }
+            | TopicState::RunOutput { .. }
+            | TopicState::Term { .. }
+            | TopicState::TermCommand { .. } => catch_up_topic(&topic, state, store.as_ref(), &hub),
         };
         if !send_frames(socket, result.frames).await {
             return false;
@@ -1898,7 +1970,9 @@ fn catch_up_topic(
         }
         // routed to catch_up_metrics by the caller (it needs the actor lane,
         // an await this sync path cannot make) — nothing owed here.
-        TopicState::Metrics { .. } => CatchUpResult::keep(Vec::new()),
+        TopicState::Metrics { .. } | TopicState::Peers { .. } | TopicState::Status { .. } => {
+            CatchUpResult::keep(Vec::new())
+        }
     }
 }
 
@@ -2252,6 +2326,64 @@ async fn catch_up_metrics(
         topic: topic.to_string(),
         cursor: time_ms.to_string(),
         item: TailItem::Metrics { time_ms, text },
+    }])
+}
+
+/// re-compose the direct-peer sample, through the SAME two sources
+/// `GET /v1/peers` reads and in the same order: the live exposition for the
+/// connection and traffic counters, the last-published standing for the
+/// committed facts (roles, height, epoch). No actor round-trip, so a node
+/// stuck in a sync stage keeps answering — the whole reason the standing is
+/// published into a cell rather than asked for.
+///
+/// A SNAPSHOT, not a delta: peers have no op behind them and nothing in the
+/// index names them, so there is no cursor to resume and no backlog to replay.
+/// That is why this rides the heartbeat instead of a block wake.
+async fn catch_up_peers(topic: &str, state: &mut TopicState, handle: &NodeHandle) -> CatchUpResult {
+    let TopicState::Peers { sampled_ms } = state else {
+        return CatchUpResult::keep(Vec::new());
+    };
+    let cell = handle.status_cell();
+    let Some(exposition) = cell.exposition() else {
+        return CatchUpResult::drop(vec![unavailable(
+            topic,
+            "no metrics exposition is wired on this daemon",
+        )]);
+    };
+    let standing = cell.peers_standing();
+    let time_ms = unix_millis();
+    *sampled_ms = time_ms;
+    let peers =
+        crate::peers::peers_from_exposition(&exposition, time_ms, standing.height, standing.epoch)
+            .with_roles(&standing.validators, &standing.residents);
+    CatchUpResult::keep(vec![ServerFrame::Tail {
+        topic: topic.to_string(),
+        cursor: time_ms.to_string(),
+        item: TailItem::Peers { time_ms, peers },
+    }])
+}
+
+/// re-read the published node-status projection. The CHEAP snapshot topic:
+/// `current()` clones the cell the owning actor swapped at its last boundary,
+/// so there is no registry encode and no actor round-trip here at all. It
+/// never drops the topic — a node that has published nothing yet has a
+/// zeroed status, which is the honest pre-boundary answer and the same one
+/// `GET /v1/status` gives.
+async fn catch_up_status(
+    topic: &str,
+    state: &mut TopicState,
+    handle: &NodeHandle,
+) -> CatchUpResult {
+    let TopicState::Status { sampled_ms } = state else {
+        return CatchUpResult::keep(Vec::new());
+    };
+    let time_ms = unix_millis();
+    *sampled_ms = time_ms;
+    let status = Box::new(handle.status_cell().current());
+    CatchUpResult::keep(vec![ServerFrame::Tail {
+        topic: topic.to_string(),
+        cursor: time_ms.to_string(),
+        item: TailItem::Status { time_ms, status },
     }])
 }
 
@@ -2898,6 +3030,11 @@ mod tests {
             (Topic::FilesWatch, Admission::Public),
             (Topic::Logs, Admission::Public),
             (Topic::Metrics, Admission::Public),
+            // public for the SAME reason metrics is, and no weaker: the
+            // identical sample already leaves this node over unauthenticated
+            // `GET /v1/peers`, which this change does not touch.
+            (Topic::Peers, Admission::Public),
+            (Topic::Status, Admission::Public),
             (Topic::RunOutput("r1"), Admission::Workspace),
             (Topic::TermCommand("s1"), Admission::Workspace),
             (Topic::Term("s1"), Admission::Workspace),
@@ -2911,6 +3048,8 @@ mod tests {
         assert_eq!(Topic::parse("files:watch"), Some(Topic::FilesWatch));
         assert_eq!(Topic::parse("logs"), Some(Topic::Logs));
         assert_eq!(Topic::parse("metrics"), Some(Topic::Metrics));
+        assert_eq!(Topic::parse("peers"), Some(Topic::Peers));
+        assert_eq!(Topic::parse("status"), Some(Topic::Status));
         assert_eq!(Topic::parse("run-output:r1"), Some(Topic::RunOutput("r1")));
         assert_eq!(Topic::parse("term:s1"), Some(Topic::Term("s1")));
         // `term-cmd:` is its own family and never decodes as a `term:` session
@@ -3242,6 +3381,7 @@ mod tests {
             seq: 0,
         };
         let metrics = TopicState::Metrics { sampled_ms: 0 };
+        let peers = TopicState::Peers { sampled_ms: 0 };
         let term = TopicState::Term {
             session: "s".into(),
             seq: 0,
@@ -3263,6 +3403,12 @@ mod tests {
         // it, and no other topic class re-scans on the heartbeat tick.
         assert!(metrics.wakes_on(Wake::Tick) && !metrics.wakes_on(Wake::Block));
         assert!(!metrics.wakes_on(Wake::Logs) && !metrics.wakes_on(Wake::RunOutput));
+        // peers is the second snapshot topic and rides the SAME clock: a block
+        // wake must never re-sample it, or an idle chain's 2 Hz of nop fillers
+        // becomes 2 Hz of whole-registry encodes.
+        assert!(peers.wakes_on(Wake::Tick) && !peers.wakes_on(Wake::Block));
+        assert!(!peers.wakes_on(Wake::Logs) && !peers.wakes_on(Wake::RunOutput));
+        assert!(peers.wakes_on(Wake::All));
         for state in [&module, &files, &logs, &run, &term, &term_cmd] {
             assert!(state.wakes_on(Wake::All));
             assert!(!state.wakes_on(Wake::Tick));
@@ -3312,6 +3458,80 @@ mod tests {
             }
             other => panic!("expected one metrics tail frame, got {other:?}"),
         }
+    }
+
+    /// THE TOPIC MUST ACTUALLY DELIVER A PEER. `files:watch` subscribed
+    /// cleanly for months and never produced a frame, because nothing asserted
+    /// the ITEM — only that the subscribe was admitted. So this reads the row
+    /// out of the frame and checks the two things composition can drop: the
+    /// counters, which come from the exposition, and the role, which comes
+    /// from the separately-published standing and is the half a lane that
+    /// cannot read the valset legitimately leaves absent.
+    #[tokio::test]
+    async fn peers_catch_up_delivers_a_stamped_sample_through_both_sources() {
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        handle.status_cell().wire_exposition(|| {
+            "network_tracker_directory_connected{peer=\"aa\"} 1000\n\
+             network_spawner_messages_sent_total{peer=\"aa\",message=\"data\"} 7\n"
+                .to_string()
+        });
+        handle
+            .status_cell()
+            .publish_peers(crate::handle::PeersStanding {
+                validators: ["aa".to_string()].into_iter().collect(),
+                residents: Default::default(),
+                height: 42,
+                epoch: Some(3),
+            });
+
+        let (mut state, _) = prepare_topic("peers", NO_SECRET, None, None).expect("topic");
+        let result = catch_up_peers("peers", &mut state, &handle).await;
+        assert!(!result.drop_topic);
+        match &result.frames[..] {
+            [
+                ServerFrame::Tail {
+                    topic,
+                    cursor,
+                    item: TailItem::Peers { time_ms, peers },
+                },
+            ] => {
+                assert_eq!(topic, "peers");
+                assert_eq!(cursor, &time_ms.to_string());
+                assert_eq!(&state.cursor(), cursor);
+                // the committed half, off the published standing
+                assert_eq!(peers.height, 42);
+                assert_eq!(peers.epoch, Some(3));
+                // the live half, off the exposition
+                let [peer] = &peers.peers[..] else {
+                    panic!("expected exactly one peer, got {:?}", peers.peers);
+                };
+                assert_eq!(peer.peer, "aa");
+                assert!(peer.connected);
+                assert_eq!(peer.msgs_sent, 7);
+                assert_eq!(
+                    peer.role.as_deref(),
+                    Some("validator"),
+                    "the standing's roles must be stamped onto the sample, or every \
+                     row renders with no standing at all"
+                );
+            }
+            other => panic!("expected one peers tail frame, got {other:?}"),
+        }
+    }
+
+    /// An unwired exposition drops the topic rather than serving an empty peer
+    /// set — an empty list and "this daemon cannot answer" are different
+    /// answers, and the console must not paint the second as the first.
+    #[tokio::test]
+    async fn peers_catch_up_drops_the_topic_when_no_exposition_is_wired() {
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        let (mut state, _) = prepare_topic("peers", NO_SECRET, None, None).expect("topic");
+        let result = catch_up_peers("peers", &mut state, &handle).await;
+        assert!(result.drop_topic, "an unanswerable topic must be dropped");
+        assert!(matches!(
+            &result.frames[..],
+            [ServerFrame::Error { topic, .. }] if topic == "peers"
+        ));
     }
 
     /// The service link is granted on the TOKEN and nothing else.

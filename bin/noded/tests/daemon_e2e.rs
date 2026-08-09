@@ -1439,6 +1439,78 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
     );
 }
 
+/// THE OVERVIEW TOPICS MUST DELIVER, OVER A REAL SOCKET, IN THE SHAPE THE
+/// CONSOLE DECODES.
+///
+/// `files:watch` subscribed cleanly for months and never delivered a frame,
+/// because every test stopped at the `subscribed` ack. So this reads the
+/// items: `item.peers` must be the same document `GET /v1/peers` serves and
+/// `item.status` the same one `GET /v1/status` serves, because
+/// `ducktape_rpc::node_snapshots` routes on exactly those two keys and the
+/// console then parses them with the readers it already had for the HTTP
+/// routes. A rename on either side breaks this test rather than the console.
+#[test]
+fn overview_snapshot_topics_push_peers_and_status_over_ws() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    let mut ws = daemon.ws_connect();
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["peers","status"]}"#);
+    let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+    assert_eq!(subscribed["topics"]["peers"], "0", "fresh snapshot cursor");
+    assert_eq!(subscribed["topics"]["status"], "0", "fresh snapshot cursor");
+
+    // BOTH arrive on the subscribe replay — no wait for a heartbeat tick, and
+    // no block has to move: these planes have no op behind them, which is the
+    // whole reason they needed a snapshot topic instead of a module stream.
+    let mut peers = serde_json::Value::Null;
+    let mut status = serde_json::Value::Null;
+    for _ in 0..2 {
+        let tail = Daemon::ws_read_type(&mut ws, "tail");
+        let time_ms = tail["item"]["time_ms"].as_u64().expect("sample instant");
+        assert_eq!(tail["cursor"], time_ms.to_string());
+        match tail["topic"].as_str().expect("topic") {
+            "peers" => peers = tail["item"]["peers"].clone(),
+            "status" => status = tail["item"]["status"].clone(),
+            other => panic!("unexpected topic {other}"),
+        }
+    }
+
+    // the peers sample is the `/v1/peers` document: the envelope's own chain
+    // coordinates plus the peer array. A solo daemon meshes with nobody, so an
+    // EMPTY array is the correct answer — and an absent one is not.
+    assert!(
+        peers["peers"].is_array(),
+        "peers sample carries the peer array: {peers}"
+    );
+    assert!(
+        peers["sampled_at_ms"].as_u64().is_some(),
+        "peers sample carries its own instant: {peers}"
+    );
+
+    // the status sample is the `/v1/status` document, read field-for-field by
+    // the console's `load_node_facts`.
+    assert!(
+        status["version"].as_str().is_some(),
+        "status sample carries the build: {status}"
+    );
+    assert!(
+        status["root_hash"].as_str().is_some(),
+        "status sample carries the app hash: {status}"
+    );
+    assert!(
+        status["operations"].is_object(),
+        "status sample carries the operations projection the overview reads: {status}"
+    );
+
+    // and it agrees with the HTTP route it mirrors — one node, one answer.
+    let http = daemon.status();
+    assert_eq!(
+        status["version"], http["version"],
+        "the pushed status must not be a second, drifting projection"
+    );
+}
+
 // ============================================================================
 // git smart-HTTP receive-pack: REAL `git push` against the daemon's /forge lane.
 //

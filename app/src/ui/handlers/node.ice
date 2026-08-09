@@ -36,6 +36,26 @@ on node_facts_loaded(next)
 on node_facts_failed(cause)
   return if cause.generation != node_facts_generation
 
+// A PUSHED overview sample (lifecycle.ice's gated subscription). Each frame
+// answers ONE of the two snapshot topics, so every field takes its `answered`
+// flag — a peers frame must not blank the consensus facts, and a status frame
+// must not empty the table.
+//
+// NO GENERATION GUARD, and that is not an omission: a generation retires a
+// stale REPLY to a request this app made, and a push answers no request. The
+// freshest sample simply wins, which is what the node's own ordering already
+// gives.
+on node_overview_sample(next)
+  node_peers = keep_peers(next.peers_answered, next.peers, node_peers)
+  node_version = keep_str(next.facts_answered, next.facts.version, node_version)
+  node_root_hash = keep_str(next.facts_answered, next.facts.root_hash, node_root_hash)
+  node_last_finalized = keep_i64(next.facts_answered, next.facts.last_finalized_at, node_last_finalized)
+  node_checkpoint = keep_i64(next.facts_answered, next.facts.checkpoint_height, node_checkpoint)
+  node_height = keep_i64(next.facts_answered, next.facts.height, node_height)
+  node_view_label = keep_str(next.facts_answered, optional_number(next.facts.view), node_view_label)
+  node_quorum_label = keep_str(next.facts_answered, optional_number(next.facts.quorum), node_quorum_label)
+  node_reachable_label = keep_str(next.facts_answered, optional_number(next.facts.reachable_validators), node_reachable_label)
+
 // Overview | Permissions | Activity, inside Settings now that the Node rail
 // seat is gone. The log stream below subscribes on this tab.
 on select_node_tab(tab)

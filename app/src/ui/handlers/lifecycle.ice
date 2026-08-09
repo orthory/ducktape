@@ -219,7 +219,7 @@ on workspace_connected(next)
     run load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
     run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
     run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
-    run load_peers(connected_rpc, node_peers_generation) -> peers_loaded _ | peers_failed _
+    run load_peers(connected_rpc, keep_i64(shell_tab == "settings" && node_tab == "overview", node_peers_generation, -1)) -> peers_loaded _ | peers_failed _
     run load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
     run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     run load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_failed _
@@ -529,7 +529,13 @@ on select_shell_tab(next)
     run load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
     run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
     run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
-    run load_peers(connected_rpc, node_peers_generation) -> peers_loaded _ | peers_failed _
+    // PEERS IS A HEAVY LOADER AND WAS FILED WITH THE LIGHT ONES. `/v1/peers`
+    // encodes the node's whole metrics registry per call (485 KB, ~10 ms), so
+    // running it on entry to Explorer, Files, Members, Agents and Forge — none
+    // of which draw a peer — was the single most expensive unread call the
+    // console made. The overview tab now gets its rows pushed, so gating this
+    // to that tab costs nothing there and stops the encode everywhere else.
+    run load_peers(connected_rpc, keep_i64(shell_tab == "settings" && node_tab == "overview", node_peers_generation, -1)) -> peers_loaded _ | peers_failed _
     run load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
     run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     run load_forge(connected_rpc, keep_i64(shell_tab == "forge", forge_generation, -1)) -> forge_loaded _ | forge_failed _
@@ -570,6 +576,17 @@ subscribe
   // when the LAST tracked window closes, leave.
   window closed with-id -> window_was_closed _
   run node_logs(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "activity") -> node_log_line _
+  // THE NODE'S OWN TWO PLANES. Peers and the consensus facts have no op behind
+  // them — nothing in the index names a mesh connection or a checkpoint height
+  // — so no module topic can carry them, which is why they were the last two
+  // surfaces the console left cold, refreshed only by a connect or a tab
+  // switch.
+  //
+  // Not a poll. The node re-samples these only while this subscription is
+  // held, so THIS GATE IS THE BUDGET: `/v1/peers` composes its sample by
+  // encoding the whole metrics registry (485 KB, ~10 ms a call, measured), and
+  // leaving the tab stops that at the source rather than throttling it here.
+  run node_overview(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "overview") -> node_overview_sample _
   every 1s when huddle_joined -> tick
   every 300ms when !empty(toast) -> toast_tick
   // The settle-✓'s dismissal clock: tick one holds the tick on screen and
