@@ -470,6 +470,10 @@ pub struct StreamHub {
     /// session's serial command consumer appends `(seq, origin, text)` and the
     /// ws catch-up path replays it for `term-cmd:<session>` subscribers.
     term_commands: crate::term::TermCommandRing,
+    /// wired once at boot by a daemon that registers [`crate::NodeMetrics`], so
+    /// the index sweeps this hub gates can be COUNTED. Unwired (simnode, the
+    /// router tests) every record is a no-op.
+    metrics: Arc<std::sync::OnceLock<crate::NodeMetrics>>,
 }
 
 impl StreamHub {
@@ -487,12 +491,29 @@ impl StreamHub {
             run_output: RunOutputRegistry::default(),
             terminals: crate::term::TermRing::default(),
             term_commands: crate::term::TermCommandRing::default(),
+            metrics: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
     pub fn publish_block(&self, height: u64, root_hash: impl Into<String>, wake: BlockWake) {
         self.prime(height, root_hash);
         let _ = self.blocks.send(wake);
+    }
+
+    /// Wire the metrics registry so index sweeps are counted. Once per
+    /// process, beside [`crate::StatusCell::wire_metrics`].
+    pub fn wire_metrics(&self, metrics: &crate::NodeMetrics) {
+        self.metrics
+            .set(metrics.clone())
+            .ok()
+            .expect("stream hub metrics wired twice");
+    }
+
+    /// One session went back to the store, and what sent it.
+    fn note_index_sweep(&self, cause: crate::metrics::SweepCause) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.record_index_sweep(cause);
+        }
     }
 
     pub fn prime(&self, height: u64, root_hash: impl Into<String>) {
@@ -896,7 +917,14 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
     let mut term_rx = hub.terminals().subscribe();
     let mut term_cmd_rx = hub.term_commands().subscribe();
     let mut heartbeat = tokio::time::interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
-    let mut index_backstop = tokio::time::interval(INDEX_BACKSTOP_INTERVAL);
+    // FIRST TICK AFTER ONE PERIOD, not immediately: `interval` fires at once,
+    // and a session that has just run its subscribe-time `Wake::All` owes
+    // nothing yet. Starting late also makes the sweep counter mean what it says
+    // over a short window.
+    let mut index_backstop = tokio::time::interval_at(
+        tokio::time::Instant::now() + INDEX_BACKSTOP_INTERVAL,
+        INDEX_BACKSTOP_INTERVAL,
+    );
     let mut topics = BTreeMap::new();
     // set once, by a `ServiceAttach` that this node accepts. The guard's Drop —
     // on every `return` below, and on the task being cancelled — releases the
@@ -994,13 +1022,17 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                 }
                 // An idle block appended no op row, so every scan it used to
                 // trigger read the store and found nothing.
-                if sweep && !catch_up(&handle, &mut socket, &mut topics, Wake::Block).await {
-                    return;
+                if sweep {
+                    hub.note_index_sweep(crate::metrics::SweepCause::Block);
+                    if !catch_up(&handle, &mut socket, &mut topics, Wake::Block).await {
+                        return;
+                    }
                 }
             }
             _ = index_backstop.tick() => {
                 // see `INDEX_BACKSTOP_INTERVAL`: the floor under every writer
                 // that appends rows and tells nobody.
+                hub.note_index_sweep(crate::metrics::SweepCause::Backstop);
                 if !catch_up(&handle, &mut socket, &mut topics, Wake::Block).await {
                     return;
                 }

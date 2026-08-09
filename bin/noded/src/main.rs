@@ -333,6 +333,7 @@ fn run_node(
         // standing stays role-less, and the sample parses honestly empty.
         let status = node_handle.status_cell();
         status.wire_metrics(&metrics);
+        stream_hub.wire_metrics(&metrics);
         // `Context` has no Clone; a child shares the SAME registry (the
         // label only prefixes new registrations), so its encode() serves
         // the identical exposition.

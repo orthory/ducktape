@@ -1273,6 +1273,66 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
     daemon.status();
 }
 
+/// A SUBSCRIBED SESSION IS SENT BACK TO THE STORE ONCE PER FED BLOCK — AND ONLY
+/// THEN.
+///
+/// The block wake is gated on the block having appended index rows, and until
+/// this series existed nothing could observe whether that gate was wired at
+/// all: inverting the one `sweep &&` that connects the decision to `catch_up`
+/// left the whole suite green, because the 30s backstop delivered late and no
+/// assertion measured promptness. This measures the sweep itself, so the gate
+/// is pinned rather than inferred from a frame arriving eventually.
+///
+/// The counter is read BEFORE and AFTER, because `subscribe` runs its own
+/// `Wake::All` catch-up that is not a block wake and must not be counted.
+#[test]
+fn a_fed_block_sweeps_a_subscribed_session_exactly_once() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    // BY CAUSE, because the total cannot tell the gate from its floor: the 30s
+    // backstop sweeps too, and a test that waited for the total to move would
+    // pass on a broken wake after half a minute. This asks whether the BLOCK
+    // woke it.
+    fn block_sweeps(text: &str) -> u64 {
+        text.lines()
+            .find_map(|line| {
+                line.strip_prefix("ducktape_stream_index_sweeps_total{cause=\"block\"} ")
+            })
+            .map(|count| count.trim().parse().expect("counter is a number"))
+            // absent until the first one — a family emits no series for a
+            // label it has never seen.
+            .unwrap_or(0)
+    }
+
+    let mut ws = daemon.ws_connect();
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["module:chat"]}"#);
+    let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+    assert!(subscribed["topics"]["module:chat"].is_string());
+    let before = block_sweeps(&daemon.metrics());
+
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
+        }),
+        None,
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+
+    // wait on the session's OWN delivery, never a clock: the event frame for
+    // this block cannot arrive before the sweep that produced it.
+    let event = Daemon::ws_read_type(&mut ws, "event");
+    assert_eq!(event["topic"], "module:chat");
+
+    assert_eq!(
+        block_sweeps(&daemon.metrics()),
+        before + 1,
+        "one fed block, one sweep — not zero (the gate never fires) and not \
+         several (something else is waking the index topics)"
+    );
+}
+
 #[test]
 fn metrics_endpoint_exposes_ducktape_and_runtime_series() {
     let storage = tempfile::TempDir::new().expect("storage dir");
