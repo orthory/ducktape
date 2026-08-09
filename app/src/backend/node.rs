@@ -241,11 +241,9 @@ pub struct NodeFacts {
     /// HEIGHT h 422,553 — an order no node is ever in. See [`served_height`]
     /// for why a wire `0` lands here as [`UNMEASURED`].
     pub height: i64,
-    pub peers_live: i64,
-    pub peers_total: i64,
 }
 
-/// Load the node facts from the raw status document plus the peer sample.
+/// Load the node facts from the raw status document.
 /// A section the node omits for its role stays `None` — the status projection
 /// leaves it out rather than filling it with misleading numbers, and so do we.
 pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, HydrationError> {
@@ -254,8 +252,6 @@ pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, 
         let status = client.status_json().await?;
         let operations = &status["operations"];
         let consensus = &operations["consensus"];
-        let peers = client.peers().await.unwrap_or_default();
-        let peers = peers["peers"].as_array().cloned().unwrap_or_default();
         Ok(NodeFacts {
             generation,
             version: status["version"].as_str().unwrap_or_default().to_string(),
@@ -270,13 +266,6 @@ pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, 
                 .as_i64()
                 .unwrap_or(UNMEASURED),
             height: served_height(&status["height"]),
-            peers_live: count_i64(
-                peers
-                    .iter()
-                    .filter(|peer| peer["live"].as_bool().unwrap_or(false))
-                    .count(),
-            ),
-            peers_total: count_i64(peers.len()),
         })
     }
     .await
@@ -333,11 +322,17 @@ pub fn optional_number(value: Option<i64>) -> String {
     }
 }
 
-/// One peer row.
+/// One direct peer, as `GET /v1/peers` actually reports it.
+///
+/// There is NO per-peer height on that surface — the envelope carries this
+/// node's own, and stamping it on every row would print the same number beside
+/// every peer and call it theirs. `role` is the standing the peers view does
+/// carry (`validator` / `resident`), absent on a lane that cannot read the
+/// valset — and absent renders as nothing, which is the honest answer.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PeerRow {
     pub key: String,
-    pub height: i64,
+    pub role: String,
     pub live: bool,
 }
 
@@ -357,10 +352,14 @@ pub async fn load_peers(rpc: String, generation: i64) -> Result<PeersData, Hydra
             .cloned()
             .unwrap_or_default()
             .into_iter()
+            // THE KEYS THE NODE ACTUALLY SERVES. This read `key`/`height`/`live`
+            // and `bin/noded/src/peers.rs` serves none of the three, so every
+            // row rendered a blank name, a zero, and an offline dot — for peers
+            // that were connected.
             .map(|peer| PeerRow {
-                key: short_label(peer["key"].as_str().unwrap_or_default()),
-                height: peer["height"].as_i64().unwrap_or(0),
-                live: peer["live"].as_bool().unwrap_or(false),
+                key: short_label(peer["peer"].as_str().unwrap_or_default()),
+                role: peer["role"].as_str().unwrap_or_default().to_string(),
+                live: peer["connected"].as_bool().unwrap_or(false),
             })
             .collect();
         Ok(PeersData { generation, peers })

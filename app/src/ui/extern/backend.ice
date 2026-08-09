@@ -174,10 +174,10 @@ extern crate::backend
   NodeLogLine(cursor:str, line:str)
   LogParts(time:str, level:str, message:str)
   sync split_log_line(line:str) -> LogParts
-  NodeFacts(generation:i64, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, peers_live:i64, peers_total:i64)
+  NodeFacts(generation:i64, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64)
   load_node_facts(rpc:str, generation:i64) -> NodeFacts ! HydrationError
   sync optional_number(value:i64?) -> str
-  PeerRow(key:str, height:i64, live:bool)
+  PeerRow(key:str, role:str, live:bool)
   PeersData(generation:i64, peers:[PeerRow])
   sync push_log_line(lines:[NodeLogLine], line:NodeLogLine) -> [NodeLogLine]
   sync filter_log_lines(lines:[NodeLogLine], filter:str) -> [NodeLogLine]

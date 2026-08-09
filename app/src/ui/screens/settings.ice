@@ -737,7 +737,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                                 wrap=none
                                 font=code
                                 @text-fg
-                            text peer.height
+                            text peer.role
                               with
                                 size=12.0
                                 wrap=none

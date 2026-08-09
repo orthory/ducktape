@@ -345,6 +345,39 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
     assert_eq!(app.shell_tab, "members");
 }
 
+/// EVERY READER OF `/v1/peers` USES THE NAMES `PeerView` SERIALIZES.
+///
+/// `bin/noded/src/peers.rs` serves `peer` / `connected` / `role`; it has never
+/// served `key`, `live`, or a per-peer `height`. Reading the wrong ones does
+/// not fail — `as_str()` answers `None` and the row renders blank, zero and
+/// offline for a peer that is connected.
+///
+/// This has already happened twice in two different readers: `roster.rs`
+/// carries the scar in a comment, and Settings' PEERS table shipped with all
+/// three wrong names. The app cannot depend on `noded` to pin the contract with
+/// a type, so it is pinned here instead — one rule over every reader at once.
+#[test]
+fn peer_readers_use_the_names_the_node_serves() {
+    const READERS: [(&str, &str); 2] = [
+        ("backend/node.rs", include_str!("backend/node.rs")),
+        ("backend/roster.rs", include_str!("backend/roster.rs")),
+    ];
+    for (name, source) in READERS {
+        for wrong in ["peer[\"key\"]", "peer[\"live\"]", "peer[\"height\"]"] {
+            assert!(
+                !source.contains(wrong),
+                "{name} reads {wrong}, which `/v1/peers` does not serve — \
+                 see bin/noded/src/peers.rs for the names it does"
+            );
+        }
+        assert!(
+            source.contains("peer[\"peer\"]") || source.contains("peer[\"connected\"]"),
+            "{name} was expected to read the peers view; if it no longer does, \
+             drop it from this lint rather than leaving the guard vacuous"
+        );
+    }
+}
+
 /// The app has NO polling loop: every live surface rides the delta stream.
 /// The only recurring subscriptions are wall clocks that nothing else can
 /// supply — the huddle call timer and the toast's own dismissal — and this
