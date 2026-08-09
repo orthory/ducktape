@@ -1294,7 +1294,7 @@ impl FanOutWatch {
 /// here.
 async fn node_that_answers_only_a_full_fan_out(
     requests: usize,
-    refused: Option<&'static str>,
+    refused: &'static [&'static str],
     watch: std::sync::Arc<Mutex<FanOutWatch>>,
 ) -> String {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1384,7 +1384,7 @@ async fn node_that_answers_only_a_full_fan_out(
                         }
                     }
                 }
-                let refuse = refused == Some(*leg);
+                let refuse = refused.contains(leg);
                 let (status, reply) = match refuse {
                     true => ("503 Service Unavailable", "the module is not answering"),
                     false => ("200 OK", *reply),
@@ -1423,7 +1423,7 @@ async fn node_that_answers_only_a_full_fan_out(
 #[tokio::test(flavor = "current_thread")]
 async fn a_workspace_search_reaches_its_six_sources_together() {
     let watch: std::sync::Arc<Mutex<FanOutWatch>> = Default::default();
-    let rpc = node_that_answers_only_a_full_fan_out(9, None, watch.clone()).await;
+    let rpc = node_that_answers_only_a_full_fan_out(9, &[], watch.clone()).await;
 
     let results = search_workspace(rpc, "needle".into(), 4)
         .await
@@ -1489,7 +1489,15 @@ async fn a_search_that_lost_a_source_says_which_one() {
     ];
 
     for (leg, label, silent_kind) in SOURCES {
-        let rpc = node_that_answers_only_a_full_fan_out(9, Some(leg), Default::default()).await;
+        let leg_alone: &'static [&'static str] = match leg {
+            "chat" => &["chat"],
+            "pages" => &["pages"],
+            "forge" => &["forge"],
+            "files" => &["files"],
+            "tasks" => &["tasks"],
+            _ => &["runs"],
+        };
+        let rpc = node_that_answers_only_a_full_fan_out(9, leg_alone, Default::default()).await;
 
         let results = search_workspace(rpc, "needle".into(), 5)
             .await
@@ -1528,6 +1536,32 @@ async fn a_search_that_lost_a_source_says_which_one() {
             "with {label} silent the other sources still land, in screen order"
         );
     }
+
+    // CARDINALITY. Every case above refuses exactly ONE source, and a filter
+    // keyed on `silent.first()` instead of `silent.contains(..)` passes all six
+    // — the reviewer changed that one token and the suite stayed green while a
+    // second silent source got a chip reading 0, against the strip's own "a
+    // count of 0 means nothing matched, never no loader". Two at once is the
+    // case the PR body's own headline scenario describes.
+    let rpc =
+        node_that_answers_only_a_full_fan_out(9, &["chat", "pages"], Default::default()).await;
+    let results = search_workspace(rpc, "needle".into(), 5)
+        .await
+        .expect("the other four sources answered");
+    assert_eq!(
+        results.partial, "Messages, Pages did not answer — these results are incomplete.",
+        "both silent sources are named, in screen order"
+    );
+    let chips: Vec<&str> = results
+        .kinds
+        .iter()
+        .map(|kind| kind.kind.as_str())
+        .collect();
+    assert_eq!(
+        chips,
+        ["code", "file", "task", "run"],
+        "NEITHER refused source keeps a chip — not just the first one"
+    );
 }
 
 /// A SEARCH HIT SAYS WHICH ROOM IT IS IN, ONCE. The hit's `meta` was
