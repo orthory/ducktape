@@ -7,14 +7,22 @@
 // The `settings_*` / `node_*` / `account_*` / `members_*` prefixes are KEPT.
 // They are not redundant with the screen name — this one surface carries four
 // fact families, and the prefix is what says which loader a reading came from.
-// THIS SCREEN SHOWS ONE HEIGHT, AND IT IS `node_height` — the head as the FACTS
-// document saw it, the same document the checkpoint beside it comes from. It
-// used to show two, from two different `/v1/status` calls: the network card's
-// own `settings_height` and the live `block_height` register, which disagreed
-// by thousands of blocks under one word. And because the checkpoint was
-// sampled by a THIRD call, the node tile could print CHECKPOINT h 422,563
-// above HEIGHT h 422,553 — an order the node itself can never be in. The
-// titlebar keeps `block_height`: that seat's job IS the live head.
+// THIS IS THE ONE SEAT THAT PRINTS A HEAD BESIDE A CHECKPOINT, so it is the one
+// seat that must draw both from a SINGLE `/v1/status` read: `node_height` and
+// `node_checkpoint` are two fields of one `load_node_facts` document. A
+// checkpoint says nothing on its own — it is only ever "how far the durable
+// snapshot trails the head" — so the moment its head comes from a different
+// read, the pair can print an order no node is ever in. It did: this screen
+// held THREE heights (`settings_height`, the live `block_height` register, and
+// the checkpoint's own document) and rendered CHECKPOINT h 422,563 above
+// HEIGHT h 422,553.
+//
+// The live `block_height` register is deliberately NOT read here. It is the
+// titlebar's, whose job is liveness and which now prints no checkpoint at all
+// (see `StatusCard` in components/shell.ice). The cost of that split is stated
+// rather than hidden: this pair refreshes with `node_facts_generation` — on
+// connect and on a shell-tab change — so it is a coherent sample, not a live
+// one, and reads `h —` until the first one lands.
 component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
   emits
     select_shell_tab(str)

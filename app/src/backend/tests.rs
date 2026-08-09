@@ -1222,39 +1222,143 @@ fn an_unread_block_height_is_not_reported_as_zero() {
     );
 
     // The state default is what Settings shows before any node fact lands.
+    // This is the RENDERER's contract and it is unchanged: `0` still reads as a
+    // real height here. What changed is upstream — `served_height` decides that
+    // a `0` on the wire was never a measurement, so no zero reaches this label
+    // as a head. See `a_resyncing_replica_has_no_head_to_print_a_checkpoint_against`.
     const STATE: &str = include_str!("../ui/state.ice");
     assert!(
         STATE.contains("node_height:i64 = -1"),
         "an unread height must default to the sentinel, not to a measured zero"
     );
+}
 
-    // AND THE SCREEN SHOWS EXACTLY ONE OF THEM. It used to carry three heights
-    // from three separate `/v1/status` calls — the network card's own
-    // `settings_height`, the live `block_height` register on the node tile, and
-    // the checkpoint from a third document. Two disagreed by thousands of
-    // blocks under one word, and the third let the tile print a CHECKPOINT
-    // higher than the HEIGHT beside it, which the node can never be in.
+/// A node that serves `GET /v1/status` EXACTLY ONCE and answers `500` to every
+/// later ask for it. `/v1/peers` answers every time — the pin is on the status
+/// document, not on the peer sample.
+///
+/// This is the whole point of the fixture: a loader that reads the chain twice
+/// to fill one card cannot get away with it here, whichever field it takes from
+/// whichever read. Counting reads is the only pin that survives a rename —
+/// #1017's first round asserted identifier names instead, and a reviewer put
+/// the literal second `client.status()` back with every name intact and all
+/// 272 tests still green.
+async fn node_that_serves_its_status_once(status_body: &'static str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the stub node");
+    let origin = format!("http://{}", listener.local_addr().expect("stub address"));
+    let status_reads = std::sync::Arc::new(AtomicUsize::new(0));
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            // Both routes are bodyless GETs, so the request is in hand as soon
+            // as the head is.
+            while let Ok(read) = stream.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let asked_for_status = String::from_utf8_lossy(&request).contains("/v1/status");
+            let already_served =
+                asked_for_status && status_reads.fetch_add(1, Ordering::SeqCst) > 0;
+            let (code, body) = match (asked_for_status, already_served) {
+                (true, false) => ("200 OK", status_body),
+                (true, true) => (
+                    "500 Internal Server Error",
+                    "this node answers /v1/status once",
+                ),
+                (false, _) => ("200 OK", r#"{"peers":[]}"#),
+            };
+            let response = format!(
+                "HTTP/1.1 {code}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    origin
+}
+
+/// ONE CARD, ONE SAMPLE — AND THE SAMPLE IS THE WHOLE PAIR.
+///
+/// A checkpoint carries no meaning alone; it only ever says how far the durable
+/// snapshot trails the head. So the head printed beside it has to come from the
+/// same read, or the pair can render an order no node is ever in. Settings did
+/// exactly that: `HEIGHT h 422,553` under `CHECKPOINT h 422,563`, from a live
+/// register and a facts document sampled seconds apart on a chain moving
+/// several blocks a second.
+///
+/// The stub serves `/v1/status` once and refuses the rest, so this fails on a
+/// second read no matter what the fields are called.
+#[tokio::test(flavor = "current_thread")]
+async fn the_node_tile_prints_a_head_and_a_checkpoint_from_one_status_read() {
+    // Shape copied from the live demo node, whose checkpoint trails its head by
+    // 118 blocks — the direction a healthy node is always in.
+    const SERVING: &str = r#"{"version":"0.1.0","root_hash":"20c53b","height":426099,"modules":[],"public_key":"ab","operations":{"last_finalized_at":426099,"storage":{"checkpoint_height":425981}}}"#;
+    let rpc = node_that_serves_its_status_once(SERVING).await;
+
+    let facts = load_node_facts(rpc, 9)
+        .await
+        .expect("one read fills the whole card; a second one is the defect");
+
+    assert_eq!(facts.height, 426_099);
+    assert_eq!(facts.checkpoint_height, 425_981);
     assert!(
-        !STATE.contains("settings_height"),
-        "a second height register is the defect, not a feature"
+        facts.checkpoint_height <= facts.height,
+        "a durable snapshot cannot be ahead of the head it was taken from"
     );
-    // Scoped to the component BODY, not the file: the header comment above it
-    // names `block_height` while explaining why the screen no longer reads it,
-    // and a whole-file negative would flag that prose as the defect it
-    // describes.
-    const SETTINGS: &str = include_str!("../ui/screens/settings.ice");
-    let screen = SETTINGS
-        .split_once("component SettingsScreen(")
-        .expect("the screen")
-        .1;
-    assert!(
-        !screen.contains("block_height"),
-        "the live head belongs to the titlebar; this screen reads the facts document"
+}
+
+/// A NODE SERVING NO BOUNDARY HAS NO HEAD — AND ITS CHECKPOINT KEEPS CLIMBING.
+///
+/// One read is necessary and not sufficient: the replica lane publishes a
+/// document that is itself two instants. `publish_replica_status` fills `height`
+/// from `serving`, which is `None` — and so `0` — through a range-pruned
+/// backfill, an unresolvable pruned view and an epoch cutover, while it hands
+/// the same call the LIVE `replica_prev_ckpt`, which only ever climbs. Read as
+/// a measurement, that one honest document renders `HEIGHT h 0` above
+/// `CHECKPOINT h 425,981`: a measured zero AND a starker inversion than the
+/// ten-block skew this change set out to remove.
+///
+/// `0` is the node's own word for "no boundary served" — `NodeStatus::default`,
+/// the validator's `unwrap_or(0)` and the replica's `None` arm all write it —
+/// so the app reads it as absence, and the pair prints `h —` over the
+/// checkpoint that is genuinely on disk.
+#[tokio::test(flavor = "current_thread")]
+async fn a_resyncing_replica_has_no_head_to_print_a_checkpoint_against() {
+    const RESYNCING: &str = r#"{"version":"0.1.0","root_hash":"","height":0,"modules":[],"public_key":"ab","operations":{"last_finalized_at":0,"storage":{"checkpoint_height":425981}}}"#;
+    let rpc = node_that_serves_its_status_once(RESYNCING).await;
+
+    let facts = load_node_facts(rpc, 9)
+        .await
+        .expect("one read fills the whole card; a second one is the defect");
+
+    assert_eq!(
+        facts.checkpoint_height, 425_981,
+        "the checkpoint on disk is real and stays printed"
     );
     assert_eq!(
-        screen.matches("node_height").count(),
-        3,
-        "one prop, and the two rows that read it"
+        facts.height, UNMEASURED,
+        "a node serving no boundary reports height 0; that is absence, not a measurement"
+    );
+    assert_eq!(
+        height_label_short(facts.height),
+        "h —",
+        "the rendered head says it has no reading"
+    );
+    assert!(
+        facts.height < 0 || facts.checkpoint_height <= facts.height,
+        "the pair may say `h —`, but it may never say a checkpoint above its head"
     );
 }
 

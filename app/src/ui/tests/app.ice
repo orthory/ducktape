@@ -60,7 +60,6 @@ test palette_escape_contract
         quorum="—"
         reachable="—"
         last_finalized=0
-        checkpoint=0
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
@@ -190,7 +189,6 @@ test minimum_window_layout_contract
         quorum="—"
         reachable="—"
         last_finalized=0
-        checkpoint=0
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
@@ -420,7 +418,6 @@ test settings_keyboard_scroll_contract
         quorum="—"
         reachable="—"
         last_finalized=0
-        checkpoint=0
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell

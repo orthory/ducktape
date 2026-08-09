@@ -81,7 +81,6 @@ view
           quorum=node_quorum_label
           reachable=node_reachable_label
           last_finalized=node_last_finalized
-          checkpoint=node_checkpoint
         events
           select_shell_tab -> select_shell_tab _
           toggle_bell -> toggle_bell

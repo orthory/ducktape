@@ -351,9 +351,12 @@ state
   // absent reading must print `—`, never a measured `0`.
   node_last_finalized:i64 = 0
   node_checkpoint:i64 = 0
-  // The head AS THE FACTS DOCUMENT SAW IT — the only height the Settings
-  // screen shows, so its network card and its node tile can never disagree and
-  // a checkpoint can never outrun the head it is printed beside.
+  // `node_checkpoint`'s OWN HEAD — the same `load_node_facts` document, so the
+  // pair Settings prints is one sample and the checkpoint can never outrun the
+  // head beside it. The two move together; a reader of one is a reader of both.
+  // Defaults to the sentinel, and the loader also lands a wire `0` here as -1:
+  // a node serving no boundary publishes height 0 while its checkpoint keeps
+  // climbing, and `h —` is what "no head served" honestly reads as.
   node_height:i64 = -1
   node_tab = "overview"
   status_card_open = false
