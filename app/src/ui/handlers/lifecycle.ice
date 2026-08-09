@@ -307,14 +307,13 @@ on live_updated(next)
     // and the failed arm's guard drops the refusal unread, so a plane no
     // module touched costs a dead call, not a query.
     //
-    // NO SECOND `shell_tab` GATE HERE. This arm is the ONLY off-tab refresh
-    // path for the titlebar chips — approvals from `open_proposals(gov_rows)`
-    // and the agent dot from `any_agent_active(agents_rows)`. Governance and
-    // agents used to carry `&& shell_tab == …` on top of the module hit, which
-    // was survivable only while the tab-switch path refetched them
-    // unconditionally; it does not any more (`tab_reads_plane`, below). A
-    // badge whose whole job is to tell you something needs approval WHILE you
-    // are elsewhere cannot wait for you to open that tab.
+    // NO SECOND `shell_tab` GATE ON THE CHIP PLANES. This arm is the ONLY
+    // off-tab refresh path for the titlebar chips — approvals from
+    // `open_proposals(gov_rows)` and the agent dot from
+    // `any_agent_active(agents_rows)` — so it is the half that lets the tab
+    // move gate itself. `tab_reads_plane`'s doc in backend/shell.rs carries
+    // the whole argument. `files_ls` below draws no chip and keeps its own tab
+    // gate.
     run load_members(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "valset"), members_generation, -1)) -> members_loaded _ | members_failed _
     run load_governance(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "governance"), gov_generation, -1)) -> governance_loaded _ | governance_failed _
     run load_account(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation, -1)) -> account_loaded _ | account_failed _
@@ -441,13 +440,13 @@ on live_resynced(next)
   block_comments_generation = block_comments_generation + 1
   live_thread_generation = live_thread_generation + 1
   // The rail's live refresh must ask the SAME question the rail was filled
-  // from. `refresh_block_comments` asks `ThreadsForTargets` for the target
-  // ALONE, so with a page target it found only page-anchored threads and wiped
-  // every block-anchored one out of the open rail on the next pages event.
+  // from. The old refresh asked `ThreadsForTargets` for the target ALONE, so
+  // with a page target it found only page-anchored threads and wiped every
+  // block-anchored one out of the open rail on the next pages event.
   // `load_page_threads` fans out over the page AND its blocks, and answers on
-  // the handler pages.ice already routes its own loads through. Both routes
-  // ignore a closed rail, so a page event with no rail open costs one refused
-  // query and never touches the banner.
+  // the handler pages.ice already routes its own loads through. It ignores a
+  // closed rail, so a page event with no rail open costs one refused query and
+  // never touches the banner.
   //
   // The list is all that refreshes live. An OPEN thread's replies do not: a task
   // group must be the final statement in a handler, so the comment-page load
@@ -527,16 +526,14 @@ on select_shell_tab(next)
   // sends the off-screen ones generation -1; the backend refuses it and the
   // failed arm's generation guard drops the refusal unread.
   //
-  // members/governance/agents/account are gated the same way, by
-  // `tab_reads_plane`. They used to be unconditional "because the titlebar
-  // chips read them and they have no other refresh path" — the second half is
-  // no longer true: the `plane` arm above refetches each one when its own
-  // module commits, which is earlier AND cheaper than waiting for the next tab
-  // click. Four ungated `/v1/query` round trips per click is what that claim
-  // cost. That arm is now the chips' ONLY off-tab writer, so it carries no
-  // `shell_tab` gate of its own — the two are a pair, and gating both would
-  // leave a chip dark until you opened the very tab it exists to save you
-  // from opening.
+  // members/governance/agents/account are gated the same way, but through
+  // `tab_reads_plane` rather than an inline `shell_tab ==`: members fans out
+  // to four panes and account to two, so the mapping is a tested table, and
+  // the two one-tab planes ride it so this whole group reads one way. Its doc
+  // in backend/shell.rs carries the argument — including why the live `plane`
+  // arm above must carry no tab gate of its own. New loader here: a chain
+  // PLANE gets a `tab_reads_plane` row; a loader keyed on one pane's own state
+  // (explorer, files, forge) keeps the inline `shell_tab ==` above.
   parallel
     run load_node_facts(connected_rpc, node_facts_generation) -> node_facts_loaded _ | node_facts_failed _
     run load_explorer(connected_rpc, keep_i64(shell_tab == "explorer", explorer_generation, -1)) -> explorer_loaded _ | explorer_failed _

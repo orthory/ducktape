@@ -557,8 +557,8 @@ fn assert_no_polling(lifecycle: &str) {
 
 /// THE TAB GATE IS WIRING, NOT A PREDICATE. `tab_reads_plane` being correct in
 /// isolation buys nothing if `lifecycle.ice` still calls the loaders
-/// unconditionally — a declared-and-unrun extern is exactly how
-/// `load_block_threads` sat dead in `backend.ice`. This pins the call shapes.
+/// unconditionally — a declared-and-unrun extern is exactly how a dead loader
+/// sat in `backend.ice` until this branch swept it. This pins the call shapes.
 ///
 /// It pins the OTHER half too: the `plane` arm is the chips' only off-tab
 /// writer, so its governance/agents runs must NOT carry a second

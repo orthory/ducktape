@@ -988,8 +988,8 @@ pub fn forge_live_hit(kind: String, module: String) -> bool {
 }
 
 /// One scoped forge catch-up, flag-selected per slice like [`LiveRefresh`]:
-/// the repo list reloads on any forge hit; the open repo's slice and the open
-/// item reload only when the op's scope reaches them.
+/// the repo list reloads only while the forge surface is open; the open repo's
+/// slice and the open item reload when the op's scope reaches them.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ForgeLiveData {
     pub generation: i64,

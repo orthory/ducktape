@@ -2610,7 +2610,13 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     let threads = load_page_threads(origin.clone(), "welcome".into(), 1)
         .await
         .unwrap();
-    assert!(threads.threads.iter().any(|t| t.id == "thread-live"));
+    assert!(
+        threads
+            .threads
+            .iter()
+            .any(|thread| thread.id == "thread-live"),
+        "the live comment's thread is on the page rail"
+    );
     submit_test(
         &rpc,
         &signer,
@@ -2625,7 +2631,13 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     let threads = load_page_threads(origin.clone(), "welcome".into(), 2)
         .await
         .unwrap();
-    assert!(!threads.threads.iter().any(|t| t.id == "thread-live"));
+    assert!(
+        !threads
+            .threads
+            .iter()
+            .any(|thread| thread.id == "thread-live"),
+        "the deleted comment's thread is gone from the page rail"
+    );
 
     let refreshed = live_resync_load(
         origin,
@@ -3746,34 +3758,38 @@ fn chat_reads_never_cross_the_dispatch_query_lane() {
 /// screen reads.
 #[test]
 fn a_tab_move_only_refetches_what_its_destination_draws() {
-    let reads = |tab: &str, plane: &str| tab_reads_plane(tab.into(), plane.into());
+    // EVERY tab, taken from the rail itself plus the footer's Settings, so a
+    // new seat lands in this sweep instead of quietly defaulting to "reads
+    // nothing" behind a hand-written negative list.
+    let mut tabs: Vec<String> = shell_nav("chat".into(), 0, false)
+        .into_iter()
+        .map(|seat| seat.id)
+        .collect();
+    tabs.push("settings".into());
 
     // the roster is drawn by four panes: its own, the admin gate under
-    // Approvals, the forge write gate, and the Settings standing card.
-    for tab in ["members", "governance", "forge", "settings"] {
-        assert!(reads(tab, "members"), "{tab} draws the roster");
+    // Approvals, the forge write gate, and the Settings standing card. The
+    // rest are narrow: Settings draws the account card, Forge the org "about",
+    // and proposals and agent rows belong to one pane each.
+    for (plane, drawn) in [
+        (
+            "members",
+            &["forge", "members", "governance", "settings"][..],
+        ),
+        ("governance", &["governance"][..]),
+        ("agents", &["agents"][..]),
+        ("account", &["forge", "settings"][..]),
+        // an unknown plane name is nobody's — a typo must not silently reopen
+        // the storm by answering true.
+        ("explorer", &[][..]),
+    ] {
+        let readers: Vec<&str> = tabs
+            .iter()
+            .filter(|tab| tab_reads_plane((*tab).clone(), plane.into()))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(readers, drawn, "exactly these tabs draw {plane}");
     }
-    for tab in ["chat", "pages", "agents", "files", "explorer"] {
-        assert!(!reads(tab, "members"), "{tab} draws no roster");
-    }
-
-    // the narrow planes belong to exactly one pane each.
-    assert!(reads("governance", "governance"));
-    assert!(reads("agents", "agents"));
-    assert!(reads("settings", "account") && reads("forge", "account"));
-    for tab in ["chat", "pages", "forge", "files", "explorer", "members"] {
-        assert!(!reads(tab, "governance"), "{tab} draws no proposals");
-    }
-    for tab in ["chat", "pages", "forge", "files", "explorer", "settings"] {
-        assert!(!reads(tab, "agents"), "{tab} draws no agent rows");
-    }
-    for tab in ["chat", "pages", "agents", "files", "explorer", "governance"] {
-        assert!(!reads(tab, "account"), "{tab} draws no account card");
-    }
-
-    // an unknown plane name is nobody's — a typo must not silently reopen the
-    // storm by answering true.
-    assert!(!reads("settings", "explorer"));
 }
 
 /// THE GATE IS ONLY WORTH ANYTHING IF THE LOADER HONOURS IT. `keep_i64` sends
