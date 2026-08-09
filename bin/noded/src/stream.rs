@@ -1921,7 +1921,17 @@ async fn catch_up(
             TopicState::Metrics { .. } => catch_up_metrics(&topic, state, handle).await,
             TopicState::Peers { .. } => catch_up_peers(&topic, state, handle).await,
             TopicState::Status { .. } => catch_up_status(&topic, state, handle).await,
-            _ => catch_up_topic(&topic, state, store.as_ref(), &hub),
+            // EVERY cursor-scan variant named, no `_`. A fourth snapshot topic
+            // must fail the build here rather than fall through to the sync
+            // path — where the natural "fix" is the do-nothing arm in
+            // `catch_up_topic`, giving a topic that subscribes cleanly and
+            // never delivers a frame. That is exactly what `files:watch` was.
+            TopicState::Module { .. }
+            | TopicState::FilesWatch { .. }
+            | TopicState::Logs { .. }
+            | TopicState::RunOutput { .. }
+            | TopicState::Term { .. }
+            | TopicState::TermCommand { .. } => catch_up_topic(&topic, state, store.as_ref(), &hub),
         };
         if !send_frames(socket, result.frames).await {
             return false;

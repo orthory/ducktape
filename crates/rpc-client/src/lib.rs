@@ -142,16 +142,29 @@ pub enum NodeSnapshot {
     Status(serde_json::Value),
 }
 
-/// Route one server frame to its snapshot, or `None` for every frame this
-/// subscription does not consume (the subscribe ack, heartbeats, a refusal).
+/// Route one server frame: a snapshot, a failure, or `None` for a frame this
+/// subscription simply does not consume (a heartbeat, a per-topic refusal).
 ///
 /// The TOPIC decides, not the payload's shape: two snapshot documents that
 /// happened to share a field would otherwise be routed by accident, and a
 /// refusal on one topic must not be read as a sample on the other.
-fn snapshot_from_frame(text: &str) -> Option<NodeSnapshot> {
+///
+/// ADMITTING NONE IS THE CONNECTION FAILING — the same rule
+/// `module_event_stream` states below, and for a sharper reason here. Both of
+/// these topics are new, so a console pointed at a daemon that predates them
+/// has BOTH refused and gets `subscribed: {}`. Swallowing that wedges the
+/// overview in total silence: the node heartbeats every block and every 3 s,
+/// so the idle timeout never fires, the socket never closes, no retry ever
+/// runs, and the table sits at its connect-time values looking exactly like a
+/// quiet node. That is the `files:watch` failure — a topic that subscribes
+/// cleanly and never delivers — moved to the client side.
+fn snapshot_from_frame(text: &str) -> Option<Result<NodeSnapshot>> {
     #[derive(Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     enum SnapshotFrame {
+        Subscribed {
+            topics: BTreeMap<String, String>,
+        },
         Tail {
             topic: String,
             item: serde_json::Value,
@@ -159,15 +172,19 @@ fn snapshot_from_frame(text: &str) -> Option<NodeSnapshot> {
         #[serde(other)]
         Other,
     }
-    let SnapshotFrame::Tail { topic, mut item } =
-        serde_json::from_str::<SnapshotFrame>(text).ok()?
-    else {
-        return None;
-    };
-    match topic.as_str() {
-        "peers" => Some(NodeSnapshot::Peers(item["peers"].take())),
-        "status" => Some(NodeSnapshot::Status(item["status"].take())),
-        _ => None,
+    match serde_json::from_str::<SnapshotFrame>(text).ok()? {
+        SnapshotFrame::Subscribed { topics } if topics.is_empty() => {
+            Some(Err(Error::new("RPC stream admitted no requested topic")))
+        }
+        SnapshotFrame::Subscribed { .. } | SnapshotFrame::Other => None,
+        // `get`, not `item["…"]`: indexing a `Value` with a &str PANICS on a
+        // non-object, and a missing key would otherwise read as an empty
+        // sample and blank the table every tick instead of being ignored.
+        SnapshotFrame::Tail { topic, item } => match topic.as_str() {
+            "peers" => Some(Ok(NodeSnapshot::Peers(item.get("peers")?.clone()))),
+            "status" => Some(Ok(NodeSnapshot::Status(item.get("status")?.clone()))),
+            _ => None,
+        },
     }
 }
 
@@ -550,7 +567,10 @@ impl Client {
                     continue;
                 };
                 match snapshot_from_frame(&text) {
-                    Some(snapshot) => return Some((Ok(snapshot), Some(socket))),
+                    Some(Ok(snapshot)) => return Some((Ok(snapshot), Some(socket))),
+                    // a refused subscription ends the stream so the caller's
+                    // backoff can rebuild it, exactly as a dropped socket does.
+                    Some(Err(error)) => return Some((Err(error), None)),
                     None => continue,
                 }
             }
@@ -784,6 +804,77 @@ fn bounded_detail(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A NODE THAT ADMITS NEITHER TOPIC MUST FAIL THE STREAM, NOT GO QUIET.
+    ///
+    /// Both overview topics are new, so a console pointed at an older daemon
+    /// has both refused and receives `subscribed: {}`. If that is swallowed the
+    /// socket stays open forever — the node heartbeats every block and every
+    /// 3 s, so the idle timeout never fires — and the overview holds its
+    /// connect-time values looking exactly like a quiet node. Erroring is what
+    /// lets the caller's backoff rebuild, and what makes the failure visible.
+    #[test]
+    fn an_empty_subscribe_ack_fails_the_snapshot_stream() {
+        let refused = snapshot_from_frame(r#"{"type":"subscribed","topics":{}}"#);
+        assert!(
+            matches!(refused, Some(Err(_))),
+            "admitting no topic is the connection failing"
+        );
+
+        // one admitted topic is a partial degrade, not a failure: the other
+        // half still goes live, and its own error frame already said which.
+        let partial = snapshot_from_frame(r#"{"type":"subscribed","topics":{"status":"0"}}"#);
+        assert!(
+            partial.is_none(),
+            "a partial admit keeps the stream: {partial:?}"
+        );
+    }
+
+    /// The frames are routed by TOPIC and read at the key the node actually
+    /// writes — the `files:watch` lesson: a topic can subscribe cleanly and
+    /// still deliver nothing usable if the reader looks in the wrong place.
+    #[test]
+    fn snapshot_frames_route_by_topic_and_survive_a_malformed_item() {
+        let peers = snapshot_from_frame(
+            r#"{"type":"tail","topic":"peers","cursor":"1","item":{"time_ms":1,"peers":{"peers":[]}}}"#,
+        );
+        assert!(
+            matches!(peers, Some(Ok(NodeSnapshot::Peers(_)))),
+            "{peers:?}"
+        );
+
+        let status = snapshot_from_frame(
+            r#"{"type":"tail","topic":"status","cursor":"1","item":{"time_ms":1,"status":{"version":"0.1.0"}}}"#,
+        );
+        assert!(
+            matches!(status, Some(Ok(NodeSnapshot::Status(_)))),
+            "{status:?}"
+        );
+
+        // an UNKNOWN topic on this socket is ignored, never guessed at.
+        assert!(
+            snapshot_from_frame(r#"{"type":"tail","topic":"metrics","item":{"text":"x"}}"#)
+                .is_none()
+        );
+
+        // A MISSING KEY IS NOT AN EMPTY SAMPLE. Reading it as one would blank
+        // the peers table every tick with no error anywhere.
+        assert!(
+            snapshot_from_frame(r#"{"type":"tail","topic":"peers","item":{"time_ms":1}}"#)
+                .is_none()
+        );
+
+        // and a non-object `item` must not panic the subscription task —
+        // `Value` string-indexing does exactly that.
+        assert!(snapshot_from_frame(r#"{"type":"tail","topic":"peers","item":42}"#).is_none());
+
+        // heartbeats and per-topic refusals are simply not ours.
+        assert!(snapshot_from_frame(r#"{"type":"heartbeat","height":9}"#).is_none());
+        assert!(
+            snapshot_from_frame(r#"{"type":"error","topic":"peers","code":"unavailable"}"#)
+                .is_none()
+        );
+    }
 
     #[test]
     fn accepts_only_bare_http_origins() {

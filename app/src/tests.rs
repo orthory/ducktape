@@ -174,12 +174,36 @@ fn reply_composer(app: &Ducktape) -> String {
 #[test]
 fn the_node_overview_stream_only_runs_on_the_tab_that_draws_it() {
     let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
-    assert!(
-        lifecycle.contains(
+    // PIN THE SET, not a substring. A `contains` check passes while a SECOND,
+    // ungated `run node_overview(…)` sits beside the gated one — which is the
+    // whole defect this guard exists to stop, since the cost lives on the far
+    // side of the socket where no app test can observe it. Comment-only lines
+    // would also satisfy a `contains`; an exact set cannot be fooled by either.
+    let overview_runs: Vec<_> = lifecycle
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("run node_overview("))
+        .collect();
+    assert_eq!(
+        overview_runs,
+        [
             "run node_overview(connected_rpc) when (connected && shell_tab == \"settings\" && node_tab == \"overview\") -> node_overview_sample _"
-        ),
-        "the overview stream must carry its full gate — connected, the settings \
-         tab, and the overview sub-tab that actually draws the peers table"
+        ],
+        "the overview stream must appear EXACTLY once, carrying its full gate"
+    );
+    // The peers HTTP load is the same 485 KB encode and must be gated too, or
+    // the budget holds only in the steady state and every shell-tab switch
+    // pays it again.
+    let peers_loads: Vec<_> = lifecycle
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("run load_peers("))
+        .collect();
+    assert!(
+        !peers_loads.is_empty() && peers_loads.iter().all(|line| line.contains(
+            "keep_i64(shell_tab == \"settings\" && node_tab == \"overview\", node_peers_generation, -1)"
+        )),
+        "every load_peers must be gated to the tab that draws it: {peers_loads:?}"
     );
     // and it must stay a STREAM, never a clock: `assert_no_polling` pins the
     // recurring set exactly, so a future rewrite into `every 2s …` fails there
@@ -200,7 +224,13 @@ fn an_overview_frame_moves_only_the_half_it_answered() {
         live: true,
     }];
     app.node_version = "0.1.0".into();
+    app.node_root_hash = "hash-old".into();
     app.node_checkpoint = 400;
+    app.node_last_finalized = 111;
+    app.node_height = 222;
+    app.node_view_label = "7".into();
+    app.node_quorum_label = "3".into();
+    app.node_reachable_label = "4".into();
 
     // a STATUS frame: facts move, the table does not.
     let _ = app.__update(__DucktapeMessage::NodeOverviewSample(
@@ -209,14 +239,28 @@ fn an_overview_frame_moves_only_the_half_it_answered() {
             facts: backend::NodeFacts {
                 generation: -1,
                 version: "0.2.0".into(),
+                root_hash: "hash-new".into(),
                 checkpoint_height: 512,
-                ..backend::NodeFacts::default()
+                last_finalized_at: 999,
+                height: 888,
+                view: Some(9),
+                quorum: Some(5),
+                reachable_validators: Some(6),
             },
             ..backend::NodeOverview::default()
         },
     ));
+    // ALL NINE, because a frame carrying a field the handler forgot leaves that
+    // field frozen at its connect-time value for as long as the tab is open —
+    // and a test that checks two of nine cannot see the other seven.
     assert_eq!(app.node_version, "0.2.0", "the status half landed");
+    assert_eq!(app.node_root_hash, "hash-new");
     assert_eq!(app.node_checkpoint, 512);
+    assert_eq!(app.node_last_finalized, 999);
+    assert_eq!(app.node_height, 888);
+    assert_eq!(app.node_view_label, "9");
+    assert_eq!(app.node_quorum_label, "5");
+    assert_eq!(app.node_reachable_label, "6");
     assert_eq!(
         app.node_peers.len(),
         1,
@@ -247,7 +291,13 @@ fn an_overview_frame_moves_only_the_half_it_answered() {
         app.node_version, "0.2.0",
         "a peers frame must not blank the consensus facts"
     );
+    assert_eq!(app.node_root_hash, "hash-new");
     assert_eq!(app.node_checkpoint, 512);
+    assert_eq!(app.node_last_finalized, 999);
+    assert_eq!(app.node_height, 888);
+    assert_eq!(app.node_view_label, "9");
+    assert_eq!(app.node_quorum_label, "5");
+    assert_eq!(app.node_reachable_label, "6");
 }
 
 /// The page document's text, the way the save tick reads it.
