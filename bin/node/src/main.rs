@@ -536,6 +536,7 @@ fn run_node(
         // (`Context` has no Clone; a child shares the SAME registry, so its
         // encode() serves the identical exposition).
         status.wire_metrics(&metrics);
+        stream_hub.wire_metrics(&metrics);
         let exposition_context = context.child("exposition");
         status.wire_exposition(move || exposition_context.encode());
         status.publish(noded::NodeStatus {

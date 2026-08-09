@@ -358,7 +358,10 @@ fn call_ws_without_a_hub_refuses_with_a_reason() {
 
     let (status, raw) = daemon.ws_upgrade_refusal("/v1/presence/ws?page=page-1");
     assert_eq!(status, 503, "no realtime hub → presence refused: {raw}");
-    assert!(raw.contains("no mesh realtime hub"), "refusal says WHY: {raw}");
+    assert!(
+        raw.contains("no mesh realtime hub"),
+        "refusal says WHY: {raw}"
+    );
 
     let (status, _raw) = daemon.ws_upgrade_refusal("/v1/voice/ws?channel=general");
     assert_eq!(status, 404, "the old voice route is unrouted, not refused");
@@ -697,7 +700,10 @@ fn state_persists_across_restart() {
                     break;
                 }
                 None => {
-                    assert!(Instant::now() < deadline, "daemon ignored /v1/admin/shutdown");
+                    assert!(
+                        Instant::now() < deadline,
+                        "daemon ignored /v1/admin/shutdown"
+                    );
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
@@ -872,7 +878,10 @@ fn per_module_index_serves_ops_and_views() {
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut daemon = daemon;
         while daemon.child.try_wait().expect("poll daemon").is_none() {
-            assert!(Instant::now() < deadline, "daemon ignored /v1/admin/shutdown");
+            assert!(
+                Instant::now() < deadline,
+                "daemon ignored /v1/admin/shutdown"
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -1273,6 +1282,66 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
     daemon.status();
 }
 
+/// A SUBSCRIBED SESSION IS SENT BACK TO THE STORE ONCE PER FED BLOCK — AND ONLY
+/// THEN.
+///
+/// The block wake is gated on the block having appended index rows, and until
+/// this series existed nothing could observe whether that gate was wired at
+/// all: inverting the one `sweep &&` that connects the decision to `catch_up`
+/// left the whole suite green, because the 30s backstop delivered late and no
+/// assertion measured promptness. This measures the sweep itself, so the gate
+/// is pinned rather than inferred from a frame arriving eventually.
+///
+/// The counter is read BEFORE and AFTER, because `subscribe` runs its own
+/// `Wake::All` catch-up that is not a block wake and must not be counted.
+#[test]
+fn a_fed_block_sweeps_a_subscribed_session_exactly_once() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    // BY CAUSE, because the total cannot tell the gate from its floor: the 30s
+    // backstop sweeps too, and a test that waited for the total to move would
+    // pass on a broken wake after half a minute. This asks whether the BLOCK
+    // woke it.
+    fn block_sweeps(text: &str) -> u64 {
+        text.lines()
+            .find_map(|line| {
+                line.strip_prefix("ducktape_stream_index_sweeps_total{cause=\"block\"} ")
+            })
+            .map(|count| count.trim().parse().expect("counter is a number"))
+            // absent until the first one — a family emits no series for a
+            // label it has never seen.
+            .unwrap_or(0)
+    }
+
+    let mut ws = daemon.ws_connect();
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["module:chat"]}"#);
+    let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+    assert!(subscribed["topics"]["module:chat"].is_string());
+    let before = block_sweeps(&daemon.metrics());
+
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
+        }),
+        None,
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+
+    // wait on the session's OWN delivery, never a clock: the event frame for
+    // this block cannot arrive before the sweep that produced it.
+    let event = Daemon::ws_read_type(&mut ws, "event");
+    assert_eq!(event["topic"], "module:chat");
+
+    assert_eq!(
+        block_sweeps(&daemon.metrics()),
+        before + 1,
+        "one fed block, one sweep — not zero (the gate never fires) and not \
+         several (something else is waking the index topics)"
+    );
+}
+
 #[test]
 fn metrics_endpoint_exposes_ducktape_and_runtime_series() {
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -1339,7 +1408,10 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
     let mut ws = daemon.ws_connect();
     Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["metrics"]}"#);
     let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
-    assert_eq!(subscribed["topics"]["metrics"], "0", "fresh snapshot cursor");
+    assert_eq!(
+        subscribed["topics"]["metrics"], "0",
+        "fresh snapshot cursor"
+    );
 
     // the subscribe replay pushes the first sample immediately — no wait for
     // the next heartbeat tick — carrying the SAME exposition GET /metrics
@@ -1351,7 +1423,10 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
         text.contains("ducktape_blocks_total"),
         "stream sample carries the block series: {text}"
     );
-    assert!(text.trim_end().ends_with("# EOF"), "whole scrape body rides");
+    assert!(
+        text.trim_end().ends_with("# EOF"),
+        "whole scrape body rides"
+    );
     let time_ms = tail["item"]["time_ms"].as_u64().expect("sample instant");
     assert_eq!(tail["cursor"], time_ms.to_string());
 
@@ -1631,7 +1706,8 @@ fn git_clone_over_http_round_trips_full_history() {
 /// PACK bytes are legal only in the final response.
 #[test]
 fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
-    if skip_without_git("git_fetch_and_pull_into_nonempty_checkout_complete_negotiation").is_some() {
+    if skip_without_git("git_fetch_and_pull_into_nonempty_checkout_complete_negotiation").is_some()
+    {
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -1656,7 +1732,11 @@ fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
     let checkout = checkout_root.path().join("checkout");
     git_ok(
         checkout_root.path(),
-        &["clone", &url, checkout.to_str().expect("utf-8 checkout path")],
+        &[
+            "clone",
+            &url,
+            checkout.to_str().expect("utf-8 checkout path"),
+        ],
     );
 
     // A fetch from a non-empty repo has a common first commit. This exercises
@@ -1727,7 +1807,10 @@ fn libgit2_mirror_fetch_completes_incremental_sync() {
 
     fetch(&mirror);
     let first_oid = git2::Oid::from_str(&first_head).expect("head oid");
-    assert!(mirror.find_commit(first_oid).is_ok(), "fresh sync lands the head");
+    assert!(
+        mirror.find_commit(first_oid).is_ok(),
+        "fresh sync lands the head"
+    );
 
     // origin advances; the re-sync's haves earn an ACK + delta pack, and the
     // mirror must still complete the new head's closure from it.
@@ -1736,7 +1819,9 @@ fn libgit2_mirror_fetch_completes_incremental_sync() {
     let second_head = rev_parse_head(src);
     fetch(&mirror);
     let second_oid = git2::Oid::from_str(&second_head).expect("head oid");
-    let landed = mirror.find_commit(second_oid).expect("incremental sync lands the head");
+    let landed = mirror
+        .find_commit(second_oid)
+        .expect("incremental sync lands the head");
     assert_eq!(
         landed
             .tree()

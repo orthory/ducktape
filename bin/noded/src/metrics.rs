@@ -47,6 +47,32 @@ struct OutcomeLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct SweepLabels {
+    cause: String,
+}
+
+/// What sent a ws session back to the derived index.
+///
+/// A closed set, so a caller cannot invent a label and split the series.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SweepCause {
+    /// a block that appended index rows — the intended path.
+    Block,
+    /// the periodic floor. Climbing means rows reached the index without their
+    /// writer announcing, and the wake is no longer carrying the plane.
+    Backstop,
+}
+
+impl SweepCause {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Backstop => "backstop",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ModuleLabels {
     module: String,
 }
@@ -87,6 +113,7 @@ pub struct NodeMetrics {
     checkpoint_height: Registered<raw::Gauge>,
     index_poisoned: Registered<raw::Gauge>,
     index_height: Registered<raw::Family<ModuleLabels, raw::Gauge>>,
+    stream_index_sweeps: Registered<raw::Family<SweepLabels, raw::Counter>>,
     operations: Arc<RwLock<OperationalStatus>>,
 }
 
@@ -106,6 +133,16 @@ impl NodeMetrics {
             blocks_total: context.counter(
                 "ducktape_blocks",
                 "committed local blocks since daemon start",
+            ),
+            // THE FAN-OUT'S ONLY WITNESS. A block wake sweeps the index topics
+            // only when the block appended rows, so this counts how often a
+            // session was sent back to the store. Before that gate it ticked
+            // once per block per subscribed topic per session — on an idle
+            // chain, forever, finding nothing. If this climbs on a quiet chain
+            // the gate has stopped working, and nothing else would say so.
+            stream_index_sweeps: context.family(
+                "ducktape_stream_index_sweeps",
+                "ws sessions sent to re-scan the derived index, by what woke them",
             ),
             apply_latency: context.histogram(
                 "ducktape_block_apply_latency_seconds",
@@ -206,6 +243,20 @@ impl NodeMetrics {
                 })
                 .inc();
         }
+    }
+
+    /// One ws session re-scanned the derived index, labelled by what sent it.
+    ///
+    /// The SPLIT is the point, not the total. `block` is the intended path.
+    /// `backstop` climbing means rows reached the index without their writer
+    /// announcing — the gate is then being carried by a 30s floor instead of
+    /// the wake, which is a bug upstream that nothing else would report.
+    pub fn record_index_sweep(&self, cause: SweepCause) {
+        self.stream_index_sweeps
+            .get_or_create(&SweepLabels {
+                cause: cause.label().to_string(),
+            })
+            .inc();
     }
 
     /// Record deterministic finalized operation outcomes.
