@@ -22,8 +22,11 @@
 //!   past-deadline timeouts and expires stale leases (retry or fail). anyone
 //!   may crank; safety never depends on who does.
 //! - `Cancel` terminates a pending saga — gated to the trigger origin.
-//! - `Prune` removes TERMINAL sagas — gated to the trigger origin per id. GC
-//!   is explicit; there is no lazy retention sweep.
+//! - `Prune` removes TERMINAL sagas on demand — gated to the trigger origin
+//!   per id. it is the owner's EAGER GC on top of a bounded automatic trim:
+//!   every op also drops the terminal tail past a fixed count/byte cap
+//!   (newest kept first), so a terminal saga is never guaranteed to still be
+//!   readable — treat the callback, not the ledger, as the durable result.
 //!
 //! every terminal transition with a `reply_to` emits a [`SagaCallback`] msg to
 //! the requester in the SAME block — requesters depend only on this crate to

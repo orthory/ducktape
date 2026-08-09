@@ -32,8 +32,8 @@ use capability::{CapabilityMsg, CapabilityRegistry, encode_msg as capability_enc
 use host::{BlockContext, BlockOutcome, Host, MemberOutcome, SubmitError};
 use saga::{
     LeasePolicy, MAX_CAPABILITY_BYTES, MAX_ERROR_BYTES, MAX_REPLY_PAYLOAD_BYTES, MAX_RESULT_BYTES,
-    SagaModule, SagaMsg, SagaQuery, SagaReply, SagaStatus, WorkerRequest, decode_reply,
-    decode_worker_control, decode_worker_request, encode_msg, encode_query,
+    MAX_RETAINED_TERMINAL, SagaModule, SagaMsg, SagaQuery, SagaReply, SagaStatus, WorkerRequest,
+    decode_reply, decode_worker_control, decode_worker_request, encode_msg, encode_query,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use std::collections::BTreeMap;
@@ -1468,4 +1468,141 @@ async fn multi_dispatch_inner() {
         .expect("decode"),
         SagaReply::Saga(Some(_))
     ));
+}
+
+/// which of `ids` a host still answers a saga for — the retention set, named
+/// so a divergence says WHICH receipt went instead of just "roots differ".
+async fn retained(h: &Host, ids: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    for id in ids {
+        let reply = h
+            .query(
+                "saga",
+                &encode_query(&SagaQuery::Get {
+                    saga_id: id.clone(),
+                }),
+            )
+            .await
+            .expect("get");
+        if matches!(
+            decode_reply(&reply).expect("decode"),
+            SagaReply::Saga(Some(_))
+        ) {
+            kept.push(id.clone());
+        }
+    }
+    kept
+}
+
+#[test]
+fn a_block_that_crosses_the_retention_cap_evicts_identically_on_both_runtimes() {
+    futures::executor::block_on(retention_parity_inner());
+}
+
+async fn retention_parity_inner() {
+    // the hazard the per-op trim exists FOR. the wasm shell calls the guest's
+    // inner `commit_block` once per OP, the native module once per BLOCK, so a
+    // trim that read the committed map at the boundary would evict at a
+    // different point under the two — and this is the block that would expose
+    // it: one block settling MAX_RETAINED_TERMINAL + 1 sagas, i.e. crossing
+    // the cap MID-block. staged inside the op, both runtimes must drop the
+    // same id and answer identically afterwards.
+    let a = key(0xAA);
+    let members = vec![a.clone()];
+    let member_keys: [&[u8]; 1] = [&a];
+
+    let mut native = native_host(&members).await;
+    let mut wasm = wasm_host_(&members).await;
+    let (n_before, w_before) = (root_of(&native), root_of(&wasm));
+
+    let ids: Vec<String> = (0..=MAX_RETAINED_TERMINAL)
+        .map(|i| sid(&a, &format!("s{i:04}")))
+        .collect();
+    let mut batch: Vec<(Origin, Msg)> = ids
+        .iter()
+        .flat_map(|id| {
+            [
+                (Origin::External(a.clone()), saga_op(&trigger(id).into())),
+                (
+                    Origin::External(a.clone()),
+                    oracle(id, 0, Ok(b"agreed".to_vec())),
+                ),
+            ]
+        })
+        .collect();
+    // the op that MAKES the mid-block eviction observable: re-trigger the id
+    // the crossing just freed, in the same block. once evicted it is new work
+    // (a fresh pending saga and its work order); left in place until the
+    // boundary it is the duplicate NO-OP instead — so a trim that moved to
+    // `commit_block` diverges the two runtimes here, in events and in state.
+    batch.push((
+        Origin::External(a.clone()),
+        saga_op(&trigger(&ids[0]).into()),
+    ));
+
+    let n_out = native
+        .submit_block(block(1, Origin::External(a.clone())), batch.clone())
+        .await
+        .expect("native block");
+    let w_out = wasm
+        .submit_block(block(1, Origin::External(a.clone())), batch)
+        .await
+        .expect("wasm block");
+    for out in [&n_out, &w_out] {
+        assert!(
+            out.members
+                .iter()
+                .all(|m| matches!(m, MemberOutcome::Applied { .. })),
+            "all members must apply: {:?}",
+            out.members
+        );
+    }
+    let tuples = |events: &[sdk::Event]| -> Vec<(String, Vec<u8>)> {
+        events
+            .iter()
+            .map(|e| (e.source.clone(), e.payload.clone()))
+            .collect()
+    };
+    assert_eq!(
+        tuples(&n_out.events),
+        tuples(&w_out.events),
+        "event traces diverge across the cap"
+    );
+    assert_eq!(
+        retained(&native, &ids).await,
+        retained(&wasm, &ids).await,
+        "the runtimes retained different sagas"
+    );
+    assert_eq!(
+        replies(&native, &ids, &member_keys).await,
+        replies(&wasm, &ids, &member_keys).await
+    );
+    // the two roots are over DIFFERENT preimages by construction (native
+    // canonical map vs the port's host-KV store), so parity is the SIBLINGS
+    // agreeing and both roots moving — never byte equality between them.
+    for sibling in SIBLING_IDS {
+        assert_eq!(
+            native.module_root(sibling),
+            wasm.module_root(sibling),
+            "the {sibling} sibling diverged across the cap"
+        );
+    }
+    assert_ne!(root_of(&native), n_before, "native root stuck");
+    assert_ne!(root_of(&wasm), w_before, "wasm root stuck");
+
+    // and the trim actually bit MID-block on both: one consensus_time for the
+    // whole block, so the id breaks every tie and the LOWEST one goes — which
+    // is why its re-trigger landed as live work instead of a duplicate no-op.
+    for h in [&native, &wasm] {
+        assert_eq!(
+            view_of(h, &ids[0]).await.status,
+            SagaStatus::Pending,
+            "the freed id must be new work to the rest of the block"
+        );
+        assert_eq!(
+            view_of(h, ids.last().expect("ids")).await.status,
+            SagaStatus::Done,
+            "the newest receipt always survives"
+        );
+    }
 }

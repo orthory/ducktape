@@ -55,9 +55,23 @@
 //!
 //! ## GC
 //!
-//! retention is explicit: `Prune` removes terminal sagas, gated to the
-//! recorded trigger origin per id. there is no lazy retention sweep — a
-//! terminal saga stays in the root preimage until its owner prunes it.
+//! retention is BOUNDED, and owners may still prune eagerly. `Prune` removes
+//! terminal sagas on demand, gated to the recorded trigger origin per id; on
+//! top of that EVERY op trims the terminal tail to [`MAX_RETAINED_TERMINAL`]
+//! entries / [`MAX_RETAINED_TERMINAL_BYTES`] bytes, newest first
+//! ([`terminal_evictions`]) — a pure function of the visible map, so every
+//! validator drops the identical set whether it replayed the state or adopted
+//! a snapshot. pending sagas are never eligible. an evicted id behaves exactly
+//! like an explicitly pruned one: unknown to every handler, and free to
+//! trigger again as new work.
+//!
+//! the trim runs inside `execute` and STAGES its removals, deliberately: the
+//! native module merges its overlay at `commit_block` while the wasm shell
+//! (`snapshot_guest!`) calls the inner `commit_block` once per OP, so a
+//! boundary hook reading the whole committed map would evict at a different
+//! point under the two. both are chain participants — `bin/noded` and
+//! `bin/simnode` construct this native module, `bin/node` loads the component
+//! — so they must agree op for op, not just block for block.
 //!
 //! `root()` folds in every field, so any transition moves the root-hash. a
 //! joiner rebuilds this module from a peer via [`SagaModule::snapshot`] /
@@ -82,7 +96,7 @@ pub mod index;
 #[cfg(feature = "index-guest")]
 mod index_guest;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use capability::{
     CapabilityQuery, CapabilityReply, decode_reply as capability_decode_reply,
@@ -99,6 +113,21 @@ use valset::{
 /// hard cap on state transitions per `Crank` op — a consensus constant, so a
 /// backlog of expired sagas is worked off in deterministic, bounded slices.
 pub const CRANK_BUDGET: u32 = 32;
+
+/// how many TERMINAL sagas stay in the root preimage. a terminal saga has
+/// already fired its callback (P6, in the block it landed) — what remains is a
+/// read-only receipt, and an unbounded pile of receipts is the state-growth
+/// cliff: every wasm op decodes the WHOLE state before it looks at the
+/// payload, so a big enough map traps every op on every validator, INCLUDING
+/// the `Prune` that would shrink it.
+pub const MAX_RETAINED_TERMINAL: usize = 64;
+
+/// byte budget for the retained terminal tail. the count cap alone bounds
+/// entries, not bytes — one saga carries its spec ([`MAX_SPEC_BYTES`]) and its
+/// result ([`MAX_RESULT_BYTES`]). entries are kept newest-first while the
+/// running total is within budget, so the retained tail is at most this plus
+/// one maximal entry.
+pub const MAX_RETAINED_TERMINAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// lease window (in views) granted when a trigger leaves `lease_views` unset
 /// but an assignee exists — an assigned attempt must always be reclaimable.
@@ -205,6 +234,50 @@ fn encode_committed(sagas: &BTreeMap<String, Saga>) -> Vec<u8> {
         out.extend_from_slice(&s.updated_at.to_le_bytes());
     }
     out
+}
+
+/// the retention decision, as a pure function: which terminal sagas this
+/// VISIBLE map (committed plus this op's staged overlay) must drop to stay
+/// inside [`MAX_RETAINED_TERMINAL`]/[`MAX_RETAINED_TERMINAL_BYTES`].
+///
+/// terminal-only — a pending saga is live work and is never eligible. terminal
+/// receipts are ranked NEWEST first by `(updated_at, id)` and kept while both
+/// budgets hold, so the newest receipt always survives and the retained tail is
+/// at most the byte budget plus one maximal entry.
+///
+/// it reads nothing but the map it is handed, so every validator evicts the
+/// identical set at the identical op — and a node that adopted the state from
+/// a snapshot decides the same as one that replayed it.
+fn terminal_evictions(sagas: &BTreeMap<&str, &Saga>) -> Vec<String> {
+    let mut terminal: Vec<(u64, &str, usize)> = sagas
+        .iter()
+        .filter(|(_, s)| s.status.is_terminal())
+        .map(|(id, s)| {
+            let bytes = s.spec.len()
+                + s.reply_payload.len()
+                + s.result.as_ref().map_or(0, Vec::len)
+                + s.error.as_ref().map_or(0, String::len);
+            (s.updated_at, *id, bytes)
+        })
+        .collect();
+    // newest first; the id breaks ties, so the order is total and stable.
+    terminal.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+
+    let mut kept = 0usize;
+    let mut kept_bytes = 0usize;
+    let mut evicted = Vec::new();
+    for (_, id, bytes) in terminal {
+        let within_count = kept < MAX_RETAINED_TERMINAL;
+        // checked BEFORE this entry is added, so the newest is always kept.
+        let within_budget = kept_bytes <= MAX_RETAINED_TERMINAL_BYTES;
+        if within_count && within_budget {
+            kept += 1;
+            kept_bytes = kept_bytes.saturating_add(bytes);
+            continue;
+        }
+        evicted.push(id.to_string());
+    }
+    evicted
 }
 
 /// the state-based commitment over a committed saga map — shared by `root()`
@@ -465,16 +538,28 @@ impl SagaModule {
         self.pending.insert(saga_id, None);
     }
 
+    /// the whole visible map — committed, with this block's staged writes and
+    /// removals applied. the same view `get` answers from, materialized.
+    fn visible(&self) -> BTreeMap<&str, &Saga> {
+        let mut visible: BTreeMap<&str, &Saga> = self
+            .sagas
+            .iter()
+            .map(|(id, saga)| (id.as_str(), saga))
+            .collect();
+        for (id, staged) in &self.pending {
+            match staged {
+                Some(saga) => visible.insert(id.as_str(), saga),
+                None => visible.remove(id.as_str()),
+            };
+        }
+        visible
+    }
+
     /// every saga id visible this dispatch — committed plus staged, sorted —
-    /// the deterministic iteration domain for `Crank`.
+    /// the deterministic iteration domain for `Crank`. staged REMOVALS are
+    /// applied, so every id it yields is one `get` answers.
     fn visible_ids(&self) -> Vec<String> {
-        self.pending
-            .keys()
-            .chain(self.sagas.keys())
-            .cloned()
-            .collect::<BTreeSet<String>>()
-            .into_iter()
-            .collect()
+        self.visible().into_keys().map(str::to_string).collect()
     }
 
     /// project a saga to its wire view.
@@ -721,29 +806,10 @@ impl SagaModule {
         self.pending.clear();
         Ok(())
     }
-}
 
-#[async_trait::async_trait(?Send)]
-impl Module for SagaModule {
-    fn id(&self) -> ModuleId {
-        self.id.clone()
-    }
-
-    /// state-based commitment: sha256 over the canonical committed encoding —
-    /// a length-prefixed fold of every saga field in sorted-id order.
-    /// insertion-order-independent and idempotent — and sensitive to every
-    /// field, so any transition (status, attempt, lease, result) yields a
-    /// distinct root. the preimage IS the snapshot encoding (see
-    /// [`SagaModule::snapshot`]).
-    fn root(&self) -> StateRoot {
-        committed_root(&self.sagas)
-    }
-
-    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
-        Some(self.snapshot())
-    }
-
-    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+    /// the op handler — one arm per [`SagaMsg`] variant. every write it makes
+    /// is STAGED; `execute` wraps it with the retention trim.
+    async fn handle(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             SagaMsg::Trigger {
                 saga_id,
@@ -1138,8 +1204,9 @@ impl Module for SagaModule {
             SagaMsg::Prune { saga_ids } => {
                 // explicit GC: remove TERMINAL sagas whose recorded trigger
                 // origin matches the submitter. non-terminal, foreign, and
-                // unknown ids are skipped as no-ops. no lazy retention sweep
-                // exists — retention is always an owner's explicit choice.
+                // unknown ids are skipped as no-ops. the automatic trim in
+                // `execute` bounds the tail regardless; this is an owner
+                // reclaiming a specific id early.
                 let origin = saga_origin(&ctx.env().origin);
                 for saga_id in saga_ids {
                     let Some(current) = self.get(&saga_id) else {
@@ -1151,6 +1218,39 @@ impl Module for SagaModule {
                     self.stage_remove(saga_id);
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for SagaModule {
+    fn id(&self) -> ModuleId {
+        self.id.clone()
+    }
+
+    /// state-based commitment: sha256 over the canonical committed encoding —
+    /// a length-prefixed fold of every saga field in sorted-id order.
+    /// insertion-order-independent and idempotent — and sensitive to every
+    /// field, so any transition (status, attempt, lease, result) yields a
+    /// distinct root. the preimage IS the snapshot encoding (see
+    /// [`SagaModule::snapshot`]).
+    fn root(&self) -> StateRoot {
+        committed_root(&self.sagas)
+    }
+
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
+    }
+
+    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        self.handle(ctx, msg).await?;
+        // bounded retention, STAGED like every other write this op makes —
+        // never deferred to the block boundary (see the crate header, `## GC`,
+        // for why the two runtimes would disagree if it were).
+        let evictions = terminal_evictions(&self.visible());
+        for saga_id in evictions {
+            self.stage_remove(saga_id);
         }
         Ok(())
     }
@@ -1253,6 +1353,7 @@ mod tests {
     };
     use futures::executor::block_on;
     use sdk::{Env, Event};
+    use std::collections::BTreeSet;
 
     /// a minimal `Ctx` that captures emitted msgs/effects and serves a canned
     /// valset — enough to unit-test `execute` in isolation (the host provides
@@ -3621,6 +3722,191 @@ mod tests {
         assert!(ctx.events.is_empty(), "rejected triggers fire no worker");
         assert_eq!(get(&m, &sid("s1")), None, "nothing was staged");
         assert_eq!(get(&m, &sid("s2")), None, "nothing was staged");
+    }
+
+    // ---- retention ---------------------------------------------------------
+
+    fn saga_state(status: SagaStatus, updated_at: u64, spec_bytes: usize) -> Saga {
+        Saga {
+            origin: SagaOrigin::System,
+            reply_to: None,
+            reply_payload: Vec::new(),
+            spec: vec![b'x'; spec_bytes],
+            capability: None,
+            demands: BTreeMap::new(),
+            status,
+            attempt: 0,
+            max_attempts: 1,
+            assignee: None,
+            pinned_assignee: None,
+            lease_views: None,
+            lease_expires_at: None,
+            deadline: None,
+            result: None,
+            error: None,
+            created_at: updated_at,
+            updated_at,
+        }
+    }
+
+    /// the retention decision reads a borrowed view; these unit cases own
+    /// their fixture map.
+    fn borrowed(map: &BTreeMap<String, Saga>) -> BTreeMap<&str, &Saga> {
+        map.iter().map(|(id, saga)| (id.as_str(), saga)).collect()
+    }
+
+    #[test]
+    fn the_retention_decision_evicts_the_oldest_terminal_and_nothing_else() {
+        // the pending saga carries the OLDEST timestamp: age alone must never
+        // make live work eligible.
+        let mut map = BTreeMap::new();
+        map.insert("pending".to_string(), saga_state(SagaStatus::Pending, 0, 4));
+        let overflow = 5;
+        let terminal = [
+            SagaStatus::Done,
+            SagaStatus::Failed,
+            SagaStatus::TimedOut,
+            SagaStatus::Cancelled,
+        ];
+        for i in 0..MAX_RETAINED_TERMINAL + overflow {
+            let status = terminal[i % terminal.len()];
+            map.insert(format!("s{i:04}"), saga_state(status, 100 + i as u64, 4));
+        }
+
+        let mut evicted = terminal_evictions(&borrowed(&map));
+        evicted.sort();
+        let expected: Vec<String> = (0..overflow).map(|i| format!("s{i:04}")).collect();
+        assert_eq!(evicted, expected, "exactly the oldest terminal receipts go");
+
+        // under the cap it evicts nothing at all.
+        let mut small = BTreeMap::new();
+        small.insert("pending".to_string(), saga_state(SagaStatus::Pending, 0, 4));
+        small.insert("one".to_string(), saga_state(SagaStatus::Done, 9, 4));
+        assert!(terminal_evictions(&borrowed(&small)).is_empty());
+    }
+
+    #[test]
+    fn the_retention_decision_also_holds_a_byte_budget() {
+        // four half-budget receipts: the running total is checked BEFORE each
+        // entry is added, so three are kept (the last one crossing the line)
+        // and the oldest is evicted — count cap untouched.
+        let half = MAX_RETAINED_TERMINAL_BYTES / 2;
+        let mut map = BTreeMap::new();
+        for i in 0..4u64 {
+            map.insert(format!("s{i}"), saga_state(SagaStatus::Done, i, half));
+        }
+        assert_eq!(terminal_evictions(&borrowed(&map)), vec!["s0".to_string()]);
+
+        // one oversized receipt is still kept — the newest always survives —
+        // but it pushes every older one out.
+        let mut map = BTreeMap::new();
+        map.insert("old".to_string(), saga_state(SagaStatus::Done, 1, 8));
+        map.insert(
+            "huge".to_string(),
+            saga_state(SagaStatus::Done, 2, MAX_RETAINED_TERMINAL_BYTES + 1),
+        );
+        assert_eq!(terminal_evictions(&borrowed(&map)), vec!["old".to_string()]);
+    }
+
+    #[test]
+    fn retention_is_staged_inside_the_op_not_deferred_to_the_block_boundary() {
+        // the wasm shell (`snapshot_guest!`) calls the inner `commit_block`
+        // once per OP; the native module once per BLOCK — and both run as
+        // chain participants. a trim living in `commit_block` would therefore
+        // evict mid-block under wasm and only at the boundary natively, and
+        // the two would disagree on the state root of any block that crosses
+        // the cap. staged inside the op, the eviction lands in the same
+        // read-your-writes overlay every later op of the block already reads.
+        let mut m = SagaModule::new("saga");
+        let mut ctx = CaptureCtx::new().at(1);
+        for i in 0..=MAX_RETAINED_TERMINAL {
+            let id = sid(&format!("s{i:04}"));
+            exec(&mut m, &mut ctx, &trigger(&id, b"w")).unwrap();
+            exec(&mut m, &mut ctx, &oracle(&id, 0, Ok(b"r".to_vec()))).unwrap();
+        }
+        // one consensus_time for the whole block, so the id breaks every tie:
+        // newest-first ranks the LOWEST id last, and it is the one that goes.
+        let evicted = sid("s0000");
+        assert!(
+            m.get(&evicted).is_none(),
+            "the eviction must be visible to the rest of THIS block"
+        );
+        // and the freed id is new work to the very next op — what a wasm
+        // validator sees, so a native one must see it too.
+        exec(&mut m, &mut ctx, &trigger(&evicted, b"again")).unwrap();
+        assert_eq!(m.get(&evicted).map(|s| s.status), Some(SagaStatus::Pending));
+        commit(&mut m);
+        assert_eq!(
+            m.sagas.get(&evicted).map(|s| s.status),
+            Some(SagaStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn sustained_saga_traffic_keeps_the_committed_ledger_bounded() {
+        // the growth-bound pin: three capfuls of sagas triggered and settled,
+        // one per block. without the per-op trim this ledger is 1:1 with
+        // every saga ever triggered — the state-growth cliff.
+        let mut m = SagaModule::new("saga");
+
+        // one long-lived pending saga, triggered FIRST (so it is also the
+        // oldest thing in the ledger) — live work is never retention's to take.
+        let mut ctx = CaptureCtx::new().at(1);
+        exec(&mut m, &mut ctx, &trigger(&sid("long-lived"), b"w")).unwrap();
+        commit(&mut m);
+
+        const ROUNDS: usize = MAX_RETAINED_TERMINAL * 3;
+        for i in 0..ROUNDS {
+            let height = (i as u64 + 1) * 4;
+            let id = sid(&format!("s{i:04}"));
+            let mut ctx = CaptureCtx::new().at(height);
+            exec(&mut m, &mut ctx, &trigger(&id, b"work spec")).unwrap();
+            exec(
+                &mut m,
+                &mut ctx,
+                &oracle(&id, 0, Ok(b"the agreed result".to_vec())),
+            )
+            .unwrap();
+            commit(&mut m);
+
+            assert!(
+                m.sagas.len() <= MAX_RETAINED_TERMINAL + 1,
+                "round {i}: {} sagas retained",
+                m.sagas.len()
+            );
+        }
+
+        // the cap, plus the one pending saga that is not retention's business.
+        assert_eq!(m.sagas.len(), MAX_RETAINED_TERMINAL + 1);
+        assert_eq!(
+            get(&m, &sid("long-lived")).unwrap().status,
+            SagaStatus::Pending,
+            "live work survives every trim"
+        );
+        let newest = sid(&format!("s{:04}", ROUNDS - 1));
+        assert_eq!(
+            get(&m, &newest).unwrap().status,
+            SagaStatus::Done,
+            "the newest receipt survived"
+        );
+        assert_eq!(
+            get(&m, &sid("s0000")),
+            None,
+            "the oldest receipt was trimmed"
+        );
+
+        // and the owner's explicit Prune still reaches what is retained.
+        let mut ctx = CaptureCtx::new().at(9999);
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Prune {
+                saga_ids: vec![newest.clone()],
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, &newest), None, "explicit prune still removes it");
     }
 }
 

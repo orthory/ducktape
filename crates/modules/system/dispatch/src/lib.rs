@@ -26,6 +26,19 @@
 //! block: a permanent abort loop. same discipline the platform already
 //! demands of chat hook subscribers.
 //!
+//! ## retention
+//!
+//! the RECORD is permanent, the PAYLOAD is not. a dispatch record is the
+//! network's turn-claim key — `runs` asks "does this dispatch id exist?" to
+//! refuse a second run for a `run_id` it already ran, long after its own
+//! pending entry is gone — so a record is never evicted, ever. what is
+//! unbounded is the outcome: up to [`MAX_RESULT_BYTES`] per dispatch, and
+//! every wasm op decodes the WHOLE state before it looks at its payload, so a
+//! big enough map traps every op on every validator. delivery therefore hands
+//! the bytes to the receiver and DROPS this module's copy, in the same
+//! transition, leaving a fixed-size receipt. state then grows with the number
+//! of dispatches, not with the size of their results.
+//!
 //! ## self-containment
 //!
 //! this module imports no app module and no app interface. its collaborators
@@ -688,6 +701,10 @@ impl DispatchModule {
             let mut dispatch = current;
             dispatch.status = Status::Delivered;
             dispatch.updated_at = now;
+            // the receiver now owns the bytes; a second copy here would grow
+            // the root preimage forever (crate header, "retention"). the
+            // RECORD stays — it is `runs`' permanent turn claim.
+            dispatch.outcome = None;
             ctx.emit_msg(Msg {
                 target: dispatch.receiver.clone(),
                 payload: encode_result_event(&ResultEvent {
@@ -935,11 +952,7 @@ mod tests {
     fn module() -> DispatchModule {
         DispatchModule::new("dispatch", "saga")
     }
-    fn exec(
-        m: &mut DispatchModule,
-        ctx: &mut TestCtx,
-        payload: &DispatchMsg,
-    ) -> Result<(), Error> {
+    fn exec(m: &mut DispatchModule, ctx: &mut TestCtx, payload: &DispatchMsg) -> Result<(), Error> {
         let msg = Msg {
             target: "dispatch".into(),
             payload: crate::encode_msg(payload),
@@ -983,8 +996,13 @@ mod tests {
         commit(m);
         dispatch_key("caller", "d1")
     }
-    fn callback_for(m: &mut DispatchModule, key: &str, outcome: SagaOutcome) -> Result<(), Error> {
-        let mut ctx = mk_ctx(9, Origin::Module("saga".into()));
+    fn callback_for(
+        m: &mut DispatchModule,
+        at: u64,
+        key: &str,
+        outcome: SagaOutcome,
+    ) -> Result<(), Error> {
+        let mut ctx = mk_ctx(at, Origin::Module("saga".into()));
         let msg = Msg {
             target: "dispatch".into(),
             payload: encode_callback(&SagaCallback {
@@ -1266,7 +1284,8 @@ mod tests {
     fn work_spec_without_demands_field_is_rejected() {
         // FLAG DAY: demands is required — a spec that omits the key fails to
         // decode rather than silently defaulting to a demandless job.
-        let no_demands = br#"{"kind":"dispatch-work-v1","dispatch_id":"d","capability":"c","payload":[]}"#;
+        let no_demands =
+            br#"{"kind":"dispatch-work-v1","dispatch_id":"d","capability":"c","payload":[]}"#;
         assert!(crate::decode_work_spec(no_demands).is_err());
     }
 
@@ -1275,7 +1294,13 @@ mod tests {
         // Json contract, JSON result: Ok flows to the mailbox.
         let mut m = module();
         let key = registered_and_dispatched(&mut m, OutputContract::Json);
-        callback_for(&mut m, &key, SagaOutcome::Done(br#"{"ok":true}"#.to_vec())).unwrap();
+        callback_for(
+            &mut m,
+            9,
+            &key,
+            SagaOutcome::Done(br#"{"ok":true}"#.to_vec()),
+        )
+        .unwrap();
         commit(&mut m);
         let view = get_dispatch(&m, &key).unwrap();
         assert_eq!(view.status, DispatchStatus::AwaitingDelivery);
@@ -1285,7 +1310,7 @@ mod tests {
         // Json contract, non-JSON result: the VIOLATION is the outcome.
         let mut m = module();
         let key = registered_and_dispatched(&mut m, OutputContract::Json);
-        callback_for(&mut m, &key, SagaOutcome::Done(b"not json".to_vec())).unwrap();
+        callback_for(&mut m, 9, &key, SagaOutcome::Done(b"not json".to_vec())).unwrap();
         commit(&mut m);
         let view = get_dispatch(&m, &key).unwrap();
         match view.outcome {
@@ -1297,7 +1322,7 @@ mod tests {
         // saga failure maps to the Err outcome verbatim.
         let mut m = module();
         let key = registered_and_dispatched(&mut m, OutputContract::Text);
-        callback_for(&mut m, &key, SagaOutcome::Failed("provider died".into())).unwrap();
+        callback_for(&mut m, 9, &key, SagaOutcome::Failed("provider died".into())).unwrap();
         commit(&mut m);
         assert_eq!(
             get_dispatch(&m, &key).unwrap().outcome,
@@ -1308,7 +1333,13 @@ mod tests {
         let mut m = module();
         let key = registered_and_dispatched(&mut m, OutputContract::Text);
         let before = m.root();
-        callback_for(&mut m, "caller\x1fnope", SagaOutcome::Done(b"x".to_vec())).unwrap();
+        callback_for(
+            &mut m,
+            9,
+            "caller\x1fnope",
+            SagaOutcome::Done(b"x".to_vec()),
+        )
+        .unwrap();
         let mut ctx = mk_ctx(0, Origin::Module("saga".into()));
         let msg = Msg {
             target: "dispatch".into(),
@@ -1350,6 +1381,7 @@ mod tests {
             let key = dispatch_key(receiver, &format!("d{i:03}"));
             callback_for(
                 &mut m,
+                9,
                 &key,
                 SagaOutcome::Done(format!("r{i}").into_bytes()),
             )
@@ -1396,7 +1428,7 @@ mod tests {
     fn snapshot_round_trips_and_rejects_wrong_roots() {
         let mut m = module();
         let key = registered_and_dispatched(&mut m, OutputContract::Json);
-        callback_for(&mut m, &key, SagaOutcome::Done(br#"[1,2]"#.to_vec())).unwrap();
+        callback_for(&mut m, 9, &key, SagaOutcome::Done(br#"[1,2]"#.to_vec())).unwrap();
         commit(&mut m);
 
         let snap = m.snapshot();
@@ -1505,7 +1537,7 @@ mod tests {
 
         // once the Cancelled callback lands, the result flows the NORMAL
         // path (Err in the mailbox) and a repeat cancel is a no-op.
-        callback_for(&mut m, &key, SagaOutcome::Cancelled).unwrap();
+        callback_for(&mut m, 9, &key, SagaOutcome::Cancelled).unwrap();
         commit(&mut m);
         assert_eq!(pending_deliveries(&m), 1);
         let mut ctx = mk_ctx(0, Origin::Module("caller".into()));
@@ -1590,6 +1622,128 @@ mod tests {
         ));
     }
 
+    // ---- retention ---------------------------------------------------------
+
+    /// drive one dispatch all the way from `Dispatch` to `Delivered`, one
+    /// block per transition, with an `outcome_bytes`-sized result.
+    fn full_round(m: &mut DispatchModule, i: usize, outcome_bytes: usize) {
+        let height = (i as u64 + 1) * 4;
+        let dispatch_id = format!("d{i:04}");
+        let key = dispatch_key("caller", &dispatch_id);
+
+        let mut ctx = mk_ctx(height, Origin::Module("caller".into()));
+        exec(m, &mut ctx, &dispatch_op(&dispatch_id, b"input")).unwrap();
+        commit(m);
+
+        callback_for(
+            m,
+            height + 1,
+            &key,
+            SagaOutcome::Done(vec![b'x'; outcome_bytes]),
+        )
+        .unwrap();
+        commit(m);
+
+        let mut ctx = mk_ctx(height + 2, Origin::System);
+        exec(m, &mut ctx, &DispatchMsg::DeliverPending {}).unwrap();
+        commit(m);
+    }
+
+    #[test]
+    fn delivery_hands_the_outcome_over_and_drops_this_module_s_copy() {
+        let mut m = module();
+        let mut ctx = mk_ctx(0, owner());
+        exec(
+            &mut m,
+            &mut ctx,
+            &register(OutputContract::Text, Routing::Rendezvous),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        // the pre-delivery record still carries the bytes — the mailbox sweep
+        // is what needs them.
+        let key = dispatch_key("caller", "d0000");
+        let mut ctx = mk_ctx(4, Origin::Module("caller".into()));
+        exec(&mut m, &mut ctx, &dispatch_op("d0000", b"input")).unwrap();
+        commit(&mut m);
+        callback_for(&mut m, 9, &key, SagaOutcome::Done(b"result".to_vec())).unwrap();
+        commit(&mut m);
+        assert_eq!(
+            get_dispatch(&m, &key).unwrap().outcome,
+            Some(Ok(b"result".to_vec()))
+        );
+
+        let mut sys = mk_ctx(6, Origin::System);
+        exec(&mut m, &mut sys, &DispatchMsg::DeliverPending {}).unwrap();
+        commit(&mut m);
+
+        // the receiver got every byte...
+        let event = crate::decode_result_event(&sys.msgs()[0].payload).unwrap();
+        assert_eq!(event.outcome, Ok(b"result".to_vec()));
+        // ...and the record kept none of them, while STAYING a record.
+        let view = get_dispatch(&m, &key).expect("the delivered record survives");
+        assert_eq!(view.status, DispatchStatus::Delivered);
+        assert_eq!(view.outcome, None, "the delivered copy is dropped");
+    }
+
+    #[test]
+    fn sustained_dispatch_traffic_keeps_the_state_bounded_but_never_forgets_a_run() {
+        // the growth pin. every dispatch record is `runs`' PERMANENT turn
+        // claim (runs::dispatch_flow::turn_taken) — evicting one re-opens a
+        // settled run for a duplicate agent launch — so the count grows 1:1
+        // with traffic ON PURPOSE. what must NOT grow is the payload: the
+        // outcome is up to MAX_RESULT_BYTES and every wasm op decodes the
+        // whole state first.
+        let mut m = module();
+        let mut ctx = mk_ctx(0, owner());
+        exec(
+            &mut m,
+            &mut ctx,
+            &register(OutputContract::Text, Routing::Rendezvous),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        const ROUNDS: usize = 64;
+        const OUTCOME_BYTES: usize = 64 * 1024;
+        for i in 0..ROUNDS {
+            full_round(&mut m, i, OUTCOME_BYTES);
+        }
+
+        assert_eq!(
+            m.committed.dispatches.len(),
+            ROUNDS,
+            "no receipt is ever evicted: the record IS the turn claim"
+        );
+        assert_eq!(pending_deliveries(&m), 0, "every result was delivered");
+
+        // ROUNDS * 64 KiB of results passed through; the state that commits
+        // to them is a small multiple of the record count, not of the bytes.
+        let bytes = m.snapshot().len();
+        let ceiling = ROUNDS * 1024;
+        assert!(
+            bytes < ceiling,
+            "state is {bytes} bytes for {ROUNDS} delivered dispatches (ceiling {ceiling}); \
+             delivered outcomes are being retained"
+        );
+
+        // the oldest turn is still claimed — the query runs' `turn_taken`
+        // makes, answered from committed state only.
+        let reply = block_on(m.query(&crate::encode_query(&DispatchQuery::Dispatch {
+            receiver: "caller".into(),
+            dispatch_id: "d0000".into(),
+        })))
+        .unwrap();
+        let DispatchReply::Dispatch(Some(oldest)) = crate::decode_reply(&reply).unwrap() else {
+            panic!("the oldest turn claim must still answer");
+        };
+        assert_eq!(oldest.status, DispatchStatus::Delivered);
+        assert_eq!(oldest.outcome, None);
+
+        // the recipe is untouched.
+        assert_eq!(m.committed.recipes.len(), 1);
+    }
 }
 
 // the wasm-guest port: the dispatch shell that adapts this module to the
