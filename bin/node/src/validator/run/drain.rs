@@ -464,7 +464,13 @@ impl ValidatorRuntime<'_> {
         if *blocks_since_checkpoint >= checkpoint_blocks
             && let Some(f) = node.finalized()
         {
+            // EVERY STAGE BELOW RUNS ON THE SELECT LOOP, so its duration is
+            // time the `http_ingress` arm is not polled and `/v1/query` is
+            // unserviced (issue #1018). The stage timings ARE the diagnosis,
+            // so they ride the checkpoint event itself rather than needing a
+            // profiler on a box where the stall only shows under real state.
             let pos = node.sink_mut().oplog_pos().await;
+            let checkpoint_started = context.current();
             let captured = Manifest::capture(
                 node.host(),
                 Some(f.height),
@@ -476,9 +482,11 @@ impl ValidatorRuntime<'_> {
                 pos,
                 *next_seq,
             );
+            let captured_at = context.current();
             match captured {
                 Ok(m) => match node.sink_mut().write_manifest(&m).await {
                     Ok(()) => {
+                        let written_at = context.current();
                         *blocks_since_checkpoint = 0;
                         let floor_passed = matches!(
                             node.sink_mut().floor_cert(),
@@ -508,11 +516,18 @@ impl ValidatorRuntime<'_> {
                             );
                         }
                         *prev_ckpt = (m.height, pos);
+                        let since = |a: std::time::SystemTime, b: std::time::SystemTime| {
+                            b.duration_since(a).unwrap_or_default().as_millis()
+                        };
+                        let done_at = context.current();
                         tracing::info!(
                             target: "ducktape::recovery",
                             event = "node_checkpoint_written",
                             node = %label,
-                            height = m.height.unwrap_or_default()
+                            height = m.height.unwrap_or_default(),
+                            capture_ms = since(checkpoint_started, captured_at),
+                            write_ms = since(captured_at, written_at),
+                            prune_ms = since(written_at, done_at)
                         );
                     }
                     Err(e) => {

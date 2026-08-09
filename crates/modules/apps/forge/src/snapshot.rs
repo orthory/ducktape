@@ -46,6 +46,21 @@ impl Forge {
     /// exactly what contributes to `root()` — plus the tracker's canonical
     /// bytes. staged (this-block) state is deliberately excluded.
     pub fn snapshot(&self) -> Result<Vec<u8>, Error> {
+        // PACKING IS THE EXPENSIVE PART AND THE CALLER IS A CLOCK. The node's
+        // checkpoint calls this every `checkpoint_blocks` blocks on its select
+        // loop; see [`SnapshotCache`] for the measurement and what it starved.
+        let root = <Self as sdk::Module>::root(self);
+        let pending = self.pending_key();
+        let cached = self
+            .snapshot_cache
+            .borrow()
+            .as_ref()
+            .filter(|hit| hit.root == root && hit.pending == pending)
+            .map(|hit| hit.bytes.clone());
+        if let Some(bytes) = cached {
+            return Ok(bytes);
+        }
+
         let mut out = FORGE_SNAPSHOT_MAGIC.to_vec();
         let born: Vec<(&str, &RepoState)> = self
             .repos
@@ -82,7 +97,23 @@ impl Forge {
             codec::put_bytes(&mut out, &pack);
         }
         codec::put_bytes(&mut out, &self.tracker.canonical_bytes());
+        *self.snapshot_cache.borrow_mut() = Some(crate::SnapshotCache {
+            root,
+            pending,
+            bytes: out.clone(),
+        });
         Ok(out)
+    }
+
+    /// the node-local half of [`SnapshotCache`]'s key: which branches are still
+    /// waiting on their objects, per repo. `root()` cannot carry this — the
+    /// pending set is deliberately not consensus state — but it does change the
+    /// container, so it has to be compared beside the root.
+    fn pending_key(&self) -> Vec<(String, crate::refs::PendingMap)> {
+        self.repos
+            .iter()
+            .map(|(name, state)| (name.clone(), state.pending().clone()))
+            .collect()
     }
 
     /// replace this module's WHOLE state with snapshot bytes, gated on

@@ -440,6 +440,34 @@ pub struct Forge {
     /// where issue/PR discussion-channel follow-ups go (`emit_msg` target).
     /// `None` (tests / minimal deployments without chat) emits nothing.
     chat_target: Option<String>,
+    /// the last snapshot bytes, keyed on the committed state they encode.
+    ///
+    /// `snapshot()` packs the object closure of every branch head, and the
+    /// node checkpoints by calling it every `checkpoint_blocks` blocks. On the
+    /// demo workspace that measured **60.2 s of a 60.5 s capture — every one of
+    /// the other 19 modules was 0 ms** — and the capture runs on the validator's
+    /// select loop, so for those 60 s no other arm of that loop was polled:
+    /// `/v1/query` went unserviced and even SIGTERM waited (issue #1018). An
+    /// idle forge was re-packing a byte-identical 61 MB repo every 32 blocks.
+    ///
+    /// The key is total. The bytes are a pure function of the committed refs,
+    /// the tracker and the pending map: `root()` covers the first two, and the
+    /// objects behind an unchanged head oid cannot change, because git is
+    /// content-addressed — the one case where they legitimately arrive later is
+    /// a MISSING closure, which is exactly what `pending` records.
+    ///
+    /// ponytail: holds one snapshot resident (repo-sized — 61 MB here). Swap
+    /// for a digest + on-disk container if a node's repos outgrow its memory.
+    snapshot_cache: std::cell::RefCell<Option<SnapshotCache>>,
+}
+
+/// [`Forge::snapshot`]'s memo, and the committed state it was built from.
+pub(crate) struct SnapshotCache {
+    pub(crate) root: StateRoot,
+    /// per repo, the branches whose objects have not arrived — node-local, so
+    /// NOT covered by the root, and it changes the container's pending section.
+    pub(crate) pending: Vec<(String, crate::refs::PendingMap)>,
+    pub(crate) bytes: Vec<u8>,
 }
 
 impl Forge {
@@ -527,6 +555,7 @@ impl Forge {
             tracker,
             staged_tracker: None,
             chat_target: None,
+            snapshot_cache: std::cell::RefCell::new(None),
         })
     }
 
@@ -2184,6 +2213,45 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    /// AN UNCHANGED FORGE MUST NOT RE-PACK, AND A CHANGED ONE MUST.
+    ///
+    /// The checkpoint calls `snapshot()` every `checkpoint_blocks` blocks on the
+    /// validator's select loop — 60.2 s of a 60.5 s capture on the demo
+    /// workspace, during which nothing else on that loop was serviced (#1018).
+    ///
+    /// The assertion POISONS the memo rather than timing the call: a re-pack
+    /// overwrites the poison with real container bytes, a cache hit hands it
+    /// back. Timing would only say "fast", which is what a warm page cache says
+    /// too.
+    #[test]
+    fn an_unchanged_forge_serves_its_snapshot_from_the_memo() {
+        let base = tmp_base("snap-memo");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        seed_materialized_commit(&mut forge, 1, "demo", "a.txt", "hello", "c1");
+
+        let first = forge.snapshot().unwrap();
+        assert!(first.starts_with(FORGE_SNAPSHOT_MAGIC.as_slice()));
+
+        let poison = b"POISONED".to_vec();
+        forge.snapshot_cache.borrow_mut().as_mut().unwrap().bytes = poison.clone();
+        assert_eq!(
+            forge.snapshot().unwrap(),
+            poison,
+            "an unchanged forge re-packed its whole object closure instead of serving the memo"
+        );
+
+        // A COMMITTED CHANGE MOVES THE ROOT, so the key misses and it re-packs.
+        seed_materialized_commit(&mut forge, 2, "demo", "b.txt", "world", "c2");
+        let after = forge.snapshot().unwrap();
+        assert_ne!(
+            after, poison,
+            "a forge whose committed state moved must re-pack, not serve a stale snapshot"
+        );
+        assert!(after.starts_with(FORGE_SNAPSHOT_MAGIC.as_slice()));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // a snapshot carries branches AND tracker; install onto a fresh namespace
