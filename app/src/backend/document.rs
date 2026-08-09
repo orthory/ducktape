@@ -166,12 +166,36 @@ pub struct DocumentSaveResult {
     pub document: String,
 }
 
+/// Whether this save owes the node a title write.
+///
+/// A TITLE IS ONLY "MOVED" WHEN THIS READER MOVED IT. Disagreeing with the node
+/// was the whole test, and it is not enough: the node disagrees just as loudly
+/// when SOMEONE ELSE renamed the page and this buffer has not caught up. Line 0
+/// IS the title, so a reader who never touched it still carries the old one —
+/// and the write then reverted the other person's rename on chain, silently, on
+/// the next keystroke. It needs no dirty buffer and no race: any reader whose
+/// line 0 is behind the chain does it.
+///
+/// `saved` is the baseline the buffer was last synced to, so the difference
+/// between its line 0 and the buffer's is exactly "what this reader typed".
+/// BOTH conditions are required and neither alone is sufficient: authorship
+/// stops a stale reader from writing, and disagreement stops an agreeing title
+/// from costing a block. (Authorship alone would also submit a rename on the
+/// first save of a buffer whose baseline is still empty.)
+pub(crate) fn title_write_owed(text: &str, saved: &str, node_title: &str) -> bool {
+    let title = document_title(text);
+    let node_disagrees = title != node_title;
+    let reader_retitled_it = title != document_title(saved);
+    node_disagrees && reader_retitled_it
+}
+
 /// Reconcile the edited buffer against the page as the node currently holds it.
 pub async fn save_page_document(
     rpc: String,
     password: String,
     page_id: String,
     text: String,
+    saved: String,
     generation: i64,
 ) -> Result<DocumentSaveResult, HydrationError> {
     let failed = |message: String| HydrationError {
@@ -230,7 +254,7 @@ pub async fn save_page_document(
     // path returns Ok(false) — a silently dropped rename to a caller that
     // does not read the bool.
     let title = document_title(&text);
-    let title_moved = title != current.active_page_title;
+    let title_moved = title_write_owed(&text, &saved, &current.active_page_title);
     if title_moved {
         let bounded = bounded_exact_text(title, "page title", 512).map_err(failed)?;
         write(

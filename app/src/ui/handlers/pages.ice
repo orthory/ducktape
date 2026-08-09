@@ -556,7 +556,7 @@ on page_autosave_tick
   block_autosave_generation = block_autosave_generation + 1
   page_inflight_text = text
   error = ""
-  run save_page_document(connected_rpc, password, active_page, text, block_autosave_generation) -> page_document_saved _ | page_document_save_failed _
+  run save_page_document(connected_rpc, password, active_page, text, page_saved_text, block_autosave_generation) -> page_document_saved _ | page_document_save_failed _
 
 // The baseline is the node's own text after a write, and the submitted text
 // after a no-op — `saved_baseline` carries the reasoning. Either way anything

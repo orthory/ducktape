@@ -298,6 +298,33 @@ fn an_overview_frame_moves_only_the_half_it_answered() {
     assert_eq!(app.node_view_label, "9");
     assert_eq!(app.node_quorum_label, "5");
     assert_eq!(app.node_reachable_label, "6");
+
+/// THE PREDICATE IS ONLY HALF THE FIX; THIS PINS THE OTHER HALF.
+///
+/// `title_write_owed` cannot tell whether the caller handed it the real
+/// baseline or something else — a unit test of the predicate stays green while
+/// the autosave passes the buffer twice, which would make authorship trivially
+/// false and stop EVERY rename. So the wiring gets its own guard.
+///
+/// PINNED AS A SET, not a substring: `inlined` does not strip comments, so a
+/// `contains` is satisfied by a commented-out call, and equally by a SECOND
+/// call site passing something else. Same idiom as the overview lint above.
+#[test]
+fn the_autosave_hands_the_save_the_baseline_it_started_from() {
+    let pages = inlined(include_str!("ui/handlers/pages.ice"));
+    let saves: Vec<_> = pages
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("run save_page_document("))
+        .collect();
+    assert_eq!(
+        saves,
+        [
+            "run save_page_document(connected_rpc, password, active_page, text, page_saved_text, block_autosave_generation) -> page_document_saved _ | page_document_save_failed _"
+        ],
+        "the save must receive `page_saved_text` — the text the buffer was last \
+         synced to — or it is back to comparing line 0 against a fresh node read"
+    );
 }
 
 /// The page document's text, the way the save tick reads it.

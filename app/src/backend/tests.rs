@@ -2393,6 +2393,29 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     assert_eq!(loaded_page.active_page, "welcome");
     assert_eq!(loaded_page.blocks[0].text, "A signed page block");
 
+    // THE TITLE WRITE IS AUTHORSHIP, NOT DISAGREEMENT.
+    //
+    // Every case below has line 0 disagreeing with the node — which is what the
+    // old test was, and why a reader who had merely not caught up wrote the old
+    // name back over someone else's rename.
+    let renamed_by_reader = title_write_owed("New\nbody", "Old\nbody", "Old");
+    assert!(
+        renamed_by_reader,
+        "she retyped line 0, so the node owes a rename"
+    );
+    let renamed_by_someone_else = title_write_owed("Old\nbody", "Old\nbody", "New");
+    assert!(
+        !renamed_by_someone_else,
+        "her line 0 matches the baseline she started from — she renamed nothing, \
+         and writing it back would revert the other rename on chain"
+    );
+    // the same reader, now mid-sentence: still not an author of the title.
+    let dirty_but_not_retitled = title_write_owed("Old\nbody mid-sen", "Old\nbody", "New");
+    assert!(!dirty_but_not_retitled, "a dirty BODY is not a retitle");
+    // and an agreeing title never costs a block, even from a fresh baseline.
+    let agrees = title_write_owed("Doc\nbody", "", "Doc");
+    assert!(!agrees, "an agreeing title must not submit an op");
+
     // A SAVE AGAINST A PAGE THE INDEX DOES NOT HOLD MUST REFUSE, NOT RETARGET.
     // `load_pages_data` answers a missing id with `pages.first()` — here that is
     // `welcome`, a real page full of real blocks. Without the guard in
@@ -2410,6 +2433,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         origin.clone(),
         String::new(),
         "no-such-page".into(),
+        "Welcome\n".into(),
         "Welcome\n".into(),
         0,
     )
