@@ -3096,6 +3096,70 @@ async fn next_change(
     }
 }
 
+/// THE CLASSIFIER, not the handler: a text edit must reach the shell with
+/// `load_pages` FALSE, which is what stops the reload.
+///
+/// `a_folded_text_edit_updates_the_block_and_fetches_nothing` (app/src/tests.rs)
+/// asserts the handler's half by building the update by hand, so it cannot see
+/// this half at all — flipping `load_pages` back to unconditional leaves it
+/// green. This is the test that goes red.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pages_text_op_folds_and_a_structural_one_reloads() {
+    let op = |msg: &PageMsg| ducktape_rpc::StreamOp {
+        height: 9,
+        seq: 0,
+        time: 0,
+        origin: ducktape_rpc::StreamOrigin {
+            kind: ducktape_rpc::StreamOriginKind::External,
+            id: None,
+        },
+        payload: Some(serde_json::from_slice(&pages::encode_msg(msg)).expect("payload json")),
+        payload_hex: None,
+        assigned: None,
+        assigned_hex: None,
+    };
+
+    let edit = folded_update(
+        "",
+        "pages",
+        op(&PageMsg::UpdateText {
+            block_id: "b1".into(),
+            text: "typed".into(),
+            marks: None,
+        }),
+    )
+    .await
+    .expect("a text op is visible to the shell");
+    assert_eq!(edit.pages.kind, "text");
+    assert_eq!(edit.pages.block_id, "b1");
+    assert_eq!(edit.pages.text, "typed");
+    assert!(
+        !edit.load_pages,
+        "a folded edit must not ask for a reload — that is the whole change"
+    );
+    assert!(
+        !edit.debounce,
+        "nothing to coalesce when nothing is fetched"
+    );
+
+    let moved = folded_update(
+        "",
+        "pages",
+        op(&PageMsg::MoveBlock {
+            block_id: "b1".into(),
+            parent: Some("page".into()),
+            after: None,
+        }),
+    )
+    .await
+    .expect("a structural op is visible to the shell");
+    assert_eq!(moved.pages.kind, "touched");
+    assert!(
+        moved.load_pages,
+        "ordering and prefixes are not derivable from the op — reload"
+    );
+}
+
 /// A TIP MOVES THE HEAD AND MUST FETCH NOTHING.
 ///
 /// The heartbeat rides every block, and an idle chain nop-fills once per

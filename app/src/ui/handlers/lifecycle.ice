@@ -259,6 +259,19 @@ on live_updated(next)
   active_channel_members_only = channel_flag_members_only(channels, active_channel, active_channel_members_only)
   active_channel_huddle_count = channel_live_huddle_count(channels, active_channel, active_channel_huddle_count)
   channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
+  // THE PAGES FOLD. A committed text edit lands in the open document's blocks
+  // with no query at all — the autosave commits one per tick while a reader
+  // types, and each used to buy three sequential reads of the very document
+  // being typed into. A delta for a block this list does not hold is a no-op.
+  //
+  // The buffer moves on the SAME shared decision the resync path uses below:
+  // the canonical text replaces it only when the editor is CLEAN and actually
+  // differs, so a reader mid-sentence keeps their words and their caret, and
+  // their own settled echo is a no-op because the baseline already matches.
+  blocks = apply_page_text(blocks, next.pages)
+  let folded_saved = refreshed_page_saved(page_editor, active_page_title, blocks, page_saved_text)
+  page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
+  page_saved_text = folded_saved
   bell_unread = bell_unread_after(bell_unread, bell_items, next.bell)
   bell_items = apply_bell(bell_items, next.bell)
   forge_discussion = apply_chat_messages(forge_discussion, next.chat, forge_item_channel)

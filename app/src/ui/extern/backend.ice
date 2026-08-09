@@ -10,7 +10,7 @@ extern crate::backend
   ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
   SendReceipt(operation_id:str, channel_id:str)
   ChatDelta(kind:str, channel_id:str, seq:i64, root_seq:i64, message:ChatMessage, channel:ChatChannel, name:str, archived:bool, emoji:str, added:bool, reactor:str, by_me:bool, member:ChatMember)
-  PagesDelta(kind:str, comments:bool)
+  PagesDelta(kind:str, block_id:str, text:str)
   LiveRefresh(generation:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages_loaded:bool, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
   ThreadLoadData(generation:i64, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   ThreadPageData(generation:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
@@ -308,6 +308,7 @@ extern crate::backend
   sync keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
   sync pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
   sync keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
+  sync apply_page_text(blocks:[PageBlock], delta:PagesDelta) -> [PageBlock]
   sync keep_str(loaded:bool, next:str, current:str) -> str
   sync keep_bool(loaded:bool, next:bool, current:bool) -> bool
   sync keep_i64(loaded:bool, next:i64, current:i64) -> i64
