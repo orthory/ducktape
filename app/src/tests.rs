@@ -3014,6 +3014,12 @@ fn a_folded_text_edit_updates_the_block_and_fetches_nothing() {
     app.loading = false;
     app.active_page = "page".into();
     app.buffer_page = "page".into();
+    // THE TITLE IS HERE TO PROVE A BODY EDIT CANNOT MOVE IT. `apply_page_title`
+    // rests entirely on `delta.block_id == active_page`; drop that term and
+    // every body edit renames the open page — on chain, via line 0 — which is
+    // the bug this fold exists to fix, pointed the other way. Nothing else in
+    // the suite constrains it.
+    app.active_page_title = "Doc".into();
     app.blocks = vec![
         page_block("b1", "page", "old"),
         page_block("b2", "page", "untouched"),
@@ -3038,6 +3044,10 @@ fn a_folded_text_edit_updates_the_block_and_fetches_nothing() {
         "the edit folded into its block"
     );
     assert_eq!(app.blocks[1].text, "untouched", "and only into its block");
+    assert_eq!(
+        app.active_page_title, "Doc",
+        "a body edit must never move the page's title"
+    );
     assert_eq!(
         app.hydration_generation, before,
         "a folded edit must not start a reload — that is the whole point"

@@ -649,9 +649,22 @@ pub fn apply_page_title(title: String, delta: PagesDelta, active_page: String) -
 /// The same rename, in the page list — for ANY page, not just the open one.
 ///
 /// The list holds page ids, so the delta's `block_id` landing in it IS the
-/// test: block ids and page ids are minted apart (`fresh_id`), so a body edit
-/// can never match a row here. That is what keeps the sidebar and the tab
-/// strip from carrying a name the chain has already replaced.
+/// test, and the module is what makes that sound: page ids ARE block ids in
+/// one global namespace, and both writers enforce global uniqueness against
+/// the whole store — `InsertBlock` refuses an id that already exists
+/// (`block_ops.rs`, `PageError::DuplicateBlock`) and `CreatePage` refuses one
+/// already held by a non-page block (`page_ops.rs`). So a body block's id can
+/// never equal a page id, and a body edit can never rewrite a row here. (The
+/// app's own `fresh_id` prefixes are a local convention and prove nothing —
+/// ids are client-minted, and another writer need not use them.)
+///
+/// The empty title becomes `Untitled` because THAT IS WHAT A RELOAD PRODUCES
+/// (`load.rs`, `page_items`), and a fold must land exactly where the reload it
+/// replaces would have. Clearing line 0 submits an `UpdateText` with empty
+/// text, so this is reachable from this very editor; without it the row and
+/// the doc tab would go blank until some unrelated op bought a reload.
+/// `active_page_title` deliberately does NOT normalize — a reload leaves it
+/// verbatim (`load.rs`, `active_page_title`), so folding it verbatim matches.
 pub fn apply_page_rename(mut pages: Vec<PageItem>, delta: PagesDelta) -> Vec<PageItem> {
     if delta.kind != "text" {
         return pages;
@@ -659,7 +672,10 @@ pub fn apply_page_rename(mut pages: Vec<PageItem>, delta: PagesDelta) -> Vec<Pag
     let Some(page) = pages.iter_mut().find(|page| page.id == delta.block_id) else {
         return pages;
     };
-    page.title = delta.text;
+    page.title = match delta.text.is_empty() {
+        true => "Untitled".into(),
+        false => delta.text,
+    };
     pages
 }
 
