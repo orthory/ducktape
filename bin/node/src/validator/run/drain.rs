@@ -13,7 +13,9 @@ use sdk::Msg;
 
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET};
-use crate::drain_actions::{CutoverTrigger, EpochActions, checkpoint_due, cooldown_until};
+use crate::drain_actions::{
+    CutoverTrigger, EpochActions, capture_breakdown, checkpoint_due, cooldown_until,
+};
 use noded::projection::{BlockProjection, project_block};
 use crate::host_reads::{
     read_valset_members, read_valset_residents,
@@ -494,7 +496,10 @@ impl ValidatorRuntime<'_> {
             // profiler on a box where the stall only shows under real state.
             let pos = node.sink_mut().oplog_pos().await;
             let checkpoint_started = context.current();
-            let captured = Manifest::capture(
+            // the capture reads the LOOP's clock per module (the host and the
+            // recovery crate own none) so a slow capture names its module
+            // instead of leaving `capture_ms` to be attributed by guesswork.
+            let captured = Manifest::capture_timed(
                 node.host(),
                 Some(f.height),
                 orchestrator.epoch(),
@@ -504,10 +509,16 @@ impl ValidatorRuntime<'_> {
                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
                 pos,
                 *next_seq,
+                || {
+                    context
+                        .current()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                },
             );
             let captured_at = context.current();
             match captured {
-                Ok(m) => match node.sink_mut().write_manifest(&m).await {
+                Ok((m, capture_cost)) => match node.sink_mut().write_manifest(&m).await {
                     Ok(()) => {
                         let written_at = context.current();
                         *blocks_since_checkpoint = 0;
@@ -550,7 +561,8 @@ impl ValidatorRuntime<'_> {
                             height = m.height.unwrap_or_default(),
                             capture_ms = since(checkpoint_started, captured_at),
                             write_ms = since(captured_at, written_at),
-                            prune_ms = since(written_at, done_at)
+                            prune_ms = since(written_at, done_at),
+                            capture_modules = %capture_breakdown(&capture_cost)
                         );
                     }
                     Err(e) => {

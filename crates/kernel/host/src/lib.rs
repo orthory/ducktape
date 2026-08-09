@@ -29,6 +29,7 @@
 //! never vanish from the registry.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Duration;
 
 use sdk::{
     Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
@@ -54,13 +55,21 @@ pub mod worker;
 /// computes the same root. upgrade to a small merkle tree only when a light
 /// client needs log-n membership proofs.
 pub fn global_root(modules: &[&dyn Module]) -> StateRoot {
-    let mut pairs: Vec<(ModuleId, StateRoot)> =
-        modules.iter().map(|m| (m.id(), m.root())).collect();
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let pairs: Vec<(ModuleId, StateRoot)> = modules.iter().map(|m| (m.id(), m.root())).collect();
+    global_root_of(&pairs)
+}
+
+/// [`global_root`] over roots the caller ALREADY has. `root()` is a full state
+/// serialization + hash for a map-backed module, so a caller holding every
+/// module's root must never pay for it twice — a checkpoint capture computed
+/// each root four times before this seam existed (#1018).
+pub fn global_root_of(pairs: &[(ModuleId, StateRoot)]) -> StateRoot {
+    let mut sorted: Vec<&(ModuleId, StateRoot)> = pairs.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut h = Sha256::new();
-    h.update((pairs.len() as u64).to_le_bytes());
-    for (id, root) in &pairs {
+    h.update((sorted.len() as u64).to_le_bytes());
+    for (id, root) in sorted {
         h.update((id.len() as u64).to_le_bytes());
         h.update(id.as_bytes());
         h.update(root.0);
@@ -850,38 +859,93 @@ impl Host {
         &self,
         finalized: FinalizedBlock,
     ) -> Result<FinalizedSnapshot, SnapshotError> {
-        let actual = self.root_hash();
-        if actual != finalized.root_hash {
-            return Err(SnapshotError::RootHashMismatch {
-                expected: finalized.root_hash,
-                actual,
-            });
+        self.snapshot_at(finalized.height, Some(finalized.root_hash), || {
+            Duration::ZERO
+        })
+        .map(|(snapshot, _)| snapshot)
+    }
+
+    /// capture the committed registry view at the host's CURRENT root, which
+    /// this computes rather than verifying. For a caller that has no
+    /// independently-known finalized hash to check against, passing
+    /// [`Host::root_hash`] into [`Host::capture_finalized_snapshot`] is a
+    /// tautology that costs a SECOND full pass over every module root — and
+    /// `root()` is a whole state serialization + hash for a map-backed module.
+    ///
+    /// `now` is the CALLER's clock (the host owns none, by design): it is read
+    /// around each module's capture and the deltas are returned ALONGSIDE the
+    /// snapshot — what a module cost is wall-clock, so it is not part of the
+    /// boundary's identity and must stay out of its `Eq`. Registry order,
+    /// degraded modules included. Pass `|| Duration::ZERO` to opt out.
+    pub fn capture_current_snapshot(
+        &self,
+        height: u64,
+        now: impl FnMut() -> Duration,
+    ) -> (FinalizedSnapshot, Vec<(ModuleId, Duration)>) {
+        self.snapshot_at(height, None, now)
+            .expect("an unverified capture has no root to mismatch")
+    }
+
+    /// the one capture body: every module root computed EXACTLY ONCE, the
+    /// composite root derived from those, and the state-sync handles taken only
+    /// after the root check passes (a mismatched capture must not pay to
+    /// materialize snapshot bytes it will throw away).
+    fn snapshot_at(
+        &self,
+        height: u64,
+        expected: Option<StateRoot>,
+        mut now: impl FnMut() -> Duration,
+    ) -> Result<(FinalizedSnapshot, Vec<(ModuleId, Duration)>), SnapshotError> {
+        let mut roots: Vec<(ModuleId, StateRoot)> = Vec::with_capacity(self.registry.len());
+        let mut capture_cost: Vec<(ModuleId, Duration)> = Vec::with_capacity(self.registry.len());
+        for (id, module) in self.registry.iter() {
+            let started = now();
+            let root = module.root();
+            roots.push((id.clone(), root));
+            capture_cost.push((id.clone(), now().saturating_sub(started)));
+        }
+
+        let actual = global_root_of(&roots);
+        if let Some(expected) = expected
+            && actual != expected
+        {
+            return Err(SnapshotError::RootHashMismatch { expected, actual });
         }
 
         let mut modules = Vec::with_capacity(self.registry.len());
         let mut degraded = Vec::new();
-        for (id, module) in self.registry.iter() {
-            let root = module.root();
-            match module.state_sync_handle() {
+        for ((module, (id, root)), cost) in self
+            .registry
+            .values()
+            .zip(roots.iter())
+            .zip(capture_cost.iter_mut())
+        {
+            let started = now();
+            let handle = module.state_sync_handle();
+            cost.1 += now().saturating_sub(started);
+            match handle {
                 Ok(state_sync) => modules.push(ModuleSnapshot {
                     id: id.clone(),
-                    root,
+                    root: *root,
                     state_sync,
                 }),
                 Err(reason) => degraded.push(DegradedModule {
                     id: id.clone(),
-                    root,
+                    root: *root,
                     reason,
                 }),
             }
         }
 
-        Ok(FinalizedSnapshot {
-            height: finalized.height,
-            root_hash: finalized.root_hash,
-            modules,
-            degraded,
-        })
+        Ok((
+            FinalizedSnapshot {
+                height,
+                root_hash: actual,
+                modules,
+                degraded,
+            },
+            capture_cost,
+        ))
     }
 
     /// apply one inbound message as a block: route, execute, drain follow-ups,

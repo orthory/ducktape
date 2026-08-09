@@ -309,3 +309,40 @@ fn every_degraded_module_is_reported_not_just_the_first() {
         assert!(snapshot.modules.is_empty());
     });
 }
+
+#[test]
+fn the_capture_cost_breakdown_covers_every_registered_module() {
+    deterministic::Runner::default().start(|_| async move {
+        let host = Host::genesis(vec![
+            Box::new(BytesModule::new(1)),
+            Box::new(DegradedBytesModule),
+            Box::new(ResolverBackedModule),
+        ])
+        .expect("genesis");
+
+        // the caller's clock: one millisecond per reading, so each module's
+        // cost is attributable and a per-module measurement is distinguishable
+        // from one aggregate stamped onto everybody.
+        let mut tick = std::time::Duration::ZERO;
+        let (_snapshot, capture_cost) = host.capture_current_snapshot(4, || {
+            tick += std::time::Duration::from_millis(1);
+            tick
+        });
+
+        let mut billed: Vec<&str> = capture_cost.iter().map(|(id, _)| id.as_str()).collect();
+        billed.sort_unstable();
+        assert_eq!(
+            billed,
+            vec![BYTES_ID, DEGRADED_ID, RESOLVER_ID],
+            "every registered module is billed, degraded included — an absent \
+             module is exactly the one a slow capture would be blamed on",
+        );
+        for (id, spent) in &capture_cost {
+            assert_eq!(
+                *spent,
+                std::time::Duration::from_millis(2),
+                "{id} must be billed its OWN root + handle readings",
+            );
+        }
+    });
+}

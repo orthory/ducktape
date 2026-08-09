@@ -505,14 +505,50 @@ impl Manifest {
         oplog_pos: u64,
         next_seq: u64,
     ) -> Result<Self, Error> {
-        let snapshot = host
-            .capture_finalized_snapshot(host::FinalizedBlock {
-                // the capture only verifies the root-hash; a genesis manifest
-                // has no boundary yet and 0 is a placeholder, not a height.
-                height: height.unwrap_or(0),
-                root_hash: host.root_hash(),
-            })
-            .map_err(|e| Error::Storage(format!("checkpoint capture: {e}")))?;
+        Self::capture_timed(
+            host,
+            height,
+            epoch,
+            view_base,
+            participants,
+            residents,
+            pending_cutover_view,
+            oplog_pos,
+            next_seq,
+            || std::time::Duration::ZERO,
+        )
+        .map(|(manifest, _)| manifest)
+    }
+
+    /// [`Manifest::capture`] that also reports what each module COST to
+    /// capture, read off the caller's clock (`now`) — the checkpoint runs on
+    /// the node's select loop, and an aggregate `capture_ms` cannot name the
+    /// module that spent it (#1018).
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_timed(
+        host: &Host,
+        height: Option<u64>,
+        epoch: u64,
+        view_base: u64,
+        participants: Vec<Vec<u8>>,
+        residents: Vec<Vec<u8>>,
+        pending_cutover_view: Option<u64>,
+        oplog_pos: u64,
+        next_seq: u64,
+        now: impl FnMut() -> std::time::Duration,
+    ) -> Result<(Self, Vec<(sdk::ModuleId, std::time::Duration)>), Error> {
+        // ONE pass over the registry: the capture computes every module root
+        // exactly once and the composite root is derived from those. this used
+        // to re-read `host.root_hash()` here (twice) on top of the host's own
+        // recompute — four full serializations per map-backed module, for a
+        // check that compared the host's root against itself.
+        let (snapshot, capture_cost) = host.capture_current_snapshot(
+            // a genesis manifest has no boundary yet; 0 is a placeholder, not
+            // a height.
+            height.unwrap_or(0),
+            now,
+        );
+        let root_hash = snapshot.root_hash;
         // a checkpoint is ALL-OR-NOTHING and that is deliberate: restore reads
         // bytes back per module, so a manifest missing one module's snapshot is
         // a checkpoint that cannot restore — and writing it would prune the
@@ -544,19 +580,22 @@ impl Manifest {
                 _ => None,
             })
             .collect();
-        Ok(Self {
-            height,
-            epoch,
-            view_base,
-            participants,
-            residents,
-            pending_cutover_view,
-            root_hash: host.root_hash(),
-            roots,
-            snapshots,
-            oplog_pos,
-            next_seq,
-        })
+        Ok((
+            Self {
+                height,
+                epoch,
+                view_base,
+                participants,
+                residents,
+                pending_cutover_view,
+                root_hash,
+                roots,
+                snapshots,
+                oplog_pos,
+                next_seq,
+            },
+            capture_cost,
+        ))
     }
 }
 
@@ -1847,6 +1886,77 @@ mod tests {
             "every degraded module is named, not just the first: {msg}",
         );
         assert!(msg.contains("no pack for committed head"), "{msg}");
+    }
+
+    /// a module that COUNTS its own `root()` calls. for a map-backed module
+    /// `root()` is a full state serialization + SHA-256, so every extra call is
+    /// another whole pass over the module's state — and the capture is holding
+    /// the node's select loop while it happens (#1018).
+    struct CountingModule {
+        id: &'static str,
+        roots: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl sdk::Module for CountingModule {
+        fn id(&self) -> ModuleId {
+            self.id.into()
+        }
+
+        fn root(&self) -> StateRoot {
+            self.roots
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            StateRoot([7; 32])
+        }
+
+        fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
+            Ok(sdk::StateSyncHandle::SnapshotBytes(vec![7]))
+        }
+
+        async fn execute(
+            &mut self,
+            _ctx: &mut dyn sdk::Ctx,
+            _msg: &sdk::Msg,
+        ) -> Result<(), sdk::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn one_capture_computes_each_module_root_exactly_once() {
+        let forge = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let chat = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let host = Host::genesis(vec![
+            Box::new(CountingModule {
+                id: "forge",
+                roots: forge.clone(),
+            }),
+            Box::new(CountingModule {
+                id: "chat",
+                roots: chat.clone(),
+            }),
+        ])
+        .expect("genesis");
+
+        let count =
+            |c: &std::sync::atomic::AtomicUsize| c.load(std::sync::atomic::Ordering::Relaxed);
+        let (forge_before, chat_before) = (count(&forge), count(&chat));
+        Manifest::capture(&host, Some(9), 0, 0, vec![], vec![], None, 0, 1).expect("capture");
+
+        // the capture used to compute each root FOUR times: twice in this
+        // function (the `root_hash` argument and the manifest field) and twice
+        // inside the host (its own verification recompute plus the per-module
+        // loop). the composite root is now derived from the one pass.
+        assert_eq!(
+            count(&forge) - forge_before,
+            1,
+            "forge root recomputed by one capture"
+        );
+        assert_eq!(
+            count(&chat) - chat_before,
+            1,
+            "chat root recomputed by one capture"
+        );
     }
 
     fn sample_manifest() -> Manifest {
