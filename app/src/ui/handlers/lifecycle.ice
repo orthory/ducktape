@@ -278,13 +278,34 @@ on live_updated(next)
   // A huddle change on the ACTIVE channel forces the chat resync the delta
   // path cannot carry: `huddle_joined`/`huddle_roster` are answered only by
   // a full chat load (see `huddle_refresh_hits`).
-  return if !forge_live_hit(next.kind, next.module) && !next.load_chat && !next.load_pages && !huddle_refresh_hits(next.chat, active_channel)
+  // ONE PLANE WENT STALE AND THE OP SAID WHICH. `plane_live_hit` is an extern
+  // for the same reason `forge_live_hit` is: the Ice checker cannot type a
+  // subscription payload's field inside a `let` (see handlers/overlays.ice).
+  return if next.kind != "plane" && !forge_live_hit(next.kind, next.module) && !next.load_chat && !next.load_pages && !huddle_refresh_hits(next.chat, active_channel)
+  members_generation = keep_i64(plane_live_hit(next.kind, next.module, "valset"), members_generation + 1, members_generation)
+  gov_generation = keep_i64(plane_live_hit(next.kind, next.module, "governance"), gov_generation + 1, gov_generation)
+  account_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation + 1, account_generation)
+  dm_peers_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), dm_peers_generation + 1, dm_peers_generation)
+  agents_generation = keep_i64(plane_live_hit(next.kind, next.module, "agent"), agents_generation + 1, agents_generation)
+  fs_generation = keep_i64(plane_live_hit(next.kind, next.module, "files"), fs_generation + 1, fs_generation)
   forge_generation = keep_i64(forge_live_hit(next.kind, next.module), forge_generation + 1, forge_generation)
   hydration_generation = keep_i64(next.load_chat || next.load_pages || huddle_refresh_hits(next.chat, active_channel), hydration_generation + 1, hydration_generation)
   hydration_retry_attempt = keep_i64(next.load_chat || next.load_pages || huddle_refresh_hits(next.chat, active_channel), 0, hydration_retry_attempt)
   parallel
     run live_resync_load(connected_rpc, active_channel, active_page, resync_planes((next.load_chat || huddle_refresh_hits(next.chat, active_channel)), next.load_pages), next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
     run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, forge_generation) -> forge_refreshed _ | forge_failed _
+    // The `keep_i64(shell_tab == …, gen, -1)` on the heavy three is the SAME
+    // off-screen refusal the tab-switch path uses: the backend refuses a
+    // generation of -1 and the failed arm's guard drops the refusal unread, so
+    // an Approvals tab nobody is looking at costs a dead call, not a query.
+    // Members, account and the DM directory stay ungated — all three feed
+    // always-visible chrome.
+    run load_members(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "valset"), members_generation, -1)) -> members_loaded _ | members_failed _
+    run load_governance(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "governance") && shell_tab == "governance", gov_generation, -1)) -> governance_loaded _ | governance_failed _
+    run load_account(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation, -1)) -> account_loaded _ | account_failed _
+    run load_dm_peers(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "identity"), dm_peers_generation, -1)) -> dm_peers_loaded _ | dm_peers_failed _
+    run load_agents(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "agent") && shell_tab == "agents", agents_generation, -1)) -> agents_loaded _ | agents_failed _
+    run files_ls(connected_rpc, fs_path, keep_i64(plane_live_hit(next.kind, next.module, "files") && shell_tab == "files", fs_generation, -1)) -> fs_listed _ | fs_failed _
 
 on live_resynced(next)
   return if next.generation != hydration_generation

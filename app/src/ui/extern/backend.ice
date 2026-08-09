@@ -309,6 +309,7 @@ extern crate::backend
   sync pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
   sync keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
   sync apply_page_text(blocks:[PageBlock], delta:PagesDelta) -> [PageBlock]
+  sync plane_live_hit(kind:str, module:str, want:str) -> bool
   sync keep_str(loaded:bool, next:str, current:str) -> str
   sync keep_bool(loaded:bool, next:bool, current:bool) -> bool
   sync keep_i64(loaded:bool, next:i64, current:i64) -> i64

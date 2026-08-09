@@ -20,6 +20,14 @@ pub(crate) fn live_retry(_message: String) -> LiveUpdate {
     live_update("retry", "Reconnecting…", -1)
 }
 
+/// One plane's module committed something. The handler refetches that plane and
+/// nothing else — `module` is the whole payload.
+pub(crate) fn live_plane(module: &str, height: i64) -> LiveUpdate {
+    let mut update = live_update("plane", &format!("Live · block {height}"), height);
+    update.module = module.to_string();
+    update
+}
+
 /// A module's replay is unavailable or unfoldable — the handler reloads that
 /// module's slices instead of folding.
 pub(crate) fn live_resync(module: &str, height: i64) -> LiveUpdate {

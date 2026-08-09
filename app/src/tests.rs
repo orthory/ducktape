@@ -2829,6 +2829,74 @@ fn comment_pages_merge_by_identity_and_ordinal() {
     assert_eq!(comments[2].text, "new");
 }
 
+/// A PLANE'S OP REFETCHES THAT PLANE AND NO OTHER.
+///
+/// These five modules feed surfaces that were correct only at connect and at
+/// tab-switch time: a validator joining, a proposal being voted, a device being
+/// renamed, an agent registering, a file being committed — none of it reached a
+/// console already looking at the page that shows it.
+///
+/// The generation counters ARE the assertion: each is the refetch's own guard,
+/// so one moving means exactly that plane was asked for, and the others holding
+/// means nothing else was.
+#[test]
+fn a_plane_op_refetches_only_the_plane_it_names() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+
+    let plane = |app: &mut Ducktape, module: &str| {
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+            kind: "plane".into(),
+            status: "Live".into(),
+            height: 12,
+            module: module.into(),
+            ..backend::LiveUpdate::default()
+        }));
+    };
+
+    let (members, gov, agents, account, dm, fs) = (
+        app.members_generation,
+        app.gov_generation,
+        app.agents_generation,
+        app.account_generation,
+        app.dm_peers_generation,
+        app.fs_generation,
+    );
+
+    plane(&mut app, "valset");
+    assert_eq!(app.members_generation, members + 1, "valset feeds members");
+    assert_eq!(app.gov_generation, gov, "and nothing else");
+    assert_eq!(app.fs_generation, fs);
+
+    plane(&mut app, "governance");
+    assert_eq!(app.gov_generation, gov + 1);
+    assert_eq!(
+        app.members_generation,
+        members + 1,
+        "unchanged by governance"
+    );
+
+    // identity feeds TWO surfaces: the account card and the DM directory.
+    plane(&mut app, "identity");
+    assert_eq!(app.account_generation, account + 1);
+    assert_eq!(app.dm_peers_generation, dm + 1);
+
+    plane(&mut app, "agent");
+    assert_eq!(app.agents_generation, agents + 1);
+
+    plane(&mut app, "files");
+    assert_eq!(app.fs_generation, fs + 1);
+
+    // A module with no plane of its own moves nothing.
+    let before = app.members_generation;
+    plane(&mut app, "tagging");
+    assert_eq!(
+        app.members_generation, before,
+        "an unrouted module is inert"
+    );
+}
+
 /// A COMMITTED EDIT LANDS WITHOUT RE-READING THE DOCUMENT IT LANDED IN.
 ///
 /// The page autosave commits one `UpdateText` per tick while a reader types,

@@ -72,12 +72,25 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
             if state.stream.is_none() {
                 let connected = async {
                     let rpc = rpc_client(&state.rpc)?;
+                    // THE PLANES THIS CONSOLE DRAWS. The first four fold; the
+                    // rest reload the one plane they name (see `folded_update`).
+                    //
+                    // A module a node does not index no longer takes the others
+                    // down — it comes back as `Refused` and that plane alone
+                    // stays cold (`ModuleEvent::Refused`). `bin/noded` indexes
+                    // no `valset` and no `governance`, so this list is only
+                    // safe at all because of that.
                     rpc.module_events(
                         vec![
                             "chat".to_string(),
                             "pages".to_string(),
                             "inbox".to_string(),
                             "forge".to_string(),
+                            "valset".to_string(),
+                            "governance".to_string(),
+                            "identity".to_string(),
+                            "agent".to_string(),
+                            "files".to_string(),
                         ],
                         state.cursors.clone(),
                     )
@@ -307,6 +320,19 @@ pub(crate) async fn folded_update(
             }),
             Err(_) => Some(live_resync("forge", height)),
         },
+        // THE RELOAD PLANES. No client fold exists for these modules and none
+        // is worth writing: a validator set changes when someone joins, a
+        // proposal when someone votes, an account when someone renames a
+        // device. Human-rate, all of them — so the op is a signal that ONE
+        // plane is stale, and the handler refetches exactly that one.
+        //
+        // Reading rather than folding costs a checkpoint-gated query
+        // (`connect`), which is why this is not the answer for chat or pages.
+        // At these rates it is the right trade: no fold to keep correct, and
+        // nothing at all on a block that does not touch them.
+        "valset" | "governance" | "identity" | "agent" | "files" => {
+            Some(live_plane(module, height))
+        }
         _ => None,
     }
 }
@@ -470,6 +496,16 @@ pub async fn live_resync_load(
         generation,
         message: user_error(message),
     })
+}
+
+/// Did this live update say `want`'s plane went stale?
+///
+/// AN EXTERN, not a `let`, because the Ice checker cannot type a subscription
+/// payload's field inside one (`handlers/overlays.ice` records the same
+/// limitation) — which is why `forge_live_hit` is one too. Taking the wanted
+/// module as an argument keeps it to a single predicate for every plane.
+pub fn plane_live_hit(kind: String, module: String, want: String) -> bool {
+    kind == "plane" && module == want
 }
 
 /// The planes discriminant for [`live_resync_load`].

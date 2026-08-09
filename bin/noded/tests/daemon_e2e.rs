@@ -358,7 +358,10 @@ fn call_ws_without_a_hub_refuses_with_a_reason() {
 
     let (status, raw) = daemon.ws_upgrade_refusal("/v1/presence/ws?page=page-1");
     assert_eq!(status, 503, "no realtime hub → presence refused: {raw}");
-    assert!(raw.contains("no mesh realtime hub"), "refusal says WHY: {raw}");
+    assert!(
+        raw.contains("no mesh realtime hub"),
+        "refusal says WHY: {raw}"
+    );
 
     let (status, _raw) = daemon.ws_upgrade_refusal("/v1/voice/ws?channel=general");
     assert_eq!(status, 404, "the old voice route is unrouted, not refused");
@@ -697,7 +700,10 @@ fn state_persists_across_restart() {
                     break;
                 }
                 None => {
-                    assert!(Instant::now() < deadline, "daemon ignored /v1/admin/shutdown");
+                    assert!(
+                        Instant::now() < deadline,
+                        "daemon ignored /v1/admin/shutdown"
+                    );
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
@@ -872,7 +878,10 @@ fn per_module_index_serves_ops_and_views() {
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut daemon = daemon;
         while daemon.child.try_wait().expect("poll daemon").is_none() {
-            assert!(Instant::now() < deadline, "daemon ignored /v1/admin/shutdown");
+            assert!(
+                Instant::now() < deadline,
+                "daemon ignored /v1/admin/shutdown"
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -1399,7 +1408,10 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
     let mut ws = daemon.ws_connect();
     Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["metrics"]}"#);
     let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
-    assert_eq!(subscribed["topics"]["metrics"], "0", "fresh snapshot cursor");
+    assert_eq!(
+        subscribed["topics"]["metrics"], "0",
+        "fresh snapshot cursor"
+    );
 
     // the subscribe replay pushes the first sample immediately — no wait for
     // the next heartbeat tick — carrying the SAME exposition GET /metrics
@@ -1411,7 +1423,10 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
         text.contains("ducktape_blocks_total"),
         "stream sample carries the block series: {text}"
     );
-    assert!(text.trim_end().ends_with("# EOF"), "whole scrape body rides");
+    assert!(
+        text.trim_end().ends_with("# EOF"),
+        "whole scrape body rides"
+    );
     let time_ms = tail["item"]["time_ms"].as_u64().expect("sample instant");
     assert_eq!(tail["cursor"], time_ms.to_string());
 
@@ -1691,7 +1706,8 @@ fn git_clone_over_http_round_trips_full_history() {
 /// PACK bytes are legal only in the final response.
 #[test]
 fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
-    if skip_without_git("git_fetch_and_pull_into_nonempty_checkout_complete_negotiation").is_some() {
+    if skip_without_git("git_fetch_and_pull_into_nonempty_checkout_complete_negotiation").is_some()
+    {
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -1716,7 +1732,11 @@ fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
     let checkout = checkout_root.path().join("checkout");
     git_ok(
         checkout_root.path(),
-        &["clone", &url, checkout.to_str().expect("utf-8 checkout path")],
+        &[
+            "clone",
+            &url,
+            checkout.to_str().expect("utf-8 checkout path"),
+        ],
     );
 
     // A fetch from a non-empty repo has a common first commit. This exercises
@@ -1787,7 +1807,10 @@ fn libgit2_mirror_fetch_completes_incremental_sync() {
 
     fetch(&mirror);
     let first_oid = git2::Oid::from_str(&first_head).expect("head oid");
-    assert!(mirror.find_commit(first_oid).is_ok(), "fresh sync lands the head");
+    assert!(
+        mirror.find_commit(first_oid).is_ok(),
+        "fresh sync lands the head"
+    );
 
     // origin advances; the re-sync's haves earn an ACK + delta pack, and the
     // mirror must still complete the new head's closure from it.
@@ -1796,7 +1819,9 @@ fn libgit2_mirror_fetch_completes_incremental_sync() {
     let second_head = rev_parse_head(src);
     fetch(&mirror);
     let second_oid = git2::Oid::from_str(&second_head).expect("head oid");
-    let landed = mirror.find_commit(second_oid).expect("incremental sync lands the head");
+    let landed = mirror
+        .find_commit(second_oid)
+        .expect("incremental sync lands the head");
     assert_eq!(
         landed
             .tree()
