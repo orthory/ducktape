@@ -182,6 +182,8 @@ extern crate::backend
   sync push_log_line(lines:[NodeLogLine], line:NodeLogLine) -> [NodeLogLine]
   sync filter_log_lines(lines:[NodeLogLine], filter:str) -> [NodeLogLine]
   stream node_logs(rpc:str) -> NodeLogLine
+  NodeOverview(peers_answered:bool, peers:[PeerRow], facts_answered:bool, facts:NodeFacts)
+  stream node_overview(rpc:str) -> NodeOverview
   load_peers(rpc:str, generation:i64) -> PeersData ! HydrationError
   ModuleRow(id:str, category:str, root:str, code_hash:str, pending_hash:str, activation_height:i64, readiness:i64, ready:bool)
   ModulesData(generation:i64, rows:[ModuleRow])
@@ -305,6 +307,7 @@ extern crate::backend
   sync keep_messages(loaded:bool, next:[ChatMessage], current:[ChatMessage]) -> [ChatMessage]
   sync keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
   sync keep_roster(joined:bool, next:[HuddleParticipant]) -> [HuddleParticipant]
+  sync keep_peers(loaded:bool, next:[PeerRow], current:[PeerRow]) -> [PeerRow]
   sync keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
   sync pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
   sync keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]

@@ -130,6 +130,47 @@ pub struct LogLine {
     pub line: String,
 }
 
+/// One pushed sample from a node OVERVIEW snapshot topic.
+///
+/// The payloads are the SAME documents `GET /v1/peers` and `GET /v1/status`
+/// serve, so a consumer reads them with the reader it already has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeSnapshot {
+    /// the `peers` topic's `PeersView` document.
+    Peers(serde_json::Value),
+    /// the `status` topic's `NodeStatus` document.
+    Status(serde_json::Value),
+}
+
+/// Route one server frame to its snapshot, or `None` for every frame this
+/// subscription does not consume (the subscribe ack, heartbeats, a refusal).
+///
+/// The TOPIC decides, not the payload's shape: two snapshot documents that
+/// happened to share a field would otherwise be routed by accident, and a
+/// refusal on one topic must not be read as a sample on the other.
+fn snapshot_from_frame(text: &str) -> Option<NodeSnapshot> {
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum SnapshotFrame {
+        Tail {
+            topic: String,
+            item: serde_json::Value,
+        },
+        #[serde(other)]
+        Other,
+    }
+    let SnapshotFrame::Tail { topic, mut item } =
+        serde_json::from_str::<SnapshotFrame>(text).ok()?
+    else {
+        return None;
+    };
+    match topic.as_str() {
+        "peers" => Some(NodeSnapshot::Peers(item["peers"].take())),
+        "status" => Some(NodeSnapshot::Status(item["status"].take())),
+        _ => None,
+    }
+}
+
 /// The stable portion of `GET /v1/status` needed by public clients.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct Status {
@@ -453,6 +494,64 @@ impl Client {
                     }
                     Ok(_) => continue,
                     Err(_) => continue,
+                }
+            }
+        })
+        .boxed();
+        Ok(stream)
+    }
+
+    /// Subscribe the node's two OVERVIEW snapshot topics on one socket.
+    ///
+    /// `peers` and `status` have no op behind them — nothing in the index
+    /// names a mesh connection or a checkpoint height — so no module stream
+    /// can carry them, and they are the two planes the console had to leave
+    /// cold. They are SNAPSHOT topics: the node re-composes each per heartbeat
+    /// while this subscription is held, so the subscription's lifetime is the
+    /// whole cost control. Drop the stream and the sampling stops.
+    ///
+    /// Both arrive as raw JSON on purpose. `/v1/peers` and `/v1/status` are
+    /// already parsed field-by-field by the console, and a typed mirror here
+    /// would be a SECOND reader of the same wire to drift from the first —
+    /// which is exactly how the peers table came to read three field names the
+    /// node has never served.
+    pub async fn node_snapshots(
+        &self,
+    ) -> Result<futures::stream::BoxStream<'static, Result<NodeSnapshot>>> {
+        let subscribe = serde_json::to_string(&SubscribeRequest {
+            op: "subscribe",
+            topics: vec!["peers".to_string(), "status".to_string()],
+            resume: BTreeMap::new(),
+        })
+        .map_err(|error| Error::new(format!("could not encode snapshot subscription: {error}")))?;
+        let url = self.stream_url()?;
+        let (mut socket, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(&url))
+            .await
+            .map_err(|_| Error::new("RPC stream connection timed out"))?
+            .map_err(|error| Error::new(format!("RPC stream connection failed: {error}")))?;
+        tokio::time::timeout(TIMEOUT, socket.send(Message::Text(subscribe)))
+            .await
+            .map_err(|_| Error::new("RPC stream subscription timed out"))?
+            .map_err(|error| Error::new(format!("RPC stream subscription failed: {error}")))?;
+        let stream = futures::stream::unfold(Some(socket), move |socket| async move {
+            let mut socket = socket?;
+            loop {
+                let message = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, socket.next()).await {
+                    Ok(Some(message)) => message,
+                    Ok(None) => return Some((Err(Error::new("RPC stream closed")), None)),
+                    Err(_) => {
+                        return Some((Err(Error::new("RPC stream heartbeat timed out")), None));
+                    }
+                };
+                let Ok(Message::Text(text)) = message else {
+                    if matches!(message, Ok(Message::Close(_)) | Err(_)) {
+                        return Some((Err(Error::new("RPC stream closed")), None));
+                    }
+                    continue;
+                };
+                match snapshot_from_frame(&text) {
+                    Some(snapshot) => return Some((Ok(snapshot), Some(socket))),
+                    None => continue,
                 }
             }
         })

@@ -275,7 +275,7 @@ pub fn block_row(record: &BlockRecord) -> Vec<u8> {
 /// registered module's root. `Default` is the pre-first-publish snapshot in
 /// [`StatusCell`] — zeroed boundary facts are the honest answer before any
 /// boundary is served.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeStatus {
     pub version: String,
     pub root_hash: String,
@@ -407,7 +407,7 @@ pub struct IndexOperationalStatus {
     pub applied_height: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModuleStatus {
     pub id: String,
     pub root: String,

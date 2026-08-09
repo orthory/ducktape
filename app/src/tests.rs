@@ -163,6 +163,93 @@ fn reply_composer(app: &Ducktape) -> String {
     app.reply_editor.text().trim().to_string()
 }
 
+/// THE OVERVIEW SUBSCRIPTION MUST STAY GATED, AND THE GATE IS THE BUDGET.
+///
+/// The node re-samples `peers` only while someone holds the topic, and each
+/// sample encodes its whole metrics registry (485 KB, ~10 ms, measured). So an
+/// ungated subscription is not a style problem — it is that cost running for
+/// every connected console, forever, for a table nobody has open. A source
+/// lint because the cost lives on the OTHER side of the socket, where no app
+/// test can observe it.
+#[test]
+fn the_node_overview_stream_only_runs_on_the_tab_that_draws_it() {
+    let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
+    assert!(
+        lifecycle.contains(
+            "run node_overview(connected_rpc) when (connected && shell_tab == \"settings\" && node_tab == \"overview\") -> node_overview_sample _"
+        ),
+        "the overview stream must carry its full gate — connected, the settings \
+         tab, and the overview sub-tab that actually draws the peers table"
+    );
+    // and it must stay a STREAM, never a clock: `assert_no_polling` pins the
+    // recurring set exactly, so a future rewrite into `every 2s …` fails there
+    // rather than quietly reintroducing a poll this repo forbids.
+    assert_no_polling(&lifecycle);
+}
+
+/// A pushed frame answers ONE topic. The half it did not carry must survive
+/// it — otherwise the peers sample blanks the consensus facts 1.5 s before the
+/// status sample paints them back, and the overview strobes.
+#[test]
+fn an_overview_frame_moves_only_the_half_it_answered() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.node_peers = vec![backend::PeerRow {
+        key: "aa".into(),
+        role: "validator".into(),
+        live: true,
+    }];
+    app.node_version = "0.1.0".into();
+    app.node_checkpoint = 400;
+
+    // a STATUS frame: facts move, the table does not.
+    let _ = app.__update(__DucktapeMessage::NodeOverviewSample(
+        backend::NodeOverview {
+            facts_answered: true,
+            facts: backend::NodeFacts {
+                generation: -1,
+                version: "0.2.0".into(),
+                checkpoint_height: 512,
+                ..backend::NodeFacts::default()
+            },
+            ..backend::NodeOverview::default()
+        },
+    ));
+    assert_eq!(app.node_version, "0.2.0", "the status half landed");
+    assert_eq!(app.node_checkpoint, 512);
+    assert_eq!(
+        app.node_peers.len(),
+        1,
+        "a status frame must not empty the peers table"
+    );
+
+    // a PEERS frame: the table moves, the facts do not.
+    let _ = app.__update(__DucktapeMessage::NodeOverviewSample(
+        backend::NodeOverview {
+            peers_answered: true,
+            peers: vec![
+                backend::PeerRow {
+                    key: "aa".into(),
+                    role: "validator".into(),
+                    live: true,
+                },
+                backend::PeerRow {
+                    key: "bb".into(),
+                    role: "resident".into(),
+                    live: false,
+                },
+            ],
+            ..backend::NodeOverview::default()
+        },
+    ));
+    assert_eq!(app.node_peers.len(), 2, "the peers half landed");
+    assert_eq!(
+        app.node_version, "0.2.0",
+        "a peers frame must not blank the consensus facts"
+    );
+    assert_eq!(app.node_checkpoint, 512);
+}
+
 /// The page document's text, the way the save tick reads it.
 fn page_document_text(app: &Ducktape) -> String {
     crate::pages::page_text(app.page_editor.clone())

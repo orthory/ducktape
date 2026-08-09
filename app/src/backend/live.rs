@@ -573,6 +573,12 @@ pub fn keep_participants(
     if loaded { next } else { current }
 }
 
+/// The peers table's own keep: a pushed overview frame answers ONE of the two
+/// snapshot topics, so the half it did not carry must survive it.
+pub fn keep_peers(loaded: bool, next: Vec<PeerRow>, current: Vec<PeerRow>) -> Vec<PeerRow> {
+    if loaded { next } else { current }
+}
+
 pub fn keep_pages(loaded: bool, next: Vec<PageItem>, current: Vec<PageItem>) -> Vec<PageItem> {
     if loaded { next } else { current }
 }

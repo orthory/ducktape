@@ -570,6 +570,17 @@ subscribe
   // when the LAST tracked window closes, leave.
   window closed with-id -> window_was_closed _
   run node_logs(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "activity") -> node_log_line _
+  // THE NODE'S OWN TWO PLANES. Peers and the consensus facts have no op behind
+  // them — nothing in the index names a mesh connection or a checkpoint height
+  // — so no module topic can carry them, which is why they were the last two
+  // surfaces the console left cold, refreshed only by a connect or a tab
+  // switch.
+  //
+  // Not a poll. The node re-samples these only while this subscription is
+  // held, so THIS GATE IS THE BUDGET: `/v1/peers` composes its sample by
+  // encoding the whole metrics registry (485 KB, ~10 ms a call, measured), and
+  // leaving the tab stops that at the source rather than throttling it here.
+  run node_overview(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "overview") -> node_overview_sample _
   every 1s when huddle_joined -> tick
   every 300ms when !empty(toast) -> toast_tick
   // The settle-✓'s dismissal clock: tick one holds the tick on screen and
