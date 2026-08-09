@@ -150,6 +150,48 @@ pub fn saved_baseline(written: bool, canonical: String, submitted: String) -> St
     }
 }
 
+/// The baseline, corrected to the title that was actually SUBMITTED.
+///
+/// A save adopts the node's canonical text, and that text carries a title
+/// somebody else may have changed while this reader was typing — a title this
+/// buffer has never displayed, because the dirty guard refuses to rebuild a
+/// buffer mid-sentence. Line 0 IS the title, so taking the canonical line 0
+/// makes the baseline claim a sync that did not happen, and the next tick
+/// reads that manufactured difference as THIS reader retitling the page,
+/// writing the old name back over the rename.
+///
+/// `submitted` is `page_inflight_text` — the text the tick actually reconciled
+/// against the node — and NOT the live buffer. The distinction is the whole
+/// correctness of this function, and the handler already draws it one line
+/// below (`untouched`): a reader keeps typing during the round trip. Feeding
+/// the live buffer here adopts characters she has not saved into the baseline,
+/// which makes the document read CLEAN, retires the tick that would have
+/// written her rename, and leaves the next live fold free to rebuild the
+/// buffer and erase what she typed. That is a worse bug than the one this
+/// function exists to fix, in the same family.
+///
+/// VERBATIM rather than trimmed, because the dirty test compares these texts
+/// byte for byte and a normalized line 0 costs a needless extra round trip.
+/// The identical-title case returns the canonical text untouched, so the
+/// ordinary path is not reshaped at all.
+///
+/// The buffer is deliberately NOT corrected here. Rebuilding it would throw
+/// the reader's caret to the origin mid-sentence; the title on screen catches
+/// up the moment the buffer goes clean and any live event folds it.
+pub fn baseline_at_submitted_title(canonical: String, submitted: String) -> String {
+    let submitted_line = submitted
+        .split_once('\n')
+        .map_or(submitted.as_str(), |(head, _)| head);
+    let title_agrees = document_title(&canonical) == document_title(submitted_line);
+    if title_agrees {
+        return canonical;
+    }
+    match canonical.split_once('\n') {
+        Some((_, body)) => format!("{submitted_line}\n{body}"),
+        None => submitted_line.to_string(),
+    }
+}
+
 /// The document after a save attempt.
 ///
 /// `refusal` is not an error: the node is fine, the WRITE was not attempted
@@ -166,12 +208,35 @@ pub struct DocumentSaveResult {
     pub document: String,
 }
 
+/// Whether this save owes the node a title write.
+///
+/// A TITLE IS ONLY "MOVED" WHEN THIS READER MOVED IT. Disagreeing with the node
+/// was the whole test, and it is not enough: the node disagrees just as loudly
+/// when SOMEONE ELSE renamed the page and this buffer has not caught up. Line 0
+/// IS the title, so a reader who never touched it still carries the old one —
+/// and the write then reverted the other person's rename on chain, silently, on
+/// the next keystroke. It needs no dirty buffer and no race: any reader whose
+/// line 0 is behind the chain does it.
+///
+/// `saved` is the baseline the buffer was last synced to, so the difference
+/// between its line 0 and the buffer's is exactly "what this reader typed".
+/// BOTH conditions are required and neither alone is sufficient: authorship
+/// stops a stale reader from writing, and disagreement stops an agreeing title
+/// from costing a block. (Authorship alone would also submit a rename on the
+/// first save of a buffer whose baseline is still empty.)
+pub(crate) fn title_write_owed(title: &str, saved: &str, node_title: &str) -> bool {
+    let node_disagrees = title != node_title;
+    let reader_retitled_it = title != document_title(saved);
+    node_disagrees && reader_retitled_it
+}
+
 /// Reconcile the edited buffer against the page as the node currently holds it.
 pub async fn save_page_document(
     rpc: String,
     password: String,
     page_id: String,
     text: String,
+    saved: String,
     generation: i64,
 ) -> Result<DocumentSaveResult, HydrationError> {
     let failed = |message: String| HydrationError {
@@ -230,7 +295,7 @@ pub async fn save_page_document(
     // path returns Ok(false) — a silently dropped rename to a caller that
     // does not read the bool.
     let title = document_title(&text);
-    let title_moved = title != current.active_page_title;
+    let title_moved = title_write_owed(&title, &saved, &current.active_page_title);
     if title_moved {
         let bounded = bounded_exact_text(title, "page title", 512).map_err(failed)?;
         write(

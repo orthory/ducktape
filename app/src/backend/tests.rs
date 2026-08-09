@@ -2310,6 +2310,82 @@ fn block_comment_posts_reuse_the_selected_thread() {
     assert!(comment_thread_id(" ".into()).is_err());
 }
 
+/// THE TITLE WRITE IS AUTHORSHIP, NOT DISAGREEMENT.
+///
+/// Disagreement with the node was the whole old test, and it is why a reader
+/// who had merely not caught up wrote the old name back over someone else's
+/// rename. `title_write_owed` takes the title, the baseline the buffer was
+/// synced to, and the node's title — a pure decide, so it needs no node.
+#[test]
+fn a_title_write_is_owed_only_when_this_reader_retitled_the_page() {
+    assert!(
+        title_write_owed("New", "Old\nbody", "Old"),
+        "she retyped line 0, so the node owes a rename"
+    );
+    assert!(
+        !title_write_owed("Old", "Old\nbody", "New"),
+        "her line 0 matches the baseline she started from — she renamed nothing, \
+         and writing it back would revert the other rename on chain"
+    );
+    // AUTHORSHIP ALONE IS NOT ENOUGH, and this is the case that proves it: an
+    // empty baseline (a buffer that has never synced) makes every title look
+    // authored. Only the node's disagreement stops a first save from
+    // submitting a rename nobody asked for.
+    assert!(
+        !title_write_owed("Doc", "", "Doc"),
+        "an agreeing title must not submit an op, whatever the baseline says"
+    );
+    assert!(
+        title_write_owed("Doc", "", "Other"),
+        "a genuinely new title on a fresh buffer IS owed"
+    );
+}
+
+/// The baseline may not claim a sync that never happened.
+///
+/// A save adopts the node's canonical text, and that carries a title someone
+/// else may have changed while this reader typed — one the buffer has never
+/// shown, because the dirty guard refuses to rebuild it mid-sentence. Swallow
+/// that and the NEXT tick reads the difference as this reader retitling the
+/// page: the same revert, one tick later.
+#[test]
+fn the_baseline_keeps_the_title_the_buffer_is_actually_showing() {
+    // the ordinary path: titles agree, the canonical text is not reshaped.
+    let untouched = baseline_at_submitted_title("Doc\nbody".into(), "Doc\nbody typing".into());
+    assert_eq!(untouched, "Doc\nbody");
+
+    // someone else renamed it: the node's body is adopted, her line 0 is kept,
+    // so the next tick still reads "she retitled nothing".
+    let corrected =
+        baseline_at_submitted_title("New Name\nbody".into(), "Old Name\nbody mid-sen".into());
+    assert_eq!(corrected, "Old Name\nbody");
+    assert!(!title_write_owed(
+        &crate::pages::sync::document_title("Old Name\nbody mid-sen"),
+        &corrected,
+        "New Name"
+    ));
+
+    // VERBATIM, not trimmed: the dirty test compares these byte for byte, so a
+    // normalized line 0 would leave the buffer permanently dirty and the save
+    // tick running forever.
+    let spaced = baseline_at_submitted_title("New\nbody".into(), "Old  \nbody".into());
+    assert_eq!(spaced, "Old  \nbody");
+
+    // a title-only document keeps its shape — no newline is invented.
+    let titleless = baseline_at_submitted_title("New".into(), "Old".into());
+    assert_eq!(titleless, "Old");
+
+    // THE EARLY RETURN IS LOAD-BEARING, not an optimization: when the titles
+    // agree the canonical text must come back BYTE-IDENTICAL, body and all.
+    // Rebuilding it from the submitted line 0 would drop the node's own body
+    // edits into the baseline and call the buffer clean.
+    let agreeing = baseline_at_submitted_title("Doc\nnode body".into(), "Doc\nher body".into());
+    assert_eq!(
+        agreeing, "Doc\nnode body",
+        "an agreeing title returns the node's text untouched"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn chat_and_pages_round_trip_over_signed_frames() {
     let storage = tempfile::tempdir().unwrap();
@@ -2410,6 +2486,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         origin.clone(),
         String::new(),
         "no-such-page".into(),
+        "Welcome\n".into(),
         "Welcome\n".into(),
         0,
     )

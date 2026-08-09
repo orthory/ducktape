@@ -381,7 +381,7 @@ extern crate::backend
   delete_page(rpc:str, password:str, page_id:str) -> PagesData ! AppError
   // THE PAGE'S ONE WRITE PATH. The edited buffer in, the module's own ops
   // out — see backend/document.rs for the ordering rule and the refusal.
-  save_page_document(rpc:str, password:str, page_id:str, text:str, generation:i64) -> DocumentSaveResult ! HydrationError
+  save_page_document(rpc:str, password:str, page_id:str, text:str, saved:str, generation:i64) -> DocumentSaveResult ! HydrationError
   // The buffer a page opens on: its TITLE as line 0, its blocks under it.
   sync page_document_text(title:str, blocks:[PageBlock]) -> str
   sync subpage_blocks(blocks:[PageBlock]) -> [PageBlock]
@@ -392,6 +392,7 @@ extern crate::backend
   sync refreshed_page_editor(document:editor, title:str, blocks:[PageBlock], saved:str) -> editor
   sync refreshed_page_saved(document:editor, title:str, blocks:[PageBlock], saved:str) -> str
   sync saved_baseline(written:bool, canonical:str, submitted:str) -> str
+  sync baseline_at_submitted_title(canonical:str, submitted:str) -> str
   sync install_decision(document:editor, current_page:str, next_page:str, saved:str, canonical:str) -> bool
   sync installed_page_editor(document:editor, install:bool, canonical:str) -> editor
   sync rolled_back_editor(document:editor, untouched:bool, canonical:str) -> editor
