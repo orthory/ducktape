@@ -695,7 +695,11 @@ async fn submit_one(
 
     // fan the block out live after the derived index had its chance to
     // materialize rows. no subscribers is fine.
-    stream_hub.publish_block(block.height, block.root_hash.clone());
+    stream_hub.publish_block(
+        block.height,
+        block.root_hash.clone(),
+        noded::BlockWake::from_dispatches(&out.dispatches),
+    );
 
     Ok((block, out.events))
 }

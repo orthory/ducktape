@@ -1280,8 +1280,11 @@ impl Sim {
                 &projection.dispatches,
             );
             if let Some(root_hash) = projection.sealed_hash {
-                self.stream_hub
-                    .publish_block(projection.height, hex_root(&root_hash));
+                self.stream_hub.publish_block(
+                    projection.height,
+                    hex_root(&root_hash),
+                    noded::BlockWake::from_dispatches(&projection.dispatches),
+                );
             }
         }
         // the deterministic lane's read barrier: fold triggers drain on a

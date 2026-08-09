@@ -131,7 +131,17 @@ impl ValidatorRuntime<'_> {
         *blocks_since_checkpoint += sealed_heights;
         // The orderer-independent projection keeps member/System order,
         // explorer rows, and discard handling identical to the replica.
-        for projection in project_block(&drained, node.take_system_dispatches(), blobs) {
+        let projections = project_block(&drained, node.take_system_dispatches(), blobs);
+        // THE PASS PUBLISHES ONE TIP FRAME FOR N BLOCKS, so the wake is the OR
+        // over all of them and never the tip block's alone. A pass of
+        // [chat@10, nop@11] publishes h=11, and the 1s nop filler makes that the
+        // ORDINARY busy shape — taking the tip block's answer would strand the
+        // rows at h=10 until some later block happened to feed chat again.
+        let pass_wake = match projections.iter().any(|p| !p.dispatches.is_empty()) {
+            true => noded::BlockWake::IndexChanged,
+            false => noded::BlockWake::TipOnly,
+        };
+        for projection in projections {
             let BlockProjection {
                 height,
                 dispatches,
@@ -409,7 +419,7 @@ impl ValidatorRuntime<'_> {
         if let Some(f) = node.finalized()
             && *last_published != Some(f.height)
         {
-            stream_hub.publish_block(f.height, hex(&f.root_hash));
+            stream_hub.publish_block(f.height, hex(&f.root_hash), pass_wake);
             *last_published = Some(f.height);
         }
 
