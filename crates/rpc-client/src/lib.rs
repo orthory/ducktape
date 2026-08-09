@@ -55,6 +55,20 @@ pub enum ModuleEvent {
     },
     /// Replay history was unavailable; hydrate a fresh snapshot at this cursor.
     Lagged { module: String, cursor: String },
+    /// The chain head, as the node's heartbeat reports it.
+    ///
+    /// The heartbeat rides EVERY block wake — nop fillers included, which feed
+    /// no topic at all (`bin/noded/src/stream.rs`, the `block_rx` arm) — so this
+    /// is the only event that moves a follower's head on a chain whose
+    /// subscribed modules are quiet. Folding an op is not a substitute: an idle
+    /// chain finalizes nop blocks forever and emits no ops, which used to freeze
+    /// the console's head until someone typed.
+    ///
+    /// It carries the height and NOTHING ELSE on purpose. A read of `/v1/status`
+    /// triggered by this event would be a poll wearing a consensus costume: an
+    /// idle chain nop-fills once per `BLOCK_TIME` (`bin/node/src/constants.rs`),
+    /// so "on every tip" is a 1 Hz timer with extra steps.
+    Tip { height: u64 },
 }
 
 /// One applied-op feed row as the stream serves it: the block coordinates,
@@ -150,7 +164,9 @@ enum StreamFrame {
         topic: String,
         cursor: String,
     },
-    Heartbeat,
+    Heartbeat {
+        height: u64,
+    },
     Error {
         topic: String,
         detail: String,
@@ -388,8 +404,7 @@ impl Client {
         let stream = futures::stream::unfold(Some(socket), move |socket| async move {
             let mut socket = socket?;
             loop {
-                let message = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, socket.next()).await
-                {
+                let message = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, socket.next()).await {
                     Ok(Some(message)) => message,
                     Ok(None) => return Some((Err(Error::new("RPC stream closed")), None)),
                     Err(_) => {
@@ -574,7 +589,7 @@ fn decode_stream_message(
         StreamFrame::Error { topic, detail } => Some(Err(Error::new(format!(
             "RPC stream topic {topic} failed: {detail}"
         )))),
-        StreamFrame::Heartbeat => None,
+        StreamFrame::Heartbeat { height } => Some(Ok(ModuleEvent::Tip { height })),
     }
 }
 
@@ -670,6 +685,28 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// THE HEARTBEAT CARRIES THE HEAD, AND IT USED TO BE DROPPED HERE.
+    ///
+    /// `StreamFrame::Heartbeat` was a UNIT variant, so `height` never survived
+    /// deserialization and the frame decoded to nothing. A follower's head then
+    /// moved only when one of its subscribed modules committed an op — and an
+    /// idle chain nop-fills forever without feeding any topic, so the console
+    /// sat on a frozen block number until someone typed.
+    ///
+    /// The frame below is the node's own, verbatim: `bin/noded/tests/daemon_e2e.rs`
+    /// pins that it serves `type`/`height`/`interval_ms`, so this test fails if
+    /// either side moves. `root_hash`, `time_ms` and `interval_ms` are not
+    /// decoded — the tip's whole contract is the height.
+    #[test]
+    fn a_heartbeat_decodes_to_the_head_it_carries() {
+        let expected = BTreeSet::from(["module:chat".to_string()]);
+        let heartbeat = r#"{"type":"heartbeat","height":41,"root_hash":"ab","time_ms":1752000000000,"interval_ms":3000}"#;
+        let tip = decode_stream_message(Ok(Message::Text(heartbeat.into())), &expected)
+            .expect("a heartbeat is an event, not a skipped frame")
+            .expect("a heartbeat is not an error");
+        assert_eq!(tip, ModuleEvent::Tip { height: 41 });
     }
 
     #[test]
