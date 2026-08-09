@@ -130,9 +130,15 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                     //
                     // It carries no cursor: a heartbeat is not a topic and
                     // resuming does not replay one. And it triggers NO load —
-                    // see `ModuleEvent::Tip`. The handler's same-value writes
-                    // are no-ops, so the 3s idle beat repeating a height costs
-                    // nothing and needs no suppression here.
+                    // see `ModuleEvent::Tip`.
+                    //
+                    // No de-duplication here, deliberately: the handler stops a
+                    // tip immediately after the head assignment
+                    // (`handlers/lifecycle.ice`), so a repeated height costs two
+                    // scalar writes and no fold. Suppressing it would buy that
+                    // back at the price of carrying a last-height in this state,
+                    // and the fold path — the part that actually cost something
+                    // — is already unreachable.
                     Some(Ok(ModuleEvent::Tip { height })) => live_update(
                         "tip",
                         &format!("Live · block {height}"),

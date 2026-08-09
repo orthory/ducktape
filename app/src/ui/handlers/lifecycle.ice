@@ -229,8 +229,19 @@ on workspace_connected(next)
 
 on live_updated(next)
   status = next.status
+  // THE HEAD IS ASSIGNED ABOVE THE GUARD BECAUSE THE TIP STOPS AT IT.
+  //
+  // A tip carries a height and an EMPTY delta, and it arrives once per block —
+  // on `bin/node` that is 1 Hz of nop fillers plus the 3s idle beat, forever,
+  // on a chain where nothing happened. Every `apply_*` below takes its list BY
+  // VALUE (`extern/backend.ice`), so letting a tip walk down to the `return if`
+  // at the bottom clones `messages`, `channels` and `thread_messages` a dozen
+  // times over to fold a delta that is empty by construction — then rebuilds
+  // the view. Per second. Idle.
+  //
   return if next.kind == "retry"
   block_height = keep_i64(next.height >= 0, next.height, block_height)
+  return if next.kind == "tip"
   channels = apply_chat_channels(channels, next.chat)
   // Settle-✓ choreography, read against the PRE-fold rows: the settle delta
   // pops the tick (true), any later live event — the next block at the
