@@ -1439,29 +1439,42 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
     );
 }
 
-/// A SUBSCRIBE COSTS ONE SAMPLE, NOT TWO.
+/// A SUBSCRIBE COSTS ONE SAMPLE PER TOPIC, NOT TWO.
 ///
 /// `peers` composes its sample by encoding the whole metrics registry, so the
 /// heartbeat's immediate first tick landing on the heels of the subscribe
 /// replay meant every subscribe paid that twice — the second carrying nothing
 /// the first did not. The scrape sits inside the ~3 s before the next real
 /// beat, so the margin here is a whole heartbeat, not a hair.
+///
+/// ALL THREE SNAPSHOT TOPICS, because the guard is written at three call
+/// sites. Asserting `peers` alone leaves deleting the other two copies green,
+/// which is the same forget-a-topic failure `catch_up`'s exhaustive dispatch
+/// was written to prevent.
 #[test]
-fn a_subscribe_composes_one_snapshot_and_not_the_tick_behind_it() {
+fn a_subscribe_composes_one_snapshot_per_topic_and_not_the_tick_behind_it() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
 
     let mut ws = daemon.ws_connect();
-    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["peers"]}"#);
-    let _ = Daemon::ws_read_type(&mut ws, "subscribed");
-    let _ = Daemon::ws_read_type(&mut ws, "tail");
-
-    assert_eq!(
-        peers_samples(&daemon.metrics()),
-        1,
-        "the subscribe replay composed the document; the immediate heartbeat \
-         tick behind it must fold away rather than encode the registry again"
+    Daemon::ws_send_text(
+        &mut ws,
+        r#"{"op":"subscribe","topics":["peers","status","metrics"]}"#,
     );
+    let _ = Daemon::ws_read_type(&mut ws, "subscribed");
+    for _ in 0..3 {
+        let _ = Daemon::ws_read_type(&mut ws, "tail");
+    }
+
+    let exposition = daemon.metrics();
+    for topic in ["peers", "status", "metrics"] {
+        assert_eq!(
+            snapshot_samples(&exposition, topic),
+            1,
+            "{topic}: the subscribe replay composed the document; the immediate \
+             heartbeat tick behind it must fold away rather than compose again"
+        );
+    }
 }
 
 /// DROPPING THE SOCKET MUST STOP THE SAMPLING — the whole cost argument for
@@ -1537,15 +1550,20 @@ fn a_closed_session_stops_costing_the_node_a_snapshot_sample() {
     );
 }
 
-/// the `peers` arm of `ducktape_stream_snapshot_samples`, off a scrape.
-fn peers_samples(exposition: &str) -> u64 {
+/// one arm of `ducktape_stream_snapshot_samples`, off a scrape.
+fn snapshot_samples(exposition: &str, topic: &str) -> u64 {
+    let series = format!("ducktape_stream_snapshot_samples_total{{topic=\"{topic}\"}}");
     exposition
         .lines()
-        .find(|line| line.starts_with("ducktape_stream_snapshot_samples_total{topic=\"peers\"}"))
+        .find(|line| line.starts_with(&series))
         .and_then(|line| line.rsplit(' ').next())
         .and_then(|value| value.parse::<f64>().ok())
         .map(|value| value as u64)
-        .unwrap_or_else(|| panic!("no peers sample counter in exposition"))
+        .unwrap_or_else(|| panic!("no {topic} sample counter in exposition"))
+}
+
+fn peers_samples(exposition: &str) -> u64 {
+    snapshot_samples(exposition, "peers")
 }
 
 /// THE OVERVIEW TOPICS MUST DELIVER, OVER A REAL SOCKET, IN THE SHAPE THE
