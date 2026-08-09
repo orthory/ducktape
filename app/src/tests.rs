@@ -298,6 +298,7 @@ fn an_overview_frame_moves_only_the_half_it_answered() {
     assert_eq!(app.node_view_label, "9");
     assert_eq!(app.node_quorum_label, "5");
     assert_eq!(app.node_reachable_label, "6");
+}
 
 /// THE PREDICATE IS ONLY HALF THE FIX; THIS PINS THE OTHER HALF.
 ///
@@ -2024,6 +2025,69 @@ fn the_save_tick_waits_for_inflight_saves_and_open_fences() {
         "a closed fence saves"
     );
     assert_eq!(app.block_autosave_status, "saving");
+}
+
+/// TICK TWO MUST NOT REVERT WHAT TICK ONE CORRECTLY LEFT ALONE.
+///
+/// The predicate alone survives exactly one tick. A save that writes body ops
+/// comes back with the node's canonical text — carrying a rename someone else
+/// made — and the handler adopts it as the baseline while deliberately leaving
+/// the dirty buffer's stale line 0 in place. That manufactures authorship out
+/// of nothing, and the NEXT tick writes the old name back on chain.
+///
+/// Driven through the handler, two ticks, on the fixture #1032 uses for the
+/// same collision: a reader mid-sentence whose page is renamed under her.
+#[test]
+fn a_save_that_lands_body_ops_does_not_manufacture_a_rename_next_tick() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.active_page = "page".into();
+    app.buffer_page = "page".into();
+    // she is mid-sentence; her line 0 is the OLD name and she never touched it.
+    app.page_editor = compose("Old Name\nbody mid-sentence");
+    app.page_saved_text = "Old Name\nbody".into();
+    let generation = app.block_autosave_generation;
+
+    // the save landed her body edit. The node's canonical text carries the
+    // other person's rename, which her buffer has never shown.
+    let _ = app.__update(__DucktapeMessage::PageDocumentSaved(
+        backend::DocumentSaveResult {
+            generation,
+            written: true,
+            refusal: String::new(),
+            document: "New Name\nbody mid-sentence".into(),
+            data: backend::PagesData {
+                pages: vec![page_item("page", "New Name")],
+                blocks: vec![page_block("b1", "page", "body mid-sentence")],
+                active_page: "page".into(),
+                active_page_title: "New Name".into(),
+                active_page_parent: String::new(),
+                comment_thread_total: 0,
+                commented_block_hits: Vec::new(),
+            },
+        },
+    ));
+
+    // the label follows the chain — that half is right and stays right.
+    assert_eq!(app.active_page_title, "New Name");
+    // THE BASELINE KEEPS HER LINE 0. Adopting "New Name" here is what made the
+    // next tick believe she had retitled the page.
+    assert_eq!(
+        app.page_saved_text, "Old Name\nbody mid-sentence",
+        "the baseline may not claim a title the buffer never showed"
+    );
+    // and with buffer and baseline agreeing at line 0, the document is clean:
+    // the tick does not even fire, so no rename can be planned from it.
+    assert_eq!(
+        page_document_text(&app),
+        app.page_saved_text,
+        "no manufactured dirt at line 0"
+    );
+    let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
+    assert_eq!(
+        app.block_autosave_generation, generation,
+        "tick two must plan nothing — there is nothing of hers left unsaved"
+    );
 }
 
 fn page_item(id: &str, title: &str) -> backend::PageItem {

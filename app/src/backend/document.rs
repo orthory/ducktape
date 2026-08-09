@@ -150,6 +150,42 @@ pub fn saved_baseline(written: bool, canonical: String, submitted: String) -> St
     }
 }
 
+/// The baseline, corrected to the title the buffer is ACTUALLY showing.
+///
+/// A save adopts the node's canonical text, and that text carries a title
+/// somebody else may have changed while this reader was typing — a title this
+/// buffer has never displayed, because the dirty guard refuses to rebuild a
+/// buffer mid-sentence. Line 0 IS the title, so taking the canonical line 0
+/// makes the baseline claim a sync that did not happen.
+///
+/// The next tick then reads that manufactured difference as THIS reader
+/// retitling the page and writes the old name back over the rename — which is
+/// the whole defect `title_write_owed` exists to stop, arriving one tick late
+/// instead of immediately.
+///
+/// So the baseline keeps the buffer's own line 0, VERBATIM rather than
+/// trimmed: the dirty test compares these two texts byte for byte, and a
+/// normalized line 0 would leave the buffer permanently dirty and the save
+/// tick running forever. The identical-title case returns the canonical text
+/// untouched, so the ordinary path is not reshaped at all.
+///
+/// The buffer is deliberately NOT corrected here. Rebuilding it would throw
+/// the reader's caret to the origin mid-sentence; the title on screen catches
+/// up the moment the buffer goes clean and any live event folds it.
+pub fn baseline_at_buffer_title(canonical: String, buffer: String) -> String {
+    let buffer_line = buffer
+        .split_once('\n')
+        .map_or(buffer.as_str(), |(head, _)| head);
+    let title_agrees = document_title(&canonical) == document_title(buffer_line);
+    if title_agrees {
+        return canonical;
+    }
+    match canonical.split_once('\n') {
+        Some((_, body)) => format!("{buffer_line}\n{body}"),
+        None => buffer_line.to_string(),
+    }
+}
+
 /// The document after a save attempt.
 ///
 /// `refusal` is not an error: the node is fine, the WRITE was not attempted
@@ -182,8 +218,7 @@ pub struct DocumentSaveResult {
 /// stops a stale reader from writing, and disagreement stops an agreeing title
 /// from costing a block. (Authorship alone would also submit a rename on the
 /// first save of a buffer whose baseline is still empty.)
-pub(crate) fn title_write_owed(text: &str, saved: &str, node_title: &str) -> bool {
-    let title = document_title(text);
+pub(crate) fn title_write_owed(title: &str, saved: &str, node_title: &str) -> bool {
     let node_disagrees = title != node_title;
     let reader_retitled_it = title != document_title(saved);
     node_disagrees && reader_retitled_it
@@ -254,7 +289,7 @@ pub async fn save_page_document(
     // path returns Ok(false) — a silently dropped rename to a caller that
     // does not read the bool.
     let title = document_title(&text);
-    let title_moved = title_write_owed(&text, &saved, &current.active_page_title);
+    let title_moved = title_write_owed(&title, &saved, &current.active_page_title);
     if title_moved {
         let bounded = bounded_exact_text(title, "page title", 512).map_err(failed)?;
         write(
