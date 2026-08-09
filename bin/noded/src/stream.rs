@@ -1869,12 +1869,17 @@ fn catch_up_files(topic: &str, cursor: &mut String, store: &indexer::IndexStore)
         scanned += entry_count;
         for (key, value) in page.entries {
             let key = String::from_utf8_lossy(&key).into_owned();
-            let row = match serde_json::from_slice::<StreamOpRow>(&value) {
-                Ok(row) => row,
+            // THE SAME BYTES `catch_up_module` READS, so the same decoder.
+            // `IndexStore::apply_block` writes one BORSH `indexer::OpRow` per
+            // dispatch; this read them as json, so every files commit answered
+            // "rebuild the index" and dropped the topic. The index was fine —
+            // `files:watch` has simply never delivered a frame.
+            let row = match borsh::from_slice::<indexer::OpRow>(&value) {
+                Ok(row) => stream_op_row(row),
                 Err(_) => {
                     frames.push(unavailable(
                         topic,
-                        "stored op row was not json — rebuild the index",
+                        "stored op row was not a borsh envelope — rebuild the index",
                     ));
                     return CatchUpResult::drop(frames);
                 }
@@ -2301,6 +2306,61 @@ mod tests {
                 record: None,
             })
             .expect("apply block");
+    }
+
+    /// FILES:WATCH HAD NEVER DELIVERED A FRAME.
+    ///
+    /// `IndexStore::apply_block` writes one BORSH `indexer::OpRow` per dispatch
+    /// — the same bytes `catch_up_module` reads with `borsh::from_slice`. This
+    /// path read them as json, so the first files commit answered "rebuild the
+    /// index" and dropped the topic, blaming a store that was correct.
+    ///
+    /// The block goes in through the REAL `apply_block`, so the encoding under
+    /// test is the one the node actually writes — which is the whole reason a
+    /// test here catches it and none existed.
+    #[test]
+    fn files_watch_reads_the_rows_the_index_actually_wrote() {
+        let (_dir, store) = temp_store(&["files"]);
+        let commit = json!({
+            "commit": {
+                "base_snapshot": null,
+                "message": "first",
+                "changes": [{ "mkdir": { "path": "notes" } }],
+            }
+        });
+        store
+            .apply_block(&BlockOps {
+                height: 1,
+                time: 10,
+                ops: vec![AppliedOp {
+                    module: "files".into(),
+                    origin: OriginTag::external("tester"),
+                    payload: serde_json::to_vec(&commit).expect("payload json"),
+                    assigned: Vec::new(),
+                }],
+                record: None,
+            })
+            .expect("apply block");
+
+        let mut cursor = "op/0000000000000000/ffff".to_string();
+        let result = catch_up_files("files:watch", &mut cursor, &store);
+        assert!(
+            !result.drop_topic,
+            "a healthy index must not drop the topic: {:?}",
+            result.frames
+        );
+        match result.frames.as_slice() {
+            [
+                ServerFrame::Tail {
+                    item: TailItem::FileChange { paths, message, .. },
+                    ..
+                },
+            ] => {
+                assert_eq!(paths, &["notes".to_string()]);
+                assert_eq!(message, "first");
+            }
+            other => panic!("expected one file-change tail, got {other:?}"),
+        }
     }
 
     #[test]
