@@ -324,16 +324,12 @@ fn the_capture_cost_breakdown_covers_every_registered_module() {
         // cost is attributable and a per-module measurement is distinguishable
         // from one aggregate stamped onto everybody.
         let mut tick = std::time::Duration::ZERO;
-        let snapshot = host.capture_current_snapshot(4, || {
+        let (_snapshot, capture_cost) = host.capture_current_snapshot(4, || {
             tick += std::time::Duration::from_millis(1);
             tick
         });
 
-        let mut billed: Vec<&str> = snapshot
-            .capture_cost
-            .iter()
-            .map(|(id, _)| id.as_str())
-            .collect();
+        let mut billed: Vec<&str> = capture_cost.iter().map(|(id, _)| id.as_str()).collect();
         billed.sort_unstable();
         assert_eq!(
             billed,
@@ -341,7 +337,7 @@ fn the_capture_cost_breakdown_covers_every_registered_module() {
             "every registered module is billed, degraded included — an absent \
              module is exactly the one a slow capture would be blamed on",
         );
-        for (id, spent) in &snapshot.capture_cost {
+        for (id, spent) in &capture_cost {
             assert_eq!(
                 *spent,
                 std::time::Duration::from_millis(2),

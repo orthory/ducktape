@@ -542,14 +542,13 @@ impl Manifest {
         // to re-read `host.root_hash()` here (twice) on top of the host's own
         // recompute — four full serializations per map-backed module, for a
         // check that compared the host's root against itself.
-        let snapshot = host.capture_current_snapshot(
+        let (snapshot, capture_cost) = host.capture_current_snapshot(
             // a genesis manifest has no boundary yet; 0 is a placeholder, not
             // a height.
             height.unwrap_or(0),
             now,
         );
         let root_hash = snapshot.root_hash;
-        let capture_cost = snapshot.capture_cost;
         // a checkpoint is ALL-OR-NOTHING and that is deliberate: restore reads
         // bytes back per module, so a manifest missing one module's snapshot is
         // a checkpoint that cannot restore — and writing it would prune the

@@ -1458,6 +1458,12 @@ pub(super) async fn park(
                 let checkpoint_started = context.current();
                 let members = read_valset_members(node_r.host()).await;
                 let residents = read_valset_residents(node_r.host()).await;
+                // the capture's OWN window: the two valset reads above are host
+                // queries that run module execution, and charging them to
+                // `capture_ms` would put time in the stage that the per-module
+                // breakdown cannot account for. `checkpoint_started` still spans
+                // them for the cooldown — they block the loop too.
+                let capture_started = context.current();
                 // TIMED, exactly like the validator's periodic checkpoint: this
                 // capture blocks the replica's own select loop, so its per-module
                 // cost is the same diagnosis (#1018) and must not be visible in
@@ -1523,7 +1529,7 @@ pub(super) async fn park(
                                 event = "node_checkpoint_written",
                                 node = %label,
                                 height = ckpt.height.unwrap_or_default(),
-                                capture_ms = since(checkpoint_started, captured_at),
+                                capture_ms = since(capture_started, captured_at),
                                 write_ms = since(captured_at, written_at),
                                 prune_ms = since(written_at, done_at),
                                 capture_modules = %crate::drain_actions::capture_breakdown(&capture_cost)

@@ -356,12 +356,6 @@ pub struct FinalizedSnapshot {
     pub root_hash: StateRoot,
     pub modules: Vec<ModuleSnapshot>,
     pub degraded: Vec<DegradedModule>,
-    /// what each registered module COST to capture (its `root()` plus its
-    /// state-sync handle), in registry order, degraded modules included.
-    /// observability only, never consensus input: the capture runs on the
-    /// node's single select loop, and an aggregate `capture_ms` cannot name
-    /// the module that spent it (#1018 was one module out of twenty).
-    pub capture_cost: Vec<(ModuleId, Duration)>,
 }
 
 impl FinalizedSnapshot {
@@ -868,6 +862,7 @@ impl Host {
         self.snapshot_at(finalized.height, Some(finalized.root_hash), || {
             Duration::ZERO
         })
+        .map(|(snapshot, _)| snapshot)
     }
 
     /// capture the committed registry view at the host's CURRENT root, which
@@ -878,13 +873,15 @@ impl Host {
     /// `root()` is a whole state serialization + hash for a map-backed module.
     ///
     /// `now` is the CALLER's clock (the host owns none, by design): it is read
-    /// around each module's capture and the deltas land in
-    /// [`FinalizedSnapshot::capture_cost`]. Pass `|| Duration::ZERO` to opt out.
+    /// around each module's capture and the deltas are returned ALONGSIDE the
+    /// snapshot — what a module cost is wall-clock, so it is not part of the
+    /// boundary's identity and must stay out of its `Eq`. Registry order,
+    /// degraded modules included. Pass `|| Duration::ZERO` to opt out.
     pub fn capture_current_snapshot(
         &self,
         height: u64,
         now: impl FnMut() -> Duration,
-    ) -> FinalizedSnapshot {
+    ) -> (FinalizedSnapshot, Vec<(ModuleId, Duration)>) {
         self.snapshot_at(height, None, now)
             .expect("an unverified capture has no root to mismatch")
     }
@@ -898,7 +895,7 @@ impl Host {
         height: u64,
         expected: Option<StateRoot>,
         mut now: impl FnMut() -> Duration,
-    ) -> Result<FinalizedSnapshot, SnapshotError> {
+    ) -> Result<(FinalizedSnapshot, Vec<(ModuleId, Duration)>), SnapshotError> {
         let mut roots: Vec<(ModuleId, StateRoot)> = Vec::with_capacity(self.registry.len());
         let mut capture_cost: Vec<(ModuleId, Duration)> = Vec::with_capacity(self.registry.len());
         for (id, module) in self.registry.iter() {
@@ -917,32 +914,38 @@ impl Host {
 
         let mut modules = Vec::with_capacity(self.registry.len());
         let mut degraded = Vec::new();
-        for (i, (id, module)) in self.registry.iter().enumerate() {
-            let root = roots[i].1;
+        for ((module, (id, root)), cost) in self
+            .registry
+            .values()
+            .zip(roots.iter())
+            .zip(capture_cost.iter_mut())
+        {
             let started = now();
             let handle = module.state_sync_handle();
-            capture_cost[i].1 += now().saturating_sub(started);
+            cost.1 += now().saturating_sub(started);
             match handle {
                 Ok(state_sync) => modules.push(ModuleSnapshot {
                     id: id.clone(),
-                    root,
+                    root: *root,
                     state_sync,
                 }),
                 Err(reason) => degraded.push(DegradedModule {
                     id: id.clone(),
-                    root,
+                    root: *root,
                     reason,
                 }),
             }
         }
 
-        Ok(FinalizedSnapshot {
-            height,
-            root_hash: actual,
-            modules,
-            degraded,
+        Ok((
+            FinalizedSnapshot {
+                height,
+                root_hash: actual,
+                modules,
+                degraded,
+            },
             capture_cost,
-        })
+        ))
     }
 
     /// apply one inbound message as a block: route, execute, drain follow-ups,

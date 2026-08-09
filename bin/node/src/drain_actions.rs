@@ -1,15 +1,17 @@
 //! Orderer-independent epoch-cutover actions shared by validators and replicas.
 //!
 //! The concrete loops still own drain timing and side-effect order. This seam
-//! only stages the observe -> ceiling -> cutover decisions both roles must
-//! interpret identically. The block-projection half (RootOp assembly + explorer
-//! rows) now lives in [`noded::projection`], consumed by both loops.
+//! holds what both roles must decide identically — the observe -> ceiling ->
+//! cutover actions, the checkpoint cadence, and the one log format that reports
+//! what a checkpoint cost. The block-projection half (RootOp assembly +
+//! explorer rows) now lives in [`noded::projection`], consumed by both loops.
 
 use commonware_cryptography::ed25519;
 use consensus::{ObservationOutcome, RespawnPlan, ScheduledCutover, ValsetOrchestrator};
 
 // ============================================================================
-// checkpoint cadence — the one decision BOTH loops make about their own cost.
+// checkpoint cadence — what BOTH loops decide about their own cost, and how
+// they report it.
 // ============================================================================
 
 /// the largest share of a loop's wall time a checkpoint may occupy: one part in
