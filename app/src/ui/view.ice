@@ -489,6 +489,7 @@ view
               loading=explorer_loading
               kinds=explorer_kinds
               kind=explorer_kind
+              partial=explorer_partial
               hits=explorer_hits
               blocks=explorer_blocks
               selected=explorer_selected

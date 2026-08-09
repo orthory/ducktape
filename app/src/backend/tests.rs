@@ -1161,6 +1161,409 @@ fn palette_keys_use_logical_escape_and_physical_shortcut() {
     );
 }
 
+/// One stubbed lane of the workspace search: the substring that names it in a
+/// raw request, the search LEG it belongs to, and the reply. An empty leg name
+/// marks a FOLLOW-UP — a request a leg can only issue after its own first reply
+/// (forge's per-repo tracker read, pages' title lookup), so it can never be in
+/// flight at first contact and is not counted as overlap.
+///
+/// FIRST MATCH WINS, SO A FOLLOW-UP GOES ABOVE THE LANE IT SHARES A ROUTE WITH.
+/// `list_pages` is `/v1/index/pages/view` too — the same route as the page
+/// search — so on the substring alone the title lookup would be served the
+/// search's own reply and read as a second `pages` arrival. Matching the query
+/// discriminant first is what keeps "a request this stub does not model panics
+/// by name" true rather than nearly true.
+///
+/// The chat lane answers with no hits on purpose: a `MsgRow` is seventeen wire
+/// fields and nothing here turns on its contents. The other five carry one
+/// matching row each, which is what pins the row order.
+const SEARCH_LANES: &[(&str, &str, &str)] = &[
+    ("/v1/index/chat/view", "chat", r#"{"hits":[]}"#),
+    (
+        "list_pages",
+        "",
+        r#"{"pages":{"pages":[{"id":"page-1","title":"The needle page"}],"has_more":false}}"#,
+    ),
+    (
+        "/v1/index/pages/view",
+        "pages",
+        r#"{"hits":[{"block_id":"block-1","page_id":"page-1","parent":"page-1","kind":"paragraph","text":"needle in a page","height":1,"time":1}]}"#,
+    ),
+    (
+        "list_repos",
+        "forge",
+        r#"{"repos":[{"name":"needle-repo","head":"0000000000000000000000000000000000000000"}]}"#,
+    ),
+    (
+        "list_items",
+        "",
+        r#"{"items":[{"number":7,"kind":"issue","title":"needle issue","state":"open","author":"system","created_at":1,"updated_at":1}]}"#,
+    ),
+    (
+        "/v1/files/grep",
+        "files",
+        r#"{"hits":[{"path":"src/needle.rs","line":3,"text":"a needle here"}]}"#,
+    ),
+    (
+        "/v1/index/tasks/view",
+        "tasks",
+        r#"{"tasks":{"tasks":[{"title":"needle task","task_id":"task-1","created_by":"user:aa","updated_height":2}]}}"#,
+    ),
+    (
+        "pending_runs",
+        "runs",
+        r#"{"pending_runs":[{"run_id":"needle-run","agent_id":"agent-1","created_at":1,"channel_id":"c1"}]}"#,
+    ),
+    ("recent_runs", "runs", r#"{"recent_runs":[]}"#),
+];
+
+/// The lane one raw HTTP request belongs to. `None` = a request this stub does
+/// not model, which is a test bug, not a product one.
+fn search_lane_of(request: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
+    SEARCH_LANES
+        .iter()
+        .find(|(mark, ..)| request.contains(mark))
+}
+
+/// Which REQUESTS of a workspace search were in flight AT THE SAME MOMENT, each
+/// tagged with the leg it belongs to, as seen by the stub node below.
+///
+/// Requests, not legs — a set of leg names cannot see a leg serializing its own
+/// round trips (tasks reads three status pages, runs reads two queries), and
+/// "the six legs overlapped" stays true while the work inside them is a chain.
+/// Counting arrivals makes the multiplicity part of the answer.
+#[derive(Default)]
+struct FanOutWatch {
+    waiting: Vec<String>,
+    /// The arrivals as they stood when the stub let them through — the answer
+    /// the test asserts on. Empty until then.
+    overlapped: Vec<String>,
+    released: bool,
+}
+
+impl FanOutWatch {
+    /// Record one arrival; true when it is the one that completes the wave. An
+    /// arrival AFTER release is not recorded: it is by definition a request that
+    /// was waiting on something, which is the failure being measured.
+    fn arrive(&mut self, leg: &str, requests: usize) -> bool {
+        if self.released {
+            return false;
+        }
+        self.waiting.push(leg.to_string());
+        self.waiting.len() >= requests
+    }
+
+    /// Let everyone through and freeze the report.
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        self.overlapped = self.waiting.clone();
+        self.overlapped.sort();
+    }
+}
+
+/// A stub node that ANSWERS NOTHING until a workspace search has `requests`
+/// round trips in flight at once, then releases them together. That overlap is
+/// the only thing observable from outside the process, and it is the whole
+/// guarantee: a request that waits on another request's reply — a serial chain,
+/// a nested `.await` inside the join, a helper that folds two legs into one
+/// future, a leg walking its own pages one at a time — cannot be in flight
+/// beside what it waits on, so the wave never completes and the stub reports
+/// exactly what did overlap.
+///
+/// [`FanOutWatch::overlapped`] is filled ONCE, at release, and requests that
+/// arrive after it are not counted — the report is what overlapped, not what
+/// ever arrived. Recording every arrival instead makes this stub pass the very
+/// break it exists to catch: a leg held back behind another leg's reply lands
+/// the moment the rest are let go, and a set that keeps filling then reads as a
+/// full fan-out.
+///
+/// A grep of the join's TEXT cannot see any of this, which is why the pin this
+/// replaced could be broken while staying green.
+///
+/// THE ESCAPE FROM A WEDGE IS AN EVENT, NOT A CLOCK. A serialized search never
+/// completes the wave, so its held requests run out `RpcClient`'s own 30 s
+/// ceiling and reqwest drops the connection — and that FIN is what this stub
+/// waits on beside the release. The first hang-up freezes the report at what
+/// had genuinely overlapped and lets the rest go, so a broken fan-out FAILS
+/// with the truth in the message instead of hanging the suite. The passing path
+/// never touches either seam: nine loopback requests overlap in milliseconds
+/// and release on the ninth ARRIVAL, so no duration is load-bearing anywhere
+/// here.
+async fn node_that_answers_only_a_full_fan_out(
+    requests: usize,
+    refused: &'static [&'static str],
+    watch: std::sync::Arc<Mutex<FanOutWatch>>,
+) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// The request is in hand once the body reaches its declared length.
+    fn request_is_complete(request: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(request);
+        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+            return false;
+        };
+        let declared = head
+            .to_lowercase()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("content-length:")?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .unwrap_or(0);
+        body.len() >= declared
+    }
+
+    /// The held request's client gave up and closed the socket — the only
+    /// event a stub holding a reply can observe when the wave will never
+    /// complete. `Ok(0)` is the FIN; an error is the same fact, harder.
+    async fn hung_up(stream: &mut tokio::net::TcpStream) {
+        let mut ignored = [0u8; 1];
+        while let Ok(read) = stream.read(&mut ignored).await {
+            if read == 0 {
+                return;
+            }
+        }
+    }
+
+    let (release, _) = tokio::sync::watch::channel(false);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the stub node");
+    let origin = format!("http://{}", listener.local_addr().expect("stub address"));
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let watch = watch.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 2048];
+                while let Ok(read) = stream.read(&mut chunk).await {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request_is_complete(&request) {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).to_string();
+                let (_, leg, reply) = search_lane_of(&request).unwrap_or_else(|| {
+                    panic!(
+                        "the workspace search touched a lane this stub does not \
+                         model, so it costs a round trip nobody accounted for: \
+                         {request}"
+                    )
+                });
+                let counts = !leg.is_empty();
+                if counts {
+                    let completes_the_wave =
+                        watch.lock().expect("stub watch").arrive(leg, requests);
+                    if completes_the_wave {
+                        watch.lock().expect("stub watch").release();
+                        let _ = release.send(true);
+                    }
+                    let mut open = release.subscribe();
+                    let opened = async {
+                        while !*open.borrow_and_update() {
+                            let _ = open.changed().await;
+                        }
+                    };
+                    tokio::select! {
+                        () = opened => {}
+                        () = hung_up(&mut stream) => {
+                            // Nobody is coming: this request's client already
+                            // walked away. Freeze the report at what did
+                            // overlap and let the others answer into the void.
+                            watch.lock().expect("stub watch").release();
+                            let _ = release.send(true);
+                        }
+                    }
+                }
+                let refuse = refused.contains(leg);
+                let (status, reply) = match refuse {
+                    true => ("503 Service Unavailable", "the module is not answering"),
+                    false => ("200 OK", *reply),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    origin
+}
+
+/// A SEARCH COSTS ITS SLOWEST SOURCE, NOT THEIR SUM. `search_workspace` awaited
+/// six independent sources one after another, and nothing in it reads what
+/// another leg produced. Warm that is worth nothing — every leg answers in a
+/// few milliseconds. COLD it is the whole cost: a module's first touch measured
+/// 10-54 s against this app's 30 s client ceiling, so serial is several
+/// ceilings end to end and fanned out is one.
+///
+/// THE OVERLAP IS THE GUARANTEE, SO THE OVERLAP IS WHAT IS PINNED — observed
+/// from outside the process by a node that answers nothing until all six legs
+/// are in flight together. The pin this replaced greped the join's text for six
+/// names, which folding two legs into one `async { a.await; b.await }` inside
+/// the join defeats while staying green.
+///
+/// The row order is asserted in the same run: a fan-out that silently reordered
+/// the results would be a different defect.
+///
+/// This does NOT contradict the `join_all` ban in backend/document.rs: that one
+/// guards the WRITE chain, where an op built on the block before it must land
+/// after it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_workspace_search_reaches_its_six_sources_together() {
+    let watch: std::sync::Arc<Mutex<FanOutWatch>> = Default::default();
+    let rpc = node_that_answers_only_a_full_fan_out(9, &[], watch.clone()).await;
+
+    let results = search_workspace(rpc, "needle".into(), 4)
+        .await
+        .expect("the stub answers every lane");
+
+    assert_eq!(
+        watch.lock().expect("stub watch").overlapped,
+        [
+            "chat", "files", "forge", "pages", "runs", "runs", "tasks", "tasks", "tasks"
+        ],
+        "every round trip a workspace search opens with must be in flight at \
+         once — anything missing here waited on another request's reply. The \
+         repeats are the legs that read more than one thing: tasks walks three \
+         status pages, runs reads pending and recent."
+    );
+    // Every lane answered, so nothing is held back.
+    assert_eq!(results.partial, "");
+    // And the rows land in the order the screen shows them. The tasks lane is
+    // three status pages behind one source, hence the run-length squash.
+    let mut order: Vec<String> = results.hits.iter().map(|hit| hit.kind.clone()).collect();
+    order.dedup();
+    assert_eq!(order, ["page", "code", "file", "task", "run"]);
+    // The page row heads with its PAGE, which is the second wave's whole job —
+    // and the reason `list_pages` is a lane of its own rather than a substring
+    // collision with the search it follows. Served the search's reply instead,
+    // the title lookup fails and every page hit falls back to "Untitled".
+    let page = results
+        .hits
+        .iter()
+        .find(|hit| hit.kind == "page")
+        .expect("the pages lane answered");
+    assert_eq!(page.title, "The needle page");
+}
+
+/// A SOURCE THAT DID NOT ANSWER IS NOT A SOURCE WITH NOTHING TO SAY. All six
+/// legs failed silently — `if let Ok(..)` on two, `return Vec::new()` on the
+/// rest — and the node's per-module cold start runs tens of seconds against a
+/// 30 s client ceiling, so a timeout was the ordinary case, not the exotic one.
+/// A search that reached the node and lost three of its six sources still
+/// rendered a confident count, a full chip strip reading 0 for kinds it never
+/// read, and — when the survivors were empty — "Nothing matched that query in
+/// this workspace". Three lies off one timeout, in the app that spent the night
+/// learning to say nothing rather than something false.
+///
+/// EVERY LEG, NOT THE ONE I FIXED FIRST. The round-2 version refused the forge
+/// lane alone, and reverting the silence report on chat, files or tasks — two
+/// of them the `return Vec::new()` swallowers — kept the suite green. The
+/// defect was class-wide, so the pin walks the class: each source in turn is
+/// the one that does not answer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_search_that_lost_a_source_says_which_one() {
+    /// The six sources, each with the name the screen must call it by and the
+    /// hit kind it contributes. One table: a seventh source added to
+    /// `search_workspace` with no silence report has to be added here to pass,
+    /// and then fails.
+    const SOURCES: [(&str, &str, &str); 6] = [
+        ("chat", "Messages", "message"),
+        ("pages", "Pages", "page"),
+        ("forge", "Code", "code"),
+        ("files", "Files", "file"),
+        ("tasks", "Tasks", "task"),
+        ("runs", "Runs", "run"),
+    ];
+
+    for (leg, label, silent_kind) in SOURCES {
+        let leg_alone: &'static [&'static str] = match leg {
+            "chat" => &["chat"],
+            "pages" => &["pages"],
+            "forge" => &["forge"],
+            "files" => &["files"],
+            "tasks" => &["tasks"],
+            _ => &["runs"],
+        };
+        let rpc = node_that_answers_only_a_full_fan_out(9, leg_alone, Default::default()).await;
+
+        let results = search_workspace(rpc, "needle".into(), 5)
+            .await
+            .expect("the other five sources answered");
+
+        assert_eq!(
+            results.partial,
+            format!("{label} did not answer — these results are incomplete."),
+            "the screen must name the source it did not read"
+        );
+        // The chip strip's contract is "a count of 0 means nothing matched,
+        // never no loader", so the source that never ran keeps no chip at all.
+        let chips: Vec<&str> = results
+            .kinds
+            .iter()
+            .map(|kind| kind.kind.as_str())
+            .collect();
+        let answered: Vec<&str> = SOURCES
+            .iter()
+            .map(|(_, _, kind)| *kind)
+            .filter(|kind| *kind != silent_kind)
+            .collect();
+        assert_eq!(chips, answered, "{label} was refused, so it keeps no chip");
+        // And the answer that did arrive is untouched, in screen order —
+        // degrading the survivors would be the opposite mistake. The chat lane
+        // carries no rows on purpose (see `SEARCH_LANES`); every other source
+        // contributes exactly one.
+        let mut rows: Vec<&str> = results.hits.iter().map(|hit| hit.kind.as_str()).collect();
+        rows.dedup();
+        let carried: Vec<&str> = ["page", "code", "file", "task", "run"]
+            .into_iter()
+            .filter(|kind| *kind != silent_kind)
+            .collect();
+        assert_eq!(
+            rows, carried,
+            "with {label} silent the other sources still land, in screen order"
+        );
+    }
+
+    // CARDINALITY. Every case above refuses exactly ONE source, and a filter
+    // keyed on `silent.first()` instead of `silent.contains(..)` passes all six
+    // — the reviewer changed that one token and the suite stayed green while a
+    // second silent source got a chip reading 0, against the strip's own "a
+    // count of 0 means nothing matched, never no loader". Two at once is the
+    // case the PR body's own headline scenario describes.
+    let rpc =
+        node_that_answers_only_a_full_fan_out(9, &["chat", "pages"], Default::default()).await;
+    let results = search_workspace(rpc, "needle".into(), 5)
+        .await
+        .expect("the other four sources answered");
+    assert_eq!(
+        results.partial, "Messages, Pages did not answer — these results are incomplete.",
+        "both silent sources are named, in screen order"
+    );
+    let chips: Vec<&str> = results
+        .kinds
+        .iter()
+        .map(|kind| kind.kind.as_str())
+        .collect();
+    assert_eq!(
+        chips,
+        ["code", "file", "task", "run"],
+        "NEITHER refused source keeps a chip — not just the first one"
+    );
+}
+
 /// A SEARCH HIT SAYS WHICH ROOM IT IS IN, ONCE. The hit's `meta` was
 /// `#{seq}` — the message's sequence number, rendered exactly like a channel,
 /// because every channel in this app is written `# General`. So a palette row

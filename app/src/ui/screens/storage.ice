@@ -495,7 +495,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
                 changed_by=""
                 changed_height=0
 
-component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading:bool, kinds:[KindCount], kind:str, hits:[ExplorerHit], blocks:[ExplorerBlock], selected:i64, ops:[ExplorerOp])
+component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading:bool, kinds:[KindCount], kind:str, partial:str, hits:[ExplorerHit], blocks:[ExplorerBlock], selected:i64, ops:[ExplorerOp])
   emits
     explorer_search_submit()
     clear_explorer_search()
@@ -607,6 +607,34 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
               h=30.0
               p=7.0
               @outline_action
+      // A PARTIAL ANSWER SAYS SO. Each of the six sources behind a
+      // workspace search fails silently, and the node's per-module cold
+      // start runs tens of seconds against a 30s client ceiling — so a
+      // search that reached the node and timed out on three of them used
+      // to render the survivors as the whole truth: a confident count, a
+      // full chip strip reading 0 for what was never read, and "Nothing
+      // matched that query in this workspace" when the survivors were
+      // empty. This line names what went unanswered; the strip below
+      // drops those kinds rather than count them, and the empty plate
+      // stands down.
+      if connected && !empty(partial)
+        box w=fill max-w=860.0
+          box #explorer-partial
+            with
+              w=fill
+              pl=12.0
+              pr=12.0
+              pt=8.0
+              pb=8.0
+              bg=warning_bg
+              border=warning_line
+              border-w=1.0
+              r=9.0
+            text partial
+              with
+                w=fill
+                size=12.0
+                @text-warning
       // THE KIND STRIP. Drawn FROM the reply, never from a fixed list
       // of labels: every chip here names a kind `search_workspace`
       // genuinely ran, so a count of 0 means "nothing matched", never
@@ -687,8 +715,11 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
         for kind_count in kinds
           if kind == kind_count.kind && kind_count.count <= 0
             EmptyPlate message="Nothing of that kind matched — the other chips still hold results."
-      if connected && empty(hits) && !searching && !empty(trim(query))
-        EmptyPlate message="Nothing matched that query in this workspace."
+      // "Nothing matched" is a claim about the WORKSPACE, and only the sources
+      // that answered can support it. With `partial` standing, the banner above
+      // already says why the screen is empty.
+      if connected && empty(hits) && !searching && !empty(trim(query)) && empty(partial)
+        EmptyPlate message="Nothing matched that query in this workspace." #explorer-nothing-matched
       // NOT CONNECTED IS NOT EMPTY. `connected` already disables the query box
       // above; the ledger below it still asserted "No blocks yet" off a node
       // that answered nothing. The head and the query box stay.

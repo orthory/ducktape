@@ -265,7 +265,7 @@ extern crate::backend
   load_explorer(rpc:str, generation:i64) -> ExplorerData ! HydrationError
   ExplorerHit(kind:str, code:str, title:str, snippet:str, meta:str, target:str)
   KindCount(kind:str, label:str, count:i64)
-  ExplorerResults(generation:i64, hits:[ExplorerHit], kinds:[KindCount])
+  ExplorerResults(generation:i64, hits:[ExplorerHit], kinds:[KindCount], partial:str)
   search_workspace(rpc:str, text:str, generation:i64) -> ExplorerResults ! HydrationError
   sync doc_tabs_with(tabs:[str], page_id:str) -> [str]
   sync doc_tabs_without(tabs:[str], page_id:str) -> [str]
