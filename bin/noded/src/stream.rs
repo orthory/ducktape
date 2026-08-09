@@ -1513,6 +1513,32 @@ const FILES_WATCH_TOPIC: &str = "files:watch";
 const LOGS_TOPIC: &str = "logs";
 /// the metrics-exposition snapshot topic.
 const METRICS_TOPIC: &str = "metrics";
+/// How recently a snapshot topic must have sampled for the next wakeup to be
+/// a no-op.
+///
+/// A subscriber used to be sampled TWICE within milliseconds: the subscribe's
+/// `Wake::All`, and then the heartbeat's first tick, which fires at once
+/// (`tokio::time::interval`, unlike `index_backstop`'s `interval_at`). For
+/// `peers` that is two whole-registry encodes — 485 KB and ~10 ms each — for
+/// one subscribe, the second carrying nothing the first did not.
+///
+/// HALF THE BEAT, and both bounds are load-bearing.
+///
+/// The lower bound is the subscribe-to-first-tick gap, which is milliseconds.
+///
+/// The upper bound is COMPOSE LATENCY, and it is the subtler of the two. The
+/// stamp is written AFTER the document is built, so every sample lands L ms
+/// past the tick that asked for it, and every following tick is therefore only
+/// `interval - L` old. A window at or above `interval - L` treats that as too
+/// soon, skips, and the topic delivers every OTHER beat — permanently, not as
+/// a phase artefact that corrects itself. Measured L on an idle single-node
+/// daemon is ~40 ms, so a 1500 ms window leaves the whole of the rest of the
+/// beat as margin; L would have to reach 1.5 s to halve the cadence.
+///
+/// L grows with the registry, which is why the bound is pinned by a test
+/// rather than left to the constant looking obviously small.
+const SNAPSHOT_MIN_INTERVAL_MS: u64 = HEARTBEAT_INTERVAL_MS / 2;
+
 /// the direct-peer snapshot topic — the same sample `GET /v1/peers` composes.
 const PEERS_TOPIC: &str = "peers";
 /// the node-status snapshot topic — the same projection `GET /v1/status` serves.
@@ -2308,6 +2334,30 @@ fn catch_up_term_command(
     CatchUpResult::keep(frames)
 }
 
+/// Whether a snapshot topic sampled too recently to be worth re-composing.
+///
+/// `sampled_ms` starts at 0, so a topic's FIRST catch-up always composes —
+/// which is what makes the subscribe replay the one that survives, and the
+/// immediate tick behind it the one that folds away.
+///
+/// `checked_sub`, NOT `saturating_sub`. The beat is monotonic
+/// (`tokio::time::interval`) and this stamp is wall clock (`unix_millis`), so
+/// the two can diverge: an ntp step backwards, a VM resumed from a snapshot, a
+/// container syncing a drifted RTC. Saturating turns every such reading into
+/// `0`, which reads as FRESH — and both overview topics would then compose
+/// nothing for the length of the jump, behind heartbeat frames that keep the
+/// socket looking perfectly healthy. A stamp from the future is instead read
+/// as stale: the topic composes once and re-anchors to the new clock.
+///
+/// This mattered less before the debounce, when `sampled_ms` was cursor
+/// bookkeeping and a wrong label was cosmetic. Making it a delivery decision
+/// is what put a clock skew on the path.
+fn snapshot_is_fresh(sampled_ms: u64, now_ms: u64) -> bool {
+    now_ms
+        .checked_sub(sampled_ms)
+        .is_some_and(|age_ms| age_ms < SNAPSHOT_MIN_INTERVAL_MS)
+}
+
 /// re-sample the node's OpenMetrics exposition through the SAME wired source
 /// GET /metrics reads (the handle's status cell), so the stream needs no
 /// second registry encoder — and no actor round-trip. one Tail frame per
@@ -2321,6 +2371,12 @@ async fn catch_up_metrics(
     let TopicState::Metrics { sampled_ms } = state else {
         return CatchUpResult::keep(Vec::new());
     };
+    // ONE reading, used by the guard and by the stamp below: two calls would
+    // decide freshness against one clock and record another.
+    let now_ms = unix_millis();
+    if snapshot_is_fresh(*sampled_ms, now_ms) {
+        return CatchUpResult::keep(Vec::new());
+    }
     let Some(text) = handle.status_cell().exposition() else {
         return CatchUpResult::drop(vec![unavailable(
             topic,
@@ -2330,7 +2386,7 @@ async fn catch_up_metrics(
     handle
         .stream_hub()
         .note_snapshot_sample(crate::metrics::SnapshotTopic::Metrics);
-    let time_ms = unix_millis();
+    let time_ms = now_ms;
     *sampled_ms = time_ms;
     CatchUpResult::keep(vec![ServerFrame::Tail {
         topic: topic.to_string(),
@@ -2353,6 +2409,12 @@ async fn catch_up_peers(topic: &str, state: &mut TopicState, handle: &NodeHandle
     let TopicState::Peers { sampled_ms } = state else {
         return CatchUpResult::keep(Vec::new());
     };
+    // ONE reading, used by the guard and by the stamp below: two calls would
+    // decide freshness against one clock and record another.
+    let now_ms = unix_millis();
+    if snapshot_is_fresh(*sampled_ms, now_ms) {
+        return CatchUpResult::keep(Vec::new());
+    }
     let cell = handle.status_cell();
     let Some(exposition) = cell.exposition() else {
         return CatchUpResult::drop(vec![unavailable(
@@ -2366,7 +2428,7 @@ async fn catch_up_peers(topic: &str, state: &mut TopicState, handle: &NodeHandle
         .stream_hub()
         .note_snapshot_sample(crate::metrics::SnapshotTopic::Peers);
     let standing = cell.peers_standing();
-    let time_ms = unix_millis();
+    let time_ms = now_ms;
     *sampled_ms = time_ms;
     let peers =
         crate::peers::peers_from_exposition(&exposition, time_ms, standing.height, standing.epoch)
@@ -2392,10 +2454,16 @@ async fn catch_up_status(
     let TopicState::Status { sampled_ms } = state else {
         return CatchUpResult::keep(Vec::new());
     };
+    // ONE reading, used by the guard and by the stamp below: two calls would
+    // decide freshness against one clock and record another.
+    let now_ms = unix_millis();
+    if snapshot_is_fresh(*sampled_ms, now_ms) {
+        return CatchUpResult::keep(Vec::new());
+    }
     handle
         .stream_hub()
         .note_snapshot_sample(crate::metrics::SnapshotTopic::Status);
-    let time_ms = unix_millis();
+    let time_ms = now_ms;
     *sampled_ms = time_ms;
     let status = Box::new(handle.status_cell().current());
     CatchUpResult::keep(vec![ServerFrame::Tail {
@@ -3535,6 +3603,54 @@ mod tests {
             }
             other => panic!("expected one peers tail frame, got {other:?}"),
         }
+    }
+
+    /// THE DEBOUNCE MUST NEVER SWALLOW A STEADY BEAT.
+    ///
+    /// The window has two bounds and only one of them is obvious. Too small and
+    /// the subscribe's immediate follow-on tick composes the registry a second
+    /// time. Too LARGE and the cadence eats itself — and that failure is
+    /// invisible to every frame-counting test, because the samples stay 1:1
+    /// with the frames delivered; only their RATE halves. Widening this
+    /// constant to a full interval leaves the e2e green and merely slower,
+    /// which is how it would ship.
+    ///
+    /// STEADY is the word that matters. A subscribe landing more than a window
+    /// into a period does skip the tick right behind it, so its first gap is
+    /// up to `interval + window` before it re-aligns and stays on the beat.
+    /// That is bought deliberately and no constant avoids it — the two demands
+    /// meet only at a window of zero. Do not read this test as forbidding
+    /// every skip.
+    #[test]
+    fn the_debounce_window_never_swallows_a_steady_beat() {
+        // the tick riding milliseconds behind the subscribe replay folds away.
+        assert!(snapshot_is_fresh(0, 40));
+
+        // THE ONE THAT PINS THE UPPER BOUND. A subscribe lands part-way INTO a
+        // heartbeat period, so the next beat arrives that much short of a full
+        // interval after it. Treat that as too soon and the topic delivers
+        // every OTHER beat, forever.
+        let landed_into_the_period = 40;
+        assert!(
+            !snapshot_is_fresh(landed_into_the_period, HEARTBEAT_INTERVAL_MS),
+            "a beat arriving {}ms after the last sample must compose; a window \
+             that swallows it halves the topic's cadence",
+            HEARTBEAT_INTERVAL_MS - landed_into_the_period
+        );
+
+        // and the steady case, from any phase.
+        assert!(!snapshot_is_fresh(0, HEARTBEAT_INTERVAL_MS));
+
+        // A STAMP FROM THE FUTURE IS STALE, NOT FRESH. The beat is monotonic
+        // and this stamp is wall clock, so an ntp step backwards makes `now`
+        // precede the last sample. Saturating arithmetic reads that as age
+        // zero — freshest possible — and both overview topics would compose
+        // nothing for the length of the jump while heartbeats kept the socket
+        // looking healthy.
+        assert!(
+            !snapshot_is_fresh(5_000, 4_000),
+            "a backwards clock step must not read as fresh"
+        );
     }
 
     /// An unwired exposition drops the topic rather than serving an empty peer
