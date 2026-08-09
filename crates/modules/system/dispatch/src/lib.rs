@@ -39,13 +39,6 @@
 //! transition, leaving a fixed-size receipt. state then grows with the number
 //! of dispatches, not with the size of their results.
 //!
-//! the drop happens inside `execute`, not at the block boundary: the native
-//! module merges its staged overlay at `commit_block` while the wasm shell
-//! calls the inner `commit_block` once per OP, so a boundary hook that reads
-//! the whole committed map would decide differently under the two — and both
-//! run as chain participants (`bin/noded` and `bin/simnode` construct the
-//! native module, `bin/node` loads the component).
-//!
 //! ## self-containment
 //!
 //! this module imports no app module and no app interface. its collaborators
@@ -1003,8 +996,13 @@ mod tests {
         commit(m);
         dispatch_key("caller", "d1")
     }
-    fn callback_for(m: &mut DispatchModule, key: &str, outcome: SagaOutcome) -> Result<(), Error> {
-        let mut ctx = mk_ctx(9, Origin::Module("saga".into()));
+    fn callback_for(
+        m: &mut DispatchModule,
+        at: u64,
+        key: &str,
+        outcome: SagaOutcome,
+    ) -> Result<(), Error> {
+        let mut ctx = mk_ctx(at, Origin::Module("saga".into()));
         let msg = Msg {
             target: "dispatch".into(),
             payload: encode_callback(&SagaCallback {
@@ -1296,7 +1294,13 @@ mod tests {
         // Json contract, JSON result: Ok flows to the mailbox.
         let mut m = module();
         let key = registered_and_dispatched(&mut m, OutputContract::Json);
-        callback_for(&mut m, &key, SagaOutcome::Done(br#"{"ok":true}"#.to_vec())).unwrap();
+        callback_for(
+            &mut m,
+            9,
+            &key,
+            SagaOutcome::Done(br#"{"ok":true}"#.to_vec()),
+        )
+        .unwrap();
         commit(&mut m);
         let view = get_dispatch(&m, &key).unwrap();
         assert_eq!(view.status, DispatchStatus::AwaitingDelivery);
@@ -1306,7 +1310,7 @@ mod tests {
         // Json contract, non-JSON result: the VIOLATION is the outcome.
         let mut m = module();
         let key = registered_and_dispatched(&mut m, OutputContract::Json);
-        callback_for(&mut m, &key, SagaOutcome::Done(b"not json".to_vec())).unwrap();
+        callback_for(&mut m, 9, &key, SagaOutcome::Done(b"not json".to_vec())).unwrap();
         commit(&mut m);
         let view = get_dispatch(&m, &key).unwrap();
         match view.outcome {
@@ -1318,7 +1322,7 @@ mod tests {
         // saga failure maps to the Err outcome verbatim.
         let mut m = module();
         let key = registered_and_dispatched(&mut m, OutputContract::Text);
-        callback_for(&mut m, &key, SagaOutcome::Failed("provider died".into())).unwrap();
+        callback_for(&mut m, 9, &key, SagaOutcome::Failed("provider died".into())).unwrap();
         commit(&mut m);
         assert_eq!(
             get_dispatch(&m, &key).unwrap().outcome,
@@ -1329,7 +1333,13 @@ mod tests {
         let mut m = module();
         let key = registered_and_dispatched(&mut m, OutputContract::Text);
         let before = m.root();
-        callback_for(&mut m, "caller\x1fnope", SagaOutcome::Done(b"x".to_vec())).unwrap();
+        callback_for(
+            &mut m,
+            9,
+            "caller\x1fnope",
+            SagaOutcome::Done(b"x".to_vec()),
+        )
+        .unwrap();
         let mut ctx = mk_ctx(0, Origin::Module("saga".into()));
         let msg = Msg {
             target: "dispatch".into(),
@@ -1371,6 +1381,7 @@ mod tests {
             let key = dispatch_key(receiver, &format!("d{i:03}"));
             callback_for(
                 &mut m,
+                9,
                 &key,
                 SagaOutcome::Done(format!("r{i}").into_bytes()),
             )
@@ -1417,7 +1428,7 @@ mod tests {
     fn snapshot_round_trips_and_rejects_wrong_roots() {
         let mut m = module();
         let key = registered_and_dispatched(&mut m, OutputContract::Json);
-        callback_for(&mut m, &key, SagaOutcome::Done(br#"[1,2]"#.to_vec())).unwrap();
+        callback_for(&mut m, 9, &key, SagaOutcome::Done(br#"[1,2]"#.to_vec())).unwrap();
         commit(&mut m);
 
         let snap = m.snapshot();
@@ -1526,7 +1537,7 @@ mod tests {
 
         // once the Cancelled callback lands, the result flows the NORMAL
         // path (Err in the mailbox) and a repeat cancel is a no-op.
-        callback_for(&mut m, &key, SagaOutcome::Cancelled).unwrap();
+        callback_for(&mut m, 9, &key, SagaOutcome::Cancelled).unwrap();
         commit(&mut m);
         assert_eq!(pending_deliveries(&m), 1);
         let mut ctx = mk_ctx(0, Origin::Module("caller".into()));
@@ -1615,7 +1626,7 @@ mod tests {
 
     /// drive one dispatch all the way from `Dispatch` to `Delivered`, one
     /// block per transition, with an `outcome_bytes`-sized result.
-    fn full_round(m: &mut DispatchModule, i: usize, outcome_bytes: usize) -> String {
+    fn full_round(m: &mut DispatchModule, i: usize, outcome_bytes: usize) {
         let height = (i as u64 + 1) * 4;
         let dispatch_id = format!("d{i:04}");
         let key = dispatch_key("caller", &dispatch_id);
@@ -1624,22 +1635,18 @@ mod tests {
         exec(m, &mut ctx, &dispatch_op(&dispatch_id, b"input")).unwrap();
         commit(m);
 
-        let mut ctx = mk_ctx(height + 1, Origin::Module("saga".into()));
-        let callback = Msg {
-            target: "dispatch".into(),
-            payload: encode_callback(&SagaCallback {
-                saga_id: saga_id_for(&key),
-                payload: key.clone().into_bytes(),
-                outcome: SagaOutcome::Done(vec![b'x'; outcome_bytes]),
-            }),
-        };
-        block_on(m.execute(&mut ctx, &callback)).unwrap();
+        callback_for(
+            m,
+            height + 1,
+            &key,
+            SagaOutcome::Done(vec![b'x'; outcome_bytes]),
+        )
+        .unwrap();
         commit(m);
 
         let mut ctx = mk_ctx(height + 2, Origin::System);
         exec(m, &mut ctx, &DispatchMsg::DeliverPending {}).unwrap();
         commit(m);
-        key
     }
 
     #[test]
@@ -1660,7 +1667,7 @@ mod tests {
         let mut ctx = mk_ctx(4, Origin::Module("caller".into()));
         exec(&mut m, &mut ctx, &dispatch_op("d0000", b"input")).unwrap();
         commit(&mut m);
-        callback_for(&mut m, &key, SagaOutcome::Done(b"result".to_vec())).unwrap();
+        callback_for(&mut m, 9, &key, SagaOutcome::Done(b"result".to_vec())).unwrap();
         commit(&mut m);
         assert_eq!(
             get_dispatch(&m, &key).unwrap().outcome,

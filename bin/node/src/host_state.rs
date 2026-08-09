@@ -1352,9 +1352,6 @@ mod tests {
     /// at block zero, pinned so that moving it is a decision instead of an
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
-    /// Last moved by the dispatch/saga retention change: both guests were
-    /// rebuilt, and `seeded_lifecycle` commits `sha256(component.wasm)` per
-    /// wasm tenant, so their code digests ARE this hash's preimage.
     const GENESIS_ROOT_HASH: &str =
         "7409864359c0e09e86227f2fb1d6d96d84c087eb41af65080c927f8967361e84";
 

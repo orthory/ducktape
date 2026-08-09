@@ -96,7 +96,7 @@ pub mod index;
 #[cfg(feature = "index-guest")]
 mod index_guest;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use capability::{
     CapabilityQuery, CapabilityReply, decode_reply as capability_decode_reply,
@@ -555,22 +555,11 @@ impl SagaModule {
         visible
     }
 
-    /// which terminal sagas this op must evict — [`terminal_evictions`] over
-    /// the visible map.
-    fn terminal_evictions(&self) -> Vec<String> {
-        terminal_evictions(&self.visible())
-    }
-
     /// every saga id visible this dispatch — committed plus staged, sorted —
-    /// the deterministic iteration domain for `Crank`.
+    /// the deterministic iteration domain for `Crank`. staged REMOVALS are
+    /// applied, so every id it yields is one `get` answers.
     fn visible_ids(&self) -> Vec<String> {
-        self.pending
-            .keys()
-            .chain(self.sagas.keys())
-            .cloned()
-            .collect::<BTreeSet<String>>()
-            .into_iter()
-            .collect()
+        self.visible().into_keys().map(str::to_string).collect()
     }
 
     /// project a saga to its wire view.
@@ -817,135 +806,7 @@ impl SagaModule {
         self.pending.clear();
         Ok(())
     }
-}
 
-#[async_trait::async_trait(?Send)]
-impl Module for SagaModule {
-    fn id(&self) -> ModuleId {
-        self.id.clone()
-    }
-
-    /// state-based commitment: sha256 over the canonical committed encoding —
-    /// a length-prefixed fold of every saga field in sorted-id order.
-    /// insertion-order-independent and idempotent — and sensitive to every
-    /// field, so any transition (status, attempt, lease, result) yields a
-    /// distinct root. the preimage IS the snapshot encoding (see
-    /// [`SagaModule::snapshot`]).
-    fn root(&self) -> StateRoot {
-        committed_root(&self.sagas)
-    }
-
-    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
-        Some(self.snapshot())
-    }
-
-    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        self.handle(ctx, msg).await?;
-        // bounded retention, staged like every other write this op makes —
-        // NOT at the block boundary. the native module merges its overlay in
-        // `commit_block` while the wasm shell calls the inner `commit_block`
-        // once per OP, so a boundary hook reading the whole committed map
-        // would evict at a different point under the two, and both run as
-        // chain participants (`bin/noded`/`bin/simnode` build the native
-        // module, `bin/node` loads the component). staging the removals here
-        // puts them in the same read-your-writes overlay every later op in
-        // the block already sees — identical state either way.
-        for saga_id in self.terminal_evictions() {
-            self.stage_remove(saga_id);
-        }
-        Ok(())
-    }
-
-    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match decode_query(req).map_err(Error::Module)? {
-            SagaQuery::Get { saga_id } => Ok(encode_reply(&SagaReply::Saga(
-                self.get(&saga_id).map(Self::view),
-            ))),
-            SagaQuery::NextExpiry => {
-                // the crank pump's read: the earliest lease-expiry or
-                // deadline over PENDING sagas — once the current view reaches
-                // it, a Crank is guaranteed to transition something.
-                let next = self
-                    .visible_ids()
-                    .into_iter()
-                    .filter_map(|id| self.get(&id))
-                    .filter(|saga| !saga.status.is_terminal())
-                    .flat_map(|saga| [saga.lease_expires_at, saga.deadline])
-                    .flatten()
-                    .min();
-                Ok(encode_reply(&SagaReply::NextExpiry(next)))
-            }
-            SagaQuery::AssignedPending { assignee } => {
-                // the resident worker pump's read: reconstruct exactly the
-                // WorkerRequest the effect lane carried for every pending
-                // attempt leased to `assignee`. a node that installs synced
-                // boundaries (and so never observes effects) discovers its
-                // own assigned work here; visible_ids is sorted, so the
-                // projection is deterministic.
-                let requests = self
-                    .visible_ids()
-                    .into_iter()
-                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
-                    .filter(|(_, saga)| {
-                        !saga.status.is_terminal()
-                            && saga.assignee.as_deref() == Some(assignee.as_slice())
-                    })
-                    .map(|(id, saga)| WorkerRequest {
-                        saga_id: id,
-                        attempt: saga.attempt,
-                        spec: saga.spec.clone(),
-                        deadline: saga.deadline,
-                        assignee: saga.assignee.clone(),
-                    })
-                    .collect();
-                Ok(encode_reply(&SagaReply::AssignedPending(requests)))
-            }
-            SagaQuery::UnassignedPending => {
-                // the claim lane's read: the announcement requests, which no
-                // node holds a lease on yet. Same projection shape as
-                // `AssignedPending` (and the same `visible_ids` ordering, so
-                // it is deterministic) — only the assignee predicate differs,
-                // and `assignee` rides through as `None` so the worker gate
-                // sees exactly the announcement the effect lane carried.
-                let requests = self
-                    .visible_ids()
-                    .into_iter()
-                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
-                    .filter(|(_, saga)| !saga.status.is_terminal() && saga.assignee.is_none())
-                    .map(|(id, saga)| WorkerRequest {
-                        saga_id: id,
-                        attempt: saga.attempt,
-                        spec: saga.spec.clone(),
-                        deadline: saga.deadline,
-                        assignee: None,
-                    })
-                    .collect();
-                Ok(encode_reply(&SagaReply::UnassignedPending(requests)))
-            }
-        }
-    }
-
-    async fn commit_block(&mut self) -> Result<(), Error> {
-        for (id, staged) in std::mem::take(&mut self.pending) {
-            match staged {
-                Some(saga) => {
-                    self.sagas.insert(id, saga);
-                }
-                None => {
-                    self.sagas.remove(&id);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending.clear();
-        Ok(())
-    }
-}
-
-impl SagaModule {
     /// the op handler — one arm per [`SagaMsg`] variant. every write it makes
     /// is STAGED; `execute` wraps it with the retention trim.
     async fn handle(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -1362,6 +1223,127 @@ impl SagaModule {
     }
 }
 
+#[async_trait::async_trait(?Send)]
+impl Module for SagaModule {
+    fn id(&self) -> ModuleId {
+        self.id.clone()
+    }
+
+    /// state-based commitment: sha256 over the canonical committed encoding —
+    /// a length-prefixed fold of every saga field in sorted-id order.
+    /// insertion-order-independent and idempotent — and sensitive to every
+    /// field, so any transition (status, attempt, lease, result) yields a
+    /// distinct root. the preimage IS the snapshot encoding (see
+    /// [`SagaModule::snapshot`]).
+    fn root(&self) -> StateRoot {
+        committed_root(&self.sagas)
+    }
+
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
+    }
+
+    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        self.handle(ctx, msg).await?;
+        // bounded retention, STAGED like every other write this op makes —
+        // never deferred to the block boundary (see the crate header, `## GC`,
+        // for why the two runtimes would disagree if it were).
+        let evictions = terminal_evictions(&self.visible());
+        for saga_id in evictions {
+            self.stage_remove(saga_id);
+        }
+        Ok(())
+    }
+
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        match decode_query(req).map_err(Error::Module)? {
+            SagaQuery::Get { saga_id } => Ok(encode_reply(&SagaReply::Saga(
+                self.get(&saga_id).map(Self::view),
+            ))),
+            SagaQuery::NextExpiry => {
+                // the crank pump's read: the earliest lease-expiry or
+                // deadline over PENDING sagas — once the current view reaches
+                // it, a Crank is guaranteed to transition something.
+                let next = self
+                    .visible_ids()
+                    .into_iter()
+                    .filter_map(|id| self.get(&id))
+                    .filter(|saga| !saga.status.is_terminal())
+                    .flat_map(|saga| [saga.lease_expires_at, saga.deadline])
+                    .flatten()
+                    .min();
+                Ok(encode_reply(&SagaReply::NextExpiry(next)))
+            }
+            SagaQuery::AssignedPending { assignee } => {
+                // the resident worker pump's read: reconstruct exactly the
+                // WorkerRequest the effect lane carried for every pending
+                // attempt leased to `assignee`. a node that installs synced
+                // boundaries (and so never observes effects) discovers its
+                // own assigned work here; visible_ids is sorted, so the
+                // projection is deterministic.
+                let requests = self
+                    .visible_ids()
+                    .into_iter()
+                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
+                    .filter(|(_, saga)| {
+                        !saga.status.is_terminal()
+                            && saga.assignee.as_deref() == Some(assignee.as_slice())
+                    })
+                    .map(|(id, saga)| WorkerRequest {
+                        saga_id: id,
+                        attempt: saga.attempt,
+                        spec: saga.spec.clone(),
+                        deadline: saga.deadline,
+                        assignee: saga.assignee.clone(),
+                    })
+                    .collect();
+                Ok(encode_reply(&SagaReply::AssignedPending(requests)))
+            }
+            SagaQuery::UnassignedPending => {
+                // the claim lane's read: the announcement requests, which no
+                // node holds a lease on yet. Same projection shape as
+                // `AssignedPending` (and the same `visible_ids` ordering, so
+                // it is deterministic) — only the assignee predicate differs,
+                // and `assignee` rides through as `None` so the worker gate
+                // sees exactly the announcement the effect lane carried.
+                let requests = self
+                    .visible_ids()
+                    .into_iter()
+                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
+                    .filter(|(_, saga)| !saga.status.is_terminal() && saga.assignee.is_none())
+                    .map(|(id, saga)| WorkerRequest {
+                        saga_id: id,
+                        attempt: saga.attempt,
+                        spec: saga.spec.clone(),
+                        deadline: saga.deadline,
+                        assignee: None,
+                    })
+                    .collect();
+                Ok(encode_reply(&SagaReply::UnassignedPending(requests)))
+            }
+        }
+    }
+
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        for (id, staged) in std::mem::take(&mut self.pending) {
+            match staged {
+                Some(saga) => {
+                    self.sagas.insert(id, saga);
+                }
+                None => {
+                    self.sagas.remove(&id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.pending.clear();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1371,6 +1353,7 @@ mod tests {
     };
     use futures::executor::block_on;
     use sdk::{Env, Event};
+    use std::collections::BTreeSet;
 
     /// a minimal `Ctx` that captures emitted msgs/effects and serves a canned
     /// valset — enough to unit-test `execute` in isolation (the host provides
@@ -3862,7 +3845,7 @@ mod tests {
     #[test]
     fn sustained_saga_traffic_keeps_the_committed_ledger_bounded() {
         // the growth-bound pin: three capfuls of sagas triggered and settled,
-        // one per block. without the boundary trim this ledger is 1:1 with
+        // one per block. without the per-op trim this ledger is 1:1 with
         // every saga ever triggered — the state-growth cliff.
         let mut m = SagaModule::new("saga");
 
