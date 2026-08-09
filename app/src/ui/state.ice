@@ -383,6 +383,7 @@ state
   // already-rendered `node_view_label` / `node_quorum_label` /
   // `node_reachable_label`, because /v1/status reports each as optional and an
   // absent reading must print `—`, never a measured `0`.
+  //
   // THE SENTINEL, like `node_height` below — before a load lands the node has
   // published neither, and `h 0` is a measurement. Left at zero these printed
   // `CHECKPOINT h 0` directly above `HEIGHT h —`, which is the same

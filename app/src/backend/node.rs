@@ -212,32 +212,6 @@ pub fn split_log_line(line: String) -> LogParts {
     }
 }
 
-/// A DEFAULT IS A DOCUMENT NO NODE HAS PUBLISHED, so its three numbers are
-/// [`UNMEASURED`] and not zero.
-///
-/// `derive(Default)` gave them `0`, which is the one value this whole file
-/// exists to keep off the screen: `height_label(0)` renders `h 0` and
-/// `relative_time(0)` renders nothing, so a defaulted document prints a
-/// measured head and a measured checkpoint for a node that has served neither.
-/// It was inert where it was introduced — the only arm that reaches it is one
-/// `keep_i64` discards — which is exactly why it needed writing down rather
-/// than leaving as a loaded gun on a public struct.
-impl Default for NodeFacts {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            version: String::new(),
-            root_hash: String::new(),
-            view: None,
-            quorum: None,
-            reachable_validators: None,
-            last_finalized_at: UNMEASURED,
-            checkpoint_height: UNMEASURED,
-            height: UNMEASURED,
-        }
-    }
-}
-
 /// The node's consensus/storage facts — everything `/v1/status` publishes that
 /// the two-field `Status` type drops, plus the mesh sample's live/total.
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -269,13 +243,42 @@ pub struct NodeFacts {
     pub height: i64,
 }
 
+/// A DEFAULT IS A DOCUMENT NO NODE HAS PUBLISHED, so its three numbers are
+/// [`UNMEASURED`] and not zero.
+///
+/// `derive(Default)` gave them `0`, which is the one value this whole file
+/// exists to keep off the screen: `height_label(0)` renders `h 0` and
+/// `relative_time(0)` renders nothing, so a defaulted document prints a
+/// measured head and a measured checkpoint for a node that has served neither.
+/// It is inert today: both arms of `overview_from` construct a default (the
+/// struct literal is evaluated before the status arm overwrites `facts`), but
+/// only the peers frame's copy survives, and every one of the six `keep_i64` /
+/// `keep_str` guards in `node_overview_sample` discards it on
+/// `facts_answered == false`. Inert is not the same as right, which is why the
+/// invariant is written here rather than left loaded on a public struct.
+impl Default for NodeFacts {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            version: String::new(),
+            root_hash: String::new(),
+            view: None,
+            quorum: None,
+            reachable_validators: None,
+            last_finalized_at: UNMEASURED,
+            checkpoint_height: UNMEASURED,
+            height: UNMEASURED,
+        }
+    }
+}
+
 /// Load the node facts from the raw status document.
 /// A section the node omits for its role stays `None` — the status projection
 /// leaves it out rather than filling it with misleading numbers, and so do we.
 /// The facts a `/v1/status` document carries — the ONE reader, shared by the
 /// HTTP load and the pushed `status` snapshot, for the same reason
 /// [`peer_rows`] is shared.
-fn node_facts(status: &serde_json::Value, generation: i64) -> NodeFacts {
+pub(crate) fn node_facts(status: &serde_json::Value, generation: i64) -> NodeFacts {
     let operations = &status["operations"];
     let consensus = &operations["consensus"];
     NodeFacts {
