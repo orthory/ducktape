@@ -8,7 +8,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::chat::index::{ChatViewQuery, ChatViewReply, MsgRow};
-use ::chat::{ChatMsg, ChatQuery, ChatReply, PostPolicy};
+// No `ChatQuery`/`ChatReply` here on purpose: every chat read in this app goes
+// through `/v1/index/chat/view`, off the node's select loop. A dispatch query
+// import reappearing is the signal that one crawled back onto it.
+use ::chat::{ChatMsg, PostPolicy};
 use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
 use iced::futures::StreamExt as _;
 use pages::index::{PageRow, PagesViewQuery, PagesViewReply, ThreadRow};
@@ -247,20 +250,6 @@ pub struct BlockCommentData {
     pub comments: Vec<PageComment>,
     pub next_from: i64,
     pub has_more: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct BlockCommentsRefreshData {
-    pub generation: i64,
-    pub target: String,
-    pub threads: Vec<PageCommentThread>,
-    pub total: i64,
-    pub threads_next_from: i64,
-    pub threads_has_more: bool,
-    pub thread_id: String,
-    pub comments: Vec<PageComment>,
-    pub comments_next_from: i64,
-    pub comments_has_more: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]

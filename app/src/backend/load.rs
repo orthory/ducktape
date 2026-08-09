@@ -563,42 +563,6 @@ fn thread_page_bound(total: u64, through_reply_offset: u64) -> (u64, bool) {
     }
 }
 
-pub(crate) async fn query_block_threads(
-    rpc: &RpcClient,
-    target: &str,
-    from: u32,
-    generation: i64,
-) -> Result<BlockThreadListData, String> {
-    let reply: PagesViewReply = rpc
-        .view(
-            "pages",
-            &PagesViewQuery::ThreadsForTargets {
-                targets: vec![target.to_string()],
-            },
-        )
-        .await?;
-    let PagesViewReply::Threads(groups) = reply else {
-        return Err("node returned an invalid comment thread page".into());
-    };
-    // threads-per-target is consensus-capped, so the whole list arrives in one
-    // grouped reply — there is no offset paging to resume.
-    let threads = groups
-        .into_iter()
-        .find(|group| group.target == target)
-        .map(|group| group.threads)
-        .unwrap_or_default();
-    let total = count_i64(threads.len());
-    Ok(BlockThreadListData {
-        generation,
-        target: target.to_string(),
-        from: i64::from(from),
-        threads: threads.into_iter().map(page_comment_thread).collect(),
-        total,
-        next_from: 0,
-        has_more: false,
-    })
-}
-
 pub(crate) async fn query_block_comment_page(
     rpc: &RpcClient,
     target: &str,

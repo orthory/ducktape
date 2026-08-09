@@ -591,9 +591,12 @@ fn forge_depth_rides_the_established_seams() {
     ));
 
     // committed forge ops refresh scoped slices through the handler's one
-    // terminal parallel — no polling, no per-op full reloads.
+    // terminal parallel — no polling, no per-op full reloads. The repo LIST
+    // is the one slice with no open-scope of its own, so it carries the forge
+    // surface's own gate: a chain op must not walk every repo's git mirror for
+    // a list that is not on screen.
     assert!(lifecycle.contains(
-        "run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, forge_generation)"
+        "run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == \"forge\"), forge_generation)"
     ));
     assert_no_polling(&lifecycle);
 

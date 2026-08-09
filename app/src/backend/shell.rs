@@ -195,6 +195,32 @@ pub fn shell_nav(tab: String, approvals: i64, agent_live: bool) -> Vec<NavItem> 
     .collect()
 }
 
+/// Does the pane `tab` mounts actually read `plane`'s rows?
+///
+/// THE TAB-SWITCH GATE. Every tab move used to refetch members, governance,
+/// agents and account — four `/v1/query` round trips per click, on the way into
+/// panes that render none of them. The refetch is not what keeps those planes
+/// fresh either: `plane_live_hit` already refetches each one when ITS module
+/// commits (`live.rs`), which is both cheaper and earlier. So a tab move only
+/// needs the plane its destination screen is about to draw.
+///
+/// The titlebar chips (tier, approvals, agent dot, account name) read all four
+/// from state, and state is what the connect load and the live-plane lane fill
+/// — no chip depends on a tab click.
+pub fn tab_reads_plane(tab: String, plane: String) -> bool {
+    let tabs: &[&str] = match plane.as_str() {
+        // the tier badge, the admin gate and the forge write gate all read the
+        // roster, so four panes draw it.
+        "members" => &["members", "governance", "forge", "settings"],
+        "governance" => &["governance"],
+        "agents" => &["agents"],
+        // Settings draws the account card; Forge draws the org "about".
+        "account" => &["settings", "forge"],
+        _ => &[],
+    };
+    tabs.contains(&tab.as_str())
+}
+
 /// The demo registry, when this machine has one (`ops/demo-seed.sh` is its
 /// only writer). Read per call, not cached: the launch window switches
 /// networks in-process, so no registry reading may outlive a boot.

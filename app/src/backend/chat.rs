@@ -674,25 +674,6 @@ pub async fn load_page(rpc: String, page_id: String) -> Result<PagesData, AppErr
     .map_err(app_error)
 }
 
-pub async fn load_block_threads(
-    rpc: String,
-    target: String,
-    from: i64,
-    generation: i64,
-) -> Result<BlockThreadListData, HydrationError> {
-    let result = async {
-        let target = required_id(target, "block")?;
-        let from = u32::try_from(from).map_err(|_| "invalid comment offset".to_string())?;
-        let rpc = rpc_client(&rpc)?;
-        query_block_threads(&rpc, &target, from, generation).await
-    }
-    .await;
-    result.map_err(|message| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
 /// Every comment thread on a PAGE, not on one block: the same
 /// `ThreadsForTargets` query, asked for the page and all of its blocks at once.
 /// `target` comes back as the page id — the rail is document-scoped.
@@ -758,74 +739,6 @@ pub async fn load_block_comment_page(
         query_block_comment_page(&rpc, &target, &thread_id, from, generation)
             .await?
             .ok_or_else(|| "comment thread was not found".to_string())
-    }
-    .await;
-    result.map_err(|message| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-pub async fn refresh_block_comments(
-    rpc: String,
-    target: String,
-    thread_id: String,
-    generation: i64,
-) -> Result<BlockCommentsRefreshData, HydrationError> {
-    let result = async {
-        if target.is_empty() {
-            return Ok(BlockCommentsRefreshData {
-                generation,
-                target,
-                threads: Vec::new(),
-                total: 0,
-                threads_next_from: 0,
-                threads_has_more: false,
-                thread_id: String::new(),
-                comments: Vec::new(),
-                comments_next_from: 0,
-                comments_has_more: false,
-            });
-        }
-        let target = required_id(target, "block")?;
-        let rpc = rpc_client(&rpc)?;
-        let threads = query_block_threads(&rpc, &target, 0, generation).await?;
-        let comments = if thread_id.is_empty() {
-            BlockCommentData {
-                generation,
-                target: target.clone(),
-                thread_id,
-                from: 0,
-                comments: Vec::new(),
-                next_from: 0,
-                has_more: false,
-            }
-        } else {
-            let thread_id = required_id(thread_id, "comment thread")?;
-            query_block_comment_page(&rpc, &target, &thread_id, 0, generation)
-                .await?
-                .unwrap_or(BlockCommentData {
-                    generation,
-                    target: target.clone(),
-                    thread_id: String::new(),
-                    from: 0,
-                    comments: Vec::new(),
-                    next_from: 0,
-                    has_more: false,
-                })
-        };
-        Ok(BlockCommentsRefreshData {
-            generation,
-            target,
-            threads: threads.threads,
-            total: threads.total,
-            threads_next_from: threads.next_from,
-            threads_has_more: threads.has_more,
-            thread_id: comments.thread_id,
-            comments: comments.comments,
-            comments_next_from: comments.next_from,
-            comments_has_more: comments.has_more,
-        })
     }
     .await;
     result.map_err(|message| HydrationError {

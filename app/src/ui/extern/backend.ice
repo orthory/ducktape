@@ -25,7 +25,6 @@ extern crate::backend
   PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
   BlockThreadListData(generation:i64, target:str, from:i64, threads:[PageCommentThread], total:i64, next_from:i64, has_more:bool)
   BlockCommentData(generation:i64, target:str, thread_id:str, from:i64, comments:[PageComment], next_from:i64, has_more:bool)
-  BlockCommentsRefreshData(generation:i64, target:str, threads:[PageCommentThread], total:i64, threads_next_from:i64, threads_has_more:bool, thread_id:str, comments:[PageComment], comments_next_from:i64, comments_has_more:bool)
   PageSearchHit(page_id:str, page_title:str, block_id:str, kind:str, text:str)
   PageSearchData(generation:i64, hits:[PageSearchHit])
   PaletteSearchData(generation:i64, chat_hits:[ChatSearchHit], page_hits:[PageSearchHit])
@@ -224,7 +223,7 @@ extern crate::backend
   sync forge_comment_target(path:str, line:str, side:str) -> str
   submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
   merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
-  forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:str, module:str, scope:ForgeRefresh, generation:i64) -> ForgeLiveData ! HydrationError
+  forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:str, module:str, scope:ForgeRefresh, forge_open:bool, generation:i64) -> ForgeLiveData ! HydrationError
   sync forge_live_hit(kind:str, module:str) -> bool
   sync forge_repo_row(repos:[ForgeRepo], name:str) -> ForgeRepo
   sync forge_stats(files:i64, additions:i64, deletions:i64) -> str
@@ -315,6 +314,7 @@ extern crate::backend
   sync apply_page_title(title:str, delta:PagesDelta, active_page:str) -> str
   sync apply_page_rename(pages:[PageItem], delta:PagesDelta) -> [PageItem]
   sync plane_live_hit(kind:str, module:str, want:str) -> bool
+  sync tab_reads_plane(tab:str, plane:str) -> bool
   sync keep_str(loaded:bool, next:str, current:str) -> str
   sync keep_bool(loaded:bool, next:bool, current:bool) -> bool
   sync keep_i64(loaded:bool, next:i64, current:i64) -> i64
@@ -372,10 +372,8 @@ extern crate::backend
   remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   search_chat(rpc:str, channel_id:str, text:str, generation:i64) -> ChatSearchData ! HydrationError
   load_page(rpc:str, page_id:str) -> PagesData ! AppError
-  load_block_threads(rpc:str, target:str, from:i64, generation:i64) -> BlockThreadListData ! HydrationError
   load_page_threads(rpc:str, page_id:str, generation:i64) -> BlockThreadListData ! HydrationError
   load_block_comment_page(rpc:str, target:str, thread_id:str, from:i64, generation:i64) -> BlockCommentData ! HydrationError
-  refresh_block_comments(rpc:str, target:str, thread_id:str, generation:i64) -> BlockCommentsRefreshData ! HydrationError
   post_block_comment(rpc:str, password:str, target:str, thread_id:str, text:str, generation:i64) -> BlockCommentData ! AppError
   resolve_comment_thread(rpc:str, password:str, thread_id:str, resolved:bool) -> bool ! AppError
   open_external_url(url:str) -> bool ! AppError

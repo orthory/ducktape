@@ -301,7 +301,7 @@ on live_updated(next)
   hydration_retry_attempt = keep_i64(next.load_chat || next.load_pages || huddle_refresh_hits(next.chat, active_channel), 0, hydration_retry_attempt)
   parallel
     run live_resync_load(connected_rpc, active_channel, active_page, resync_planes((next.load_chat || huddle_refresh_hits(next.chat, active_channel)), next.load_pages), next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
-    run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, forge_generation) -> forge_refreshed _ | forge_failed _
+    run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == "forge"), forge_generation) -> forge_refreshed _ | forge_failed _
     // The `keep_i64(shell_tab == …, gen, -1)` on the heavy three is the SAME
     // off-screen refusal the tab-switch path uses: the backend refuses a
     // generation of -1 and the failed arm's guard drops the refusal unread, so
@@ -518,16 +518,21 @@ on select_shell_tab(next)
   // per repo, explorer flattens the ops of 100 blocks, files walks the tree —
   // all three used to run on the way into Settings or Members. A `keep_i64`
   // sends the off-screen ones generation -1; the backend refuses it and the
-  // failed arm's generation guard drops the refusal unread. The light loaders
-  // stay unconditional: members/governance/agents feed the always-visible
-  // titlebar chips and have no other refresh path.
+  // failed arm's generation guard drops the refusal unread.
+  //
+  // members/governance/agents/account are gated the same way, by
+  // `tab_reads_plane`. They used to be unconditional "because the titlebar
+  // chips read them and they have no other refresh path" — the second half was
+  // never true: the `plane` arm above refetches each one when its own module
+  // commits, which is earlier AND cheaper than waiting for the next tab click.
+  // Four ungated `/v1/query` round trips per click is what that claim cost.
   parallel
     run load_node_facts(connected_rpc, node_facts_generation) -> node_facts_loaded _ | node_facts_failed _
     run load_explorer(connected_rpc, keep_i64(shell_tab == "explorer", explorer_generation, -1)) -> explorer_loaded _ | explorer_failed _
     run files_ls(connected_rpc, fs_path, keep_i64(shell_tab == "files", fs_generation, -1)) -> fs_listed _ | fs_failed _
     run files_history(connected_rpc, keep_i64(shell_tab == "files", fs_generation, -1)) -> fs_history_loaded _ | fs_failed _
-    run load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
-    run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
+    run load_members(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "members"), members_generation, -1)) -> members_loaded _ | members_failed _
+    run load_governance(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "governance"), gov_generation, -1)) -> governance_loaded _ | governance_failed _
     run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
     // PEERS IS A HEAVY LOADER AND WAS FILED WITH THE LIGHT ONES. `/v1/peers`
     // encodes the node's whole metrics registry per call (485 KB, ~10 ms), so
@@ -536,8 +541,8 @@ on select_shell_tab(next)
     // console made. The overview tab now gets its rows pushed, so gating this
     // to that tab costs nothing there and stops the encode everywhere else.
     run load_peers(connected_rpc, keep_i64(shell_tab == "settings" && node_tab == "overview", node_peers_generation, -1)) -> peers_loaded _ | peers_failed _
-    run load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
-    run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
+    run load_agents(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "agents"), agents_generation, -1)) -> agents_loaded _ | agents_failed _
+    run load_account(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "account"), account_generation, -1)) -> account_loaded _ | account_failed _
     run load_forge(connected_rpc, keep_i64(shell_tab == "forge", forge_generation, -1)) -> forge_loaded _ | forge_failed _
 
 // The huddle's elapsed clock is a LOCAL session fact: one tick per second for

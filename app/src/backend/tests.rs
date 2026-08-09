@@ -2607,10 +2607,10 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     )
     .await;
     wait_for_block(&mut live, base_height + 8).await;
-    let comments = refresh_block_comments(origin.clone(), "intro".into(), "thread-live".into(), 1)
+    let threads = load_page_threads(origin.clone(), "welcome".into(), 1)
         .await
         .unwrap();
-    assert_eq!(comments.thread_id, "thread-live");
+    assert!(threads.threads.iter().any(|t| t.id == "thread-live"));
     submit_test(
         &rpc,
         &signer,
@@ -2622,11 +2622,10 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     )
     .await;
     wait_for_block(&mut live, base_height + 9).await;
-    let comments = refresh_block_comments(origin.clone(), "intro".into(), "thread-live".into(), 2)
+    let threads = load_page_threads(origin.clone(), "welcome".into(), 2)
         .await
         .unwrap();
-    assert!(comments.thread_id.is_empty());
-    assert!(comments.comments.is_empty());
+    assert!(!threads.threads.iter().any(|t| t.id == "thread-live"));
 
     let refreshed = live_resync_load(
         origin,
@@ -3685,4 +3684,146 @@ async fn a_failed_title_lookup_keeps_the_page_hits_it_could_not_name() {
     // Only the LABEL degrades, onto the same fallback an unresolvable page id
     // already takes in `titled_page_hits`.
     assert_eq!(data.hits[0].page_title, "Untitled");
+}
+
+/// EVERY CHAT READ RIDES THE VIEW LANE. `load_channel_row` is awaited INSIDE
+/// the live stream's decoder fold, so a `/v1/query` there hands the node's
+/// single select loop the fold of every subscriber: a channel row cost up to
+/// the node's whole checkpoint write (issue #1018). `ChatViewQuery::Channel`
+/// returns the identical `ChannelInfo` off an MVCC snapshot, off-loop.
+///
+/// Pinned as a source shape for the same reason `connect`'s cause is: the
+/// difference between the two lanes is which HTTP route the round trip takes,
+/// and both answer the same rows against a live node — a behavioural assertion
+/// cannot tell them apart.
+#[test]
+fn chat_reads_never_cross_the_dispatch_query_lane() {
+    const LIVE: &str = include_str!("live.rs");
+    let load_channel_row = LIVE
+        .split("pub(crate) async fn load_channel_row(")
+        .nth(1)
+        .expect("load_channel_row is declared")
+        .split("\npub ")
+        .next()
+        .expect("load_channel_row body");
+    assert!(
+        load_channel_row.contains("ChatViewQuery::Channel {"),
+        "the channel row reads the index view arm"
+    );
+    assert!(
+        !load_channel_row.contains(".query("),
+        "a chat read on /v1/query pays the node's checkpoint tax"
+    );
+
+    // The whole crate, not just this function: `ChatQuery`/`ChatReply` are the
+    // dispatch-lane types, and `backend/mod.rs` is the one `use` every backend
+    // module inherits. An import reappearing IS a chat read crawling back onto
+    // the select loop.
+    // The `use` LINES, not the file: the comment above them names the banned
+    // types to say why they are banned, and a sweep over raw source cannot
+    // tell a symbol from the prose about it.
+    const MOD: &str = include_str!("mod.rs");
+    let imports: Vec<&str> = MOD
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("use "))
+        .collect();
+    assert!(
+        !imports
+            .iter()
+            .any(|line| line.contains("ChatQuery") || line.contains("ChatReply")),
+        "no backend module may reach for chat's dispatch query type: {imports:?}"
+    );
+    assert!(
+        imports.iter().any(|line| line.contains("ChatViewQuery")),
+        "the view lane's types are the ones the backend imports"
+    );
+}
+
+/// THE TAB-SWITCH GATE. Four planes used to refetch on every tab move —
+/// members, governance, agents, account — regardless of the destination, so a
+/// click into Files paid four `/v1/query` round trips for rows nothing on
+/// screen reads.
+#[test]
+fn a_tab_move_only_refetches_what_its_destination_draws() {
+    let reads = |tab: &str, plane: &str| tab_reads_plane(tab.into(), plane.into());
+
+    // the roster is drawn by four panes: its own, the admin gate under
+    // Approvals, the forge write gate, and the Settings standing card.
+    for tab in ["members", "governance", "forge", "settings"] {
+        assert!(reads(tab, "members"), "{tab} draws the roster");
+    }
+    for tab in ["chat", "pages", "agents", "files", "explorer"] {
+        assert!(!reads(tab, "members"), "{tab} draws no roster");
+    }
+
+    // the narrow planes belong to exactly one pane each.
+    assert!(reads("governance", "governance"));
+    assert!(reads("agents", "agents"));
+    assert!(reads("settings", "account") && reads("forge", "account"));
+    for tab in ["chat", "pages", "forge", "files", "explorer", "members"] {
+        assert!(!reads(tab, "governance"), "{tab} draws no proposals");
+    }
+    for tab in ["chat", "pages", "forge", "files", "explorer", "settings"] {
+        assert!(!reads(tab, "agents"), "{tab} draws no agent rows");
+    }
+    for tab in ["chat", "pages", "agents", "files", "explorer", "governance"] {
+        assert!(!reads(tab, "account"), "{tab} draws no account card");
+    }
+
+    // an unknown plane name is nobody's — a typo must not silently reopen the
+    // storm by answering true.
+    assert!(!reads("settings", "explorer"));
+}
+
+/// THE GATE IS ONLY WORTH ANYTHING IF THE LOADER HONOURS IT. `keep_i64` sends
+/// an off-screen plane generation -1; each loader has to refuse it BEFORE any
+/// I/O, which is what turns the gate into a skipped round trip rather than a
+/// wasted one. `unreachable` is never contacted: reaching the client at all is
+/// the failure this pins.
+#[tokio::test(flavor = "current_thread")]
+async fn an_off_screen_plane_is_refused_before_it_touches_the_node() {
+    let unreachable = "http://127.0.0.1:9".to_string();
+    let refusals = [
+        load_members(unreachable.clone(), -1).await.err(),
+        load_governance(unreachable.clone(), -1).await.err(),
+        load_agents(unreachable.clone(), -1).await.err(),
+        load_account(unreachable, -1).await.err(),
+    ];
+    for refusal in refusals {
+        let refusal = refusal.expect("an off-screen load refuses");
+        assert_eq!(refusal.generation, -1);
+        assert_eq!(
+            refusal.message, "skipped_offscreen",
+            "the refusal must be the guard's, not a failed round trip's"
+        );
+    }
+}
+
+/// THE FORGE REPO LIST IS THE ONE UNSCOPED SLICE. Every other slice here is
+/// keyed on what the forge pane has open, but the list reloaded on EVERY forge
+/// chain op — a git-mirror walk per repo — while any other tab was on screen.
+/// Off the forge tab this reloads nothing, and reaching the (unreachable) node
+/// is what a lost gate would look like.
+#[tokio::test(flavor = "current_thread")]
+async fn a_forge_op_does_not_walk_the_repo_mirrors_for_a_closed_pane() {
+    let data = forge_live_refresh(
+        "http://127.0.0.1:9".into(),
+        String::new(),
+        0,
+        "forge".into(),
+        "forge".into(),
+        ForgeRefresh::default(),
+        false,
+        4,
+    )
+    .await
+    .expect("a closed forge pane loads nothing, so nothing can fail");
+
+    assert_eq!(data.generation, 4);
+    assert!(
+        !data.repos_loaded,
+        "an unloaded list must leave the handler's keep alone"
+    );
+    assert!(data.repos.is_empty());
 }
