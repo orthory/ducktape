@@ -71,14 +71,23 @@ on global_key_pressed(event)
   // editor lets command-letter presses bubble on purpose, so its focus is
   // still on the draft when the mark lands; an empty verdict is a no-op.
   //
-  // ONE chord, TWO composers: the subscription is global and sees no widget
-  // focus, so `composer_focus` (stamped by whichever composer last took an
-  // event) picks the target and the other arm's gate goes false — the two
-  // lines are exclusive, never both. Without the split, Cmd+B pressed with the
-  // caret in a thread reply silently bolded the CHANNEL draft instead.
-  let reply_chord = active_thread_seq > 0 && composer_focus == "reply"
-  message_editor = composer_toggle_mark(message_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, (connected && shell_tab == "chat" && !palette_open && !reply_chord)))
-  reply_editor = composer_toggle_mark(reply_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, (connected && shell_tab == "chat" && !palette_open && reply_chord)))
+  // ONE chord, TWO composers, and BOTH arms self-select on a POSITIVE match of
+  // `composer_focus` — the same keeper shape as the escape ladder above. The
+  // negation this replaced (`!reply_chord`) made the stream's composer the
+  // fallback for every state, so the moment the discriminant said "the caret
+  // left" the chord went right back to marking a draft nobody was in.
+  let chord_ready = connected && shell_tab == "chat"
+  let message_chord = chord_ready && composer_focus == "message"
+  // A closed rail can never be the target, however stale the discriminant is —
+  // and one route leaves it stale ON PURPOSE. Every rail teardown a USER asks
+  // for retires (they all write a literal `active_thread_seq = 0`, which is a
+  // linted rule), but `live_resynced` closes the rail when the thread root is
+  // deleted under you, and that same handler runs on every ordinary resync
+  // while you keep typing in the rail — so it cannot retire unconditionally.
+  // This term is that route's only cover; the lint pins it by driving it.
+  let reply_chord = chord_ready && composer_focus == "reply" && active_thread_seq > 0
+  message_editor = composer_toggle_mark(message_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, message_chord))
+  reply_editor = composer_toggle_mark(reply_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, reply_chord))
   // The page document's undo/redo (Cmd/Ctrl+Z, +Shift+Z) — the editor
   // bubbles command-letter chords on purpose; an off-pages press is the
   // identity.
@@ -94,6 +103,11 @@ on global_key_pressed(event)
   palette_generation = palette_generation + 1
   palette_searching = false
   return if !palette_open
+  // THE PALETTE TAKES THE CARET, and closing it does not hand it back — so the
+  // retire is here, at the open, not on a `!palette_open` term in the chord's
+  // own gate. That term could only mute the chord while the palette was up;
+  // Escape then handed a stale "reply" straight back to it.
+  composer_focus = "none"
   task widget focus #workspace-tabs/overlays/palette-input
 
 // THE CONTENT PANE'S KEYBOARD SCROLL. iced's scrollable has no focus and no

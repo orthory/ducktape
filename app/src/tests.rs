@@ -3778,6 +3778,279 @@ fn a_thread_reply_takes_marks_from_its_own_toolbar_and_the_chord() {
     assert_eq!(reply_composer(&app), reply_before);
 }
 
+/// A CLAIM ON THE CARET HAS TO DIE WHEN THE CARET LEAVES. `composer_focus`
+/// stands in for widget focus the app cannot read: the rich editor drops its
+/// own focus on any press landing outside it (`rich_text_editor.rs` sets
+/// `state.focus = None` in the else-arm of its press handler) and publishes
+/// NOTHING when it does. So a discriminant stamped on entry is honest only for
+/// as long as the set of handlers that retire it is complete — and #1005
+/// shipped the claim with no retire at all, leaving Cmd+B marking the reply
+/// draft while the caret sat in an inline edit box, on another tab, or in a
+/// channel two switches away.
+///
+/// The enforcement is three MECHANICAL rules, not a remembered list, because
+/// the hole was never in a route that existed — it was in the one nobody
+/// thought to write. A handler carrying a `task widget focus` moves the caret
+/// by hand; a handler writing `shell_tab` unmounts the composer under it; a
+/// handler writing a literal `active_thread_seq = 0` tears the rail, and the
+/// reply composer, out from under it. Any of the three must RETIRE — `"none"`
+/// and nothing else, since a mover by definition took the caret somewhere that
+/// is not a chat composer. The pinned set then catches the two the rules cannot
+/// name, `open_thread_for`'s reset included: deleting that line used to fail
+/// nothing.
+///
+/// Every rule here records the VALUE and not merely the assignment. A retire
+/// flipped to `"message"` is a claim on a composer the caret is not in — the
+/// exact defect — and a lint that only counted assignments called that green.
+///
+/// The rules cannot reach every rail close, and the last arm here is the one
+/// they miss on purpose — which is what the chord's own `active_thread_seq > 0`
+/// term is for. Both halves are driven, so neither the guard nor the retires
+/// can be deleted quietly.
+#[test]
+fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
+    // THE BEHAVIOUR, on the route the rules are about: a claim, then a handler
+    // that takes the caret with the rail still open — so neither the
+    // `active_thread_seq > 0` gate nor the tab gate can save it — then the
+    // chord. It must mark NEITHER draft.
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.shell_tab = "chat".into();
+    app.active_channel = "general".into();
+    app.active_thread_seq = 7;
+    let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+        editor::ComposerEvent::Apply(editor::RichAction::Edit(
+            iced::widget::text_editor::Action::Move(iced::widget::text_editor::Motion::DocumentEnd),
+        )),
+    ));
+    let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "hello".into(), 2));
+    app.message_editor = compose("channel draft");
+    app.reply_editor = compose("reply draft");
+    app.reply_editor
+        .perform(iced::widget::text_editor::Action::SelectAll);
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
+        iced::keyboard::key::Code::KeyB,
+    )));
+    assert_eq!(
+        reply_composer(&app),
+        "reply draft",
+        "the caret is in the inline edit box, so Cmd+B is not a reply edit"
+    );
+    assert_eq!(
+        composer(&app),
+        "channel draft",
+        "and it is not a channel edit either — a retired claim marks neither"
+    );
+
+    // THE SAME BEHAVIOUR ON THE RAIL'S OWN OPEN, which is where the VALUE of a
+    // retire is load-bearing. `open_thread_for` inherits whatever the channel
+    // composer claimed, and the click that opened the rail landed on a message
+    // row — the caret is in NEITHER box. The rail is open, so `"reply"` is as
+    // live as `"message"` here: every wrong value this one line could carry
+    // marks a draft, which is why the assertion is on both drafts and not on
+    // the presence of the line.
+    let (mut rail, _) = Ducktape::__boot();
+    rail.connected = true;
+    rail.loading = false;
+    rail.shell_tab = "chat".into();
+    rail.active_channel = "general".into();
+    let _ = rail.__update(__DucktapeMessage::ChatComposerEvent(
+        editor::ComposerEvent::Apply(editor::RichAction::Edit(
+            iced::widget::text_editor::Action::Move(iced::widget::text_editor::Motion::DocumentEnd),
+        )),
+    ));
+    let _ = rail.__update(__DucktapeMessage::OpenThreadFor(7));
+    rail.message_editor = compose("channel draft");
+    rail.reply_editor = compose("reply draft");
+    rail.message_editor
+        .perform(iced::widget::text_editor::Action::SelectAll);
+    let _ = rail.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
+        iced::keyboard::key::Code::KeyB,
+    )));
+    assert_eq!(
+        composer(&rail),
+        "channel draft",
+        "opening the rail moved the caret off the channel composer, so Cmd+B \
+         is not a channel edit"
+    );
+    assert_eq!(
+        reply_composer(&rail),
+        "reply draft",
+        "and the rail's own composer never had it either — the click landed on \
+         a message row"
+    );
+
+    // THE ONE RAIL CLOSE NO RETIRE CAN COVER, which is the whole job of the
+    // chord's `active_thread_seq > 0` term. Someone deletes the thread root
+    // while you are typing a reply: `live_resynced` answers 0 for a root it
+    // finds deleted (`refreshed_known_message_seq`) and the rail — with the
+    // reply composer in it — is gone. That handler ALSO runs on every ordinary
+    // resync while the rail stays open and you keep typing, so it cannot
+    // retire unconditionally the way the user-driven teardowns do. The claim
+    // survives on purpose; the READ side is what has to be honest.
+    let (mut gone, _) = Ducktape::__boot();
+    gone.connected = true;
+    gone.loading = false;
+    gone.shell_tab = "chat".into();
+    gone.active_channel = "general".into();
+    gone.hydration_generation = 4;
+    gone.active_thread_seq = 7;
+    let _ = gone.__update(__DucktapeMessage::ReplyComposerEvent(
+        editor::ComposerEvent::Apply(editor::RichAction::Edit(
+            iced::widget::text_editor::Action::Move(iced::widget::text_editor::Motion::DocumentEnd),
+        )),
+    ));
+    let _ = gone.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        4,
+        "general",
+        vec![message(7, "the root", true)],
+        "",
+        Vec::new(),
+    )));
+    assert_eq!(
+        gone.active_thread_seq, 0,
+        "a deleted root closes the rail under the caret"
+    );
+    assert_eq!(
+        gone.composer_focus, "reply",
+        "and nothing retires the claim on that route — if this ever stops \
+         holding, the arm below has gone vacuous and this gate needs a new pin"
+    );
+    // The resync rebuilt the stream's box, so both drafts are seated after it.
+    gone.message_editor = compose("channel draft");
+    gone.reply_editor = compose("reply draft");
+    gone.reply_editor
+        .perform(iced::widget::text_editor::Action::SelectAll);
+    let _ = gone.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
+        iced::keyboard::key::Code::KeyB,
+    )));
+    assert_eq!(
+        reply_composer(&gone),
+        "reply draft",
+        "a closed rail is never the chord's target, however stale the claim is"
+    );
+    assert_eq!(
+        composer(&gone),
+        "channel draft",
+        "and a stale \"reply\" does not fall through to the channel draft either"
+    );
+
+    // THE RULES. Every handler file, so a focus mover added to a screen nobody
+    // is thinking about today still has to answer.
+    const HANDLERS: [(&str, &str); 10] = [
+        ("chat", include_str!("ui/handlers/chat.ice")),
+        ("files", include_str!("ui/handlers/files.ice")),
+        ("forge", include_str!("ui/handlers/forge.ice")),
+        ("huddle", include_str!("ui/handlers/huddle.ice")),
+        ("lifecycle", include_str!("ui/handlers/lifecycle.ice")),
+        ("node", include_str!("ui/handlers/node.ice")),
+        ("onboarding", include_str!("ui/handlers/onboarding.ice")),
+        ("overlays", include_str!("ui/handlers/overlays.ice")),
+        ("pages", include_str!("ui/handlers/pages.ice")),
+        ("roster", include_str!("ui/handlers/roster.ice")),
+    ];
+
+    // `app.ice` is the real registry; the list above is a hand copy of it, and
+    // an eleventh handler file would otherwise ship unscanned.
+    for line in include_str!("ui/app.ice").lines() {
+        let Some(rest) = line.trim_start().strip_prefix("use \"handlers/") else {
+            continue;
+        };
+        let Some(file) = rest.strip_suffix(".ice\"") else {
+            continue;
+        };
+        assert!(
+            HANDLERS.iter().any(|(scanned, _)| *scanned == file),
+            "app.ice registers handlers/{file}.ice and this lint does not read \
+             it — add it to HANDLERS, or the next focus mover lands there \
+             unchecked"
+        );
+    }
+
+    let mut moves_the_caret: Vec<String> = Vec::new();
+    // Handler AND value: `composer_focus = "message"` in a retire is the defect
+    // itself, so recording only the handler name pins nothing worth pinning.
+    let mut writes_the_focus: Vec<String> = Vec::new();
+    for (file, source) in HANDLERS {
+        // Per FILE, not per sweep: carrying the previous file's last handler in
+        // here credits it with any statement standing above the first `on `.
+        let mut handler = format!("{file}::<above the first handler>");
+        for line in source.lines() {
+            if let Some(rest) = line.strip_prefix("on ") {
+                handler = format!("{file}::{}", rest.split('(').next().unwrap_or(rest).trim());
+            }
+            let statement = line.trim_start();
+            let takes_the_caret = statement.starts_with("task widget focus");
+            let unmounts_the_tab = statement.starts_with("shell_tab = ");
+            // The LITERAL zero only. A computed write (`= seq`,
+            // `= next.active_thread_seq`, `= refreshed_known_message_seq(…)`)
+            // may leave the rail open, so it is not a teardown and a retire
+            // there would fire mid-typing; the chord's own `> 0` gate covers
+            // what those can produce, and the last behaviour arm drives it.
+            let closes_the_rail = statement == "active_thread_seq = 0";
+            if takes_the_caret || unmounts_the_tab || closes_the_rail {
+                moves_the_caret.push(handler.clone());
+            }
+            if let Some(value) = statement.strip_prefix("composer_focus = ") {
+                writes_the_focus.push(format!("{handler} = {}", value.trim()));
+            }
+        }
+    }
+    moves_the_caret.sort();
+    moves_the_caret.dedup();
+    writes_the_focus.sort();
+    writes_the_focus.dedup();
+
+    let silent: Vec<&String> = moves_the_caret
+        .iter()
+        .filter(|mover| !writes_the_focus.contains(&format!("{mover} = \"none\"")))
+        .collect();
+    assert!(
+        silent.is_empty(),
+        "these handlers move the caret (`task widget focus`), unmount the \
+         composer under it (`shell_tab = `), or tear the thread rail out from \
+         under it (`active_thread_seq = 0`) without RETIRING the claim on it — \
+         each needs `composer_focus = \"none\"`, and \"none\" is the only \
+         honest value: a mover took the caret somewhere that is not a chat \
+         composer: {silent:?}"
+    );
+
+    assert_eq!(
+        writes_the_focus,
+        [
+            "chat::arm_message_delete = \"none\"",
+            "chat::arm_thread_message_delete = \"none\"",
+            "chat::begin_message_edit = \"none\"",
+            "chat::begin_thread_message_edit = \"none\"",
+            "chat::chat_composer_event = \"message\"",
+            "chat::choose_channel = \"none\"",
+            "chat::choose_dm = \"none\"",
+            "chat::close_thread = \"none\"",
+            "chat::open_chat_search_hit = \"none\"",
+            "chat::open_message_actions = \"none\"",
+            "chat::open_message_reactions = \"none\"",
+            "chat::open_thread_for = \"none\"",
+            "chat::open_thread_message_actions = \"none\"",
+            "chat::open_thread_message_reactions = \"none\"",
+            "chat::reply_composer_event = \"reply\"",
+            "chat::toggle_channel_create = \"none\"",
+            "chat::toggle_channel_settings = \"none\"",
+            "huddle::huddle_go_channel = \"none\"",
+            "lifecycle::reconnect = \"none\"",
+            "lifecycle::select_shell_tab = \"none\"",
+            "onboarding::console_opened = \"none\"",
+            "overlays::global_key_pressed = \"none\"",
+            "pages::open_page_search_hit = \"none\"",
+            "pages::toggle_page_create = \"none\"",
+        ],
+        "a handler started, stopped, or CHANGED what it says about the caret: \
+         exactly two may CLAIM it (the two composer-event handlers, and only \
+         with their own composer's name), everyone else here RETIRES it to \
+         \"none\" — decide which yours is, then update this list"
+    );
+}
+
 /// One Cmd/Ctrl chord, shaped the way the keyboard subscription delivers it.
 fn command_chord(code: iced::keyboard::key::Code) -> __IceKeyPress {
     __IceKeyPress {

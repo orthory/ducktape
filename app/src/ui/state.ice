@@ -84,12 +84,46 @@ state
   message_draft = ""
   message_editor:editor = ""
   reply_editor:editor = ""
-  // WHICH CHAT COMPOSER THE FORMATTING CHORD MEANS — "message" or "reply".
-  // The chord rides the app's ONE keyboard subscription, which sees no widget
-  // focus, so the two composer-event handlers stamp this as they run (a click
-  // into an editor is one of those events). Read only together with
-  // `active_thread_seq > 0`: a closed rail can never be the target.
-  composer_focus = "message"
+  // WHICH CHAT COMPOSER HOLDS THE CARET — "message", "reply", or "none".
+  // The formatting chord rides the app's ONE keyboard subscription, which sees
+  // no widget focus, so this stands in for focus the app cannot read: the two
+  // composer-event handlers CLAIM it (a click into an editor is one of those
+  // events) and every handler that moves the caret away RETIRES it to "none",
+  // on which the chord marks neither composer. Boot is "none" on purpose —
+  // nothing is focused before the first click, and a mark into an unfocused
+  // draft is the very defect this discriminant exists to prevent.
+  //
+  // The retire set is the whole contract, so it is linted, not remembered:
+  // `every_handler_that_moves_the_caret_retires_the_composer_focus` in
+  // app/src/tests.rs pins the VALUE every writer assigns, and fails the build
+  // on a new focus mover or tab mover that has not retired the claim.
+  //
+  // THREE classes are mechanical, all three visible in the source: a
+  // `task widget focus` takes the caret by hand, a `shell_tab` write unmounts
+  // the composer under it, and a literal `active_thread_seq = 0` tears the
+  // thread rail — and the reply composer — out from under it. That last one is
+  // deliberately the LITERAL zero and not every write of the field: a computed
+  // one (`= seq`, `= next.active_thread_seq`, `= refreshed_known_message_seq(…)`)
+  // may equally well leave the rail open, and a blanket retire on those would
+  // fire mid-typing on every ordinary resync. What they can produce instead is
+  // a rail closed WITHOUT a retire, and the chord's `active_thread_seq > 0`
+  // gate covers exactly that.
+  //
+  // What is left is a NAMED list of two, because neither is derivable from
+  // anything the source says: `chat::open_thread_for` OPENS a rail (its click
+  // landed on a message row, so the caret is in neither box), and
+  // `chat::toggle_channel_create` lays a modal with a text input over a chat
+  // composer that stays mounted. Neither is "rebuilds a composer" either —
+  // that is a different fact, and a false one: sending a message rebuilds the
+  // box and the caret stays right in it.
+  //
+  // ponytail: what is left uncovered is a press on an ordinary widget (the
+  // sidebar's search box, a reaction chip). It drops the editor's focus and is
+  // invisible from here: the widget publishes nothing, and the pane's
+  // `press-at` observer runs AFTER its child, so it can only clobber a fresh
+  // claim, never retire a stale one. Upgrade path is a widget-level blur route
+  // (or a focus query) in ducktape-ui — not another app-side proxy.
+  composer_focus = "none"
   pending_message = ""
   pending_message_id = ""
   // The transient settle ✓: `send_flash_id` anchors it to the row whose
