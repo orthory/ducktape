@@ -345,28 +345,34 @@ fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
     }
 }
 
-/// One channel's row rebuilt from its canonical record (the dispatch-grade
-/// point read) — the huddle roster length is not derivable from the op.
+/// One channel's row rebuilt from the index view — the huddle roster length is
+/// not derivable from the op, so the row still has to be read.
+///
+/// THE VIEW LANE, NOT `/v1/query`. This is awaited inside the live stream's
+/// decoder fold, so a `/v1/query` here freezes every subscriber's fold for as
+/// long as the node's select loop is busy writing a checkpoint (issue #1018).
+/// `ChatViewQuery::Channel` reads the same `ChannelInfo` off an MVCC snapshot,
+/// off-loop — identical payload, no checkpoint tax.
 pub(crate) async fn load_channel_row(rpc: &str, channel_id: &str) -> Result<ChatChannel, String> {
     let rpc = rpc_client(rpc)?;
-    let reply: ChatReply = rpc
-        .query(
+    let reply: ChatViewReply = rpc
+        .view(
             "chat",
-            &ChatQuery::Channel {
+            &ChatViewQuery::Channel {
                 channel_id: channel_id.to_string(),
             },
         )
         .await?;
-    let ChatReply::Channel(Some(channel)) = reply else {
+    let ChatViewReply::Channel(Some(info)) = reply else {
         return Err("channel record was not found".into());
     };
     Ok(ChatChannel {
-        id: channel.id,
-        name: channel.name,
-        archived: channel.archived,
-        members_only: channel.post_policy == PostPolicy::MembersOnly,
-        huddle_count: count_i64(channel.huddle.len()),
-        head_seq: number_i64(channel.head_seq),
+        id: info.channel.id,
+        name: info.channel.name,
+        archived: info.channel.archived,
+        members_only: info.channel.post_policy == PostPolicy::MembersOnly,
+        huddle_count: count_i64(info.channel.huddle.len()),
+        head_seq: number_i64(info.head_seq),
     })
 }
 
@@ -859,6 +865,7 @@ pub struct DmPeersData {
 /// key, so a multi-device account is reachable only at that key. Pair-wide DMs
 /// need account-keyed membership in the chat module itself.
 pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, HydrationError> {
+    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let me = local_user_key().await.map(|key| hex_encode(&key));

@@ -704,6 +704,7 @@ fn agent_caps(caps: &serde_json::Value) -> Vec<AgentCap> {
 /// Load the agent roster from the canonical registry, each row marked with
 /// whether THIS device's user key is its owner.
 pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, HydrationError> {
+    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let local = local_user_key().await.map(|key| hex_encode(&key));
@@ -939,6 +940,7 @@ pub struct AccountData {
 
 /// Load the account this node is bound to (via the canonical resolver).
 pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, HydrationError> {
+    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let node_key_hex = client.status().await?.public_key;

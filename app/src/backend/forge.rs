@@ -988,8 +988,8 @@ pub fn forge_live_hit(kind: String, module: String) -> bool {
 }
 
 /// One scoped forge catch-up, flag-selected per slice like [`LiveRefresh`]:
-/// the repo list reloads on any forge hit; the open repo's slice and the open
-/// item reload only when the op's scope reaches them.
+/// the repo list reloads only while the forge surface is open; the open repo's
+/// slice and the open item reload when the op's scope reaches them.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ForgeLiveData {
     pub generation: i64,
@@ -1006,6 +1006,18 @@ pub struct ForgeLiveData {
 /// invalidated. A non-hit update no-ops with every flag false (the handler's
 /// keeps leave state untouched); an empty op scope means the scope is
 /// unknown — reload every open slice.
+///
+/// `forge_open` is the repo LIST's surface gate. That one load was the only
+/// unscoped slice here — a git-mirror walk per repo, on every forge op, for a
+/// list no other tab draws. The repo and item slices keep running off-tab on
+/// purpose: they are already scoped to what the forge pane has open, and
+/// dropping them would hand a stale PR back on the return trip (the tab-switch
+/// handler's `load_forge` refills the list, and nothing else).
+// Eight arguments, and none of them can be folded away: this is one Ice extern
+// and every argument is a separate piece of handler state the `run` reads at
+// the call site. Grouping them into a struct would mean a new Ice type declared
+// for one call.
+#[allow(clippy::too_many_arguments)]
 pub async fn forge_live_refresh(
     rpc: String,
     open_repo: String,
@@ -1013,6 +1025,7 @@ pub async fn forge_live_refresh(
     kind: String,
     module: String,
     refresh: ForgeRefresh,
+    forge_open: bool,
     generation: i64,
 ) -> Result<ForgeLiveData, HydrationError> {
     let noop = ForgeLiveData {
@@ -1036,7 +1049,10 @@ pub async fn forge_live_refresh(
     let item_hit = repo_hit
         && open_item > 0
         && (scope_unknown || refresh.number == open_item || refresh.refs_moved);
-    let repos = load_forge(rpc.clone(), generation).await?;
+    let repos = match forge_open {
+        false => None,
+        true => Some(load_forge(rpc.clone(), generation).await?),
+    };
     let repo_slice = match repo_hit {
         false => None,
         true => Some(load_forge_repo(rpc.clone(), open_repo.clone(), generation).await?),
@@ -1046,8 +1062,8 @@ pub async fn forge_live_refresh(
         true => Some(load_forge_item(rpc, open_repo, open_item, generation).await?),
     };
     Ok(ForgeLiveData {
-        repos_loaded: true,
-        repos: repos.repos,
+        repos_loaded: repos.is_some(),
+        repos: repos.map(|data| data.repos).unwrap_or_default(),
         repo_loaded: repo_slice.is_some(),
         branches: repo_slice
             .as_ref()

@@ -555,6 +555,51 @@ fn assert_no_polling(lifecycle: &str) {
     );
 }
 
+/// THE TAB GATE IS WIRING, NOT A PREDICATE. `tab_reads_plane` being correct in
+/// isolation buys nothing if `lifecycle.ice` still calls the loaders
+/// unconditionally — a declared-and-unrun extern is exactly how a dead loader
+/// sat in `backend.ice` until this branch swept it. This pins the call shapes.
+///
+/// It pins the OTHER half too: the `plane` arm is the chips' only off-tab
+/// writer, so its governance/agents runs must NOT carry a second
+/// `shell_tab ==` gate. Gating both leaves the approvals badge dark until you
+/// open Approvals — which is the one thing the badge exists to spare you.
+#[test]
+fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
+    let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
+
+    for (loader, plane, generation) in [
+        ("load_members", "members", "members_generation"),
+        ("load_governance", "governance", "gov_generation"),
+        ("load_agents", "agents", "agents_generation"),
+        ("load_account", "account", "account_generation"),
+    ] {
+        let wired = format!(
+            "run {loader}(connected_rpc, keep_i64(tab_reads_plane(shell_tab, \"{plane}\"), {generation}, -1))"
+        );
+        assert!(
+            lifecycle.contains(&wired),
+            "the tab switch must gate {loader}: {wired}"
+        );
+    }
+
+    for (loader, module, generation) in [
+        ("load_members", "valset", "members_generation"),
+        ("load_governance", "governance", "gov_generation"),
+        ("load_account", "identity", "account_generation"),
+        ("load_dm_peers", "identity", "dm_peers_generation"),
+        ("load_agents", "agent", "agents_generation"),
+    ] {
+        let live = format!(
+            "run {loader}(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, \"{module}\"), {generation}, -1))"
+        );
+        assert!(
+            lifecycle.contains(&live),
+            "a {module} commit must refresh {loader} on any tab: {live}"
+        );
+    }
+}
+
 #[test]
 fn forge_depth_rides_the_established_seams() {
     // the forge handlers moved out of lifecycle.ice into their own file;
@@ -591,9 +636,12 @@ fn forge_depth_rides_the_established_seams() {
     ));
 
     // committed forge ops refresh scoped slices through the handler's one
-    // terminal parallel — no polling, no per-op full reloads.
+    // terminal parallel — no polling, no per-op full reloads. The repo LIST
+    // is the one slice with no open-scope of its own, so it carries the forge
+    // surface's own gate: a chain op must not walk every repo's git mirror for
+    // a list that is not on screen.
     assert!(lifecycle.contains(
-        "run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, forge_generation)"
+        "run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == \"forge\"), forge_generation)"
     ));
     assert_no_polling(&lifecycle);
 
