@@ -712,12 +712,17 @@ pub async fn load_agent_runs(
 ) -> Result<AgentRunsData, HydrationError> {
     async {
         let client = rpc_client(&rpc)?;
-        let pending: serde_json::Value = client
-            .query("runs", &serde_json::json!("pending_runs"))
-            .await?;
-        let recent: serde_json::Value = client
-            .query("runs", &serde_json::json!("recent_runs"))
-            .await?;
+        // Two independent reads of one module, awaited one after the other. On a
+        // cold `runs` module the first touch measured 54 s on this box, so the
+        // serial pair was two ceilings deep for no ordering reason.
+        let ask_pending = serde_json::json!("pending_runs");
+        let ask_recent = serde_json::json!("recent_runs");
+        let (pending, recent) = tokio::join!(
+            client.query::<_, serde_json::Value>("runs", &ask_pending),
+            client.query::<_, serde_json::Value>("runs", &ask_recent),
+        );
+        let pending = pending?;
+        let recent = recent?;
         let wanted = |record: &serde_json::Value| {
             agent_id.is_empty() || record["agent_id"].as_str() == Some(agent_id.as_str())
         };

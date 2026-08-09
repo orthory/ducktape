@@ -550,3 +550,91 @@ test settings_keyboard_scroll_contract
   dispatch toggle_bell
   key page-down
   expect body.scroll_y > 30.0
+
+preset ui_explorer_partial
+  state
+    shell_tab = "explorer"
+    connected = true
+    loading = false
+    mutation_phase = "idle"
+    error = ""
+    explorer_query = "needle"
+    explorer_searching = false
+    explorer_kind = "all"
+    explorer_partial = "Code did not answer — these results are incomplete."
+
+preset ui_explorer_whole
+  state
+    shell_tab = "explorer"
+    connected = true
+    loading = false
+    mutation_phase = "idle"
+    error = ""
+    explorer_query = "needle"
+    explorer_searching = false
+    explorer_kind = "all"
+    explorer_partial = ""
+
+// A PARTIAL ANSWER SAYS SO, AND ONLY A WHOLE ONE CLAIMS EMPTY. Each of the six
+// sources behind a workspace search fails silently and the node's per-module
+// cold start runs tens of seconds against a 30s client ceiling, so a search
+// that reached the node and lost three of its sources rendered the survivors as
+// the whole truth — and with no survivors it printed "Nothing matched that
+// query in this workspace", which is a claim about the WORKSPACE that only the
+// sources that answered can support.
+test explorer_partial_banner_contract
+  preset ui_explorer_partial
+  viewport 1120 720
+  mount
+    ExplorerScreen query<->explorer_query #explorer
+      with
+        connected
+        searching=explorer_searching
+        loading
+        kinds=explorer_kinds
+        kind=explorer_kind
+        partial=explorer_partial
+        hits=explorer_hits
+        blocks=explorer_blocks
+        selected=explorer_selected
+        ops=explorer_ops
+      events
+        explorer_search_submit -> explorer_search_submit
+        clear_explorer_search -> clear_explorer_search
+        refresh_explorer -> refresh_explorer
+        pick_explorer_kind -> pick_explorer_kind _
+        select_explorer_block -> select_explorer_block _
+  target banner = #explorer/explorer-partial
+  target plate = #explorer/explorer-nothing-matched/root
+  expect exists banner
+  expect missing plate
+
+// The other half, which is what stops the banner from being wallpaper: with
+// every source answered there is nothing to warn about, and "nothing matched"
+// is then the honest line.
+test explorer_whole_answer_contract
+  preset ui_explorer_whole
+  viewport 1120 720
+  mount
+    ExplorerScreen query<->explorer_query #explorer
+      with
+        connected
+        searching=explorer_searching
+        loading
+        kinds=explorer_kinds
+        kind=explorer_kind
+        partial=explorer_partial
+        hits=explorer_hits
+        blocks=explorer_blocks
+        selected=explorer_selected
+        ops=explorer_ops
+      events
+        explorer_search_submit -> explorer_search_submit
+        clear_explorer_search -> clear_explorer_search
+        refresh_explorer -> refresh_explorer
+        pick_explorer_kind -> pick_explorer_kind _
+        select_explorer_block -> select_explorer_block _
+  target banner = #explorer/explorer-partial
+  target plate = #explorer/explorer-nothing-matched/root
+  expect missing banner
+  expect exists plate

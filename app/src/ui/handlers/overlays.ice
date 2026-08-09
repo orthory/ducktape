@@ -164,6 +164,10 @@ state
   content_scroll = 0.0
   explorer_hits:[ExplorerHit] = []
   explorer_kinds:[KindCount] = []
+  // Names the sources that did not answer this search, empty when they all
+  // did. A timed-out source contributes no hits and no chip, so without this
+  // line the screen presents whatever survived as the whole truth.
+  explorer_partial = ""
   explorer_searching = false
   explorer_search_generation:i64 = 0
 
@@ -173,6 +177,7 @@ on explorer_search_submit
   explorer_searching = true
   explorer_hits = []
   explorer_kinds = []
+  explorer_partial = ""
   explorer_kind = "all"
   error = ""
   run search_workspace(connected_rpc, trim(explorer_query), explorer_search_generation) -> explorer_results_loaded _ | explorer_search_failed _
@@ -181,6 +186,7 @@ on explorer_results_loaded(next)
   return if next.generation != explorer_search_generation
   explorer_hits = next.hits
   explorer_kinds = next.kinds
+  explorer_partial = next.partial
   explorer_searching = false
   error = ""
 
@@ -194,6 +200,7 @@ on clear_explorer_search
   explorer_query = ""
   explorer_hits = []
   explorer_kinds = []
+  explorer_partial = ""
   explorer_kind = "all"
   explorer_searching = false
 
