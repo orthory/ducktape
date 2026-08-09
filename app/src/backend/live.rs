@@ -176,7 +176,11 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
 /// Fold one applied op into a live update. A decode failure (payload or
 /// stamp) degrades to a scoped resync of that module — a CLIENT reloads,
 /// never wedges. `None` = the op is invisible to this UI.
-async fn folded_update(rpc: &str, module: &str, op: ducktape_rpc::StreamOp) -> Option<LiveUpdate> {
+pub(crate) async fn folded_update(
+    rpc: &str,
+    module: &str,
+    op: ducktape_rpc::StreamOp,
+) -> Option<LiveUpdate> {
     let height = i64::try_from(op.height).unwrap_or(i64::MAX);
     let Some(payload) = op
         .payload
@@ -258,19 +262,31 @@ async fn folded_update(rpc: &str, module: &str, op: ducktape_rpc::StreamOp) -> O
             }
         }
         "pages" => match pages::client::delta_from_op(&payload) {
-            Ok(delta) => Some(LiveUpdate {
-                kind: "pages".into(),
-                status: format!("Live · block {height}"),
-                height,
-                module: "pages".into(),
-                load_chat: false,
-                load_pages: true,
-                debounce: true,
-                chat: ChatDelta::default(),
-                pages: delta,
-                bell: BellDelta::default(),
-                forge: ForgeRefresh::default(),
-            }),
+            Ok(delta) => {
+                let folded = delta.kind == "text";
+                Some(LiveUpdate {
+                    kind: "pages".into(),
+                    status: format!("Live · block {height}"),
+                    height,
+                    module: "pages".into(),
+                    load_chat: false,
+                    // A TEXT EDIT FOLDS; EVERYTHING ELSE RELOADS. The page autosave
+                    // commits one `UpdateText` per tick while a reader types, and
+                    // each used to buy a `load_pages_data`: three SEQUENTIAL
+                    // queries — the page index, every block of the open page, and a
+                    // `ThreadsForTargets` whose body carries every block id. Your
+                    // own keystrokes came back on your own stream and made you
+                    // re-read the document you were typing into, against a read
+                    // path that is checkpoint-gated.
+                    load_pages: !folded,
+                    // nothing to coalesce when nothing is fetched.
+                    debounce: !folded,
+                    chat: ChatDelta::default(),
+                    pages: delta,
+                    bell: BellDelta::default(),
+                    forge: ForgeRefresh::default(),
+                })
+            }
             Err(_) => Some(live_resync("pages", height)),
         },
         "forge" => match forge::client::refresh_from_op(&payload) {
@@ -548,6 +564,28 @@ pub fn keep_strs(loaded: bool, next: Vec<String>, current: Vec<String>) -> Vec<S
 
 pub fn keep_blocks(loaded: bool, next: Vec<PageBlock>, current: Vec<PageBlock>) -> Vec<PageBlock> {
     if loaded { next } else { current }
+}
+
+/// Fold one committed text edit into the open document's blocks.
+///
+/// The whole fold, because text is the whole of what an `UpdateText` changes
+/// that this shell can draw: `page_blocks` copies `block.text` verbatim and
+/// carries no mark field, so this produces exactly what a reload would have.
+///
+/// A `block_id` this list does not hold is NOT an error — block ids are minted,
+/// so it belongs to a page nobody is looking at, and the reader of that page
+/// gets it from their own load. Same for any non-`text` delta: those already
+/// carry `load_pages`, and folding them would mean re-deriving `prefix`,
+/// `child_count` and sibling order from an op that names none of them.
+pub fn apply_page_text(mut blocks: Vec<PageBlock>, delta: PagesDelta) -> Vec<PageBlock> {
+    if delta.kind != "text" {
+        return blocks;
+    }
+    let Some(block) = blocks.iter_mut().find(|block| block.id == delta.block_id) else {
+        return blocks;
+    };
+    block.text = delta.text;
+    blocks
 }
 
 pub fn keep_str(loaded: bool, next: String, current: String) -> String {

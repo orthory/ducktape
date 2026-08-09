@@ -2829,6 +2829,70 @@ fn comment_pages_merge_by_identity_and_ordinal() {
     assert_eq!(comments[2].text, "new");
 }
 
+/// A COMMITTED EDIT LANDS WITHOUT RE-READING THE DOCUMENT IT LANDED IN.
+///
+/// The page autosave commits one `UpdateText` per tick while a reader types,
+/// and every one used to set `load_pages` — buying a `live_resync_load` and its
+/// three sequential queries, against a read path that is checkpoint-gated. Your
+/// own keystrokes came back on your own stream and made you re-read the page
+/// you were typing into.
+///
+/// `hydration_generation` is the reload's own counter, so an unchanged one IS
+/// the assertion that nothing was fetched.
+#[test]
+fn a_folded_text_edit_updates_the_block_and_fetches_nothing() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_page = "page".into();
+    app.buffer_page = "page".into();
+    app.blocks = vec![
+        page_block("b1", "page", "old"),
+        page_block("b2", "page", "untouched"),
+    ];
+    let before = app.hydration_generation;
+
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "pages".into(),
+        status: "Live".into(),
+        height: 9,
+        module: "pages".into(),
+        pages: backend::PagesDelta {
+            kind: "text".into(),
+            block_id: "b1".into(),
+            text: "typed".into(),
+        },
+        ..backend::LiveUpdate::default()
+    }));
+
+    assert_eq!(
+        app.blocks[0].text, "typed",
+        "the edit folded into its block"
+    );
+    assert_eq!(app.blocks[1].text, "untouched", "and only into its block");
+    assert_eq!(
+        app.hydration_generation, before,
+        "a folded edit must not start a reload — that is the whole point"
+    );
+
+    // A block this document does not hold belongs to another page. Fold
+    // nothing, fetch nothing.
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "pages".into(),
+        status: "Live".into(),
+        height: 10,
+        module: "pages".into(),
+        pages: backend::PagesDelta {
+            kind: "text".into(),
+            block_id: "elsewhere".into(),
+            text: "another page".into(),
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    assert_eq!(app.blocks[0].text, "typed");
+    assert_eq!(app.hydration_generation, before);
+}
+
 #[test]
 fn live_comment_refresh_updates_threads_without_touching_the_draft() {
     let (mut app, _) = Ducktape::__boot();
@@ -2860,7 +2924,7 @@ fn live_comment_refresh_updates_threads_without_touching_the_draft() {
         debounce: true,
         pages: backend::PagesDelta {
             kind: "touched".into(),
-            comments: true,
+            ..backend::PagesDelta::default()
         },
         ..backend::LiveUpdate::default()
     }));
