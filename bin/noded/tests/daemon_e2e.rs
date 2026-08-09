@@ -1439,6 +1439,79 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
     );
 }
 
+/// DROPPING THE SOCKET MUST STOP THE SAMPLING — the whole cost argument for
+/// gating the console's overview subscription rests on it, and until now
+/// nothing observed it.
+///
+/// `peers` re-composes its sample by encoding the node's ENTIRE metrics
+/// registry, per session, per heartbeat, for as long as a session holds the
+/// topic. "Leaving the tab stops that at the source" is a claim about session
+/// teardown that no test could see: a session that outlived its socket would
+/// keep paying that cost forever with every existing test green.
+///
+/// THE SECOND SESSION IS THE CLOCK. Its frames mark heartbeat ticks, so the
+/// test waits on the system's own events and never on a duration — a sleep
+/// here would be a timeout wearing a disguise. If the closed session were
+/// still sampling, the counter would advance by two per tick instead of one.
+#[test]
+fn a_closed_session_stops_costing_the_node_a_snapshot_sample() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    let mut leaving = daemon.ws_connect();
+    Daemon::ws_send_text(&mut leaving, r#"{"op":"subscribe","topics":["peers"]}"#);
+    let _ = Daemon::ws_read_type(&mut leaving, "subscribed");
+    let _ = Daemon::ws_read_type(&mut leaving, "tail");
+
+    let mut clock = daemon.ws_connect();
+    Daemon::ws_send_text(&mut clock, r#"{"op":"subscribe","topics":["peers"]}"#);
+    let _ = Daemon::ws_read_type(&mut clock, "subscribed");
+    let _ = Daemon::ws_read_type(&mut clock, "tail");
+
+    // the leaver goes away. Nothing else changes.
+    drop(leaving);
+
+    // DISCARD ONE TICK so the close is certainly observed by the node before
+    // the window we measure — the only ordering this test needs, and it is
+    // bounded by an event rather than a clock.
+    let _ = Daemon::ws_read_type(&mut clock, "tail");
+    let before = peers_samples(&daemon.metrics());
+
+    // THREE ticks, counted by the surviving session's own frames.
+    const TICKS: u64 = 3;
+    for _ in 0..TICKS {
+        let _ = Daemon::ws_read_type(&mut clock, "tail");
+    }
+    let observed = peers_samples(&daemon.metrics()) - before;
+
+    // A RANGE, NOT AN EQUALITY, and the slack is exactly one tick: the counter
+    // is incremented before its frame is sent, so reading N frames proves at
+    // least N samples, and at most one further tick can fire between the last
+    // frame and the scrape. Demanding equality would flake on that one tick.
+    //
+    // The separation is what matters: ONE subscriber gives 3..=4, and a leaked
+    // session gives 6 — which no slack of one tick can reach.
+    assert!(
+        (TICKS..=TICKS + 1).contains(&observed),
+        "expected {TICKS}..={} samples for the ONE session still subscribed, got \
+         {observed}. At roughly double, the closed session is still being \
+         sampled and the console's subscription gate buys the node nothing; at \
+         zero, the surviving session stopped sampling and the topic is dead.",
+        TICKS + 1
+    );
+}
+
+/// the `peers` arm of `ducktape_stream_snapshot_samples`, off a scrape.
+fn peers_samples(exposition: &str) -> u64 {
+    exposition
+        .lines()
+        .find(|line| line.starts_with("ducktape_stream_snapshot_samples_total{topic=\"peers\"}"))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(|value| value as u64)
+        .unwrap_or_else(|| panic!("no peers sample counter in exposition"))
+}
+
 /// THE OVERVIEW TOPICS MUST DELIVER, OVER A REAL SOCKET, IN THE SHAPE THE
 /// CONSOLE DECODES.
 ///
