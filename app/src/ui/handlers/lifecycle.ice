@@ -302,17 +302,24 @@ on live_updated(next)
   parallel
     run live_resync_load(connected_rpc, active_channel, active_page, resync_planes((next.load_chat || huddle_refresh_hits(next.chat, active_channel)), next.load_pages), next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
     run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == "forge"), forge_generation) -> forge_refreshed _ | forge_failed _
-    // The `keep_i64(shell_tab == …, gen, -1)` on the heavy three is the SAME
-    // off-screen refusal the tab-switch path uses: the backend refuses a
-    // generation of -1 and the failed arm's guard drops the refusal unread, so
-    // an Approvals tab nobody is looking at costs a dead call, not a query.
-    // Members, account and the DM directory stay ungated — all three feed
-    // always-visible chrome.
+    // The `keep_i64(plane_live_hit(…), gen, -1)` is the SAME off-screen
+    // refusal the tab-switch path uses: the backend refuses a generation of -1
+    // and the failed arm's guard drops the refusal unread, so a plane no
+    // module touched costs a dead call, not a query.
+    //
+    // NO SECOND `shell_tab` GATE HERE. This arm is the ONLY off-tab refresh
+    // path for the titlebar chips — approvals from `open_proposals(gov_rows)`
+    // and the agent dot from `any_agent_active(agents_rows)`. Governance and
+    // agents used to carry `&& shell_tab == …` on top of the module hit, which
+    // was survivable only while the tab-switch path refetched them
+    // unconditionally; it does not any more (`tab_reads_plane`, below). A
+    // badge whose whole job is to tell you something needs approval WHILE you
+    // are elsewhere cannot wait for you to open that tab.
     run load_members(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "valset"), members_generation, -1)) -> members_loaded _ | members_failed _
-    run load_governance(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "governance") && shell_tab == "governance", gov_generation, -1)) -> governance_loaded _ | governance_failed _
+    run load_governance(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "governance"), gov_generation, -1)) -> governance_loaded _ | governance_failed _
     run load_account(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation, -1)) -> account_loaded _ | account_failed _
     run load_dm_peers(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "identity"), dm_peers_generation, -1)) -> dm_peers_loaded _ | dm_peers_failed _
-    run load_agents(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "agent") && shell_tab == "agents", agents_generation, -1)) -> agents_loaded _ | agents_failed _
+    run load_agents(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "agent"), agents_generation, -1)) -> agents_loaded _ | agents_failed _
     run files_ls(connected_rpc, fs_path, keep_i64(plane_live_hit(next.kind, next.module, "files") && shell_tab == "files", fs_generation, -1)) -> fs_listed _ | fs_failed _
 
 on live_resynced(next)
@@ -522,10 +529,14 @@ on select_shell_tab(next)
   //
   // members/governance/agents/account are gated the same way, by
   // `tab_reads_plane`. They used to be unconditional "because the titlebar
-  // chips read them and they have no other refresh path" — the second half was
-  // never true: the `plane` arm above refetches each one when its own module
-  // commits, which is earlier AND cheaper than waiting for the next tab click.
-  // Four ungated `/v1/query` round trips per click is what that claim cost.
+  // chips read them and they have no other refresh path" — the second half is
+  // no longer true: the `plane` arm above refetches each one when its own
+  // module commits, which is earlier AND cheaper than waiting for the next tab
+  // click. Four ungated `/v1/query` round trips per click is what that claim
+  // cost. That arm is now the chips' ONLY off-tab writer, so it carries no
+  // `shell_tab` gate of its own — the two are a pair, and gating both would
+  // leave a chip dark until you opened the very tab it exists to save you
+  // from opening.
   parallel
     run load_node_facts(connected_rpc, node_facts_generation) -> node_facts_loaded _ | node_facts_failed _
     run load_explorer(connected_rpc, keep_i64(shell_tab == "explorer", explorer_generation, -1)) -> explorer_loaded _ | explorer_failed _

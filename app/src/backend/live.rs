@@ -865,6 +865,7 @@ pub struct DmPeersData {
 /// key, so a multi-device account is reachable only at that key. Pair-wide DMs
 /// need account-keyed membership in the chat module itself.
 pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, HydrationError> {
+    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let me = local_user_key().await.map(|key| hex_encode(&key));
