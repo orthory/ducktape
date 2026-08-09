@@ -186,6 +186,26 @@ pub async fn save_page_document(
     let current = load_pages_data(&client, Some(&page_id))
         .await
         .map_err(failed)?;
+    // A SAVE MUST PLAN AGAINST THE PAGE ITS CALLER NAMED.
+    //
+    // `load_pages_data` drops a requested id the index does not hold and falls
+    // back to `pages.first()` (backend/load.rs). That is RIGHT for a live
+    // refresh — a page can be archived out from under a resync — and
+    // catastrophic here: the plan below pairs THIS buffer against those blocks
+    // POSITIONALLY (`document_plan`), so every op it emits carries the OTHER
+    // page's block ids. A short buffer leaves no survivors and the plan becomes
+    // a `RemoveBlock` for every line of a document the reader never opened.
+    //
+    // Nothing downstream catches it. The title write is the only accidental
+    // guard — it fails `BlockNotFound` and aborts — and it does not run at all
+    // when the two titles match, which two untitled pages always do.
+    //
+    // The reader is not stuck: the failure surfaces as the save error, and the
+    // resync that follows a delete moves `active_page` off the dead page, which
+    // parks the autosave tick on `active_page != buffer_page` (handlers/pages.ice).
+    if current.active_page != page_id {
+        return Err(failed("page was not found".into()));
+    }
     let canonical = |data: &PagesData| {
         crate::pages::sync::page_document_text(&data.active_page_title, &data.blocks)
     };

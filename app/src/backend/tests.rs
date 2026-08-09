@@ -2392,6 +2392,42 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     let loaded_page = load_page(origin.clone(), "welcome".into()).await.unwrap();
     assert_eq!(loaded_page.active_page, "welcome");
     assert_eq!(loaded_page.blocks[0].text, "A signed page block");
+
+    // A SAVE AGAINST A PAGE THE INDEX DOES NOT HOLD MUST REFUSE, NOT RETARGET.
+    // `load_pages_data` answers a missing id with `pages.first()` — here that is
+    // `welcome`, a real page full of real blocks. Without the guard in
+    // `save_page_document` this call plans one buffer against another page's
+    // blocks and emits removes against ITS ids. It refuses before any write, so
+    // the password never has to be real.
+    //
+    // THE TITLE MUST MATCH THE PAGE IT WOULD FALL BACK TO, or this test proves
+    // nothing: a differing title makes the title write fire first, and it dies
+    // `BlockNotFound` on the id that does not exist. That accident is the only
+    // thing standing between today's code and the corruption — and it does not
+    // happen when the titles agree, which two untitled pages always do. With
+    // the title matched, the body plan is `remove every line`.
+    let stray = save_page_document(
+        origin.clone(),
+        String::new(),
+        "no-such-page".into(),
+        "Welcome\n".into(),
+        0,
+    )
+    .await;
+    // ASSERT THE REASON, NOT JUST THE FAILURE. An unsigned save fails anyway —
+    // at the signer, several steps after the plan was already built against the
+    // wrong page's blocks. Only the message separates "refused before planning"
+    // from "planned the damage, then could not sign it".
+    let refusal = stray.expect_err("a save must not retarget to another page");
+    assert_eq!(
+        refusal.message, "page was not found",
+        "the save must refuse on the page it cannot find, before it plans or signs anything"
+    );
+    let after = load_pages_data(&rpc, Some("welcome")).await.unwrap();
+    assert_eq!(
+        after.blocks[0].text, "A signed page block",
+        "the refused save must not have touched the page it fell back to"
+    );
     let workspace = connect(origin.clone(), 0, 0).await.unwrap();
     let mut live = live_events(origin.clone());
     let ready = live.next().await.unwrap();
