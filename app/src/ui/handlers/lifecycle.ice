@@ -109,6 +109,11 @@ on reconnect
   reply_draft = ""
   reply_editor = editor("")
   pending_reply = ""
+  // Both composers above are new empty boxes and the rail is gone. `connected`
+  // goes false here, which only MUTES the chord — the stale claim would ride
+  // straight through the reconnect and mark a rebuilt draft on the first
+  // Cmd+B after it lands.
+  composer_focus = "none"
   pending_channel = ""
   pending_message = ""
   chat_search_hits = []

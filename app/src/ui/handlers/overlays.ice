@@ -78,7 +78,13 @@ on global_key_pressed(event)
   // left" the chord went right back to marking a draft nobody was in.
   let chord_ready = connected && shell_tab == "chat"
   let message_chord = chord_ready && composer_focus == "message"
-  // A closed rail can never be the target, however stale the discriminant is.
+  // A closed rail can never be the target, however stale the discriminant is —
+  // and one route leaves it stale ON PURPOSE. Every rail teardown a USER asks
+  // for retires (they all write a literal `active_thread_seq = 0`, which is a
+  // linted rule), but `live_resynced` closes the rail when the thread root is
+  // deleted under you, and that same handler runs on every ordinary resync
+  // while you keep typing in the rail — so it cannot retire unconditionally.
+  // This term is that route's only cover; the lint pins it by driving it.
   let reply_chord = chord_ready && composer_focus == "reply" && active_thread_seq > 0
   message_editor = composer_toggle_mark(message_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, message_chord))
   reply_editor = composer_toggle_mark(reply_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, reply_chord))

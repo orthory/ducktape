@@ -98,15 +98,24 @@ state
   // app/src/tests.rs pins the VALUE every writer assigns, and fails the build
   // on a new focus mover or tab mover that has not retired the claim.
   //
-  // TWO of the three classes are mechanical: a `task widget focus` and a
-  // `shell_tab` write are both visible in the source, so the lint derives them.
-  // The third is a NAMED list — the handlers whose click lands on something
-  // that is not an editor while replacing the composer under it (a channel row,
-  // a DM row, a message row, the rail's close, the network chip in
-  // `onboarding::console_opened`). It cannot be derived from "rebuilds a
-  // composer", because that is not the same fact: sending a message rebuilds
-  // the box and the caret stays right in it. Those five are pinned by name and
-  // value instead.
+  // THREE classes are mechanical, all three visible in the source: a
+  // `task widget focus` takes the caret by hand, a `shell_tab` write unmounts
+  // the composer under it, and a literal `active_thread_seq = 0` tears the
+  // thread rail — and the reply composer — out from under it. That last one is
+  // deliberately the LITERAL zero and not every write of the field: a computed
+  // one (`= seq`, `= next.active_thread_seq`, `= refreshed_known_message_seq(…)`)
+  // may equally well leave the rail open, and a blanket retire on those would
+  // fire mid-typing on every ordinary resync. What they can produce instead is
+  // a rail closed WITHOUT a retire, and the chord's `active_thread_seq > 0`
+  // gate covers exactly that.
+  //
+  // What is left is a NAMED list of two, because neither is derivable from
+  // anything the source says: `chat::open_thread_for` OPENS a rail (its click
+  // landed on a message row, so the caret is in neither box), and
+  // `chat::toggle_channel_create` lays a modal with a text input over a chat
+  // composer that stays mounted. Neither is "rebuilds a composer" either —
+  // that is a different fact, and a false one: sending a message rebuilds the
+  // box and the caret stays right in it.
   //
   // ponytail: what is left uncovered is a press on an ordinary widget (the
   // sidebar's search box, a reaction chip). It drops the editor's focus and is

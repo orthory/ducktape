@@ -177,10 +177,21 @@ on toggle_channel_create
   // ModalShell component, and a widget target cannot reach into a nested
   // component's slot fill — every working path in this app stops at the first
   // component boundary. Restore the focus when the language can address it.
+  //
+  // The RETIRE does not wait for that task, and is why this handler is on the
+  // named list rather than derived: the modal lays a text input OVER the chat
+  // composer, which stays mounted underneath. The press that got here was on
+  // the New-channel button, and the next one goes into the modal's field — the
+  // caret is in no composer either way, opening or cancelling.
+  composer_focus = "none"
 
 on toggle_channel_settings
   return if empty(active_channel)
   channel_settings_open = !channel_settings_open
+  // Same modal-over-a-live-composer as `toggle_channel_create`, and this sits
+  // ABOVE the teardown's own `return` so closing the panel retires too. The
+  // teardown below makes it mechanical as well — see the rail rule.
+  composer_focus = "none"
   channel_name_draft = active_channel_name
   return if !channel_settings_open
   thread_generation = thread_generation + 1
