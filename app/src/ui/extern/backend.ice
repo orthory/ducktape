@@ -54,7 +54,7 @@ extern crate::backend
   box-style raised_style()
   svg-style icon_tint(tone:str)
   sync icon(name:str) -> str
-  connect(rpc:str) -> WorkspaceData ! AppError
+  connect(rpc:str, attempt:i64, generation:i64) -> WorkspaceData ! HydrationError
   stream live_events(rpc:str) -> LiveUpdate
   sync resync_planes(load_chat:bool, load_pages:bool) -> str
   live_resync_load(rpc:str, channel_id:str, page_id:str, planes:str, debounce:bool, generation:i64, attempt:i64) -> LiveRefresh ! HydrationError

@@ -148,9 +148,12 @@ on reconnect
   page_searching = false
   error = ""
   status = "Connecting…"
-  run connect(connected_rpc) -> workspace_connected _ | failed _
+  connect_generation = connect_generation + 1
+  run connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _
 
 on workspace_connected(next)
+  // A connect answering for an endpoint you have since left is not an answer.
+  return if next.generation != connect_generation
   rpc = next.rpc
   connected_rpc = next.rpc
   network_name = network_label(account_name, connected_rpc)
@@ -581,6 +584,35 @@ on restore_failed_reply
 
 on dismiss_failed_reply
   failed_reply_draft = ""
+
+// THE CONNECT RETRIES; IT USED TO GIVE UP AFTER ONE FAILURE. The steady-state
+// path has always retried forever (`live_resync_failed` below), so the console
+// healed itself from every interruption EXCEPT the one that gets it running.
+// One transient failure left it Offline against a node answering `/v1/status`
+// in under a millisecond, with no way back but the network picker — and issue
+// #1018 makes that failure ordinary: a `/v1/query` can block until the node
+// writes its next checkpoint, which outlasts the RPC client's 30s timeout.
+//
+// The backoff is `live_resync_load`'s own — 1s doubling to a 16s cap — so a
+// genuinely dead endpoint costs one request every 16s, and the degraded
+// surfaces keep telling the truth while it retries: `connected` stays false,
+// the band and the "Not connected" plate stay up, and the plate still names the
+// way out for a reader who does not want to wait.
+on connect_failed(cause)
+  // ONE CHAIN AT A TIME. Every route into a connect bumps the generation, so a
+  // failure carrying an older one belongs to a chain that was abandoned — a
+  // second network chosen, a reconnect pressed. Retrying it would leave two
+  // chains alive forever, and each chain's own bump could then reject the
+  // other's success. Measured before this guard existed: a dead endpoint drew
+  // two interleaved retry series 5.2s and 10.8s apart, summing to one 16s cap.
+  return if cause.generation != connect_generation
+  hydration_generation = hydration_generation + 1
+  connect_generation = connect_generation + 1
+  hydration_retry_attempt = hydration_retry_attempt + 1
+  loading = false
+  status = "Offline"
+  error = cause.message
+  run connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _
 
 on failed(cause)
   hydration_generation = hydration_generation + 1

@@ -4445,6 +4445,137 @@ fn every_header_subtitle_is_gated_on_the_connection() {
     );
 }
 
+/// THE CONSOLE HEALS ITSELF FROM A CONNECT FAILURE. The steady-state path has
+/// always retried forever (`live_resync_failed`), so the app recovered from
+/// every interruption except the one that gets it running: `on failed` set
+/// Offline and stopped, leaving the console dead against a node answering
+/// `/v1/status` in under a millisecond, with no way back but the network
+/// picker. Issue #1018 makes that failure ordinary — a `/v1/query` can block
+/// until the node writes its next checkpoint, outlasting the client's 30s
+/// timeout.
+#[test]
+fn a_failed_connect_retries_instead_of_giving_up() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    let before = app.connect_generation;
+
+    let fail = |generation: i64| {
+        __DucktapeMessage::ConnectFailed(backend::HydrationError {
+            generation,
+            message: "error sending request".into(),
+        })
+    };
+    let _ = app.__update(fail(app.connect_generation));
+    assert_eq!(
+        app.hydration_retry_attempt, 1,
+        "the first failure is attempt 1"
+    );
+    assert_eq!(app.status, "Offline", "and it is offline while it retries");
+    assert!(
+        app.connect_generation > before,
+        "each attempt owns a generation, so an abandoned one cannot answer"
+    );
+
+    // The counter CLIMBS — that is what feeds the backoff. A reset here would
+    // retry at 1s forever against a genuinely dead endpoint.
+    let _ = app.__update(fail(app.connect_generation));
+    let _ = app.__update(fail(app.connect_generation));
+    assert_eq!(app.hydration_retry_attempt, 3);
+
+    // A CONNECT IS NOT GUARDED ON `hydration_generation`, AND THIS IS WHY.
+    // Thirty-seven handlers bump that counter for reasons of their own —
+    // `choose_channel` is one of them — and a connect is in flight for seconds,
+    // or for up to 30s while the node sits in issue #1018's checkpoint stall.
+    // Guarded on the shared counter, one click on a channel mid-connect drops
+    // the successful reply; because it SUCCEEDED no failure arm fires and
+    // nothing retries, so the console sits Offline forever. Strictly worse than
+    // the defect this PR fixes.
+    let (mut wired, _) = Ducktape::__boot();
+    wired.connected_rpc = "http://127.0.0.1:38259".into();
+    let connect_gen = wired.connect_generation;
+    let shared_before = wired.hydration_generation;
+    let _ = wired.__update(__DucktapeMessage::ChooseChannel("general".into()));
+    assert!(
+        wired.hydration_generation > shared_before,
+        "an ordinary channel click bumps the SHARED counter"
+    );
+    assert_eq!(
+        wired.connect_generation, connect_gen,
+        "and leaves the connect's own alone — only the three routes that start a connect may touch it"
+    );
+
+    // AND A FAILURE FROM AN ABANDONED CHAIN IS DROPPED UNREAD. Without this,
+    // two chains retry forever and each one's generation bump can reject the
+    // other's success — measured live as two interleaved retry series 5.2s and
+    // 10.8s apart, summing to one 16s cap.
+    let stale = app.connect_generation - 1;
+    let attempts = app.hydration_retry_attempt;
+    let _ = app.__update(fail(stale));
+    assert_eq!(
+        app.hydration_retry_attempt, attempts,
+        "an abandoned chain must not start a second retry loop"
+    );
+
+    // The handler re-runs the connect, and the reply is generation-guarded.
+    let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
+    let arm = lifecycle
+        .split_once("on connect_failed(cause)")
+        .expect("connect owns its failure arm, not the shared one")
+        .1
+        .split_once("\non ")
+        .expect("the arm ends")
+        .0;
+    assert!(
+        arm.contains("hydration_retry_attempt = hydration_retry_attempt + 1"),
+        "the attempt climbs"
+    );
+    assert!(
+        arm.contains(
+            "run connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _"
+        ),
+        "and it goes round again, carrying the attempt into the backoff"
+    );
+    // Scoped to the ARM, not to the rest of the file: `live_resynced` further
+    // down guards on `hydration_generation` and is right to — that one really
+    // is the live plane's counter.
+    let connected_rest = lifecycle
+        .split_once("on workspace_connected(next)")
+        .expect("the success arm")
+        .1;
+    let connected = connected_rest
+        .split_once("\non ")
+        .map_or(connected_rest, |(arm, _)| arm);
+    // NO `||` HERE. An alternative that is trivially true short-circuits the
+    // half that matters — the first version of this assertion accepted the
+    // presence of a COMMENT and stayed green with the guard pointed back at the
+    // shared counter, which is the wedge this test exists to prevent.
+    assert!(
+        connected.contains("return if next.generation != connect_generation"),
+        "the connect is guarded on its OWN generation, never the shared one"
+    );
+    assert!(
+        !connected.contains("return if next.generation != hydration_generation"),
+        "the shared counter is bumped by 37 handlers; guarding on it drops a \
+         successful connect and nothing retries"
+    );
+
+    // The SHARED `failed` arm still belongs to the six page/chat loaders that
+    // route to it, and must NOT have grown a connect retry.
+    // `on failed` is the LAST handler in the file, so there may be no `\non `
+    // after it to cut at — take the remainder when there is not.
+    let shared_rest = lifecycle
+        .split_once("on failed(cause)")
+        .expect("the shared arm")
+        .1;
+    let shared = shared_rest
+        .split_once("\non ")
+        .map_or(shared_rest, |(arm, _)| arm);
+    assert!(
+        !shared.contains("run connect("),
+        "a failed page load must not restart the workspace connect"
+    );
+}
+
 /// THE BEHAVIOUR THE SWEEPS ABOVE ONLY SPELL. Boot the console, drop the
 /// connection, and the four subtitles go silent instead of reporting the zeros
 /// an unfetched listing folds to.

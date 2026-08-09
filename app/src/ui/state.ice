@@ -19,6 +19,15 @@ state
   shift_held = false
   block_height:i64 = -1
   hydration_generation:i64 = 0
+  // THE CONNECT'S OWN GENERATION, and it must not be `hydration_generation`:
+  // thirty-seven handlers bump that one — choosing a channel, opening a thread,
+  // loading a page — and a connect is in flight for seconds (for up to 30s when
+  // the node is inside issue #1018's checkpoint stall). Guarding the connect on
+  // the shared counter means one click on a channel mid-connect drops the
+  // successful reply, and because it SUCCEEDED no failure arm fires and nothing
+  // retries: the console sits Offline forever. Only the three routes that start
+  // a connect touch this.
+  connect_generation:i64 = 0
   hydration_retry_attempt:i64 = 0
   mutation_phase = "idle"
   error = ""
