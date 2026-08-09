@@ -44,6 +44,21 @@ pub const MAX_RESULT_BYTES: usize = saga::MAX_RESULT_BYTES;
 /// compare the same bytes.
 pub const RESOURCE_UNAVAILABLE_RESULT: &[u8] = br#"{"code":"RESOURCE_UNAVAILABLE"}"#;
 
+/// how many DELIVERED dispatches stay in the root preimage. a delivered
+/// dispatch has already handed its result to its receiver — what remains is a
+/// read-only receipt, and an unbounded pile of receipts is the state-growth
+/// cliff (every wasm op decodes the WHOLE state before it looks at the
+/// payload, so a big enough map traps every op on every validator, including
+/// the ops that would shrink it).
+pub const MAX_RETAINED_DELIVERED: usize = 64;
+
+/// byte budget for the retained delivered tail. the count cap alone bounds
+/// entries, not bytes — one outcome may be [`MAX_RESULT_BYTES`], so 64 of them
+/// is 16 MiB of receipts. entries are kept newest-first while the running
+/// total is within budget, so the retained tail is at most this plus one
+/// maximal entry.
+pub const MAX_RETAINED_DELIVERED_BYTES: usize = 4 * 1024 * 1024;
+
 /// hard cap on a recipe / dispatch id.
 pub const MAX_ID_BYTES: usize = 128;
 

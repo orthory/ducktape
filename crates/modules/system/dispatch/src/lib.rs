@@ -26,6 +26,18 @@
 //! block: a permanent abort loop. same discipline the platform already
 //! demands of chat hook subscribers.
 //!
+//! ## retention
+//!
+//! a dispatch's record is a receipt, not a ledger entry to keep forever. once
+//! delivered it is read-only, so every block boundary trims the delivered tail
+//! to [`MAX_RETAINED_DELIVERED`] entries / [`MAX_RETAINED_DELIVERED_BYTES`]
+//! bytes, newest first ([`delivered_evictions`]) — a pure function of the
+//! committed map, so every validator drops the identical set. in-flight
+//! (`AwaitingResult`) and undelivered (`AwaitingDelivery`) dispatches are
+//! never eligible. a receiver may re-use a `dispatch_id` whose receipt was
+//! trimmed: the key is free again and the re-dispatch is new work, the same
+//! GC semantics saga's explicit `Prune` has always had.
+//!
 //! ## self-containment
 //!
 //! this module imports no app module and no app interface. its collaborators
@@ -327,6 +339,54 @@ fn decode_committed(buf: &[u8]) -> Result<Committed, Error> {
 
     cur.finish("snapshot")?;
     Ok(c)
+}
+
+// ---- retention -------------------------------------------------------------------
+
+/// the retention decision, as a pure function: which delivered dispatches this
+/// committed map must drop to stay inside
+/// [`MAX_RETAINED_DELIVERED`]/[`MAX_RETAINED_DELIVERED_BYTES`].
+///
+/// terminal-only — an `AwaitingResult` dispatch is still in flight and an
+/// `AwaitingDelivery` one is referenced by the mailbox; neither is ever
+/// eligible. delivered receipts are ranked NEWEST first by `(updated_at, key)`
+/// and kept while both budgets hold, so the newest receipt always survives and
+/// the retained tail is at most the byte budget plus one maximal entry.
+///
+/// it reads nothing but the map, so every validator evicts the identical set
+/// at the identical block — and a node that adopted the state from a snapshot
+/// decides the same as one that replayed it.
+fn delivered_evictions(dispatches: &BTreeMap<String, DispatchState>) -> Vec<String> {
+    let mut delivered: Vec<(u64, &String, usize)> = dispatches
+        .iter()
+        .filter(|(_, d)| d.status == Status::Delivered)
+        .map(|(key, d)| {
+            let outcome_bytes = match &d.outcome {
+                None => 0,
+                Some(Ok(bytes)) => bytes.len(),
+                Some(Err(error)) => error.len(),
+            };
+            (d.updated_at, key, outcome_bytes)
+        })
+        .collect();
+    // newest first; the key breaks ties, so the order is total and stable.
+    delivered.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+
+    let mut kept = 0usize;
+    let mut kept_bytes = 0usize;
+    let mut evicted = Vec::new();
+    for (_, key, bytes) in delivered {
+        let within_count = kept < MAX_RETAINED_DELIVERED;
+        // checked BEFORE this entry is added, so the newest is always kept.
+        let within_budget = kept_bytes <= MAX_RETAINED_DELIVERED_BYTES;
+        if within_count && within_budget {
+            kept += 1;
+            kept_bytes = kept_bytes.saturating_add(bytes);
+            continue;
+        }
+        evicted.push(key.clone());
+    }
+    evicted
 }
 
 // ---- the module -----------------------------------------------------------------
@@ -901,6 +961,11 @@ impl Module for DispatchModule {
             self.committed.mailbox = mailbox;
             self.committed.next_seq = next_seq;
         }
+        // bounded retention: the delivered tail is trimmed at every boundary,
+        // as a pure function of what just committed.
+        for key in delivered_evictions(&self.committed.dispatches) {
+            self.committed.dispatches.remove(&key);
+        }
         Ok(())
     }
 
@@ -935,11 +1000,7 @@ mod tests {
     fn module() -> DispatchModule {
         DispatchModule::new("dispatch", "saga")
     }
-    fn exec(
-        m: &mut DispatchModule,
-        ctx: &mut TestCtx,
-        payload: &DispatchMsg,
-    ) -> Result<(), Error> {
+    fn exec(m: &mut DispatchModule, ctx: &mut TestCtx, payload: &DispatchMsg) -> Result<(), Error> {
         let msg = Msg {
             target: "dispatch".into(),
             payload: crate::encode_msg(payload),
@@ -1266,7 +1327,8 @@ mod tests {
     fn work_spec_without_demands_field_is_rejected() {
         // FLAG DAY: demands is required — a spec that omits the key fails to
         // decode rather than silently defaulting to a demandless job.
-        let no_demands = br#"{"kind":"dispatch-work-v1","dispatch_id":"d","capability":"c","payload":[]}"#;
+        let no_demands =
+            br#"{"kind":"dispatch-work-v1","dispatch_id":"d","capability":"c","payload":[]}"#;
         assert!(crate::decode_work_spec(no_demands).is_err());
     }
 
@@ -1590,6 +1652,135 @@ mod tests {
         ));
     }
 
+    // ---- retention ---------------------------------------------------------
+
+    fn state(status: Status, updated_at: u64, outcome_bytes: usize) -> DispatchState {
+        DispatchState {
+            receiver: "caller".into(),
+            dispatch_id: "d".into(),
+            recipe_id: "summarize".into(),
+            contract: OutputContract::Text,
+            saga_id: "s".into(),
+            status,
+            outcome: (status != Status::AwaitingResult).then(|| Ok(vec![b'x'; outcome_bytes])),
+            created_at: updated_at,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn the_retention_decision_evicts_the_oldest_delivered_and_nothing_else() {
+        // the in-flight pair carries the OLDEST timestamps: age alone must
+        // never make an undelivered dispatch eligible.
+        let mut map = BTreeMap::new();
+        map.insert("inflight".to_string(), state(Status::AwaitingResult, 0, 0));
+        map.insert("queued".to_string(), state(Status::AwaitingDelivery, 1, 4));
+        let overflow = 5;
+        for i in 0..MAX_RETAINED_DELIVERED + overflow {
+            map.insert(
+                format!("d{i:04}"),
+                state(Status::Delivered, 100 + i as u64, 4),
+            );
+        }
+
+        let mut evicted = delivered_evictions(&map);
+        evicted.sort();
+        let expected: Vec<String> = (0..overflow).map(|i| format!("d{i:04}")).collect();
+        assert_eq!(
+            evicted, expected,
+            "exactly the oldest delivered receipts go"
+        );
+
+        // and under the cap it evicts nothing at all.
+        let mut small = BTreeMap::new();
+        small.insert("inflight".to_string(), state(Status::AwaitingResult, 0, 0));
+        small.insert("one".to_string(), state(Status::Delivered, 9, 4));
+        assert!(delivered_evictions(&small).is_empty());
+    }
+
+    #[test]
+    fn the_retention_decision_also_holds_a_byte_budget() {
+        // four half-budget receipts: the running total is checked BEFORE each
+        // entry is added, so three are kept (the last one crossing the line)
+        // and the oldest is evicted — count cap untouched.
+        let half = MAX_RETAINED_DELIVERED_BYTES / 2;
+        let mut map = BTreeMap::new();
+        for i in 0..4u64 {
+            map.insert(format!("d{i}"), state(Status::Delivered, i, half));
+        }
+        assert_eq!(delivered_evictions(&map), vec!["d0".to_string()]);
+
+        // one oversized receipt is still kept — the newest always survives —
+        // but it pushes every older one out.
+        let mut map = BTreeMap::new();
+        map.insert("old".to_string(), state(Status::Delivered, 1, 8));
+        map.insert(
+            "huge".to_string(),
+            state(Status::Delivered, 2, MAX_RETAINED_DELIVERED_BYTES + 1),
+        );
+        assert_eq!(delivered_evictions(&map), vec!["old".to_string()]);
+    }
+
+    #[test]
+    fn sustained_dispatch_traffic_keeps_the_committed_map_bounded() {
+        // the growth-bound pin: three capfuls of dispatches driven all the way
+        // to Delivered, one per block. without the boundary trim this map is
+        // 1:1 with every dispatch ever made — the state-growth cliff.
+        let mut m = module();
+        let mut ctx = mk_ctx(0, owner());
+        exec(
+            &mut m,
+            &mut ctx,
+            &register(OutputContract::Text, Routing::Rendezvous),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        const ROUNDS: usize = MAX_RETAINED_DELIVERED * 3;
+        for i in 0..ROUNDS {
+            let height = (i as u64 + 1) * 4;
+            let dispatch_id = format!("d{i:04}");
+            let key = dispatch_key("caller", &dispatch_id);
+
+            let mut ctx = mk_ctx(height, Origin::Module("caller".into()));
+            exec(&mut m, &mut ctx, &dispatch_op(&dispatch_id, b"input")).unwrap();
+            commit(&mut m);
+
+            let mut ctx = mk_ctx(height + 1, Origin::Module("saga".into()));
+            let callback = Msg {
+                target: "dispatch".into(),
+                payload: encode_callback(&SagaCallback {
+                    saga_id: saga_id_for(&key),
+                    payload: key.clone().into_bytes(),
+                    outcome: SagaOutcome::Done(b"ok".to_vec()),
+                }),
+            };
+            block_on(m.execute(&mut ctx, &callback)).unwrap();
+            commit(&mut m);
+
+            let mut ctx = mk_ctx(height + 2, Origin::System);
+            exec(&mut m, &mut ctx, &DispatchMsg::DeliverPending {}).unwrap();
+            commit(&mut m);
+
+            assert!(
+                m.committed.dispatches.len() <= MAX_RETAINED_DELIVERED,
+                "round {i}: {} dispatches retained",
+                m.committed.dispatches.len()
+            );
+        }
+
+        assert_eq!(m.committed.dispatches.len(), MAX_RETAINED_DELIVERED);
+        assert_eq!(pending_deliveries(&m), 0, "every result was delivered");
+        // the tail that survived is the NEWEST one.
+        let newest = dispatch_key("caller", &format!("d{:04}", ROUNDS - 1));
+        assert!(m.committed.dispatches.contains_key(&newest));
+        assert!(
+            get_dispatch(&m, &dispatch_key("caller", "d0000")).is_none(),
+            "the oldest receipt was trimmed"
+        );
+        // the recipe is untouched by dispatch retention.
+        assert_eq!(m.committed.recipes.len(), 1);
+    }
 }
 
 // the wasm-guest port: the dispatch shell that adapts this module to the
