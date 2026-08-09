@@ -624,6 +624,45 @@ pub fn apply_page_text(mut blocks: Vec<PageBlock>, delta: PagesDelta) -> Vec<Pag
     blocks
 }
 
+/// Fold a committed RENAME into the open page's title.
+///
+/// `UpdateText` against a PAGE block is the rename op — there is no other one
+/// (`pages::interface`, `block_ops`) — and the module-side classifier calls it
+/// `text` like any other edit, because a payload naming one block id cannot
+/// know which ids are pages. This shell can: `active_page` IS that id.
+///
+/// Without this the rename folded into NOTHING and was not merely invisible.
+/// `page_blocks` drops the page head (`load.rs`, `.skip(1)`), so the block fold
+/// never matches it; `load_pages` is false because the op classified as text;
+/// and the title is line 0 of the buffer, so the reader's next keystroke made
+/// `save_page_document` compare its stale line 0 against a FRESH read of the
+/// node and write the old title back over the new one. A rename by anyone else
+/// was reverted on chain by the next person to type.
+pub fn apply_page_title(title: String, delta: PagesDelta, active_page: String) -> String {
+    let renames_open_page = delta.kind == "text" && delta.block_id == active_page;
+    if renames_open_page {
+        return delta.text;
+    }
+    title
+}
+
+/// The same rename, in the page list — for ANY page, not just the open one.
+///
+/// The list holds page ids, so the delta's `block_id` landing in it IS the
+/// test: block ids and page ids are minted apart (`fresh_id`), so a body edit
+/// can never match a row here. That is what keeps the sidebar and the tab
+/// strip from carrying a name the chain has already replaced.
+pub fn apply_page_rename(mut pages: Vec<PageItem>, delta: PagesDelta) -> Vec<PageItem> {
+    if delta.kind != "text" {
+        return pages;
+    }
+    let Some(page) = pages.iter_mut().find(|page| page.id == delta.block_id) else {
+        return pages;
+    };
+    page.title = delta.text;
+    pages
+}
+
 pub fn keep_str(loaded: bool, next: String, current: String) -> String {
     if loaded { next } else { current }
 }

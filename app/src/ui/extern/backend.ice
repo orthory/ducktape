@@ -309,6 +309,8 @@ extern crate::backend
   sync pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
   sync keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
   sync apply_page_text(blocks:[PageBlock], delta:PagesDelta) -> [PageBlock]
+  sync apply_page_title(title:str, delta:PagesDelta, active_page:str) -> str
+  sync apply_page_rename(pages:[PageItem], delta:PagesDelta) -> [PageItem]
   sync plane_live_hit(kind:str, module:str, want:str) -> bool
   sync keep_str(loaded:bool, next:str, current:str) -> str
   sync keep_bool(loaded:bool, next:bool, current:bool) -> bool
