@@ -535,6 +535,13 @@ impl StreamHub {
         }
     }
 
+    /// One snapshot topic re-composed its document for one session.
+    fn note_snapshot_sample(&self, topic: crate::metrics::SnapshotTopic) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.record_snapshot_sample(topic);
+        }
+    }
+
     pub fn prime(&self, height: u64, root_hash: impl Into<String>) {
         *self.tip.write().expect("stream tip lock poisoned") = Some((height, root_hash.into()));
     }
@@ -2320,6 +2327,9 @@ async fn catch_up_metrics(
             "no metrics exposition is wired on this daemon",
         )]);
     };
+    handle
+        .stream_hub()
+        .note_snapshot_sample(crate::metrics::SnapshotTopic::Metrics);
     let time_ms = unix_millis();
     *sampled_ms = time_ms;
     CatchUpResult::keep(vec![ServerFrame::Tail {
@@ -2350,6 +2360,11 @@ async fn catch_up_peers(topic: &str, state: &mut TopicState, handle: &NodeHandle
             "no metrics exposition is wired on this daemon",
         )]);
     };
+    // BELOW the availability guard: the counter says "a document was composed",
+    // and a catch-up that drops the topic composed nothing.
+    handle
+        .stream_hub()
+        .note_snapshot_sample(crate::metrics::SnapshotTopic::Peers);
     let standing = cell.peers_standing();
     let time_ms = unix_millis();
     *sampled_ms = time_ms;
@@ -2377,6 +2392,9 @@ async fn catch_up_status(
     let TopicState::Status { sampled_ms } = state else {
         return CatchUpResult::keep(Vec::new());
     };
+    handle
+        .stream_hub()
+        .note_snapshot_sample(crate::metrics::SnapshotTopic::Status);
     let time_ms = unix_millis();
     *sampled_ms = time_ms;
     let status = Box::new(handle.status_cell().current());

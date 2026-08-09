@@ -51,6 +51,35 @@ struct SweepLabels {
     cause: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct SnapshotLabels {
+    topic: String,
+}
+
+/// A snapshot topic re-composed its sample.
+///
+/// A closed set: these are the three topics whose catch-up rebuilds a whole
+/// document on the heartbeat rather than scanning a cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotTopic {
+    /// the whole OpenMetrics exposition.
+    Metrics,
+    /// the direct-peer sample — a WHOLE registry encode per sample.
+    Peers,
+    /// the node-status projection; a cell read, effectively free.
+    Status,
+}
+
+impl SnapshotTopic {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Metrics => "metrics",
+            Self::Peers => "peers",
+            Self::Status => "status",
+        }
+    }
+}
+
 /// What sent a ws session back to the derived index.
 ///
 /// A closed set, so a caller cannot invent a label and split the series.
@@ -114,6 +143,7 @@ pub struct NodeMetrics {
     index_poisoned: Registered<raw::Gauge>,
     index_height: Registered<raw::Family<ModuleLabels, raw::Gauge>>,
     stream_index_sweeps: Registered<raw::Family<SweepLabels, raw::Counter>>,
+    stream_snapshot_samples: Registered<raw::Family<SnapshotLabels, raw::Counter>>,
     operations: Arc<RwLock<OperationalStatus>>,
 }
 
@@ -143,6 +173,19 @@ impl NodeMetrics {
             stream_index_sweeps: context.family(
                 "ducktape_stream_index_sweeps",
                 "ws sessions sent to re-scan the derived index, by what woke them",
+            ),
+            // THE SUBSCRIPTION-IS-THE-BUDGET CLAIM'S ONLY WITNESS. A snapshot
+            // topic re-composes its whole document per heartbeat tick, per
+            // session, for as long as the session holds it — and `peers`
+            // encodes the ENTIRE metrics registry to do it. The whole cost
+            // argument is that dropping the socket stops that at the source,
+            // which is a claim about session teardown that nothing else
+            // observes. If this keeps climbing after the last subscriber
+            // leaves, sessions are outliving their sockets and no other series
+            // would say so.
+            stream_snapshot_samples: context.family(
+                "ducktape_stream_snapshot_samples",
+                "snapshot-topic documents re-composed for a subscriber, by topic",
             ),
             apply_latency: context.histogram(
                 "ducktape_block_apply_latency_seconds",
@@ -255,6 +298,15 @@ impl NodeMetrics {
         self.stream_index_sweeps
             .get_or_create(&SweepLabels {
                 cause: cause.label().to_string(),
+            })
+            .inc();
+    }
+
+    /// One snapshot topic re-composed its document for one session.
+    pub fn record_snapshot_sample(&self, topic: SnapshotTopic) {
+        self.stream_snapshot_samples
+            .get_or_create(&SnapshotLabels {
+                topic: topic.label().to_string(),
             })
             .inc();
     }
