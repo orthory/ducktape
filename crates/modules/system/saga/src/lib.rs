@@ -57,13 +57,21 @@
 //!
 //! retention is BOUNDED, and owners may still prune eagerly. `Prune` removes
 //! terminal sagas on demand, gated to the recorded trigger origin per id; on
-//! top of that every block boundary trims the terminal tail to
-//! [`MAX_RETAINED_TERMINAL`] entries / [`MAX_RETAINED_TERMINAL_BYTES`] bytes,
-//! newest first ([`terminal_evictions`]) — a pure function of the committed
-//! map, so every validator drops the identical set whether it replayed the
-//! state or adopted a snapshot. pending sagas are never eligible. an evicted
-//! id behaves exactly like an explicitly pruned one: unknown to every handler,
-//! and free to trigger again as new work.
+//! top of that EVERY op trims the terminal tail to [`MAX_RETAINED_TERMINAL`]
+//! entries / [`MAX_RETAINED_TERMINAL_BYTES`] bytes, newest first
+//! ([`terminal_evictions`]) — a pure function of the visible map, so every
+//! validator drops the identical set whether it replayed the state or adopted
+//! a snapshot. pending sagas are never eligible. an evicted id behaves exactly
+//! like an explicitly pruned one: unknown to every handler, and free to
+//! trigger again as new work.
+//!
+//! the trim runs inside `execute` and STAGES its removals, deliberately: the
+//! native module merges its overlay at `commit_block` while the wasm shell
+//! (`snapshot_guest!`) calls the inner `commit_block` once per OP, so a
+//! boundary hook reading the whole committed map would evict at a different
+//! point under the two. both are chain participants — `bin/noded` and
+//! `bin/simnode` construct this native module, `bin/node` loads the component
+//! — so they must agree op for op, not just block for block.
 //!
 //! `root()` folds in every field, so any transition moves the root-hash. a
 //! joiner rebuilds this module from a peer via [`SagaModule::snapshot`] /
@@ -229,19 +237,19 @@ fn encode_committed(sagas: &BTreeMap<String, Saga>) -> Vec<u8> {
 }
 
 /// the retention decision, as a pure function: which terminal sagas this
-/// committed map must drop to stay inside
-/// [`MAX_RETAINED_TERMINAL`]/[`MAX_RETAINED_TERMINAL_BYTES`].
+/// VISIBLE map (committed plus this op's staged overlay) must drop to stay
+/// inside [`MAX_RETAINED_TERMINAL`]/[`MAX_RETAINED_TERMINAL_BYTES`].
 ///
 /// terminal-only — a pending saga is live work and is never eligible. terminal
 /// receipts are ranked NEWEST first by `(updated_at, id)` and kept while both
 /// budgets hold, so the newest receipt always survives and the retained tail is
 /// at most the byte budget plus one maximal entry.
 ///
-/// it reads nothing but the map, so every validator evicts the identical set at
-/// the identical block — and a node that adopted the state from a snapshot
-/// decides the same as one that replayed it.
-fn terminal_evictions(sagas: &BTreeMap<String, Saga>) -> Vec<String> {
-    let mut terminal: Vec<(u64, &String, usize)> = sagas
+/// it reads nothing but the map it is handed, so every validator evicts the
+/// identical set at the identical op — and a node that adopted the state from
+/// a snapshot decides the same as one that replayed it.
+fn terminal_evictions(sagas: &BTreeMap<&str, &Saga>) -> Vec<String> {
+    let mut terminal: Vec<(u64, &str, usize)> = sagas
         .iter()
         .filter(|(_, s)| s.status.is_terminal())
         .map(|(id, s)| {
@@ -249,7 +257,7 @@ fn terminal_evictions(sagas: &BTreeMap<String, Saga>) -> Vec<String> {
                 + s.reply_payload.len()
                 + s.result.as_ref().map_or(0, Vec::len)
                 + s.error.as_ref().map_or(0, String::len);
-            (s.updated_at, id, bytes)
+            (s.updated_at, *id, bytes)
         })
         .collect();
     // newest first; the id breaks ties, so the order is total and stable.
@@ -267,7 +275,7 @@ fn terminal_evictions(sagas: &BTreeMap<String, Saga>) -> Vec<String> {
             kept_bytes = kept_bytes.saturating_add(bytes);
             continue;
         }
-        evicted.push(id.clone());
+        evicted.push(id.to_string());
     }
     evicted
 }
@@ -528,6 +536,29 @@ impl SagaModule {
     /// stage a removal for this block without committing.
     fn stage_remove(&mut self, saga_id: String) {
         self.pending.insert(saga_id, None);
+    }
+
+    /// the whole visible map — committed, with this block's staged writes and
+    /// removals applied. the same view `get` answers from, materialized.
+    fn visible(&self) -> BTreeMap<&str, &Saga> {
+        let mut visible: BTreeMap<&str, &Saga> = self
+            .sagas
+            .iter()
+            .map(|(id, saga)| (id.as_str(), saga))
+            .collect();
+        for (id, staged) in &self.pending {
+            match staged {
+                Some(saga) => visible.insert(id.as_str(), saga),
+                None => visible.remove(id.as_str()),
+            };
+        }
+        visible
+    }
+
+    /// which terminal sagas this op must evict — [`terminal_evictions`] over
+    /// the visible map.
+    fn terminal_evictions(&self) -> Vec<String> {
+        terminal_evictions(&self.visible())
     }
 
     /// every saga id visible this dispatch — committed plus staged, sorted —
@@ -809,6 +840,115 @@ impl Module for SagaModule {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        self.handle(ctx, msg).await?;
+        // bounded retention, staged like every other write this op makes —
+        // NOT at the block boundary. the native module merges its overlay in
+        // `commit_block` while the wasm shell calls the inner `commit_block`
+        // once per OP, so a boundary hook reading the whole committed map
+        // would evict at a different point under the two, and both run as
+        // chain participants (`bin/noded`/`bin/simnode` build the native
+        // module, `bin/node` loads the component). staging the removals here
+        // puts them in the same read-your-writes overlay every later op in
+        // the block already sees — identical state either way.
+        for saga_id in self.terminal_evictions() {
+            self.stage_remove(saga_id);
+        }
+        Ok(())
+    }
+
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        match decode_query(req).map_err(Error::Module)? {
+            SagaQuery::Get { saga_id } => Ok(encode_reply(&SagaReply::Saga(
+                self.get(&saga_id).map(Self::view),
+            ))),
+            SagaQuery::NextExpiry => {
+                // the crank pump's read: the earliest lease-expiry or
+                // deadline over PENDING sagas — once the current view reaches
+                // it, a Crank is guaranteed to transition something.
+                let next = self
+                    .visible_ids()
+                    .into_iter()
+                    .filter_map(|id| self.get(&id))
+                    .filter(|saga| !saga.status.is_terminal())
+                    .flat_map(|saga| [saga.lease_expires_at, saga.deadline])
+                    .flatten()
+                    .min();
+                Ok(encode_reply(&SagaReply::NextExpiry(next)))
+            }
+            SagaQuery::AssignedPending { assignee } => {
+                // the resident worker pump's read: reconstruct exactly the
+                // WorkerRequest the effect lane carried for every pending
+                // attempt leased to `assignee`. a node that installs synced
+                // boundaries (and so never observes effects) discovers its
+                // own assigned work here; visible_ids is sorted, so the
+                // projection is deterministic.
+                let requests = self
+                    .visible_ids()
+                    .into_iter()
+                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
+                    .filter(|(_, saga)| {
+                        !saga.status.is_terminal()
+                            && saga.assignee.as_deref() == Some(assignee.as_slice())
+                    })
+                    .map(|(id, saga)| WorkerRequest {
+                        saga_id: id,
+                        attempt: saga.attempt,
+                        spec: saga.spec.clone(),
+                        deadline: saga.deadline,
+                        assignee: saga.assignee.clone(),
+                    })
+                    .collect();
+                Ok(encode_reply(&SagaReply::AssignedPending(requests)))
+            }
+            SagaQuery::UnassignedPending => {
+                // the claim lane's read: the announcement requests, which no
+                // node holds a lease on yet. Same projection shape as
+                // `AssignedPending` (and the same `visible_ids` ordering, so
+                // it is deterministic) — only the assignee predicate differs,
+                // and `assignee` rides through as `None` so the worker gate
+                // sees exactly the announcement the effect lane carried.
+                let requests = self
+                    .visible_ids()
+                    .into_iter()
+                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
+                    .filter(|(_, saga)| !saga.status.is_terminal() && saga.assignee.is_none())
+                    .map(|(id, saga)| WorkerRequest {
+                        saga_id: id,
+                        attempt: saga.attempt,
+                        spec: saga.spec.clone(),
+                        deadline: saga.deadline,
+                        assignee: None,
+                    })
+                    .collect();
+                Ok(encode_reply(&SagaReply::UnassignedPending(requests)))
+            }
+        }
+    }
+
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        for (id, staged) in std::mem::take(&mut self.pending) {
+            match staged {
+                Some(saga) => {
+                    self.sagas.insert(id, saga);
+                }
+                None => {
+                    self.sagas.remove(&id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+impl SagaModule {
+    /// the op handler — one arm per [`SagaMsg`] variant. every write it makes
+    /// is STAGED; `execute` wraps it with the retention trim.
+    async fn handle(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             SagaMsg::Trigger {
                 saga_id,
@@ -1203,8 +1343,9 @@ impl Module for SagaModule {
             SagaMsg::Prune { saga_ids } => {
                 // explicit GC: remove TERMINAL sagas whose recorded trigger
                 // origin matches the submitter. non-terminal, foreign, and
-                // unknown ids are skipped as no-ops. no lazy retention sweep
-                // exists — retention is always an owner's explicit choice.
+                // unknown ids are skipped as no-ops. the automatic trim in
+                // `execute` bounds the tail regardless; this is an owner
+                // reclaiming a specific id early.
                 let origin = saga_origin(&ctx.env().origin);
                 for saga_id in saga_ids {
                     let Some(current) = self.get(&saga_id) else {
@@ -1217,99 +1358,6 @@ impl Module for SagaModule {
                 }
             }
         }
-        Ok(())
-    }
-
-    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match decode_query(req).map_err(Error::Module)? {
-            SagaQuery::Get { saga_id } => Ok(encode_reply(&SagaReply::Saga(
-                self.get(&saga_id).map(Self::view),
-            ))),
-            SagaQuery::NextExpiry => {
-                // the crank pump's read: the earliest lease-expiry or
-                // deadline over PENDING sagas — once the current view reaches
-                // it, a Crank is guaranteed to transition something.
-                let next = self
-                    .visible_ids()
-                    .into_iter()
-                    .filter_map(|id| self.get(&id))
-                    .filter(|saga| !saga.status.is_terminal())
-                    .flat_map(|saga| [saga.lease_expires_at, saga.deadline])
-                    .flatten()
-                    .min();
-                Ok(encode_reply(&SagaReply::NextExpiry(next)))
-            }
-            SagaQuery::AssignedPending { assignee } => {
-                // the resident worker pump's read: reconstruct exactly the
-                // WorkerRequest the effect lane carried for every pending
-                // attempt leased to `assignee`. a node that installs synced
-                // boundaries (and so never observes effects) discovers its
-                // own assigned work here; visible_ids is sorted, so the
-                // projection is deterministic.
-                let requests = self
-                    .visible_ids()
-                    .into_iter()
-                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
-                    .filter(|(_, saga)| {
-                        !saga.status.is_terminal()
-                            && saga.assignee.as_deref() == Some(assignee.as_slice())
-                    })
-                    .map(|(id, saga)| WorkerRequest {
-                        saga_id: id,
-                        attempt: saga.attempt,
-                        spec: saga.spec.clone(),
-                        deadline: saga.deadline,
-                        assignee: saga.assignee.clone(),
-                    })
-                    .collect();
-                Ok(encode_reply(&SagaReply::AssignedPending(requests)))
-            }
-            SagaQuery::UnassignedPending => {
-                // the claim lane's read: the announcement requests, which no
-                // node holds a lease on yet. Same projection shape as
-                // `AssignedPending` (and the same `visible_ids` ordering, so
-                // it is deterministic) — only the assignee predicate differs,
-                // and `assignee` rides through as `None` so the worker gate
-                // sees exactly the announcement the effect lane carried.
-                let requests = self
-                    .visible_ids()
-                    .into_iter()
-                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
-                    .filter(|(_, saga)| !saga.status.is_terminal() && saga.assignee.is_none())
-                    .map(|(id, saga)| WorkerRequest {
-                        saga_id: id,
-                        attempt: saga.attempt,
-                        spec: saga.spec.clone(),
-                        deadline: saga.deadline,
-                        assignee: None,
-                    })
-                    .collect();
-                Ok(encode_reply(&SagaReply::UnassignedPending(requests)))
-            }
-        }
-    }
-
-    async fn commit_block(&mut self) -> Result<(), Error> {
-        for (id, staged) in std::mem::take(&mut self.pending) {
-            match staged {
-                Some(saga) => {
-                    self.sagas.insert(id, saga);
-                }
-                None => {
-                    self.sagas.remove(&id);
-                }
-            }
-        }
-        // bounded retention: the terminal tail is trimmed at every boundary,
-        // as a pure function of what just committed.
-        for id in terminal_evictions(&self.sagas) {
-            self.sagas.remove(&id);
-        }
-        Ok(())
-    }
-
-    async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending.clear();
         Ok(())
     }
 }
@@ -3718,6 +3766,12 @@ mod tests {
         }
     }
 
+    /// the retention decision reads a borrowed view; these unit cases own
+    /// their fixture map.
+    fn borrowed(map: &BTreeMap<String, Saga>) -> BTreeMap<&str, &Saga> {
+        map.iter().map(|(id, saga)| (id.as_str(), saga)).collect()
+    }
+
     #[test]
     fn the_retention_decision_evicts_the_oldest_terminal_and_nothing_else() {
         // the pending saga carries the OLDEST timestamp: age alone must never
@@ -3736,7 +3790,7 @@ mod tests {
             map.insert(format!("s{i:04}"), saga_state(status, 100 + i as u64, 4));
         }
 
-        let mut evicted = terminal_evictions(&map);
+        let mut evicted = terminal_evictions(&borrowed(&map));
         evicted.sort();
         let expected: Vec<String> = (0..overflow).map(|i| format!("s{i:04}")).collect();
         assert_eq!(evicted, expected, "exactly the oldest terminal receipts go");
@@ -3745,7 +3799,7 @@ mod tests {
         let mut small = BTreeMap::new();
         small.insert("pending".to_string(), saga_state(SagaStatus::Pending, 0, 4));
         small.insert("one".to_string(), saga_state(SagaStatus::Done, 9, 4));
-        assert!(terminal_evictions(&small).is_empty());
+        assert!(terminal_evictions(&borrowed(&small)).is_empty());
     }
 
     #[test]
@@ -3758,7 +3812,7 @@ mod tests {
         for i in 0..4u64 {
             map.insert(format!("s{i}"), saga_state(SagaStatus::Done, i, half));
         }
-        assert_eq!(terminal_evictions(&map), vec!["s0".to_string()]);
+        assert_eq!(terminal_evictions(&borrowed(&map)), vec!["s0".to_string()]);
 
         // one oversized receipt is still kept — the newest always survives —
         // but it pushes every older one out.
@@ -3768,7 +3822,41 @@ mod tests {
             "huge".to_string(),
             saga_state(SagaStatus::Done, 2, MAX_RETAINED_TERMINAL_BYTES + 1),
         );
-        assert_eq!(terminal_evictions(&map), vec!["old".to_string()]);
+        assert_eq!(terminal_evictions(&borrowed(&map)), vec!["old".to_string()]);
+    }
+
+    #[test]
+    fn retention_is_staged_inside_the_op_not_deferred_to_the_block_boundary() {
+        // the wasm shell (`snapshot_guest!`) calls the inner `commit_block`
+        // once per OP; the native module once per BLOCK — and both run as
+        // chain participants. a trim living in `commit_block` would therefore
+        // evict mid-block under wasm and only at the boundary natively, and
+        // the two would disagree on the state root of any block that crosses
+        // the cap. staged inside the op, the eviction lands in the same
+        // read-your-writes overlay every later op of the block already reads.
+        let mut m = SagaModule::new("saga");
+        let mut ctx = CaptureCtx::new().at(1);
+        for i in 0..=MAX_RETAINED_TERMINAL {
+            let id = sid(&format!("s{i:04}"));
+            exec(&mut m, &mut ctx, &trigger(&id, b"w")).unwrap();
+            exec(&mut m, &mut ctx, &oracle(&id, 0, Ok(b"r".to_vec()))).unwrap();
+        }
+        // one consensus_time for the whole block, so the id breaks every tie:
+        // newest-first ranks the LOWEST id last, and it is the one that goes.
+        let evicted = sid("s0000");
+        assert!(
+            m.get(&evicted).is_none(),
+            "the eviction must be visible to the rest of THIS block"
+        );
+        // and the freed id is new work to the very next op — what a wasm
+        // validator sees, so a native one must see it too.
+        exec(&mut m, &mut ctx, &trigger(&evicted, b"again")).unwrap();
+        assert_eq!(m.get(&evicted).map(|s| s.status), Some(SagaStatus::Pending));
+        commit(&mut m);
+        assert_eq!(
+            m.sagas.get(&evicted).map(|s| s.status),
+            Some(SagaStatus::Pending)
+        );
     }
 
     #[test]

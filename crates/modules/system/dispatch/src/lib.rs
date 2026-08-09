@@ -28,15 +28,23 @@
 //!
 //! ## retention
 //!
-//! a dispatch's record is a receipt, not a ledger entry to keep forever. once
-//! delivered it is read-only, so every block boundary trims the delivered tail
-//! to [`MAX_RETAINED_DELIVERED`] entries / [`MAX_RETAINED_DELIVERED_BYTES`]
-//! bytes, newest first ([`delivered_evictions`]) — a pure function of the
-//! committed map, so every validator drops the identical set. in-flight
-//! (`AwaitingResult`) and undelivered (`AwaitingDelivery`) dispatches are
-//! never eligible. a receiver may re-use a `dispatch_id` whose receipt was
-//! trimmed: the key is free again and the re-dispatch is new work, the same
-//! GC semantics saga's explicit `Prune` has always had.
+//! the RECORD is permanent, the PAYLOAD is not. a dispatch record is the
+//! network's turn-claim key — `runs` asks "does this dispatch id exist?" to
+//! refuse a second run for a `run_id` it already ran, long after its own
+//! pending entry is gone — so a record is never evicted, ever. what is
+//! unbounded is the outcome: up to [`MAX_RESULT_BYTES`] per dispatch, and
+//! every wasm op decodes the WHOLE state before it looks at its payload, so a
+//! big enough map traps every op on every validator. delivery therefore hands
+//! the bytes to the receiver and DROPS this module's copy, in the same
+//! transition, leaving a fixed-size receipt. state then grows with the number
+//! of dispatches, not with the size of their results.
+//!
+//! the drop happens inside `execute`, not at the block boundary: the native
+//! module merges its staged overlay at `commit_block` while the wasm shell
+//! calls the inner `commit_block` once per OP, so a boundary hook that reads
+//! the whole committed map would decide differently under the two — and both
+//! run as chain participants (`bin/noded` and `bin/simnode` construct the
+//! native module, `bin/node` loads the component).
 //!
 //! ## self-containment
 //!
@@ -339,54 +347,6 @@ fn decode_committed(buf: &[u8]) -> Result<Committed, Error> {
 
     cur.finish("snapshot")?;
     Ok(c)
-}
-
-// ---- retention -------------------------------------------------------------------
-
-/// the retention decision, as a pure function: which delivered dispatches this
-/// committed map must drop to stay inside
-/// [`MAX_RETAINED_DELIVERED`]/[`MAX_RETAINED_DELIVERED_BYTES`].
-///
-/// terminal-only — an `AwaitingResult` dispatch is still in flight and an
-/// `AwaitingDelivery` one is referenced by the mailbox; neither is ever
-/// eligible. delivered receipts are ranked NEWEST first by `(updated_at, key)`
-/// and kept while both budgets hold, so the newest receipt always survives and
-/// the retained tail is at most the byte budget plus one maximal entry.
-///
-/// it reads nothing but the map, so every validator evicts the identical set
-/// at the identical block — and a node that adopted the state from a snapshot
-/// decides the same as one that replayed it.
-fn delivered_evictions(dispatches: &BTreeMap<String, DispatchState>) -> Vec<String> {
-    let mut delivered: Vec<(u64, &String, usize)> = dispatches
-        .iter()
-        .filter(|(_, d)| d.status == Status::Delivered)
-        .map(|(key, d)| {
-            let outcome_bytes = match &d.outcome {
-                None => 0,
-                Some(Ok(bytes)) => bytes.len(),
-                Some(Err(error)) => error.len(),
-            };
-            (d.updated_at, key, outcome_bytes)
-        })
-        .collect();
-    // newest first; the key breaks ties, so the order is total and stable.
-    delivered.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
-
-    let mut kept = 0usize;
-    let mut kept_bytes = 0usize;
-    let mut evicted = Vec::new();
-    for (_, key, bytes) in delivered {
-        let within_count = kept < MAX_RETAINED_DELIVERED;
-        // checked BEFORE this entry is added, so the newest is always kept.
-        let within_budget = kept_bytes <= MAX_RETAINED_DELIVERED_BYTES;
-        if within_count && within_budget {
-            kept += 1;
-            kept_bytes = kept_bytes.saturating_add(bytes);
-            continue;
-        }
-        evicted.push(key.clone());
-    }
-    evicted
 }
 
 // ---- the module -----------------------------------------------------------------
@@ -748,6 +708,10 @@ impl DispatchModule {
             let mut dispatch = current;
             dispatch.status = Status::Delivered;
             dispatch.updated_at = now;
+            // the receiver now owns the bytes; a second copy here would grow
+            // the root preimage forever (crate header, "retention"). the
+            // RECORD stays — it is `runs`' permanent turn claim.
+            dispatch.outcome = None;
             ctx.emit_msg(Msg {
                 target: dispatch.receiver.clone(),
                 payload: encode_result_event(&ResultEvent {
@@ -960,11 +924,6 @@ impl Module for DispatchModule {
         if let Some((mailbox, next_seq)) = self.staged_queue.take() {
             self.committed.mailbox = mailbox;
             self.committed.next_seq = next_seq;
-        }
-        // bounded retention: the delivered tail is trimmed at every boundary,
-        // as a pure function of what just committed.
-        for key in delivered_evictions(&self.committed.dispatches) {
-            self.committed.dispatches.remove(&key);
         }
         Ok(())
     }
@@ -1654,78 +1613,37 @@ mod tests {
 
     // ---- retention ---------------------------------------------------------
 
-    fn state(status: Status, updated_at: u64, outcome_bytes: usize) -> DispatchState {
-        DispatchState {
-            receiver: "caller".into(),
-            dispatch_id: "d".into(),
-            recipe_id: "summarize".into(),
-            contract: OutputContract::Text,
-            saga_id: "s".into(),
-            status,
-            outcome: (status != Status::AwaitingResult).then(|| Ok(vec![b'x'; outcome_bytes])),
-            created_at: updated_at,
-            updated_at,
-        }
+    /// drive one dispatch all the way from `Dispatch` to `Delivered`, one
+    /// block per transition, with an `outcome_bytes`-sized result.
+    fn full_round(m: &mut DispatchModule, i: usize, outcome_bytes: usize) -> String {
+        let height = (i as u64 + 1) * 4;
+        let dispatch_id = format!("d{i:04}");
+        let key = dispatch_key("caller", &dispatch_id);
+
+        let mut ctx = mk_ctx(height, Origin::Module("caller".into()));
+        exec(m, &mut ctx, &dispatch_op(&dispatch_id, b"input")).unwrap();
+        commit(m);
+
+        let mut ctx = mk_ctx(height + 1, Origin::Module("saga".into()));
+        let callback = Msg {
+            target: "dispatch".into(),
+            payload: encode_callback(&SagaCallback {
+                saga_id: saga_id_for(&key),
+                payload: key.clone().into_bytes(),
+                outcome: SagaOutcome::Done(vec![b'x'; outcome_bytes]),
+            }),
+        };
+        block_on(m.execute(&mut ctx, &callback)).unwrap();
+        commit(m);
+
+        let mut ctx = mk_ctx(height + 2, Origin::System);
+        exec(m, &mut ctx, &DispatchMsg::DeliverPending {}).unwrap();
+        commit(m);
+        key
     }
 
     #[test]
-    fn the_retention_decision_evicts_the_oldest_delivered_and_nothing_else() {
-        // the in-flight pair carries the OLDEST timestamps: age alone must
-        // never make an undelivered dispatch eligible.
-        let mut map = BTreeMap::new();
-        map.insert("inflight".to_string(), state(Status::AwaitingResult, 0, 0));
-        map.insert("queued".to_string(), state(Status::AwaitingDelivery, 1, 4));
-        let overflow = 5;
-        for i in 0..MAX_RETAINED_DELIVERED + overflow {
-            map.insert(
-                format!("d{i:04}"),
-                state(Status::Delivered, 100 + i as u64, 4),
-            );
-        }
-
-        let mut evicted = delivered_evictions(&map);
-        evicted.sort();
-        let expected: Vec<String> = (0..overflow).map(|i| format!("d{i:04}")).collect();
-        assert_eq!(
-            evicted, expected,
-            "exactly the oldest delivered receipts go"
-        );
-
-        // and under the cap it evicts nothing at all.
-        let mut small = BTreeMap::new();
-        small.insert("inflight".to_string(), state(Status::AwaitingResult, 0, 0));
-        small.insert("one".to_string(), state(Status::Delivered, 9, 4));
-        assert!(delivered_evictions(&small).is_empty());
-    }
-
-    #[test]
-    fn the_retention_decision_also_holds_a_byte_budget() {
-        // four half-budget receipts: the running total is checked BEFORE each
-        // entry is added, so three are kept (the last one crossing the line)
-        // and the oldest is evicted — count cap untouched.
-        let half = MAX_RETAINED_DELIVERED_BYTES / 2;
-        let mut map = BTreeMap::new();
-        for i in 0..4u64 {
-            map.insert(format!("d{i}"), state(Status::Delivered, i, half));
-        }
-        assert_eq!(delivered_evictions(&map), vec!["d0".to_string()]);
-
-        // one oversized receipt is still kept — the newest always survives —
-        // but it pushes every older one out.
-        let mut map = BTreeMap::new();
-        map.insert("old".to_string(), state(Status::Delivered, 1, 8));
-        map.insert(
-            "huge".to_string(),
-            state(Status::Delivered, 2, MAX_RETAINED_DELIVERED_BYTES + 1),
-        );
-        assert_eq!(delivered_evictions(&map), vec!["old".to_string()]);
-    }
-
-    #[test]
-    fn sustained_dispatch_traffic_keeps_the_committed_map_bounded() {
-        // the growth-bound pin: three capfuls of dispatches driven all the way
-        // to Delivered, one per block. without the boundary trim this map is
-        // 1:1 with every dispatch ever made — the state-growth cliff.
+    fn delivery_hands_the_outcome_over_and_drops_this_module_s_copy() {
         let mut m = module();
         let mut ctx = mk_ctx(0, owner());
         exec(
@@ -1736,49 +1654,87 @@ mod tests {
         .unwrap();
         commit(&mut m);
 
-        const ROUNDS: usize = MAX_RETAINED_DELIVERED * 3;
+        // the pre-delivery record still carries the bytes — the mailbox sweep
+        // is what needs them.
+        let key = dispatch_key("caller", "d0000");
+        let mut ctx = mk_ctx(4, Origin::Module("caller".into()));
+        exec(&mut m, &mut ctx, &dispatch_op("d0000", b"input")).unwrap();
+        commit(&mut m);
+        callback_for(&mut m, &key, SagaOutcome::Done(b"result".to_vec())).unwrap();
+        commit(&mut m);
+        assert_eq!(
+            get_dispatch(&m, &key).unwrap().outcome,
+            Some(Ok(b"result".to_vec()))
+        );
+
+        let mut sys = mk_ctx(6, Origin::System);
+        exec(&mut m, &mut sys, &DispatchMsg::DeliverPending {}).unwrap();
+        commit(&mut m);
+
+        // the receiver got every byte...
+        let event = crate::decode_result_event(&sys.msgs()[0].payload).unwrap();
+        assert_eq!(event.outcome, Ok(b"result".to_vec()));
+        // ...and the record kept none of them, while STAYING a record.
+        let view = get_dispatch(&m, &key).expect("the delivered record survives");
+        assert_eq!(view.status, DispatchStatus::Delivered);
+        assert_eq!(view.outcome, None, "the delivered copy is dropped");
+    }
+
+    #[test]
+    fn sustained_dispatch_traffic_keeps_the_state_bounded_but_never_forgets_a_run() {
+        // the growth pin. every dispatch record is `runs`' PERMANENT turn
+        // claim (runs::dispatch_flow::turn_taken) — evicting one re-opens a
+        // settled run for a duplicate agent launch — so the count grows 1:1
+        // with traffic ON PURPOSE. what must NOT grow is the payload: the
+        // outcome is up to MAX_RESULT_BYTES and every wasm op decodes the
+        // whole state first.
+        let mut m = module();
+        let mut ctx = mk_ctx(0, owner());
+        exec(
+            &mut m,
+            &mut ctx,
+            &register(OutputContract::Text, Routing::Rendezvous),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        const ROUNDS: usize = 64;
+        const OUTCOME_BYTES: usize = 64 * 1024;
         for i in 0..ROUNDS {
-            let height = (i as u64 + 1) * 4;
-            let dispatch_id = format!("d{i:04}");
-            let key = dispatch_key("caller", &dispatch_id);
-
-            let mut ctx = mk_ctx(height, Origin::Module("caller".into()));
-            exec(&mut m, &mut ctx, &dispatch_op(&dispatch_id, b"input")).unwrap();
-            commit(&mut m);
-
-            let mut ctx = mk_ctx(height + 1, Origin::Module("saga".into()));
-            let callback = Msg {
-                target: "dispatch".into(),
-                payload: encode_callback(&SagaCallback {
-                    saga_id: saga_id_for(&key),
-                    payload: key.clone().into_bytes(),
-                    outcome: SagaOutcome::Done(b"ok".to_vec()),
-                }),
-            };
-            block_on(m.execute(&mut ctx, &callback)).unwrap();
-            commit(&mut m);
-
-            let mut ctx = mk_ctx(height + 2, Origin::System);
-            exec(&mut m, &mut ctx, &DispatchMsg::DeliverPending {}).unwrap();
-            commit(&mut m);
-
-            assert!(
-                m.committed.dispatches.len() <= MAX_RETAINED_DELIVERED,
-                "round {i}: {} dispatches retained",
-                m.committed.dispatches.len()
-            );
+            full_round(&mut m, i, OUTCOME_BYTES);
         }
 
-        assert_eq!(m.committed.dispatches.len(), MAX_RETAINED_DELIVERED);
-        assert_eq!(pending_deliveries(&m), 0, "every result was delivered");
-        // the tail that survived is the NEWEST one.
-        let newest = dispatch_key("caller", &format!("d{:04}", ROUNDS - 1));
-        assert!(m.committed.dispatches.contains_key(&newest));
-        assert!(
-            get_dispatch(&m, &dispatch_key("caller", "d0000")).is_none(),
-            "the oldest receipt was trimmed"
+        assert_eq!(
+            m.committed.dispatches.len(),
+            ROUNDS,
+            "no receipt is ever evicted: the record IS the turn claim"
         );
-        // the recipe is untouched by dispatch retention.
+        assert_eq!(pending_deliveries(&m), 0, "every result was delivered");
+
+        // ROUNDS * 64 KiB of results passed through; the state that commits
+        // to them is a small multiple of the record count, not of the bytes.
+        let bytes = m.snapshot().len();
+        let ceiling = ROUNDS * 1024;
+        assert!(
+            bytes < ceiling,
+            "state is {bytes} bytes for {ROUNDS} delivered dispatches (ceiling {ceiling}); \
+             delivered outcomes are being retained"
+        );
+
+        // the oldest turn is still claimed — the query runs' `turn_taken`
+        // makes, answered from committed state only.
+        let reply = block_on(m.query(&crate::encode_query(&DispatchQuery::Dispatch {
+            receiver: "caller".into(),
+            dispatch_id: "d0000".into(),
+        })))
+        .unwrap();
+        let DispatchReply::Dispatch(Some(oldest)) = crate::decode_reply(&reply).unwrap() else {
+            panic!("the oldest turn claim must still answer");
+        };
+        assert_eq!(oldest.status, DispatchStatus::Delivered);
+        assert_eq!(oldest.outcome, None);
+
+        // the recipe is untouched.
         assert_eq!(m.committed.recipes.len(), 1);
     }
 }
