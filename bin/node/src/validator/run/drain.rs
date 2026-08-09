@@ -13,7 +13,7 @@ use sdk::Msg;
 
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET};
-use crate::drain_actions::{CutoverTrigger, EpochActions};
+use crate::drain_actions::{CutoverTrigger, EpochActions, checkpoint_due, cooldown_until};
 use noded::projection::{BlockProjection, project_block};
 use crate::host_reads::{
     read_valset_members, read_valset_residents,
@@ -66,6 +66,7 @@ impl ValidatorRuntime<'_> {
             validator_relay,
             last_published,
             blocks_since_checkpoint,
+            checkpoint_not_before,
             last_reach_view,
             pending_retarget,
             next_drain,
@@ -471,8 +472,20 @@ impl ValidatorRuntime<'_> {
         // prune the op journal below the PREVIOUS checkpoint once
         // the persisted floor has passed it (pruned frames must
         // never be needed to resolve a re-reported finalization).
-        if *blocks_since_checkpoint >= checkpoint_blocks
-            && let Some(f) = node.finalized()
+        // A BLOCK COUNT ALONE CANNOT EXPRESS WHAT A CHECKPOINT COSTS. 32 blocks
+        // is ~30 s of chain, and one capture measured 59–70 s on a real
+        // workspace (#1018) — so the trigger fired again before the previous
+        // one had finished paying for itself, and the node spent two thirds of
+        // its life in this branch, unable to poll any other arm of the loop.
+        // The cadence is therefore gated on BOTH: enough blocks, and enough
+        // recovery time since the last attempt to keep the loop's occupancy
+        // under one part in `CHECKPOINT_DUTY_LIMIT`.
+        if checkpoint_due(
+            *blocks_since_checkpoint,
+            checkpoint_blocks,
+            context.current(),
+            *checkpoint_not_before,
+        ) && let Some(f) = node.finalized()
         {
             // EVERY STAGE BELOW RUNS ON THE SELECT LOOP, so its duration is
             // time the `http_ingress` arm is not polled and `/v1/query` is
@@ -559,6 +572,16 @@ impl ValidatorRuntime<'_> {
                     );
                 }
             }
+            // SET OUTSIDE THE MATCH, ON PURPOSE. A capture that FAILS costs the
+            // loop everything a successful one does, and the failure path does
+            // not reset `blocks_since_checkpoint` — so without this the retry
+            // is immediate and the node re-pays the full cost on every drain
+            // tick, forever. The cooldown is what makes the failure survivable.
+            let attempt = context
+                .current()
+                .duration_since(checkpoint_started)
+                .unwrap_or_default();
+            *checkpoint_not_before = cooldown_until(context.current(), attempt);
         }
 
         // the VALSET ORCHESTRATION step: observe the finalized
@@ -757,6 +780,7 @@ impl ValidatorRuntime<'_> {
                     pos,
                     *next_seq,
                 );
+                let post_cutover_started = context.current();
                 match captured {
                     Ok(m) => match node.sink_mut().write_manifest(&m).await {
                         Ok(()) => {
@@ -779,6 +803,16 @@ impl ValidatorRuntime<'_> {
                          covers a restart"
                     ),
                 }
+                // THE CUTOVER CHECKPOINT IS NOT GATED — a restart must land on
+                // the new epoch's boundary — but it costs the loop exactly what
+                // the periodic one does, so it is charged the same cooldown.
+                // Otherwise the periodic branch fires immediately after it and
+                // the node pays twice back to back.
+                let post_cutover_cost = context
+                    .current()
+                    .duration_since(post_cutover_started)
+                    .unwrap_or_default();
+                *checkpoint_not_before = cooldown_until(context.current(), post_cutover_cost);
                 tracing::info!(
                     target: "ducktape::consensus",
                     node = %label,
@@ -1447,6 +1481,86 @@ mod block_cadence_tests {
         assert_ne!(
             super::round_robin_leader(5, 1, &keys),
             super::round_robin_leader(5, 2, &keys)
+        );
+    }
+
+    /// THE BLOCK COUNT ALONE MUST NO LONGER AUTHORIZE A CHECKPOINT. This is the
+    /// assertion that fails if the cooldown is dropped from the decision —
+    /// testing the arithmetic of `cooldown_until` on its own would not, since
+    /// nothing would be consulting it.
+    #[test]
+    fn a_sealed_block_count_alone_does_not_authorize_an_expensive_checkpoint() {
+        let finished = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let owed = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
+
+        // 32 blocks have sealed — the ENTIRE old trigger — but only ~30s of
+        // chain has passed, which is exactly the shape that had the node
+        // spending two thirds of its life inside the branch.
+        assert!(
+            !crate::drain_actions::checkpoint_due(
+                32,
+                32,
+                finished + std::time::Duration::from_secs(30),
+                owed
+            ),
+            "a 60s checkpoint must not be re-authorized 30s later just because 32 blocks sealed"
+        );
+        // ...and it does fire once the cost has been paid back.
+        assert!(crate::drain_actions::checkpoint_due(
+            32,
+            32,
+            finished + std::time::Duration::from_secs(420),
+            owed
+        ));
+        // A CHEAP CHECKPOINT IS NEVER DELAYED: 25ms owes 175ms of quiet, long
+        // gone by the time 32 blocks seal, so the configured cadence governs.
+        let cheap = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_millis(25));
+        assert!(crate::drain_actions::checkpoint_due(
+            32,
+            32,
+            finished + std::time::Duration::from_secs(30),
+            cheap
+        ));
+        // The cooldown never SUBSTITUTES for the cadence: quiet is necessary,
+        // not sufficient.
+        assert!(!crate::drain_actions::checkpoint_due(
+            31,
+            32,
+            finished + std::time::Duration::from_secs(420),
+            owed
+        ));
+    }
+
+    /// THE COOLDOWN IS PROPORTIONAL TO THE COST, which is the whole point: a
+    /// cheap checkpoint keeps the configured block cadence, an expensive one
+    /// backs itself off without anyone tuning a constant per workspace.
+    #[test]
+    fn a_checkpoint_holds_the_next_one_off_by_what_it_cost() {
+        let finished = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        // the demo workspace's pre-#1023 checkpoint: 60s of loop occupancy
+        // every 32 blocks (~30s of chain), i.e. it never stopped.
+        let expensive = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
+        assert_eq!(
+            expensive,
+            finished + std::time::Duration::from_secs(420),
+            "a 60s checkpoint must buy 7 minutes of quiet — 1/8 duty"
+        );
+        // post-#1023: 25ms. The hold is 175ms, far under the 32-block cadence,
+        // so the configured cadence still governs and this guard is invisible.
+        let cheap = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_millis(25));
+        assert_eq!(cheap, finished + std::time::Duration::from_millis(175));
+    }
+
+    /// A NODE THAT STOPS CHECKPOINTING IS WORSE OFF THAN ONE THAT STUTTERS —
+    /// it cannot recover quickly or admit a joiner. So the overflow direction
+    /// is "no cooldown", never "never again".
+    #[test]
+    fn an_absurd_cost_does_not_disable_checkpointing_forever() {
+        let finished = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        assert_eq!(
+            crate::drain_actions::cooldown_until(finished, std::time::Duration::MAX),
+            finished,
+            "an unrepresentable cooldown must collapse to none, not to forever"
         );
     }
 

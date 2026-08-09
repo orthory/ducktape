@@ -202,6 +202,10 @@ struct ValidatorRuntime<'a> {
     last_published: Option<u64>,
     join_requests: std::collections::BTreeMap<Vec<u8>, JoinRequestRecord>,
     blocks_since_checkpoint: u64,
+    /// the earliest a checkpoint may START again — see `cooldown_until`.
+    /// blocks alone cannot express what a checkpoint COSTS the loop, and
+    /// the loop is what answers `/v1/query` and SIGTERM (#1018).
+    checkpoint_not_before: std::time::SystemTime,
     last_reach_view: Option<u64>,
     last_flush: std::time::SystemTime,
     pending_retarget: Option<reachability::MeshEpochEvent>,
@@ -321,6 +325,9 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         std::collections::BTreeMap::new();
     // recovery cadence: sealed blocks since the last checkpoint manifest.
     let blocks_since_checkpoint: u64 = 0;
+    // no cooldown owed at boot: the first checkpoint's own cost is the
+    // estimate every later one is held off by.
+    let checkpoint_not_before = context.current();
     // the last absolute view ticked to the reachability plane — one
     // ViewTick per actual advance, not one per 100ms drain pass.
     let last_reach_view: Option<u64> = None;
@@ -457,6 +464,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         last_published,
         join_requests,
         blocks_since_checkpoint,
+        checkpoint_not_before,
         last_reach_view,
         last_flush,
         pending_retarget,
