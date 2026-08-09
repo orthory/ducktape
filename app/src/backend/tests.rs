@@ -3083,6 +3083,16 @@ async fn next_change(
         if update.kind != "tip" {
             return update;
         }
+        // AND WHILE WE ARE HOLDING A REAL ONE, PIN IT HERE. The unit test below
+        // builds its own tip, so it can only speak for `live_update` — it stays
+        // green if the stream's arm starts asking for a load. These are the
+        // tips the node actually sent, decoded by the real client, so this is
+        // the assertion that binds the arm.
+        assert!(update.height > 0, "a tip carries the head it was sent with");
+        assert!(
+            !update.load_chat && !update.load_pages,
+            "a tip must not trigger a load — that is a 1 Hz poll on an idle chain"
+        );
     }
 }
 
