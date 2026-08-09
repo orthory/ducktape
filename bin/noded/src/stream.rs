@@ -1513,6 +1513,22 @@ const FILES_WATCH_TOPIC: &str = "files:watch";
 const LOGS_TOPIC: &str = "logs";
 /// the metrics-exposition snapshot topic.
 const METRICS_TOPIC: &str = "metrics";
+/// How recently a snapshot topic must have sampled for the next wakeup to be
+/// a no-op.
+///
+/// A subscriber used to be sampled TWICE within milliseconds: the subscribe's
+/// `Wake::All`, and then the heartbeat's first tick, which fires at once
+/// (`tokio::time::interval`, unlike `index_backstop`'s `interval_at`). For
+/// `peers` that is two whole-registry encodes — 485 KB and ~10 ms each — for
+/// one subscribe, the second carrying nothing the first did not.
+///
+/// HALF THE BEAT, and both bounds are load-bearing. It must exceed the
+/// subscribe-to-first-tick gap, which is milliseconds. It must stay UNDER a
+/// full interval, or the steady cadence eats itself: a sample taken 40 ms into
+/// a period would make the tick 2960 ms later look too soon, and the topic
+/// would deliver every OTHER beat.
+const SNAPSHOT_MIN_INTERVAL_MS: u64 = HEARTBEAT_INTERVAL_MS / 2;
+
 /// the direct-peer snapshot topic — the same sample `GET /v1/peers` composes.
 const PEERS_TOPIC: &str = "peers";
 /// the node-status snapshot topic — the same projection `GET /v1/status` serves.
@@ -2308,6 +2324,15 @@ fn catch_up_term_command(
     CatchUpResult::keep(frames)
 }
 
+/// Whether a snapshot topic sampled too recently to be worth re-composing.
+///
+/// `sampled_ms` starts at 0, so a topic's FIRST catch-up always composes —
+/// which is what makes the subscribe replay the one that survives, and the
+/// immediate tick behind it the one that folds away.
+fn snapshot_is_fresh(sampled_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(sampled_ms) < SNAPSHOT_MIN_INTERVAL_MS
+}
+
 /// re-sample the node's OpenMetrics exposition through the SAME wired source
 /// GET /metrics reads (the handle's status cell), so the stream needs no
 /// second registry encoder — and no actor round-trip. one Tail frame per
@@ -2321,6 +2346,9 @@ async fn catch_up_metrics(
     let TopicState::Metrics { sampled_ms } = state else {
         return CatchUpResult::keep(Vec::new());
     };
+    if snapshot_is_fresh(*sampled_ms, unix_millis()) {
+        return CatchUpResult::keep(Vec::new());
+    }
     let Some(text) = handle.status_cell().exposition() else {
         return CatchUpResult::drop(vec![unavailable(
             topic,
@@ -2353,6 +2381,9 @@ async fn catch_up_peers(topic: &str, state: &mut TopicState, handle: &NodeHandle
     let TopicState::Peers { sampled_ms } = state else {
         return CatchUpResult::keep(Vec::new());
     };
+    if snapshot_is_fresh(*sampled_ms, unix_millis()) {
+        return CatchUpResult::keep(Vec::new());
+    }
     let cell = handle.status_cell();
     let Some(exposition) = cell.exposition() else {
         return CatchUpResult::drop(vec![unavailable(
@@ -2392,6 +2423,9 @@ async fn catch_up_status(
     let TopicState::Status { sampled_ms } = state else {
         return CatchUpResult::keep(Vec::new());
     };
+    if snapshot_is_fresh(*sampled_ms, unix_millis()) {
+        return CatchUpResult::keep(Vec::new());
+    }
     handle
         .stream_hub()
         .note_snapshot_sample(crate::metrics::SnapshotTopic::Status);
@@ -3535,6 +3569,36 @@ mod tests {
             }
             other => panic!("expected one peers tail frame, got {other:?}"),
         }
+    }
+
+    /// THE DEBOUNCE MUST NEVER SWALLOW A STEADY BEAT.
+    ///
+    /// The window has two bounds and only one of them is obvious. Too small and
+    /// the subscribe's immediate follow-on tick composes the registry a second
+    /// time. Too LARGE and the cadence eats itself — and that failure is
+    /// invisible to every frame-counting test, because the samples stay 1:1
+    /// with the frames delivered; only their RATE halves. Widening this
+    /// constant to a full interval leaves the e2e green and merely slower,
+    /// which is how it would ship.
+    #[test]
+    fn the_debounce_window_never_swallows_a_steady_beat() {
+        // the tick riding milliseconds behind the subscribe replay folds away.
+        assert!(snapshot_is_fresh(0, 40));
+
+        // THE ONE THAT PINS THE UPPER BOUND. A subscribe lands part-way INTO a
+        // heartbeat period, so the next beat arrives that much short of a full
+        // interval after it. Treat that as too soon and the topic delivers
+        // every OTHER beat, forever.
+        let landed_into_the_period = 40;
+        assert!(
+            !snapshot_is_fresh(landed_into_the_period, HEARTBEAT_INTERVAL_MS),
+            "a beat arriving {}ms after the last sample must compose; a window \
+             that swallows it halves the topic's cadence",
+            HEARTBEAT_INTERVAL_MS - landed_into_the_period
+        );
+
+        // and the steady case, from any phase.
+        assert!(!snapshot_is_fresh(0, HEARTBEAT_INTERVAL_MS));
     }
 
     /// An unwired exposition drops the topic rather than serving an empty peer

@@ -1439,6 +1439,31 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
     );
 }
 
+/// A SUBSCRIBE COSTS ONE SAMPLE, NOT TWO.
+///
+/// `peers` composes its sample by encoding the whole metrics registry, so the
+/// heartbeat's immediate first tick landing on the heels of the subscribe
+/// replay meant every subscribe paid that twice — the second carrying nothing
+/// the first did not. The scrape sits inside the ~3 s before the next real
+/// beat, so the margin here is a whole heartbeat, not a hair.
+#[test]
+fn a_subscribe_composes_one_snapshot_and_not_the_tick_behind_it() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    let mut ws = daemon.ws_connect();
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["peers"]}"#);
+    let _ = Daemon::ws_read_type(&mut ws, "subscribed");
+    let _ = Daemon::ws_read_type(&mut ws, "tail");
+
+    assert_eq!(
+        peers_samples(&daemon.metrics()),
+        1,
+        "the subscribe replay composed the document; the immediate heartbeat \
+         tick behind it must fold away rather than encode the registry again"
+    );
+}
+
 /// DROPPING THE SOCKET MUST STOP THE SAMPLING — the whole cost argument for
 /// gating the console's overview subscription rests on it, and until now
 /// nothing observed it.
@@ -1471,17 +1496,14 @@ fn a_closed_session_stops_costing_the_node_a_snapshot_sample() {
     // the leaver goes away. Nothing else changes.
     drop(leaving);
 
-    // DRAIN THE SECOND SUBSCRIBE-TIME FRAME. Every session gets TWO samples
-    // within milliseconds of subscribing: the `Wake::All` replay, and then the
-    // heartbeat's FIRST tick, because `tokio::time::interval` fires at once —
-    // only `index_backstop` beside it uses `interval_at`. So this read returns
-    // instantly, with a frame the node had already buffered.
+    // ONE TICK OF SLACK so the close is observed before the window we measure.
     //
-    // It therefore establishes NO ordering against the close above, and it is
-    // still required: without it that already-counted frame would be one of the
-    // three reads below, `observed` would be 2, and the assert would fire
-    // blaming a dead topic. Delete this line on the strength of a comment
-    // claiming it orders anything and the test breaks accusing the wrong thing.
+    // This read blocks for a real heartbeat beat now. It did not always: a
+    // subscribe used to be sampled twice within milliseconds — the `Wake::All`
+    // replay and the heartbeat's immediate first tick — and this read returned
+    // instantly with that second, already-counted frame, ordering nothing.
+    // `SNAPSHOT_MIN_INTERVAL_MS` folded the pair into one, which is what makes
+    // the wait real and this comment true.
     let _ = Daemon::ws_read_type(&mut clock, "tail");
     let before = peers_samples(&daemon.metrics());
 
