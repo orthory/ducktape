@@ -2897,6 +2897,106 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
     );
 }
 
+/// A REMOTE RENAME REACHES LINE 0, WHICH IS WHERE THE SAVE READS THE TITLE.
+///
+/// `UpdateText` on the page's own block is the rename op, and it classifies as
+/// `text` like any body edit — so it folds, and nothing reloads. Before the
+/// title fold it landed nowhere at all: `apply_page_text` cannot see the page
+/// head (the block list drops it), so the reader kept the old name on screen
+/// AND in buffer line 0. Their next keystroke then ran `save_page_document`,
+/// which reads the node fresh, found line 0 disagreeing with the node's new
+/// title, and wrote the OLD one back — reverting someone else's rename on
+/// chain, with nothing on screen.
+///
+/// Asserting the buffer, not just the label, is the point: line 0 is the only
+/// copy of the title the save ever reads.
+#[test]
+fn a_folded_rename_moves_the_title_the_page_row_and_line_zero() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_page = "page".into();
+    app.buffer_page = "page".into();
+    app.active_page_title = "Old Name".into();
+    app.pages = vec![page_item("page", "Old Name"), page_item("other", "Other")];
+    app.blocks = vec![page_block("b1", "page", "body")];
+    // A CLEAN buffer: baseline and buffer agree, so the rebuild is allowed.
+    app.page_editor = compose("Old Name\nbody");
+    app.page_saved_text = "Old Name\nbody".into();
+    let before = app.hydration_generation;
+
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "pages".into(),
+        status: "Live".into(),
+        height: 11,
+        module: "pages".into(),
+        pages: backend::PagesDelta {
+            kind: "text".into(),
+            block_id: "page".into(),
+            text: "New Name".into(),
+        },
+        ..backend::LiveUpdate::default()
+    }));
+
+    assert_eq!(app.active_page_title, "New Name", "the open page's title");
+    assert_eq!(app.pages[0].title, "New Name", "and its row in the list");
+    assert_eq!(app.pages[1].title, "Other", "and only its row");
+    assert_eq!(
+        page_document_text(&app),
+        "New Name\nbody",
+        "line 0 is the title the save reads — a stale one writes it back over the rename"
+    );
+    assert_eq!(
+        app.page_saved_text, "New Name\nbody",
+        "the baseline moves with the buffer, or the next save plans a title change nobody made"
+    );
+    assert_eq!(
+        app.hydration_generation, before,
+        "a rename still folds — it must not buy back the reload this PR removed"
+    );
+}
+
+/// The dirty-buffer rule is UNCHANGED by the title fold: a reader mid-sentence
+/// keeps their words and their caret. The label and the list still move (they
+/// are not the reader's text), but the buffer does not.
+#[test]
+fn a_folded_rename_never_overwrites_a_dirty_buffer() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_page = "page".into();
+    app.buffer_page = "page".into();
+    app.active_page_title = "Old Name".into();
+    app.pages = vec![page_item("page", "Old Name")];
+    app.blocks = vec![page_block("b1", "page", "body")];
+    // DIRTY: she has typed since the last save.
+    app.page_editor = compose("Old Name\nbody mid-sentence");
+    app.page_saved_text = "Old Name\nbody".into();
+
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "pages".into(),
+        status: "Live".into(),
+        height: 12,
+        module: "pages".into(),
+        pages: backend::PagesDelta {
+            kind: "text".into(),
+            block_id: "page".into(),
+            text: "New Name".into(),
+        },
+        ..backend::LiveUpdate::default()
+    }));
+
+    assert_eq!(
+        page_document_text(&app),
+        "Old Name\nbody mid-sentence",
+        "her buffer is hers until she saves"
+    );
+    assert_eq!(
+        app.active_page_title, "New Name",
+        "the title itself still moved — it is not part of her unsaved text"
+    );
+}
+
 /// A COMMITTED EDIT LANDS WITHOUT RE-READING THE DOCUMENT IT LANDED IN.
 ///
 /// The page autosave commits one `UpdateText` per tick while a reader types,
@@ -2914,6 +3014,12 @@ fn a_folded_text_edit_updates_the_block_and_fetches_nothing() {
     app.loading = false;
     app.active_page = "page".into();
     app.buffer_page = "page".into();
+    // THE TITLE IS HERE TO PROVE A BODY EDIT CANNOT MOVE IT. `apply_page_title`
+    // rests entirely on `delta.block_id == active_page`; drop that term and
+    // every body edit renames the open page — on chain, via line 0 — which is
+    // the bug this fold exists to fix, pointed the other way. Nothing else in
+    // the suite constrains it.
+    app.active_page_title = "Doc".into();
     app.blocks = vec![
         page_block("b1", "page", "old"),
         page_block("b2", "page", "untouched"),
@@ -2938,6 +3044,10 @@ fn a_folded_text_edit_updates_the_block_and_fetches_nothing() {
         "the edit folded into its block"
     );
     assert_eq!(app.blocks[1].text, "untouched", "and only into its block");
+    assert_eq!(
+        app.active_page_title, "Doc",
+        "a body edit must never move the page's title"
+    );
     assert_eq!(
         app.hydration_generation, before,
         "a folded edit must not start a reload — that is the whole point"

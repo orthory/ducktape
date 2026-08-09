@@ -268,6 +268,14 @@ on live_updated(next)
   // the canonical text replaces it only when the editor is CLEAN and actually
   // differs, so a reader mid-sentence keeps their words and their caret, and
   // their own settled echo is a no-op because the baseline already matches.
+  // A RENAME IS AN `UpdateText` TOO — on the page's own block, which is the
+  // only rename op pages has. It folds here and NOT in `apply_page_text`: the
+  // block list drops the page head, so the block fold can never see it, and
+  // nothing else on this path would have moved the title. Both writes sit
+  // ABOVE the buffer rebuild for the reason the resync path states below —
+  // the title is line 0, so it has to land before the text is rebuilt from it.
+  pages = apply_page_rename(pages, next.pages)
+  active_page_title = apply_page_title(active_page_title, next.pages, active_page)
   blocks = apply_page_text(blocks, next.pages)
   let folded_saved = refreshed_page_saved(page_editor, active_page_title, blocks, page_saved_text)
   page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
