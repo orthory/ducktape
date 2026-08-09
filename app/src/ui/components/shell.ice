@@ -157,10 +157,13 @@ component StatusPill(degraded:bool, loading:bool)
 // 16/40 modal shadow — because the tooltip frame around it must stay
 // transparent to carry the edge gutter (see the mount below).
 //
-// OMITTED, not faked: the `gossip` row (NodeFacts carries peers_live/total but
-// no state field holds them) and the 26-bar sparkline (it needs the newest 26
-// of a 100-block window with a clamped bar height, and neither a slice nor a
-// clamp exists as a helper). Both are named in the handoff report.
+// OMITTED, not faked: the `gossip` row and the 26-bar sparkline (it needs the
+// newest 26 of a 100-block window with a clamped bar height, and neither a
+// slice nor a clamp exists as a helper). Both are named in the handoff report.
+// NodeFacts used to carry `peers_live`/`peers_total` for that gossip row — no
+// state field ever held them, and filling them cost `load_node_facts` a second
+// HTTP round trip whose handler re-encodes the WHOLE Prometheus registry
+// uncached. They are gone; a gossip row starts by deciding what it needs.
 component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
   box #root
     with
