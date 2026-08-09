@@ -2430,7 +2430,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     );
     let workspace = connect(origin.clone(), 0, 0).await.unwrap();
     let mut live = live_events(origin.clone());
-    let ready = live.next().await.unwrap();
+    let ready = next_change(&mut live).await;
     assert_eq!(ready.kind, "ready");
     submit_test(
         &rpc,
@@ -2446,7 +2446,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         }),
     )
     .await;
-    let changed = live.next().await.unwrap();
+    let changed = next_change(&mut live).await;
     assert_eq!(changed.kind, "chat", "a chat op folds into a chat delta");
     assert_eq!(changed.chat.kind, "posted");
     assert_eq!(changed.chat.channel_id, "general");
@@ -3065,6 +3065,54 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
     assert_eq!(
         frozen_unread_boundary(caught_up, channels, "general".into(), "random".into(), 999),
         0
+    );
+}
+
+/// The next update that says something happened.
+///
+/// THE TIP ARRIVES FIRST, EVERY BLOCK. The node sends the heartbeat on the
+/// block wake and only THEN catches its topics up (`bin/noded/src/stream.rs`,
+/// the `block_rx` arm), so the head for block N is on the wire before N's ops
+/// are. A test that asserts on `live.next()` directly is asserting on that
+/// heartbeat, not on its own submit.
+async fn next_change(
+    live: &mut iced::futures::stream::BoxStream<'static, LiveUpdate>,
+) -> LiveUpdate {
+    loop {
+        let update = live.next().await.expect("live stream ended");
+        if update.kind != "tip" {
+            return update;
+        }
+    }
+}
+
+/// A TIP MOVES THE HEAD AND MUST FETCH NOTHING.
+///
+/// The heartbeat rides every block, and an idle chain nop-fills once per
+/// `BLOCK_TIME` (`bin/node/src/constants.rs`) — so anything this update
+/// triggers runs at ~1 Hz forever, on a chain where nothing happened. A load
+/// hung off it would be a poll wearing a consensus costume, and `/v1/query` is
+/// checkpoint-gated (`backend/live.rs`), so that poll would also be the thing
+/// that hands a healthy node's console "error sending request".
+///
+/// `assert_no_polling` cannot see this: it greps `lifecycle.ice` for lines
+/// starting with `every ` and a load reached through a live update is invisible
+/// to it. So the guard is here, on the value itself.
+#[test]
+fn a_tip_carries_the_head_and_loads_nothing() {
+    let tip = live_update("tip", "Live · block 41", 41);
+    assert_eq!(tip.height, 41, "the head is the tip's entire payload");
+    assert!(
+        !tip.load_chat && !tip.load_pages,
+        "a tip must not trigger a load — that is a 1 Hz poll on an idle chain"
+    );
+    assert!(
+        !tip.debounce,
+        "there is nothing to coalesce: a tip fetches nothing"
+    );
+    assert!(
+        tip.module.is_empty(),
+        "a heartbeat is not a topic, so it names no module"
     );
 }
 

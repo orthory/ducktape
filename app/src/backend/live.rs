@@ -119,6 +119,25 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                         state.cursors.insert(format!("module:{module}"), cursor);
                         live_resync(&module, -1)
                     }
+                    // THE HEAD MOVES ON BLOCKS, NOT ON OPS. Height used to come
+                    // only from a folded op, so a chain whose four subscribed
+                    // modules were quiet left the console reading a frozen
+                    // block number — on an idle chain, forever. The node has
+                    // been sending this every block the whole time (the
+                    // heartbeat rides the block wake, nop fillers included);
+                    // the client threw it away by declaring the frame a unit
+                    // variant, so the height never survived deserialization.
+                    //
+                    // It carries no cursor: a heartbeat is not a topic and
+                    // resuming does not replay one. And it triggers NO load —
+                    // see `ModuleEvent::Tip`. The handler's same-value writes
+                    // are no-ops, so the 3s idle beat repeating a height costs
+                    // nothing and needs no suppression here.
+                    Some(Ok(ModuleEvent::Tip { height })) => live_update(
+                        "tip",
+                        &format!("Live · block {height}"),
+                        i64::try_from(height).unwrap_or(i64::MAX),
+                    ),
                     Some(Err(error)) => {
                         state.stream = None;
                         state.retry_attempt = state.retry_attempt.saturating_add(1);
