@@ -115,6 +115,17 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                             None => continue,
                         }
                     }
+                    // THIS PLANE IS DEAD FOR THIS CONNECTION; THE OTHERS ARE
+                    // NOT. Keep draining — the whole point is that a module
+                    // this node does not index no longer takes chat and pages
+                    // down with it.
+                    //
+                    // NOT surfaced, and saying so rather than pretending: the
+                    // refusal arrives just before `ready`, and `live_updated`
+                    // assigns `status` as its first statement, so any message
+                    // put here is overwritten microseconds later. Showing it
+                    // needs a per-plane field that no surface reads yet.
+                    Some(Ok(ModuleEvent::Refused { .. })) => continue,
                     Some(Ok(ModuleEvent::Lagged { module, cursor })) => {
                         state.cursors.insert(format!("module:{module}"), cursor);
                         live_resync(&module, -1)

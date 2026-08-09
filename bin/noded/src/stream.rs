@@ -192,7 +192,12 @@ pub enum ClientMsg {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
     Subscribed {
-        topics: BTreeMap<String, Option<String>>,
+        /// admitted topic -> its start cursor. A REFUSED topic is not in here;
+        /// it got its own `Error` frame, ahead of this one, naming the code.
+        /// (This was `Option<String>` with exactly one inhabitant — the only
+        /// insert always carried a cursor — which read as "admitted but
+        /// cursorless", a state that has never existed.)
+        topics: BTreeMap<String, String>,
     },
     Event {
         topic: String,
@@ -1331,7 +1336,7 @@ fn subscribe_topics(
         }
         match prepare_topic(&topic, holds_workspace_secret, resume.get(&topic), store.as_ref()) {
             Ok((state, lagged)) => {
-                accepted.insert(topic.clone(), Some(state.cursor()));
+                accepted.insert(topic.clone(), state.cursor());
                 states.insert(topic, state);
                 if let Some(frame) = lagged {
                     frames.push(frame);

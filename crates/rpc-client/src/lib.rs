@@ -55,6 +55,15 @@ pub enum ModuleEvent {
     },
     /// Replay history was unavailable; hydrate a fresh snapshot at this cursor.
     Lagged { module: String, cursor: String },
+    /// One topic will not deliver, and the node named which and why.
+    ///
+    /// NOT the connection's failure. The node refuses PER TOPIC and keeps
+    /// serving the rest; collapsing that into a stream error took chat and
+    /// pages down over a module this node never indexed, then reconnected
+    /// forever to be refused again. Only a subscribe-time refusal arrives as
+    /// this variant — a mid-session drop is transient (a scan error, a poisoned
+    /// index) and still tears the stream down so the reconnect can recover it.
+    Refused { module: String, code: String },
     /// The chain head, as the node's heartbeat reports it.
     ///
     /// The heartbeat rides EVERY block wake — nop fillers included, which feed
@@ -153,7 +162,7 @@ struct SubscribeRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum StreamFrame {
     Subscribed {
-        topics: BTreeMap<String, Option<String>>,
+        topics: BTreeMap<String, String>,
     },
     Event {
         topic: String,
@@ -169,6 +178,11 @@ enum StreamFrame {
     },
     Error {
         topic: String,
+        /// the node's stable snake_case refusal token (`unknown_module`,
+        /// `topic_not_admitted`, `unavailable`). It has been on the wire all
+        /// along and was thrown away here, leaving only a sentence to branch on.
+        #[serde(default)]
+        code: String,
         detail: String,
     },
 }
@@ -520,8 +534,11 @@ where
         + Unpin
         + 'static,
 {
-    futures::stream::unfold(Some((socket, expected)), move |state| async move {
-        let (mut socket, expected) = state?;
+    // `subscribed` is what separates a topic that never started from one that
+    // stopped: the node refuses at subscribe time and reports later trouble the
+    // same way, and only the clock tells them apart.
+    futures::stream::unfold(Some((socket, expected, false)), move |state| async move {
+        let (mut socket, expected, mut subscribed) = state?;
         loop {
             let message = match tokio::time::timeout(idle_timeout, socket.next()).await {
                 Ok(Some(message)) => message,
@@ -530,8 +547,9 @@ where
                     return Some((Err(Error::new("RPC stream heartbeat timed out")), None));
                 }
             };
-            if let Some(event) = decode_stream_message(message, &expected) {
-                return Some((event, Some((socket, expected))));
+            if let Some(event) = decode_stream_message(message, &expected, subscribed) {
+                subscribed = subscribed || matches!(event, Ok(ModuleEvent::Ready { .. }));
+                return Some((event, Some((socket, expected, subscribed))));
             }
         }
     })
@@ -541,6 +559,7 @@ where
 fn decode_stream_message(
     message: std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
     expected: &BTreeSet<String>,
+    subscribed: bool,
 ) -> Option<Result<ModuleEvent>> {
     let message = match message {
         Ok(message) => message,
@@ -566,19 +585,14 @@ fn decode_stream_message(
     };
     match frame {
         StreamFrame::Subscribed { topics } => {
-            let complete = expected
-                .iter()
-                .all(|topic| topics.get(topic).is_some_and(|cursor| cursor.is_some()));
-            if !complete {
-                return Some(Err(Error::new(
-                    "RPC stream refused a required module topic",
-                )));
+            // ADMITTING NONE IS THE CONNECTION FAILING; admitting some is one
+            // plane degrading. Anything refused already arrived as its own
+            // `Error` frame ahead of this one, so the caller has been told
+            // which and why by the time this lands.
+            if topics.is_empty() {
+                return Some(Err(Error::new("RPC stream admitted no requested topic")));
             }
-            let cursors = topics
-                .into_iter()
-                .filter_map(|(topic, cursor)| cursor.map(|cursor| (topic, cursor)))
-                .collect();
-            Some(Ok(ModuleEvent::Ready { cursors }))
+            Some(Ok(ModuleEvent::Ready { cursors: topics }))
         }
         StreamFrame::Event { topic, cursor, op } => Some(
             module_name(&topic, expected).map(|module| ModuleEvent::Changed { module, cursor, op }),
@@ -586,9 +600,22 @@ fn decode_stream_message(
         StreamFrame::Lagged { topic, cursor } => {
             Some(module_name(&topic, expected).map(|module| ModuleEvent::Lagged { module, cursor }))
         }
-        StreamFrame::Error { topic, detail } => Some(Err(Error::new(format!(
-            "RPC stream topic {topic} failed: {detail}"
-        )))),
+        // BEFORE `subscribed`, this topic never started and the others did:
+        // degrade that plane and keep the connection. AFTER, it is a scan error
+        // or a poisoned index — transient, and tearing down is what lets the
+        // reconnect recover it. Same frame, two meanings, told apart by when.
+        StreamFrame::Error {
+            topic,
+            code,
+            detail,
+        } => match subscribed {
+            false => Some(
+                module_name(&topic, expected).map(|module| ModuleEvent::Refused { module, code }),
+            ),
+            true => Some(Err(Error::new(format!(
+                "RPC stream topic {topic} failed: {detail}"
+            )))),
+        },
         StreamFrame::Heartbeat { height } => Some(Ok(ModuleEvent::Tip { height })),
     }
 }
@@ -703,10 +730,67 @@ mod tests {
     fn a_heartbeat_decodes_to_the_head_it_carries() {
         let expected = BTreeSet::from(["module:chat".to_string()]);
         let heartbeat = r#"{"type":"heartbeat","height":41,"root_hash":"ab","time_ms":1752000000000,"interval_ms":3000}"#;
-        let tip = decode_stream_message(Ok(Message::Text(heartbeat.into())), &expected)
+        let tip = decode_stream_message(Ok(Message::Text(heartbeat.into())), &expected, true)
             .expect("a heartbeat is an event, not a skipped frame")
             .expect("a heartbeat is not an error");
         assert_eq!(tip, ModuleEvent::Tip { height: 41 });
+    }
+
+    /// ONE REFUSED TOPIC MUST NOT TAKE THE OTHERS DOWN.
+    ///
+    /// The node answers PER TOPIC — a refusal is its own `Error` frame ahead of
+    /// `Subscribed`, and the admitted topics still carry cursors. This required
+    /// EVERY requested topic to come back or it errored the whole stream, and
+    /// the app's reconnect loop then re-asked forever and was refused again —
+    /// so subscribing to one module a node does not index took chat and pages
+    /// dark for the life of the process.
+    #[test]
+    fn a_refused_topic_degrades_its_plane_and_spares_the_rest() {
+        let expected = BTreeSet::from(["module:chat".to_string(), "module:valset".to_string()]);
+
+        // subscribe time: the node names the topic and the reason.
+        let refusal = r#"{"type":"error","topic":"module:valset","code":"unknown_module","detail":"this node indexes no such module"}"#;
+        let event = decode_stream_message(Ok(Message::Text(refusal.into())), &expected, false)
+            .expect("a refusal is an event")
+            .expect("a refusal is not the connection failing");
+        assert_eq!(
+            event,
+            ModuleEvent::Refused {
+                module: "valset".into(),
+                code: "unknown_module".into(),
+            },
+            "the TYPED code, not the sentence — a reason is greppable or it is prose"
+        );
+
+        // and the rest of the subscription still starts.
+        let subscribed = r#"{"type":"subscribed","topics":{"module:chat":"c1"}}"#;
+        let ready = decode_stream_message(Ok(Message::Text(subscribed.into())), &expected, false)
+            .unwrap()
+            .expect("a partial subscription is not a failure");
+        assert_eq!(
+            ready,
+            ModuleEvent::Ready {
+                cursors: BTreeMap::from([("module:chat".into(), "c1".into())]),
+            }
+        );
+
+        // admitting NOTHING is the connection failing, not a plane degrading.
+        let none = r#"{"type":"subscribed","topics":{}}"#;
+        assert!(
+            decode_stream_message(Ok(Message::Text(none.into())), &expected, false)
+                .unwrap()
+                .is_err()
+        );
+
+        // the SAME frame after `subscribed` is a live topic dropping out — a
+        // scan error or a poisoned index. Transient, and the reconnect is what
+        // recovers it, so it must still tear the stream down.
+        assert!(
+            decode_stream_message(Ok(Message::Text(refusal.into())), &expected, true)
+                .unwrap()
+                .is_err(),
+            "a mid-session drop must not be mistaken for a permanent refusal"
+        );
     }
 
     #[test]
@@ -714,7 +798,7 @@ mod tests {
         let expected = BTreeSet::from(["module:chat".to_string(), "module:pages".to_string()]);
         let subscribed =
             r#"{"type":"subscribed","topics":{"module:chat":"c1","module:pages":"p1"}}"#;
-        let ready = decode_stream_message(Ok(Message::Text(subscribed.into())), &expected)
+        let ready = decode_stream_message(Ok(Message::Text(subscribed.into())), &expected, false)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -730,14 +814,14 @@ mod tests {
         let unexpected =
             r#"{"type":"event","topic":"module:files","cursor":"f1","op":{"height":7}}"#;
         assert!(
-            decode_stream_message(Ok(Message::Text(unexpected.into())), &expected)
+            decode_stream_message(Ok(Message::Text(unexpected.into())), &expected, true)
                 .unwrap()
                 .is_err()
         );
 
         let unknown = r#"{"type":"retired_frame"}"#;
         assert!(
-            decode_stream_message(Ok(Message::Text(unknown.into())), &expected)
+            decode_stream_message(Ok(Message::Text(unknown.into())), &expected, true)
                 .unwrap()
                 .is_err()
         );
