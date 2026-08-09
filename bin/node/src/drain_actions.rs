@@ -8,6 +8,56 @@
 use commonware_cryptography::ed25519;
 use consensus::{ObservationOutcome, RespawnPlan, ScheduledCutover, ValsetOrchestrator};
 
+// ============================================================================
+// checkpoint cadence — the one decision BOTH loops make about their own cost.
+// ============================================================================
+
+/// the largest share of a loop's wall time a checkpoint may occupy: one part in
+/// this. The checkpoint runs on the same select as the HTTP command arm and the
+/// signal arm in BOTH roles, so its occupancy is not an internal detail — it is
+/// the fraction of the time `/v1/query`, `git clone`'s ref advertisement and
+/// SIGTERM are unanswerable (#1018).
+pub(crate) const CHECKPOINT_DUTY_LIMIT: u32 = 8;
+
+/// enough blocks have sealed AND the last attempt has paid for itself.
+///
+/// The block count alone was the whole trigger, and it cannot express cost —
+/// 32 blocks is ~30s of chain while one capture measured 59-70s, so the trigger
+/// kept re-firing before the previous one had finished and the node lived
+/// inside the branch.
+pub(crate) fn checkpoint_due(
+    blocks_since: u64,
+    checkpoint_blocks: u64,
+    now: std::time::SystemTime,
+    not_before: std::time::SystemTime,
+) -> bool {
+    let cadence_reached = blocks_since >= checkpoint_blocks;
+    let cooled_down = now >= not_before;
+    cadence_reached && cooled_down
+}
+
+/// when the next checkpoint may START, given when this one finished and what
+/// the whole attempt cost. Holding it off for `LIMIT - 1` times its own cost
+/// puts the branch's share of wall time at `1/LIMIT` WITHOUT anyone having to
+/// know what a checkpoint costs on this box — the last one is the estimate.
+///
+/// This bounds how OFTEN the loop is blocked, never how LONG: one checkpoint
+/// still occupies it for the full duration, so a query landing inside a slow
+/// one still times out. Cutting the duration is the module's own problem
+/// (#1023 was one instance).
+///
+/// Overflow FAILS TOWARD CHECKPOINTING, deliberately: a node that stops
+/// checkpointing cannot recover quickly or admit a joiner, which is worse than
+/// any occupancy — so an absurd cost yields no cooldown, never an infinite one.
+pub(crate) fn cooldown_until(
+    finished_at: std::time::SystemTime,
+    cost: std::time::Duration,
+) -> std::time::SystemTime {
+    finished_at
+        .checked_add(cost.saturating_mul(CHECKPOINT_DUTY_LIMIT - 1))
+        .unwrap_or(finished_at)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CutoverTrigger {
     Membership(ScheduledCutover),

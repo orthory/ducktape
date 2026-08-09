@@ -485,6 +485,10 @@ pub(super) async fn park(
     let mut pending_seal_checks: std::collections::HashMap<u64, ServedSeal> =
         std::collections::HashMap::new();
     let mut blocks_since_checkpoint: u64 = 0;
+    // the earliest a checkpoint may START again. The replica checkpoints on
+    // ITS loop too — the same loop that answers `NodeCommand::Query` — so it
+    // owes the same duty bound the validator does (#1018).
+    let mut checkpoint_not_before = context.current();
     let mut last_cert_height: Option<u64> = None;
     // the serving replica's manifest-fetch pacer (see the gate at the
     // fetch site). absolute, so per-cert window closes can't starve it.
@@ -1390,6 +1394,11 @@ pub(super) async fn park(
                         // validator writes one immediately post-cutover
                         // for the same restart-boundary reason.
                         blocks_since_checkpoint = checkpoint_blocks;
+                        // ...and CLEAR the duty cooldown with it. The force
+                        // says "a restart must land on the new boundary", and
+                        // an unpaid cooldown from the previous checkpoint would
+                        // otherwise hold this one off for minutes.
+                        checkpoint_not_before = context.current();
                         tracing::info!(
                             target: "ducktape::consensus",
                             node = %label,
@@ -1438,10 +1447,15 @@ pub(super) async fn park(
             // epoch coordinates describe). journal pruning stays the
             // validator's concern for now (a replica's journal prunes
             // at its next ascension checkpoint).
-            if blocks_since_checkpoint >= checkpoint_blocks
-                && let Some(f) = node_r.finalized()
+            if crate::drain_actions::checkpoint_due(
+                blocks_since_checkpoint,
+                checkpoint_blocks,
+                context.current(),
+                checkpoint_not_before,
+            ) && let Some(f) = node_r.finalized()
             {
                 let pos = node_r.sink_mut().oplog_pos().await;
+                let checkpoint_started = context.current();
                 let members = read_valset_members(node_r.host()).await;
                 let residents = read_valset_residents(node_r.host()).await;
                 let captured = Manifest::capture(
@@ -1502,6 +1516,17 @@ pub(super) async fn park(
                         "replica checkpoint capture failed; retrying"
                     ),
                 }
+                // OUTSIDE THE MATCH: a capture that fails costs this loop
+                // everything a successful one does, and neither failure arm
+                // resets `blocks_since_checkpoint` — so without the cooldown
+                // the retry is immediate and the node re-pays the full cost on
+                // every pass, forever.
+                let attempt = context
+                    .current()
+                    .duration_since(checkpoint_started)
+                    .unwrap_or_default();
+                checkpoint_not_before =
+                    crate::drain_actions::cooldown_until(context.current(), attempt);
             }
         }
         // ---- THE PROMOTION SEAT (in-process) ---------------------
