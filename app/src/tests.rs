@@ -328,6 +328,28 @@ fn the_autosave_hands_the_save_the_baseline_it_started_from() {
     );
 }
 
+/// THE CONSOLE OPENS ON `—`, NOT ON ZERO.
+///
+/// The Ice state defaults are the other half of the same invariant: a fresh
+/// console has loaded nothing, so every reading it shows for the node must say
+/// so. `node_checkpoint` sat at `0` while `node_height` sat at the sentinel,
+/// which painted `CHECKPOINT h 0` directly above `HEIGHT h —`.
+#[test]
+fn a_console_that_has_loaded_nothing_shows_no_measurements() {
+    let (app, _) = Ducktape::__boot();
+    assert_eq!(backend::height_label_short(app.node_height), "h —");
+    assert_eq!(
+        backend::height_label_short(app.node_checkpoint),
+        "h —",
+        "a checkpoint reading before any load is not a measurement"
+    );
+    assert_eq!(backend::relative_time(app.node_last_finalized), "—");
+    // the consensus trio is already rendered text, and starts the same way.
+    assert_eq!(app.node_view_label, "—");
+    assert_eq!(app.node_quorum_label, "—");
+    assert_eq!(app.node_reachable_label, "—");
+}
+
 /// The page document's text, the way the save tick reads it.
 fn page_document_text(app: &Ducktape) -> String {
     crate::pages::page_text(app.page_editor.clone())

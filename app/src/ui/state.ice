@@ -383,8 +383,14 @@ state
   // already-rendered `node_view_label` / `node_quorum_label` /
   // `node_reachable_label`, because /v1/status reports each as optional and an
   // absent reading must print `—`, never a measured `0`.
-  node_last_finalized:i64 = 0
-  node_checkpoint:i64 = 0
+  //
+  // THE SENTINEL, like `node_height` below — before a load lands the node has
+  // published neither, and `h 0` is a measurement. Left at zero these printed
+  // `CHECKPOINT h 0` directly above `HEIGHT h —`, which is the same
+  // checkpoint-outruns-the-head inversion `node_height` was given the sentinel
+  // to prevent, wearing the other face.
+  node_last_finalized:i64 = -1
+  node_checkpoint:i64 = -1
   // `node_checkpoint`'s OWN HEAD — the same `load_node_facts` document, so the
   // pair Settings prints is one sample and the checkpoint can never outrun the
   // head beside it. The two move together; a reader of one is a reader of both.

@@ -974,6 +974,44 @@ fn an_unpublished_operations_reading_renders_as_unknown() {
     assert_eq!(relative_time(0), "");
 }
 
+/// THE OTHER HALF OF THE SAME FACT: the reading has to ARRIVE as `UNMEASURED`.
+///
+/// The test above pins the renderers. This pins the producer, on the one path
+/// where a real node publishes nothing: a resident, a joiner or the embedded
+/// local daemon omits `operations` entirely (`skip_serializing_if` on the node
+/// side), so the `unwrap_or` arms are what run. Every fixture in this file
+/// supplies an `operations` object, so those arms had no coverage at all —
+/// `.unwrap_or(UNMEASURED)` could be changed to `.unwrap_or(0)` with the whole
+/// suite green, which is exactly the defect on exactly the lane this file
+/// spends twenty lines forbidding.
+#[test]
+fn a_status_without_operations_produces_unmeasured_readings() {
+    let resident = serde_json::json!({
+        "version": "0.1.0",
+        "root_hash": "abc",
+        "height": 0,
+    });
+    let facts = node_facts(&resident, 7);
+
+    assert_eq!(facts.generation, 7);
+    assert_eq!(
+        facts.last_finalized_at, UNMEASURED,
+        "an omitted `operations` must not read as a finalization at epoch zero"
+    );
+    assert_eq!(
+        facts.checkpoint_height, UNMEASURED,
+        "nor as a checkpoint at genesis"
+    );
+    assert_eq!(
+        facts.height, UNMEASURED,
+        "and a wire `0` head is the node's own no-boundary-served sentinel"
+    );
+    // the trio is `Option` for the same reason and stays absent.
+    assert_eq!(facts.view, None);
+    assert_eq!(facts.quorum, None);
+    assert_eq!(facts.reachable_validators, None);
+}
+
 /// A record stamp is a BLOCK HEIGHT on this chain, so every record-time
 /// string counts blocks. Only `/v1/status` supplies unix seconds.
 #[test]
@@ -2308,6 +2346,25 @@ fn block_comment_posts_reuse_the_selected_thread() {
             .starts_with("thread-")
     );
     assert!(comment_thread_id(" ".into()).is_err());
+}
+
+/// A DEFAULTED STATUS DOCUMENT MUST NOT READ AS MEASURED.
+///
+/// Asserting the RENDERED strings, not the integers: `-1` is only correct
+/// because the renderers turn it into an em dash, and a future change to
+/// either end that broke the pairing would leave an integer assertion green
+/// while the screen went back to printing a head no node ever served.
+#[test]
+fn a_defaulted_node_facts_prints_as_unserved_everywhere() {
+    let facts = NodeFacts::default();
+    assert_eq!(facts.height, UNMEASURED);
+    assert_eq!(facts.checkpoint_height, UNMEASURED);
+    assert_eq!(facts.last_finalized_at, UNMEASURED);
+
+    // What these render as is pinned once, by
+    // `an_unpublished_operations_reading_renders_as_unknown` above — including
+    // that a real `0` still prints `h 0`. Repeating it here would be
+    // duplication wearing the costume of defence in depth.
 }
 
 /// THE TITLE WRITE IS AUTHORSHIP, NOT DISAGREEMENT.
