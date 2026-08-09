@@ -188,23 +188,25 @@ on toggle_channel_create
 on toggle_channel_settings
   return if empty(active_channel)
   channel_settings_open = !channel_settings_open
-  // Same modal-over-a-live-composer as `toggle_channel_create`, and this sits
-  // ABOVE the teardown's own `return` so closing the panel retires too. The
-  // teardown below makes it mechanical as well — see the rail rule.
+  // Same modal-over-a-live-composer as `toggle_channel_create`: the drawer lays
+  // its own inputs over a chat composer that stays mounted, so the claim on the
+  // caret retires whether the panel is opening or closing. This handler is on
+  // the NAMED list for that reason — it no longer writes `active_thread_seq = 0`
+  // and so the rail rule cannot derive it.
   composer_focus = "none"
   channel_name_draft = active_channel_name
-  return if !channel_settings_open
-  thread_generation = thread_generation + 1
-  live_thread_generation = live_thread_generation + 1
-  active_thread_seq = 0
-  thread_target_seq = 0
-  thread_messages = []
-  thread_next_reply_offset = 0
-  thread_has_more = false
-  thread_loading = false
-  reply_draft = ""
-  reply_editor = editor("")
-  pending_reply = ""
+  // AND IT DOES NOT TEAR THE RAIL DOWN. It used to clear the thread, its
+  // messages and `reply_editor` — so opening this drawer DISCARDED a reply you
+  // were part-way through typing, and closing it again gave you an empty
+  // composer. Nobody asked to close the thread; they asked to see the channel.
+  //
+  // The teardown was never needed to hide the rail either: the screen already
+  // draws it under `if active_thread_seq > 0 && !channel_settings_open`, so the
+  // drawer covers it either way. `close_thread` stays the one route that
+  // discards a reply, because that one is a request to.
+  //
+  // The app's own rule, from the other direction: `reconnect` harvests the
+  // composer draft and puts it back rather than letting a transition eat it.
 
 on rename_channel_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || empty(trim(channel_name_draft))

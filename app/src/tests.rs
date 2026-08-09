@@ -3952,6 +3952,86 @@ fn a_thread_reply_takes_marks_from_its_own_toolbar_and_the_chord() {
 /// they miss on purpose — which is what the chord's own `active_thread_seq > 0`
 /// term is for. Both halves are driven, so neither the guard nor the retires
 /// can be deleted quietly.
+/// OPENING THE CHANNEL DRAWER IS NOT A REQUEST TO CLOSE THE THREAD.
+/// `toggle_channel_settings` cleared `active_thread_seq`, the thread's messages
+/// and `reply_editor` on the way in, so a part-typed reply was gone and closing
+/// the drawer gave back an empty one. The main composer's draft survives the
+/// same trip, which is the app's own standard — `reconnect` harvests it
+/// deliberately rather than letting a transition eat it.
+///
+/// A NOTE ON HOW THIS WAS FOUND, because the first account of it was wrong.
+/// The live drive that "reproduced" it had clicked (1408, 164) — which with the
+/// rail open is the RAIL's own `×`, not the channel header's `⋯` (that moves to
+/// 1077 when the rail narrows the column). `close_thread` discarding a reply is
+/// by design. The defect is real on the drawer's path and this test is what
+/// proves it: restoring the teardown fails the first assertion below. The fix
+/// was then driven correctly — drawer opened at 1077, Escape, reply intact.
+///
+/// The teardown was never what hid the rail: the screen draws it under
+/// `if active_thread_seq > 0 && !channel_settings_open`. `close_thread` remains
+/// the one route that discards a reply, because that one is a request to.
+#[test]
+fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.shell_tab = "chat".into();
+    app.active_channel = "general".into();
+    app.active_thread_seq = 7;
+    app.thread_messages = vec![message(7, "the root", false)];
+    app.reply_editor = compose("half a reply");
+
+    let _ = app.__update(__DucktapeMessage::ToggleChannelSettings);
+    assert!(app.channel_settings_open, "the drawer opened");
+    assert_eq!(
+        reply_composer(&app),
+        "half a reply",
+        "the drawer does not discard a reply in progress"
+    );
+    assert_eq!(app.active_thread_seq, 7, "and it does not close the thread");
+    assert_eq!(
+        app.thread_messages.len(),
+        1,
+        "nor throw away the thread it was reading"
+    );
+
+    // Closing it gives the rail back exactly as it was.
+    let _ = app.__update(__DucktapeMessage::ToggleChannelSettings);
+    assert!(!app.channel_settings_open);
+    assert_eq!(reply_composer(&app), "half a reply");
+    assert_eq!(app.active_thread_seq, 7);
+
+    // The screen is what hides the rail while the drawer is up — the handler
+    // never needed to.
+    assert!(
+        SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"),
+        "the rail is drawn under the drawer's own gate"
+    );
+    // And the claim on the caret still retires, because the drawer lays its own
+    // inputs over a composer that stays mounted.
+    let chat = inlined(include_str!("ui/handlers/chat.ice"));
+    let arm = chat
+        .split_once("on toggle_channel_settings")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("it ends")
+        .0;
+    // Statements, not prose: the comment above this handler NAMES the
+    // teardown it no longer does, and a substring check over the arm would
+    // read that as the teardown itself. Third time tonight.
+    let statements: Vec<&str> = arm
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+        .collect();
+    assert!(statements.contains(&"composer_focus = \"none\""));
+    assert!(
+        !statements.contains(&"active_thread_seq = 0"),
+        "the drawer must not tear the rail down"
+    );
+}
+
 #[test]
 fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
     // THE BEHAVIOUR, on the route the rules are about: a claim, then a handler
