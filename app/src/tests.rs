@@ -3296,6 +3296,15 @@ fn forge_empty_states_name_only_routes_that_exist() {
 /// sentences: the copy may be rewritten, but a count must carry its noun, a
 /// value must carry its name, one set must not have two names on one screen,
 /// and no row may contradict the name the screen prints over it.
+///
+/// AND WHAT THE SCREEN SHOWS MUST REACH IT. The same class one layer out: a
+/// `search_workspace` reply reaches this screen through two ice seams — the
+/// handler that lands it in state and the mount that hands it down — and
+/// neither is visible to an ice screen contract, because a contract MOUNTS
+/// `ExplorerScreen` itself against a preset. So it pins the component while the
+/// app's wiring to it stays severable: deleting `explorer_partial = next.partial`
+/// and passing `partial=""` at the mount left the whole suite green with the
+/// banner gone and the false empty plate back.
 #[test]
 fn the_explorer_names_what_it_shows() {
     // The dispatch trace, fed the `operations` shape `bin/noded`'s projection
@@ -3411,6 +3420,67 @@ fn the_explorer_names_what_it_shows() {
             label_at < value_at,
             "`{named}` must precede `{value}`, or it labels something else"
         );
+    }
+
+    // EVERY FIELD OF THE REPLY IS CARRIED, OR THE SCREEN SHOWS A DEFAULT AND
+    // CALLS IT AN ANSWER. `generation` is the only one that is not carried —
+    // the handler's first line compares it and returns — so the three that ARE
+    // walk both seams here. `partial` is the field this rule was written for:
+    // without it the strip's kinds and the hit count are still rendered, so the
+    // screen goes back to presenting whatever survived as the whole truth.
+    let loaded = inlined(include_str!("ui/handlers/overlays.ice"));
+    let loaded = loaded
+        .split_once("on explorer_results_loaded(next)")
+        .expect("the Explorer's results handler")
+        .1
+        .split_once("\non ")
+        .expect("the next handler closes it")
+        .0;
+    // `inlined` folds the mount's `with` block back onto its node line, so the
+    // props ARE the rest of that line — anything below it is the event wiring.
+    let mount = inlined(include_str!("ui/view.ice"));
+    let mount = mount
+        .split_once("ExplorerScreen query<->explorer_query")
+        .expect("the app mounts the Explorer")
+        .1
+        .split_once('\n')
+        .expect("the props line ends")
+        .0;
+    // AND A FACT ABOUT THE LAST SEARCH DIES WITH IT. Both resets already clear
+    // the hits and the strip; a `partial` left standing keeps naming a source
+    // that failed to answer a query the reader has since cleared or replaced.
+    let handlers = inlined(include_str!("ui/handlers/overlays.ice"));
+    let resets = ["on explorer_search_submit", "on clear_explorer_search"].map(|opener| {
+        handlers
+            .split_once(opener)
+            .unwrap_or_else(|| panic!("`{opener}` is where it was"))
+            .1
+            .split_once("\non ")
+            .expect("the next handler closes it")
+            .0
+    });
+    for (field, held, cleared) in [
+        ("hits", "explorer_hits", "[]"),
+        ("kinds", "explorer_kinds", "[]"),
+        ("partial", "explorer_partial", r#""""#),
+    ] {
+        assert!(
+            loaded.contains(&format!("{held} = next.{field}")),
+            "`{field}` comes back from the search and nothing lands it in \
+             `{held}`, so the screen renders the state default"
+        );
+        assert!(
+            mount.contains(&format!("{field}={held}")),
+            "the Explorer mount passes something other than `{held}` for \
+             `{field}`, so what the loader read never reaches the screen"
+        );
+        for reset in &resets {
+            assert!(
+                reset.contains(&format!("{held} = {cleared}")),
+                "a reset that leaves `{held}` standing shows the last search's \
+                 answer over the next one"
+            );
+        }
     }
 }
 

@@ -1164,14 +1164,26 @@ fn palette_keys_use_logical_escape_and_physical_shortcut() {
 /// One stubbed lane of the workspace search: the substring that names it in a
 /// raw request, the search LEG it belongs to, and the reply. An empty leg name
 /// marks a FOLLOW-UP — a request a leg can only issue after its own first reply
-/// (the per-repo tracker read), so it can never be in flight at first contact
-/// and is not counted as overlap.
+/// (forge's per-repo tracker read, pages' title lookup), so it can never be in
+/// flight at first contact and is not counted as overlap.
+///
+/// FIRST MATCH WINS, SO A FOLLOW-UP GOES ABOVE THE LANE IT SHARES A ROUTE WITH.
+/// `list_pages` is `/v1/index/pages/view` too — the same route as the page
+/// search — so on the substring alone the title lookup would be served the
+/// search's own reply and read as a second `pages` arrival. Matching the query
+/// discriminant first is what keeps "a request this stub does not model panics
+/// by name" true rather than nearly true.
 ///
 /// The chat lane answers with no hits on purpose: a `MsgRow` is seventeen wire
 /// fields and nothing here turns on its contents. The other five carry one
 /// matching row each, which is what pins the row order.
 const SEARCH_LANES: &[(&str, &str, &str)] = &[
     ("/v1/index/chat/view", "chat", r#"{"hits":[]}"#),
+    (
+        "list_pages",
+        "",
+        r#"{"pages":{"pages":[{"id":"page-1","title":"The needle page"}],"has_more":false}}"#,
+    ),
     (
         "/v1/index/pages/view",
         "pages",
@@ -1265,15 +1277,21 @@ impl FanOutWatch {
 /// arrive after it are not counted — the report is what overlapped, not what
 /// ever arrived. Recording every arrival instead makes this stub pass the very
 /// break it exists to catch: a leg held back behind another leg's reply lands
-/// the moment the give-up releases the rest, and a set that keeps filling then
-/// reads as a full fan-out.
+/// the moment the rest are let go, and a set that keeps filling then reads as a
+/// full fan-out.
 ///
 /// A grep of the join's TEXT cannot see any of this, which is why the pin this
 /// replaced could be broken while staying green.
 ///
-/// The wait has a give-up so a serialized search FAILS instead of hanging; the
-/// passing path never reaches it (six loopback requests overlap in
-/// milliseconds), so nothing here is timing-sensitive.
+/// THE ESCAPE FROM A WEDGE IS AN EVENT, NOT A CLOCK. A serialized search never
+/// completes the wave, so its held requests run out `RpcClient`'s own 30 s
+/// ceiling and reqwest drops the connection — and that FIN is what this stub
+/// waits on beside the release. The first hang-up freezes the report at what
+/// had genuinely overlapped and lets the rest go, so a broken fan-out FAILS
+/// with the truth in the message instead of hanging the suite. The passing path
+/// never touches either seam: nine loopback requests overlap in milliseconds
+/// and release on the ninth ARRIVAL, so no duration is load-bearing anywhere
+/// here.
 async fn node_that_answers_only_a_full_fan_out(
     requests: usize,
     refused: Option<&'static str>,
@@ -1300,9 +1318,17 @@ async fn node_that_answers_only_a_full_fan_out(
         body.len() >= declared
     }
 
-    /// Long enough that a fanned-out search never reaches it, short enough that
-    /// a serialized one fails the run instead of wedging it.
-    const GIVE_UP: Duration = Duration::from_secs(5);
+    /// The held request's client gave up and closed the socket — the only
+    /// event a stub holding a reply can observe when the wave will never
+    /// complete. `Ok(0)` is the FIN; an error is the same fact, harder.
+    async fn hung_up(stream: &mut tokio::net::TcpStream) {
+        let mut ignored = [0u8; 1];
+        while let Ok(read) = stream.read(&mut ignored).await {
+            if read == 0 {
+                return;
+            }
+        }
+    }
 
     let (release, _) = tokio::sync::watch::channel(false);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1342,8 +1368,17 @@ async fn node_that_answers_only_a_full_fan_out(
                         let _ = release.send(true);
                     }
                     let mut open = release.subscribe();
-                    while !*open.borrow_and_update() {
-                        if tokio::time::timeout(GIVE_UP, open.changed()).await.is_err() {
+                    let opened = async {
+                        while !*open.borrow_and_update() {
+                            let _ = open.changed().await;
+                        }
+                    };
+                    tokio::select! {
+                        () = opened => {}
+                        () = hung_up(&mut stream) => {
+                            // Nobody is coming: this request's client already
+                            // walked away. Freeze the report at what did
+                            // overlap and let the others answer into the void.
                             watch.lock().expect("stub watch").release();
                             let _ = release.send(true);
                         }
@@ -1411,6 +1446,16 @@ async fn a_workspace_search_reaches_its_six_sources_together() {
     let mut order: Vec<String> = results.hits.iter().map(|hit| hit.kind.clone()).collect();
     order.dedup();
     assert_eq!(order, ["page", "code", "file", "task", "run"]);
+    // The page row heads with its PAGE, which is the second wave's whole job —
+    // and the reason `list_pages` is a lane of its own rather than a substring
+    // collision with the search it follows. Served the search's reply instead,
+    // the title lookup fails and every page hit falls back to "Untitled".
+    let page = results
+        .hits
+        .iter()
+        .find(|hit| hit.kind == "page")
+        .expect("the pages lane answered");
+    assert_eq!(page.title, "The needle page");
 }
 
 /// A SOURCE THAT DID NOT ANSWER IS NOT A SOURCE WITH NOTHING TO SAY. All six
@@ -1422,35 +1467,67 @@ async fn a_workspace_search_reaches_its_six_sources_together() {
 /// read, and — when the survivors were empty — "Nothing matched that query in
 /// this workspace". Three lies off one timeout, in the app that spent the night
 /// learning to say nothing rather than something false.
+///
+/// EVERY LEG, NOT THE ONE I FIXED FIRST. The round-2 version refused the forge
+/// lane alone, and reverting the silence report on chat, files or tasks — two
+/// of them the `return Vec::new()` swallowers — kept the suite green. The
+/// defect was class-wide, so the pin walks the class: each source in turn is
+/// the one that does not answer.
 #[tokio::test(flavor = "current_thread")]
 async fn a_search_that_lost_a_source_says_which_one() {
-    let watch: std::sync::Arc<Mutex<FanOutWatch>> = Default::default();
-    let rpc = node_that_answers_only_a_full_fan_out(9, Some("forge"), watch.clone()).await;
+    /// The six sources, each with the name the screen must call it by and the
+    /// hit kind it contributes. One table: a seventh source added to
+    /// `search_workspace` with no silence report has to be added here to pass,
+    /// and then fails.
+    const SOURCES: [(&str, &str, &str); 6] = [
+        ("chat", "Messages", "message"),
+        ("pages", "Pages", "page"),
+        ("forge", "Code", "code"),
+        ("files", "Files", "file"),
+        ("tasks", "Tasks", "task"),
+        ("runs", "Runs", "run"),
+    ];
 
-    let results = search_workspace(rpc, "needle".into(), 5)
-        .await
-        .expect("five sources answered");
+    for (leg, label, silent_kind) in SOURCES {
+        let rpc = node_that_answers_only_a_full_fan_out(9, Some(leg), Default::default()).await;
 
-    assert_eq!(
-        results.partial, "Code did not answer — these results are incomplete.",
-        "the screen must name the source it did not read"
-    );
-    // The chip strip's contract is "a count of 0 means nothing matched, never
-    // no loader", so the source that never ran keeps no chip at all.
-    let chips: Vec<&str> = results
-        .kinds
-        .iter()
-        .map(|kind| kind.kind.as_str())
-        .collect();
-    assert_eq!(chips, ["message", "page", "file", "task", "run"]);
-    assert!(
-        !results.hits.iter().any(|hit| hit.kind == "code"),
-        "the refused source contributes nothing"
-    );
-    // The five that answered are untouched — a partial answer is still an
-    // answer, and degrading it would be the opposite mistake.
-    assert!(results.hits.iter().any(|hit| hit.kind == "page"));
-    assert!(results.hits.iter().any(|hit| hit.kind == "run"));
+        let results = search_workspace(rpc, "needle".into(), 5)
+            .await
+            .expect("the other five sources answered");
+
+        assert_eq!(
+            results.partial,
+            format!("{label} did not answer — these results are incomplete."),
+            "the screen must name the source it did not read"
+        );
+        // The chip strip's contract is "a count of 0 means nothing matched,
+        // never no loader", so the source that never ran keeps no chip at all.
+        let chips: Vec<&str> = results
+            .kinds
+            .iter()
+            .map(|kind| kind.kind.as_str())
+            .collect();
+        let answered: Vec<&str> = SOURCES
+            .iter()
+            .map(|(_, _, kind)| *kind)
+            .filter(|kind| *kind != silent_kind)
+            .collect();
+        assert_eq!(chips, answered, "{label} was refused, so it keeps no chip");
+        // And the answer that did arrive is untouched, in screen order —
+        // degrading the survivors would be the opposite mistake. The chat lane
+        // carries no rows on purpose (see `SEARCH_LANES`); every other source
+        // contributes exactly one.
+        let mut rows: Vec<&str> = results.hits.iter().map(|hit| hit.kind.as_str()).collect();
+        rows.dedup();
+        let carried: Vec<&str> = ["page", "code", "file", "task", "run"]
+            .into_iter()
+            .filter(|kind| *kind != silent_kind)
+            .collect();
+        assert_eq!(
+            rows, carried,
+            "with {label} silent the other sources still land, in screen order"
+        );
+    }
 }
 
 /// A SEARCH HIT SAYS WHICH ROOM IT IS IN, ONCE. The hit's `meta` was
