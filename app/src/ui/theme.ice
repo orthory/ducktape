@@ -234,10 +234,34 @@ palette app for AppTheme
   // selected. Each is one notch off the surface it sits on, never a grey.
   //
   // `selected_row` is the ONE plate that means "this is the row/tab you are
-  // on", everywhere: chat channels, DMs, pages, both file trees, the object
-  // list, the repo switcher, the nav rail, the Explorer blocks, the node
-  // matrix head. It is NOT `subtle` — that is the track/pressed grey, and the
-  // two sat 2.3/255 apart in dark until they were settled.
+  // on", everywhere: chat channels, the selected chat MESSAGE and thread
+  // reply, DMs, pages, both file trees, the object list, the repo switcher,
+  // the nav rail, the member card, the Explorer blocks, the node matrix head.
+  // It is NOT `subtle` — that is the track/pressed grey, and the two sat
+  // 2.3/255 apart in dark until they were settled.
+  //
+  // A WASH CANNOT BE THE MARK ON ANYTHING NESTED INSIDE A ROW. Not a rule
+  // about which wash: a wash an inner control rests on is a wash its row can
+  // also wear, and no wash here stands off both `bg` and `selected_row` (the
+  // best is `warning_plate`, 11.33/12.00, and it is the warning plate). So a
+  // nested mark is INK or an EDGE. The reaction chip is where this was found:
+  // mine rested on `brand_bg`, the selected message card's own plate at the
+  // time, 0.00/255 apart in both themes, and now fills with `brand` ink at
+  // 68.00/82.33 from the nearest plate any row wears.
+  //
+  // The quiet nested SLABS keep their washes — the un-reacted chip and the
+  // code fence on `muted_bg`, the thread chip on `surface` — because the wash
+  // was never their mark either. What draws them is the EDGE, and all three
+  // were on lines that vanished on exactly the row this token paints:
+  // `card_line` 2.33/3.00 and `border` 5.33/2.00 against `selected_row`. All
+  // three now carry `control_line`, 13.00/7.67.
+  //
+  // `app/src/tests.rs` measures all four slabs' EDGES against every plate a
+  // current-row arm anywhere in the app rests on, and holds every state on
+  // them to the resting plate. Only the reacted chip's FILL is measured, and
+  // only because it is the one of the four whose mark is a fill — the other
+  // three rest on a wash on purpose, so a fill gate on them would be a gate
+  // nothing is meant to pass.
   bg_wash #f7f6f2
   card_wash #faf9f6
   card_wash_hover #fcfbf9

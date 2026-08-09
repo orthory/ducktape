@@ -242,13 +242,19 @@ component MessageBody(message:ChatMessage)
       // as "preformatted" in both themes (the old black/26 was a dark slab in
       // light mode and vanished in dark). The lang tag is an eyebrow label,
       // not a code line.
+      //
+      // Same shape as the un-reacted reaction chip, and the same fix: this is
+      // nested INSIDE a message row, `muted_bg` was never what drew it, and
+      // its `border` edge measured 5.33/2.00 against `selected_row` — inside a
+      // message you had a menu open on, the fence had no outline at all.
+      // `control_line` is 13.00/7.67 there and 31.67/31.00 against `bg`.
       if block.kind == "code"
         box
           with
             w=fill
             p=11.0
             bg=muted_bg
-            border=border
+            border=control_line
             border-w=1.0
             r=9.0
           col w=fill gap=6.0
@@ -333,13 +339,18 @@ component MessageAvatar(initials:str, kind:str)
             plate=30.0
             ink=11.0
 
-// ONE reaction chip, on the artifact's warm pair. Mine is the tint plate the
-// tree already tokenises at the artifact's own #f0ece1; not-mine is the flat
-// wash with the card hairline. The count rides at the emoji's size, not one
-// step above it.
-// NOTE the two tokens theme.ice does not carry: the mine border (#e0d2bd) and
-// the mine ink (#8a6a4a). Until they land this chip wears `brand_line`/`brand`,
-// which is the same warm family one step hotter.
+// ONE reaction chip: FILLED when I am in this reaction, a quiet outlined slab
+// when I am not. The count rides at the emoji's size, not one step above it.
+//
+// A chip is nested INSIDE a message row, so no WASH can be its mark: a wash it
+// rests on is a wash some row can also wear, and this palette holds none that
+// stands off both the stream's `bg` and a row's `selected_row`. Nearer of the
+// two, mean per channel, light/dark: `brand_wash` 4.33/9.33, `brand_bg`
+// 7.67/9.00, `muted_bg` 8.00/10.33, `warning_plate` 11.33/12.00 — and that
+// last is the warning plate. So the mark is INK on the arm that has one to
+// make, and an EDGE on the arm that does not. The tinted pair this chip wore
+// before proved the point: mine sat on `brand_bg`, which was the selected
+// message card's own plate at the time, 0.00 apart in both themes.
 component ReactionChip(reaction:ChatReaction, seq:i64)
   emits
     add_reaction_at(i64, str)
@@ -364,18 +375,30 @@ component ReactionChip(reaction:ChatReaction, seq:i64)
                 size=11.0
                 wrap=none
                 font=code_medium
-                @text-fg
+                @text-brand_fg
             text reaction.count
               with
                 size=11.0
                 wrap=none
                 font=code_medium
-                @text-brand
-        // A chip you are IN, not a row you are ON: brand ink over the brand
-        // plate, so `selected_row` keeps meaning exactly one thing.
-        active bg=brand_bg text=brand border=brand_line border-w=1.0 r=11.0
-        hovered bg=brand_bg text=brand border=brand
-        pressed bg=warning_plate text=brand border=brand
+                @text-brand_fg
+        // A chip you are IN INVERTS TO INK, exactly as the filter chip inverts
+        // to `primary`. Ink cannot collide with a row plate, whichever plate a
+        // row is later retuned to: `brand` stands 68.00/82.33 from the nearest
+        // of them, where the `brand_bg` it replaces stood 0.00 from the
+        // selected card's own plate. Hover halos rather than deflating,
+        // because deflating to a wash is what put this chip inside its row's
+        // plate to begin with.
+        //
+        // NO state moves the plate, on either arm: a chip nested in a row
+        // cannot flash a wash without landing on some row's own plate, so it
+        // flashes its RING instead — `brand` at rest, the `brand_line` halo
+        // under the cursor (109.00/88.33 from the fill), the full `brand_fg`
+        // ring under a finger (151.67/121.00). The glyphs are `brand_fg`
+        // whatever happens, which a plate that moved could not promise.
+        active bg=brand text=brand_fg border=brand border-w=1.0 r=11.0
+        hovered bg=brand text=brand_fg border=brand_line
+        pressed bg=brand text=brand_fg border=brand_fg
     if !reaction.reacted_by_me
       button -> emit(add_reaction_at, seq, reaction.emoji)
         with
@@ -402,9 +425,36 @@ component ReactionChip(reaction:ChatReaction, seq:i64)
                 wrap=none
                 font=code_medium
                 @text-muted
-        active bg=muted_bg text=muted border=card_line border-w=1.0 r=11.0
-        hovered bg=elevated text=fg border=control_line
-        pressed bg=subtle text=fg
+        // A chip you are NOT in is a quiet SLAB, and what draws it is its
+        // EDGE, not its plate: `muted_bg` sits 8.00/10.33 off the stream's
+        // `bg` and 10.67/13.00 off `selected_row`, faint on every row and no
+        // fainter on a selected one. The edge is where it actually broke —
+        // `card_line` measured 21.00/20.33 against `bg` but 2.33/3.00 against
+        // `selected_row`, so on the row you were reading the outline was gone.
+        // `control_line`, the token NAMED for a control's resting outline,
+        // beats it on all four: 31.67/31.00 and 13.00/7.67.
+        //
+        // It is chosen for the name, not for the number, and it is not the
+        // palette's strongest line — over both themes and every plate a row
+        // can wear its worst case is 7.67, where `control_line_hover` scores
+        // 17.33, `window_line` 12.33, `pending_line` 11.33 and `brand_line`
+        // 9.33. Those are the hover step, the window chrome line, the
+        // not-yet-settled dash and the brand family; taking one of them for a
+        // resting neutral outline would buy contrast by spending a token's
+        // meaning, which is the defect the whole `selected_row` line of work
+        // exists to undo.
+        //
+        // Same rule as the arm above: the plate never moves, the RING does.
+        // Hover and press used to deflate to `elevated` and `subtle`, 7.67/8.33
+        // and 3.33/2.33 from `selected_row` — so pressing this chip on a
+        // selected message painted it the row's own colour, which is the defect
+        // #1008 existed for, one level down. The ring warms instead:
+        // `control_line` at rest, `brand_line` under the cursor, full `brand`
+        // under a finger, each a visible step (13.00/8.33, then further) and
+        // none of them a wash the row can also wear.
+        active bg=muted_bg text=muted border=control_line border-w=1.0 r=11.0
+        hovered bg=muted_bg text=fg border=brand_line
+        pressed bg=muted_bg text=fg border=brand
 
 component MessageContents(message:ChatMessage, flash:f64)
   emits
@@ -517,9 +567,25 @@ component MessageContents(message:ChatMessage, flash:f64)
                       wrap=none
                       font=code_medium
                       @text-brand
-              active bg=surface text=brand border=border border-w=1.0 r=8.0
-              hovered bg=muted_bg text=brand border=control_line
-              pressed bg=elevated text=brand
+              // The third slab in this stream drawn by its EDGE rather than its
+              // plate — with the un-reacted reaction chip and the code fence —
+              // and it takes the same one-token fix. It is the mirror image of
+              // those two: `surface` is 21.33/16.33 off `selected_row` but only
+              // 2.67/7.00 off `bg`, so on an ordinary row it is drawn entirely by
+              // its outline — and that outline was `border`, 5.33/2.00 from
+              // `selected_row`, which left it with neither on a selected one.
+              //
+              // And the same rule on its states as both chip arms: the plate
+              // never moves, the ring does. This one still deflated —
+              // `muted_bg` under the cursor and `elevated` under a finger, and
+              // `elevated` is 7.67/8.33 from `selected_row`, so pressing it on
+              // the message you had a menu open on painted it the row's own
+              // colour. That is #1008's defect one level down, and fixing it
+              // on the chips while leaving it here is how the same class keeps
+              // coming back one sibling out.
+              active bg=surface text=brand border=control_line border-w=1.0 r=8.0
+              hovered bg=surface text=brand border=brand_line
+              pressed bg=surface text=brand border=brand
       // The quiet send-state lane at the row's right edge: an in-flight row
       // carries a small dot, the settle swaps it for a ✓ that fades out (the
       // `flash` prop is the animation's opacity — nonzero only on the row the
@@ -585,7 +651,11 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
               add_reaction_at
               remove_reaction_at
               open_thread_for
-      // Selection is a tint, not a ring — see the QA note in the stream.
+      // Selection is a tint, not a ring — see the QA note in the stream. The
+      // tint is `selected_row`, the one plate that means "the row you are on":
+      // a menu-open or deep-linked message is that row, exactly as a chosen
+      // channel or an open file is. It read `brand_bg` until the reaction chip
+      // moved onto the same token and vanished on it.
       if !message.deleted && selected
         box
           with
@@ -594,7 +664,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
             pr=7.0
             pt=6.0
             pb=6.0
-            bg=brand_bg
+            bg=selected_row
             border=transparent
             border-w=1.0
             r=9.0
@@ -765,6 +835,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
               add_reaction_at
               remove_reaction_at
               open_thread_for
+      // Same `selected_row` tint as the stream — see the note in MessageCard.
       if !message.deleted && selected
         box
           with
@@ -773,7 +844,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
             pr=7.0
             pt=6.0
             pb=6.0
-            bg=brand_bg
+            bg=selected_row
             border=transparent
             border-w=1.0
             r=9.0

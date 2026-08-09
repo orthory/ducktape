@@ -3556,6 +3556,81 @@ fn the_explorer_marks_the_block_row_whose_detail_is_open() {
 /// are commented where they live: the tab underline and the filter chip invert
 /// to ink, the matrix cell takes the faintest wash because its column HEAD
 /// already wears the mark, and the huddle camera toggle is an engaged control
+/// A CHIP INSIDE A MESSAGE ROW MUST NOT WEAR A PLATE THE ROW ITSELF COULD BE
+/// WEARING. #1008 gave the current row `selected_row`; the reacted chip was
+/// painting `brand_bg`, and both of its other states deflated to washes. On a
+/// message you had open the mark and the card were the same colour.
+///
+/// Luminance means computed from `ui/theme.ice`, distance from `selected_row`,
+/// light / dark:
+///
+/// | plate | before | after |
+/// |---|---|---|
+/// | reacted chip | `brand_bg` 6.65 / 9.12 | `brand` **128.43 / 102.41** |
+/// | un-reacted chip | `elevated`, `subtle` on hover/press | `muted_bg` 9.02 / 13.37, held in every state |
+/// | thread chip | `muted_bg`, `elevated` on hover/press | `surface` 19.06 / 17.14, held in every state |
+///
+/// This pins the three arms by their own state lines rather than by a scanner.
+/// A scanner was tried across four rounds of #1016 and grew a fresh hole each
+/// time — an unbounded forward walk that measured the next component, a
+/// `transparent` skip, then `border-w=0`. The rule that generalises already
+/// exists directly below (`every_current_row_marker_rests_on_one_selection_token`);
+/// this one only has to say what these three chips wear.
+#[test]
+fn no_chip_inside_a_message_row_deflates_onto_the_row() {
+    let chat = inlined(include_str!("ui/components/chat.ice"));
+    for (chip, states) in [
+        (
+            "reacted",
+            [
+                "active bg=brand text=brand_fg border=brand border-w=1.0 r=11.0",
+                "hovered bg=brand text=brand_fg border=brand_line",
+                "pressed bg=brand text=brand_fg border=brand_fg",
+            ],
+        ),
+        (
+            "un-reacted",
+            [
+                "active bg=muted_bg text=muted border=control_line border-w=1.0 r=11.0",
+                "hovered bg=muted_bg text=fg border=brand_line",
+                "pressed bg=muted_bg text=fg border=brand",
+            ],
+        ),
+        (
+            "thread",
+            [
+                "active bg=surface text=brand border=control_line border-w=1.0 r=8.0",
+                "hovered bg=surface text=brand border=brand_line",
+                "pressed bg=surface text=brand border=brand",
+            ],
+        ),
+    ] {
+        for state in states {
+            assert!(
+                chat.contains(state),
+                "the {chip} chip must hold its plate in every state: {state}"
+            );
+        }
+    }
+
+    // And none of them may go back to a wash that sits within ~13/255 of the
+    // row plate. Scoped to the two chip components, because `elevated` and
+    // `subtle` are legitimate elsewhere in this file.
+    let chips = chat
+        .split_once("component ReactionChip(")
+        .expect("the reaction chip")
+        .1
+        .split_once("\ncomponent ")
+        .expect("it ends")
+        .0;
+    for wash in ["bg=brand_bg", "bg=elevated", "bg=subtle"] {
+        assert!(
+            !chips.contains(wash),
+            "a chip on the row you are reading may not rest on {wash}"
+        );
+    }
+}
+
 /// rather than a row you navigated to.
 #[test]
 fn every_current_row_marker_rests_on_one_selection_token() {
