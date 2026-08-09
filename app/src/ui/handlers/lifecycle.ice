@@ -148,11 +148,12 @@ on reconnect
   page_searching = false
   error = ""
   status = "Connecting…"
-  run connect(connected_rpc, hydration_retry_attempt, hydration_generation) -> workspace_connected _ | connect_failed _
+  connect_generation = connect_generation + 1
+  run connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _
 
 on workspace_connected(next)
   // A connect answering for an endpoint you have since left is not an answer.
-  return if next.generation != hydration_generation
+  return if next.generation != connect_generation
   rpc = next.rpc
   connected_rpc = next.rpc
   network_name = network_label(account_name, connected_rpc)
@@ -604,13 +605,14 @@ on connect_failed(cause)
   // chains alive forever, and each chain's own bump could then reject the
   // other's success. Measured before this guard existed: a dead endpoint drew
   // two interleaved retry series 5.2s and 10.8s apart, summing to one 16s cap.
-  return if cause.generation != hydration_generation
+  return if cause.generation != connect_generation
   hydration_generation = hydration_generation + 1
+  connect_generation = connect_generation + 1
   hydration_retry_attempt = hydration_retry_attempt + 1
   loading = false
   status = "Offline"
   error = cause.message
-  run connect(connected_rpc, hydration_retry_attempt, hydration_generation) -> workspace_connected _ | connect_failed _
+  run connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _
 
 on failed(cause)
   hydration_generation = hydration_generation + 1

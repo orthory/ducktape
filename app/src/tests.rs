@@ -4457,7 +4457,7 @@ fn every_header_subtitle_is_gated_on_the_connection() {
 fn a_failed_connect_retries_instead_of_giving_up() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
-    let before = app.hydration_generation;
+    let before = app.connect_generation;
 
     let fail = |generation: i64| {
         __DucktapeMessage::ConnectFailed(backend::HydrationError {
@@ -4465,28 +4465,50 @@ fn a_failed_connect_retries_instead_of_giving_up() {
             message: "error sending request".into(),
         })
     };
-    let _ = app.__update(fail(app.hydration_generation));
+    let _ = app.__update(fail(app.connect_generation));
     assert_eq!(
         app.hydration_retry_attempt, 1,
         "the first failure is attempt 1"
     );
     assert_eq!(app.status, "Offline", "and it is offline while it retries");
     assert!(
-        app.hydration_generation > before,
+        app.connect_generation > before,
         "each attempt owns a generation, so an abandoned one cannot answer"
     );
 
     // The counter CLIMBS — that is what feeds the backoff. A reset here would
     // retry at 1s forever against a genuinely dead endpoint.
-    let _ = app.__update(fail(app.hydration_generation));
-    let _ = app.__update(fail(app.hydration_generation));
+    let _ = app.__update(fail(app.connect_generation));
+    let _ = app.__update(fail(app.connect_generation));
     assert_eq!(app.hydration_retry_attempt, 3);
+
+    // A CONNECT IS NOT GUARDED ON `hydration_generation`, AND THIS IS WHY.
+    // Thirty-seven handlers bump that counter for reasons of their own —
+    // `choose_channel` is one of them — and a connect is in flight for seconds,
+    // or for up to 30s while the node sits in issue #1018's checkpoint stall.
+    // Guarded on the shared counter, one click on a channel mid-connect drops
+    // the successful reply; because it SUCCEEDED no failure arm fires and
+    // nothing retries, so the console sits Offline forever. Strictly worse than
+    // the defect this PR fixes.
+    let (mut wired, _) = Ducktape::__boot();
+    wired.connected_rpc = "http://127.0.0.1:38259".into();
+    let connect_gen = wired.connect_generation;
+    let shared_before = wired.hydration_generation;
+    let _ = wired.__update(__DucktapeMessage::ChooseChannel("general".into()));
+    assert!(
+        wired.hydration_generation > shared_before,
+        "an ordinary channel click bumps the SHARED counter"
+    );
+    assert_eq!(
+        wired.connect_generation, connect_gen,
+        "and leaves the connect's own alone — only the three routes that start a connect may touch it"
+    );
 
     // AND A FAILURE FROM AN ABANDONED CHAIN IS DROPPED UNREAD. Without this,
     // two chains retry forever and each one's generation bump can reject the
     // other's success — measured live as two interleaved retry series 5.2s and
     // 10.8s apart, summing to one 16s cap.
-    let stale = app.hydration_generation - 1;
+    let stale = app.connect_generation - 1;
     let attempts = app.hydration_retry_attempt;
     let _ = app.__update(fail(stale));
     assert_eq!(
@@ -4509,18 +4531,32 @@ fn a_failed_connect_retries_instead_of_giving_up() {
     );
     assert!(
         arm.contains(
-            "run connect(connected_rpc, hydration_retry_attempt, hydration_generation) -> workspace_connected _ | connect_failed _"
+            "run connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _"
         ),
         "and it goes round again, carrying the attempt into the backoff"
     );
-    let connected = lifecycle
+    // Scoped to the ARM, not to the rest of the file: `live_resynced` further
+    // down guards on `hydration_generation` and is right to — that one really
+    // is the live plane's counter.
+    let connected_rest = lifecycle
         .split_once("on workspace_connected(next)")
         .expect("the success arm")
         .1;
+    let connected = connected_rest
+        .split_once("\non ")
+        .map_or(connected_rest, |(arm, _)| arm);
+    // NO `||` HERE. An alternative that is trivially true short-circuits the
+    // half that matters — the first version of this assertion accepted the
+    // presence of a COMMENT and stayed green with the guard pointed back at the
+    // shared counter, which is the wedge this test exists to prevent.
     assert!(
-        connected.starts_with("\n  // A connect answering")
-            || connected.contains("return if next.generation != hydration_generation"),
-        "a connect answering for an endpoint you have left is dropped unread"
+        connected.contains("return if next.generation != connect_generation"),
+        "the connect is guarded on its OWN generation, never the shared one"
+    );
+    assert!(
+        !connected.contains("return if next.generation != hydration_generation"),
+        "the shared counter is bumped by 37 handlers; guarding on it drops a \
+         successful connect and nothing retries"
     );
 
     // The SHARED `failed` arm still belongs to the six page/chat loaders that

@@ -167,6 +167,7 @@ on console_opened(id)
   connected_rpc = rpc
   network_name = network_label(account_name, connected_rpc)
   hydration_generation = hydration_generation + 1
+  connect_generation = connect_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = "idle"
   channels = []
@@ -267,7 +268,7 @@ on console_opened(id)
   parallel
     task window close target=window_target(onboarding_win)
     run remember_network(connected_rpc) -> network_remembered _
-    run connect(connected_rpc, 0, hydration_generation) -> workspace_connected _ | connect_failed _
+    run connect(connected_rpc, 0, connect_generation) -> workspace_connected _ | connect_failed _
 
 on network_remembered(_written)
   error = error
