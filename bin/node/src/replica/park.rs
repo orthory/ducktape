@@ -1458,7 +1458,11 @@ pub(super) async fn park(
                 let checkpoint_started = context.current();
                 let members = read_valset_members(node_r.host()).await;
                 let residents = read_valset_residents(node_r.host()).await;
-                let captured = Manifest::capture(
+                // TIMED, exactly like the validator's periodic checkpoint: this
+                // capture blocks the replica's own select loop, so its per-module
+                // cost is the same diagnosis (#1018) and must not be visible in
+                // only one of the two roles.
+                let captured = Manifest::capture_timed(
                     node_r.host(),
                     Some(f.height),
                     replica_epoch,
@@ -1468,10 +1472,19 @@ pub(super) async fn park(
                     None,
                     pos,
                     1,
+                    || {
+                        context
+                            .current()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                    },
                 );
+                let captured_at = context.current();
                 match captured {
-                    Ok(ckpt) => match node_r.sink_mut().write_manifest(&ckpt).await {
+                    Ok((ckpt, capture_cost)) => match node_r.sink_mut().write_manifest(&ckpt).await
+                    {
                         Ok(()) => {
+                            let written_at = context.current();
                             // prune the journal below the PREVIOUS
                             // checkpoint once the persisted floor
                             // passed it — the validator's exact
@@ -1501,6 +1514,20 @@ pub(super) async fn park(
                             }
                             replica_prev_ckpt = (ckpt.height, pos);
                             blocks_since_checkpoint = 0;
+                            let since = |a: std::time::SystemTime, b: std::time::SystemTime| {
+                                b.duration_since(a).unwrap_or_default().as_millis()
+                            };
+                            let done_at = context.current();
+                            tracing::info!(
+                                target: "ducktape::recovery",
+                                event = "node_checkpoint_written",
+                                node = %label,
+                                height = ckpt.height.unwrap_or_default(),
+                                capture_ms = since(checkpoint_started, captured_at),
+                                write_ms = since(captured_at, written_at),
+                                prune_ms = since(written_at, done_at),
+                                capture_modules = %crate::drain_actions::capture_breakdown(&capture_cost)
+                            );
                         }
                         Err(e) => tracing::warn!(
                             target: "ducktape::recovery",
