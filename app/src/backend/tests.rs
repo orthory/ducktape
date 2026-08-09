@@ -2310,6 +2310,37 @@ fn block_comment_posts_reuse_the_selected_thread() {
     assert!(comment_thread_id(" ".into()).is_err());
 }
 
+/// A DEFAULTED STATUS DOCUMENT MUST NOT READ AS MEASURED.
+///
+/// Asserting the RENDERED strings, not the integers: `-1` is only correct
+/// because the renderers turn it into an em dash, and a future change to
+/// either end that broke the pairing would leave an integer assertion green
+/// while the screen went back to printing a head no node ever served.
+#[test]
+fn a_defaulted_node_facts_prints_as_unserved_everywhere() {
+    let facts = NodeFacts::default();
+    assert_eq!(facts.height, UNMEASURED);
+    assert_eq!(facts.checkpoint_height, UNMEASURED);
+    assert_eq!(facts.last_finalized_at, UNMEASURED);
+
+    assert_eq!(crate::backend::height_label_short(facts.height), "h —");
+    assert_eq!(
+        crate::backend::height_label_short(facts.checkpoint_height),
+        "h —",
+        "a defaulted checkpoint above a dashed head is the inversion the \
+         sentinel exists to prevent"
+    );
+    assert_eq!(
+        crate::backend::relative_time(facts.last_finalized_at),
+        "—",
+        "the node published no finalization; blank would say it legitimately \
+         carries no stamp, which is a different claim"
+    );
+
+    // and the value the derive used to hand out is exactly what must not print.
+    assert_eq!(crate::backend::height_label_short(0), "h 0");
+}
+
 /// THE TITLE WRITE IS AUTHORSHIP, NOT DISAGREEMENT.
 ///
 /// Disagreement with the node was the whole old test, and it is why a reader

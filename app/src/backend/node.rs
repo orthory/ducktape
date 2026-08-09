@@ -212,9 +212,35 @@ pub fn split_log_line(line: String) -> LogParts {
     }
 }
 
+/// A DEFAULT IS A DOCUMENT NO NODE HAS PUBLISHED, so its three numbers are
+/// [`UNMEASURED`] and not zero.
+///
+/// `derive(Default)` gave them `0`, which is the one value this whole file
+/// exists to keep off the screen: `height_label(0)` renders `h 0` and
+/// `relative_time(0)` renders nothing, so a defaulted document prints a
+/// measured head and a measured checkpoint for a node that has served neither.
+/// It was inert where it was introduced — the only arm that reaches it is one
+/// `keep_i64` discards — which is exactly why it needed writing down rather
+/// than leaving as a loaded gun on a public struct.
+impl Default for NodeFacts {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            version: String::new(),
+            root_hash: String::new(),
+            view: None,
+            quorum: None,
+            reachable_validators: None,
+            last_finalized_at: UNMEASURED,
+            checkpoint_height: UNMEASURED,
+            height: UNMEASURED,
+        }
+    }
+}
+
 /// The node's consensus/storage facts — everything `/v1/status` publishes that
 /// the two-field `Status` type drops, plus the mesh sample's live/total.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NodeFacts {
     pub generation: i64,
     /// The daemon's build version, verbatim off `/v1/status` (its own
