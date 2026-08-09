@@ -906,7 +906,12 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
 //
 // `selected_row` is the token the Forge file tree already uses for exactly
 // this, and it is the one NAMED for it. The app has since settled: every
-// surface that marks a current row reads this token and nothing else.
+// surface that marks a current row reads this token, with three documented
+// exceptions that say why where they live. The tab underline and the filter
+// chip take no plate at all and invert to INK. The matrix CELL takes the
+// faintest wash there is, `bg_wash`, because its column HEAD already wears the
+// mark and the cell only has to show how far that column reaches — repeating
+// the full plate down the column made the mark itself unreadable.
 //
 // The plate is LIGHTER than the surface, which is the direction every selected
 // row in this app moves; the measured lift here is +13/255, against the chat
