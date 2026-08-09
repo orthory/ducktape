@@ -392,7 +392,7 @@ extern crate::backend
   sync refreshed_page_editor(document:editor, title:str, blocks:[PageBlock], saved:str) -> editor
   sync refreshed_page_saved(document:editor, title:str, blocks:[PageBlock], saved:str) -> str
   sync saved_baseline(written:bool, canonical:str, submitted:str) -> str
-  sync baseline_at_buffer_title(canonical:str, buffer:str) -> str
+  sync baseline_at_submitted_title(canonical:str, submitted:str) -> str
   sync install_decision(document:editor, current_page:str, next_page:str, saved:str, canonical:str) -> bool
   sync installed_page_editor(document:editor, install:bool, canonical:str) -> editor
   sync rolled_back_editor(document:editor, untouched:bool, canonical:str) -> editor

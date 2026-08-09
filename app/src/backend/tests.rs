@@ -2351,13 +2351,13 @@ fn a_title_write_is_owed_only_when_this_reader_retitled_the_page() {
 #[test]
 fn the_baseline_keeps_the_title_the_buffer_is_actually_showing() {
     // the ordinary path: titles agree, the canonical text is not reshaped.
-    let untouched = baseline_at_buffer_title("Doc\nbody".into(), "Doc\nbody typing".into());
+    let untouched = baseline_at_submitted_title("Doc\nbody".into(), "Doc\nbody typing".into());
     assert_eq!(untouched, "Doc\nbody");
 
     // someone else renamed it: the node's body is adopted, her line 0 is kept,
     // so the next tick still reads "she retitled nothing".
     let corrected =
-        baseline_at_buffer_title("New Name\nbody".into(), "Old Name\nbody mid-sen".into());
+        baseline_at_submitted_title("New Name\nbody".into(), "Old Name\nbody mid-sen".into());
     assert_eq!(corrected, "Old Name\nbody");
     assert!(!title_write_owed(
         &crate::pages::sync::document_title("Old Name\nbody mid-sen"),
@@ -2368,12 +2368,22 @@ fn the_baseline_keeps_the_title_the_buffer_is_actually_showing() {
     // VERBATIM, not trimmed: the dirty test compares these byte for byte, so a
     // normalized line 0 would leave the buffer permanently dirty and the save
     // tick running forever.
-    let spaced = baseline_at_buffer_title("New\nbody".into(), "Old  \nbody".into());
+    let spaced = baseline_at_submitted_title("New\nbody".into(), "Old  \nbody".into());
     assert_eq!(spaced, "Old  \nbody");
 
     // a title-only document keeps its shape — no newline is invented.
-    let titleless = baseline_at_buffer_title("New".into(), "Old".into());
+    let titleless = baseline_at_submitted_title("New".into(), "Old".into());
     assert_eq!(titleless, "Old");
+
+    // THE EARLY RETURN IS LOAD-BEARING, not an optimization: when the titles
+    // agree the canonical text must come back BYTE-IDENTICAL, body and all.
+    // Rebuilding it from the submitted line 0 would drop the node's own body
+    // edits into the baseline and call the buffer clean.
+    let agreeing = baseline_at_submitted_title("Doc\nnode body".into(), "Doc\nher body".into());
+    assert_eq!(
+        agreeing, "Doc\nnode body",
+        "an agreeing title returns the node's text untouched"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

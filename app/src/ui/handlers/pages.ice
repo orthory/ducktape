@@ -569,7 +569,7 @@ on page_document_saved(next)
   active_page_title = next.data.active_page_title
   active_page_parent = next.data.active_page_parent
   page_refusal = next.refusal
-  page_saved_text = baseline_at_buffer_title(saved_baseline(next.written, next.document, page_inflight_text), page_text(page_editor))
+  page_saved_text = baseline_at_submitted_title(saved_baseline(next.written, next.document, page_inflight_text), page_inflight_text)
   block_autosave_status = "saved"
   error = ""
   return if empty(next.refusal)
@@ -579,10 +579,11 @@ on page_document_saved(next)
   // buffer re-plans on the next tick with the refusal line explaining why.
   let untouched = page_text(page_editor) == page_inflight_text
   page_editor = rolled_back_editor(page_editor, untouched, next.document)
-  // AFTER the rollback, so a rolled-back buffer reads its own restored line 0
-  // and the correction is a no-op — while a KEPT buffer holds on to the title
-  // it is still showing.
-  page_saved_text = baseline_at_buffer_title(next.document, page_text(page_editor))
+  // THE SUBMITTED TEXT, never the live buffer: she keeps typing through the
+  // round trip, and `untouched` above exists because of it. Adopting her
+  // unsaved line 0 here would make the document read clean and retire the very
+  // tick that owes the node her rename.
+  page_saved_text = baseline_at_submitted_title(next.document, page_inflight_text)
   block_autosave_status = "idle"
 
 on page_document_save_failed(cause)

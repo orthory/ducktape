@@ -2046,6 +2046,10 @@ fn a_save_that_lands_body_ops_does_not_manufacture_a_rename_next_tick() {
     // she is mid-sentence; her line 0 is the OLD name and she never touched it.
     app.page_editor = compose("Old Name\nbody mid-sentence");
     app.page_saved_text = "Old Name\nbody".into();
+    // WHAT THE TICK ACTUALLY SUBMITTED. The correction reads this, not the live
+    // buffer, so leaving it at its default empty string would hand the baseline
+    // an empty title and prove nothing about the case under test.
+    app.page_inflight_text = "Old Name\nbody mid-sentence".into();
     let generation = app.block_autosave_generation;
 
     // the save landed her body edit. The node's canonical text carries the
@@ -2087,6 +2091,103 @@ fn a_save_that_lands_body_ops_does_not_manufacture_a_rename_next_tick() {
     assert_eq!(
         app.block_autosave_generation, generation,
         "tick two must plan nothing — there is nothing of hers left unsaved"
+    );
+}
+
+/// A RENAME TYPED DURING THE ROUND TRIP MUST STILL REACH THE CHAIN.
+///
+/// The correction has to use the text the tick actually reconciled against the
+/// node, never the live buffer — she keeps typing while the save is in flight.
+/// Feeding the live buffer adopts characters she has not saved into the
+/// baseline, which makes the document read CLEAN, retires the tick that owed
+/// the node her rename, and lets the next live fold rebuild the buffer and
+/// erase what she typed. Worse than the bug this file exists to fix.
+#[test]
+fn a_title_typed_during_the_round_trip_is_not_swallowed_by_the_baseline() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.active_page = "page".into();
+    app.buffer_page = "page".into();
+    app.page_editor = compose("Notes\nhello");
+    app.page_saved_text = "Notes\nhello".into();
+
+    // the tick submits what it can see.
+    app.page_inflight_text = "Notes \nhello".into();
+    let generation = app.block_autosave_generation;
+
+    // SHE FINISHES THE WORD while the save is in flight.
+    app.page_editor = compose("Notes A\nhello");
+
+    // the save was a no-op — the trimmed title still matched the node.
+    let _ = app.__update(__DucktapeMessage::PageDocumentSaved(
+        backend::DocumentSaveResult {
+            generation,
+            written: false,
+            refusal: String::new(),
+            document: "Notes\nhello".into(),
+            data: backend::PagesData {
+                pages: vec![page_item("page", "Notes")],
+                blocks: vec![page_block("b1", "page", "hello")],
+                active_page: "page".into(),
+                active_page_title: "Notes".into(),
+                active_page_parent: String::new(),
+                comment_thread_total: 0,
+                commented_block_hits: Vec::new(),
+            },
+        },
+    ));
+
+    assert_ne!(
+        page_document_text(&app),
+        app.page_saved_text,
+        "her unsaved rename must leave the document DIRTY — a clean one retires \
+         the tick that owes the node that rename, and it is never written"
+    );
+    let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
+    assert_eq!(
+        app.block_autosave_generation,
+        generation + 1,
+        "the next tick must plan her rename"
+    );
+}
+
+/// The refusal path takes the same correction, and nothing pinned it: deleting
+/// that call site left every test in this change green while a refused write
+/// plus a remote rename reverted the rename on the next tick.
+#[test]
+fn a_refused_write_does_not_hand_the_baseline_someone_elses_title() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.active_page = "page".into();
+    app.buffer_page = "page".into();
+    app.page_editor = compose("Old Name\nbody typed on");
+    app.page_saved_text = "Old Name\nbody".into();
+    app.page_inflight_text = "Old Name\nbody typed".into();
+    let generation = app.block_autosave_generation;
+
+    // the node refused the body op, and its text carries someone else's rename.
+    let _ = app.__update(__DucktapeMessage::PageDocumentSaved(
+        backend::DocumentSaveResult {
+            generation,
+            written: false,
+            refusal: "that edit would destroy comments".into(),
+            document: "New Name\nbody".into(),
+            data: backend::PagesData {
+                pages: vec![page_item("page", "New Name")],
+                blocks: vec![page_block("b1", "page", "body")],
+                active_page: "page".into(),
+                active_page_title: "New Name".into(),
+                active_page_parent: String::new(),
+                comment_thread_total: 0,
+                commented_block_hits: Vec::new(),
+            },
+        },
+    ));
+
+    assert_eq!(
+        app.page_saved_text, "Old Name\nbody",
+        "the baseline keeps the title she submitted — adopting the node's makes \
+         the next tick believe she renamed the page and revert the other rename"
     );
 }
 

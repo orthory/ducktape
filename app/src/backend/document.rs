@@ -150,39 +150,45 @@ pub fn saved_baseline(written: bool, canonical: String, submitted: String) -> St
     }
 }
 
-/// The baseline, corrected to the title the buffer is ACTUALLY showing.
+/// The baseline, corrected to the title that was actually SUBMITTED.
 ///
 /// A save adopts the node's canonical text, and that text carries a title
 /// somebody else may have changed while this reader was typing — a title this
 /// buffer has never displayed, because the dirty guard refuses to rebuild a
 /// buffer mid-sentence. Line 0 IS the title, so taking the canonical line 0
-/// makes the baseline claim a sync that did not happen.
+/// makes the baseline claim a sync that did not happen, and the next tick
+/// reads that manufactured difference as THIS reader retitling the page,
+/// writing the old name back over the rename.
 ///
-/// The next tick then reads that manufactured difference as THIS reader
-/// retitling the page and writes the old name back over the rename — which is
-/// the whole defect `title_write_owed` exists to stop, arriving one tick late
-/// instead of immediately.
+/// `submitted` is `page_inflight_text` — the text the tick actually reconciled
+/// against the node — and NOT the live buffer. The distinction is the whole
+/// correctness of this function, and the handler already draws it one line
+/// below (`untouched`): a reader keeps typing during the round trip. Feeding
+/// the live buffer here adopts characters she has not saved into the baseline,
+/// which makes the document read CLEAN, retires the tick that would have
+/// written her rename, and leaves the next live fold free to rebuild the
+/// buffer and erase what she typed. That is a worse bug than the one this
+/// function exists to fix, in the same family.
 ///
-/// So the baseline keeps the buffer's own line 0, VERBATIM rather than
-/// trimmed: the dirty test compares these two texts byte for byte, and a
-/// normalized line 0 would leave the buffer permanently dirty and the save
-/// tick running forever. The identical-title case returns the canonical text
-/// untouched, so the ordinary path is not reshaped at all.
+/// VERBATIM rather than trimmed, because the dirty test compares these texts
+/// byte for byte and a normalized line 0 costs a needless extra round trip.
+/// The identical-title case returns the canonical text untouched, so the
+/// ordinary path is not reshaped at all.
 ///
 /// The buffer is deliberately NOT corrected here. Rebuilding it would throw
 /// the reader's caret to the origin mid-sentence; the title on screen catches
 /// up the moment the buffer goes clean and any live event folds it.
-pub fn baseline_at_buffer_title(canonical: String, buffer: String) -> String {
-    let buffer_line = buffer
+pub fn baseline_at_submitted_title(canonical: String, submitted: String) -> String {
+    let submitted_line = submitted
         .split_once('\n')
-        .map_or(buffer.as_str(), |(head, _)| head);
-    let title_agrees = document_title(&canonical) == document_title(buffer_line);
+        .map_or(submitted.as_str(), |(head, _)| head);
+    let title_agrees = document_title(&canonical) == document_title(submitted_line);
     if title_agrees {
         return canonical;
     }
     match canonical.split_once('\n') {
-        Some((_, body)) => format!("{buffer_line}\n{body}"),
-        None => buffer_line.to_string(),
+        Some((_, body)) => format!("{submitted_line}\n{body}"),
+        None => submitted_line.to_string(),
     }
 }
 
