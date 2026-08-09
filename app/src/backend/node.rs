@@ -7,7 +7,6 @@ pub struct SettingsFacts {
     pub generation: i64,
     pub endpoint: String,
     pub node_key: String,
-    pub height: i64,
     pub key_path: String,
     pub key_state: String,
     /// this workspace's directory on this device — the NETWORK card's Data dir.
@@ -52,7 +51,6 @@ pub async fn load_settings_facts(
             generation,
             endpoint: rpc,
             node_key: short_label(&status.public_key),
-            height: i64::try_from(status.height).unwrap_or(i64::MAX),
             key_path,
             key_state,
             data_dir,
@@ -236,6 +234,13 @@ pub struct NodeFacts {
     /// rather than a plain `0`, which both renderers already print as `—`.
     pub last_finalized_at: i64,
     pub checkpoint_height: i64,
+    /// THE HEAD FROM THE SAME DOCUMENT AS [`Self::checkpoint_height`]. A
+    /// checkpoint means nothing except against the head it was sampled with, so
+    /// the two travel together or not at all: Settings used to draw them from
+    /// two separate `/v1/status` calls and printed CHECKPOINT h 422,563 above
+    /// HEIGHT h 422,553 — an order no node is ever in. See [`served_height`]
+    /// for why a wire `0` lands here as [`UNMEASURED`].
+    pub height: i64,
     pub peers_live: i64,
     pub peers_total: i64,
 }
@@ -264,6 +269,7 @@ pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, 
             checkpoint_height: operations["storage"]["checkpoint_height"]
                 .as_i64()
                 .unwrap_or(UNMEASURED),
+            height: served_height(&status["height"]),
             peers_live: count_i64(
                 peers
                     .iter()
@@ -278,6 +284,31 @@ pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, 
         generation,
         message: user_error(message),
     })
+}
+
+/// The head a status document actually serves, or [`UNMEASURED`] when it
+/// serves none.
+///
+/// **A wire `0` is not a measurement — it is the node's own "no boundary
+/// served" sentinel**, written at three independent sites: `NodeStatus`'s
+/// `Default` ("zeroed boundary facts are the honest answer before any boundary
+/// is served"), the validator's `node.finalized().map(|f| f.height)
+/// .unwrap_or(0)`, and the replica's `None => (0, String::new(), Vec::new())`.
+///
+/// That last one is why this matters beside a checkpoint. A resident takes it
+/// whenever it stops serving — a range-pruned backfill, an unresolvable pruned
+/// view, an epoch cutover — and each of those three sites sets `serving = None`
+/// and republishes while passing the LIVE `replica_prev_ckpt`, which only ever
+/// climbs. Read as a measurement, one honest document then renders
+/// `HEIGHT h 0` above `CHECKPOINT h 425,981`: a measured zero AND the very
+/// inversion the pair is supposed to make impossible. Read as absence, it
+/// renders `HEIGHT h —` — which is exactly what a node serving no boundary
+/// knows about the head.
+fn served_height(height: &serde_json::Value) -> i64 {
+    match height.as_i64() {
+        Some(head) if head > 0 => head,
+        _ => UNMEASURED,
+    }
 }
 
 /// What an `operations` reading the node did not publish carries.

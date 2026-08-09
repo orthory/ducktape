@@ -60,7 +60,6 @@ test palette_escape_contract
         quorum="—"
         reachable="—"
         last_finalized=0
-        checkpoint=0
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
@@ -190,7 +189,6 @@ test minimum_window_layout_contract
         quorum="—"
         reachable="—"
         last_finalized=0
-        checkpoint=0
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
@@ -420,7 +418,6 @@ test settings_keyboard_scroll_contract
         quorum="—"
         reachable="—"
         last_finalized=0
-        checkpoint=0
       events
         select_shell_tab -> select_shell_tab _
         toggle_bell -> toggle_bell
@@ -452,7 +449,7 @@ test settings_keyboard_scroll_contract
             connected_rpc
             settings_endpoint
             settings_node_key
-            settings_height
+            node_height
             settings_data_dir
             settings_key_state
             settings_key_path
@@ -472,7 +469,6 @@ test settings_keyboard_scroll_contract
             mutation_phase
             node_tab
             module_rows
-            block_height
             node_checkpoint
             node_last_finalized
             node_reachable_label

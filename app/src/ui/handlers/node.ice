@@ -28,6 +28,7 @@ on node_facts_loaded(next)
   node_root_hash = next.root_hash
   node_last_finalized = next.last_finalized_at
   node_checkpoint = next.checkpoint_height
+  node_height = next.height
   node_view_label = optional_number(next.view)
   node_quorum_label = optional_number(next.quorum)
   node_reachable_label = optional_number(next.reachable_validators)
@@ -44,7 +45,6 @@ on settings_loaded(next)
   return if next.generation != settings_generation
   settings_endpoint = next.endpoint
   settings_node_key = next.node_key
-  settings_height = next.height
   settings_data_dir = next.data_dir
   settings_key_path = next.key_path
   settings_key_state = next.key_state

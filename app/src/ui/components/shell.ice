@@ -140,7 +140,18 @@ component StatusPill(degraded:bool, loading:bool)
             @text-input
 
 // The 284px card behind the pill: what this node knows about the chain it is
-// standing on. Every value comes off /v1/status through `load_node_facts`.
+// standing on.
+//
+// THIS SEAT'S JOB IS LIVENESS, so its `height` is the live `block_height`
+// register — NOT the `load_node_facts` document the rest of the card comes off.
+// That is why it carries NO CHECKPOINT. A checkpoint is only readable against
+// the head it was sampled with, and this card cannot supply one: it printed the
+// live head at the top and a facts-document `node_checkpoint` four rows down,
+// two reads of a chain that moves several blocks a second, which is how
+// `checkpoint` came to sit ABOVE the head beside it — an order no node is ever
+// in. Settings' node tile prints the pair, both halves from one document. Do
+// not re-add a checkpoint here without a head from the same read; the facts
+// head is stale between tab switches, so it cannot be that head.
 //
 // The card owns its own paper — same surface the bell card wears, r13 over the
 // 16/40 modal shadow — because the tooltip frame around it must stay
@@ -150,7 +161,7 @@ component StatusPill(degraded:bool, loading:bool)
 // no state field holds them) and the 26-bar sparkline (it needs the newest 26
 // of a 100-block window with a clamped bar height, and neither a slice nor a
 // clamp exists as a helper). Both are named in the handoff report.
-component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
+component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
   box #root
     with
       w=284.0
@@ -320,24 +331,6 @@ component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, tie
               wrap=none
               font=code_medium
               @text-secondary_fg
-        row
-          with
-            w=fill
-            gap=14.0
-            align=center
-          text "checkpoint"
-            with
-              size=10.5
-              wrap=none
-              font=code_medium
-              @text-hint
-          space w=fill
-          text height_label(checkpoint)
-            with
-              size=10.5
-              wrap=none
-              font=code_medium
-              @text-secondary_fg
       col w=fill gap=9.0
         box
           with
@@ -414,7 +407,7 @@ component BellBadge(count:i64, sev:str, plate:f64)
 // 40px: a 39px bar over its 1px rule. This bar exists only in the console
 // window — the launch window wears the OS's own chrome — so the chip and the
 // right cluster are unconditional now.
-component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
+component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
   emits
     toggle_bell
     switch_network
@@ -469,7 +462,6 @@ component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_ba
                   quorum
                   reachable
                   last_finalized
-                  checkpoint
           stack w=26.0 h=24.0
             button -> emit(toggle_bell)
               with
@@ -838,7 +830,7 @@ component ScreenHeader(title:str, meta:str)
         bg=separator
       space w=1.0 h=1.0
 
-component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)
+component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
   emits
     select_shell_tab(str)
     toggle_bell
@@ -867,7 +859,6 @@ component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degra
             quorum
             reachable
             last_finalized
-            checkpoint
           forward
             toggle_bell
             switch_network

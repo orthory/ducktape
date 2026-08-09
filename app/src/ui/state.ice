@@ -188,7 +188,6 @@ state
   // ~398,000 while every string reading beside it (node key, data directory)
   // sat correctly blank at its own default. A measured zero is a claim; this
   // field has to be able to say it has no reading.
-  settings_height:i64 = -1
   settings_data_dir = ""
   settings_key_path = ""
   settings_key_state = ""
@@ -352,6 +351,13 @@ state
   // absent reading must print `—`, never a measured `0`.
   node_last_finalized:i64 = 0
   node_checkpoint:i64 = 0
+  // `node_checkpoint`'s OWN HEAD — the same `load_node_facts` document, so the
+  // pair Settings prints is one sample and the checkpoint can never outrun the
+  // head beside it. The two move together; a reader of one is a reader of both.
+  // Defaults to the sentinel, and the loader also lands a wire `0` here as -1:
+  // a node serving no boundary publishes height 0 while its checkpoint keeps
+  // climbing, and `h —` is what "no head served" honestly reads as.
+  node_height:i64 = -1
   node_tab = "overview"
   status_card_open = false
   // ROSTER — members and agents share one screen, so they share one filter.

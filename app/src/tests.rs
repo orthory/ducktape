@@ -54,6 +54,79 @@ fn inlined(source: &str) -> String {
     out.join("\n")
 }
 
+/// Every authored `.ice` file, walked rather than listed — a hardcoded list is
+/// a rule with its own escape hatch, since the next screen added is the one the
+/// sweep never sees.
+fn ice_sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let entries = std::fs::read_dir(dir).expect("the ui tree is readable");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|kind| kind == "ice") {
+                let source = std::fs::read_to_string(&path).expect("an .ice file reads");
+                out.push((path.display().to_string(), source));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui"),
+        &mut out,
+    );
+    out
+}
+
+/// A SEAT THAT PRINTS A CHECKPOINT MUST OWN THE HEAD IT IS COMPARED AGAINST.
+///
+/// A checkpoint height is meaningless on its own: it says how far the durable
+/// snapshot trails the head, and nothing else. Print it beside a head from a
+/// DIFFERENT read and the pair can render an order no node is ever in — which
+/// is what the titlebar's status card did, live `block_height` at the top and
+/// the facts document's `node_checkpoint` four rows down, and what Settings'
+/// node tile did with three reads on one screen.
+///
+/// So: the live register and a checkpoint may never be props of the same mount
+/// or the same component. `node_height` — the checkpoint's own document's head
+/// — is what a seat pairs a checkpoint with. The rule runs over every mount in
+/// every `.ice` file, folded by [`inlined`] so a wrapped `with` block cannot
+/// hide the pairing, because the seat this catches next is one nobody has
+/// written yet.
+#[test]
+fn no_seat_prints_a_checkpoint_beside_the_live_head() {
+    let sources = ice_sources();
+    assert!(
+        sources.len() > 10,
+        "the walk found the .ice tree, not an empty directory"
+    );
+    let mut mounts = 0;
+    for (path, source) in sources {
+        for line in inlined(&source).lines() {
+            // Prose is not a mount. Comments here NAME both registers on
+            // purpose — explaining why they are apart is not putting them
+            // together — and a sweep that flags its own documentation is the
+            // whole-file negative that shipped green in this PR's first round.
+            let code = line.split("//").next().unwrap_or_default();
+            let live_head = code.contains("block_height");
+            let a_checkpoint = code.contains("checkpoint");
+            mounts += usize::from(live_head || a_checkpoint);
+            assert!(
+                !(live_head && a_checkpoint),
+                "{path}: `{}` pairs the live head register with a checkpoint. \
+                 They are two reads of a chain that moves several blocks a \
+                 second, so the pair can print the checkpoint ABOVE the head. \
+                 A checkpoint goes beside `node_height`, its own document's head.",
+                code.trim()
+            );
+        }
+    }
+    assert!(
+        mounts > 4,
+        "the sweep found the registers it is supposed to be watching"
+    );
+}
+
 fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
     backend::ChatMessage {
         id: format!("message-{seq}"),
@@ -2110,7 +2183,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     let shell = inlined(include_str!("ui/components/shell.ice"));
     // the shell is titlebar + optional degradation banner over the panes.
     assert!(shell.contains(
-        "component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, checkpoint:i64)"
+        "component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)"
     ));
     // The bar exists only in the console window now — the launch window
     // wears OS chrome — so the chip and the status/bell cluster are

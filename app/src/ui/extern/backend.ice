@@ -174,7 +174,7 @@ extern crate::backend
   NodeLogLine(cursor:str, line:str)
   LogParts(time:str, level:str, message:str)
   sync split_log_line(line:str) -> LogParts
-  NodeFacts(generation:i64, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, peers_live:i64, peers_total:i64)
+  NodeFacts(generation:i64, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, peers_live:i64, peers_total:i64)
   load_node_facts(rpc:str, generation:i64) -> NodeFacts ! HydrationError
   sync optional_number(value:i64?) -> str
   PeerRow(key:str, height:i64, live:bool)
@@ -189,7 +189,7 @@ extern crate::backend
   AccountData(generation:i64, bound:bool, account_id:str, display_name:str, bio:str, members:i64, nodes:i64)
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
   set_account_name(rpc:str, password:str, display_name:str) -> bool ! AppError
-  SettingsFacts(generation:i64, endpoint:str, node_key:str, height:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
+  SettingsFacts(generation:i64, endpoint:str, node_key:str, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
   forget_workspace(rpc:str) -> bool ! AppError
