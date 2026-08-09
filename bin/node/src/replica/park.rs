@@ -1256,7 +1256,11 @@ pub(super) async fn park(
                     );
                 }
                 if let Some(root) = sealed_hash {
-                    stream_hub.publish_block(height, hex(&root));
+                    stream_hub.publish_block(
+                        height,
+                        hex(&root),
+                        noded::BlockWake::from_dispatches(&dispatches),
+                    );
                     last_indexed_root = Some(root);
                 }
                 *served_height = height;
@@ -2001,7 +2005,17 @@ pub(super) async fn park(
                                         "replica explorer row refused"
                                     );
                                 }
-                                stream_hub.publish_block(tip, hex(&root));
+                                // THE HEAL REWOUND FLOORS, so this wake must
+                                // reach the index topics even though it carries
+                                // no dispatches of its own: `heal_index` above
+                                // wiped module dbs and stamped backfill floors,
+                                // and the `lagged` frame a subscriber is owed
+                                // comes only from the scan this wakes.
+                                stream_hub.publish_block(
+                                    tip,
+                                    hex(&root),
+                                    noded::BlockWake::IndexChanged,
+                                );
                                 last_indexed_root = Some(root);
                             }
                             serving = Some((tip, node_r));

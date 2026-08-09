@@ -29,8 +29,8 @@ pub mod blobs;
 pub mod log;
 pub mod stream;
 pub use stream::{
-    ClientMsg, LogRing, RunOutputEvent, RunOutputRegistry, RunStream, ServerFrame, StreamErrorCode,
-    StreamHub, StreamOpRow, StreamOrigin, StreamOriginKind, TailItem,
+    BlockWake, ClientMsg, LogRing, RunOutputEvent, RunOutputRegistry, RunStream, ServerFrame,
+    StreamErrorCode, StreamHub, StreamOpRow, StreamOrigin, StreamOriginKind, TailItem,
 };
 // the duckfs product surface lives in its own module; re-exported flat so the
 // router keeps its bare handler names and the public param structs stay at

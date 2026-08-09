@@ -18,6 +18,17 @@ use crate::NodeHandle;
 /// client watchdog's timeout basis. a heartbeat frame also rides every block
 /// wake, so on a moving chain the tip reaches clients per block, not per tick.
 pub const HEARTBEAT_INTERVAL_MS: u64 = 3_000;
+/// THE ANTI-ENTROPY BACKSTOP. A block wake sweeps the index topics only when
+/// the block appended rows ([`BlockWake`]), which makes delivery depend on
+/// every index writer announcing. That set is provable today and silently
+/// breakable tomorrow — a writer added later that forgets would strand a topic
+/// with no error, no `lagged`, and a head that keeps rising. This bounds every
+/// such miss, known or not, to one period.
+///
+/// It REPLACES a sweep that ran once per block — 1 Hz on an idle chain, since
+/// the nop filler publishes every `BLOCK_TIME` — so it is 30x less work than
+/// what it stands in for, not new work.
+pub const INDEX_BACKSTOP_INTERVAL: Duration = Duration::from_secs(30);
 pub const STREAM_CATCHUP_BUDGET: usize = 256;
 /// per-connection subscription ceiling. the ws surface is unauthenticated
 /// (trusted-client convention), so per-connection state must stay bounded:
@@ -381,12 +392,73 @@ pub enum RunStream {
     Stderr,
 }
 
+/// What a block wake owes the index-tier topics.
+///
+/// The tip snapshot is owed UNCONDITIONALLY — a console's head moves on nop
+/// fillers, which feed no topic at all — so this gates the index SWEEP alone,
+/// never the heartbeat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockWake {
+    /// the tip moved and nothing else. An idle chain nop-fills once per
+    /// `BLOCK_TIME` (`bin/node/src/constants.rs`) and that filler appends no
+    /// per-module op row, so every scan it used to trigger returned empty.
+    TipOnly,
+    /// op rows were appended under the subscribers.
+    IndexChanged,
+}
+
+impl BlockWake {
+    /// Op rows are built one-for-one from dispatches (`index_block_ops`), so an
+    /// empty dispatch list appends none and the index tier owes nothing.
+    ///
+    /// NOT `applied`, and not the explorer `record`: `applied` is false on a
+    /// System-only block whose dispatches are not (see `projection.rs`, where
+    /// System dispatches merge after the member loop), and `record` lands in
+    /// the blocks db, which no ws topic reads.
+    pub fn from_dispatches(dispatches: &[host::DispatchRecord]) -> Self {
+        match dispatches.is_empty() {
+            true => Self::TipOnly,
+            false => Self::IndexChanged,
+        }
+    }
+}
+
+/// What one block wake tells a session to do.
+///
+/// A VALUE, not a branch taken in place: the arm that consumes it is inside a
+/// `select!` over a live socket, so this is the only way the decision is
+/// reachable from a test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockAction {
+    /// send the tip, then re-scan the index topics.
+    SweepIndex,
+    /// send the tip and nothing else — the block appended no op row.
+    TipOnly,
+    /// the hub is gone; the session is over.
+    Stop,
+}
+
+/// Decide what a block wake owes, from the wake alone. Writes nothing.
+fn block_action(note: Result<BlockWake, broadcast::error::RecvError>) -> BlockAction {
+    match note {
+        Ok(BlockWake::IndexChanged) => BlockAction::SweepIndex,
+        Ok(BlockWake::TipOnly) => BlockAction::TipOnly,
+        // N WAKES WERE DROPPED AND THEIR DISCRIMINANTS WITH THEM. Any one may
+        // have been `IndexChanged` and there is no way to tell which, so sweep:
+        // a scan re-reads the store as it stands now, which costs a miss
+        // nothing, while skipping one strands the topic until the backstop.
+        Err(broadcast::error::RecvError::Lagged(_)) => BlockAction::SweepIndex,
+        Err(broadcast::error::RecvError::Closed) => BlockAction::Stop,
+    }
+}
+
 #[derive(Clone)]
 pub struct StreamHub {
-    /// block wakeups: subscribers re-scan on any commit and push the fresh
-    /// tip (height/root-hash) as a heartbeat frame — `publish_block` primes
-    /// `tip` before broadcasting, so the wake always reads its own block.
-    blocks: broadcast::Sender<()>,
+    /// block wakeups carrying whether the index tier changed — `publish_block`
+    /// primes `tip` before broadcasting, so the wake always reads its own
+    /// block. A `TipOnly` wake still moves every subscriber's head; it just
+    /// does not send them back to the store for rows that are not there.
+    blocks: broadcast::Sender<BlockWake>,
     tip: Arc<RwLock<Option<(u64, String)>>>,
     logs: LogRing,
     run_output: RunOutputRegistry,
@@ -418,9 +490,9 @@ impl StreamHub {
         }
     }
 
-    pub fn publish_block(&self, height: u64, root_hash: impl Into<String>) {
+    pub fn publish_block(&self, height: u64, root_hash: impl Into<String>, wake: BlockWake) {
         self.prime(height, root_hash);
-        let _ = self.blocks.send(());
+        let _ = self.blocks.send(wake);
     }
 
     pub fn prime(&self, height: u64, root_hash: impl Into<String>) {
@@ -450,7 +522,7 @@ impl StreamHub {
         self.term_commands.clone()
     }
 
-    pub(crate) fn subscribe_blocks(&self) -> broadcast::Receiver<()> {
+    pub(crate) fn subscribe_blocks(&self) -> broadcast::Receiver<BlockWake> {
         self.blocks.subscribe()
     }
 
@@ -824,6 +896,7 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
     let mut term_rx = hub.terminals().subscribe();
     let mut term_cmd_rx = hub.term_commands().subscribe();
     let mut heartbeat = tokio::time::interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
+    let mut index_backstop = tokio::time::interval(INDEX_BACKSTOP_INTERVAL);
     let mut topics = BTreeMap::new();
     // set once, by a `ServiceAttach` that this node accepts. The guard's Drop —
     // on every `return` below, and on the task being cancelled — releases the
@@ -906,16 +979,28 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                 }
             }
             note = block_rx.recv() => {
-                match note {
-                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
+                let sweep = match block_action(note) {
+                    BlockAction::Stop => return,
+                    BlockAction::SweepIndex => true,
+                    BlockAction::TipOnly => false,
+                };
                 // the tip rides every block wake — nop fillers included, which
                 // feed no topic — so a console's height ticks per block instead
                 // of waiting out the timer beat below (the idle/stall floor).
+                // NOT gated on `sweep`: gating it here re-freezes the head on an
+                // idle chain, which is the bug #1021 fixed.
                 if !send_frame(&mut socket, heartbeat_frame(&hub)).await {
                     return;
                 }
+                // An idle block appended no op row, so every scan it used to
+                // trigger read the store and found nothing.
+                if sweep && !catch_up(&handle, &mut socket, &mut topics, Wake::Block).await {
+                    return;
+                }
+            }
+            _ = index_backstop.tick() => {
+                // see `INDEX_BACKSTOP_INTERVAL`: the floor under every writer
+                // that appends rows and tells nobody.
                 if !catch_up(&handle, &mut socket, &mut topics, Wake::Block).await {
                     return;
                 }
@@ -2384,6 +2469,41 @@ mod tests {
             other => panic!("expected event, got {other:?}"),
         }
         assert_eq!(cursor, "op/0000000000000001/0001");
+    }
+
+    /// A BLOCK THAT APPENDED NOTHING MUST NOT SEND ANYONE BACK TO THE STORE.
+    ///
+    /// An idle chain nop-fills once per `BLOCK_TIME`, and that filler dispatches
+    /// nothing, so every scan it used to trigger read the index and found
+    /// nothing — per subscribed topic, per session, once a second, forever.
+    #[test]
+    fn an_unfed_block_owes_the_index_nothing() {
+        assert_eq!(BlockWake::from_dispatches(&[]), BlockWake::TipOnly);
+        assert_eq!(
+            block_action(Ok(BlockWake::TipOnly)),
+            BlockAction::TipOnly,
+            "an unfed block still sends the tip — the head moves on nop blocks"
+        );
+        assert_eq!(
+            block_action(Ok(BlockWake::IndexChanged)),
+            BlockAction::SweepIndex
+        );
+    }
+
+    /// A DROPPED WAKE IS SWEPT, NOT SKIPPED. The discriminants went with the
+    /// dropped wakes, so any of them may have fed a module. Sweeping a block
+    /// that did not costs one empty scan; skipping one that did strands the
+    /// topic until the backstop.
+    #[test]
+    fn a_lagged_wake_sweeps_and_a_closed_hub_stops() {
+        assert_eq!(
+            block_action(Err(broadcast::error::RecvError::Lagged(7))),
+            BlockAction::SweepIndex
+        );
+        assert_eq!(
+            block_action(Err(broadcast::error::RecvError::Closed)),
+            BlockAction::Stop
+        );
     }
 
     #[test]
