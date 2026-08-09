@@ -2321,15 +2321,15 @@ async fn catch_up_metrics(
     let TopicState::Metrics { sampled_ms } = state else {
         return CatchUpResult::keep(Vec::new());
     };
-    handle
-        .stream_hub()
-        .note_snapshot_sample(crate::metrics::SnapshotTopic::Metrics);
     let Some(text) = handle.status_cell().exposition() else {
         return CatchUpResult::drop(vec![unavailable(
             topic,
             "no metrics exposition is wired on this daemon",
         )]);
     };
+    handle
+        .stream_hub()
+        .note_snapshot_sample(crate::metrics::SnapshotTopic::Metrics);
     let time_ms = unix_millis();
     *sampled_ms = time_ms;
     CatchUpResult::keep(vec![ServerFrame::Tail {
@@ -2353,9 +2353,6 @@ async fn catch_up_peers(topic: &str, state: &mut TopicState, handle: &NodeHandle
     let TopicState::Peers { sampled_ms } = state else {
         return CatchUpResult::keep(Vec::new());
     };
-    handle
-        .stream_hub()
-        .note_snapshot_sample(crate::metrics::SnapshotTopic::Peers);
     let cell = handle.status_cell();
     let Some(exposition) = cell.exposition() else {
         return CatchUpResult::drop(vec![unavailable(
@@ -2363,6 +2360,11 @@ async fn catch_up_peers(topic: &str, state: &mut TopicState, handle: &NodeHandle
             "no metrics exposition is wired on this daemon",
         )]);
     };
+    // BELOW the availability guard: the counter says "a document was composed",
+    // and a catch-up that drops the topic composed nothing.
+    handle
+        .stream_hub()
+        .note_snapshot_sample(crate::metrics::SnapshotTopic::Peers);
     let standing = cell.peers_standing();
     let time_ms = unix_millis();
     *sampled_ms = time_ms;

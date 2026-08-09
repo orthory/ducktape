@@ -1471,9 +1471,17 @@ fn a_closed_session_stops_costing_the_node_a_snapshot_sample() {
     // the leaver goes away. Nothing else changes.
     drop(leaving);
 
-    // DISCARD ONE TICK so the close is certainly observed by the node before
-    // the window we measure — the only ordering this test needs, and it is
-    // bounded by an event rather than a clock.
+    // DRAIN THE SECOND SUBSCRIBE-TIME FRAME. Every session gets TWO samples
+    // within milliseconds of subscribing: the `Wake::All` replay, and then the
+    // heartbeat's FIRST tick, because `tokio::time::interval` fires at once —
+    // only `index_backstop` beside it uses `interval_at`. So this read returns
+    // instantly, with a frame the node had already buffered.
+    //
+    // It therefore establishes NO ordering against the close above, and it is
+    // still required: without it that already-counted frame would be one of the
+    // three reads below, `observed` would be 2, and the assert would fire
+    // blaming a dead topic. Delete this line on the strength of a comment
+    // claiming it orders anything and the test breaks accusing the wrong thing.
     let _ = Daemon::ws_read_type(&mut clock, "tail");
     let before = peers_samples(&daemon.metrics());
 
@@ -1484,10 +1492,16 @@ fn a_closed_session_stops_costing_the_node_a_snapshot_sample() {
     }
     let observed = peers_samples(&daemon.metrics()) - before;
 
-    // A RANGE, NOT AN EQUALITY, and the slack is exactly one tick: the counter
-    // is incremented before its frame is sent, so reading N frames proves at
-    // least N samples, and at most one further tick can fire between the last
-    // frame and the scrape. Demanding equality would flake on that one tick.
+    // A RANGE, NOT AN EQUALITY, and the slack is exactly one tick.
+    //
+    // Upper bound: at most one further tick can fire between the last frame and
+    // the scrape, so demanding equality would flake on it.
+    //
+    // Lower bound: the counter is incremented before its frame is sent, so
+    // reading N frames proves at least N samples — but ONLY because the drain
+    // above leaves no counted-but-unread frame behind at the `before` scrape.
+    // The two steps buy that invariant together; neither alone is enough, and
+    // the bottom of this range has no margin beyond it.
     //
     // The separation is what matters: ONE subscriber gives 3..=4, and a leaked
     // session gives 6 — which no slack of one tick can reach.
