@@ -22,8 +22,8 @@
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use dispatch::{
-    DispatchModule, DispatchMsg, DispatchQuery, DispatchReply, DispatchStatus, DispatchView,
-    OutputContract, Recipe, Routing, decode_reply, encode_msg, encode_query,
+    AdmissionPolicy, DispatchModule, DispatchMsg, DispatchQuery, DispatchReply, DispatchStatus,
+    DispatchView, OutputContract, Recipe, Routing, decode_reply, encode_msg, encode_query,
 };
 use saga::{SagaCallback, SagaOutcome, encode_callback};
 use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot, StateSyncHandle};
@@ -91,7 +91,7 @@ fn dispatch_op(dispatch_id: &str) -> Vec<u8> {
         recipe_id: "summarize".into(),
         payload: b"the entire input".to_vec(),
         demands: Default::default(),
-        admission: dispatch::AdmissionPolicy::Queue,
+        admission: AdmissionPolicy::Queue,
     })
 }
 

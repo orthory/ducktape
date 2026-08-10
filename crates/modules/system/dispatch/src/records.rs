@@ -15,8 +15,8 @@
 //! the store hashes its keys and cannot enumerate, so anything a reader walks
 //! needs an index of its own:
 //!
-//! * [`DispatchQuery::Recipes`] is an unpaged read of every recipe, so the ids
-//!   live in the `r#` index record.
+//! * [`crate::DispatchQuery::Recipes`] is an unpaged read of every recipe, so
+//!   the ids live in the `r#` index record.
 //! * `DeliverPending` sweeps the mailbox in FIFO order. entries are only ever
 //!   APPENDED at `next` and REMOVED from the front, so the queue is the
 //!   contiguous range `head..next` and the cursor record is all the index it
@@ -122,7 +122,7 @@ pub(crate) fn encode_recipe(r: &Recipe) -> Vec<u8> {
     out
 }
 
-pub(crate) fn decode_recipe(bytes: &[u8]) -> Result<Recipe, Error> {
+fn decode_recipe(bytes: &[u8]) -> Result<Recipe, Error> {
     let mut cur = codec::Cursor::new(bytes);
     let recipe_id = cur.string("recipe id")?;
     let owner = take_origin(&mut cur)?;
@@ -187,7 +187,7 @@ pub(crate) fn encode_dispatch(d: &DispatchState) -> Vec<u8> {
     out
 }
 
-pub(crate) fn decode_dispatch(bytes: &[u8]) -> Result<DispatchState, Error> {
+fn decode_dispatch(bytes: &[u8]) -> Result<DispatchState, Error> {
     let mut cur = codec::Cursor::new(bytes);
     let receiver = cur.string("dispatch receiver")?;
     let dispatch_id = cur.string("dispatch id")?;

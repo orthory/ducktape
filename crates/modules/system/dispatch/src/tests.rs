@@ -120,7 +120,7 @@ fn recipes(m: &DispatchModule) -> Vec<Recipe> {
 /// the committed byte size of one dispatch record — what the retention pin
 /// measures now that the state IS the store.
 fn record_bytes(m: &DispatchModule, key: &str) -> usize {
-    block_on(m.staged.get_committed(&records::dispatch_key_of(key)))
+    block_on(m.staged.get_committed(&dispatch_key_of(key)))
         .unwrap()
         .expect("the record survives")
         .len()

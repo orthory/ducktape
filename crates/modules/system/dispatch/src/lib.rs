@@ -67,8 +67,9 @@ use std::collections::BTreeMap;
 use capability::{validate_resources, validate_tag};
 use records::{
     Mailbox, committed_dispatch, committed_mailbox, committed_recipe, committed_recipe_index,
-    dispatch_key_of, encode_dispatch, encode_recipe, encode_recipe_index, mailbox_key, recipe_key,
-    stage_mailbox, staged_dispatch, staged_mailbox, staged_recipe, staged_recipe_index,
+    dispatch_key_of, encode_dispatch, encode_recipe, encode_recipe_index, mailbox_key,
+    recipe_index_key, recipe_key, stage_mailbox, staged_dispatch, staged_mailbox, staged_recipe,
+    staged_recipe_index,
 };
 use saga::{
     SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, decode_callback, encode_msg as saga_encode_msg,
@@ -123,7 +124,7 @@ fn saga_id_for(key: &str) -> String {
 /// none on the other, and the two ports diverge on the root. no path does that
 /// today (`RegisterRecipe` checks both records before staging either, and every
 /// other transition stages last); keep it that way when adding one.
-pub(crate) fn check_record(value: &[u8], what: &str) -> Result<(), Error> {
+fn check_record(value: &[u8], what: &str) -> Result<(), Error> {
     if value.len() > MAX_RECORD_BYTES {
         return Err(Error::Module(format!(
             "{what} is {} bytes, over the {MAX_RECORD_BYTES}-byte store record cap",
@@ -296,13 +297,12 @@ impl DispatchModule {
             }
         };
         let key = String::from_utf8_lossy(&callback.payload).into_owned();
-        let Some(current) = staged_dispatch(&self.staged, &key).await? else {
+        let Some(mut dispatch) = staged_dispatch(&self.staged, &key).await? else {
             return Ok(());
         };
-        if current.status != Status::AwaitingResult || current.saga_id != callback.saga_id {
+        if dispatch.status != Status::AwaitingResult || dispatch.saga_id != callback.saga_id {
             return Ok(());
         }
-        let mut dispatch = current;
         dispatch.outcome = Some(Self::judged_outcome(dispatch.contract, callback.outcome));
         dispatch.status = Status::AwaitingDelivery;
         dispatch.updated_at = ctx.env().consensus_time;
@@ -520,24 +520,23 @@ impl DispatchModule {
             };
             self.staged.delete(entry_key);
             let key = String::from_utf8_lossy(&raw).into_owned();
-            let Some(current) = staged_dispatch(&self.staged, &key).await? else {
+            let Some(mut dispatch) = staged_dispatch(&self.staged, &key).await? else {
                 self.note(ctx, format!("dropped orphaned mailbox entry {key:?}"));
                 continue;
             };
-            let Some(outcome) = current.outcome.clone() else {
+            // TAKE, never clone: the receiver now owns the bytes, and a second
+            // copy here would grow this record forever (crate header,
+            // "retention"). the RECORD stays — it is `runs`' permanent turn
+            // claim.
+            let Some(outcome) = dispatch.outcome.take() else {
                 self.note(
                     ctx,
                     format!("dropped mailbox entry {key:?} with no recorded outcome"),
                 );
                 continue;
             };
-            let mut dispatch = current;
             dispatch.status = Status::Delivered;
             dispatch.updated_at = now;
-            // the receiver now owns the bytes; a second copy here would grow
-            // this record forever (crate header, "retention"). the RECORD stays
-            // — it is `runs`' permanent turn claim.
-            dispatch.outcome = None;
             ctx.emit_msg(Msg {
                 target: dispatch.receiver.clone(),
                 payload: encode_result_event(&ResultEvent {
@@ -601,7 +600,7 @@ impl DispatchModule {
         check_record(&record, "recipe record")?;
         check_record(&index_record, "recipe index")?;
         self.staged.stage(recipe_key(&recipe_id), record);
-        self.staged.stage(records::recipe_index_key(), index_record);
+        self.staged.stage(recipe_index_key(), index_record);
         Ok(())
     }
 
@@ -612,11 +611,11 @@ impl DispatchModule {
         if index.is_empty() {
             // an empty index DROPS its key, so a plane whose recipes were all
             // removed hashes exactly like one that never registered any.
-            self.staged.delete(records::recipe_index_key());
+            self.staged.delete(recipe_index_key());
         } else {
             stage_record(
                 &mut self.staged,
-                records::recipe_index_key(),
+                recipe_index_key(),
                 encode_recipe_index(&index),
                 "recipe index",
             )?;
