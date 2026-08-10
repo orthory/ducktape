@@ -62,7 +62,7 @@
 //! |---|---|
 //! | `saga\0{id}` | one [`Saga`] record (borsh) — every field EXCEPT the spec bytes |
 //! | `spec\0{id}{n:u64-le}` | chunk `n` of that saga's spec, raw bytes |
-//! | `pending` | the LIVE id index: a borsh `BTreeSet<String>` of non-terminal ids |
+//! | `pending{shard:u8}` | one of [`PENDING_SHARDS`] LIVE id shards: a borsh `BTreeSet<String>` of non-terminal ids that hash to it |
 //! | `terminal` | the terminal receipt index: a borsh `BTreeMap<String, TerminalEntry>` |
 //!
 //! ### why the spec is chunked
@@ -86,10 +86,13 @@
 //! whole-map reads: `Crank`, `NextExpiry`, `AssignedPending` and
 //! `UnassignedPending` all iterate the live sagas in id order, and the
 //! retention trim ranks every TERMINAL saga. so the two domains are split
-//! into two sentinel records, and the trim itself is what keeps the terminal
-//! one small — it is bounded by [`MAX_RETAINED_TERMINAL`] plus one block's
-//! arrivals, and each entry carries the `(updated_at, bytes)` the ranking
-//! needs so the trim never reads a saga record it does not evict.
+//! into two sentinel key spaces. the live one is SHARDED by `sha256(id)` over
+//! [`PENDING_SHARDS`] records, so one saga's write touches exactly one of them
+//! and the readers merge them back into a single sorted sequence. the terminal
+//! one stays small by the trim itself: it is bounded by
+//! [`MAX_RETAINED_TERMINAL`] plus one block's arrivals, and each entry carries
+//! the `(updated_at, bytes)` the ranking needs so the trim never reads a saga
+//! record it does not evict.
 //!
 //! ## GC
 //!
@@ -186,10 +189,10 @@ pub const SPEC_CHUNK_BYTES: usize = MAX_RECORD_BYTES;
 
 /// hard cap on a `saga_id`'s byte length, enforced at trigger time.
 ///
-/// load-bearing, not cosmetic: every live id shares the ONE `pending` index
+/// load-bearing, not cosmetic: every live id shares a `pending` index shard
 /// record bounded by [`MAX_RECORD_BYTES`], so an UNCAPPED id let a single
 /// trigger (an op frame carries up to `node::MAX_FRAME_BYTES`, 1 MiB + 16 KiB)
-/// fill that record and refuse EVERY later trigger, for every principal. a
+/// fill that record and refuse every later trigger that hashes to it. a
 /// pending saga with neither deadline nor lease never expires, and `Cancel` is
 /// gated to the trigger origin, so only the squatter could have freed it.
 /// every producer's id is ~100 bytes (dispatch's `dispatch{SEP}{receiver}{SEP}{id}`
@@ -241,21 +244,46 @@ fn spec_chunk_keys(saga_id: &str, spec_len: u64) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// the live (non-terminal) id index — the deterministic iteration domain of
-/// `Crank`, `NextExpiry`, `AssignedPending` and `UnassignedPending`.
+/// how many records the live id index spans. a CONSENSUS constant, never
+/// config: it decides which record an id's row lands in, so two nodes running
+/// different values commit different roots.
+const PENDING_SHARDS: u8 = 16;
+
+/// the live (non-terminal) id index, sharded — the deterministic iteration
+/// domain of `Crank`, `NextExpiry`, `AssignedPending` and `UnassignedPending`.
+/// [`SagaModule::load_pending`] merges the shards back into the ONE sorted
+/// sequence those four promise; a writer touches only its id's shard.
 ///
-// ponytail: ONE index record holds every LIVE id, so the ledger refuses new
-// triggers once it hits MAX_RECORD_BYTES — ~4k concurrent pending sagas at
-// realistic ~250-byte ids, ~2k at the MAX_SAGA_ID_BYTES cap. unlike the
+// ponytail: the ceiling moves, it does not vanish. each shard is its own
+// MAX_RECORD_BYTES record, so the ledger refuses a trigger once ITS shard
+// fills — ~60k concurrent pending sagas at realistic ~250-byte ids, ~30k at
+// the MAX_SAGA_ID_BYTES cap (16x the one record this replaced). unlike the
 // terminal index, nothing trims this one: it drains only as sagas terminate,
-// and a saga triggered with neither a deadline nor a lease never expires, so a
-// squatter could hold the ceiling. that is still strictly better than the
-// unbounded map this replaced (which grew the fuel cost of EVERY op), and the
-// refusal is loud rather than a silent brick. if it must scale past that,
-// shard the index by id prefix — the four readers above already iterate it as
-// one sorted sequence, so a merge over N shards is the whole change. a
-// per-origin live quota is a WIRE change and belongs to a separate decision.
-const PENDING_INDEX_KEY: &[u8] = b"pending";
+// and a saga triggered with neither a deadline nor a lease never expires. a
+// squatter who grinds ids into ONE shard can still fill it — but that refuses
+// only the 1/16 of later triggers hashing there, not every trigger for every
+// principal. a per-origin live quota is the real fix, and it is a WIRE change
+// that belongs to a separate decision.
+const PENDING_INDEX_PREFIX: &[u8] = b"pending";
+
+/// which shard record one id's row lives in: the low nibble of
+/// `sha256(id)`'s first byte, which is uniform over ids.
+///
+/// hashing, not the id's own leading bytes: every id is NAMESPACED
+/// (`dispatch{SEP}…`, `system{SEP}…`, a 64-hex node namespace), so a prefix
+/// split would put nearly everything in one bucket and buy nothing.
+fn pending_shard(saga_id: &str) -> u8 {
+    Sha256::digest(saga_id.as_bytes())[0] % PENDING_SHARDS
+}
+
+/// one shard's record key: the prefix plus the shard byte. no separator is
+/// needed — the tail is always exactly one byte, and no other key space is
+/// this prefix followed by one.
+fn pending_shard_key(shard: u8) -> Vec<u8> {
+    let mut key = PENDING_INDEX_PREFIX.to_vec();
+    key.push(shard);
+    key
+}
 
 /// the terminal receipt index — the retention trim's whole input.
 const TERMINAL_INDEX_KEY: &[u8] = b"terminal";
@@ -545,14 +573,25 @@ impl SagaModule {
         Ok(spec)
     }
 
-    /// the live id index; absent reads as the empty set. `BTreeSet` serializes
-    /// ASCENDING, so the bytes are canonical and the iteration order is the
-    /// sorted id order every projection promises.
-    async fn load_pending(&self) -> Result<BTreeSet<String>, Error> {
-        let Some(bytes) = self.staged.get(PENDING_INDEX_KEY).await? else {
+    /// one shard of the live id index; absent reads as the empty set.
+    /// `BTreeSet` serializes ASCENDING, so the bytes are canonical.
+    async fn load_pending_shard(&self, shard: u8) -> Result<BTreeSet<String>, Error> {
+        let Some(bytes) = self.staged.get(&pending_shard_key(shard)).await? else {
             return Ok(BTreeSet::new());
         };
         borsh::from_slice(&bytes).map_err(|e| Error::Module(format!("pending index decode: {e}")))
+    }
+
+    /// every live id as ONE sorted sequence — the iteration order `Crank`,
+    /// `NextExpiry`, `AssignedPending` and `UnassignedPending` all promise.
+    /// the shards are hash-assigned, so this merge is what restores the id
+    /// order; iterating them shard by shard would NOT be sorted.
+    async fn load_pending(&self) -> Result<BTreeSet<String>, Error> {
+        let mut merged = BTreeSet::new();
+        for shard in 0..PENDING_SHARDS {
+            merged.extend(self.load_pending_shard(shard).await?);
+        }
+        Ok(merged)
     }
 
     /// the terminal receipt index; absent reads as empty.
@@ -597,7 +636,11 @@ impl SagaModule {
         let record = borsh::to_vec(saga).expect("saga record is serializable");
         check_record(&record, "saga record")?;
 
-        let mut pending = self.load_pending().await?;
+        // exactly ONE shard record moves per saga — that is the whole point of
+        // the split: a trigger's write cost no longer scales with every other
+        // pending id in the ledger.
+        let shard = pending_shard(saga_id);
+        let mut pending = self.load_pending_shard(shard).await?;
         let mut terminal = self.load_terminal().await?;
         if saga.status.is_terminal() {
             pending.remove(saga_id);
@@ -617,7 +660,7 @@ impl SagaModule {
         let terminal_record = encode_terminal(&terminal)?;
 
         self.staged.stage(record_key(saga_id), record);
-        self.stage_if_changed(PENDING_INDEX_KEY, pending_record)
+        self.stage_if_changed(&pending_shard_key(shard), pending_record)
             .await?;
         self.stage_if_changed(TERMINAL_INDEX_KEY, terminal_record)
             .await
@@ -632,14 +675,15 @@ impl SagaModule {
         }
         self.staged.delete(record_key(saga_id));
 
-        let mut pending = self.load_pending().await?;
+        let shard = pending_shard(saga_id);
+        let mut pending = self.load_pending_shard(shard).await?;
         pending.remove(saga_id);
         let mut terminal = self.load_terminal().await?;
         terminal.remove(saga_id);
         // removals only shrink an index, so neither can cross the record cap.
         let pending_record = encode_pending(&pending)?;
         let terminal_record = encode_terminal(&terminal)?;
-        self.stage_if_changed(PENDING_INDEX_KEY, pending_record)
+        self.stage_if_changed(&pending_shard_key(shard), pending_record)
             .await?;
         self.stage_if_changed(TERMINAL_INDEX_KEY, terminal_record)
             .await
@@ -915,8 +959,8 @@ impl SagaModule {
                         ctx.env().origin.actor_string()
                     )));
                 }
-                // the SHARED-record guard: every live id rides the one
-                // `pending` index record (see [`MAX_SAGA_ID_BYTES`]).
+                // the SHARED-record guard: every live id rides a `pending`
+                // index shard record (see [`MAX_SAGA_ID_BYTES`]).
                 if saga_id.len() > MAX_SAGA_ID_BYTES {
                     return Err(Error::Module(format!(
                         "trigger saga_id is {} bytes; the cap is {MAX_SAGA_ID_BYTES}",
@@ -1324,14 +1368,15 @@ impl SagaModule {
     }
 }
 
-/// the live index's record form. an EMPTY index DROPS its key, so a ledger
-/// pruned back to nothing hashes to the same root a never-used one does.
+/// one live shard's record form. an EMPTY shard DROPS its key — per shard, so
+/// a ledger pruned back to nothing holds NO pending key at all and hashes to
+/// the same root a never-used one does.
 fn encode_pending(pending: &BTreeSet<String>) -> Result<Option<Vec<u8>>, Error> {
     if pending.is_empty() {
         return Ok(None);
     }
     let bytes = borsh::to_vec(pending).expect("pending index is serializable");
-    check_record(&bytes, "pending saga index")?;
+    check_record(&bytes, "pending saga index shard")?;
     Ok(Some(bytes))
 }
 
@@ -3932,9 +3977,9 @@ mod tests {
     #[test]
     fn oversized_saga_ids_and_pinned_keys_are_refused_before_they_poison_a_record() {
         // the two write-time caps the store adds. an op frame carries up to
-        // 1 MiB + 16 KiB, so BOTH of these were reachable: the id rides the
-        // ONE shared `pending` index record, and `pinned_assignee` was the only
-        // wire-supplied field on the hot record with no size bound.
+        // 1 MiB + 16 KiB, so BOTH of these were reachable: the id rides a
+        // shared `pending` index shard record, and `pinned_assignee` was the
+        // only wire-supplied field on the hot record with no size bound.
         let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new();
 
@@ -3973,39 +4018,97 @@ mod tests {
         assert_eq!(get(&m, &ok_id).map(|v| v.status), Some(SagaStatus::Pending));
     }
 
+    /// six ids that hash to six DIFFERENT live-index shards, in id order —
+    /// the spread the sharding pins need. `shard_spread` asserts the premise,
+    /// so a hash change that collapses them fails loudly instead of quietly
+    /// making its test vacuous.
+    fn shard_spread() -> Vec<String> {
+        let ids: Vec<String> = ["s1", "s2", "s3", "s4", "s5", "s6"]
+            .iter()
+            .map(|id| sid(id))
+            .collect();
+        let shards: Vec<u8> = ids.iter().map(|id| pending_shard(id)).collect();
+        assert_eq!(
+            shards.iter().collect::<BTreeSet<_>>().len(),
+            ids.len(),
+            "the ids must span DIFFERENT shards or the pin is vacuous: {shards:?}"
+        );
+        assert!(
+            shards.windows(2).any(|pair| pair[0] > pair[1]),
+            "shard order must not already BE id order, or the merge is untested: {shards:?}"
+        );
+        ids
+    }
+
+    #[test]
+    fn ids_in_different_shards_still_iterate_globally_sorted() {
+        // the live index is PENDING_SHARDS hash-assigned records, so shard
+        // order is not id order — the readers' "sorted id order" promise now
+        // lives entirely in `load_pending`'s merge. walking the shards
+        // shard-by-shard would emit these six in a different order.
+        let ids = shard_spread();
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+        let mut ctx = CaptureCtx::new().at(1);
+        // triggered scrambled: neither id order nor shard order.
+        for i in [3usize, 0, 5, 1, 4, 2] {
+            exec(&mut m, &mut ctx, &trigger(&ids[i], b"w")).unwrap();
+        }
+        commit(&mut m);
+
+        let seen: Vec<String> = unassigned_pending(&m)
+            .into_iter()
+            .map(|request| request.saga_id)
+            .collect();
+        assert_eq!(seen, ids, "the four readers see ONE sorted sequence");
+
+        // and the WRITE side of the same split: one saga moved exactly one
+        // shard record. a single-record index would read back identically
+        // here — this is the assertion that tells them apart.
+        for id in &ids {
+            assert_eq!(
+                block_on(m.load_pending_shard(pending_shard(id))).unwrap(),
+                BTreeSet::from([id.clone()]),
+                "each id must sit ALONE in the shard its hash names"
+            );
+        }
+    }
+
     #[test]
     fn a_ledger_emptied_again_hashes_like_a_never_used_one() {
         // the empty-collection-drops-its-key rule, which the whole-state
         // encoding used to give for free: an index that kept an empty record
         // would leave a ledger pruned back to nothing on a DIFFERENT root than
-        // one that never ran a saga.
+        // one that never ran a saga. it is PER SHARD: the ids below spread
+        // over six of them, so six keys must come back off.
+        let ids = shard_spread();
         let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let genesis = m.root();
-        let id = sid("s1");
 
         let mut ctx = CaptureCtx::new().at(1);
-        exec(&mut m, &mut ctx, &trigger(&id, b"a spec")).unwrap();
-        exec(
-            &mut m,
-            &mut ctx,
-            &msg(&SagaMsg::Cancel {
-                saga_id: id.clone(),
-            }),
-        )
-        .unwrap();
+        for id in &ids {
+            exec(&mut m, &mut ctx, &trigger(id, b"a spec")).unwrap();
+            exec(
+                &mut m,
+                &mut ctx,
+                &msg(&SagaMsg::Cancel {
+                    saga_id: id.clone(),
+                }),
+            )
+            .unwrap();
+        }
         commit(&mut m);
-        assert_ne!(m.root(), genesis, "the ledger really held a saga");
+        assert_ne!(m.root(), genesis, "the ledger really held sagas");
 
         exec(
             &mut m,
             &mut ctx,
             &msg(&SagaMsg::Prune {
-                saga_ids: vec![id.clone()],
+                saga_ids: ids.clone(),
             }),
         )
         .unwrap();
         commit(&mut m);
-        assert_eq!(get(&m, &id), None);
+        assert!(ids.iter().all(|id| get(&m, id).is_none()));
         assert_eq!(
             m.root(),
             genesis,
