@@ -151,7 +151,10 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
             Some("tasks".into()),
             Some("tasks".into()),
         )),
-        Box::new(Tasks::new("tasks")),
+        Box::new(Tasks::new(
+            "tasks",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
     ])
     .expect("genesis")
 }

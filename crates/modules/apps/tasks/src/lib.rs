@@ -4,12 +4,28 @@
 //! * a **job board** (first-claim kind): a consensus-native work board where
 //!   exactly one worker claim wins by consensus order.
 //!
-//! both are intentionally state-based rather than qmdb-backed: each needs
-//! ordered list/query semantics over a small canonical state. each board stages
-//! writes during `execute`, publishes them only at `commit_block`, and the
-//! module `root()` hashes the concatenation of the two boards' committed
-//! canonical byte streams. `snapshot`/`install` use that exact stream so a
-//! joiner can verify a peer-provided image before mutating local state.
+//! both are QMDB-BACKED: pure logic over a host-injected [`sdk::MerkleStore`]
+//! with the shared [`StagedStore`] overlay in front of it. every record is its
+//! OWN store key, so an op touches only the keys it names, `root()` is the
+//! store's cached merkle root (never a re-serialization of the whole board),
+//! and state-sync rides the store's resolver lane rather than a byte snapshot
+//! whose size grew with every job ever submitted.
+//!
+//! ## the key space
+//!
+//! | logical key | value |
+//! |---|---|
+//! | `t/{task_id}` | one [`Task`] record (json) |
+//! | `t#` | the task-id enumeration index (a json `BTreeSet<String>`) |
+//! | `j/{job_id}` | one [`Job`] record (json) |
+//! | `j#` | the live job count (u64 LE) -- what [`MAX_JOBS`] is checked against |
+//! | `w#` | the registered worker set (a json `BTreeSet<ModuleId>`) |
+//!
+//! the store hashes each logical key (`sdk::store_key`) and cannot enumerate,
+//! so the task board carries `t#`: [`TaskQuery::List`] is an unpaged read of
+//! the WHOLE board and something has to hold the id order. the job board needs
+//! no such index -- its only dispatch read is the by-id `Get`, and board
+//! enumeration is the index guest's job on the derived tier.
 //!
 //! ops and queries ride ONE wire envelope ([`WorkMsg`]/[`WorkQuery`]): the
 //! module's single `execute`/`query` decodes the envelope and routes to the
@@ -27,9 +43,6 @@ mod guest;
 
 mod job_board;
 mod task_board;
-
-use job_board::JobBoard;
-use task_board::TaskBoard;
 
 // re-export the job board's public caps so external callers keep referring to
 // `tasks::MAX_PAYLOAD` etc.
@@ -50,60 +63,65 @@ pub mod index;
 #[cfg(feature = "index-guest")]
 mod index_guest;
 
-use sdk::codec::Cursor;
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
-use sha2::{Digest, Sha256};
+use sdk::{
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, ResolverSyncTarget, StagedStore, StateRoot,
+    StateSyncHandle,
+};
 
+/// write-time cap on ONE stored record. the concrete store's codec bounds a
+/// stored value at 1 MiB AT DECODE TIME (`statesync::qmdb::store_config`): an
+/// oversized value would COMMIT fine and then panic every later read on every
+/// validator -- a poison pill. the 4 KiB margin below the codec bound covers
+/// the serialized operation's framing (32-byte hashed key, varint length
+/// prefix, operation tag), exactly as `kv::MAX_VALUE_LEN` reasons.
+///
+/// this is the ONE guard the storage swap adds: an op frame may carry up to
+/// `node::MAX_FRAME_BYTES` (1 MiB + 16 KiB), so an unbounded `title`/`task_id`
+/// was reachable and would now poison the store.
+pub const MAX_RECORD_BYTES: usize = (1 << 20) - 4 * 1024;
+
+/// a qmdb-backed work module: the task board and the job board over ONE store.
 pub struct Tasks {
     id: ModuleId,
-    tasks: TaskBoard,
-    jobs: JobBoard,
+    /// the host-injected authenticated store plus this block's staging overlay
+    /// (read-your-writes; folded into `root()` at `commit_block`).
+    staged: StagedStore,
 }
 
 impl Tasks {
-    pub fn new(id: impl Into<ModuleId>) -> Self {
+    /// wrap the host-constructed store under module identity `id`. sync -- the
+    /// store arrives already opened (or already synced to a verified root).
+    pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {
         Self {
             id: id.into(),
-            tasks: TaskBoard::new(),
-            jobs: JobBoard::new(),
+            staged: StagedStore::new(store),
         }
     }
+}
 
-    /// the canonical committed encoding: the task board's bytes followed by the
-    /// job board's bytes. this is the exact `root()` preimage AND the snapshot.
-    fn encode_state(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        self.tasks.encode_committed(&mut out);
-        self.jobs.encode_committed(&mut out);
-        out
+/// refuse a value the store's codec would later panic decoding. `what` names
+/// the record in the rejection. an op that writes SEVERAL records checks them
+/// all before staging any, so a refused op leaves no overlay entry at all.
+pub(crate) fn check_record(value: &[u8], what: &str) -> Result<(), Error> {
+    if value.len() > MAX_RECORD_BYTES {
+        return Err(Error::Module(format!(
+            "{what} is {} bytes, over the {MAX_RECORD_BYTES}-byte store record cap",
+            value.len()
+        )));
     }
+    Ok(())
+}
 
-    fn root_of(bytes: &[u8]) -> StateRoot {
-        let mut h = Sha256::new();
-        h.update(bytes);
-        StateRoot(h.finalize().into())
-    }
-
-    pub fn snapshot(&self) -> Vec<u8> {
-        self.encode_state()
-    }
-
-    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let mut c = Cursor::new(bytes);
-        let tasks = TaskBoard::decode_from(&mut c)?;
-        let jobs = JobBoard::decode_from(&mut c)?;
-        c.finish("work snapshot")?;
-
-        // recompute the combined root over the two boards' committed bytes and
-        // reject any image that does not hash to the expected root.
-        let mut encoded = Vec::new();
-        tasks.encode_committed(&mut encoded);
-        jobs.encode_committed(&mut encoded);
-        sdk::verify_snapshot_root(Self::root_of(&encoded), expected)?;
-        self.tasks = tasks;
-        self.jobs = jobs;
-        Ok(())
-    }
+/// [`check_record`] then stage — the single-record writer's shape.
+pub(crate) fn stage_record(
+    staged: &mut StagedStore,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    what: &str,
+) -> Result<(), Error> {
+    check_record(&value, what)?;
+    staged.stage(key, value);
+    Ok(())
 }
 
 #[async_trait::async_trait(?Send)]
@@ -112,48 +130,59 @@ impl Module for Tasks {
         self.id.clone()
     }
 
+    /// the REAL merkle root over all committed records, cached by the store --
+    /// never a re-serialization of the boards.
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.encode_state())
+        self.staged.root()
     }
 
-    /// advertise the snapshot lane: [`Tasks::snapshot`] is the exact preimage of
-    /// `root()`, and [`Tasks::install`] verifies before adopting -- without this
-    /// override, sync orchestration saw `Unsupported` and a joiner could not
-    /// rebuild the module at all.
-    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
-        Some(self.snapshot())
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        self.staged.state_sync_handle()
+    }
+
+    /// the network state-sync serve lane: answers the shared qmdb wire requests
+    /// (historical proof-carrying op ranges) from committed state. read-only.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.staged.serve_sync(req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        self.staged.sync_target().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match decode_work_msg(&msg.payload).map_err(Error::Module)? {
-            WorkMsg::Task(task_msg) => self.tasks.execute(task_msg, ctx.env().consensus_time),
+            WorkMsg::Task(task_msg) => {
+                let consensus_time = ctx.env().consensus_time;
+                task_board::execute(&mut self.staged, task_msg, consensus_time).await
+            }
             WorkMsg::Job(job_msg) => {
                 let id = self.id.clone();
-                self.jobs.execute(ctx, job_msg, &id).await
+                job_board::execute(&mut self.staged, ctx, job_msg, &id).await
             }
         }
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_work_query(req).map_err(Error::Module)? {
-            WorkQuery::Task(TaskQuery::List) => {
-                Ok(encode_work_reply(&WorkReply::Task(self.tasks.query_list())))
-            }
+            WorkQuery::Task(TaskQuery::List) => Ok(encode_work_reply(&WorkReply::Task(
+                task_board::query_list(&self.staged).await?,
+            ))),
             WorkQuery::Job(job_query) => Ok(encode_work_reply(&WorkReply::Job(
-                self.jobs.query(job_query),
+                job_board::query(&self.staged, job_query).await?,
             ))),
         }
     }
 
+    /// publish the block's staged writes AND deletes in ONE store batch.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        self.tasks.commit();
-        self.jobs.commit();
-        Ok(())
+        self.staged.commit().await
     }
 
+    /// discard the block's staged writes -- nothing reached the store, so
+    /// `root()` is unchanged.
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.tasks.abort();
-        self.jobs.abort();
+        self.staged.abort();
         Ok(())
     }
 }

@@ -806,7 +806,10 @@ fn run_sim(
             Box::new(QmdbStore::init(context.child("tagging"), "tagging").await),
         )
         .with_direct_owner("runs");
-        let tasks = Tasks::new("tasks");
+        let tasks = Tasks::new(
+            "tasks",
+            Box::new(QmdbStore::init(context.child("tasks"), "tasks").await),
+        );
         let inbox = Inbox::new(
             "inbox",
             Box::new(QmdbStore::init(context.child("inbox"), "inbox").await),

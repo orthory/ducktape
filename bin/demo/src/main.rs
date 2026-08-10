@@ -558,7 +558,10 @@ async fn demo_genesis(
         Box::new(QmdbStore::init(context.child("tagging"), "tagging").await),
     )
     .with_direct_owner("runs");
-    let tasks = Tasks::new("tasks");
+    let tasks = Tasks::new(
+        "tasks",
+        Box::new(QmdbStore::init(context.child("tasks"), "tasks").await),
+    );
     // the deterministic user->nodes binding registry: no valset gating and
     // a fixed demo chain id (the demo has no real network descriptor).
     // store-backed like chat/pages.
