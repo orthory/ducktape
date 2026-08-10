@@ -509,7 +509,16 @@ on select_shell_tab(next)
   agents_generation = agents_generation + 1
   account_generation = account_generation + 1
   forge_generation = forge_generation + 1
-  settings_generation = settings_generation + 1
+  // THE SETTINGS BUMP IS GATED TOO, AND IT IS THE ONE THAT HAS TO BE. Every
+  // other loader here draws only its own tab, so a bump that discards a
+  // still-flying CONNECT load is re-earned the moment that tab is opened. The
+  // settings facts are not: chat mounts `settings_user_key` as `me`, and chat
+  // returns above this block, so nothing chat does ever re-issues them. Bump
+  // unconditionally and a move into Members while the connect load is in
+  // flight orphans it — the -1 in its place is refused, and `me` stays "" for
+  // the session, which `rooms_only` reads as "show every DM under CHANNELS"
+  // and `post_gate` as "not seated", refusing the composer on every DM.
+  settings_generation = keep_i64(shell_tab == "settings", settings_generation + 1, settings_generation)
   node_peers_generation = node_peers_generation + 1
   node_facts_generation = node_facts_generation + 1
   explorer_loading = shell_tab == "explorer"
