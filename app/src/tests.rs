@@ -648,6 +648,68 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
             "a {module} commit must refresh {loader} on any tab: {live}"
         );
     }
+
+    // THE SETTINGS FACTS ARE THE INLINE HALF OF THE SAME GATE. No module
+    // commits `/v1/status`, a key file or the local prefs, so they get no
+    // `tab_reads_plane` row and no live arm — just the tab that draws them.
+    // The EXACT SET is the pin, both lines: the CONNECT load must stay
+    // ungated (it is what fills chat's `user_key`, which chat cannot refetch
+    // for itself — a move into chat returns above the tab block), and the tab
+    // move must carry the gate.
+    let settings_loads: Vec<_> = lifecycle
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("run load_settings_facts("))
+        .collect();
+    assert_eq!(
+        settings_loads,
+        [
+            "run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _",
+            "run load_settings_facts(connected_rpc, keep_i64(shell_tab == \"settings\", settings_generation, -1)) -> settings_loaded _ | settings_failed _",
+        ]
+    );
+}
+
+/// THE GATE'S OTHER HALF IS THE BUMP, and it is the half the `-1` cannot do
+/// alone. `settings_loaded` is dropped when its generation is stale, so a tab
+/// move that bumps unconditionally REVOKES the connect load still in flight
+/// and puts only a refused `-1` in its place. Every other generation on that
+/// block may bump freely — their loaders draw one tab, so opening it re-earns
+/// the read. The settings facts are the exception: `settings_user_key` is
+/// chat's `me`, chat returns above the tab block, and nothing chat does ever
+/// re-issues the load. Lose it and `me` stays "" for the session — which
+/// `rooms_only` reads as "show every DM under CHANNELS" and `post_gate` as
+/// "not seated", refusing the composer on every DM.
+#[test]
+fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    let in_flight = app.settings_generation;
+
+    let _ = app.__update(__DucktapeMessage::SelectShellTab("members".into()));
+    let _ = app.__update(__DucktapeMessage::SettingsLoaded(
+        crate::backend::SettingsFacts {
+            generation: in_flight,
+            endpoint: "http://127.0.0.1:7100".into(),
+            node_key: "node".into(),
+            key_path: "/w/user.key".into(),
+            key_state: "encrypted".into(),
+            data_dir: "/w".into(),
+            open_tabs: 0,
+            user_key: "abcd".into(),
+        },
+    ));
+    assert_eq!(
+        app.settings_user_key, "abcd",
+        "the move off-tab must not revoke the connect load's facts"
+    );
+
+    // and the tab that DOES draw them still re-reads on entry.
+    let _ = app.__update(__DucktapeMessage::SelectShellTab("settings".into()));
+    assert_ne!(
+        app.settings_generation, in_flight,
+        "entering Settings must issue a fresh read"
+    );
 }
 
 #[test]

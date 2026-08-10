@@ -3942,7 +3942,11 @@ async fn an_off_screen_plane_is_refused_before_it_touches_the_node() {
         // the DM directory is on the same -1 lane (lifecycle.ice's `identity`
         // live arm) and its `all{from:0,limit:256}` walk is the priciest of
         // the five — an ungated one fires on every chat post.
-        load_dm_peers(unreachable, -1).await.err(),
+        load_dm_peers(unreachable.clone(), -1).await.err(),
+        // the settings facts ride the -1 lane on the inline gate instead of a
+        // plane row, and their off-screen cost is not one round trip: a
+        // `/v1/status` call, a `user key status` SUBPROCESS and a prefs read.
+        load_settings_facts(unreachable, -1).await.err(),
     ];
     for refusal in refusals {
         let refusal = refusal.expect("an off-screen load refuses");

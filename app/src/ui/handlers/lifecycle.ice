@@ -509,7 +509,16 @@ on select_shell_tab(next)
   agents_generation = agents_generation + 1
   account_generation = account_generation + 1
   forge_generation = forge_generation + 1
-  settings_generation = settings_generation + 1
+  // THE SETTINGS BUMP IS GATED TOO, AND IT IS THE ONE THAT HAS TO BE. Every
+  // other loader here draws only its own tab, so a bump that discards a
+  // still-flying CONNECT load is re-earned the moment that tab is opened. The
+  // settings facts are not: chat mounts `settings_user_key` as `me`, and chat
+  // returns above this block, so nothing chat does ever re-issues them. Bump
+  // unconditionally and a move into Members while the connect load is in
+  // flight orphans it — the -1 in its place is refused, and `me` stays "" for
+  // the session, which `rooms_only` reads as "show every DM under CHANNELS"
+  // and `post_gate` as "not seated", refusing the composer on every DM.
+  settings_generation = keep_i64(shell_tab == "settings", settings_generation + 1, settings_generation)
   node_peers_generation = node_peers_generation + 1
   node_facts_generation = node_facts_generation + 1
   explorer_loading = shell_tab == "explorer"
@@ -533,7 +542,8 @@ on select_shell_tab(next)
   // in backend/shell.rs carries the argument — including why the live `plane`
   // arm above must carry no tab gate of its own. New loader here: a chain
   // PLANE gets a `tab_reads_plane` row; a loader keyed on one pane's own state
-  // (explorer, files, forge) keeps the inline `shell_tab ==` above.
+  // or on device-local facts (explorer, files, forge, settings) keeps the
+  // inline `shell_tab ==` above.
   parallel
     run load_node_facts(connected_rpc, node_facts_generation) -> node_facts_loaded _ | node_facts_failed _
     run load_explorer(connected_rpc, keep_i64(shell_tab == "explorer", explorer_generation, -1)) -> explorer_loaded _ | explorer_failed _
@@ -541,7 +551,16 @@ on select_shell_tab(next)
     run files_history(connected_rpc, keep_i64(shell_tab == "files", fs_generation, -1)) -> fs_history_loaded _ | fs_failed _
     run load_members(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "members"), members_generation, -1)) -> members_loaded _ | members_failed _
     run load_governance(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "governance"), gov_generation, -1)) -> governance_loaded _ | governance_failed _
-    run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
+    // SETTINGS FACTS ARE NOT A CHAIN PLANE, so they take the inline gate and
+    // no `tab_reads_plane` row: the loader reads `/v1/status`, this device's
+    // key file, its prefs and its workspace dir — nothing a module commits, so
+    // no live arm can refresh them and no table can say which panes "draw" a
+    // device fact. Only the settings screen draws them; chat reads `user_key`
+    // off the same load, but chat returns above this block, so the trip into
+    // Members or Files was never what kept it fresh — the CONNECT load is, and
+    // the key is a boot-stable file reading (`user key status` answers for an
+    // encrypted key too).
+    run load_settings_facts(connected_rpc, keep_i64(shell_tab == "settings", settings_generation, -1)) -> settings_loaded _ | settings_failed _
     // PEERS IS A HEAVY LOADER AND WAS FILED WITH THE LIGHT ONES. `/v1/peers`
     // encodes the node's whole metrics registry per call (485 KB, ~10 ms), so
     // running it on entry to Explorer, Files, Members, Agents and Forge — none
