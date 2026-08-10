@@ -214,6 +214,18 @@ fn spec_chunk_keys(saga_id: &str, spec_len: u64) -> Vec<Vec<u8>> {
 
 /// the live (non-terminal) id index — the deterministic iteration domain of
 /// `Crank`, `NextExpiry`, `AssignedPending` and `UnassignedPending`.
+///
+// ponytail: ONE index record holds every LIVE id, so the ledger refuses new
+// triggers once it hits MAX_RECORD_BYTES — ~4k concurrent pending sagas at
+// realistic ~250-byte ids, ~2k at the MAX_SAGA_ID_BYTES cap. unlike the
+// terminal index, nothing trims this one: it drains only as sagas terminate,
+// and a saga triggered with neither a deadline nor a lease never expires, so a
+// squatter could hold the ceiling. that is still strictly better than the
+// unbounded map this replaced (which grew the fuel cost of EVERY op), and the
+// refusal is loud rather than a silent brick. if it must scale past that,
+// shard the index by id prefix — the four readers above already iterate it as
+// one sorted sequence, so a merge over N shards is the whole change. a
+// per-origin live quota is a WIRE change and belongs to a separate decision.
 const PENDING_INDEX_KEY: &[u8] = b"pending";
 
 /// the terminal receipt index — the retention trim's whole input.
