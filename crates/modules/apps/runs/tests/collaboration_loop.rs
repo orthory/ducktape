@@ -259,7 +259,11 @@ async fn genesis(context: deterministic::Context) -> Host {
             Box::new(sdk_testkit::MemStore::new()),
         )),
         Box::new(SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new()))),
-        Box::new(DispatchModule::new("dispatch", "saga")),
+        Box::new(DispatchModule::new(
+            "dispatch",
+            "saga",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(agent),
         Box::new(RunsModule::new(
             "runs",

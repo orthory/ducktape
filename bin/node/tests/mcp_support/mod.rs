@@ -82,7 +82,11 @@ impl Harness {
                         "tasks",
                         Box::new(sdk_testkit::MemStore::new()),
                     )),
-                    Box::new(dispatch::DispatchModule::new("dispatch", "saga")),
+                    Box::new(dispatch::DispatchModule::new(
+                        "dispatch",
+                        "saga",
+                        Box::new(sdk_testkit::MemStore::new()),
+                    )),
                     Box::new(tagging::TaggingModule::new(
             "tagging",
             Box::new(sdk_testkit::MemStore::new()),

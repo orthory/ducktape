@@ -555,7 +555,11 @@ async fn demo_genesis(
         "saga",
         Box::new(QmdbStore::init(context.child("saga"), "saga").await),
     );
-    let dispatch = dispatch::DispatchModule::new("dispatch", "saga");
+    let dispatch = dispatch::DispatchModule::new(
+        "dispatch",
+        "saga",
+        Box::new(QmdbStore::init(context.child("dispatch"), "dispatch").await),
+    );
     let tagging = tagging::TaggingModule::new(
         "tagging",
         Box::new(QmdbStore::init(context.child("tagging"), "tagging").await),

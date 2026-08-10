@@ -156,19 +156,20 @@ const AUTOMATIONS_MODULE_ID: &str = "automations";
 
 /// dispatch — the task plane's recipe-manifest + capability-routed delivery
 /// registry, adapter-ported like its saga collaborator (the native crate
-/// compiled into the guest; canonical snapshot persisted through the host-KV
-/// store). two things make its port shape distinct:
-///   * its root representation differs from genesis — the native empty encoding is
-///     four zero counts (recipes / dispatches / mailbox / next_seq) while the
-///     map-backed guest store is a lone count, so the wasm root differs from the
-///     native root before any write.
-///   * its query surface is COMMITTED-ONLY regardless of caller — the host's
-///     `PendingDeliveries` delivery injection and runs' `turn_taken` existence
-///     read must never see a same-block staged write — pinned by the genesis
-///     builder's `.with_committed_queries()` (the kernel lane Task 3 added).
-///     dispatch carries NO ctx-routed enrichment: the former `query_with`
-///     assignee facade was retired when runs' `lease_holder` moved onto saga,
-///     so the guest's ctx-less query is exactly faithful to the native surface.
+/// compiled into the guest) and STORE-BACKED like pages/chat/tasks: one record
+/// per recipe, per dispatch and per mailbox entry over the host-constructed
+/// qmdb store, so a dispatch record — `runs`' PERMANENT turn claim — costs
+/// nothing per op and capture is O(1). the wasm root IS the store's root, so
+/// the port is ROOT-CONTINUOUS with the native module.
+///
+/// its query surface is COMMITTED-ONLY regardless of caller — the host's
+/// `PendingDeliveries` delivery injection and runs' `turn_taken` existence read
+/// must never see a same-block staged write — pinned by the genesis builder's
+/// `.with_committed_queries()`, which drops the outer staged overlay for a query
+/// round so `WitStore` serves the native module's `get_committed` reads exactly
+/// as the native store does. dispatch carries NO ctx-routed enrichment: the
+/// former `query_with` assignee facade was retired when runs' `lease_holder`
+/// moved onto saga, so the guest's ctx-less query is exactly faithful.
 ///
 /// its saga collaborator id ("saga") is genesis-constant, compiled into the guest.
 const DISPATCH_WASM_COMPONENT: &[u8] =
@@ -427,14 +428,13 @@ fn automations_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
         .expect("embedded automations component loads")
 }
 
-/// dispatch at its GENESIS code (adapter-ported — see the component const's
-/// doc). The native canonical snapshot is persisted as one host-KV value, so
-/// its root representation differs from the native root. `.with_committed_queries()`
-/// pins the guest's query lane committed-only, preserving the native read
-/// facade's contract (the host's delivery injection + runs' `turn_taken` read);
-/// EXACTLY the wiring `wasm_dispatch_parity`'s `wasm_dispatch()` pins.
-fn genesis_dispatch_wasm() -> WasmModule {
-    WasmModule::from_bytes(DISPATCH_MODULE_ID, DISPATCH_WASM_COMPONENT)
+/// dispatch at its GENESIS code over the host-constructed store (same three
+/// store lifecycles as [`pages_wasm`]). `.with_committed_queries()` pins the
+/// guest's query lane committed-only, preserving the native read facade's
+/// contract (the host's delivery injection + runs' `turn_taken` read); EXACTLY
+/// the wiring `wasm_dispatch_parity`'s `wasm_dispatch()` pins.
+fn dispatch_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(DISPATCH_MODULE_ID, DISPATCH_WASM_COMPONENT, store)
         .expect("embedded dispatch component loads")
         .with_committed_queries()
 }
@@ -658,6 +658,9 @@ pub(super) async fn genesis_host(
     let tasks = tasks_wasm(Box::new(
         QmdbStore::init(context.child("tasks"), "tasks").await,
     ));
+    let dispatch = dispatch_wasm(Box::new(
+        QmdbStore::init(context.child("dispatch"), "dispatch").await,
+    ));
     // the lifecycle registry is NATIVE but store-backed the same way; the
     // genesis seed set commits into its store in one idempotent batch.
     let lifecycle = seeded_lifecycle(Box::new(
@@ -730,8 +733,9 @@ pub(super) async fn genesis_host(
         capability,
         // the task plane: recipe manifests + capability-routed dispatch with
         // next-block result delivery (the host's DeliverPending injection).
-        // adapter-ported; committed-only query lane and a distinct root representation.
-        dispatch: genesis_dispatch_wasm(),
+        // adapter-ported and store-backed over the host-constructed qmdb store;
+        // committed-only query lane.
+        dispatch,
         // the engagement plane: content modules report tags, subscriber
         // modules receive engagement events — router only, module-agnostic.
         // store-backed over the host-constructed qmdb store.
@@ -866,6 +870,9 @@ pub(super) async fn restore_host(
     let tasks = tasks_wasm(Box::new(
         QmdbStore::init(context.child("tasks"), "tasks").await,
     ));
+    let dispatch = dispatch_wasm(Box::new(
+        QmdbStore::init(context.child("dispatch"), "dispatch").await,
+    ));
 
     let mut hello_wasm = genesis_hello_wasm();
     let (bytes, root) = snapshot_of(HELLO_WASM_MODULE_ID)?;
@@ -876,12 +883,6 @@ pub(super) async fn restore_host(
     let saga = saga_wasm(Box::new(
         QmdbStore::init(context.child("saga"), "saga").await,
     ));
-
-    let mut dispatch = genesis_dispatch_wasm();
-    let (bytes, root) = snapshot_of(DISPATCH_MODULE_ID)?;
-    dispatch
-        .install(bytes, root)
-        .map_err(|e| format!("dispatch install: {e}"))?;
 
     // files is a duckfs-odb resolver module — NOT in the checkpoint's snapshot
     // set (like the qmdb modules above, which `init` from their own on-disk
@@ -1151,6 +1152,17 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         )
         .await?,
     ));
+
+    let (target, resolver) = fetch_target(DISPATCH_MODULE_ID).await?;
+    let dispatch = dispatch_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("dispatch")),
+            "dispatch",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
     let snapshot_of = |module: &'static str| {
@@ -1199,12 +1211,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         )
         .await?,
     ));
-
-    let (bytes, root) = snapshot_of(DISPATCH_MODULE_ID).await?;
-    let mut dispatch = genesis_dispatch_wasm();
-    dispatch
-        .install(&bytes, root)
-        .map_err(|e| format!("dispatch install: {e}"))?;
 
     // the lifecycle module-code registry joins like the other store-backed
     // tenants: rebuild the store at the manifest's pinned target. the wasm
@@ -1371,7 +1377,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "ead9b5759965aa613214a8740dbee755fef5470ed24de2bd08340b9cf7b44b35";
+        "0b0dbc5e4cc664f8a1c800bba7d9f856529dc50501a3323e88de27897dbafa5f";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's store as a genesis

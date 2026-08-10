@@ -216,7 +216,11 @@ fn run_node(
         );
         // the task plane: recipe manifests + capability dispatch with
         // next-block result delivery.
-        let dispatch = DispatchModule::new("dispatch", "saga");
+        let dispatch = DispatchModule::new(
+            "dispatch",
+            "saga",
+            Box::new(QmdbStore::init(context.child("dispatch"), "dispatch").await),
+        );
         // the engagement plane: tag reports in, engagement events out.
         let tagging = TaggingModule::new(
             "tagging",

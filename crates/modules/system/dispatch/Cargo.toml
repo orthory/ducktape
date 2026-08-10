@@ -7,7 +7,7 @@ version.workspace = true
 # over saga, deterministic output-contract validation, and next-block result
 # delivery. 100% self-contained — no app-module imports, ever.
 [features]
-# the wasm-guest port (src/guest.rs): the dispatch shell over
+# the wasm-guest port (src/guest.rs): the store-backed dispatch shell over
 # guest-adapter. non-default and wasm-only — enabled solely by the
 # guest-builder's synthesized cdylib workspace, never by the native gate.
 guest = ["dep:guest-adapter"]
@@ -35,3 +35,7 @@ async-trait = { workspace = true }
 [dev-dependencies]
 futures = { workspace = true }
 sdk-testkit = { workspace = true }
+# the sync round trip drives the module the way a host does: construct the
+# concrete QmdbStore and inject it as `Box<dyn MerkleStore>`.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }

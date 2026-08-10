@@ -133,7 +133,11 @@ async fn siblings(
             Box::new(sdk_testkit::MemStore::new()),
         )),
         Box::new(saga),
-        Box::new(DispatchModule::new("dispatch", "saga")),
+        Box::new(DispatchModule::new(
+            "dispatch",
+            "saga",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(AgentModule::new(
             "agent",
             Box::new(agent_store),

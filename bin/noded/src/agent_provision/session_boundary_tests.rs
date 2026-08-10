@@ -137,7 +137,11 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
             "saga",
             Box::new(sdk_testkit::MemStore::new()),
         )),
-        Box::new(DispatchModule::new("dispatch", "saga")),
+        Box::new(DispatchModule::new(
+            "dispatch",
+            "saga",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(agent::AgentModule::new(
             "agent",
             Box::new(QmdbStore::init(context.child("agent"), "agent").await),

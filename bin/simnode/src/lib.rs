@@ -803,7 +803,11 @@ fn run_sim(
             "saga",
             Box::new(QmdbStore::init(context.child("saga"), "saga").await),
         );
-        let dispatch = DispatchModule::new("dispatch", "saga");
+        let dispatch = DispatchModule::new(
+            "dispatch",
+            "saga",
+            Box::new(QmdbStore::init(context.child("dispatch"), "dispatch").await),
+        );
         let tagging = TaggingModule::new(
             "tagging",
             Box::new(QmdbStore::init(context.child("tagging"), "tagging").await),
