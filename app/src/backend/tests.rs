@@ -1012,6 +1012,55 @@ fn a_status_without_operations_produces_unmeasured_readings() {
     assert_eq!(facts.reachable_validators, None);
 }
 
+/// SYNC IS READ OFF `phase`, NEVER OFF THE PRESENCE OF `sync`.
+///
+/// `operations.sync` is set by `begin_sync` and never cleared — no writer in
+/// `bin/noded/src/metrics.rs` puts it back to `None`. A node that finished
+/// syncing hours ago still carries the last run's heights, so reading presence
+/// as "is syncing" paints a progress bar that never goes away.
+#[test]
+fn a_finished_sync_is_not_a_sync_in_progress() {
+    let caught_up = serde_json::json!({
+        "operations": {
+            "phase": "serving",
+            "phase_since": 1_700_000_000,
+            "sync": { "target_height": 900, "applied_height": 900, "retries": 3, "failures": 1 },
+        },
+    });
+    let facts = node_facts(&caught_up, 0);
+    assert_eq!(facts.phase, "serving");
+    assert!(
+        !sync_in_progress(&facts.phase),
+        "a stale sync block must not read as a sync in progress"
+    );
+    // the numbers still ride: Settings prints them as CUMULATIVE totals.
+    assert_eq!(facts.sync_retries, 3);
+    assert_eq!(facts.sync_failures, 1);
+    assert_eq!(facts.phase_since, 1_700_000_000);
+
+    let catching_up = serde_json::json!({
+        "operations": {
+            "phase": "syncing",
+            "sync": { "target_height": 900, "applied_height": 412 },
+        },
+    });
+    let facts = node_facts(&catching_up, 0);
+    assert!(sync_in_progress(&facts.phase));
+    assert_eq!(facts.sync_applied, 412);
+    assert_eq!(facts.sync_target, 900);
+
+    // A node that has never synced publishes no `sync` at all. Heights are
+    // UNMEASURED because the node published none; the counters are genuinely
+    // zero, because a count of nothing IS zero.
+    let fresh = serde_json::json!({ "operations": { "phase": "validating" } });
+    let facts = node_facts(&fresh, 0);
+    assert_eq!(facts.sync_target, UNMEASURED);
+    assert_eq!(facts.sync_applied, UNMEASURED);
+    assert_eq!(facts.sync_retries, 0);
+    assert_eq!(facts.sync_last_error, "");
+    assert_eq!(facts.phase_since, UNMEASURED);
+}
+
 /// A record stamp is a BLOCK HEIGHT on this chain, so every record-time
 /// string counts blocks. Only `/v1/status` supplies unix seconds.
 #[test]

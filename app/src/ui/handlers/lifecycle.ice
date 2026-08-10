@@ -618,7 +618,14 @@ subscribe
   // held, so THIS GATE IS THE BUDGET: `/v1/peers` composes its sample by
   // encoding the whole metrics registry (485 KB, ~10 ms a call, measured), and
   // leaving the tab stops that at the source rather than throttling it here.
-  run node_overview(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "overview") -> node_overview_sample _
+  // STATUS RIDES EVERYWHERE. The node answers it from a cell it publishes at
+  // each boundary, so a console holding it on every tab costs one read per
+  // heartbeat — and the node's phase is a fact about the NODE, not about the
+  // surface the reader happens to have open.
+  run node_status_live(connected_rpc) when connected -> node_status_pushed _
+  // PEERS DOES NOT. Each sample encodes the whole metrics registry, so this
+  // gate is the budget: leaving the tab stops the encode at the source.
+  run node_peers_live(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "overview") -> node_peers_pushed _
   every 1s when huddle_joined -> tick
   every 300ms when !empty(toast) -> toast_tick
   // The settle-✓'s dismissal clock: tick one holds the tick on screen and

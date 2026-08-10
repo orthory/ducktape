@@ -242,6 +242,28 @@ pub struct NodeFacts {
     /// HEIGHT h 422,553 — an order no node is ever in. See [`served_height`]
     /// for why a wire `0` lands here as [`UNMEASURED`].
     pub height: i64,
+    /// The node's own lifecycle phase — `starting`, `recovering`, `joining`,
+    /// `syncing`, `validating`, `serving`, `draining`, `halted`.
+    ///
+    /// THE ONLY TRUSTWORTHY DISCRIMINANT for whether a sync is happening. The
+    /// `sync` block beside it is written by `begin_sync` and never cleared, so
+    /// a node that finished syncing hours ago still carries the last run.
+    pub phase: String,
+    /// Unix seconds the phase last changed; [`UNMEASURED`] when unpublished.
+    pub phase_since: i64,
+    /// The sync run's heights, [`UNMEASURED`] when the node has published none.
+    pub sync_target: i64,
+    pub sync_applied: i64,
+    /// CUMULATIVE since boot and never reset, so these are a total rather than
+    /// a state — which is why they belong on a detail surface and not on a
+    /// badge. Absence really is zero here: a count of nothing IS zero.
+    pub sync_retries: i64,
+    pub sync_failures: i64,
+    /// The last sync error, SELF-CLEARING: `record_sync_progress` puts it back
+    /// to `None` the moment the node advances. Present therefore means "the
+    /// most recent attempt failed and nothing has moved since", which is a
+    /// fact about now rather than a scar.
+    pub sync_last_error: String,
 }
 
 /// A DEFAULT IS A DOCUMENT NO NODE HAS PUBLISHED, so its three numbers are
@@ -269,6 +291,13 @@ impl Default for NodeFacts {
             last_finalized_at: UNMEASURED,
             checkpoint_height: UNMEASURED,
             height: UNMEASURED,
+            phase: String::new(),
+            phase_since: UNMEASURED,
+            sync_target: UNMEASURED,
+            sync_applied: UNMEASURED,
+            sync_retries: 0,
+            sync_failures: 0,
+            sync_last_error: String::new(),
         }
     }
 }
@@ -282,6 +311,7 @@ impl Default for NodeFacts {
 pub(crate) fn node_facts(status: &serde_json::Value, generation: i64) -> NodeFacts {
     let operations = &status["operations"];
     let consensus = &operations["consensus"];
+    let sync = &operations["sync"];
     NodeFacts {
         generation,
         version: status["version"].as_str().unwrap_or_default().to_string(),
@@ -296,7 +326,22 @@ pub(crate) fn node_facts(status: &serde_json::Value, generation: i64) -> NodeFac
             .as_i64()
             .unwrap_or(UNMEASURED),
         height: served_height(&status["height"]),
+        phase: operations["phase"].as_str().unwrap_or_default().to_string(),
+        phase_since: operations["phase_since"].as_i64().unwrap_or(UNMEASURED),
+        sync_target: sync["target_height"].as_i64().unwrap_or(UNMEASURED),
+        sync_applied: sync["applied_height"].as_i64().unwrap_or(UNMEASURED),
+        sync_retries: sync["retries"].as_i64().unwrap_or(0),
+        sync_failures: sync["failures"].as_i64().unwrap_or(0),
+        sync_last_error: sync["last_error"].as_str().unwrap_or_default().to_string(),
     }
+}
+
+/// Whether the node is catching up RIGHT NOW.
+///
+/// The phase, and only the phase. `operations.sync` is never cleared, so its
+/// presence says a sync once happened — not that one is happening.
+pub(crate) fn sync_in_progress(phase: &str) -> bool {
+    phase == "syncing"
 }
 
 pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, HydrationError> {
@@ -379,46 +424,50 @@ pub struct PeersData {
     pub peers: Vec<PeerRow>,
 }
 
-/// One pushed overview sample, as the console consumes it.
+/// THE NODE'S OWN STATUS, PUSHED, ON EVERY TAB.
 ///
-/// Each frame carries ONE half — the node samples the two topics
-/// independently — so the flags say which half this frame actually answered
-/// and the view keeps the other. That is deliberate over buffering both here:
-/// if one topic is refused (a daemon with no metrics exposition serves no
-/// peers), the other must still go live rather than wait forever for a
-/// partner that is never coming.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct NodeOverview {
-    pub peers_answered: bool,
-    pub peers: Vec<PeerRow>,
-    pub facts_answered: bool,
-    pub facts: NodeFacts,
+/// Cheap to hold anywhere the console is standing: the node answers `status`
+/// from a cell it publishes at each boundary, and the snapshot debounce means
+/// one read per heartbeat. That is what lets a sync reading follow the reader
+/// around instead of living on one tab — the node's phase is a fact about the
+/// node, not about the surface you happen to have open.
+pub fn node_status_live(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeFacts> {
+    snapshot_stream(rpc, Snapshot::Status)
 }
 
-/// THE NODE'S OWN TWO PLANES, PUSHED.
+/// THE DIRECT-PEER SAMPLE, PUSHED, ONLY WHERE IT IS DRAWN.
 ///
-/// Peers and node status have no op behind them — nothing in the index names
-/// a mesh connection or a checkpoint height — so no module stream can carry
-/// them, and they were the console's last two cold surfaces, refreshed only
-/// by a connect or a tab switch.
+/// Every sample encodes the node's ENTIRE metrics registry, so the Ice `when`
+/// gate on this subscription is the whole budget: leaving the tab stops the
+/// encode at the source rather than throttling it here.
+pub fn node_peers_live(rpc: String) -> iced::futures::stream::BoxStream<'static, PeersData> {
+    snapshot_stream(rpc, Snapshot::Peers)
+}
+
+/// Which snapshot topic a stream carries, and how its document is read.
 ///
-/// The SUBSCRIPTION is the cost control, which is why this is a stream and not
-/// a timer. `/v1/peers` composes its sample by encoding the node's whole
-/// metrics registry (8144 lines, 485 KB on a demo node) and parsing ten
-/// families back out — measured at ~10 ms a call. The node re-samples only
-/// while this subscription is held, so the Ice `when` gate on the overview tab
-/// IS the whole budget: leave the tab and the sampling stops, at the source.
+/// One discriminant rather than two copies of the reconnect loop: the loops
+/// were identical and the only difference was the topic and the reader.
+#[derive(Clone, Copy)]
+enum Snapshot {
+    Status,
+    Peers,
+}
+
+/// One snapshot topic, reconnecting with backoff, parsed with the SAME reader
+/// the HTTP load uses.
 ///
-/// Reconnects on its own, like the log stream beside it, so a node restart
-/// re-lights the table without a tab bounce.
-pub fn node_overview(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeOverview> {
+/// A dropped socket is not a reason to blank the surface: the rows on screen
+/// were true when they were sampled. Rebuild the subscription and keep them
+/// until a fresher sample replaces them.
+fn snapshot_stream<T: Send + 'static>(rpc: String, topic: Snapshot) -> iced::futures::stream::BoxStream<'static, T>
+where
+    Snapshot: SnapshotReader<T>,
+{
     struct State {
         rpc: String,
         stream: Option<
-            iced::futures::stream::BoxStream<
-                'static,
-                ducktape_rpc::Result<ducktape_rpc::NodeSnapshot>,
-            >,
+            iced::futures::stream::BoxStream<'static, ducktape_rpc::Result<serde_json::Value>>,
         >,
         retry_attempt: u32,
     }
@@ -428,17 +477,21 @@ pub fn node_overview(rpc: String) -> iced::futures::stream::BoxStream<'static, N
             stream: None,
             retry_attempt: 0,
         },
-        |mut state| async move {
+        move |mut state| async move {
             loop {
                 if state.stream.is_none() && state.retry_attempt > 0 {
                     tokio::time::sleep(retry_delay(state.retry_attempt)).await;
                 }
                 if state.stream.is_none() {
-                    let Ok(rpc) = rpc_client(&state.rpc) else {
+                    let Ok(client) = rpc_client(&state.rpc) else {
                         state.retry_attempt = state.retry_attempt.saturating_add(1);
                         continue;
                     };
-                    match rpc.node_snapshots().await {
+                    let opened = match topic {
+                        Snapshot::Status => client.status_events().await,
+                        Snapshot::Peers => client.peers_events().await,
+                    };
+                    match opened {
                         Ok(stream) => state.stream = Some(stream),
                         Err(_) => {
                             state.retry_attempt = state.retry_attempt.saturating_add(1);
@@ -453,14 +506,10 @@ pub fn node_overview(rpc: String) -> iced::futures::stream::BoxStream<'static, N
                     .next()
                     .await
                 {
-                    Some(Ok(snapshot)) => {
+                    Some(Ok(document)) => {
                         state.retry_attempt = 0;
-                        return Some((overview_from(snapshot), state));
+                        return Some((topic.read(&document), state));
                     }
-                    // A dropped socket is not a reason to blank the table: the
-                    // rows on screen were true when they were sampled. Rebuild
-                    // the subscription and keep them until a fresher sample
-                    // replaces them.
                     Some(Err(_)) | None => {
                         state.stream = None;
                         state.retry_attempt = state.retry_attempt.saturating_add(1);
@@ -472,22 +521,25 @@ pub fn node_overview(rpc: String) -> iced::futures::stream::BoxStream<'static, N
     .boxed()
 }
 
-/// One snapshot, read with the SAME readers the HTTP loads use.
-fn overview_from(snapshot: ducktape_rpc::NodeSnapshot) -> NodeOverview {
-    match snapshot {
-        ducktape_rpc::NodeSnapshot::Peers(view) => NodeOverview {
-            peers_answered: true,
-            peers: peer_rows(&view),
-            ..NodeOverview::default()
-        },
-        ducktape_rpc::NodeSnapshot::Status(status) => NodeOverview {
-            facts_answered: true,
-            // the generation is the HTTP loads' stale-reply guard; a PUSH
-            // answers no request, so there is nothing for it to be stale
-            // against. `-1` is the app's own "not a reply" reading.
-            facts: node_facts(&status, -1),
-            ..NodeOverview::default()
-        },
+/// How one snapshot topic's document becomes the value the console holds.
+trait SnapshotReader<T> {
+    fn read(&self, document: &serde_json::Value) -> T;
+}
+
+impl SnapshotReader<NodeFacts> for Snapshot {
+    /// The generation is the HTTP loads' stale-reply guard; a PUSH answers no
+    /// request, so `-1` is the app's own "not a reply" reading.
+    fn read(&self, document: &serde_json::Value) -> NodeFacts {
+        node_facts(document, -1)
+    }
+}
+
+impl SnapshotReader<PeersData> for Snapshot {
+    fn read(&self, document: &serde_json::Value) -> PeersData {
+        PeersData {
+            generation: -1,
+            peers: peer_rows(document),
+        }
     }
 }
 

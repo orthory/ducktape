@@ -173,7 +173,7 @@ extern crate::backend
   NodeLogLine(cursor:str, line:str)
   LogParts(time:str, level:str, message:str)
   sync split_log_line(line:str) -> LogParts
-  NodeFacts(generation:i64, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64)
+  NodeFacts(generation:i64, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, phase:str, phase_since:i64, sync_target:i64, sync_applied:i64, sync_retries:i64, sync_failures:i64, sync_last_error:str)
   load_node_facts(rpc:str, generation:i64) -> NodeFacts ! HydrationError
   sync optional_number(value:i64?) -> str
   PeerRow(key:str, role:str, live:bool)
@@ -181,8 +181,8 @@ extern crate::backend
   sync push_log_line(lines:[NodeLogLine], line:NodeLogLine) -> [NodeLogLine]
   sync filter_log_lines(lines:[NodeLogLine], filter:str) -> [NodeLogLine]
   stream node_logs(rpc:str) -> NodeLogLine
-  NodeOverview(peers_answered:bool, peers:[PeerRow], facts_answered:bool, facts:NodeFacts)
-  stream node_overview(rpc:str) -> NodeOverview
+  stream node_status_live(rpc:str) -> NodeFacts
+  stream node_peers_live(rpc:str) -> PeersData
   load_peers(rpc:str, generation:i64) -> PeersData ! HydrationError
   ModuleRow(id:str, category:str, root:str, code_hash:str, pending_hash:str, activation_height:i64, readiness:i64, ready:bool)
   ModulesData(generation:i64, rows:[ModuleRow])
