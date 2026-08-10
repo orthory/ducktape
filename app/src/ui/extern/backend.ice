@@ -181,6 +181,7 @@ extern crate::backend
   sync push_log_line(lines:[NodeLogLine], line:NodeLogLine) -> [NodeLogLine]
   sync filter_log_lines(lines:[NodeLogLine], filter:str) -> [NodeLogLine]
   stream node_logs(rpc:str) -> NodeLogLine
+  sync sync_label(phase:str, applied:i64, target:i64) -> str
   stream node_status_live(rpc:str) -> NodeFacts
   stream node_peers_live(rpc:str) -> PeersData
   load_peers(rpc:str, generation:i64) -> PeersData ! HydrationError

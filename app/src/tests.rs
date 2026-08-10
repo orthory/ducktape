@@ -244,6 +244,32 @@ fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
     assert_eq!(app.node_sync_applied, 412);
 }
 
+/// THE EXPLORER DRAWS THE LIVE REGISTER, NOT ITS OWN NEWEST ROW.
+///
+/// Its list is op-carrying blocks only, so the top row lags the chain by
+/// however many idle blocks have passed — on a quiet chain, forever. The head
+/// a reader watches moves on the ws heartbeat, every block, nop fillers
+/// included, and the screen was not even handed it: it had a hundred-block
+/// snapshot and a refresh button.
+#[test]
+fn the_explorer_is_handed_the_live_head_and_the_phase() {
+    let view = inlined(include_str!("ui/view.ice"));
+    let explorer = view
+        .split_once("ExplorerScreen")
+        .expect("the explorer mounts here")
+        .1;
+    let explorer = explorer.split_once("events").expect("props end").0;
+    assert!(
+        explorer.contains("head=block_height"),
+        "the explorer must draw the live register, not the newest row of its own window"
+    );
+    assert!(
+        explorer.contains("sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)"),
+        "a head that is not advancing and a node still catching up are different \
+         facts, and the second one needs saying"
+    );
+}
+
 /// STATUS EVERYWHERE, PEERS ONLY WHERE IT IS DRAWN — pinned as sets, because a
 /// `contains` is satisfied by a commented-out line and equally by a SECOND,
 /// wrongly-gated subscription sitting beside the right one.
@@ -2617,7 +2643,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     let shell = inlined(include_str!("ui/components/shell.ice"));
     // the shell is titlebar + optional degradation banner over the panes.
     assert!(shell.contains(
-        "component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)"
+        "component TitleBar(network:str, height:i64, sync_line:str, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)"
     ));
     // The bar exists only in the console window now — the launch window
     // wears OS chrome — so the chip and the status/bell cluster are

@@ -1061,6 +1061,29 @@ fn a_finished_sync_is_not_a_sync_in_progress() {
     assert_eq!(facts.phase_since, UNMEASURED);
 }
 
+/// ONE STRING FOR ALL THREE SURFACES, so the titlebar, the explorer header and
+/// Settings cannot disagree about what the node is doing.
+#[test]
+fn the_sync_label_shows_progress_only_while_catching_up() {
+    assert_eq!(sync_label("syncing".into(), 412, 900), "Syncing 412 / 900");
+
+    // CAUGHT UP: the phase alone, however live the numbers beside it look.
+    // `operations.sync` is never cleared, so a finished run's heights sit in
+    // the document forever and must not reach a reader.
+    assert_eq!(sync_label("serving".into(), 900, 900), "Serving");
+    assert_eq!(sync_label("validating".into(), 900, 900), "Validating");
+
+    // syncing with nothing published yet is still honest about the phase.
+    assert_eq!(
+        sync_label("syncing".into(), UNMEASURED, UNMEASURED),
+        "Syncing"
+    );
+    assert_eq!(sync_label("syncing".into(), 412, UNMEASURED), "Syncing");
+
+    // and a node that published no phase says NOTHING rather than guessing.
+    assert_eq!(sync_label(String::new(), 412, 900), "");
+}
+
 /// A record stamp is a BLOCK HEIGHT on this chain, so every record-time
 /// string counts blocks. Only `/v1/status` supplies unix seconds.
 #[test]

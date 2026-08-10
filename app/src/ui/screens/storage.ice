@@ -495,7 +495,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
                 changed_by=""
                 changed_height=0
 
-component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading:bool, kinds:[KindCount], kind:str, partial:str, hits:[ExplorerHit], blocks:[ExplorerBlock], selected:i64, ops:[ExplorerOp])
+component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading:bool, kinds:[KindCount], kind:str, partial:str, hits:[ExplorerHit], blocks:[ExplorerBlock], selected:i64, ops:[ExplorerOp], head:i64, sync_line:str)
   emits
     explorer_search_submit()
     clear_explorer_search()
@@ -525,6 +525,22 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
         with
           title="Explorer"
           detail="Search everything this workspace has recorded, or read the blocks that carried operations — an idle block keeps no row, so heights skip — newest first, each one openable for the ops it carried."
+      // THE LIVE HEAD, not the newest row of the window below it.
+      //
+      // The list is op-carrying blocks only, so its top row lags the chain by
+      // however many idle blocks have gone by — on a quiet chain, forever.
+      // This register moves on the ws heartbeat, every block, nop fillers
+      // included, which is the thing a reader is actually watching for. The
+      // sync reading rides beside it because a head that is not advancing and
+      // a node that is still catching up are different facts.
+      row
+        with
+          w=fill
+          gap=10.0
+          align=center
+        text height_label(head) size=13.0 @text-muted
+        if !empty(sync_line)
+          text sync_line size=13.0 @text-muted
       // THE QUERY BOX, on the artifact's own 1.5px ink outline.
       box w=fill max-w=860.0
         row

@@ -858,8 +858,11 @@ mod tests {
         // A MISSING KEY IS NOT AN EMPTY SAMPLE. Reading it as one would blank
         // the surface every tick with no error anywhere.
         assert!(
-            snapshot_from_frame(r#"{"type":"tail","topic":"peers","item":{"time_ms":1}}"#, "peers")
-                .is_none()
+            snapshot_from_frame(
+                r#"{"type":"tail","topic":"peers","item":{"time_ms":1}}"#,
+                "peers"
+            )
+            .is_none()
         );
 
         // and a non-object `item` must not panic the subscription task —
@@ -871,8 +874,11 @@ mod tests {
         // heartbeats and per-topic refusals are simply not ours.
         assert!(snapshot_from_frame(r#"{"type":"heartbeat","height":9}"#, "peers").is_none());
         assert!(
-            snapshot_from_frame(r#"{"type":"error","topic":"peers","code":"unavailable"}"#, "peers")
-                .is_none()
+            snapshot_from_frame(
+                r#"{"type":"error","topic":"peers","code":"unavailable"}"#,
+                "peers"
+            )
+            .is_none()
         );
     }
 

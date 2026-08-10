@@ -336,6 +336,36 @@ pub(crate) fn node_facts(status: &serde_json::Value, generation: i64) -> NodeFac
     }
 }
 
+/// The one sentence all three surfaces print for what the node is doing.
+///
+/// Progress rides ONLY while `sync_in_progress`. `operations.sync` is never
+/// cleared, so printing it whenever it exists leaves a finished run's numbers
+/// on screen for good — and a reader cannot tell a live count from a fossil.
+pub fn sync_label(phase: String, applied: i64, target: i64) -> String {
+    if phase.is_empty() {
+        return String::new();
+    }
+    let name = capitalized(&phase);
+    let measured = applied >= 0 && target >= 0;
+    if !sync_in_progress(&phase) || !measured {
+        return name;
+    }
+    format!(
+        "{name} {} / {}",
+        grouped_digits(applied),
+        grouped_digits(target)
+    )
+}
+
+/// The node spells its phases lowercase on the wire; a reader reads prose.
+fn capitalized(word: &str) -> String {
+    let mut letters = word.chars();
+    match letters.next() {
+        Some(first) => first.to_uppercase().chain(letters).collect(),
+        None => String::new(),
+    }
+}
+
 /// Whether the node is catching up RIGHT NOW.
 ///
 /// The phase, and only the phase. `operations.sync` is never cleared, so its
@@ -460,7 +490,10 @@ enum Snapshot {
 /// A dropped socket is not a reason to blank the surface: the rows on screen
 /// were true when they were sampled. Rebuild the subscription and keep them
 /// until a fresher sample replaces them.
-fn snapshot_stream<T: Send + 'static>(rpc: String, topic: Snapshot) -> iced::futures::stream::BoxStream<'static, T>
+fn snapshot_stream<T: Send + 'static>(
+    rpc: String,
+    topic: Snapshot,
+) -> iced::futures::stream::BoxStream<'static, T>
 where
     Snapshot: SnapshotReader<T>,
 {
