@@ -39,6 +39,13 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
   coordinator (see `coordinator/README.md`).
 - `wg-smoke/` — WireGuard smoke, interop, and bench harnesses.
 
+## Wasm guests
+
+- `wasm-repro-check.sh` (`make wasm-repro-check`) — builds one guest component
+  from this checkout and from a copy of the tree at a different absolute path
+  and asserts the bytes are identical, so a committed artifact never depends on
+  the builder's `/home/...`. Needs the wasm32 target and `wasm-tools`.
+
 ## Worktree cleanup
 
 Always dry-run `ops/worktree-clean.sh` before removing merged worktrees, then
