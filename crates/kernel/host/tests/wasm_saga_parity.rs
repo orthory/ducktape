@@ -439,7 +439,7 @@ async fn view_of(h: &Host, id: &str) -> saga::SagaView {
 
 #[test]
 fn same_ops_same_events_same_replies_roots_in_lockstep() {
-    deterministic::Runner::default().start(|context| same_ops_inner(context));
+    deterministic::Runner::default().start(same_ops_inner);
 }
 
 async fn same_ops_inner(context: deterministic::Context) {
@@ -953,7 +953,7 @@ async fn same_ops_inner(context: deterministic::Context) {
 
 #[test]
 fn crank_times_out_and_expires_leases_in_lockstep() {
-    deterministic::Runner::default().start(|context| crank_inner(context));
+    deterministic::Runner::default().start(crank_inner);
 }
 
 async fn crank_inner(context: deterministic::Context) {
@@ -1058,7 +1058,7 @@ async fn crank_inner(context: deterministic::Context) {
 
 #[test]
 fn rejections_match_and_leave_no_trace() {
-    deterministic::Runner::default().start(|context| rejections_inner(context));
+    deterministic::Runner::default().start(rejections_inner);
 }
 
 async fn rejections_inner(context: deterministic::Context) {
@@ -1350,7 +1350,7 @@ async fn rejections_inner(context: deterministic::Context) {
 
 #[test]
 fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
-    deterministic::Runner::default().start(|context| multi_dispatch_inner(context));
+    deterministic::Runner::default().start(multi_dispatch_inner);
 }
 
 async fn multi_dispatch_inner(context: deterministic::Context) {
@@ -1514,7 +1514,7 @@ async fn retained(h: &Host, ids: &[String]) -> Vec<String> {
 
 #[test]
 fn a_block_that_crosses_the_retention_cap_evicts_identically_on_both_runtimes() {
-    deterministic::Runner::default().start(|context| retention_parity_inner(context));
+    deterministic::Runner::default().start(retention_parity_inner);
 }
 
 async fn retention_parity_inner(context: deterministic::Context) {
