@@ -266,8 +266,8 @@ const PENDING_SHARDS: u8 = 16;
 // that belongs to a separate decision.
 const PENDING_INDEX_PREFIX: &[u8] = b"pending";
 
-/// which shard record one id's row lives in: the low nibble of
-/// `sha256(id)`'s first byte, which is uniform over ids.
+/// which shard record one id's row lives in: `sha256(id)`'s first byte modulo
+/// [`PENDING_SHARDS`], uniform over ids because 16 divides 256.
 ///
 /// hashing, not the id's own leading bytes: every id is NAMESPACED
 /// (`dispatch{SEP}…`, `system{SEP}…`, a 64-hex node namespace), so a prefix
@@ -278,7 +278,7 @@ fn pending_shard(saga_id: &str) -> u8 {
 
 /// one shard's record key: the prefix plus the shard byte. no separator is
 /// needed — the tail is always exactly one byte, and no other key space is
-/// this prefix followed by one.
+/// this prefix followed by one byte.
 fn pending_shard_key(shard: u8) -> Vec<u8> {
     let mut key = PENDING_INDEX_PREFIX.to_vec();
     key.push(shard);
@@ -636,9 +636,9 @@ impl SagaModule {
         let record = borsh::to_vec(saga).expect("saga record is serializable");
         check_record(&record, "saga record")?;
 
-        // exactly ONE shard record moves per saga — that is the whole point of
-        // the split: a trigger's write cost no longer scales with every other
-        // pending id in the ledger.
+        // exactly ONE shard record moves per saga — the whole point of the
+        // split: a write re-encodes only the ids sharing its shard, not every
+        // live id in the ledger.
         let shard = pending_shard(saga_id);
         let mut pending = self.load_pending_shard(shard).await?;
         let mut terminal = self.load_terminal().await?;
@@ -4108,7 +4108,9 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
-        assert!(ids.iter().all(|id| get(&m, id).is_none()));
+        for id in &ids {
+            assert_eq!(get(&m, id), None, "{id} must be pruned");
+        }
         assert_eq!(
             m.root(),
             genesis,
