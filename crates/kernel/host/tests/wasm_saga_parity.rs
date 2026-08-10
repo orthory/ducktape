@@ -39,8 +39,8 @@ use saga::{
     decode_reply, decode_worker_control, decode_worker_request, encode_msg, encode_query,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
-use std::collections::BTreeMap;
 use statesync::qmdb::QmdbStore;
+use std::collections::BTreeMap;
 use valset::Valset;
 use wasm_host::WasmModule;
 
