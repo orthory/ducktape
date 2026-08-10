@@ -164,7 +164,7 @@ component StatusPill(degraded:bool, loading:bool)
 // state field ever held them, and filling them cost `load_node_facts` a second
 // HTTP round trip whose handler re-encodes the WHOLE Prometheus registry
 // uncached. They are gone; a gossip row starts by deciding what it needs.
-component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
+component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, sync_line:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
   box #root
     with
       w=284.0
@@ -240,6 +240,16 @@ component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, tie
           wrap=none
           font=code_semibold
           @text-primary
+      // WHAT THE NODE IS DOING, under the head it is doing it to. A head that
+      // is not moving and a node that is still catching up look identical from
+      // a number alone; this is the row that tells them apart, and it says
+      // nothing at all when the node published no phase.
+      if !empty(sync_line)
+        text sync_line
+          with
+            size=11.0
+            wrap=none
+            @text-meta
       col w=fill gap=6.0
         row
           with
@@ -410,7 +420,7 @@ component BellBadge(count:i64, sev:str, plate:f64)
 // 40px: a 39px bar over its 1px rule. This bar exists only in the console
 // window — the launch window wears the OS's own chrome — so the chip and the
 // right cluster are unconditional now.
-component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
+component TitleBar(network:str, height:i64, sync_line:str, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
   emits
     toggle_bell
     switch_network
@@ -459,6 +469,7 @@ component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_ba
                   loading
                   answered
                   height
+                  sync_line
                   tier
                   root_hash
                   consensus_view
@@ -833,7 +844,7 @@ component ScreenHeader(title:str, meta:str)
         bg=separator
       space w=1.0 h=1.0
 
-component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
+component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
   emits
     select_shell_tab(str)
     toggle_bell
@@ -851,6 +862,7 @@ component WorkspaceTabs(network:str, status:str, height:i64, loading:bool, degra
           with
             network
             height
+            sync_line
             loading
             degraded
             bell_badge=bell_count

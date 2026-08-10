@@ -163,59 +163,14 @@ fn reply_composer(app: &Ducktape) -> String {
     app.reply_editor.text().trim().to_string()
 }
 
-/// THE OVERVIEW SUBSCRIPTION MUST STAY GATED, AND THE GATE IS THE BUDGET.
+/// TWO STREAMS, TWO SURFACES, NEITHER BLANKING THE OTHER.
 ///
-/// The node re-samples `peers` only while someone holds the topic, and each
-/// sample encodes its whole metrics registry (485 KB, ~10 ms, measured). So an
-/// ungated subscription is not a style problem — it is that cost running for
-/// every connected console, forever, for a table nobody has open. A source
-/// lint because the cost lives on the OTHER side of the socket, where no app
-/// test can observe it.
+/// The two topics now ride separate sockets with separate gates, so a status
+/// push must not touch the peers table and a peers push must not touch the
+/// consensus facts. Under the old merged stream that was enforced by
+/// `answered` flags; now it is enforced by there being nothing to confuse.
 #[test]
-fn the_node_overview_stream_only_runs_on_the_tab_that_draws_it() {
-    let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
-    // PIN THE SET, not a substring. A `contains` check passes while a SECOND,
-    // ungated `run node_overview(…)` sits beside the gated one — which is the
-    // whole defect this guard exists to stop, since the cost lives on the far
-    // side of the socket where no app test can observe it. Comment-only lines
-    // would also satisfy a `contains`; an exact set cannot be fooled by either.
-    let overview_runs: Vec<_> = lifecycle
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("run node_overview("))
-        .collect();
-    assert_eq!(
-        overview_runs,
-        [
-            "run node_overview(connected_rpc) when (connected && shell_tab == \"settings\" && node_tab == \"overview\") -> node_overview_sample _"
-        ],
-        "the overview stream must appear EXACTLY once, carrying its full gate"
-    );
-    // The peers HTTP load is the same 485 KB encode and must be gated too, or
-    // the budget holds only in the steady state and every shell-tab switch
-    // pays it again.
-    let peers_loads: Vec<_> = lifecycle
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("run load_peers("))
-        .collect();
-    assert!(
-        !peers_loads.is_empty() && peers_loads.iter().all(|line| line.contains(
-            "keep_i64(shell_tab == \"settings\" && node_tab == \"overview\", node_peers_generation, -1)"
-        )),
-        "every load_peers must be gated to the tab that draws it: {peers_loads:?}"
-    );
-    // and it must stay a STREAM, never a clock: `assert_no_polling` pins the
-    // recurring set exactly, so a future rewrite into `every 2s …` fails there
-    // rather than quietly reintroducing a poll this repo forbids.
-    assert_no_polling(&lifecycle);
-}
-
-/// A pushed frame answers ONE topic. The half it did not carry must survive
-/// it — otherwise the peers sample blanks the consensus facts 1.5 s before the
-/// status sample paints them back, and the overview strobes.
-#[test]
-fn an_overview_frame_moves_only_the_half_it_answered() {
+fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.node_peers = vec![backend::PeerRow {
@@ -223,37 +178,29 @@ fn an_overview_frame_moves_only_the_half_it_answered() {
         role: "validator".into(),
         live: true,
     }];
-    app.node_version = "0.1.0".into();
-    app.node_root_hash = "hash-old".into();
-    app.node_checkpoint = 400;
-    app.node_last_finalized = 111;
-    app.node_height = 222;
-    app.node_view_label = "7".into();
-    app.node_quorum_label = "3".into();
-    app.node_reachable_label = "4".into();
 
-    // a STATUS frame: facts move, the table does not.
-    let _ = app.__update(__DucktapeMessage::NodeOverviewSample(
-        backend::NodeOverview {
-            facts_answered: true,
-            facts: backend::NodeFacts {
-                generation: -1,
-                version: "0.2.0".into(),
-                root_hash: "hash-new".into(),
-                checkpoint_height: 512,
-                last_finalized_at: 999,
-                height: 888,
-                view: Some(9),
-                quorum: Some(5),
-                reachable_validators: Some(6),
-            },
-            ..backend::NodeOverview::default()
-        },
-    ));
-    // ALL NINE, because a frame carrying a field the handler forgot leaves that
-    // field frozen at its connect-time value for as long as the tab is open —
-    // and a test that checks two of nine cannot see the other seven.
-    assert_eq!(app.node_version, "0.2.0", "the status half landed");
+    let _ = app.__update(__DucktapeMessage::NodeStatusPushed(backend::NodeFacts {
+        generation: -1,
+        version: "0.2.0".into(),
+        root_hash: "hash-new".into(),
+        checkpoint_height: 512,
+        last_finalized_at: 999,
+        height: 888,
+        view: Some(9),
+        quorum: Some(5),
+        reachable_validators: Some(6),
+        phase: "syncing".into(),
+        phase_since: 1_700_000_000,
+        sync_target: 900,
+        sync_applied: 412,
+        sync_retries: 2,
+        sync_failures: 1,
+        sync_last_error: "peer hung up".into(),
+    }));
+
+    // ALL SIXTEEN, because a field the handler forgot stays frozen at its
+    // connect-time value for as long as the console is open.
+    assert_eq!(app.node_version, "0.2.0");
     assert_eq!(app.node_root_hash, "hash-new");
     assert_eq!(app.node_checkpoint, 512);
     assert_eq!(app.node_last_finalized, 999);
@@ -261,93 +208,112 @@ fn an_overview_frame_moves_only_the_half_it_answered() {
     assert_eq!(app.node_view_label, "9");
     assert_eq!(app.node_quorum_label, "5");
     assert_eq!(app.node_reachable_label, "6");
+    assert_eq!(app.node_phase, "syncing");
+    assert_eq!(app.node_phase_since, 1_700_000_000);
+    assert_eq!(app.node_sync_target, 900);
+    assert_eq!(app.node_sync_applied, 412);
+    assert_eq!(app.node_sync_retries, 2);
+    assert_eq!(app.node_sync_failures, 1);
+    assert_eq!(app.node_sync_last_error, "peer hung up");
     assert_eq!(
         app.node_peers.len(),
         1,
-        "a status frame must not empty the peers table"
+        "a status push must not empty the peers table"
     );
 
-    // a PEERS frame: the table moves, the facts do not.
-    let _ = app.__update(__DucktapeMessage::NodeOverviewSample(
-        backend::NodeOverview {
-            peers_answered: true,
-            peers: vec![
-                backend::PeerRow {
-                    key: "aa".into(),
-                    role: "validator".into(),
-                    live: true,
-                },
-                backend::PeerRow {
-                    key: "bb".into(),
-                    role: "resident".into(),
-                    live: false,
-                },
-            ],
-            ..backend::NodeOverview::default()
-        },
-    ));
-    assert_eq!(app.node_peers.len(), 2, "the peers half landed");
+    let _ = app.__update(__DucktapeMessage::NodePeersPushed(backend::PeersData {
+        generation: -1,
+        peers: vec![
+            backend::PeerRow {
+                key: "aa".into(),
+                role: "validator".into(),
+                live: true,
+            },
+            backend::PeerRow {
+                key: "bb".into(),
+                role: "resident".into(),
+                live: false,
+            },
+        ],
+    }));
+    assert_eq!(app.node_peers.len(), 2, "the peers push landed");
     assert_eq!(
-        app.node_version, "0.2.0",
-        "a peers frame must not blank the consensus facts"
+        app.node_phase, "syncing",
+        "a peers push must not blank the node's phase"
     );
-    assert_eq!(app.node_root_hash, "hash-new");
-    assert_eq!(app.node_checkpoint, 512);
-    assert_eq!(app.node_last_finalized, 999);
-    assert_eq!(app.node_height, 888);
-    assert_eq!(app.node_view_label, "9");
-    assert_eq!(app.node_quorum_label, "5");
-    assert_eq!(app.node_reachable_label, "6");
+    assert_eq!(app.node_sync_applied, 412);
 }
 
-/// THE PREDICATE IS ONLY HALF THE FIX; THIS PINS THE OTHER HALF.
+/// THE EXPLORER DRAWS THE LIVE REGISTER, NOT ITS OWN NEWEST ROW.
 ///
-/// `title_write_owed` cannot tell whether the caller handed it the real
-/// baseline or something else — a unit test of the predicate stays green while
-/// the autosave passes the buffer twice, which would make authorship trivially
-/// false and stop EVERY rename. So the wiring gets its own guard.
-///
-/// PINNED AS A SET, not a substring: `inlined` does not strip comments, so a
-/// `contains` is satisfied by a commented-out call, and equally by a SECOND
-/// call site passing something else. Same idiom as the overview lint above.
+/// Its list is op-carrying blocks only, so the top row lags the chain by
+/// however many idle blocks have passed — on a quiet chain, forever. The head
+/// a reader watches moves on the ws heartbeat, every block, nop fillers
+/// included, and the screen was not even handed it: it had a hundred-block
+/// snapshot and a refresh button.
 #[test]
-fn the_autosave_hands_the_save_the_baseline_it_started_from() {
-    let pages = inlined(include_str!("ui/handlers/pages.ice"));
-    let saves: Vec<_> = pages
+fn the_explorer_is_handed_the_live_head_and_the_phase() {
+    let view = inlined(include_str!("ui/view.ice"));
+    let explorer = view
+        .split_once("ExplorerScreen")
+        .expect("the explorer mounts here")
+        .1;
+    let explorer = explorer.split_once("events").expect("props end").0;
+    assert!(
+        explorer.contains("head=block_height"),
+        "the explorer must draw the live register, not the newest row of its own window"
+    );
+    assert!(
+        explorer.contains("sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)"),
+        "a head that is not advancing and a node still catching up are different \
+         facts, and the second one needs saying"
+    );
+}
+
+/// STATUS EVERYWHERE, PEERS ONLY WHERE IT IS DRAWN — pinned as sets, because a
+/// `contains` is satisfied by a commented-out line and equally by a SECOND,
+/// wrongly-gated subscription sitting beside the right one.
+#[test]
+fn the_node_streams_carry_the_gates_their_costs_require() {
+    let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
+    let status: Vec<_> = lifecycle
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with("run save_page_document("))
+        .filter(|line| line.starts_with("run node_status_live("))
         .collect();
     assert_eq!(
-        saves,
-        [
-            "run save_page_document(connected_rpc, password, active_page, text, page_saved_text, block_autosave_generation) -> page_document_saved _ | page_document_save_failed _"
-        ],
-        "the save must receive `page_saved_text` — the text the buffer was last \
-         synced to — or it is back to comparing line 0 against a fresh node read"
+        status,
+        ["run node_status_live(connected_rpc) when connected -> node_status_pushed _"],
+        "status is a cell read and a fact about the node, so it rides every tab"
     );
-}
 
-/// THE CONSOLE OPENS ON `—`, NOT ON ZERO.
-///
-/// The Ice state defaults are the other half of the same invariant: a fresh
-/// console has loaded nothing, so every reading it shows for the node must say
-/// so. `node_checkpoint` sat at `0` while `node_height` sat at the sentinel,
-/// which painted `CHECKPOINT h 0` directly above `HEIGHT h —`.
-#[test]
-fn a_console_that_has_loaded_nothing_shows_no_measurements() {
-    let (app, _) = Ducktape::__boot();
-    assert_eq!(backend::height_label_short(app.node_height), "h —");
+    let peers: Vec<_> = lifecycle
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("run node_peers_live("))
+        .collect();
     assert_eq!(
-        backend::height_label_short(app.node_checkpoint),
-        "h —",
-        "a checkpoint reading before any load is not a measurement"
+        peers,
+        [
+            "run node_peers_live(connected_rpc) when (connected && shell_tab == \"settings\" && node_tab == \"overview\") -> node_peers_pushed _"
+        ],
+        "every peers sample encodes the whole metrics registry; this gate is the budget"
     );
-    assert_eq!(backend::relative_time(app.node_last_finalized), "—");
-    // the consensus trio is already rendered text, and starts the same way.
-    assert_eq!(app.node_view_label, "—");
-    assert_eq!(app.node_quorum_label, "—");
-    assert_eq!(app.node_reachable_label, "—");
+
+    // and the peers HTTP load stays gated to the same tab for the same reason.
+    let peers_loads: Vec<_> = lifecycle
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("run load_peers("))
+        .collect();
+    assert!(
+        !peers_loads.is_empty()
+            && peers_loads.iter().all(|line| line.contains(
+                "keep_i64(shell_tab == \"settings\" && node_tab == \"overview\", node_peers_generation, -1)"
+            )),
+        "every load_peers must be gated to the tab that draws it: {peers_loads:?}"
+    );
+    assert_no_polling(&lifecycle);
 }
 
 /// The page document's text, the way the save tick reads it.
@@ -2677,7 +2643,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     let shell = inlined(include_str!("ui/components/shell.ice"));
     // the shell is titlebar + optional degradation banner over the panes.
     assert!(shell.contains(
-        "component TitleBar(network:str, height:i64, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)"
+        "component TitleBar(network:str, height:i64, sync_line:str, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)"
     ));
     // The bar exists only in the console window now — the launch window
     // wears OS chrome — so the chip and the status/bell cluster are

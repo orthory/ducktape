@@ -1012,6 +1012,78 @@ fn a_status_without_operations_produces_unmeasured_readings() {
     assert_eq!(facts.reachable_validators, None);
 }
 
+/// SYNC IS READ OFF `phase`, NEVER OFF THE PRESENCE OF `sync`.
+///
+/// `operations.sync` is set by `begin_sync` and never cleared — no writer in
+/// `bin/noded/src/metrics.rs` puts it back to `None`. A node that finished
+/// syncing hours ago still carries the last run's heights, so reading presence
+/// as "is syncing" paints a progress bar that never goes away.
+#[test]
+fn a_finished_sync_is_not_a_sync_in_progress() {
+    let caught_up = serde_json::json!({
+        "operations": {
+            "phase": "serving",
+            "phase_since": 1_700_000_000,
+            "sync": { "target_height": 900, "applied_height": 900, "retries": 3, "failures": 1 },
+        },
+    });
+    let facts = node_facts(&caught_up, 0);
+    assert_eq!(facts.phase, "serving");
+    assert!(
+        !sync_in_progress(&facts.phase),
+        "a stale sync block must not read as a sync in progress"
+    );
+    // the numbers still ride: Settings prints them as CUMULATIVE totals.
+    assert_eq!(facts.sync_retries, 3);
+    assert_eq!(facts.sync_failures, 1);
+    assert_eq!(facts.phase_since, 1_700_000_000);
+
+    let catching_up = serde_json::json!({
+        "operations": {
+            "phase": "syncing",
+            "sync": { "target_height": 900, "applied_height": 412 },
+        },
+    });
+    let facts = node_facts(&catching_up, 0);
+    assert!(sync_in_progress(&facts.phase));
+    assert_eq!(facts.sync_applied, 412);
+    assert_eq!(facts.sync_target, 900);
+
+    // A node that has never synced publishes no `sync` at all. Heights are
+    // UNMEASURED because the node published none; the counters are genuinely
+    // zero, because a count of nothing IS zero.
+    let fresh = serde_json::json!({ "operations": { "phase": "validating" } });
+    let facts = node_facts(&fresh, 0);
+    assert_eq!(facts.sync_target, UNMEASURED);
+    assert_eq!(facts.sync_applied, UNMEASURED);
+    assert_eq!(facts.sync_retries, 0);
+    assert_eq!(facts.sync_last_error, "");
+    assert_eq!(facts.phase_since, UNMEASURED);
+}
+
+/// ONE STRING FOR ALL THREE SURFACES, so the titlebar, the explorer header and
+/// Settings cannot disagree about what the node is doing.
+#[test]
+fn the_sync_label_shows_progress_only_while_catching_up() {
+    assert_eq!(sync_label("syncing".into(), 412, 900), "Syncing 412 / 900");
+
+    // CAUGHT UP: the phase alone, however live the numbers beside it look.
+    // `operations.sync` is never cleared, so a finished run's heights sit in
+    // the document forever and must not reach a reader.
+    assert_eq!(sync_label("serving".into(), 900, 900), "Serving");
+    assert_eq!(sync_label("validating".into(), 900, 900), "Validating");
+
+    // syncing with nothing published yet is still honest about the phase.
+    assert_eq!(
+        sync_label("syncing".into(), UNMEASURED, UNMEASURED),
+        "Syncing"
+    );
+    assert_eq!(sync_label("syncing".into(), 412, UNMEASURED), "Syncing");
+
+    // and a node that published no phase says NOTHING rather than guessing.
+    assert_eq!(sync_label(String::new(), 412, 900), "");
+}
+
 /// A record stamp is a BLOCK HEIGHT on this chain, so every record-time
 /// string counts blocks. Only `/v1/status` supplies unix seconds.
 #[test]

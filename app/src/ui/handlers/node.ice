@@ -32,29 +32,42 @@ on node_facts_loaded(next)
   node_view_label = optional_number(next.view)
   node_quorum_label = optional_number(next.quorum)
   node_reachable_label = optional_number(next.reachable_validators)
+  node_phase = next.phase
+  node_phase_since = next.phase_since
+  node_sync_target = next.sync_target
+  node_sync_applied = next.sync_applied
+  node_sync_retries = next.sync_retries
+  node_sync_failures = next.sync_failures
+  node_sync_last_error = next.sync_last_error
 
 on node_facts_failed(cause)
   return if cause.generation != node_facts_generation
 
-// A PUSHED overview sample (lifecycle.ice's gated subscription). Each frame
-// answers ONE of the two snapshot topics, so every field takes its `answered`
-// flag — a peers frame must not blank the consensus facts, and a status frame
-// must not empty the table.
+// A PUSHED status document (lifecycle.ice's ungated subscription).
 //
 // NO GENERATION GUARD, and that is not an omission: a generation retires a
 // stale REPLY to a request this app made, and a push answers no request. The
-// freshest sample simply wins, which is what the node's own ordering already
-// gives.
-on node_overview_sample(next)
-  node_peers = keep_peers(next.peers_answered, next.peers, node_peers)
-  node_version = keep_str(next.facts_answered, next.facts.version, node_version)
-  node_root_hash = keep_str(next.facts_answered, next.facts.root_hash, node_root_hash)
-  node_last_finalized = keep_i64(next.facts_answered, next.facts.last_finalized_at, node_last_finalized)
-  node_checkpoint = keep_i64(next.facts_answered, next.facts.checkpoint_height, node_checkpoint)
-  node_height = keep_i64(next.facts_answered, next.facts.height, node_height)
-  node_view_label = keep_str(next.facts_answered, optional_number(next.facts.view), node_view_label)
-  node_quorum_label = keep_str(next.facts_answered, optional_number(next.facts.quorum), node_quorum_label)
-  node_reachable_label = keep_str(next.facts_answered, optional_number(next.facts.reachable_validators), node_reachable_label)
+// freshest sample simply wins, which is the order the node already gives.
+on node_status_pushed(next)
+  node_version = next.version
+  node_root_hash = next.root_hash
+  node_last_finalized = next.last_finalized_at
+  node_checkpoint = next.checkpoint_height
+  node_height = next.height
+  node_view_label = optional_number(next.view)
+  node_quorum_label = optional_number(next.quorum)
+  node_reachable_label = optional_number(next.reachable_validators)
+  node_phase = next.phase
+  node_phase_since = next.phase_since
+  node_sync_target = next.sync_target
+  node_sync_applied = next.sync_applied
+  node_sync_retries = next.sync_retries
+  node_sync_failures = next.sync_failures
+  node_sync_last_error = next.sync_last_error
+
+// The peers table's own push, from the tab-gated subscription beside it.
+on node_peers_pushed(next)
+  node_peers = next.peers
 
 // Overview | Permissions | Activity, inside Settings now that the Node rail
 // seat is gone. The log stream below subscribes on this tab.

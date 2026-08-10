@@ -45,6 +45,7 @@ test palette_escape_contract
         network="testnet"
         status
         height=84912
+        sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
         loading
         degraded=false
         tab=shell_tab
@@ -174,6 +175,7 @@ test minimum_window_layout_contract
         network="testnet"
         status
         height=84912
+        sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
         loading
         degraded=false
         tab=shell_tab
@@ -403,6 +405,7 @@ test settings_keyboard_scroll_contract
         network="testnet"
         status
         height=84912
+        sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
         loading
         degraded=false
         tab=shell_tab
@@ -475,6 +478,11 @@ test settings_keyboard_scroll_contract
             node_quorum_label
             node_version
             node_root_hash
+            sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
+            node_phase_since
+            node_sync_retries
+            node_sync_failures
+            node_sync_last_error
             node_peers
             node_log_lines
           events
@@ -598,6 +606,8 @@ test explorer_partial_banner_contract
         blocks=explorer_blocks
         selected=explorer_selected
         ops=explorer_ops
+        head=block_height
+        sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
       events
         explorer_search_submit -> explorer_search_submit
         clear_explorer_search -> clear_explorer_search
@@ -628,6 +638,8 @@ test explorer_whole_answer_contract
         blocks=explorer_blocks
         selected=explorer_selected
         ops=explorer_ops
+        head=block_height
+        sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
       events
         explorer_search_submit -> explorer_search_submit
         clear_explorer_search -> clear_explorer_search

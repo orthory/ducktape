@@ -23,7 +23,7 @@
 // rather than hidden: this pair refreshes with `node_facts_generation` — on
 // connect and on a shell-tab change — so it is a coherent sample, not a live
 // one, and reads `h —` until the first one lands.
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, sync_line:str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
   emits
     select_shell_tab(str)
     reconnect()
@@ -699,6 +699,29 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
               GroupCard
                 col w=fill
                   NodeBuildRow version=node_version last=false
+                  KeyValueRow
+                    with
+                      label="Phase"
+                      value=reading_pair(sync_line, relative_time(node_phase_since))
+                      last=false
+                  // CUMULATIVE, and labelled so. These two only ever climb —
+                  // nothing in the node resets them — so a nonzero total is
+                  // history, not a fault happening now. The row above says
+                  // what is happening now.
+                  KeyValueRow
+                    with
+                      label="Sync retries / failures, cumulative"
+                      value=reading_pair(count_label(node_sync_retries), count_label(node_sync_failures))
+                      last=empty(node_sync_last_error)
+                  // The error SELF-CLEARS on the node the moment sync advances,
+                  // so its presence is a fact about now: the last attempt
+                  // failed and nothing has moved since.
+                  if !empty(node_sync_last_error)
+                    KeyValueRow
+                      with
+                        label="Last sync error"
+                        value=node_sync_last_error
+                        last=false
                   KeyValueRow
                     with
                       label="App hash"

@@ -398,6 +398,16 @@ state
   // a node serving no boundary publishes height 0 while its checkpoint keeps
   // climbing, and `h —` is what "no head served" honestly reads as.
   node_height:i64 = -1
+  // The node's lifecycle phase and its sync run. `-1` is the sentinel for a
+  // height the node has not published; the two counters are cumulative totals
+  // where absence genuinely is zero, and the error self-clears on progress.
+  node_phase = ""
+  node_phase_since:i64 = -1
+  node_sync_target:i64 = -1
+  node_sync_applied:i64 = -1
+  node_sync_retries:i64 = 0
+  node_sync_failures:i64 = 0
+  node_sync_last_error = ""
   node_tab = "overview"
   status_card_open = false
   // ROSTER — members and agents share one screen, so they share one filter.
