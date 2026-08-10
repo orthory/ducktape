@@ -334,3 +334,47 @@ fn oversized_task_record_is_refused_before_staging() {
         assert!(module_tasks(&tasks).await.is_empty());
     });
 }
+
+// every task id shares the ONE `t#` index record, so an uncapped task_id is a
+// board-wide weapon: a handful of ~1 MiB ids (each fits in one op frame) packs
+// that record to the store cap and every later create -- anyone's -- fails
+// FOREVER, with no delete op to free the bytes. MAX_TASK_ID is what keeps the
+// index bounded, so the refusal has to land on the ID, before the index grows.
+#[test]
+fn oversized_task_id_cannot_brick_the_board() {
+    block_on(async {
+        let mut tasks = tasks_on_mem();
+
+        for attempt in 0..5 {
+            let huge_id = format!("{}{attempt}", "x".repeat(256 * 1024));
+            let err = tasks
+                .execute(&mut at(1), &create(&huge_id, "brick the board"))
+                .await
+                .expect_err("an over-cap task_id must be refused");
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("task_id is")),
+                "unexpected error: {err:?}"
+            );
+        }
+        tasks.commit_block().await.expect("commit the refusals");
+
+        // the premise: after the attack the board is still writable by anyone.
+        let at_cap = "y".repeat(tasks::MAX_TASK_ID);
+        tasks
+            .execute(&mut at(2), &create(&at_cap, "an id exactly at the cap"))
+            .await
+            .expect("an id of exactly MAX_TASK_ID bytes is accepted");
+        tasks
+            .execute(&mut at(2), &create("normal", "an ordinary task"))
+            .await
+            .expect("an ordinary create still works");
+        tasks.commit_block().await.expect("commit creates");
+
+        let ids: Vec<String> = module_tasks(&tasks)
+            .await
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
+        assert_eq!(ids, ["normal".to_owned(), at_cap]);
+    });
+}

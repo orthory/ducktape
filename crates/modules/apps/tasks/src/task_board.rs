@@ -16,14 +16,25 @@ use sdk::{Error, StagedStore, require_non_empty};
 
 use crate::{Task, TaskMsg, TaskReply, TaskStatus, check_record, stage_record};
 
+/// max bytes of a `task_id`, matching the job board's [`crate::MAX_JOB_ID`].
+///
+/// this cap is load-bearing, not cosmetic: every id shares the ONE `t#` index
+/// record bounded by [`crate::MAX_RECORD_BYTES`], so an UNCAPPED id let two or
+/// three ops (an op frame carries up to `node::MAX_FRAME_BYTES`, 1 MiB + 16 KiB)
+/// pack that record to just under the cap and refuse EVERY later create, for
+/// every user, forever -- there is no delete op to recover with.
+pub const MAX_TASK_ID: usize = 256;
+
 /// one task record per id.
 const RECORD_PREFIX: &[u8] = b"t/";
 /// the enumeration index: every live task id, ascending.
 ///
 // ponytail: ONE index record holds every task id, so a create is O(all ids) in
-// bytes and the board tops out where that record hits MAX_RECORD_BYTES (~4k
-// ids at 256-byte ids). a human task list never gets there; if it must, shard
-// the index by id prefix.
+// bytes and the board stops where that record hits MAX_RECORD_BYTES (~4k ids at
+// the MAX_TASK_ID cap, ~26k at uuid-shaped ids). that stop is PERMANENT, not a
+// degradation: there is no delete op, so nothing frees index bytes once they
+// are committed. a human task list never gets there; if it must, shard the
+// index by id prefix BEFORE the board is used at that scale.
 const INDEX_KEY: &[u8] = b"t#";
 
 fn record_key(task_id: &str) -> Vec<u8> {
@@ -58,7 +69,7 @@ async fn create(
     title: String,
     consensus_time: u64,
 ) -> Result<(), Error> {
-    require_non_empty("task_id", &task_id)?;
+    sdk::validate_id("task_id", &task_id, MAX_TASK_ID)?;
     require_non_empty("title", &title)?;
     if load(staged, &task_id).await?.is_some() {
         return Err(Error::Module(format!("task already exists: {task_id}")));
@@ -92,7 +103,7 @@ async fn update_status(
     status: TaskStatus,
     consensus_time: u64,
 ) -> Result<(), Error> {
-    require_non_empty("task_id", &task_id)?;
+    sdk::validate_id("task_id", &task_id, MAX_TASK_ID)?;
     let mut task = load(staged, &task_id)
         .await?
         .ok_or_else(|| Error::Module(format!("task not found: {task_id}")))?;

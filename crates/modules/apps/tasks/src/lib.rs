@@ -50,6 +50,7 @@ pub use job_board::{
     MAX_ATTEMPTS, MAX_JOB_ID, MAX_JOBS, MAX_KIND, MAX_LEASE_VIEWS, MAX_LIST_LIMIT, MAX_PAYLOAD,
     MAX_SPEC, MAX_WORKER_MODULE_ID, MAX_WORKERS, MIN_LEASE_VIEWS,
 };
+pub use task_board::MAX_TASK_ID;
 
 // the derived-tier materialized view over the task board: the PURE decision
 // core (fold + view over index_guest::StateRead), compiled everywhere and
@@ -102,6 +103,15 @@ impl Tasks {
 /// refuse a value the store's codec would later panic decoding. `what` names
 /// the record in the rejection. an op that writes SEVERAL records checks them
 /// all before staging any, so a refused op leaves no overlay entry at all.
+///
+/// that ordering — CHECK everything, THEN stage everything — is a root
+/// invariant, not a style preference. natively this `Tasks` keeps `staged`
+/// across every dispatch in a block; the wasm guest rebuilds the module per
+/// dispatch and flushes its overlay only on a SUCCESSFUL execute. so a path
+/// that stages a write and then returns `Err` leaves residue on one side and
+/// none on the other, and the two ports diverge on the root. no path does that
+/// today (`task_board::create` checks both records before staging either, and
+/// every other transition stages last); keep it that way when adding one.
 pub(crate) fn check_record(value: &[u8], what: &str) -> Result<(), Error> {
     if value.len() > MAX_RECORD_BYTES {
         return Err(Error::Module(format!(

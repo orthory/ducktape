@@ -429,7 +429,15 @@ async fn rejections_inner(context: &deterministic::Context) {
         (
             ext(&alice),
             op_task(&create("", "no id")),
-            "task_id must not be empty",
+            "task_id must be non-empty",
+        ),
+        (
+            // the id cap: every id shares the ONE `t#` index record, so an
+            // over-cap id must be refused IDENTICALLY on both ports -- a port
+            // that accepted it would fill the index and diverge forever.
+            ext(&alice),
+            op_task(&create(&"x".repeat(tasks::MAX_TASK_ID + 1), "over cap")),
+            "task_id is",
         ),
         (
             ext(&alice),
