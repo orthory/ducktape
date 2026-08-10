@@ -113,7 +113,10 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
             Box::new(forge),
             Box::new(Directory::new("directory")),
             Box::new(valset),
-            Box::new(SagaModule::new("saga")),
+            Box::new(SagaModule::new(
+                "saga",
+                Box::new(QmdbStore::init(context.child("source_saga"), "saga").await),
+            )),
             Box::new(Greeter::new("greeter")),
         ])
         .expect("genesis");
@@ -354,12 +357,27 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
             );
             assert_eq!(join_valset.root(), valset_root);
 
-            let entry = manifest.entry("saga").unwrap();
-            let bytes = fetch_snapshot(&client, boundary, "saga")
-                .await
-                .expect("saga snapshot");
-            let mut join_saga = SagaModule::new("saga");
-            join_saga.install(&bytes, entry.root).expect("saga install");
+            // saga rides the resolver lane too (store-backed since the qmdb
+            // port): no byte snapshot, the store's proven op range.
+            let saga_entry = manifest.entry("saga").unwrap();
+            let saga_root = saga_entry.root;
+            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "saga");
+            let target = pinned_target(saga_entry);
+            assert_eq!(StateRoot(target.root.0), saga_root);
+            let join_saga = SagaModule::new(
+                "saga",
+                Box::new(
+                    QmdbStore::sync_from(
+                        joiner_ctx.child("joiner_saga"),
+                        "saga-rebuilt",
+                        target,
+                        resolver,
+                    )
+                    .await
+                    .expect("sync_from"),
+                ),
+            );
+            assert_eq!(join_saga.root(), saga_root);
 
             let entry = manifest.entry("forge").unwrap();
             let bytes = fetch_snapshot(&client, boundary, "forge")

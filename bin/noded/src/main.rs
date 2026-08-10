@@ -210,7 +210,10 @@ fn run_node(
             Box::new(QmdbStore::init(context.child("chat"), "chat").await),
         )
             .with_tagging("tagging");
-        let saga = SagaModule::new("saga");
+        let saga = SagaModule::new(
+            "saga",
+            Box::new(QmdbStore::init(context.child("saga"), "saga").await),
+        );
         // the task plane: recipe manifests + capability dispatch with
         // next-block result delivery.
         let dispatch = DispatchModule::new("dispatch", "saga");

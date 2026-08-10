@@ -160,7 +160,10 @@ async fn recorded(host: &Host) -> (u64, Option<SagaCallback>) {
 fn the_callback_lands_in_the_same_block_as_the_oracle_result() {
     block_on(async {
         let mut host = Host::genesis(vec![
-            Box::new(SagaModule::new("saga")) as Box<dyn Module>,
+            Box::new(SagaModule::new(
+                "saga",
+                Box::new(sdk_testkit::MemStore::new()),
+            )) as Box<dyn Module>,
             Box::new(Recorder::new("agent", false)),
         ])
         .expect("genesis");
@@ -225,7 +228,10 @@ fn a_trigger_with_an_unknown_reply_to_is_rejected_up_front() {
         // against ctx.module_root AT TRIGGER TIME, so a saga that could never
         // terminate cleanly is never created.
         let mut host = Host::genesis(vec![
-            Box::new(SagaModule::new("saga")) as Box<dyn Module>,
+            Box::new(SagaModule::new(
+                "saga",
+                Box::new(sdk_testkit::MemStore::new()),
+            )) as Box<dyn Module>,
             Box::new(Recorder::new("agent", false)),
         ])
         .expect("genesis");
@@ -244,7 +250,11 @@ fn a_trigger_with_an_unknown_reply_to_is_rejected_up_front() {
             None,
             "no saga was created"
         );
-        assert_eq!(host.root_hash(), genesis, "the rejected block left no trace");
+        assert_eq!(
+            host.root_hash(),
+            genesis,
+            "the rejected block left no trace"
+        );
     });
 }
 
@@ -258,7 +268,10 @@ fn a_failing_callback_arm_aborts_the_whole_block_and_the_saga_stays_pending() {
         // failing. hence the no-fail-callback rule (design §4): requester
         // callback arms must treat bad input as a staged no-op, never an Err.
         let mut host = Host::genesis(vec![
-            Box::new(SagaModule::new("saga")) as Box<dyn Module>,
+            Box::new(SagaModule::new(
+                "saga",
+                Box::new(sdk_testkit::MemStore::new()),
+            )) as Box<dyn Module>,
             Box::new(Recorder::new("agent", true)),
         ])
         .expect("genesis");
@@ -312,6 +325,7 @@ fn strict_lease_rejects_a_non_assignee_and_accepts_the_assignee() {
             // so assignment stays on the valset path.
             Box::new(SagaModule::with_assignment(
                 "saga",
+                Box::new(sdk_testkit::MemStore::new()),
                 "valset",
                 "capability",
                 LeasePolicy::Strict,

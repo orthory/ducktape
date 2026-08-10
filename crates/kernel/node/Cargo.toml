@@ -49,6 +49,8 @@ kv = { workspace = true }
 # the oracle-over-consensus test: a saga tracker module + a mock worker prove an
 # async saga settles to Done when the OracleResult op finalizes on every node.
 saga = { workspace = true }
+# the in-memory MerkleStore double the store-backed saga module is injected with.
+sdk-testkit = { workspace = true }
 # a probe module (impl sdk::Module) in the env-from-view test needs async-trait.
 async-trait = { workspace = true }
 commonware-runtime = { workspace = true }

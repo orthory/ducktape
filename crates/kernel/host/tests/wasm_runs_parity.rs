@@ -166,7 +166,7 @@ async fn native_host(context: &deterministic::Context, files_dir: std::path::Pat
         "native_pages",
         "native_agent",
         files_dir,
-        saga::SagaModule::new("saga"),
+        saga::SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new())),
         None,
     )
     .await;
@@ -181,7 +181,7 @@ async fn wasm_host_(context: &deterministic::Context, files_dir: std::path::Path
         "wasm_pages",
         "wasm_agent",
         files_dir,
-        saga::SagaModule::new("saga"),
+        saga::SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new())),
         None,
     )
     .await;

@@ -5976,6 +5976,7 @@ dependencies = [
  "node",
  "saga",
  "sdk",
+ "sdk-testkit",
  "statesync",
  "thiserror 2.0.18",
  "tracing",
@@ -8277,6 +8278,7 @@ dependencies = [
  "async-trait",
  "borsh",
  "capability",
+ "commonware-runtime",
  "futures",
  "guest-adapter",
  "host",
@@ -8286,6 +8288,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "statesync",
  "tempfile",
  "valset",
 ]

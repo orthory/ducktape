@@ -799,7 +799,10 @@ fn run_sim(
         // a real daemon's.
         let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
             .with_tagging("tagging");
-        let saga = SagaModule::new("saga");
+        let saga = SagaModule::new(
+            "saga",
+            Box::new(QmdbStore::init(context.child("saga"), "saga").await),
+        );
         let dispatch = DispatchModule::new("dispatch", "saga");
         let tagging = TaggingModule::new(
             "tagging",

@@ -131,7 +131,7 @@ async fn get_saga(host: &Host, id: &str) -> Option<SagaView> {
 #[test]
 fn a_trigger_drives_a_saga_to_done_via_the_mock_oracle() {
     block_on(async {
-        let mut host = Host::genesis(vec![Box::new(SagaModule::new("saga"))]).expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new())))]).expect("genesis");
         let workers: Vec<Box<dyn Worker>> = vec![Box::new(MockOracle)];
         settle(&mut host, &workers, trigger(&sid("s1"), b"hello", 1))
             .await
@@ -149,7 +149,7 @@ fn a_trigger_drives_a_saga_to_done_via_the_mock_oracle() {
 #[test]
 fn the_worker_is_load_bearing() {
     block_on(async {
-        let mut host = Host::genesis(vec![Box::new(SagaModule::new("saga"))]).expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new())))]).expect("genesis");
         let out = host
             .submit(trigger(&sid("s1"), b"hello", 1))
             .await
@@ -180,7 +180,7 @@ fn the_worker_is_load_bearing() {
 #[test]
 fn a_flaky_worker_retries_through_the_loop_and_settles_done() {
     block_on(async {
-        let mut host = Host::genesis(vec![Box::new(SagaModule::new("saga"))]).expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new())))]).expect("genesis");
         let workers: Vec<Box<dyn Worker>> = vec![Box::new(FlakyOracle)];
         settle(&mut host, &workers, trigger(&sid("s1"), b"hello", 2))
             .await

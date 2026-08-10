@@ -133,7 +133,7 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
             "tagging",
             Box::new(sdk_testkit::MemStore::new()),
         )),
-        Box::new(SagaModule::new("saga")),
+        Box::new(SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new()))),
         Box::new(DispatchModule::new("dispatch", "saga")),
         Box::new(agent::AgentModule::new(
             "agent",

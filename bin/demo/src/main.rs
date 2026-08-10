@@ -551,7 +551,10 @@ async fn demo_genesis(
         "valset",
         Box::new(QmdbStore::init(context.child("valset"), "valset").await),
     );
-    let saga = SagaModule::new("saga");
+    let saga = SagaModule::new(
+        "saga",
+        Box::new(QmdbStore::init(context.child("saga"), "saga").await),
+    );
     let dispatch = dispatch::DispatchModule::new("dispatch", "saga");
     let tagging = tagging::TaggingModule::new(
         "tagging",

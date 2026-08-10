@@ -102,7 +102,7 @@ async fn native_host(context: &deterministic::Context) -> Host {
     let store = QmdbStore::init(context.child("native_agent"), "agent").await;
     Host::genesis(vec![
         Box::new(native_agent(Box::new(store))),
-        Box::new(SagaModule::new("saga")),
+        Box::new(SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new()))),
         Box::new(HookRecorder::new()),
     ])
     .expect("genesis")
@@ -112,7 +112,7 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
     let store = QmdbStore::init(context.child("wasm_agent"), "agent").await;
     Host::genesis(vec![
         Box::new(wasm_agent(Box::new(store))),
-        Box::new(SagaModule::new("saga")),
+        Box::new(SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new()))),
         Box::new(HookRecorder::new()),
     ])
     .expect("genesis")
