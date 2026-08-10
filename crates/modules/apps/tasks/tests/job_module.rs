@@ -140,18 +140,6 @@ async fn stage(jobs: &mut Jobs, height: u64, origin: Origin, msg: Msg) -> Result
     jobs.execute(&mut ctx(height, origin), &msg).await
 }
 
-// jobs never reads module_root, so the module set is inert; this forwards to
-// `stage`, retained so the module-argument call sites stay put.
-async fn stage_with_modules(
-    jobs: &mut Jobs,
-    height: u64,
-    origin: Origin,
-    _modules: &[&str],
-    msg: Msg,
-) -> Result<(), Error> {
-    stage(jobs, height, origin, msg).await
-}
-
 async fn get(jobs: &Jobs, job_id: &str) -> Option<Job> {
     let JobsReply::Job(job) = decode_reply(
         &jobs
@@ -246,35 +234,34 @@ fn register_worker_gating_idempotence_unregister_and_cap() {
         let mut jobs = jobs_on_mem();
         let empty_root = jobs.root();
 
-        let err = stage_with_modules(&mut jobs, 1, ext("operator"), &[], register_worker())
+        let err = stage(&mut jobs, 1, ext("operator"), register_worker())
             .await
             .expect_err("external registration rejected");
         assert!(matches!(err, Error::Module(m) if m.contains("module origin")));
         jobs.abort_block().await.unwrap();
 
-        let err = stage_with_modules(&mut jobs, 1, ext("operator"), &[], unregister_worker())
+        let err = stage(&mut jobs, 1, ext("operator"), unregister_worker())
             .await
             .expect_err("external unregistration rejected");
         assert!(matches!(err, Error::Module(m) if m.contains("module origin")));
         jobs.abort_block().await.unwrap();
 
-        let err = stage_with_modules(&mut jobs, 1, Origin::System, &[], register_worker())
+        let err = stage(&mut jobs, 1, Origin::System, register_worker())
             .await
             .expect_err("system registration rejected");
         assert!(matches!(err, Error::Module(m) if m.contains("module origin")));
         jobs.abort_block().await.unwrap();
 
-        let err = stage_with_modules(&mut jobs, 1, Origin::System, &[], unregister_worker())
+        let err = stage(&mut jobs, 1, Origin::System, unregister_worker())
             .await
             .expect_err("system unregistration rejected");
         assert!(matches!(err, Error::Module(m) if m.contains("module origin")));
         jobs.abort_block().await.unwrap();
 
-        stage_with_modules(
+        stage(
             &mut jobs,
             2,
             Origin::Module("agent".into()),
-            &[],
             register_worker(),
         )
         .await
@@ -283,11 +270,10 @@ fn register_worker_gating_idempotence_unregister_and_cap() {
         let registered_root = jobs.root();
         assert_ne!(registered_root, empty_root, "worker set is consensus state");
 
-        stage_with_modules(
+        stage(
             &mut jobs,
             3,
             Origin::Module("agent".into()),
-            &[],
             register_worker(),
         )
         .await
@@ -299,11 +285,10 @@ fn register_worker_gating_idempotence_unregister_and_cap() {
             "idempotent re-register moves no state"
         );
 
-        stage_with_modules(
+        stage(
             &mut jobs,
             4,
             Origin::Module("ghost".into()),
-            &[],
             unregister_worker(),
         )
         .await
@@ -311,11 +296,10 @@ fn register_worker_gating_idempotence_unregister_and_cap() {
         jobs.commit_block().await.unwrap();
         assert_eq!(jobs.root(), registered_root);
 
-        stage_with_modules(
+        stage(
             &mut jobs,
             5,
             Origin::Module("agent".into()),
-            &[],
             unregister_worker(),
         )
         .await
@@ -329,22 +313,20 @@ fn register_worker_gating_idempotence_unregister_and_cap() {
 
         for i in 0..MAX_WORKERS {
             let module = format!("worker-{i:02}");
-            stage_with_modules(
+            stage(
                 &mut jobs,
                 10 + i as u64,
                 Origin::Module(module),
-                &[],
                 register_worker(),
             )
             .await
             .expect("register within cap");
             jobs.commit_block().await.unwrap();
         }
-        let err = stage_with_modules(
+        let err = stage(
             &mut jobs,
             99,
             Origin::Module("worker-overflow".into()),
-            &[],
             register_worker(),
         )
         .await
