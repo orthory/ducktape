@@ -83,8 +83,10 @@ const DIRECTORY_MODULE_ID: &str = "directory";
 
 /// inbox — a STORE-BACKED tenant like pages/chat: per-member queues ride a
 /// host-constructed qmdb store (nothing enumerates members; the read surface
-/// is the index tier). tasks GENESIS component: `tasks` hosts the task and
-/// job boards.
+/// is the index tier). tasks is STORE-BACKED the same way: the `tasks` GENESIS
+/// component hosts the task and job boards over one host-constructed qmdb
+/// store, one record per task/job, so capture is O(1) and an op costs only the
+/// keys it touches.
 const INBOX_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/inbox/component.wasm");
 const INBOX_MODULE_ID: &str = "inbox";
@@ -377,9 +379,10 @@ fn inbox_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
         .expect("embedded inbox component loads")
 }
 
-/// the `tasks` work module contains the task and job boards.
-fn genesis_tasks_wasm() -> WasmModule {
-    WasmModule::from_bytes(TASKS_MODULE_ID, TASKS_WASM_COMPONENT)
+/// the `tasks` work module (the task and job boards) at its GENESIS code over
+/// the host-constructed store (same three store lifecycles as [`pages_wasm`]).
+fn tasks_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(TASKS_MODULE_ID, TASKS_WASM_COMPONENT, store)
         .expect("embedded tasks component loads")
 }
 
@@ -652,6 +655,9 @@ pub(super) async fn genesis_host(
     let tagging = tagging_wasm(Box::new(
         QmdbStore::init(context.child("tagging"), "tagging").await,
     ));
+    let tasks = tasks_wasm(Box::new(
+        QmdbStore::init(context.child("tasks"), "tasks").await,
+    ));
     // the lifecycle registry is NATIVE but store-backed the same way; the
     // genesis seed set commits into its store in one idempotent batch.
     let lifecycle = seeded_lifecycle(Box::new(
@@ -728,7 +734,10 @@ pub(super) async fn genesis_host(
         // modules receive engagement events — router only, module-agnostic.
         // store-backed over the host-constructed qmdb store.
         tagging,
-        tasks: genesis_tasks_wasm(),
+        // the work plane: the task board (ordered lists) and the job board
+        // (first-claim work items). store-backed over the host-constructed
+        // qmdb store — one record per task/job, so capture is O(1).
+        tasks,
         // the deterministic user->nodes binding registry: certificates are
         // chain-scoped (this network's chain id, riding its store-seeded
         // GENESIS CONFIG), member-gated binds via valset, and account display
@@ -852,6 +861,9 @@ pub(super) async fn restore_host(
     let inbox = inbox_wasm(Box::new(
         QmdbStore::init(context.child("inbox"), "inbox").await,
     ));
+    let tasks = tasks_wasm(Box::new(
+        QmdbStore::init(context.child("tasks"), "tasks").await,
+    ));
 
     let mut hello_wasm = genesis_hello_wasm();
     let (bytes, root) = snapshot_of(HELLO_WASM_MODULE_ID)?;
@@ -869,12 +881,6 @@ pub(super) async fn restore_host(
     dispatch
         .install(bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
-
-    let mut tasks = genesis_tasks_wasm();
-    let (bytes, root) = snapshot_of(TASKS_MODULE_ID)?;
-    tasks
-        .install(bytes, root)
-        .map_err(|e| format!("tasks install: {e}"))?;
 
     // files is a duckfs-odb resolver module — NOT in the checkpoint's snapshot
     // set (like the qmdb modules above, which `init` from their own on-disk
@@ -1123,6 +1129,17 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .await?,
     ));
 
+    let (target, resolver) = fetch_target("tasks").await?;
+    let tasks = tasks_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("tasks")),
+            "tasks",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
+
     let (target, resolver) = fetch_target("tagging").await?;
     let tagging = tagging_wasm(Box::new(
         QmdbStore::sync_from(
@@ -1219,12 +1236,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     hello_wasm
         .install(&bytes, root)
         .map_err(|e| format!("{HELLO_WASM_MODULE_ID} install: {e}"))?;
-
-    let (bytes, root) = snapshot_of(TASKS_MODULE_ID).await?;
-    let mut tasks = genesis_tasks_wasm();
-    tasks
-        .install(&bytes, root)
-        .map_err(|e| format!("tasks install: {e}"))?;
 
     // files is a duckfs-odb resolver module: its refs image AND its
     // content-addressed objects both ride the Module/`serve_sync` lane. a fresh
@@ -1353,7 +1364,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "182b524e57c1b1308dee8e9f57d3f35fc90800517b5f3a0d120c0089ed66bc9f";
+        "af9002ddcef46eb1a53402fcbc5f0776f93949f5d0e4cc61a178eb1dc8115adf";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's store as a genesis

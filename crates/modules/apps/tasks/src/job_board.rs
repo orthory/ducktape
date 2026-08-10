@@ -1,4 +1,5 @@
-//! the job board (first-claim kind): a deterministic in-memory work board.
+//! the job board (first-claim kind): a deterministic work board over the
+//! module's qmdb store.
 //!
 //! # what the job board is (and what it is NOT)
 //!
@@ -26,31 +27,28 @@
 //! a claim that lost the race must fail loudly and deterministically on every
 //! node -- the rejection IS the product's race-resolution signal.
 //!
-//! # state and integrity
+//! # state
 //!
-//! the board is a `BTreeMap<String, Job>` with a staging overlay. writes stage
-//! during `execute` and publish only at `commit`; the canonical bytes
-//! `encode_committed` produces are hashed into the module root. the overlay is a
-//! tombstone overlay (`Option<Job>`: `Some` = upsert, `None` = staged delete) so
-//! `Prune` can remove a record atomically with the rest of the block. `decode_from`
-//! rejects structurally impossible bytes (non-ascending ids) plus the few
-//! execute-UNREACHABLE shapes that would wedge a job (e.g. `Processing` without a
-//! claim). everything execute-reachable is accepted -- the root comparison, not
-//! an invariant sweep, is the integrity check.
+//! one record per job (`j/{job_id}`), the live-job census in `j#`, and the
+//! registered worker set in `w#`. a transition reads ONE record, rewrites it,
+//! and stages the result -- no board walk, and a `Prune` stages a delete that
+//! drops the key (and its bytes) from the root at commit. the census is a
+//! counter because [`MAX_JOBS`] is checked per submit and the store cannot
+//! enumerate.
 //!
-//! queries (`Get`/`List`/`Counts`) answer from COMMITTED state only, never the
-//! staged overlay; transition guards keep an overlay-aware view internally so
-//! in-block effects (a first claim) are visible to later ops in the same block.
+//! transition guards read through the staged overlay, so in-block effects (a
+//! first claim) are visible to later ops in the same block. the `Get` query
+//! answers from COMMITTED state only, so a read never leaks a staged write that
+//! a block abort would take back.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use sdk::codec::{self, Cursor};
-use sdk::{Ctx, Error, ModuleId, Msg, Origin};
+use sdk::{Ctx, Error, ModuleId, Msg, Origin, StagedStore};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply,
-    encode_job_event,
+    Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, encode_job_event,
+    stage_record,
 };
 
 /// max bytes of a `job_id` (non-empty).
@@ -61,7 +59,7 @@ pub const MAX_KIND: usize = 64;
 pub const MAX_SPEC: usize = 64 * 1024;
 /// max bytes of a finalize `payload`.
 pub const MAX_PAYLOAD: usize = 64 * 1024;
-/// max distinct live job ids on the board (overlay-aware).
+/// max distinct live job ids on the board.
 pub const MAX_JOBS: usize = 65536;
 /// lower clamp for a claim lease, in views.
 pub const MIN_LEASE_VIEWS: u64 = 10;
@@ -76,187 +74,195 @@ pub const MAX_WORKERS: usize = 16;
 /// max bytes of a worker module id.
 pub const MAX_WORKER_MODULE_ID: usize = 256;
 
-#[derive(Default)]
-pub(crate) struct JobBoard {
-    /// committed board; the root hashes exactly this map.
-    jobs: BTreeMap<String, Job>,
-    /// committed worker set; every successful submit fans out to these modules.
-    workers: BTreeSet<ModuleId>,
-    /// staged overlay: `Some` upserts, `None` is a tombstone (staged delete).
-    overlay: BTreeMap<String, Option<Job>>,
-    /// staged worker overlay: `true` = present, `false` = absent.
-    worker_overlay: BTreeMap<ModuleId, bool>,
+/// one job record per id.
+const RECORD_PREFIX: &[u8] = b"j/";
+/// the live-job census (u64 LE) -- what [`MAX_JOBS`] is checked against.
+const COUNT_KEY: &[u8] = b"j#";
+/// the registered worker set (a json `BTreeSet<ModuleId>`, at most
+/// [`MAX_WORKERS`] entries).
+const WORKERS_KEY: &[u8] = b"w#";
+
+fn record_key(job_id: &str) -> Vec<u8> {
+    let mut key = RECORD_PREFIX.to_vec();
+    key.extend_from_slice(job_id.as_bytes());
+    key
 }
 
-impl JobBoard {
-    pub(crate) fn new() -> Self {
-        Self::default()
+fn decode_job(bytes: &[u8]) -> Result<Job, Error> {
+    sdk::wire::decode(bytes).map_err(|e| Error::Module(format!("job record decode: {e}")))
+}
+
+// ---- overlay-aware reads (execute-internal ONLY) ---------------------------
+//
+// transition guards must see in-block effects -- a second claim in the same
+// block has to observe the first claim's staged `Processing` -- so these read
+// through the overlay. the `Get` query does NOT.
+
+/// the live view of a single job, reading through the staged overlay.
+async fn load(staged: &StagedStore, job_id: &str) -> Result<Option<Job>, Error> {
+    let Some(bytes) = staged.get(&record_key(job_id)).await? else {
+        return Ok(None);
+    };
+    decode_job(&bytes).map(Some)
+}
+
+/// the live job or a precise not-found rejection.
+async fn require(staged: &StagedStore, job_id: &str) -> Result<Job, Error> {
+    load(staged, job_id)
+        .await?
+        .ok_or_else(|| Error::Module(format!("job not found: {job_id}")))
+}
+
+/// count of distinct live job ids, reading through the staged overlay.
+async fn live_count(staged: &StagedStore) -> Result<u64, Error> {
+    let Some(bytes) = staged.get(COUNT_KEY).await? else {
+        return Ok(0);
+    };
+    let raw: [u8; 8] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Module("job census record is not a u64".into()))?;
+    Ok(u64::from_le_bytes(raw))
+}
+
+/// stage the census. an EMPTY board drops the key entirely, so a board pruned
+/// back to nothing hashes to the same root a never-used one does (the
+/// empty-collection-is-absence rule the whole-state encoding gave for free).
+fn stage_count(staged: &mut StagedStore, count: u64) {
+    if count == 0 {
+        staged.delete(COUNT_KEY.to_vec());
+        return;
+    }
+    staged.stage(COUNT_KEY.to_vec(), count.to_le_bytes().to_vec());
+}
+
+/// the registered worker set, reading through the staged overlay. `BTreeSet`
+/// serializes ASCENDING, so the record bytes are canonical.
+async fn load_workers(staged: &StagedStore) -> Result<BTreeSet<ModuleId>, Error> {
+    let Some(bytes) = staged.get(WORKERS_KEY).await? else {
+        return Ok(BTreeSet::new());
+    };
+    sdk::wire::decode(&bytes).map_err(|e| Error::Module(format!("worker set decode: {e}")))
+}
+
+/// stage the worker set — an EMPTY set drops the key (see [`stage_count`]).
+fn stage_workers(staged: &mut StagedStore, workers: &BTreeSet<ModuleId>) -> Result<(), Error> {
+    if workers.is_empty() {
+        staged.delete(WORKERS_KEY.to_vec());
+        return Ok(());
+    }
+    stage_record(
+        staged,
+        WORKERS_KEY.to_vec(),
+        sdk::wire::encode(workers),
+        "worker set",
+    )
+}
+
+fn stage_job(staged: &mut StagedStore, job: &Job) -> Result<(), Error> {
+    stage_record(
+        staged,
+        record_key(&job.job_id),
+        sdk::wire::encode(job),
+        "job record",
+    )
+}
+
+fn worker_module_from_origin(origin: &Origin, module_id: &ModuleId) -> Result<ModuleId, Error> {
+    let Origin::Module(worker) = origin else {
+        return Err(Error::Module(
+            "worker registration requires a module origin".into(),
+        ));
+    };
+    if worker.is_empty() {
+        return Err(Error::Module("worker module_id must not be empty".into()));
+    }
+    if worker.len() > MAX_WORKER_MODULE_ID {
+        return Err(Error::Module(format!(
+            "worker module_id exceeds {MAX_WORKER_MODULE_ID} bytes"
+        )));
+    }
+    if worker == module_id {
+        return Err(Error::Module(
+            "the work module cannot register itself as a worker".into(),
+        ));
+    }
+    Ok(worker.clone())
+}
+
+async fn register_worker(
+    staged: &mut StagedStore,
+    origin: &Origin,
+    module_id: &ModuleId,
+) -> Result<(), Error> {
+    let worker = worker_module_from_origin(origin, module_id)?;
+    let mut workers = load_workers(staged).await?;
+    if workers.contains(&worker) {
+        return Ok(());
+    }
+    if workers.len() >= MAX_WORKERS {
+        return Err(Error::Module("worker cap reached".into()));
+    }
+    workers.insert(worker);
+    stage_workers(staged, &workers)
+}
+
+async fn unregister_worker(
+    staged: &mut StagedStore,
+    origin: &Origin,
+    module_id: &ModuleId,
+) -> Result<(), Error> {
+    let worker = worker_module_from_origin(origin, module_id)?;
+    let mut workers = load_workers(staged).await?;
+    if !workers.remove(&worker) {
+        return Ok(());
+    }
+    stage_workers(staged, &workers)
+}
+
+// ---- transitions (each fails the block on any guard violation) -------------
+
+async fn submit(
+    staged: &mut StagedStore,
+    job_id: String,
+    kind: String,
+    spec: String,
+    origin: &Origin,
+    height: u64,
+) -> Result<JobsEvent, Error> {
+    // enforce every size cap HERE, at execute time, with rejection -- so
+    // oversized bytes never reach a committed record (the repo's poison-value
+    // lesson).
+    if job_id.is_empty() {
+        return Err(Error::Module("job_id must not be empty".into()));
+    }
+    if job_id.len() > MAX_JOB_ID {
+        return Err(Error::Module(format!("job_id exceeds {MAX_JOB_ID} bytes")));
+    }
+    if kind.is_empty() {
+        return Err(Error::Module("kind must not be empty".into()));
+    }
+    if kind.len() > MAX_KIND {
+        return Err(Error::Module(format!("kind exceeds {MAX_KIND} bytes")));
+    }
+    if spec.len() > MAX_SPEC {
+        return Err(Error::Module(format!("spec exceeds {MAX_SPEC} bytes")));
+    }
+    if load(staged, &job_id).await?.is_some() {
+        return Err(Error::Module(format!("job already exists: {job_id}")));
+    }
+    let count = live_count(staged).await?;
+    if count >= MAX_JOBS as u64 {
+        return Err(Error::Module(format!(
+            "job board full: {MAX_JOBS} live jobs"
+        )));
     }
 
-    // ---- overlay-aware reads (execute-internal ONLY) --------------------------
-    //
-    // transition guards must see in-block effects -- a second claim in the same
-    // block has to observe the first claim's staged `Processing` -- so `get`/
-    // `require`/`live_count` read through the overlay. queries do NOT: they
-    // answer from COMMITTED state only, so a read never leaks a staged write
-    // that a block abort would take back.
-
-    /// the live view of a single job, reading through the staged overlay.
-    fn get(&self, job_id: &str) -> Option<&Job> {
-        match self.overlay.get(job_id) {
-            Some(Some(job)) => Some(job),
-            Some(None) => None, // tombstoned this block
-            None => self.jobs.get(job_id),
-        }
-    }
-
-    /// clone the live job or reject with a precise not-found message.
-    fn require(&self, job_id: &str) -> Result<Job, Error> {
-        self.get(job_id)
-            .cloned()
-            .ok_or_else(|| Error::Module(format!("job not found: {job_id}")))
-    }
-
-    /// count of distinct live job ids, accounting for staged upserts/tombstones.
-    fn live_count(&self) -> usize {
-        let mut count = self.jobs.len();
-        for (id, entry) in &self.overlay {
-            match entry {
-                Some(_) if !self.jobs.contains_key(id) => count += 1, // new id
-                None if self.jobs.contains_key(id) => count -= 1,     // dropped a committed id
-                _ => {}
-            }
-        }
-        count
-    }
-
-    fn has_worker(&self, module_id: &str) -> bool {
-        match self.worker_overlay.get(module_id) {
-            Some(present) => *present,
-            None => self.workers.contains(module_id),
-        }
-    }
-
-    fn worker_count(&self) -> usize {
-        let mut count = self.workers.len();
-        for (module_id, present) in &self.worker_overlay {
-            match (*present, self.workers.contains(module_id)) {
-                (true, false) => count += 1,
-                (false, true) => count -= 1,
-                _ => {}
-            }
-        }
-        count
-    }
-
-    fn live_workers(&self) -> Vec<ModuleId> {
-        self.worker_overlay
-            .keys()
-            .chain(self.workers.iter())
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter(|module_id| self.has_worker(module_id))
-            .collect()
-    }
-
-    // ---- overlay-aware writes ------------------------------------------------
-
-    fn stage_upsert(&mut self, job: Job) {
-        self.overlay.insert(job.job_id.clone(), Some(job));
-    }
-
-    fn stage_remove(&mut self, job_id: &str) {
-        self.overlay.insert(job_id.to_owned(), None);
-    }
-
-    fn worker_module_from_origin(
-        &self,
-        origin: &Origin,
-        module_id: &ModuleId,
-    ) -> Result<ModuleId, Error> {
-        let Origin::Module(worker) = origin else {
-            return Err(Error::Module(
-                "worker registration requires a module origin".into(),
-            ));
-        };
-        if worker.is_empty() {
-            return Err(Error::Module("worker module_id must not be empty".into()));
-        }
-        if worker.len() > MAX_WORKER_MODULE_ID {
-            return Err(Error::Module(format!(
-                "worker module_id exceeds {MAX_WORKER_MODULE_ID} bytes"
-            )));
-        }
-        if worker == module_id {
-            return Err(Error::Module(
-                "the work module cannot register itself as a worker".into(),
-            ));
-        }
-        Ok(worker.clone())
-    }
-
-    fn register_worker(&mut self, origin: &Origin, module_id: &ModuleId) -> Result<(), Error> {
-        let worker = self.worker_module_from_origin(origin, module_id)?;
-        if self.has_worker(&worker) {
-            return Ok(());
-        }
-        if self.worker_count() >= MAX_WORKERS {
-            return Err(Error::Module("worker cap reached".into()));
-        }
-        self.worker_overlay.insert(worker, true);
-        Ok(())
-    }
-
-    fn unregister_worker(&mut self, origin: &Origin, module_id: &ModuleId) -> Result<(), Error> {
-        let worker = self.worker_module_from_origin(origin, module_id)?;
-        if !self.has_worker(&worker) {
-            return Ok(());
-        }
-        self.worker_overlay.insert(worker, false);
-        Ok(())
-    }
-
-    // ---- transitions (each fails the block on any guard violation) -----------
-
-    fn submit(
-        &mut self,
-        job_id: String,
-        kind: String,
-        spec: String,
-        origin: &Origin,
-        height: u64,
-    ) -> Result<JobsEvent, Error> {
-        // enforce every size cap HERE, at execute time, with rejection -- so
-        // oversized bytes never reach the committed map and never enter the
-        // root preimage (the repo's poison-value lesson).
-        if job_id.is_empty() {
-            return Err(Error::Module("job_id must not be empty".into()));
-        }
-        if job_id.len() > MAX_JOB_ID {
-            return Err(Error::Module(format!("job_id exceeds {MAX_JOB_ID} bytes")));
-        }
-        if kind.is_empty() {
-            return Err(Error::Module("kind must not be empty".into()));
-        }
-        if kind.len() > MAX_KIND {
-            return Err(Error::Module(format!("kind exceeds {MAX_KIND} bytes")));
-        }
-        if spec.len() > MAX_SPEC {
-            return Err(Error::Module(format!("spec exceeds {MAX_SPEC} bytes")));
-        }
-        if self.get(&job_id).is_some() {
-            return Err(Error::Module(format!("job already exists: {job_id}")));
-        }
-        if self.live_count() >= MAX_JOBS {
-            return Err(Error::Module(format!(
-                "job board full: {MAX_JOBS} live jobs"
-            )));
-        }
-
-        let submitter = actor_from_origin(origin)?;
-        let spec_hash = Sha256::digest(spec.as_bytes()).to_vec();
-        self.stage_upsert(Job {
+    let submitter = actor_from_origin(origin)?;
+    let spec_hash = Sha256::digest(spec.as_bytes()).to_vec();
+    stage_job(
+        staged,
+        &Job {
             job_id: job_id.clone(),
             kind: kind.clone(),
             spec: spec.clone(),
@@ -267,416 +273,241 @@ impl JobBoard {
             result: None,
             created_at_height: height,
             updated_at_height: height,
+        },
+    )?;
+    stage_count(staged, count + 1);
+    Ok(JobsEvent::Submitted {
+        job_id,
+        kind,
+        submitter,
+        spec,
+        spec_hash,
+    })
+}
+
+async fn claim(
+    staged: &mut StagedStore,
+    job_id: String,
+    lease_views: u64,
+    origin: &Origin,
+    height: u64,
+) -> Result<(), Error> {
+    let mut job = require(staged, &job_id).await?;
+    if job.status != JobStatus::Pending {
+        // the consensus order already picked the winner; this op lost the
+        // race and fails deterministically on every node.
+        return Err(Error::Module(format!(
+            "job not claimable (status {:?}): {job_id}",
+            job.status
+        )));
+    }
+    let worker = actor_from_origin(origin)?;
+    job.status = JobStatus::Processing;
+    job.attempt = job.attempt.saturating_add(1);
+    job.claim = Some(Claim {
+        worker,
+        claimed_at_height: height,
+        lease_views: lease_views.clamp(MIN_LEASE_VIEWS, MAX_LEASE_VIEWS),
+    });
+    job.updated_at_height = height;
+    stage_job(staged, &job)
+}
+
+async fn finalize(
+    staged: &mut StagedStore,
+    job_id: String,
+    ok: bool,
+    payload: String,
+    origin: &Origin,
+    height: u64,
+) -> Result<(), Error> {
+    let mut job = require(staged, &job_id).await?;
+    // result singularity: a terminal job is not `Processing`, so this guard
+    // rejects any second finalize.
+    if job.status != JobStatus::Processing {
+        return Err(Error::Module(format!(
+            "job not in processing (status {:?}): {job_id}",
+            job.status
+        )));
+    }
+    let worker = actor_from_origin(origin)?;
+    if job.claim.as_ref().map(|c| c.worker.as_str()) != Some(worker.as_str()) {
+        return Err(Error::Module(format!(
+            "only the current claimant may finalize: {job_id}"
+        )));
+    }
+    if payload.len() > MAX_PAYLOAD {
+        return Err(Error::Module(format!(
+            "payload exceeds {MAX_PAYLOAD} bytes"
+        )));
+    }
+    job.status = if ok {
+        JobStatus::Done
+    } else {
+        JobStatus::Failed
+    };
+    job.result = Some(JobResult { ok, payload });
+    job.updated_at_height = height;
+    stage_job(staged, &job) // claim retained for the record
+}
+
+async fn release(
+    staged: &mut StagedStore,
+    job_id: String,
+    origin: &Origin,
+    height: u64,
+) -> Result<(), Error> {
+    let mut job = require(staged, &job_id).await?;
+    if job.status != JobStatus::Processing {
+        return Err(Error::Module(format!(
+            "job not in processing (status {:?}): {job_id}",
+            job.status
+        )));
+    }
+    let worker = actor_from_origin(origin)?;
+    if job.claim.as_ref().map(|c| c.worker.as_str()) != Some(worker.as_str()) {
+        return Err(Error::Module(format!(
+            "only the current claimant may release: {job_id}"
+        )));
+    }
+    job.status = JobStatus::Pending;
+    job.claim = None; // attempt count kept
+    job.updated_at_height = height;
+    stage_job(staged, &job)
+}
+
+async fn reclaim(staged: &mut StagedStore, job_id: String, height: u64) -> Result<(), Error> {
+    // PERMISSIONLESS (saga's permissionless-crank pattern): any origin may
+    // reclaim, because the ONLY thing that authorizes it is a consensus fact
+    // -- a deterministic deadline of heights, identical on every node.
+    let mut job = require(staged, &job_id).await?;
+    if job.status != JobStatus::Processing {
+        return Err(Error::Module(format!(
+            "reclaim only applies to processing jobs (status {:?}): {job_id}",
+            job.status
+        )));
+    }
+    let claim = job
+        .claim
+        .as_ref()
+        .ok_or_else(|| Error::Module(format!("processing job missing claim: {job_id}")))?;
+    let deadline = claim.claimed_at_height.saturating_add(claim.lease_views);
+    if height <= deadline {
+        return Err(Error::Module(format!(
+            "lease not expired (height {height} <= deadline {deadline}): {job_id}"
+        )));
+    }
+    if job.attempt >= MAX_ATTEMPTS {
+        // give up: fail the job. the claim is retained for the record, the
+        // same way a finalize-to-terminal keeps its claim.
+        job.status = JobStatus::Failed;
+        job.result = Some(JobResult {
+            ok: false,
+            payload: "attempts exhausted".into(),
         });
-        Ok(JobsEvent::Submitted {
-            job_id,
-            kind,
-            submitter,
-            spec,
-            spec_hash,
-        })
-    }
-
-    fn claim(
-        &mut self,
-        job_id: String,
-        lease_views: u64,
-        origin: &Origin,
-        height: u64,
-    ) -> Result<(), Error> {
-        let mut job = self.require(&job_id)?;
-        if job.status != JobStatus::Pending {
-            // the consensus order already picked the winner; this op lost the
-            // race and fails deterministically on every node.
-            return Err(Error::Module(format!(
-                "job not claimable (status {:?}): {job_id}",
-                job.status
-            )));
-        }
-        let worker = actor_from_origin(origin)?;
-        job.status = JobStatus::Processing;
-        job.attempt = job.attempt.saturating_add(1);
-        job.claim = Some(Claim {
-            worker,
-            claimed_at_height: height,
-            lease_views: lease_views.clamp(MIN_LEASE_VIEWS, MAX_LEASE_VIEWS),
-        });
-        job.updated_at_height = height;
-        self.stage_upsert(job);
-        Ok(())
-    }
-
-    fn finalize(
-        &mut self,
-        job_id: String,
-        ok: bool,
-        payload: String,
-        origin: &Origin,
-        height: u64,
-    ) -> Result<(), Error> {
-        let mut job = self.require(&job_id)?;
-        // result singularity: a terminal job is not `Processing`, so this guard
-        // rejects any second finalize.
-        if job.status != JobStatus::Processing {
-            return Err(Error::Module(format!(
-                "job not in processing (status {:?}): {job_id}",
-                job.status
-            )));
-        }
-        let worker = actor_from_origin(origin)?;
-        if job.claim.as_ref().map(|c| c.worker.as_str()) != Some(worker.as_str()) {
-            return Err(Error::Module(format!(
-                "only the current claimant may finalize: {job_id}"
-            )));
-        }
-        if payload.len() > MAX_PAYLOAD {
-            return Err(Error::Module(format!(
-                "payload exceeds {MAX_PAYLOAD} bytes"
-            )));
-        }
-        job.status = if ok {
-            JobStatus::Done
-        } else {
-            JobStatus::Failed
-        };
-        job.result = Some(JobResult { ok, payload });
-        job.updated_at_height = height;
-        self.stage_upsert(job); // claim retained for the record
-        Ok(())
-    }
-
-    fn release(&mut self, job_id: String, origin: &Origin, height: u64) -> Result<(), Error> {
-        let mut job = self.require(&job_id)?;
-        if job.status != JobStatus::Processing {
-            return Err(Error::Module(format!(
-                "job not in processing (status {:?}): {job_id}",
-                job.status
-            )));
-        }
-        let worker = actor_from_origin(origin)?;
-        if job.claim.as_ref().map(|c| c.worker.as_str()) != Some(worker.as_str()) {
-            return Err(Error::Module(format!(
-                "only the current claimant may release: {job_id}"
-            )));
-        }
+    } else {
         job.status = JobStatus::Pending;
-        job.claim = None; // attempt count kept
-        job.updated_at_height = height;
-        self.stage_upsert(job);
-        Ok(())
+        job.claim = None; // attempt count kept for the next claim to bump
     }
+    job.updated_at_height = height;
+    stage_job(staged, &job)
+}
 
-    fn reclaim(&mut self, job_id: String, height: u64) -> Result<(), Error> {
-        // PERMISSIONLESS (saga's permissionless-crank pattern): any origin may
-        // reclaim, because the ONLY thing that authorizes it is a consensus fact
-        // -- a deterministic deadline of heights, identical on every node.
-        let mut job = self.require(&job_id)?;
-        if job.status != JobStatus::Processing {
-            return Err(Error::Module(format!(
-                "reclaim only applies to processing jobs (status {:?}): {job_id}",
-                job.status
-            )));
-        }
-        let claim = job
-            .claim
-            .as_ref()
-            .ok_or_else(|| Error::Module(format!("processing job missing claim: {job_id}")))?;
-        let deadline = claim.claimed_at_height.saturating_add(claim.lease_views);
-        if height <= deadline {
-            return Err(Error::Module(format!(
-                "lease not expired (height {height} <= deadline {deadline}): {job_id}"
-            )));
-        }
-        if job.attempt >= MAX_ATTEMPTS {
-            // give up: fail the job. the claim is retained for the record, the
-            // same way a finalize-to-terminal keeps its claim.
-            job.status = JobStatus::Failed;
-            job.result = Some(JobResult {
-                ok: false,
-                payload: "attempts exhausted".into(),
-            });
-        } else {
-            job.status = JobStatus::Pending;
-            job.claim = None; // attempt count kept for the next claim to bump
-        }
-        job.updated_at_height = height;
-        self.stage_upsert(job);
-        Ok(())
+async fn cancel(
+    staged: &mut StagedStore,
+    job_id: String,
+    origin: &Origin,
+    height: u64,
+) -> Result<(), Error> {
+    let mut job = require(staged, &job_id).await?;
+    // once claimed, the worker owns it until finalize/release/lease expiry.
+    if job.status != JobStatus::Pending {
+        return Err(Error::Module(format!(
+            "cancel only applies to pending jobs (status {:?}): {job_id}",
+            job.status
+        )));
     }
-
-    fn cancel(&mut self, job_id: String, origin: &Origin, height: u64) -> Result<(), Error> {
-        let mut job = self.require(&job_id)?;
-        // once claimed, the worker owns it until finalize/release/lease expiry.
-        if job.status != JobStatus::Pending {
-            return Err(Error::Module(format!(
-                "cancel only applies to pending jobs (status {:?}): {job_id}",
-                job.status
-            )));
-        }
-        let actor = actor_from_origin(origin)?;
-        if job.submitter != actor {
-            return Err(Error::Module(format!(
-                "only the submitter may cancel: {job_id}"
-            )));
-        }
-        job.status = JobStatus::Cancelled;
-        job.updated_at_height = height;
-        self.stage_upsert(job);
-        Ok(())
+    let actor = actor_from_origin(origin)?;
+    if job.submitter != actor {
+        return Err(Error::Module(format!(
+            "only the submitter may cancel: {job_id}"
+        )));
     }
+    job.status = JobStatus::Cancelled;
+    job.updated_at_height = height;
+    stage_job(staged, &job)
+}
 
-    fn prune(&mut self, job_id: String, origin: &Origin) -> Result<(), Error> {
-        let job = self.require(&job_id)?;
-        if !job.status.is_terminal() {
-            return Err(Error::Module(format!(
-                "prune only applies to terminal jobs (status {:?}): {job_id}",
-                job.status
-            )));
-        }
-        let actor = actor_from_origin(origin)?;
-        if job.submitter != actor {
-            return Err(Error::Module(format!(
-                "only the submitter may prune: {job_id}"
-            )));
-        }
-        self.stage_remove(&job_id);
-        Ok(())
+async fn prune(staged: &mut StagedStore, job_id: String, origin: &Origin) -> Result<(), Error> {
+    let job = require(staged, &job_id).await?;
+    if !job.status.is_terminal() {
+        return Err(Error::Module(format!(
+            "prune only applies to terminal jobs (status {:?}): {job_id}",
+            job.status
+        )));
     }
+    let actor = actor_from_origin(origin)?;
+    if job.submitter != actor {
+        return Err(Error::Module(format!(
+            "only the submitter may prune: {job_id}"
+        )));
+    }
+    let count = live_count(staged).await?;
+    staged.delete(record_key(&job_id));
+    stage_count(staged, count.saturating_sub(1));
+    Ok(())
+}
 
-    // ---- dispatch ------------------------------------------------------------
+// ---- dispatch --------------------------------------------------------------
 
-    pub(crate) async fn execute(
-        &mut self,
-        ctx: &mut dyn Ctx,
-        msg: JobsMsg,
-        module_id: &ModuleId,
-    ) -> Result<(), Error> {
-        let env = ctx.env();
-        let (origin, height) = (env.origin.clone(), env.height);
-        match msg {
-            JobsMsg::Submit { job_id, kind, spec } => {
-                let event = self.submit(job_id, kind, spec, &origin, height)?;
-                for worker in self.live_workers() {
-                    ctx.emit_msg(Msg {
-                        target: worker,
-                        payload: encode_job_event(&event),
-                    });
-                }
-                Ok(())
+pub(crate) async fn execute(
+    staged: &mut StagedStore,
+    ctx: &mut dyn Ctx,
+    msg: JobsMsg,
+    module_id: &ModuleId,
+) -> Result<(), Error> {
+    let env = ctx.env();
+    let (origin, height) = (env.origin.clone(), env.height);
+    match msg {
+        JobsMsg::Submit { job_id, kind, spec } => {
+            let event = submit(staged, job_id, kind, spec, &origin, height).await?;
+            for worker in load_workers(staged).await? {
+                ctx.emit_msg(Msg {
+                    target: worker,
+                    payload: encode_job_event(&event),
+                });
             }
-            JobsMsg::Claim {
-                job_id,
-                lease_views,
-            } => self.claim(job_id, lease_views, &origin, height),
-            JobsMsg::Finalize {
-                job_id,
-                ok,
-                payload,
-            } => self.finalize(job_id, ok, payload, &origin, height),
-            JobsMsg::Release { job_id } => self.release(job_id, &origin, height),
-            JobsMsg::Reclaim { job_id } => self.reclaim(job_id, height),
-            JobsMsg::Cancel { job_id } => self.cancel(job_id, &origin, height),
-            JobsMsg::Prune { job_id } => self.prune(job_id, &origin),
-            JobsMsg::RegisterWorker {} => self.register_worker(&origin, module_id),
-            JobsMsg::UnregisterWorker {} => self.unregister_worker(&origin, module_id),
+            Ok(())
         }
+        JobsMsg::Claim {
+            job_id,
+            lease_views,
+        } => claim(staged, job_id, lease_views, &origin, height).await,
+        JobsMsg::Finalize {
+            job_id,
+            ok,
+            payload,
+        } => finalize(staged, job_id, ok, payload, &origin, height).await,
+        JobsMsg::Release { job_id } => release(staged, job_id, &origin, height).await,
+        JobsMsg::Reclaim { job_id } => reclaim(staged, job_id, height).await,
+        JobsMsg::Cancel { job_id } => cancel(staged, job_id, &origin, height).await,
+        JobsMsg::Prune { job_id } => prune(staged, job_id, &origin).await,
+        JobsMsg::RegisterWorker {} => register_worker(staged, &origin, module_id).await,
+        JobsMsg::UnregisterWorker {} => unregister_worker(staged, &origin, module_id).await,
     }
+}
 
-    /// read projections answer from COMMITTED state only -- never the staged
-    /// overlay. a query must not observe a write that a block abort would take
-    /// back; transition guards keep their own overlay-aware view internally.
-    pub(crate) fn query(&self, q: JobsQuery) -> JobsReply {
-        match q {
-            JobsQuery::Get { job_id } => JobsReply::Job(self.jobs.get(&job_id).cloned()),
-        }
-    }
-
-    pub(crate) fn commit(&mut self) {
-        for (id, entry) in std::mem::take(&mut self.overlay) {
-            match entry {
-                Some(job) => {
-                    self.jobs.insert(id, job);
-                }
-                None => {
-                    self.jobs.remove(&id);
-                }
-            }
-        }
-        for (module_id, present) in std::mem::take(&mut self.worker_overlay) {
-            if present {
-                self.workers.insert(module_id);
-            } else {
-                self.workers.remove(&module_id);
-            }
-        }
-    }
-
-    pub(crate) fn abort(&mut self) {
-        self.overlay.clear();
-        self.worker_overlay.clear();
-    }
-
-    // ---- canonical encoding / snapshot ---------------------------------------
-
-    /// append the canonical committed encoding (job map then worker set).
-    pub(crate) fn encode_committed(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&(self.jobs.len() as u64).to_le_bytes());
-        for job in self.jobs.values() {
-            codec::push_str(out, &job.job_id);
-            codec::push_str(out, &job.kind);
-            codec::push_str(out, &job.spec);
-            codec::push_str(out, &job.submitter);
-            out.push(status_byte(&job.status));
-            out.extend_from_slice(&job.attempt.to_le_bytes());
-            match &job.claim {
-                None => out.push(0),
-                Some(c) => {
-                    out.push(1);
-                    codec::push_str(out, &c.worker);
-                    out.extend_from_slice(&c.claimed_at_height.to_le_bytes());
-                    out.extend_from_slice(&c.lease_views.to_le_bytes());
-                }
-            }
-            match &job.result {
-                None => out.push(0),
-                Some(r) => {
-                    out.push(1);
-                    out.push(u8::from(r.ok));
-                    codec::push_str(out, &r.payload);
-                }
-            }
-            out.extend_from_slice(&job.created_at_height.to_le_bytes());
-            out.extend_from_slice(&job.updated_at_height.to_le_bytes());
-        }
-        out.extend_from_slice(&(self.workers.len() as u64).to_le_bytes());
-        for worker in &self.workers {
-            codec::push_str(out, worker);
-        }
-    }
-
-    /// read this board's portion off a shared cursor. does NOT `finish` the
-    /// cursor.
-    pub(crate) fn decode_from(c: &mut Cursor) -> Result<Self, Error> {
-        let count = c.u64("snapshot job count")?;
-
-        let mut jobs: BTreeMap<String, Job> = BTreeMap::new();
-        for _ in 0..count {
-            let job_id = c.string("snapshot job_id")?;
-            let kind = c.string("snapshot kind")?;
-            let spec = c.string("snapshot spec")?;
-            let submitter = c.string("snapshot submitter")?;
-            let status = status_from_byte(c.byte("snapshot status")?)?;
-            let attempt = c.u64("snapshot attempt")?;
-            let claim = match c.byte("snapshot claim flag")? {
-                0 => None,
-                1 => Some(Claim {
-                    worker: c.string("snapshot claim worker")?,
-                    claimed_at_height: c.u64("snapshot claimed_at_height")?,
-                    lease_views: c.u64("snapshot lease_views")?,
-                }),
-                other => {
-                    return Err(Error::Module(format!(
-                        "snapshot has invalid claim flag: {other}"
-                    )));
-                }
+/// the read projection answers from COMMITTED state only -- never the staged
+/// overlay. a query must not observe a write that a block abort would take
+/// back; transition guards keep their own overlay-aware view above.
+pub(crate) async fn query(staged: &StagedStore, q: JobsQuery) -> Result<JobsReply, Error> {
+    match q {
+        JobsQuery::Get { job_id } => {
+            let Some(bytes) = staged.get_committed(&record_key(&job_id)).await? else {
+                return Ok(JobsReply::Job(None));
             };
-            let result = match c.byte("snapshot result flag")? {
-                0 => None,
-                1 => Some(JobResult {
-                    ok: c.bool("snapshot result ok")?,
-                    payload: c.string("snapshot result payload")?,
-                }),
-                other => {
-                    return Err(Error::Module(format!(
-                        "snapshot has invalid result flag: {other}"
-                    )));
-                }
-            };
-            let created_at_height = c.u64("snapshot created_at_height")?;
-            let updated_at_height = c.u64("snapshot updated_at_height")?;
-
-            // structural check: strictly-ascending ids match `BTreeMap`
-            // iteration, so a byte stream that would not re-encode to itself is
-            // rejected.
-            if jobs
-                .last_key_value()
-                .is_some_and(|(last, _)| last.as_str() >= job_id.as_str())
-            {
-                return Err(Error::Module(
-                    "snapshot job ids not strictly ascending".into(),
-                ));
-            }
-
-            // execute-UNREACHABLE shapes are rejected -- these are exactly the
-            // invariants every execute path upholds, so refusing them can never
-            // refuse an honest validator's snapshot. anything weaker is left to
-            // the root comparison in the composer's install. in particular a
-            // `Processing` job without a claim would be permanently wedged:
-            // finalize/release need worker equality against the claim and
-            // reclaim needs its deadline, so no transition could ever repair it.
-            match (&status, &claim) {
-                (JobStatus::Processing, None) => {
-                    return Err(Error::Module(
-                        "snapshot has processing job without claim".into(),
-                    ));
-                }
-                (JobStatus::Pending, Some(_)) => {
-                    // submit creates without a claim; release/reclaim clear it.
-                    return Err(Error::Module("snapshot has pending job with claim".into()));
-                }
-                _ => {}
-            }
-            if matches!(status, JobStatus::Done | JobStatus::Failed) && result.is_none() {
-                // Done/Failed are only produced by finalize/exhausted-reclaim,
-                // and both store a result. (Cancelled legitimately has none.)
-                return Err(Error::Module(
-                    "snapshot has finalized job without result".into(),
-                ));
-            }
-            jobs.insert(
-                job_id.clone(),
-                Job {
-                    job_id,
-                    kind,
-                    spec,
-                    submitter,
-                    status,
-                    attempt,
-                    claim,
-                    result,
-                    created_at_height,
-                    updated_at_height,
-                },
-            );
+            decode_job(&bytes).map(|job| JobsReply::Job(Some(job)))
         }
-        let worker_count = c.u64("snapshot worker count")?;
-        let worker_count = usize::try_from(worker_count)
-            .map_err(|_| Error::Module("snapshot worker cap exceeded".into()))?;
-        if worker_count > MAX_WORKERS {
-            return Err(Error::Module("snapshot worker cap exceeded".into()));
-        }
-        let mut workers = BTreeSet::new();
-        for _ in 0..worker_count {
-            let worker = c.string("snapshot worker id")?;
-            if worker.is_empty() || worker.len() > MAX_WORKER_MODULE_ID {
-                return Err(Error::Module("snapshot worker module id is invalid".into()));
-            }
-            if workers
-                .last()
-                .is_some_and(|last: &String| last.as_str() >= worker.as_str())
-            {
-                return Err(Error::Module(
-                    "snapshot worker ids not strictly ascending".into(),
-                ));
-            }
-            workers.insert(worker);
-        }
-        Ok(Self {
-            jobs,
-            workers,
-            overlay: BTreeMap::new(),
-            worker_overlay: BTreeMap::new(),
-        })
     }
 }
 
@@ -691,25 +522,4 @@ fn actor_from_origin(origin: &Origin) -> Result<String, Error> {
         ));
     }
     Ok(origin.actor_string())
-}
-
-fn status_byte(status: &JobStatus) -> u8 {
-    match status {
-        JobStatus::Pending => 0,
-        JobStatus::Processing => 1,
-        JobStatus::Done => 2,
-        JobStatus::Failed => 3,
-        JobStatus::Cancelled => 4,
-    }
-}
-
-fn status_from_byte(value: u8) -> Result<JobStatus, Error> {
-    match value {
-        0 => Ok(JobStatus::Pending),
-        1 => Ok(JobStatus::Processing),
-        2 => Ok(JobStatus::Done),
-        3 => Ok(JobStatus::Failed),
-        4 => Ok(JobStatus::Cancelled),
-        _ => Err(Error::Module("snapshot has invalid job status".into())),
-    }
 }

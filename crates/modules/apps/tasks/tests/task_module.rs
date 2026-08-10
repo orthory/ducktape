@@ -1,7 +1,7 @@
 use futures::executor::block_on;
 use host::{BlockContext, Host};
 use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
-use sdk_testkit::TestCtx;
+use sdk_testkit::{MemStore, TestCtx};
 use tasks::Tasks;
 use tasks::{
     TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_task_reply as decode_reply,
@@ -9,6 +9,13 @@ use tasks::{
 };
 
 const TASKS: &str = "tasks";
+
+/// build the module the way a host does: concrete store first, injected as
+/// `Box<dyn MerkleStore>`. these tests assert BEHAVIOR, so the in-memory store
+/// stands in for qmdb; the real-store round trip lives in `sync_round_trip`.
+fn tasks_on_mem() -> Tasks {
+    Tasks::new(TASKS, Box::new(MemStore::new()))
+}
 
 fn msg(task_msg: TaskMsg) -> Msg {
     Msg {
@@ -71,7 +78,7 @@ fn at(consensus_time: u64) -> TestCtx {
 #[test]
 fn create_list_and_update_status() {
     block_on(async {
-        let mut tasks = Tasks::new(TASKS);
+        let mut tasks = tasks_on_mem();
 
         tasks
             .execute(&mut at(11), &create("task-b", "second"))
@@ -92,10 +99,7 @@ fn create_list_and_update_status() {
         assert_eq!(listed[0].updated_at, 11);
 
         tasks
-            .execute(
-                &mut at(22),
-                &update("task-a", TaskStatus::InProgress),
-            )
+            .execute(&mut at(22), &update("task-a", TaskStatus::InProgress))
             .await
             .expect("update status");
         tasks.commit_block().await.expect("commit update");
@@ -110,7 +114,7 @@ fn create_list_and_update_status() {
 #[test]
 fn root_changes_only_after_commit() {
     block_on(async {
-        let mut tasks = Tasks::new(TASKS);
+        let mut tasks = tasks_on_mem();
         let root0 = tasks.root();
 
         tasks
@@ -165,7 +169,7 @@ impl Module for CreateThenFail {
 #[test]
 fn failed_write_rolls_back_task_state() {
     block_on(async {
-        let mut host = Host::genesis(vec![Box::new(Tasks::new(TASKS)), Box::new(CreateThenFail)])
+        let mut host = Host::genesis(vec![Box::new(tasks_on_mem()), Box::new(CreateThenFail)])
             .expect("genesis");
 
         let root0 = host.module_root(TASKS).expect("tasks root");
@@ -207,7 +211,7 @@ fn failed_write_rolls_back_task_state() {
 #[test]
 fn root_hash_changes_when_task_state_changes() {
     block_on(async {
-        let mut host = Host::genesis(vec![Box::new(Tasks::new(TASKS))]).expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(tasks_on_mem())]).expect("genesis");
         let app0 = host.root_hash();
 
         let created = host
@@ -250,89 +254,128 @@ fn root_hash_changes_when_task_state_changes() {
 }
 
 #[test]
-fn state_sync_handle_returns_installable_snapshot_bytes() {
+fn state_sync_handle_is_resolver_backed() {
     block_on(async {
-        let mut source = Tasks::new(TASKS);
-        source
+        let mut tasks = tasks_on_mem();
+        tasks
             .execute(&mut at(5), &create("task-1", "sync me"))
             .await
             .expect("create");
-        source
-            .execute(&mut at(5), &create("task-2", "me too"))
-            .await
-            .expect("create");
-        source.commit_block().await.expect("commit");
+        tasks.commit_block().await.expect("commit");
 
-        // the module advertises self-contained snapshot bytes...
-        let handle = source.state_sync_handle().expect("state-sync handle");
-        let bytes = match handle {
-            StateSyncHandle::SnapshotBytes(bytes) => bytes,
-            other => panic!("expected SnapshotBytes, got {other:?}"),
-        };
-
-        // ...that install verbatim on a joiner against the source root.
-        let mut target = Tasks::new(TASKS);
-        target
-            .install(&bytes, source.root())
-            .expect("install handle bytes");
-        assert_eq!(target.root(), source.root());
-        assert_eq!(module_tasks(&target).await, module_tasks(&source).await);
+        // the module is qmdb-backed: sync rides the store's resolver lane, so
+        // capture is O(1) and NEVER a re-serialization of the whole board.
+        match tasks.state_sync_handle().expect("state-sync handle") {
+            StateSyncHandle::ResolverBacked { backend, .. } => assert_eq!(backend, "qmdb"),
+            other => panic!("expected ResolverBacked, got {other:?}"),
+        }
+        assert!(
+            tasks.snapshot_bytes().is_none(),
+            "a store-backed module ships no byte snapshot"
+        );
     });
 }
 
 #[test]
-fn snapshot_with_updated_at_before_created_at_round_trips() {
+fn updated_at_before_created_at_is_execute_reachable() {
     block_on(async {
         // consensus_time has NO cross-block monotonicity guarantee, so a status
         // update in a later block can legitimately stamp updated_at BELOW
-        // created_at. install must accept this execute-reachable state instead
-        // of refusing a snapshot an honest validator committed.
-        let mut source = Tasks::new(TASKS);
-        source
+        // created_at. the board stores what execute produced -- there is no
+        // decode-time invariant sweep to refuse it (the store's merkle root is
+        // the integrity check).
+        let mut tasks = tasks_on_mem();
+        tasks
             .execute(&mut at(10), &create("task-1", "time travels"))
             .await
             .expect("create at t=10");
-        source.commit_block().await.expect("commit create");
-        source
+        tasks.commit_block().await.expect("commit create");
+        tasks
             .execute(&mut at(5), &update("task-1", TaskStatus::Done))
             .await
             .expect("update at t=5");
-        source.commit_block().await.expect("commit update");
+        tasks.commit_block().await.expect("commit update");
 
-        let listed = module_tasks(&source).await;
+        let listed = module_tasks(&tasks).await;
         assert_eq!(listed[0].created_at, 10);
         assert_eq!(
             listed[0].updated_at, 5,
             "the premise: updated_at < created_at is execute-reachable"
         );
-
-        let mut target = Tasks::new(TASKS);
-        target
-            .install(&source.snapshot(), source.root())
-            .expect("install must accept execute-reachable timestamps");
-        assert_eq!(target.root(), source.root());
-        assert_eq!(module_tasks(&target).await, module_tasks(&source).await);
     });
 }
 
+// the ONE guard the storage swap adds: a record the concrete store's codec
+// would panic decoding (over 1 MiB) is refused at WRITE time -- never staged,
+// never committed -- instead of poisoning every later read on every validator.
 #[test]
-fn snapshot_install_reconstructs_task_state() {
+fn oversized_task_record_is_refused_before_staging() {
     block_on(async {
-        let mut source = Tasks::new(TASKS);
-        source
-            .execute(&mut at(5), &create("task-1", "sync me"))
+        let mut tasks = tasks_on_mem();
+        let root0 = tasks.root();
+
+        let err = tasks
+            .execute(
+                &mut at(1),
+                &create("big", &"x".repeat(tasks::MAX_RECORD_BYTES)),
+            )
             .await
-            .expect("create");
-        source.commit_block().await.expect("commit");
+            .expect_err("an over-cap task record must be refused");
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("store record cap")),
+            "unexpected error: {err:?}"
+        );
 
-        let expected = source.root();
-        let snapshot = source.snapshot();
-        let mut target = Tasks::new(TASKS);
-        target
-            .install(&snapshot, expected)
-            .expect("install verified snapshot");
+        tasks.commit_block().await.expect("commit");
+        assert_eq!(
+            tasks.root(),
+            root0,
+            "a refused write must not move the root"
+        );
+        assert!(module_tasks(&tasks).await.is_empty());
+    });
+}
 
-        assert_eq!(target.root(), expected);
-        assert_eq!(module_tasks(&target).await, module_tasks(&source).await);
+// every task id shares the ONE `t#` index record, so an uncapped task_id is a
+// board-wide weapon: a handful of ~1 MiB ids (each fits in one op frame) packs
+// that record to the store cap and every later create -- anyone's -- fails
+// FOREVER, with no delete op to free the bytes. MAX_TASK_ID is what keeps the
+// index bounded, so the refusal has to land on the ID, before the index grows.
+#[test]
+fn oversized_task_id_cannot_brick_the_board() {
+    block_on(async {
+        let mut tasks = tasks_on_mem();
+
+        for attempt in 0..5 {
+            let huge_id = format!("{}{attempt}", "x".repeat(256 * 1024));
+            let err = tasks
+                .execute(&mut at(1), &create(&huge_id, "brick the board"))
+                .await
+                .expect_err("an over-cap task_id must be refused");
+            assert!(
+                matches!(err, Error::Module(ref m) if m.contains("task_id is")),
+                "unexpected error: {err:?}"
+            );
+        }
+        tasks.commit_block().await.expect("commit the refusals");
+
+        // the premise: after the attack the board is still writable by anyone.
+        let at_cap = "y".repeat(tasks::MAX_TASK_ID);
+        tasks
+            .execute(&mut at(2), &create(&at_cap, "an id exactly at the cap"))
+            .await
+            .expect("an id of exactly MAX_TASK_ID bytes is accepted");
+        tasks
+            .execute(&mut at(2), &create("normal", "an ordinary task"))
+            .await
+            .expect("an ordinary create still works");
+        tasks.commit_block().await.expect("commit creates");
+
+        let ids: Vec<String> = module_tasks(&tasks)
+            .await
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
+        assert_eq!(ids, ["normal".to_owned(), at_cap]);
     });
 }

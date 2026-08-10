@@ -114,7 +114,7 @@ async fn arena(context: deterministic::Context, rule_id: &str, action: Action) -
     );
     let mut host = Host::genesis(vec![
         Box::new(chat),
-        Box::new(Tasks::new(TASKS)),
+        Box::new(Tasks::new(TASKS, Box::new(sdk_testkit::MemStore::new()))),
         Box::new(auto),
     ])
     .expect("genesis");

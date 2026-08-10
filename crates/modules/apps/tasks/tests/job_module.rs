@@ -1,18 +1,19 @@
 //! the job board under test (via the merged `tasks` work module): the full
 //! lifecycle, every race/guard rejection, caps, lease clamping, the `Get`
-//! point read, origin-derived identity, snapshot/install, and commit/abort
-//! staging — plus real-`Host` proofs that first-claim-wins under the host's
-//! ordered dispatch. board ENUMERATION (status/kind listings, the census) is
-//! the index tier's job now, covered by the native tests in `src/index.rs`.
+//! point read, origin-derived identity, and commit/abort staging -- plus
+//! real-`Host` proofs that first-claim-wins under the host's ordered dispatch.
+//! board ENUMERATION (status/kind listings, the census) is the index tier's
+//! job now, covered by the native tests in `src/index.rs`.
 //!
 //! the board lives inside the `tasks` module now, so ops ride the `WorkMsg`
-//! envelope (`encode_job_*`) and the combined snapshot carries an empty
-//! task-board prefix ahead of the job-board bytes.
+//! envelope (`encode_job_*`), and it is qmdb-backed: one record per job over
+//! the injected store. these tests inject an in-memory store and assert
+//! BEHAVIOR; the cross-node round trip over the REAL store is `sync_round_trip`.
 
 use futures::executor::block_on;
 use host::{BlockContext, Host, SubmitError};
-use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot};
-use sdk_testkit::TestCtx;
+use sdk::{Ctx, Env, Error, MerkleStore as _, Module, ModuleId, Msg, Origin, StateRoot};
+use sdk_testkit::{MemStore, TestCtx};
 use tasks::{
     Job, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply,
     decode_job_event as decode_jobs_event, decode_job_reply as decode_reply,
@@ -23,6 +24,13 @@ use tasks::{MAX_ATTEMPTS, MAX_JOBS, MAX_KIND, MAX_PAYLOAD, MAX_SPEC, MAX_WORKERS
 
 // the merged work module's genesis id -- the job board now lives here.
 const JOBS: &str = "tasks";
+
+/// build the module the way a host does: concrete store first, injected as
+/// `Box<dyn MerkleStore>`. these tests assert BEHAVIOR, so the in-memory store
+/// stands in for qmdb; the real-store round trip lives in `sync_round_trip`.
+fn jobs_on_mem() -> Jobs {
+    Jobs::new(JOBS, Box::new(MemStore::new()))
+}
 
 // ---- wire builders ---------------------------------------------------------
 
@@ -164,7 +172,7 @@ async fn get(jobs: &Jobs, job_id: &str) -> Option<Job> {
 #[test]
 fn full_lifecycle_happy_path() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
 
         apply(
             &mut jobs,
@@ -235,7 +243,7 @@ fn jobs_event_codec_round_trips_submitted() {
 #[test]
 fn register_worker_gating_idempotence_unregister_and_cap() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         let empty_root = jobs.root();
 
         let err = stage_with_modules(&mut jobs, 1, ext("operator"), &[], register_worker())
@@ -352,7 +360,7 @@ fn register_worker_gating_idempotence_unregister_and_cap() {
 #[test]
 fn second_claim_is_rejected_same_and_later_block() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         apply(&mut jobs, 1, ext("submitter"), submit("j1", "k", "")).await;
 
         // worker A wins the claim.
@@ -377,7 +385,7 @@ fn second_claim_is_rejected_same_and_later_block() {
 #[test]
 fn wrong_worker_finalize_and_release_rejected() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         apply(&mut jobs, 1, ext("submitter"), submit("j1", "k", "")).await;
         apply(&mut jobs, 2, ext("worker-a"), claim("j1", 100)).await;
 
@@ -408,7 +416,7 @@ fn wrong_worker_finalize_and_release_rejected() {
 #[test]
 fn finalize_on_terminal_rejected_result_singularity() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         apply(&mut jobs, 1, ext("submitter"), submit("j1", "k", "")).await;
         apply(&mut jobs, 2, ext("worker-a"), claim("j1", 100)).await;
         apply(&mut jobs, 3, ext("worker-a"), finalize("j1", true, "first")).await;
@@ -438,7 +446,7 @@ fn finalize_on_terminal_rejected_result_singularity() {
 #[test]
 fn premature_reclaim_rejected() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         apply(&mut jobs, 1, ext("submitter"), submit("j1", "k", "")).await;
         apply(&mut jobs, 5, ext("worker-a"), claim("j1", 10)).await; // deadline = 15
 
@@ -459,7 +467,7 @@ fn premature_reclaim_rejected() {
 #[test]
 fn expired_reclaim_requeues_attempt_kept_claim_cleared() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         apply(&mut jobs, 1, ext("submitter"), submit("j1", "k", "")).await;
         apply(&mut jobs, 5, ext("worker-a"), claim("j1", 10)).await; // deadline = 15
 
@@ -477,7 +485,7 @@ fn expired_reclaim_requeues_attempt_kept_claim_cleared() {
 #[test]
 fn attempts_exhausted_reclaim_fails_the_job() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         apply(&mut jobs, 1, ext("submitter"), submit("j1", "k", "")).await;
 
         // claim + expired-reclaim, over and over. each claim bumps attempt; each
@@ -511,7 +519,7 @@ fn attempts_exhausted_reclaim_fails_the_job() {
 #[test]
 fn cancel_only_from_pending_and_only_by_submitter() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         apply(&mut jobs, 1, ext("submitter"), submit("j1", "k", "")).await;
 
         // a non-submitter cannot cancel.
@@ -537,7 +545,7 @@ fn cancel_only_from_pending_and_only_by_submitter() {
 #[test]
 fn prune_only_terminal_and_by_submitter_removes_record() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         apply(&mut jobs, 1, ext("submitter"), submit("j1", "k", "")).await;
 
         // a live (Pending) job cannot be pruned.
@@ -569,7 +577,7 @@ fn prune_only_terminal_and_by_submitter_removes_record() {
 #[test]
 fn caps_rejection_table() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
 
         let too_long_id = "x".repeat(257);
         let too_long_kind = "k".repeat(MAX_KIND + 1);
@@ -638,7 +646,7 @@ fn caps_rejection_table() {
 #[test]
 fn max_jobs_cap_is_overlay_aware() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         // fill the board to exactly MAX_JOBS distinct live ids, committing each
         // so the live-count stays O(1).
         for i in 0..MAX_JOBS {
@@ -666,7 +674,7 @@ fn max_jobs_cap_is_overlay_aware() {
 #[test]
 fn lease_views_are_clamped() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         for id in ["lo", "hi", "mid"] {
             apply(&mut jobs, 1, ext("submitter"), submit(id, "k", "")).await;
         }
@@ -696,7 +704,7 @@ fn lease_views_are_clamped() {
 #[test]
 fn queries_get_hit_and_miss() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         apply(
             &mut jobs,
             1,
@@ -736,7 +744,7 @@ fn queries_get_hit_and_miss() {
 #[test]
 fn identities_are_derived_from_origin() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         apply(
             &mut jobs,
             1,
@@ -765,12 +773,12 @@ fn identities_are_derived_from_origin() {
 }
 
 // ============================================================================
-// snapshot / install / root
+// records / root
 // ============================================================================
 
 /// build a board exercising every status + both option fields.
 async fn varied_board() -> Jobs {
-    let mut jobs = Jobs::new(JOBS);
+    let mut jobs = jobs_on_mem();
     // pending
     apply(
         &mut jobs,
@@ -832,239 +840,33 @@ async fn varied_board() -> Jobs {
     jobs
 }
 
+/// every status shape survives as its own committed record, and `root()` is a
+/// pure function of committed state (it reads the store's cached merkle root,
+/// so repeated calls cannot drift). the cross-node round trip of these exact
+/// records is `sync_round_trip`.
 #[test]
-fn snapshot_install_round_trip_and_root_stability() {
+fn every_status_shape_is_a_committed_record_and_root_is_stable() {
     block_on(async {
-        let source = varied_board().await;
-        let expected = source.root();
-        // root is a pure function of committed state.
-        assert_eq!(source.root(), expected, "root is stable across calls");
+        let jobs = varied_board().await;
+        let root = jobs.root();
+        assert_eq!(jobs.root(), root, "root is stable across calls");
+        assert_ne!(root, StateRoot::ZERO, "a populated board has a real root");
 
-        let bytes = source.snapshot();
-        let mut target = Jobs::new(JOBS);
-        target
-            .install(&bytes, expected)
-            .expect("install verified snapshot");
-        assert_eq!(target.root(), expected);
-        for id in [
-            "a-pending",
-            "b-processing",
-            "c-done",
-            "d-failed",
-            "e-cancelled",
+        for (id, status) in [
+            ("a-pending", JobStatus::Pending),
+            ("b-processing", JobStatus::Processing),
+            ("c-done", JobStatus::Done),
+            ("d-failed", JobStatus::Failed),
+            ("e-cancelled", JobStatus::Cancelled),
         ] {
-            let job = get(&source, id).await.expect("source job exists");
-            assert_eq!(
-                get(&target, id).await.as_ref(),
-                Some(&job),
-                "every job survives the round trip"
-            );
+            assert_eq!(get(&jobs, id).await.expect("job exists").status, status);
         }
 
-        // the advertised state-sync handle carries those exact bytes.
-        match source.state_sync_handle().expect("handle") {
-            sdk::StateSyncHandle::SnapshotBytes(h) => assert_eq!(h, bytes),
-            other => panic!("expected SnapshotBytes, got {other:?}"),
+        // the module is qmdb-backed: sync rides the store's resolver lane.
+        match jobs.state_sync_handle().expect("handle") {
+            sdk::StateSyncHandle::ResolverBacked { backend, .. } => assert_eq!(backend, "qmdb"),
+            other => panic!("expected ResolverBacked, got {other:?}"),
         }
-    });
-}
-
-#[test]
-fn install_rejects_wrong_root_and_corrupt_bytes() {
-    block_on(async {
-        let source = varied_board().await;
-        let bytes = source.snapshot();
-
-        // wrong expected root.
-        let mut target = Jobs::new(JOBS);
-        assert!(matches!(
-            target.install(&bytes, StateRoot::ZERO),
-            Err(Error::Module(m)) if m.contains("root mismatch")
-        ));
-
-        // trailing bytes.
-        let mut trailing = bytes.clone();
-        trailing.push(0);
-        assert!(matches!(
-            target.install(&trailing, source.root()),
-            Err(Error::Module(m)) if m.contains("trailing bytes")
-        ));
-
-        // truncated.
-        assert!(matches!(
-            target.install(&bytes[..bytes.len() - 1], source.root()),
-            Err(Error::Module(_))
-        ));
-
-        // an empty board round-trips too (root of the empty map).
-        let empty = Jobs::new(JOBS);
-        let mut fresh = Jobs::new(JOBS);
-        fresh
-            .install(&empty.snapshot(), empty.root())
-            .expect("empty install");
-        assert_eq!(fresh.root(), empty.root());
-    });
-}
-
-// ---- hand-crafted snapshot bytes (the module's canonical encoding) ---------
-
-fn push_string(out: &mut Vec<u8>, value: &str) {
-    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
-    out.extend_from_slice(value.as_bytes());
-}
-
-/// encode a one-job snapshot with full control over status/claim/result — the
-/// only way to present execute-unreachable shapes to `install`.
-fn snapshot_one(
-    status: u8,
-    attempt: u64,
-    claim: Option<(&str, u64, u64)>,
-    result: Option<(bool, &str)>,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&0u64.to_le_bytes()); // empty task board (task count)
-    out.extend_from_slice(&1u64.to_le_bytes()); // job count
-    push_string(&mut out, "j1"); // job_id
-    push_string(&mut out, "k"); // kind
-    push_string(&mut out, "spec"); // spec
-    push_string(&mut out, "ext:00"); // submitter
-    out.push(status);
-    out.extend_from_slice(&attempt.to_le_bytes());
-    match claim {
-        None => out.push(0),
-        Some((worker, height, lease)) => {
-            out.push(1);
-            push_string(&mut out, worker);
-            out.extend_from_slice(&height.to_le_bytes());
-            out.extend_from_slice(&lease.to_le_bytes());
-        }
-    }
-    match result {
-        None => out.push(0),
-        Some((ok, payload)) => {
-            out.push(1);
-            out.push(u8::from(ok));
-            push_string(&mut out, payload);
-        }
-    }
-    out.extend_from_slice(&1u64.to_le_bytes()); // created_at_height
-    out.extend_from_slice(&1u64.to_le_bytes()); // updated_at_height
-    out.extend_from_slice(&0u64.to_le_bytes()); // worker count
-    out
-}
-
-fn snapshot_workers(workers: &[String]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&0u64.to_le_bytes()); // empty task board (task count)
-    out.extend_from_slice(&0u64.to_le_bytes()); // job count
-    out.extend_from_slice(&(workers.len() as u64).to_le_bytes());
-    for worker in workers {
-        push_string(&mut out, worker);
-    }
-    out
-}
-
-fn root_of_bytes(bytes: &[u8]) -> StateRoot {
-    use sha2::Digest as _;
-    StateRoot(sha2::Sha256::digest(bytes).into())
-}
-
-#[test]
-fn install_rejects_execute_unreachable_shapes() {
-    block_on(async {
-        // (status byte, claim, result, expected rejection)
-        let cases = vec![
-            // Processing without a claim would be permanently wedged: no
-            // transition (finalize/release/reclaim) can repair it.
-            (1, None, None, "processing job without claim"),
-            // Pending never carries a claim (submit/release/reclaim all clear it).
-            (0, Some(("ext:00", 1, 10)), None, "pending job with claim"),
-            // Done/Failed are only ever produced with a stored result.
-            (
-                2,
-                Some(("ext:00", 1, 10)),
-                None,
-                "finalized job without result",
-            ),
-            (
-                3,
-                Some(("ext:00", 1, 10)),
-                None,
-                "finalized job without result",
-            ),
-        ];
-        for (status, claim, result, needle) in cases {
-            let bytes = snapshot_one(status, 1, claim, result);
-            let mut target = Jobs::new(JOBS);
-            // decode rejects BEFORE the root comparison, so the expected root
-            // is irrelevant here.
-            let err = target
-                .install(&bytes, root_of_bytes(&bytes))
-                .expect_err("execute-unreachable shape must be rejected");
-            assert!(
-                matches!(err, Error::Module(ref m) if m.contains(needle)),
-                "expected `{needle}`, got {err:?}"
-            );
-        }
-
-        // sanity: shapes satisfying the enforced invariants install fine —
-        // install checks exactly those four, nothing stricter.
-        let ok_cases = vec![
-            (0, None, None),                                    // Pending
-            (1, Some(("ext:00", 1, 10)), None),                 // Processing
-            (2, Some(("ext:00", 1, 10)), Some((true, "done"))), // Done
-            (3, None, Some((false, "attempts exhausted"))),     // Failed, result stored
-            (4, None, None),                                    // Cancelled (no result)
-        ];
-        for (status, claim, result) in ok_cases {
-            let bytes = snapshot_one(status, 1, claim, result);
-            let mut target = Jobs::new(JOBS);
-            target
-                .install(&bytes, root_of_bytes(&bytes))
-                .expect("execute-reachable shape must install");
-        }
-    });
-}
-
-#[test]
-fn worker_set_snapshot_round_trip_and_strict_decode() {
-    block_on(async {
-        let mut source = Jobs::new(JOBS);
-        for module in ["agent", "bot"] {
-            stage_with_modules(
-                &mut source,
-                1,
-                Origin::Module(module.into()),
-                &[],
-                register_worker(),
-            )
-            .await
-            .expect("register worker");
-        }
-        source.commit_block().await.unwrap();
-
-        let bytes = source.snapshot();
-        let expected = source.root();
-        let mut target = Jobs::new(JOBS);
-        target
-            .install(&bytes, expected)
-            .expect("worker set round trip");
-        assert_eq!(target.root(), expected);
-
-        let unsorted = snapshot_workers(&["bot".into(), "agent".into()]);
-        let err = target
-            .install(&unsorted, root_of_bytes(&unsorted))
-            .expect_err("worker ids must be strictly ascending");
-        assert!(matches!(err, Error::Module(m) if m.contains("worker ids not strictly ascending")));
-
-        let too_many: Vec<String> = (0..=MAX_WORKERS)
-            .map(|i| format!("worker-{i:02}"))
-            .collect();
-        let capped = snapshot_workers(&too_many);
-        let err = target
-            .install(&capped, root_of_bytes(&capped))
-            .expect_err("worker cap must apply during decode");
-        assert!(matches!(err, Error::Module(m) if m.contains("worker cap")));
     });
 }
 
@@ -1072,12 +874,33 @@ fn worker_set_snapshot_round_trip_and_strict_decode() {
 fn claim_attempt_saturates_instead_of_wrapping() {
     block_on(async {
         // attempt counts are only ever produced by claim, so u64::MAX is not
-        // execute-reachable organically — install a crafted (but shape-valid)
-        // board to prove the increment saturates instead of wrapping.
-        let bytes = snapshot_one(0, u64::MAX, None, None); // Pending, attempt MAX
-        let mut jobs = Jobs::new(JOBS);
-        jobs.install(&bytes, root_of_bytes(&bytes))
-            .expect("install crafted board");
+        // execute-reachable: seed the store record directly (the store is
+        // injected, so a test can write one) to prove the increment saturates
+        // instead of wrapping.
+        let mut store = MemStore::new();
+        let job = serde_json::json!({
+            "job_id": "j1",
+            "kind": "k",
+            "spec": "spec",
+            "submitter": "ext:00",
+            "status": "pending",
+            "attempt": u64::MAX,
+            "claim": null,
+            "result": null,
+            "created_at_height": 1,
+            "updated_at_height": 1,
+        });
+        store
+            .commit_batch(vec![
+                (
+                    sdk::store_key(b"j/j1"),
+                    Some(serde_json::to_vec(&job).unwrap()),
+                ),
+                (sdk::store_key(b"j#"), Some(1u64.to_le_bytes().to_vec())),
+            ])
+            .await
+            .expect("seed the store");
+        let mut jobs = Jobs::new(JOBS, Box::new(store));
 
         apply(&mut jobs, 5, ext("worker-a"), claim("j1", 50)).await;
         let job = get(&jobs, "j1").await.expect("exists");
@@ -1093,7 +916,7 @@ fn claim_attempt_saturates_instead_of_wrapping() {
 #[test]
 fn queries_answer_committed_state_only() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
 
         // a staged-but-uncommitted submit is invisible to the read surface.
         stage(&mut jobs, 1, ext("submitter"), submit("j1", "k", ""))
@@ -1136,7 +959,7 @@ fn queries_answer_committed_state_only() {
 #[test]
 fn commit_and_abort_staging_including_prune_tombstones() {
     block_on(async {
-        let mut jobs = Jobs::new(JOBS);
+        let mut jobs = jobs_on_mem();
         let root0 = jobs.root();
 
         // a staged submit moves neither the committed root nor the query view.
@@ -1232,7 +1055,7 @@ impl Module for ClaimingWorker {
 fn host_submit_fans_out_to_registered_worker_and_claims_same_block() {
     block_on(async {
         let mut host = Host::genesis(vec![
-            Box::new(Jobs::new(JOBS)),
+            Box::new(jobs_on_mem()),
             Box::new(ClaimingWorker { id: "agent".into() }),
         ])
         .expect("genesis");
@@ -1269,7 +1092,7 @@ fn host_submit_fans_out_to_registered_worker_and_claims_same_block() {
 #[test]
 fn host_first_claim_wins_across_ordered_blocks() {
     block_on(async {
-        let mut host = Host::genesis(vec![Box::new(Jobs::new(JOBS))]).expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(jobs_on_mem())]).expect("genesis");
 
         host.submit_at(as_origin(1, ext("submitter")), submit("j1", "k", ""))
             .await
@@ -1326,7 +1149,7 @@ impl Module for DoubleClaim {
 fn host_two_claims_in_one_block_abort_atomically() {
     block_on(async {
         let mut host = Host::genesis(vec![
-            Box::new(Jobs::new(JOBS)),
+            Box::new(jobs_on_mem()),
             Box::new(DoubleClaim {
                 job_id: "j1".into(),
             }),
