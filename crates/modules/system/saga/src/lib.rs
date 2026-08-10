@@ -27,6 +27,35 @@
 //!   sequence, every validator times out identically; liveness comes from
 //!   anyone cranking, safety never depends on who does.
 //!
+//! ## the callback-poison rule (design §4)
+//!
+//! the terminal transition and the requester callback commit in one block; a
+//! callback that ERRORS aborts that finalized block, which replays as a
+//! deterministic no-op — wedging the saga at `Pending` forever. two defenses:
+//! `reply_to` is validated against `ctx.module_root` at trigger time (an
+//! unknown or self-targeting callback is rejected before a saga exists), and
+//! requester callback arms MUST be no-fail by construction — treat a decode
+//! failure as a staged no-op plus an event, never an `Err`.
+//!
+//! ## leases
+//!
+//! [`SagaModule::new`] runs [`LeasePolicy::Open`]: no assignee, any
+//! submitter's result accepted (first agreed one wins), lease windows still
+//! tracked when the trigger asks (so `Crank` can retry a silent worker).
+//! [`SagaModule::with_assignment`] additionally rendezvous-assigns each
+//! attempt to `pool[H(saga_id ‖ attempt ‖ height) % n]` over the valset
+//! module's membership, with a capability registry on the side: a trigger
+//! that names a capability then draws its pool from that tag's
+//! ANNOUNCED PROVIDERS instead — only nodes that can execute the work ever
+//! hold its lease, and a tag nobody provides assigns nobody (never the raw
+//! valset). under [`LeasePolicy::Strict`] a result is accepted only from the
+//! assignee's external origin. when the pool is empty or unavailable the
+//! assignee is `None` and the emitted [`WorkerRequest`] is an ANNOUNCEMENT:
+//! no result can land for it under strict — a capable node claims it with
+//! `Accept` (first in consensus order wins the lease, and the re-emitted
+//! request names the winner), so N capable nodes never each pay for the
+//! same execution.
+//!
 //! ## the key space
 //!
 //! | logical key | value |
@@ -641,15 +670,17 @@ impl SagaModule {
 
     /// the WorkerRequest a pending attempt corresponds to — the ONE projection
     /// the effect lane, `AssignedPending` and `UnassignedPending` all build, so
-    /// a resident pump discovers exactly the order the events carried.
-    async fn worker_request(&self, saga_id: &str, saga: &Saga) -> Result<WorkerRequest, Error> {
-        Ok(WorkerRequest {
-            saga_id: saga_id.to_string(),
+    /// a resident pump discovers exactly the order the events carried. the spec
+    /// is handed in: the effect lane already holds the trigger's bytes, and
+    /// only the query lane pays [`Self::load_spec`] to reassemble them.
+    fn worker_request(saga_id: String, saga: &Saga, spec: Vec<u8>) -> WorkerRequest {
+        WorkerRequest {
+            saga_id,
             attempt: saga.attempt,
-            spec: self.load_spec(saga_id, saga.spec_len).await?,
+            spec,
             deadline: saga.deadline,
             assignee: saga.assignee.clone(),
-        })
+        }
     }
 
     /// the candidate pool one attempt is assigned from. a saga that names a
@@ -824,13 +855,7 @@ impl SagaModule {
         // try-decodes and claims it; unclaimed events are plain observability.
         ctx.emit_event(Event {
             source: self.id.clone(),
-            payload: encode_worker_request(&WorkerRequest {
-                saga_id,
-                attempt: saga.attempt,
-                spec: spec.to_vec(),
-                deadline: saga.deadline,
-                assignee: saga.assignee,
-            }),
+            payload: encode_worker_request(&Self::worker_request(saga_id, &saga, spec.to_vec())),
         });
         Ok(())
     }
@@ -1208,13 +1233,7 @@ impl SagaModule {
                 // naming the winner — every other node's worker skips it.
                 ctx.emit_event(Event {
                     source: self.id.clone(),
-                    payload: encode_worker_request(&WorkerRequest {
-                        saga_id,
-                        attempt: saga.attempt,
-                        spec,
-                        deadline: saga.deadline,
-                        assignee: saga.assignee,
-                    }),
+                    payload: encode_worker_request(&Self::worker_request(saga_id, &saga, spec)),
                 });
             }
             SagaMsg::Crank {} => {
@@ -1402,7 +1421,8 @@ impl Module for SagaModule {
                     if saga.assignee.as_deref() != Some(assignee.as_slice()) {
                         continue;
                     }
-                    requests.push(self.worker_request(&saga_id, &saga).await?);
+                    let spec = self.load_spec(&saga_id, saga.spec_len).await?;
+                    requests.push(Self::worker_request(saga_id, &saga, spec));
                 }
                 Ok(encode_reply(&SagaReply::AssignedPending(requests)))
             }
@@ -1419,7 +1439,8 @@ impl Module for SagaModule {
                     if saga.assignee.is_some() {
                         continue;
                     }
-                    requests.push(self.worker_request(&saga_id, &saga).await?);
+                    let spec = self.load_spec(&saga_id, saga.spec_len).await?;
+                    requests.push(Self::worker_request(saga_id, &saga, spec));
                 }
                 Ok(encode_reply(&SagaReply::UnassignedPending(requests)))
             }
