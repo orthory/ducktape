@@ -23,6 +23,13 @@
 //! uniformly — cargo warns "unused patch" for modules whose graphs never pull
 //! those crates, which is expected and harmless.
 //!
+//! that scratch workspace also holds `tree/` — a snapshot of the platform
+//! checkout — and the build compiles THAT, never the checkout in place. The
+//! committed artifact is therefore identical from any checkout path, which the
+//! copies alone never were: cargo hashes a path package's absolute location
+//! into `-C metadata` and so into every symbol name unless the package sits
+//! under the workspace being built. See [`synthesize`] and [`remap_flags`].
+//!
 //! `--platform-root` points at the ducktape checkout supplying `guest-adapter`
 //! and the patch crates; it defaults to the checkout this binary was built
 //! from, so in-tree use (`cargo run -p guest-builder`) needs no flags and an
@@ -37,7 +44,11 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::process::{self, Command, Stdio};
+
+/// the platform checkout, copied under the scratch workspace root — see
+/// [`snapshot`] for why the build compiles the copy and not the checkout.
+const TREE: &str = "tree";
 
 const USAGE: &str = "usage: guest-builder <module-dir> [--index] \
      [--out <artifact.wasm>] [--scratch <dir>] [--platform-root <dir>]";
@@ -119,15 +130,16 @@ fn run() -> Result<(), String> {
         )),
     };
     synthesize(&scratch, &module_dir, &module.name, &platform_root, kind)?;
-    build(&scratch)?;
+    build(&scratch, &remap_flags(&module_dir, &scratch))?;
 
     let out = match args.out {
         Some(path) => path,
         None => module_dir.join(kind.artifact()),
     };
+    let cdylib = cdylib_path(&scratch, &module.name, kind);
     match kind {
-        GuestKind::Component => componentize(&scratch, &module.name, &out)?,
-        GuestKind::Index => copy_cdylib(&scratch, &module.name, &out)?,
+        GuestKind::Component => componentize(&cdylib, &out)?,
+        GuestKind::Index => copy_cdylib(&cdylib, &out)?,
     }
     println!("{}", out.display());
     Ok(())
@@ -259,6 +271,14 @@ fn read_module(module_dir: &Path, kind: GuestKind) -> Result<Module, String> {
 /// write the scratch packaging workspace: a cdylib crate whose only dependency
 /// is the module (the contract feature on, native off) plus the uniform wasm32
 /// patch set. regenerated on every run — nothing here is hand-maintained state.
+///
+/// Every path dependency is reached through [`snapshot`] — `tree/...`, INSIDE
+/// the scratch workspace — because cargo hashes a path package's location into
+/// its `-C metadata`, and thus into every symbol name, relative to the
+/// workspace root when the package sits under it and ABSOLUTELY when it does
+/// not. Depending on the checkout directly is what made two checkouts of the
+/// same source produce different bytes; no rustc flag can undo it, since the
+/// hash is cargo's and is fixed before rustc runs.
 fn synthesize(
     scratch: &Path,
     module_dir: &Path,
@@ -268,12 +288,16 @@ fn synthesize(
 ) -> Result<(), String> {
     let src = scratch.join("src");
     fs::create_dir_all(&src).map_err(|e| format!("creating {}: {e}", src.display()))?;
+    snapshot(platform_root, &scratch.join(TREE))?;
 
-    let module_path = module_dir.display();
-    let stubs = platform_root.join("crates/guests/stubs");
-    let stubs = stubs.display();
-    let blst = platform_root.join("patches/blst");
-    let blst = blst.display();
+    // an out-of-tree module is not ours to relocate: it keeps its own path, and
+    // with it the checkout-dependence this snapshot exists to remove.
+    let module_path = match module_dir.strip_prefix(platform_root) {
+        Ok(rel) => format!("{TREE}/{}", rel.display()),
+        Err(_) => module_dir.display().to_string(),
+    };
+    let stubs = format!("{TREE}/crates/guests/stubs");
+    let blst = format!("{TREE}/patches/blst");
     let feature = kind.feature();
     let suffix = kind.shell_suffix();
     let manifest = format!(
@@ -294,7 +318,11 @@ crate-type = ["cdylib"]
 [dependencies]
 {name} = {{ path = "{module_path}", default-features = false, features = ["{feature}"] }}
 
+# `exclude` is load-bearing: without it THIS workspace claims the snapshot's
+# crates, and their `workspace = true` inheritance resolves against this bare
+# table instead of the platform manifest one directory down.
 [workspace]
+exclude = ["{TREE}"]
 
 # the uniform wasm32 patch set (see crates/guests/stubs and patches/blst):
 # applied to every synthesized guest; cargo's "unused patch" warning on
@@ -316,13 +344,102 @@ blst = {{ path = "{blst}" }}
     write(&src.join("lib.rs"), &lib)
 }
 
+/// refresh `<scratch>/tree` with a copy of the platform checkout — the source
+/// the guest build actually compiles, and the reason its bytes do not depend on
+/// where the checkout lives.
+///
+/// tar rather than a hand-rolled walk: it carries symlinks and mtimes over
+/// verbatim, and the mtimes are what keep the next build incremental. `target`,
+/// `.git` and `.worktree` are build output, history and other checkouts —
+/// copying them would drag tens of GB along and recurse into the snapshot
+/// itself. What is left costs ~40 MB of disk per module.
+///
+/// The exclude patterns are UNANCHORED on purpose — no leading `./`. Anchored,
+/// they skip only the top-level `target`, and the nested
+/// `crates/guests/*-wasm/target` dirs (~145 MB each) ride along into every
+/// snapshot: 646 MB per module instead of 42 MB.
+fn snapshot(platform_root: &Path, tree: &Path) -> Result<(), String> {
+    // wiped first: tar overwrites, it never removes, so a file deleted from the
+    // checkout would otherwise live on in here forever.
+    if tree.exists() {
+        fs::remove_dir_all(tree).map_err(|e| format!("clearing {}: {e}", tree.display()))?;
+    }
+    fs::create_dir_all(tree).map_err(|e| format!("creating {}: {e}", tree.display()))?;
+
+    let mut pack = Command::new("tar")
+        .args([
+            "-cf",
+            "-",
+            "--exclude=target",
+            "--exclude=.git",
+            "--exclude=.worktree",
+            "-C",
+        ])
+        .arg(platform_root)
+        .arg(".")
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("running tar: {e}"))?;
+    let Some(packed) = pack.stdout.take() else {
+        return Err("tar produced no output stream".to_string());
+    };
+    let unpack = Command::new("tar")
+        .args(["-xf", "-", "-C"])
+        .arg(tree)
+        .stdin(packed)
+        .status()
+        .map_err(|e| format!("running tar: {e}"))?;
+    let packing = pack.wait().map_err(|e| format!("waiting on tar: {e}"))?;
+    if !packing.success() || !unpack.success() {
+        return Err(format!(
+            "snapshotting {} into {} failed",
+            platform_root.display(),
+            tree.display()
+        ));
+    }
+    Ok(())
+}
+
 // ============================================================================
 // build + componentize
 // ============================================================================
 
-fn build(scratch: &Path) -> Result<(), String> {
+/// `--remap-path-prefix` mappings that keep every builder-local absolute path
+/// out of the artifact's CONTENT — panic locations name their source file, so
+/// without these the bytes carry the builder's `/home/<user>/...` around
+/// forever. Half of path-independence; [`synthesize`]'s snapshot is the other
+/// half (symbol names). `ops/wasm-repro-check.sh` and the host-path scan in
+/// `make wasm-modules-check` are the gates.
+///
+/// The scratch mapping covers the snapshot with it, so the platform checkout
+/// needs no mapping of its own — the build never names it.
+fn remap_flags(module_dir: &Path, scratch: &Path) -> String {
+    let home = env::var("HOME").unwrap_or_default();
+    let tool_home =
+        |key: &str, dir: &str| env::var(key).unwrap_or_else(|_| format!("{home}/{dir}"));
+    let mappings = [
+        (tool_home("CARGO_HOME", ".cargo"), "/cargo"),
+        (tool_home("RUSTUP_HOME", ".rustup"), "/rustup"),
+        (scratch.display().to_string(), "/ducktape"),
+        // an out-of-tree module is compiled where it lies (see `synthesize`).
+        (module_dir.display().to_string(), "/module"),
+    ];
+    let flags: Vec<String> = mappings
+        .iter()
+        .map(|(from, to)| format!("--remap-path-prefix={from}={to}"))
+        .collect();
+    // the ENCODED form's separator: plain `RUSTFLAGS` splits on whitespace, so
+    // a checkout path containing a space would tear one flag into two.
+    flags.join("\x1f")
+}
+
+fn build(scratch: &Path, rustflags: &str) -> Result<(), String> {
     let status = Command::new(cargo())
         .args(["build", "--target", "wasm32-unknown-unknown", "--release"])
+        .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
+        // the encoded form wins over the plain one, but an inherited
+        // `RUSTFLAGS` would be a confusing dead passenger.
+        .env_remove("RUSTFLAGS")
         .current_dir(scratch)
         .status()
         .map_err(|e| format!("running cargo build: {e}"))?;
@@ -332,12 +449,11 @@ fn build(scratch: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn componentize(scratch: &Path, name: &str, out: &Path) -> Result<(), String> {
-    let cdylib = cdylib_path(scratch, name, GuestKind::Component);
+fn componentize(cdylib: &Path, out: &Path) -> Result<(), String> {
     let status = Command::new("wasm-tools")
         .arg("component")
         .arg("new")
-        .arg(&cdylib)
+        .arg(cdylib)
         .arg("-o")
         .arg(out)
         .status()
@@ -350,9 +466,8 @@ fn componentize(scratch: &Path, name: &str, out: &Path) -> Result<(), String> {
 
 /// an index guest ships as the built cdylib itself — fluentabi is core wasm,
 /// so there is nothing to componentize.
-fn copy_cdylib(scratch: &Path, name: &str, out: &Path) -> Result<(), String> {
-    let cdylib = cdylib_path(scratch, name, GuestKind::Index);
-    fs::copy(&cdylib, out)
+fn copy_cdylib(cdylib: &Path, out: &Path) -> Result<(), String> {
+    fs::copy(cdylib, out)
         .map(|_| ())
         .map_err(|e| format!("copying {} to {}: {e}", cdylib.display(), out.display()))
 }

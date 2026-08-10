@@ -8,7 +8,7 @@
 CARGO ?= cargo
 BIN_DEST ?= $(HOME)/.cargo/bin
 
-.PHONY: all dev demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-node install-coordinator test clean wasm-modules wasm-modules-check labs-gate
+.PHONY: all dev demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-repro-check labs-gate
 
 ## build every workspace crate (the default target)
 all:
@@ -138,7 +138,9 @@ test: wasm-modules-check
 ## and wasm-tools (cargo install wasm-tools). component bytes are toolchain-
 ## dependent: a rebuild on a different rustc may legitimately differ from the
 ## committed bytes — commit the refreshed set TOGETHER; `wasm-modules-check`
-## guards mutual consistency, not reproducibility.
+## guards mutual consistency. bytes no longer depend on WHERE the checkout
+## lives (guest-builder remaps the path prefixes away), so the same toolchain
+## on any box reproduces them — `wasm-repro-check` is that pin.
 #
 # Every product/example module carries its own guest port (src/guest.rs behind
 # the `guest` feature); guest-builder synthesizes the packaging workspace and
@@ -217,7 +219,22 @@ wasm-modules-check:
 	@for m in $(INDEX_MODULES); do \
 	  test -f $$m/index.wasm || { echo "missing $$m/index.wasm (make wasm-modules)"; exit 1; }; \
 	done
+# and no committed artifact may carry a builder-local absolute path. guest-builder
+# remaps the checkout, CARGO_HOME and RUSTUP_HOME prefixes to stable tokens (see
+# `remap_flags`), so a `/home/...` or `/Users/...` in the bytes means an artifact
+# built without that remap — the state where every box disagrees on every module.
+	@leaks=$$(git ls-files -z '*.wasm' | xargs -0 grep -laE '/home/|/Users/' || true); \
+	  test -z "$$leaks" || { \
+	    echo "builder host paths embedded in: $$leaks"; \
+	    echo "rebuild with make wasm-modules (guest-builder --remap-path-prefix)"; exit 1; }
 	@echo "wasm module artifacts are mutually consistent"
+
+## the reproducibility gate: one guest built from TWO different checkout paths
+## must be byte-identical, and carry no host path. Needs the wasm32 target and
+## wasm-tools (which `wasm-modules-check` deliberately does not), so it stands
+## apart from the pre-push `test` gate. See ops/wasm-repro-check.sh.
+wasm-repro-check:
+	@bash ops/wasm-repro-check.sh
 
 clean:
 	$(CARGO) clean
