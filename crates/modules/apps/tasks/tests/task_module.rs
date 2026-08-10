@@ -99,10 +99,7 @@ fn create_list_and_update_status() {
         assert_eq!(listed[0].updated_at, 11);
 
         tasks
-            .execute(
-                &mut at(22),
-                &update("task-a", TaskStatus::InProgress),
-            )
+            .execute(&mut at(22), &update("task-a", TaskStatus::InProgress))
             .await
             .expect("update status");
         tasks.commit_block().await.expect("commit update");
@@ -330,7 +327,11 @@ fn oversized_task_record_is_refused_before_staging() {
         );
 
         tasks.commit_block().await.expect("commit");
-        assert_eq!(tasks.root(), root0, "a refused write must not move the root");
+        assert_eq!(
+            tasks.root(),
+            root0,
+            "a refused write must not move the root"
+        );
         assert!(module_tasks(&tasks).await.is_empty());
     });
 }

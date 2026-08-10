@@ -1,13 +1,14 @@
 //! the job board under test (via the merged `tasks` work module): the full
 //! lifecycle, every race/guard rejection, caps, lease clamping, the `Get`
-//! point read, origin-derived identity, snapshot/install, and commit/abort
-//! staging — plus real-`Host` proofs that first-claim-wins under the host's
-//! ordered dispatch. board ENUMERATION (status/kind listings, the census) is
-//! the index tier's job now, covered by the native tests in `src/index.rs`.
+//! point read, origin-derived identity, and commit/abort staging -- plus
+//! real-`Host` proofs that first-claim-wins under the host's ordered dispatch.
+//! board ENUMERATION (status/kind listings, the census) is the index tier's
+//! job now, covered by the native tests in `src/index.rs`.
 //!
 //! the board lives inside the `tasks` module now, so ops ride the `WorkMsg`
-//! envelope (`encode_job_*`) and the combined snapshot carries an empty
-//! task-board prefix ahead of the job-board bytes.
+//! envelope (`encode_job_*`), and it is qmdb-backed: one record per job over
+//! the injected store. these tests inject an in-memory store and assert
+//! BEHAVIOR; the cross-node round trip over the REAL store is `sync_round_trip`.
 
 use futures::executor::block_on;
 use host::{BlockContext, Host, SubmitError};

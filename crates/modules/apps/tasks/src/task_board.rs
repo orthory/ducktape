@@ -8,7 +8,11 @@
 //!
 //! writes stage during `execute` and publish only at `commit_block`; reads go
 //! through the staged overlay, so a later op in the same block sees an earlier
-//! one's write and the unpaged `List` shows this block's staged tasks.
+//! one's write. `List` reads through it too -- DELIBERATELY, and unlike the job
+//! board's committed-only `Get`: `automations` probes this list mid-block for a
+//! duplicate id before emitting its create, so a task staged earlier in the
+//! SAME block must be visible or the probe passes and the create aborts the
+//! block. do not "harmonize" the two boards' read visibility.
 
 use std::collections::BTreeSet;
 
@@ -143,9 +147,9 @@ pub(crate) async fn query_list(staged: &StagedStore) -> Result<TaskReply, Error>
     let index = load_index(staged).await?;
     let mut tasks = Vec::with_capacity(index.len());
     for task_id in &index {
-        let task = load(staged, task_id).await?.ok_or_else(|| {
-            Error::Module(format!("task index names a missing task: {task_id}"))
-        })?;
+        let task = load(staged, task_id)
+            .await?
+            .ok_or_else(|| Error::Module(format!("task index names a missing task: {task_id}")))?;
         tasks.push(task);
     }
     Ok(TaskReply::Tasks(tasks))

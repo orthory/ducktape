@@ -46,7 +46,10 @@ async fn apply(module: &mut Tasks, height: u64, origin: Origin, payload: Vec<u8>
         target: TASKS.into(),
         payload,
     };
-    module.execute(&mut ctx(height, origin), &msg).await.unwrap();
+    module
+        .execute(&mut ctx(height, origin), &msg)
+        .await
+        .unwrap();
     module.commit_block().await.unwrap();
 }
 

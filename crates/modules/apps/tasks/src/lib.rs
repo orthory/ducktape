@@ -44,8 +44,8 @@ mod guest;
 mod job_board;
 mod task_board;
 
-// re-export the job board's public caps so external callers keep referring to
-// `tasks::MAX_PAYLOAD` etc.
+// re-export both boards' public caps so external callers keep referring to
+// `tasks::MAX_PAYLOAD` / `tasks::MAX_TASK_ID`.
 pub use job_board::{
     MAX_ATTEMPTS, MAX_JOB_ID, MAX_JOBS, MAX_KIND, MAX_LEASE_VIEWS, MAX_LIST_LIMIT, MAX_PAYLOAD,
     MAX_SPEC, MAX_WORKER_MODULE_ID, MAX_WORKERS, MIN_LEASE_VIEWS,

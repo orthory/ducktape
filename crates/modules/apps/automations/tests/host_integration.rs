@@ -115,10 +115,7 @@ fn genesis() -> Host {
         INBOX,
     );
     Host::genesis(vec![
-        Box::new(Tasks::new(
-            TASKS,
-            Box::new(sdk_testkit::MemStore::new()),
-        )),
+        Box::new(Tasks::new(TASKS, Box::new(sdk_testkit::MemStore::new()))),
         Box::new(RelayChat),
         Box::new(auto),
     ])

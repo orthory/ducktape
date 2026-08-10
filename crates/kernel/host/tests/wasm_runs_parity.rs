@@ -140,10 +140,7 @@ async fn siblings(
             "saga",
             Some("runs".into()),
         )),
-        Box::new(Tasks::new(
-            "tasks",
-            Box::new(sdk_testkit::MemStore::new()),
-        )),
+        Box::new(Tasks::new("tasks", Box::new(sdk_testkit::MemStore::new()))),
         Box::new(Files::open("files", files_dir).expect("files open")),
     ];
     if let Some(members) = assignment_members {
