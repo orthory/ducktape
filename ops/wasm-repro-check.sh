@@ -30,11 +30,22 @@ work="$repo/target/wasm-repro"
 rm -rf "$work"
 
 # the copy is a DIFFERENT absolute path, which is the whole point; target/ and
-# .git are build output and history, neither of which a build reads.
+# .git are build output and history, neither of which a build reads. The
+# patterns are UNANCHORED (no `./`) so nested build output — the ~145 MB
+# crates/guests/*-wasm/target dirs — is skipped too, not just the top level.
 copy="$work/checkout-at-another-path"
 mkdir -p "$copy"
-tar -cf - -C "$repo" --exclude=./target --exclude=./.git --exclude=./.worktree . |
+tar -cf - -C "$repo" --exclude=target --exclude=.git --exclude=.worktree . |
   tar -xf - -C "$copy"
+
+# a re-anchored pattern costs 15x and fails nothing else here, so the size IS
+# the assertion. Source tree is ~42 MB; anchored it was 624 MB.
+copied_mb=$(du -sm "$copy" | cut -f1)
+if [ "$copied_mb" -gt 200 ]; then
+  echo "wasm-repro-check: tree copy is ${copied_mb} MB — build output leaked in." >&2
+  echo "  the --exclude patterns must stay UNANCHORED (no leading './')." >&2
+  exit 1
+fi
 
 cargo build -q -p guest-builder
 builder="${CARGO_TARGET_DIR:-$repo/target}/debug/guest-builder"

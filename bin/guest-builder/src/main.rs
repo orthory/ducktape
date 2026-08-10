@@ -353,6 +353,11 @@ blst = {{ path = "{blst}" }}
 /// `.git` and `.worktree` are build output, history and other checkouts —
 /// copying them would drag tens of GB along and recurse into the snapshot
 /// itself. What is left costs ~40 MB of disk per module.
+///
+/// The exclude patterns are UNANCHORED on purpose — no leading `./`. Anchored,
+/// they skip only the top-level `target`, and the nested
+/// `crates/guests/*-wasm/target` dirs (~145 MB each) ride along into every
+/// snapshot: 646 MB per module instead of 42 MB.
 fn snapshot(platform_root: &Path, tree: &Path) -> Result<(), String> {
     // wiped first: tar overwrites, it never removes, so a file deleted from the
     // checkout would otherwise live on in here forever.
@@ -365,9 +370,9 @@ fn snapshot(platform_root: &Path, tree: &Path) -> Result<(), String> {
         .args([
             "-cf",
             "-",
-            "--exclude=./target",
-            "--exclude=./.git",
-            "--exclude=./.worktree",
+            "--exclude=target",
+            "--exclude=.git",
+            "--exclude=.worktree",
             "-C",
         ])
         .arg(platform_root)
