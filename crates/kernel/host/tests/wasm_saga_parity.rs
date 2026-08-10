@@ -1,12 +1,14 @@
-//! the adapter-port equivalence proof for the saga cutover: the `saga` guest
-//! component (the NATIVE `saga` crate compiled to wasm behind `guest-adapter`)
-//! and the native `SagaModule` answer the SAME op sequence with IDENTICAL
-//! query replies, emit IDENTICAL work-order events, and their roots move in
-//! lockstep. the representation difference is pinned with saga's OWN genesis shape:
-//! unlike the ZERO-sentinel modules, saga's empty canonical encoding (a bare
-//! zero count) hashes to the SAME digest as the wasm port's empty host-KV
-//! store, so the roots COINCIDE at genesis and diverge at the first committed
-//! write — never to re-converge.
+//! the STORE-BACKED cutover-continuity proof for the saga ledger: the `saga`
+//! guest component (the NATIVE `saga` crate compiled to wasm behind
+//! `guest-adapter`) over `WasmModule::with_store(QmdbStore)` and the native
+//! `SagaModule` over the same store shape are ROOT-CONTINUOUS — the same op
+//! sequence commits the IDENTICAL qmdb merkle root after every block, not
+//! merely lockstep-moving distinct roots. both roots ARE the store's root;
+//! qmdb's batch canonicalizes mutations by hashed key, so the native logical-key
+//! commit order and the wasm hashed-key drain order produce the same op log.
+//! this executor swap changes not one committed byte — including the
+//! byte-identical NO-OP blocks (a crank that finds nothing expired, a duplicate
+//! trigger) that stage nothing on either side.
 //!
 //! saga is the deterministic half of the async engine, so this proof leans on
 //! three surfaces beyond the usual reply/root matrix:
@@ -29,6 +31,7 @@
 //!   carry.
 
 use capability::{CapabilityMsg, CapabilityRegistry, encode_msg as capability_encode_msg};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, BlockOutcome, Host, MemberOutcome, SubmitError};
 use saga::{
     LeasePolicy, MAX_CAPABILITY_BYTES, MAX_ERROR_BYTES, MAX_REPLY_PAYLOAD_BYTES, MAX_RESULT_BYTES,
@@ -36,6 +39,7 @@ use saga::{
     decode_reply, decode_worker_control, decode_worker_request, encode_msg, encode_query,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
+use statesync::qmdb::QmdbStore;
 use std::collections::BTreeMap;
 use valset::Valset;
 use wasm_host::WasmModule;
@@ -44,13 +48,13 @@ use wasm_host::WasmModule;
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const SAGA_WASM: &[u8] = include_bytes!("fixtures/saga.component.wasm");
 
-fn wasm_saga() -> WasmModule {
-    WasmModule::from_bytes("saga", SAGA_WASM).expect("load component")
+fn wasm_saga(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store("saga", SAGA_WASM, store).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
-fn native_saga() -> SagaModule {
-    SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict)
+fn native_saga(store: Box<dyn sdk::MerkleStore>) -> SagaModule {
+    SagaModule::with_assignment("saga", store, "valset", "capability", LeasePolicy::Strict)
 }
 
 /// a 32-byte member key. the ordered lane hands modules verified ed25519 ids;
@@ -116,9 +120,18 @@ impl Module for Recorder {
 
 use sha2::Digest as _;
 
-async fn native_host(members: &[Vec<u8>]) -> Host {
+/// the two hosts are handed SEPARATE qmdb stores under the same store id: the
+/// root-continuity claim is that two independent stores driven by the two
+/// executors commit the same root, which a shared store would trivially fake.
+async fn native_host(
+    context: &deterministic::Context,
+    label: &'static str,
+    members: &[Vec<u8>],
+) -> Host {
     Host::genesis(vec![
-        Box::new(native_saga()),
+        Box::new(native_saga(Box::new(
+            QmdbStore::init(context.child(label), "saga").await,
+        ))),
         Box::new(seeded_valset(members).await),
         Box::new(CapabilityRegistry::new(
             "capability",
@@ -130,9 +143,15 @@ async fn native_host(members: &[Vec<u8>]) -> Host {
     .expect("genesis")
 }
 
-async fn wasm_host_(members: &[Vec<u8>]) -> Host {
+async fn wasm_host_(
+    context: &deterministic::Context,
+    label: &'static str,
+    members: &[Vec<u8>],
+) -> Host {
     Host::genesis(vec![
-        Box::new(wasm_saga()),
+        Box::new(wasm_saga(Box::new(
+            QmdbStore::init(context.child(label), "saga").await,
+        ))),
         Box::new(seeded_valset(members).await),
         Box::new(CapabilityRegistry::new(
             "capability",
@@ -338,6 +357,12 @@ async fn roundtrip(
             "the {sibling} sibling diverged at {height}"
         );
     }
+    // THE continuity claim: one root, two executors.
+    assert_eq!(
+        root_of(native),
+        root_of(wasm),
+        "saga roots diverge after block {height}"
+    );
     if moves {
         assert_ne!(root_of(native), n_before, "native root stuck at {height}");
         assert_ne!(root_of(wasm), w_before, "wasm root stuck at {height}");
@@ -385,6 +410,7 @@ async fn reject_roundtrip(
     );
     assert_eq!(root_of(native), n_before, "native root moved on reject");
     assert_eq!(root_of(wasm), w_before, "wasm root moved on reject");
+    assert_eq!(root_of(native), root_of(wasm), "roots diverge on reject");
     for sibling in SIBLING_IDS {
         assert_eq!(native.module_root(sibling), wasm.module_root(sibling));
     }
@@ -413,10 +439,10 @@ async fn view_of(h: &Host, id: &str) -> saga::SagaView {
 
 #[test]
 fn same_ops_same_events_same_replies_roots_in_lockstep() {
-    futures::executor::block_on(same_ops_inner());
+    deterministic::Runner::default().start(same_ops_inner);
 }
 
-async fn same_ops_inner() {
+async fn same_ops_inner(context: deterministic::Context) {
     let (a, b) = (key(0xAA), key(0xBB));
     let members = vec![a.clone(), b.clone()];
     let member_keys: [&[u8]; 2] = [&a, &b];
@@ -430,23 +456,16 @@ async fn same_ops_inner() {
         sid(&a, "t-re"),
     ];
 
-    let mut native = native_host(&members).await;
-    let mut wasm = wasm_host_(&members).await;
+    let mut native = native_host(&context, "same_ops_native", &members).await;
+    let mut wasm = wasm_host_(&context, "same_ops_wasm", &members).await;
 
-    // the SCHEMA-BREAK pin, saga-shaped: the native empty root hashes the
-    // empty canonical map (a bare zero count — NOT the ZERO sentinel), and the
-    // wasm root hashes the empty host-KV store — the SAME 8-zero-byte
-    // preimage. the genesis roots therefore COINCIDE, and the declared break
-    // becomes visible at the FIRST committed write below.
-    assert_ne!(
-        root_of(&native),
-        StateRoot::ZERO,
-        "saga has no ZERO sentinel"
-    );
+    // both roots ARE the qmdb store's root over two independently opened
+    // stores, so they start equal and — the claim of this file — stay equal
+    // after every committed block below.
     assert_eq!(
         root_of(&native),
         root_of(&wasm),
-        "empty-canonical-map module: genesis roots coincide by construction"
+        "store-backed tenant: genesis roots coincide"
     );
 
     // ---- capability announcements (sibling-only blocks hold the saga root).
@@ -922,9 +941,8 @@ async fn same_ops_inner() {
         "the pruned saga is gone"
     );
 
-    // the roots diverged at the first write and never re-converge (the
-    // distinct root representation).
-    assert_ne!(root_of(&native), root_of(&wasm));
+    // and after the WHOLE script the two stores hold byte-identical roots.
+    assert_eq!(root_of(&native), root_of(&wasm));
 
     // queries are read-only on the wasm side too: the root is stable across
     // the whole read matrix.
@@ -935,17 +953,17 @@ async fn same_ops_inner() {
 
 #[test]
 fn crank_times_out_and_expires_leases_in_lockstep() {
-    futures::executor::block_on(crank_inner());
+    deterministic::Runner::default().start(crank_inner);
 }
 
-async fn crank_inner() {
+async fn crank_inner(context: deterministic::Context) {
     let (a, b) = (key(0xAA), key(0xBB));
     let members = vec![a.clone(), b.clone()];
     let member_keys: [&[u8]; 2] = [&a, &b];
     let ids = [sid(&a, "t-dead"), sid(&a, "t-lease")];
 
-    let mut native = native_host(&members).await;
-    let mut wasm = wasm_host_(&members).await;
+    let mut native = native_host(&context, "crank_native", &members).await;
+    let mut wasm = wasm_host_(&context, "crank_wasm", &members).await;
 
     // a saga bounded by an absolute deadline, and one bounded by short leases.
     roundtrip(
@@ -1040,17 +1058,17 @@ async fn crank_inner() {
 
 #[test]
 fn rejections_match_and_leave_no_trace() {
-    futures::executor::block_on(rejections_inner());
+    deterministic::Runner::default().start(rejections_inner);
 }
 
-async fn rejections_inner() {
+async fn rejections_inner(context: deterministic::Context) {
     let (a, b) = (key(0xAA), key(0xBB));
     let members = vec![a.clone(), b.clone()];
     let member_keys: [&[u8]; 2] = [&a, &b];
     let ids = [sid(&a, "live"), sid(&a, "solo"), sid(&a, "pinned")];
 
-    let mut native = native_host(&members).await;
-    let mut wasm = wasm_host_(&members).await;
+    let mut native = native_host(&context, "reject_native", &members).await;
+    let mut wasm = wasm_host_(&context, "reject_wasm", &members).await;
 
     // seed: a lone provider for "solo" (reassignment has no alternate), a live
     // assigned saga (the oversized-outcome seam is gated to its assignee), a
@@ -1332,10 +1350,10 @@ async fn rejections_inner() {
 
 #[test]
 fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
-    futures::executor::block_on(multi_dispatch_inner());
+    deterministic::Runner::default().start(multi_dispatch_inner);
 }
 
-async fn multi_dispatch_inner() {
+async fn multi_dispatch_inner(context: deterministic::Context) {
     // ONE member: the valset pool is [A], so every rendezvous assigns A and
     // the strict gate accepts A's results — deterministic by construction.
     let a = key(0xAA);
@@ -1343,8 +1361,8 @@ async fn multi_dispatch_inner() {
     let member_keys: [&[u8]; 1] = [&a];
     let ids = [sid(&a, "s1"), sid(&a, "s2")];
 
-    let mut native = native_host(&members).await;
-    let mut wasm = wasm_host_(&members).await;
+    let mut native = native_host(&context, "multi_native", &members).await;
+    let mut wasm = wasm_host_(&context, "multi_wasm", &members).await;
 
     // ONE block, three ops: the result reads the STAGED trigger (and its
     // staged lease), and the prune reads the STAGED terminal state — on the
@@ -1496,10 +1514,10 @@ async fn retained(h: &Host, ids: &[String]) -> Vec<String> {
 
 #[test]
 fn a_block_that_crosses_the_retention_cap_evicts_identically_on_both_runtimes() {
-    futures::executor::block_on(retention_parity_inner());
+    deterministic::Runner::default().start(retention_parity_inner);
 }
 
-async fn retention_parity_inner() {
+async fn retention_parity_inner(context: deterministic::Context) {
     // the hazard the per-op trim exists FOR. the wasm shell calls the guest's
     // inner `commit_block` once per OP, the native module once per BLOCK, so a
     // trim that read the committed map at the boundary would evict at a
@@ -1511,8 +1529,8 @@ async fn retention_parity_inner() {
     let members = vec![a.clone()];
     let member_keys: [&[u8]; 1] = [&a];
 
-    let mut native = native_host(&members).await;
-    let mut wasm = wasm_host_(&members).await;
+    let mut native = native_host(&context, "retention_native", &members).await;
+    let mut wasm = wasm_host_(&context, "retention_wasm", &members).await;
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
 
     let ids: Vec<String> = (0..=MAX_RETAINED_TERMINAL)
@@ -1577,9 +1595,14 @@ async fn retention_parity_inner() {
         replies(&native, &ids, &member_keys).await,
         replies(&wasm, &ids, &member_keys).await
     );
-    // the two roots are over DIFFERENT preimages by construction (native
-    // canonical map vs the port's host-KV store), so parity is the SIBLINGS
-    // agreeing and both roots moving — never byte equality between them.
+    // both roots are the same store's root, so the cap-crossing block must
+    // leave them byte-identical — a trim that bit at a different point under
+    // the two runtimes would show up right here.
+    assert_eq!(
+        root_of(&native),
+        root_of(&wasm),
+        "the runtimes committed different roots across the cap"
+    );
     for sibling in SIBLING_IDS {
         assert_eq!(
             native.module_root(sibling),

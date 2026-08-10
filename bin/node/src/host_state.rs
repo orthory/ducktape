@@ -400,15 +400,15 @@ fn capability_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
         .expect("embedded capability component loads")
 }
 
-/// saga at its GENESIS code (adapter-ported). the sibling wiring — saga's
-/// valset/capability assignment reads — is genesis-constant and compiled into
-/// the guest (the exact production constructor these builders used to call
-/// natively). agent's wiring (saga dead-letter + runs hook) and automations'
-/// (the chat/tasks/inbox lanes) are compiled into their guests the same way;
-/// only their stores arrive host-constructed ([`agent_wasm`],
-/// [`automations_wasm`]).
-fn genesis_saga_wasm() -> WasmModule {
-    WasmModule::from_bytes(SAGA_MODULE_ID, SAGA_WASM_COMPONENT)
+/// saga at its GENESIS code (adapter-ported) over the host-constructed store.
+/// the sibling wiring — saga's valset/capability assignment reads — is
+/// genesis-constant and compiled into the guest (the exact production
+/// constructor these builders used to call natively). agent's wiring (saga
+/// dead-letter + runs hook) and automations' (the chat/tasks/inbox lanes) are
+/// compiled into their guests the same way; only their stores arrive
+/// host-constructed ([`agent_wasm`], [`automations_wasm`]).
+fn saga_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(SAGA_MODULE_ID, SAGA_WASM_COMPONENT, store)
         .expect("embedded saga component loads")
 }
 
@@ -720,7 +720,9 @@ pub(super) async fn genesis_host(
         // announcement a capable node must first claim via `SagaMsg::Accept`.
         // adapter-ported; the valset/capability wiring and the Strict policy
         // are compiled into the guest.
-        saga: genesis_saga_wasm(),
+        saga: saga_wasm(Box::new(
+            QmdbStore::init(context.child("saga"), "saga").await,
+        )),
         // the network-wide registry of node host capabilities ("codex",
         // "claude", ...): member-gated self-announcements, so every node holds
         // an identical view of who can run what. store-backed over the
@@ -871,10 +873,9 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("{HELLO_WASM_MODULE_ID} install: {e}"))?;
 
-    let mut saga = genesis_saga_wasm();
-    let (bytes, root) = snapshot_of(SAGA_MODULE_ID)?;
-    saga.install(bytes, root)
-        .map_err(|e| format!("saga install: {e}"))?;
+    let saga = saga_wasm(Box::new(
+        QmdbStore::init(context.child("saga"), "saga").await,
+    ));
 
     let mut dispatch = genesis_dispatch_wasm();
     let (bytes, root) = snapshot_of(DISPATCH_MODULE_ID)?;
@@ -1188,10 +1189,16 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         ),
     );
 
-    let (bytes, root) = snapshot_of(SAGA_MODULE_ID).await?;
-    let mut saga = genesis_saga_wasm();
-    saga.install(&bytes, root)
-        .map_err(|e| format!("saga install: {e}"))?;
+    let (target, resolver) = fetch_target("saga").await?;
+    let saga = saga_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("saga")),
+            "saga",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
 
     let (bytes, root) = snapshot_of(DISPATCH_MODULE_ID).await?;
     let mut dispatch = genesis_dispatch_wasm();
@@ -1364,7 +1371,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "af9002ddcef46eb1a53402fcbc5f0776f93949f5d0e4cc61a178eb1dc8115adf";
+        "ead9b5759965aa613214a8740dbee755fef5470ed24de2bd08340b9cf7b44b35";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's store as a genesis

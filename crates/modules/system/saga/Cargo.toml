@@ -41,3 +41,7 @@ futures = { workspace = true }
 host = { workspace = true }
 sdk-testkit = { workspace = true }
 tempfile = "3"
+# the sync round trip drives the module the way a host does: construct the
+# concrete QmdbStore and inject it as `Box<dyn MerkleStore>`.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }

@@ -106,7 +106,10 @@ fn results_deliver_exactly_once_and_never_in_their_own_block() {
     // an unassigned open-policy saga ledger: no valset, no capability
     // registry — nobody is assigned and any submitter's result is accepted,
     // which is all this delivery test needs.
-    host.register(Box::new(SagaModule::new("saga")));
+    host.register(Box::new(SagaModule::new(
+        "saga",
+        Box::new(sdk_testkit::MemStore::new()),
+    )));
     host.register(Box::new(DispatchModule::new("dispatch", "saga")));
     host.register(Box::new(Caller {
         received: Rc::clone(&received),

@@ -74,7 +74,10 @@ impl Harness {
                         "saga",
                         None,
                     )),
-                    Box::new(saga::SagaModule::new("saga")),
+                    Box::new(saga::SagaModule::new(
+                        "saga",
+                        Box::new(sdk_testkit::MemStore::new()),
+                    )),
                     Box::new(tasks::Tasks::new(
                         "tasks",
                         Box::new(sdk_testkit::MemStore::new()),

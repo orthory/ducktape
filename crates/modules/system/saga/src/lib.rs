@@ -1,11 +1,14 @@
 //! the saga ledger — the DETERMINISTIC half of the async engine.
 //!
 //! a pure state-machine module (in the root-hash) that records async work in
-//! flight: one effect, one agreed result, domain-agnostic. it keeps
-//! `directory`'s shape — an in-memory `BTreeMap` with a `pending` overlay
-//! staged during a block and merged at the boundary, and a state-based
-//! `root()` — and implements three of the platform's ordering-contract
-//! promises (docs/records/architecture/agent-collaboration-design.md §2, §4):
+//! flight: one effect, one agreed result, domain-agnostic. it is QMDB-BACKED:
+//! pure logic over a host-injected [`sdk::MerkleStore`] with the shared
+//! [`StagedStore`] overlay in front of it, so `root()` is the store's cached
+//! merkle root, an op touches only the keys it names, and state-sync rides the
+//! store's resolver lane instead of a byte snapshot whose size grew with every
+//! saga ever triggered. it implements three of the platform's
+//! ordering-contract promises
+//! (docs/records/architecture/agent-collaboration-design.md §2, §4):
 //!
 //! - **P5 — result singularity.** exactly one `OracleResult` transitions a
 //!   given attempt: the `(saga_id, attempt)` pair is the idempotency key, so
@@ -53,32 +56,60 @@
 //! request names the winner), so N capable nodes never each pay for the
 //! same execution.
 //!
+//! ## the key space
+//!
+//! | logical key | value |
+//! |---|---|
+//! | `saga\0{id}` | one [`Saga`] record (borsh) — every field EXCEPT the spec bytes |
+//! | `spec\0{id}{n:u64-le}` | chunk `n` of that saga's spec, raw bytes |
+//! | `pending` | the LIVE id index: a borsh `BTreeSet<String>` of non-terminal ids |
+//! | `terminal` | the terminal receipt index: a borsh `BTreeMap<String, TerminalEntry>` |
+//!
+//! ### why the spec is chunked
+//!
+//! a saga carries its `spec` up to [`MAX_SPEC_BYTES`] (12 MiB) and the store's
+//! codec bounds ONE value at 1 MiB AT DECODE TIME
+//! (`statesync::qmdb::store_config`), so one saga cannot be one record: an
+//! oversized value would COMMIT fine and then panic every later read on every
+//! validator. the spec is therefore split into [`SPEC_CHUNK_BYTES`] chunks
+//! written ONCE at trigger and deleted with the saga, and the hot record —
+//! status, attempt, lease, timestamps, origin — stays small enough that the
+//! `Crank` sweep and the pending projections never touch a spec byte they do
+//! not emit. the remaining large fields are already bounded well under the
+//! record cap by the wire caps that gate them ([`MAX_REPLY_PAYLOAD_BYTES`] 64
+//! KiB + [`MAX_RESULT_BYTES`] 256 KiB + [`MAX_ERROR_BYTES`] 16 KiB), so they
+//! ride the hot record.
+//!
+//! ### why there are two id indexes
+//!
+//! the store hashes its keys and CANNOT enumerate, but four surfaces are
+//! whole-map reads: `Crank`, `NextExpiry`, `AssignedPending` and
+//! `UnassignedPending` all iterate the live sagas in id order, and the
+//! retention trim ranks every TERMINAL saga. so the two domains are split
+//! into two sentinel records, and the trim itself is what keeps the terminal
+//! one small — it is bounded by [`MAX_RETAINED_TERMINAL`] plus one block's
+//! arrivals, and each entry carries the `(updated_at, bytes)` the ranking
+//! needs so the trim never reads a saga record it does not evict.
+//!
 //! ## GC
 //!
 //! retention is BOUNDED, and owners may still prune eagerly. `Prune` removes
 //! terminal sagas on demand, gated to the recorded trigger origin per id; on
 //! top of that EVERY op trims the terminal tail to [`MAX_RETAINED_TERMINAL`]
 //! entries / [`MAX_RETAINED_TERMINAL_BYTES`] bytes, newest first
-//! ([`terminal_evictions`]) — a pure function of the visible map, so every
-//! validator drops the identical set whether it replayed the state or adopted
-//! a snapshot. pending sagas are never eligible. an evicted id behaves exactly
-//! like an explicitly pruned one: unknown to every handler, and free to
-//! trigger again as new work.
+//! ([`terminal_evictions`]) — a pure function of the terminal index, so every
+//! validator drops the identical set whether it replayed the state or synced
+//! the store. pending sagas are never eligible: they are not in that index at
+//! all. an evicted id behaves exactly like an explicitly pruned one: unknown
+//! to every handler, and free to trigger again as new work.
 //!
 //! the trim runs inside `execute` and STAGES its removals, deliberately: the
 //! native module merges its overlay at `commit_block` while the wasm shell
-//! (`snapshot_guest!`) calls the inner `commit_block` once per OP, so a
-//! boundary hook reading the whole committed map would evict at a different
-//! point under the two. both are chain participants — `bin/noded` and
-//! `bin/simnode` construct this native module, `bin/node` loads the component
-//! — so they must agree op for op, not just block for block.
-//!
-//! `root()` folds in every field, so any transition moves the root-hash. a
-//! joiner rebuilds this module from a peer via [`SagaModule::snapshot`] /
-//! [`SagaModule::install`]: the snapshot ships the committed map in the exact
-//! canonical encoding `root()` hashes, and install re-derives the root from
-//! the decoded temporaries before adopting them — the consensus-agreed root,
-//! not the peer, is the trust anchor.
+//! (`store_guest!`) calls the inner `commit_block` once per OP, so a boundary
+//! hook reading the whole committed map would evict at a different point under
+//! the two. both are chain participants — `bin/noded` and `bin/simnode`
+//! construct this native module, `bin/node` loads the component — so they must
+//! agree op for op, not just block for block.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -96,14 +127,17 @@ pub mod index;
 #[cfg(feature = "index-guest")]
 mod index_guest;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use capability::{
     CapabilityQuery, CapabilityReply, decode_reply as capability_decode_reply,
     encode_query as capability_encode_query, validate_resources,
 };
-use sdk::codec;
-use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
+use sdk::{
+    Ctx, Error, Event, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
+    StateRoot, StateSyncHandle,
+};
 use sha2::{Digest, Sha256};
 use valset::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
@@ -114,12 +148,10 @@ use valset::{
 /// backlog of expired sagas is worked off in deterministic, bounded slices.
 pub const CRANK_BUDGET: u32 = 32;
 
-/// how many TERMINAL sagas stay in the root preimage. a terminal saga has
-/// already fired its callback (P6, in the block it landed) — what remains is a
+/// how many TERMINAL sagas stay in the ledger. a terminal saga has already
+/// fired its callback (P6, in the block it landed) — what remains is a
 /// read-only receipt, and an unbounded pile of receipts is the state-growth
-/// cliff: every wasm op decodes the WHOLE state before it looks at the
-/// payload, so a big enough map traps every op on every validator, INCLUDING
-/// the `Prune` that would shrink it.
+/// cliff.
 pub const MAX_RETAINED_TERMINAL: usize = 64;
 
 /// byte budget for the retained terminal tail. the count cap alone bounds
@@ -132,6 +164,101 @@ pub const MAX_RETAINED_TERMINAL_BYTES: usize = 4 * 1024 * 1024;
 /// lease window (in views) granted when a trigger leaves `lease_views` unset
 /// but an assignee exists — an assigned attempt must always be reclaimable.
 pub const DEFAULT_LEASE_VIEWS: u64 = 64;
+
+/// write-time cap on ONE stored record. the concrete store's codec bounds a
+/// stored value at 1 MiB AT DECODE TIME (`statesync::qmdb::store_config`): an
+/// oversized value would COMMIT fine and then panic every later read on every
+/// validator — a poison pill. the 4 KiB margin below the codec bound covers
+/// the serialized operation's framing (32-byte hashed key, varint length
+/// prefix, operation tag), exactly as `kv::MAX_VALUE_LEN` reasons.
+///
+/// this is the guard the storage swap adds. the wire caps already bound every
+/// trigger-supplied field that rides the hot record EXCEPT `pinned_assignee`
+/// (only checked non-empty), and an op frame may carry up to
+/// `node::MAX_FRAME_BYTES` (1 MiB + 16 KiB) — so one trigger could have
+/// poisoned its own saga record. the record check below catches that, and
+/// [`MAX_SAGA_ID_BYTES`] catches the SHARED-record twin.
+pub const MAX_RECORD_BYTES: usize = (1 << 20) - 4 * 1024;
+
+/// bytes of spec per stored chunk — the record cap itself, so a 12 MiB
+/// [`MAX_SPEC_BYTES`] spec is 13 keys.
+pub const SPEC_CHUNK_BYTES: usize = MAX_RECORD_BYTES;
+
+/// hard cap on a `saga_id`'s byte length, enforced at trigger time.
+///
+/// load-bearing, not cosmetic: every live id shares the ONE `pending` index
+/// record bounded by [`MAX_RECORD_BYTES`], so an UNCAPPED id let a single
+/// trigger (an op frame carries up to `node::MAX_FRAME_BYTES`, 1 MiB + 16 KiB)
+/// fill that record and refuse EVERY later trigger, for every principal. a
+/// pending saga with neither deadline nor lease never expires, and `Cancel` is
+/// gated to the trigger origin, so only the squatter could have freed it.
+/// every producer's id is ~100 bytes (dispatch's `dispatch{SEP}{receiver}{SEP}{id}`
+/// over a 128-byte `MAX_ID_BYTES`, or a 64-hex node namespace plus a local id),
+/// so this sits far above anything real.
+pub const MAX_SAGA_ID_BYTES: usize = 512;
+
+/// hard cap on a trigger's `pinned_assignee`, enforced at trigger time.
+///
+/// the OTHER half of the store-record guard: every wire-supplied field that
+/// rides the saga's hot record was already bounded ([`MAX_REPLY_PAYLOAD_BYTES`],
+/// [`MAX_RESULT_BYTES`], [`MAX_ERROR_BYTES`], [`MAX_CAPABILITY_BYTES`],
+/// `validate_resources`, a registered `reply_to`) EXCEPT this one, which only
+/// had to be non-empty. an op frame carries up to `node::MAX_FRAME_BYTES`
+/// (1 MiB + 16 KiB), so one trigger could have written a record the store's
+/// codec later panics decoding. a node key is 32 bytes; this matches the
+/// worker-id cap the work module uses.
+pub const MAX_ASSIGNEE_BYTES: usize = 256;
+
+/// per-saga record key: prefix + 0 + id (the single-component shape `chat` and
+/// `capability` use). the literal prefixes below are fixed and none is another
+/// followed by a 0 byte, so the four key spaces cannot collide.
+fn record_key(saga_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(5 + saga_id.len());
+    key.extend_from_slice(b"saga");
+    key.push(0);
+    key.extend_from_slice(saga_id.as_bytes());
+    key
+}
+
+/// spec chunk key: prefix + 0 + id + the chunk index as 8 FIXED-WIDTH bytes.
+/// the fixed-width tail is what makes the mapping injective without a
+/// separator — an id may itself contain any byte, and the last 8 bytes are
+/// always the index.
+fn spec_chunk_key(saga_id: &str, chunk: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(5 + saga_id.len() + 8);
+    key.extend_from_slice(b"spec");
+    key.push(0);
+    key.extend_from_slice(saga_id.as_bytes());
+    key.extend_from_slice(&chunk.to_le_bytes());
+    key
+}
+
+/// every chunk key a spec of `spec_len` bytes occupies. an EMPTY spec occupies
+/// none, so it costs no key at all.
+fn spec_chunk_keys(saga_id: &str, spec_len: u64) -> Vec<Vec<u8>> {
+    (0..spec_len.div_ceil(SPEC_CHUNK_BYTES as u64))
+        .map(|chunk| spec_chunk_key(saga_id, chunk))
+        .collect()
+}
+
+/// the live (non-terminal) id index — the deterministic iteration domain of
+/// `Crank`, `NextExpiry`, `AssignedPending` and `UnassignedPending`.
+///
+// ponytail: ONE index record holds every LIVE id, so the ledger refuses new
+// triggers once it hits MAX_RECORD_BYTES — ~4k concurrent pending sagas at
+// realistic ~250-byte ids, ~2k at the MAX_SAGA_ID_BYTES cap. unlike the
+// terminal index, nothing trims this one: it drains only as sagas terminate,
+// and a saga triggered with neither a deadline nor a lease never expires, so a
+// squatter could hold the ceiling. that is still strictly better than the
+// unbounded map this replaced (which grew the fuel cost of EVERY op), and the
+// refusal is loud rather than a silent brick. if it must scale past that,
+// shard the index by id prefix — the four readers above already iterate it as
+// one sorted sequence, so a merge over N shards is the whole change. a
+// per-origin live quota is a WIRE change and belongs to a separate decision.
+const PENDING_INDEX_KEY: &[u8] = b"pending";
+
+/// the terminal receipt index — the retention trim's whole input.
+const TERMINAL_INDEX_KEY: &[u8] = b"terminal";
 
 /// who may complete an assigned attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,8 +274,12 @@ pub enum LeasePolicy {
     Strict,
 }
 
-/// one tracked saga. the id is the map key, so it isn't repeated here.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// one tracked saga's HOT record. the id is the store key, so it isn't
+/// repeated here, and the spec bytes live in their own chunk keys — only the
+/// length rides along. borsh writes every field in declaration order, options
+/// as a tag byte and maps in key order, so one state has exactly one encoding
+/// and every validator commits the same record bytes.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct Saga {
     /// the trigger's origin — the cancel/prune capability.
     origin: SagaOrigin,
@@ -156,8 +287,9 @@ struct Saga {
     reply_to: Option<ModuleId>,
     /// opaque requester correlation, echoed back in the callback.
     reply_payload: Vec<u8>,
-    /// opaque work spec, echoed to the worker on every attempt.
-    spec: Vec<u8>,
+    /// the opaque work spec's byte length; the bytes themselves live under
+    /// [`spec_chunk_key`] and are echoed to the worker on every attempt.
+    spec_len: u64,
     /// the capability the work requires, when the trigger named one: each
     /// attempt is then rendezvous-assigned over the tag's announced providers
     /// instead of the raw validator set. opaque to this module.
@@ -193,83 +325,54 @@ struct Saga {
     updated_at: u64,
 }
 
-/// canonical byte encoding of a committed saga map: u64-le count, then per
-/// saga in sorted-id order every field in declaration order — u64-le length
-/// prefixes for byte strings, single-byte discriminants for enums, a 0/1 tag
-/// byte for options, u32/u64-le for integers. this is the exact preimage
-/// [`Module::root`] hashes, so a snapshot and the root that must authenticate
-/// it cannot drift.
-fn encode_committed(sagas: &BTreeMap<String, Saga>) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(sagas.len() as u64).to_le_bytes());
-    for (id, s) in sagas {
-        codec::push_str(&mut out, id);
-        put_origin(&mut out, &s.origin);
-        codec::push_opt_str(&mut out, s.reply_to.as_deref());
-        codec::push_bytes(&mut out, &s.reply_payload);
-        codec::push_bytes(&mut out, &s.spec);
-        codec::push_opt_str(&mut out, s.capability.as_deref());
-        out.extend_from_slice(&(s.demands.len() as u64).to_le_bytes());
-        for (dim, value) in &s.demands {
-            codec::push_str(&mut out, dim);
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        out.push(match s.status {
-            SagaStatus::Pending => 0,
-            SagaStatus::Done => 1,
-            SagaStatus::Failed => 2,
-            SagaStatus::TimedOut => 3,
-            SagaStatus::Cancelled => 4,
-        });
-        out.extend_from_slice(&s.attempt.to_le_bytes());
-        out.extend_from_slice(&s.max_attempts.to_le_bytes());
-        codec::push_opt_bytes(&mut out, s.assignee.as_deref());
-        codec::push_opt_bytes(&mut out, s.pinned_assignee.as_deref());
-        codec::push_opt_u64(&mut out, s.lease_views);
-        codec::push_opt_u64(&mut out, s.lease_expires_at);
-        codec::push_opt_u64(&mut out, s.deadline);
-        codec::push_opt_bytes(&mut out, s.result.as_deref());
-        codec::push_opt_str(&mut out, s.error.as_deref());
-        out.extend_from_slice(&s.created_at.to_le_bytes());
-        out.extend_from_slice(&s.updated_at.to_le_bytes());
+impl Saga {
+    /// the payload weight the retention byte budget counts — the same four
+    /// fields the whole-map trim summed before the spec moved into chunks.
+    fn receipt_bytes(&self) -> u64 {
+        self.spec_len
+            + self.reply_payload.len() as u64
+            + self.result.as_ref().map_or(0, Vec::len) as u64
+            + self.error.as_ref().map_or(0, String::len) as u64
     }
-    out
+}
+
+/// one terminal saga's row in the retention index: everything
+/// [`terminal_evictions`] ranks on, so the trim reads ONE small record instead
+/// of every receipt in the ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+struct TerminalEntry {
+    updated_at: u64,
+    bytes: u64,
 }
 
 /// the retention decision, as a pure function: which terminal sagas this
-/// VISIBLE map (committed plus this op's staged overlay) must drop to stay
+/// VISIBLE index (committed plus this op's staged overlay) must drop to stay
 /// inside [`MAX_RETAINED_TERMINAL`]/[`MAX_RETAINED_TERMINAL_BYTES`].
 ///
-/// terminal-only — a pending saga is live work and is never eligible. terminal
-/// receipts are ranked NEWEST first by `(updated_at, id)` and kept while both
-/// budgets hold, so the newest receipt always survives and the retained tail is
-/// at most the byte budget plus one maximal entry.
+/// terminal-only — a pending saga is live work and is never eligible, which
+/// this shape gives structurally: a pending saga is not in this index at all.
+/// terminal receipts are ranked NEWEST first by `(updated_at, id)` and kept
+/// while both budgets hold, so the newest receipt always survives and the
+/// retained tail is at most the byte budget plus one maximal entry.
 ///
-/// it reads nothing but the map it is handed, so every validator evicts the
-/// identical set at the identical op — and a node that adopted the state from
-/// a snapshot decides the same as one that replayed it.
-fn terminal_evictions(sagas: &BTreeMap<&str, &Saga>) -> Vec<String> {
-    let mut terminal: Vec<(u64, &str, usize)> = sagas
+/// it reads nothing but the index it is handed, so every validator evicts the
+/// identical set at the identical op — and a node that synced the store
+/// decides the same as one that replayed it.
+fn terminal_evictions(terminal: &BTreeMap<String, TerminalEntry>) -> Vec<String> {
+    let mut receipts: Vec<(u64, &str, u64)> = terminal
         .iter()
-        .filter(|(_, s)| s.status.is_terminal())
-        .map(|(id, s)| {
-            let bytes = s.spec.len()
-                + s.reply_payload.len()
-                + s.result.as_ref().map_or(0, Vec::len)
-                + s.error.as_ref().map_or(0, String::len);
-            (s.updated_at, *id, bytes)
-        })
+        .map(|(id, entry)| (entry.updated_at, id.as_str(), entry.bytes))
         .collect();
     // newest first; the id breaks ties, so the order is total and stable.
-    terminal.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    receipts.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
 
     let mut kept = 0usize;
-    let mut kept_bytes = 0usize;
+    let mut kept_bytes = 0u64;
     let mut evicted = Vec::new();
-    for (_, id, bytes) in terminal {
+    for (_, id, bytes) in receipts {
         let within_count = kept < MAX_RETAINED_TERMINAL;
         // checked BEFORE this entry is added, so the newest is always kept.
-        let within_budget = kept_bytes <= MAX_RETAINED_TERMINAL_BYTES;
+        let within_budget = kept_bytes <= MAX_RETAINED_TERMINAL_BYTES as u64;
         if within_count && within_budget {
             kept += 1;
             kept_bytes = kept_bytes.saturating_add(bytes);
@@ -280,133 +383,24 @@ fn terminal_evictions(sagas: &BTreeMap<&str, &Saga>) -> Vec<String> {
     evicted
 }
 
-/// the state-based commitment over a committed saga map — shared by `root()`
-/// and `install()` so the verification a snapshot must pass is definitionally
-/// the same algorithm the live module answers with.
-fn committed_root(sagas: &BTreeMap<String, Saga>) -> StateRoot {
-    StateRoot(Sha256::digest(encode_committed(sagas)).into())
-}
-
-/// an optional utf-8 string in the plain option layout — [`codec::Cursor`]
-/// keeps only the byte primitive; the utf-8 check layers here (opt_str's
-/// non-empty/bounded rules would reject valid states, e.g. an empty stored
-/// error string).
-fn take_opt_string(cur: &mut codec::Cursor, what: &str) -> Result<Option<String>, Error> {
-    cur.opt_bytes(what)?
-        .map(|raw| {
-            std::str::from_utf8(raw)
-                .map(str::to_string)
-                .map_err(|e| Error::Module(format!("{what} is not utf-8: {e}")))
-        })
-        .transpose()
-}
-
-/// strict decode of an [`encode_committed`] snapshot. the input is UNTRUSTED —
-/// it arrives from an arbitrary peer — so every count and length is bounded by
-/// the remaining input before allocation, ids must be strictly ascending (one
-/// byte encoding per state, and uniqueness for free), unknown discriminants
-/// and option tags are rejected, and trailing bytes are rejected. never panics
-/// on malformed input.
-fn decode_committed(buf: &[u8]) -> Result<BTreeMap<String, Saga>, Error> {
-    let mut cur = codec::Cursor::new(buf);
-    let count = cur.u64("snapshot saga count")?;
-    // every saga costs at least its fixed-width fields — the id length prefix,
-    // one origin discriminant, nine option tags, three length prefixes, one
-    // demands-map count, status, two u32s, and two u64s — so a count the
-    // input cannot possibly hold is rejected before the loop builds anything.
-    const MIN_SAGA_BYTES: u64 =
-        8 + 1 + 1 + 8 + 8 + 1 + 8 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8;
-    cur.bound(count, MIN_SAGA_BYTES, "snapshot saga")?;
-    let mut sagas: BTreeMap<String, Saga> = BTreeMap::new();
-    for _ in 0..count {
-        let id = cur.string("snapshot saga id")?;
-        if let Some((last, _)) = sagas.iter().next_back()
-            && last.as_str() >= id.as_str()
-        {
-            return Err(Error::Module(
-                "snapshot saga ids not strictly ascending".into(),
-            ));
-        }
-        let origin = take_origin(&mut cur)?;
-        let reply_to = take_opt_string(&mut cur, "snapshot reply_to")?;
-        let reply_payload = cur.bytes("snapshot reply_payload")?.to_vec();
-        let spec = cur.bytes("snapshot spec")?.to_vec();
-        let capability = take_opt_string(&mut cur, "snapshot capability")?;
-        let demand_count = cur.u64("snapshot demands count")?;
-        // each dimension costs at least its 8-byte key-length prefix plus an
-        // 8-byte value.
-        cur.bound(demand_count, 16, "snapshot demand")?;
-        let mut demands = BTreeMap::new();
-        let mut prev_dim: Option<&[u8]> = None;
-        for _ in 0..demand_count {
-            let dim = cur.bytes("snapshot demand key")?;
-            if prev_dim.is_some_and(|p| p >= dim) {
-                return Err(Error::Module(
-                    "snapshot demand keys must be strictly increasing".into(),
-                ));
-            }
-            prev_dim = Some(dim);
-            let dim = std::str::from_utf8(dim)
-                .map_err(|e| Error::Module(format!("snapshot demand key is not utf-8: {e}")))?;
-            let value = cur.u64("snapshot demand value")?;
-            if value == 0 {
-                return Err(Error::Module(
-                    "snapshot demand value is zero (omit the dimension instead)".into(),
-                ));
-            }
-            demands.insert(dim.to_string(), value);
-        }
-        let status = match cur.byte("snapshot status")? {
-            0 => SagaStatus::Pending,
-            1 => SagaStatus::Done,
-            2 => SagaStatus::Failed,
-            3 => SagaStatus::TimedOut,
-            4 => SagaStatus::Cancelled,
-            d => {
-                return Err(Error::Module(format!(
-                    "snapshot has unknown status discriminant {d}"
-                )));
-            }
-        };
-        let attempt = cur.u32("snapshot attempt")?;
-        let max_attempts = cur.u32("snapshot max_attempts")?;
-        let assignee = cur.opt_bytes("snapshot assignee")?.map(<[u8]>::to_vec);
-        let pinned_assignee = cur
-            .opt_bytes("snapshot pinned_assignee")?
-            .map(<[u8]>::to_vec);
-        let lease_views = cur.opt_u64("snapshot lease_views")?;
-        let lease_expires_at = cur.opt_u64("snapshot lease_expires_at")?;
-        let deadline = cur.opt_u64("snapshot deadline")?;
-        let result = cur.opt_bytes("snapshot result")?.map(<[u8]>::to_vec);
-        let error = take_opt_string(&mut cur, "snapshot error")?;
-        let created_at = cur.u64("snapshot created_at")?;
-        let updated_at = cur.u64("snapshot updated_at")?;
-        sagas.insert(
-            id,
-            Saga {
-                origin,
-                reply_to,
-                reply_payload,
-                spec,
-                capability,
-                demands,
-                status,
-                attempt,
-                max_attempts,
-                assignee,
-                pinned_assignee,
-                lease_views,
-                lease_expires_at,
-                deadline,
-                result,
-                error,
-                created_at,
-                updated_at,
-            },
-        );
+/// refuse a value the store's codec would later panic decoding. `what` names
+/// the record in the rejection. an op that writes SEVERAL records checks them
+/// all before staging any, so a refused op leaves no overlay entry at all.
+///
+/// that ordering — CHECK everything, THEN stage everything — is a root
+/// invariant, not a style preference. natively this `SagaModule` keeps
+/// `staged` across every dispatch in a block; the wasm guest rebuilds the
+/// module per dispatch and flushes its overlay only on a SUCCESSFUL execute.
+/// so a path that stages a write and then returns `Err` leaves residue on one
+/// side and none on the other, and the two ports diverge on the root.
+fn check_record(value: &[u8], what: &str) -> Result<(), Error> {
+    if value.len() > MAX_RECORD_BYTES {
+        return Err(Error::Module(format!(
+            "{what} is {} bytes, over the {MAX_RECORD_BYTES}-byte store record cap",
+            value.len()
+        )));
     }
-    cur.finish("snapshot")?;
-    Ok(sagas)
+    Ok(())
 }
 
 /// the canonical state form of a dispatch origin (see [`SagaOrigin`]).
@@ -462,25 +456,22 @@ pub struct SagaModule {
     capability_registry: Option<ModuleId>,
     /// genesis config, not state: identical on every node by construction.
     policy: LeasePolicy,
-    /// committed state — what `root()` and the root-hash commit to.
-    sagas: BTreeMap<String, Saga>,
-    /// this block's staged writes, read ahead of `sagas` (read-your-writes)
-    /// but merged in — and reflected in `root()` — only at `commit_block`.
-    /// `Some` stages an upsert, `None` stages a removal (prune).
-    pending: BTreeMap<String, Option<Saga>>,
+    /// the host-injected authenticated store plus this block's staging overlay
+    /// (read-your-writes; folded into `root()` at `commit_block`). the store
+    /// key is `sha256(logical_key)`, owned by [`StagedStore`].
+    staged: StagedStore,
 }
 
 impl SagaModule {
     /// an unassigned ledger under [`LeasePolicy::Open`] — no valset, no
     /// assignee, any submitter's result accepted.
-    pub fn new(id: impl Into<ModuleId>) -> Self {
+    pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {
         Self {
             id: id.into(),
             valset: None,
             capability_registry: None,
             policy: LeasePolicy::Open,
-            sagas: BTreeMap::new(),
-            pending: BTreeMap::new(),
+            staged: StagedStore::new(store),
         }
     }
 
@@ -490,6 +481,7 @@ impl SagaModule {
     /// deployments use.
     fn with_valset(
         id: impl Into<ModuleId>,
+        store: Box<dyn MerkleStore>,
         valset: impl Into<ModuleId>,
         policy: LeasePolicy,
     ) -> Self {
@@ -498,8 +490,7 @@ impl SagaModule {
             valset: Some(valset.into()),
             capability_registry: None,
             policy,
-            sagas: BTreeMap::new(),
-            pending: BTreeMap::new(),
+            staged: StagedStore::new(store),
         }
     }
 
@@ -509,66 +500,158 @@ impl SagaModule {
     /// of that tag; untagged sagas keep valset assignment.
     pub fn with_assignment(
         id: impl Into<ModuleId>,
+        store: Box<dyn MerkleStore>,
         valset: impl Into<ModuleId>,
         capability_registry: impl Into<ModuleId>,
         policy: LeasePolicy,
     ) -> Self {
         Self {
             capability_registry: Some(capability_registry.into()),
-            ..Self::with_valset(id, valset, policy)
+            ..Self::with_valset(id, store, valset, policy)
         }
     }
 
-    /// read a saga: a STAGED (this-block) write shadows committed state, and a
-    /// staged removal shadows it as absent.
-    fn get(&self, saga_id: &str) -> Option<&Saga> {
-        match self.pending.get(saga_id) {
-            Some(staged) => staged.as_ref(),
-            None => self.sagas.get(saga_id),
+    // ---- staged-over-committed reads ---------------------------------------
+    //
+    // every read goes through the overlay, so a later op in the same block sees
+    // an earlier one's write — the read-your-writes view the whole state
+    // machine decides on (`SagaModule::get` used to materialize it by hand).
+    // the query lane reads it too, DELIBERATELY: that is the visibility the
+    // pre-store module answered with, and the callback/crank contract is
+    // pinned against it.
+
+    /// read one saga's hot record (`None` == absent).
+    async fn load(&self, saga_id: &str) -> Result<Option<Saga>, Error> {
+        let Some(bytes) = self.staged.get(&record_key(saga_id)).await? else {
+            return Ok(None);
+        };
+        borsh::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| Error::Module(format!("saga record decode: {e}")))
+    }
+
+    /// reassemble one saga's spec from its chunks. only the surfaces that
+    /// actually EMIT the spec (a work order, the `Get`/pending projections)
+    /// pay for this — the crank sweep and every terminal transition never do.
+    async fn load_spec(&self, saga_id: &str, spec_len: u64) -> Result<Vec<u8>, Error> {
+        let mut spec = Vec::with_capacity(spec_len as usize);
+        for key in spec_chunk_keys(saga_id, spec_len) {
+            let chunk =
+                self.staged.get(&key).await?.ok_or_else(|| {
+                    Error::Module(format!("saga {saga_id} is missing a spec chunk"))
+                })?;
+            spec.extend_from_slice(&chunk);
         }
+        Ok(spec)
     }
 
-    /// stage a whole saga for this block without committing.
-    fn stage(&mut self, saga_id: String, saga: Saga) {
-        self.pending.insert(saga_id, Some(saga));
+    /// the live id index; absent reads as the empty set. `BTreeSet` serializes
+    /// ASCENDING, so the bytes are canonical and the iteration order is the
+    /// sorted id order every projection promises.
+    async fn load_pending(&self) -> Result<BTreeSet<String>, Error> {
+        let Some(bytes) = self.staged.get(PENDING_INDEX_KEY).await? else {
+            return Ok(BTreeSet::new());
+        };
+        borsh::from_slice(&bytes).map_err(|e| Error::Module(format!("pending index decode: {e}")))
     }
 
-    /// stage a removal for this block without committing.
-    fn stage_remove(&mut self, saga_id: String) {
-        self.pending.insert(saga_id, None);
+    /// the terminal receipt index; absent reads as empty.
+    async fn load_terminal(&self) -> Result<BTreeMap<String, TerminalEntry>, Error> {
+        let Some(bytes) = self.staged.get(TERMINAL_INDEX_KEY).await? else {
+            return Ok(BTreeMap::new());
+        };
+        borsh::from_slice(&bytes).map_err(|e| Error::Module(format!("terminal index decode: {e}")))
     }
 
-    /// the whole visible map — committed, with this block's staged writes and
-    /// removals applied. the same view `get` answers from, materialized.
-    fn visible(&self) -> BTreeMap<&str, &Saga> {
-        let mut visible: BTreeMap<&str, &Saga> = self
-            .sagas
-            .iter()
-            .map(|(id, saga)| (id.as_str(), saga))
-            .collect();
-        for (id, staged) in &self.pending {
-            match staged {
-                Some(saga) => visible.insert(id.as_str(), saga),
-                None => visible.remove(id.as_str()),
-            };
+    /// the live saga a projection promised, or a loud store bug — an index
+    /// entry without its record must never be silently skipped.
+    async fn require(&self, saga_id: &str) -> Result<Saga, Error> {
+        self.load(saga_id)
+            .await?
+            .ok_or_else(|| Error::Module(format!("saga index names a missing saga: {saga_id}")))
+    }
+
+    // ---- the writers -------------------------------------------------------
+
+    /// stage `key` only when the bytes would actually change, and DROP the key
+    /// when the collection is empty. both halves are load-bearing: the store's
+    /// root commits to the op log, so re-writing an unchanged index would move
+    /// the root on an otherwise-untouched op, and an empty index that kept its
+    /// key would hash differently from a never-used ledger.
+    async fn stage_if_changed(&mut self, key: &[u8], value: Option<Vec<u8>>) -> Result<(), Error> {
+        if self.staged.get(key).await? == value {
+            return Ok(());
         }
-        visible
+        match value {
+            Some(bytes) => self.staged.stage(key.to_vec(), bytes),
+            None => self.staged.delete(key.to_vec()),
+        }
+        Ok(())
     }
 
-    /// every saga id visible this dispatch — committed plus staged, sorted —
-    /// the deterministic iteration domain for `Crank`. staged REMOVALS are
-    /// applied, so every id it yields is one `get` answers.
-    fn visible_ids(&self) -> Vec<String> {
-        self.visible().into_keys().map(str::to_string).collect()
+    /// the ONE record writer: stage a saga and keep both id indexes in lockstep
+    /// with its status. every record it will write is encoded and checked
+    /// BEFORE any of them is staged, so a refused write leaves the overlay
+    /// untouched.
+    async fn put(&mut self, saga_id: &str, saga: &Saga) -> Result<(), Error> {
+        let record = borsh::to_vec(saga).expect("saga record is serializable");
+        check_record(&record, "saga record")?;
+
+        let mut pending = self.load_pending().await?;
+        let mut terminal = self.load_terminal().await?;
+        if saga.status.is_terminal() {
+            pending.remove(saga_id);
+            terminal.insert(
+                saga_id.to_string(),
+                TerminalEntry {
+                    updated_at: saga.updated_at,
+                    bytes: saga.receipt_bytes(),
+                },
+            );
+        } else {
+            // an evicted id that is triggered again comes back through here.
+            terminal.remove(saga_id);
+            pending.insert(saga_id.to_string());
+        }
+        let pending_record = encode_pending(&pending)?;
+        let terminal_record = encode_terminal(&terminal)?;
+
+        self.staged.stage(record_key(saga_id), record);
+        self.stage_if_changed(PENDING_INDEX_KEY, pending_record)
+            .await?;
+        self.stage_if_changed(TERMINAL_INDEX_KEY, terminal_record)
+            .await
     }
 
-    /// project a saga to its wire view.
-    fn view(saga: &Saga) -> SagaView {
+    /// drop a saga entirely — its record, its spec chunks, and its index row.
+    /// the shared tail of `Prune` and the retention trim, so an evicted id is
+    /// indistinguishable from a pruned one.
+    async fn remove(&mut self, saga_id: &str, saga: &Saga) -> Result<(), Error> {
+        for key in spec_chunk_keys(saga_id, saga.spec_len) {
+            self.staged.delete(key);
+        }
+        self.staged.delete(record_key(saga_id));
+
+        let mut pending = self.load_pending().await?;
+        pending.remove(saga_id);
+        let mut terminal = self.load_terminal().await?;
+        terminal.remove(saga_id);
+        // removals only shrink an index, so neither can cross the record cap.
+        let pending_record = encode_pending(&pending)?;
+        let terminal_record = encode_terminal(&terminal)?;
+        self.stage_if_changed(PENDING_INDEX_KEY, pending_record)
+            .await?;
+        self.stage_if_changed(TERMINAL_INDEX_KEY, terminal_record)
+            .await
+    }
+
+    /// project a saga (plus its reassembled spec) to its wire view.
+    fn view(saga: &Saga, spec: Vec<u8>) -> SagaView {
         SagaView {
             origin: saga.origin.clone(),
             reply_to: saga.reply_to.clone(),
             reply_payload: saga.reply_payload.clone(),
-            spec: saga.spec.clone(),
+            spec,
             capability: saga.capability.clone(),
             status: saga.status,
             attempt: saga.attempt,
@@ -582,6 +665,21 @@ impl SagaModule {
             error: saga.error.clone(),
             created_at: saga.created_at,
             updated_at: saga.updated_at,
+        }
+    }
+
+    /// the WorkerRequest a pending attempt corresponds to — the ONE projection
+    /// the effect lane, `AssignedPending` and `UnassignedPending` all build, so
+    /// a resident pump discovers exactly the order the events carried. the spec
+    /// is handed in: the effect lane already holds the trigger's bytes, and
+    /// only the query lane pays [`Self::load_spec`] to reassemble them.
+    fn worker_request(saga_id: String, saga: &Saga, spec: Vec<u8>) -> WorkerRequest {
+        WorkerRequest {
+            saga_id,
+            attempt: saga.attempt,
+            spec,
+            deadline: saga.deadline,
+            assignee: saga.assignee.clone(),
         }
     }
 
@@ -737,33 +835,38 @@ impl SagaModule {
     /// shared tail of trigger, error-retry, and lease-expiry-retry. a pinned
     /// saga leases every attempt to its pinned key; everything else is
     /// rendezvous-assigned from the pool.
-    fn request_assigned(
+    ///
+    /// the write happens BEFORE the emit: a refused record must not leave a
+    /// work order behind on an op that never lands.
+    async fn request_assigned(
         &mut self,
         ctx: &mut dyn Ctx,
         saga_id: String,
         mut saga: Saga,
+        spec: &[u8],
         assignee: Option<Vec<u8>>,
-    ) {
+    ) -> Result<(), Error> {
         let height = ctx.env().height;
         saga.assignee = assignee;
         saga.lease_expires_at =
             bounded_lease_expiry(height, &saga.assignee, saga.lease_views, saga.deadline);
+        self.put(&saga_id, &saga).await?;
         // the work order leaves as an EVENT — the host-side worker seam
         // try-decodes and claims it; unclaimed events are plain observability.
         ctx.emit_event(Event {
             source: self.id.clone(),
-            payload: encode_worker_request(&WorkerRequest {
-                saga_id: saga_id.clone(),
-                attempt: saga.attempt,
-                spec: saga.spec.clone(),
-                deadline: saga.deadline,
-                assignee: saga.assignee.clone(),
-            }),
+            payload: encode_worker_request(&Self::worker_request(saga_id, &saga, spec.to_vec())),
         });
-        self.stage(saga_id, saga);
+        Ok(())
     }
 
-    async fn lease_and_request(&mut self, ctx: &mut dyn Ctx, saga_id: String, saga: Saga) {
+    async fn lease_and_request(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        saga_id: String,
+        saga: Saga,
+        spec: &[u8],
+    ) -> Result<(), Error> {
         let height = ctx.env().height;
         let assignee = match &saga.pinned_assignee {
             Some(key) => Some(key.clone()),
@@ -779,32 +882,8 @@ impl SagaModule {
                 .await
             }
         };
-        self.request_assigned(ctx, saga_id, saga, assignee);
-    }
-
-    // ---- state-sync ---------------------------------------------------------
-    // hand a joiner the committed continuation state as canonical bytes; the
-    // consensus-agreed root — never the serving peer — decides whether they land.
-
-    /// serialize the COMMITTED continuation state (never the staged overlay) into
-    /// the canonical encoding `root()` commits to: sorted ids, fixed-width length
-    /// prefixes, single-byte enum discriminants. deterministic across nodes.
-    pub fn snapshot(&self) -> Vec<u8> {
-        encode_committed(&self.sagas)
-    }
-
-    /// adopt a peer's snapshot as own committed state — but only after the
-    /// decoded temporaries re-derive `expected` via the exact `root()` algorithm,
-    /// so a byzantine snapshot cannot land under an agreed root it doesn't match.
-    /// all-or-nothing: on any Err this module (and its root) is byte-identical to
-    /// before the call. on success the staged overlay is dropped — a snapshot
-    /// describes a block boundary, and nothing half-applied may shadow it.
-    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let sagas = decode_committed(bytes)?;
-        sdk::verify_snapshot_root(committed_root(&sagas), expected)?;
-        self.sagas = sagas;
-        self.pending.clear();
-        Ok(())
+        self.request_assigned(ctx, saga_id, saga, spec, assignee)
+            .await
     }
 
     /// the op handler — one arm per [`SagaMsg`] variant. every write it makes
@@ -836,11 +915,19 @@ impl SagaModule {
                         ctx.env().origin.actor_string()
                     )));
                 }
+                // the SHARED-record guard: every live id rides the one
+                // `pending` index record (see [`MAX_SAGA_ID_BYTES`]).
+                if saga_id.len() > MAX_SAGA_ID_BYTES {
+                    return Err(Error::Module(format!(
+                        "trigger saga_id is {} bytes; the cap is {MAX_SAGA_ID_BYTES}",
+                        saga_id.len()
+                    )));
+                }
                 // a duplicate saga_id — staged this block or already committed
                 // — is a DETERMINISTIC NO-OP. (v1 silently reset the saga and
                 // re-fired the worker, letting any later trigger clobber an
                 // in-flight or finished saga.)
-                if self.get(&saga_id).is_some() {
+                if self.load(&saga_id).await?.is_some() {
                     return Ok(());
                 }
                 if max_attempts == 0 {
@@ -884,13 +971,21 @@ impl SagaModule {
                 validate_resources(&demands).map_err(Error::Module)?;
                 // an empty pinned key is a caller bug, rejected rather than
                 // silently read as "no binding" (the same rule as an empty
-                // capability tag).
-                if let Some(key) = &pinned_assignee
-                    && key.is_empty()
-                {
-                    return Err(Error::Module(
-                        "trigger pinned_assignee must be non-empty when set".into(),
-                    ));
+                // capability tag). its SIZE is the ONE wire-supplied field the
+                // saga record carried unbounded, and the record now lives in
+                // the store — see [`MAX_ASSIGNEE_BYTES`].
+                if let Some(key) = &pinned_assignee {
+                    if key.is_empty() {
+                        return Err(Error::Module(
+                            "trigger pinned_assignee must be non-empty when set".into(),
+                        ));
+                    }
+                    if key.len() > MAX_ASSIGNEE_BYTES {
+                        return Err(Error::Module(format!(
+                            "trigger pinned_assignee is {} bytes; the cap is {MAX_ASSIGNEE_BYTES}",
+                            key.len()
+                        )));
+                    }
                 }
                 // the callback-poison rule (design §4): a callback aimed at an
                 // unknown module — or at this module itself, which cannot
@@ -914,7 +1009,7 @@ impl SagaModule {
                     origin: saga_origin(&ctx.env().origin),
                     reply_to,
                     reply_payload,
-                    spec,
+                    spec_len: spec.len() as u64,
                     capability,
                     demands,
                     status: SagaStatus::Pending,
@@ -930,7 +1025,17 @@ impl SagaModule {
                     created_at: now,
                     updated_at: now,
                 };
-                self.lease_and_request(ctx, saga_id, saga).await;
+                // the record and both indexes are checked and staged first, so
+                // a refused write leaves NO spec chunk behind. the spec itself
+                // is written ONCE, here — every later attempt reads it back —
+                // and each chunk is SPEC_CHUNK_BYTES by construction, so no
+                // chunk can cross the record cap.
+                self.lease_and_request(ctx, saga_id.clone(), saga, &spec)
+                    .await?;
+                for (chunk, bytes) in spec.chunks(SPEC_CHUNK_BYTES).enumerate() {
+                    self.staged
+                        .stage(spec_chunk_key(&saga_id, chunk as u64), bytes.to_vec());
+                }
             }
             SagaMsg::OracleResult {
                 saga_id,
@@ -942,7 +1047,7 @@ impl SagaModule {
                 // triggered, or pruned), terminal saga (a duplicate — the
                 // first agreed result won), stale attempt (an executor
                 // answering work that was already re-leased).
-                let Some(current) = self.get(&saga_id) else {
+                let Some(current) = self.load(&saga_id).await? else {
                     return Ok(());
                 };
                 if current.status.is_terminal() || attempt != current.attempt {
@@ -970,7 +1075,7 @@ impl SagaModule {
                 }
                 // an oversized error string is the same abort-don't-commit
                 // case as an oversized result: the Failed arm stores it in the
-                // root preimage and echoes it in the callback.
+                // record and echoes it in the callback.
                 if let Err(error) = &outcome
                     && error.len() > MAX_ERROR_BYTES
                 {
@@ -979,12 +1084,12 @@ impl SagaModule {
                         error.len()
                     )));
                 }
-                let mut saga = current.clone();
+                let mut saga = current;
                 saga.updated_at = ctx.env().consensus_time;
                 match outcome {
                     Ok(result) => {
                         // a finalized oversized result must not commit: abort
-                        // the block rather than bloat the root preimage.
+                        // the block rather than bloat the record.
                         if result.len() > MAX_RESULT_BYTES {
                             return Err(Error::Module(format!(
                                 "oracle result is {} bytes; the cap is {MAX_RESULT_BYTES}",
@@ -994,24 +1099,25 @@ impl SagaModule {
                         saga.status = SagaStatus::Done;
                         saga.result = Some(result.clone());
                         Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::Done(result));
-                        self.stage(saga_id, saga);
+                        self.put(&saga_id, &saga).await?;
                     }
                     // an Err consumes the attempt: re-lease while attempts
                     // remain, else the saga is terminally Failed.
                     Err(_) if saga.attempt + 1 < saga.max_attempts => {
                         saga.attempt += 1;
-                        self.lease_and_request(ctx, saga_id, saga).await;
+                        let spec = self.load_spec(&saga_id, saga.spec_len).await?;
+                        self.lease_and_request(ctx, saga_id, saga, &spec).await?;
                     }
                     Err(error) => {
                         saga.status = SagaStatus::Failed;
                         saga.error = Some(error.clone());
                         Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::Failed(error));
-                        self.stage(saga_id, saga);
+                        self.put(&saga_id, &saga).await?;
                     }
                 }
             }
             SagaMsg::RenewLease { saga_id, attempt } => {
-                let Some(current) = self.get(&saga_id) else {
+                let Some(current) = self.load(&saga_id).await? else {
                     return Ok(());
                 };
                 if current.status.is_terminal() || attempt != current.attempt {
@@ -1045,10 +1151,10 @@ impl SagaModule {
                     }
                 }
                 saga.updated_at = ctx.env().consensus_time;
-                self.stage(saga_id, saga);
+                self.put(&saga_id, &saga).await?;
             }
             SagaMsg::Reassign { saga_id, attempt } => {
-                let Some(current) = self.get(&saga_id) else {
+                let Some(current) = self.load(&saga_id).await? else {
                     return Ok(());
                 };
                 if current.status.is_terminal()
@@ -1057,7 +1163,7 @@ impl SagaModule {
                 {
                     return Ok(());
                 }
-                let mut saga = current.clone();
+                let mut saga = current;
                 saga.updated_at = ctx.env().consensus_time;
                 if saga.pinned_assignee.is_some() {
                     return Err(Error::Module("pinned saga cannot be reassigned".into()));
@@ -1083,8 +1189,10 @@ impl SagaModule {
                 let Some(next) = next else {
                     return Err(Error::Module("no alternate assignee is available".into()));
                 };
+                let spec = self.load_spec(&saga_id, saga.spec_len).await?;
                 self.cancel_attempt(ctx, &saga_id, old_attempt, old_assignee.as_deref());
-                self.request_assigned(ctx, saga_id, saga, Some(next));
+                self.request_assigned(ctx, saga_id, saga, &spec, Some(next))
+                    .await?;
             }
             SagaMsg::Accept { saga_id, attempt } => {
                 // the claim lane for UNASSIGNED attempts: first accept in
@@ -1103,7 +1211,7 @@ impl SagaModule {
                         "Accept requires a non-empty submitter id".into(),
                     ));
                 }
-                let Some(current) = self.get(&saga_id) else {
+                let Some(current) = self.load(&saga_id).await? else {
                     return Ok(());
                 };
                 if current.status.is_terminal()
@@ -1113,49 +1221,41 @@ impl SagaModule {
                     return Ok(());
                 }
                 let height = ctx.env().height;
-                let mut saga = current.clone();
-                saga.assignee = Some(key.clone());
+                let key = key.clone();
+                let mut saga = current;
+                saga.assignee = Some(key);
                 saga.lease_expires_at =
                     bounded_lease_expiry(height, &saga.assignee, saga.lease_views, saga.deadline);
                 saga.updated_at = ctx.env().consensus_time;
+                let spec = self.load_spec(&saga_id, saga.spec_len).await?;
+                self.put(&saga_id, &saga).await?;
                 // the actual work order: the announcement's request, re-emitted
                 // naming the winner — every other node's worker skips it.
                 ctx.emit_event(Event {
                     source: self.id.clone(),
-                    payload: encode_worker_request(&WorkerRequest {
-                        saga_id: saga_id.clone(),
-                        attempt: saga.attempt,
-                        spec: saga.spec.clone(),
-                        deadline: saga.deadline,
-                        assignee: saga.assignee.clone(),
-                    }),
+                    payload: encode_worker_request(&Self::worker_request(saga_id, &saga, spec)),
                 });
-                self.stage(saga_id, saga);
             }
             SagaMsg::Crank {} => {
                 // PERMISSIONLESS: any origin may crank — P7's liveness comes
                 // from anyone submitting this op, and its safety from every
-                // check reading only agreed values. bounded sweep in id order;
-                // when nothing has expired, nothing is staged and the root is
-                // untouched.
+                // check reading only agreed values. bounded sweep in id order
+                // over the LIVE index (a terminal saga was never crank's
+                // business, and is not in it); when nothing has expired,
+                // nothing is staged and the root is untouched.
                 let now = ctx.env().consensus_time;
                 let mut transitions: u32 = 0;
-                for saga_id in self.visible_ids() {
+                for saga_id in self.load_pending().await? {
                     if transitions == CRANK_BUDGET {
                         break;
                     }
-                    let Some(current) = self.get(&saga_id) else {
-                        continue;
-                    };
-                    if current.status.is_terminal() {
-                        continue;
-                    }
+                    let current = self.require(&saga_id).await?;
                     let deadline_hit = current.deadline.is_some_and(|d| now >= d);
                     let lease_hit = current.lease_expires_at.is_some_and(|l| now >= l);
                     if !deadline_hit && !lease_hit {
                         continue;
                     }
-                    let mut saga = current.clone();
+                    let mut saga = current;
                     saga.updated_at = now;
                     let old_attempt = saga.attempt;
                     let old_assignee = saga.assignee.clone();
@@ -1165,19 +1265,20 @@ impl SagaModule {
                         self.cancel_attempt(ctx, &saga_id, old_attempt, old_assignee.as_deref());
                         saga.status = SagaStatus::TimedOut;
                         Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::TimedOut);
-                        self.stage(saga_id, saga);
+                        self.put(&saga_id, &saga).await?;
                     } else if saga.attempt + 1 < saga.max_attempts {
                         // an expired lease consumes the attempt and re-leases.
+                        let spec = self.load_spec(&saga_id, saga.spec_len).await?;
                         self.cancel_attempt(ctx, &saga_id, old_attempt, old_assignee.as_deref());
                         saga.attempt += 1;
-                        self.lease_and_request(ctx, saga_id, saga).await;
+                        self.lease_and_request(ctx, saga_id, saga, &spec).await?;
                     } else {
                         let error = "lease attempts exhausted".to_string();
                         self.cancel_attempt(ctx, &saga_id, old_attempt, old_assignee.as_deref());
                         saga.status = SagaStatus::Failed;
                         saga.error = Some(error.clone());
                         Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::Failed(error));
-                        self.stage(saga_id, saga);
+                        self.put(&saga_id, &saga).await?;
                     }
                     transitions += 1;
                 }
@@ -1187,19 +1288,19 @@ impl SagaModule {
                 // pending saga; everything else — terminal, unknown, foreign
                 // origin — is a deterministic no-op, never an error (a
                 // finalized foreign cancel must not abort the block).
-                let Some(current) = self.get(&saga_id) else {
+                let Some(current) = self.load(&saga_id).await? else {
                     return Ok(());
                 };
                 if current.status.is_terminal() || current.origin != saga_origin(&ctx.env().origin)
                 {
                     return Ok(());
                 }
-                let mut saga = current.clone();
+                let mut saga = current;
                 self.cancel_attempt(ctx, &saga_id, saga.attempt, saga.assignee.as_deref());
                 saga.status = SagaStatus::Cancelled;
                 saga.updated_at = ctx.env().consensus_time;
                 Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::Cancelled);
-                self.stage(saga_id, saga);
+                self.put(&saga_id, &saga).await?;
             }
             SagaMsg::Prune { saga_ids } => {
                 // explicit GC: remove TERMINAL sagas whose recorded trigger
@@ -1209,18 +1310,39 @@ impl SagaModule {
                 // reclaiming a specific id early.
                 let origin = saga_origin(&ctx.env().origin);
                 for saga_id in saga_ids {
-                    let Some(current) = self.get(&saga_id) else {
+                    let Some(current) = self.load(&saga_id).await? else {
                         continue;
                     };
                     if !current.status.is_terminal() || current.origin != origin {
                         continue;
                     }
-                    self.stage_remove(saga_id);
+                    self.remove(&saga_id, &current).await?;
                 }
             }
         }
         Ok(())
     }
+}
+
+/// the live index's record form. an EMPTY index DROPS its key, so a ledger
+/// pruned back to nothing hashes to the same root a never-used one does.
+fn encode_pending(pending: &BTreeSet<String>) -> Result<Option<Vec<u8>>, Error> {
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let bytes = borsh::to_vec(pending).expect("pending index is serializable");
+    check_record(&bytes, "pending saga index")?;
+    Ok(Some(bytes))
+}
+
+/// the terminal index's record form — same empty-drops-the-key rule.
+fn encode_terminal(terminal: &BTreeMap<String, TerminalEntry>) -> Result<Option<Vec<u8>>, Error> {
+    if terminal.is_empty() {
+        return Ok(None);
+    }
+    let bytes = borsh::to_vec(terminal).expect("terminal index is serializable");
+    check_record(&bytes, "terminal saga index")?;
+    Ok(Some(bytes))
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1229,18 +1351,24 @@ impl Module for SagaModule {
         self.id.clone()
     }
 
-    /// state-based commitment: sha256 over the canonical committed encoding —
-    /// a length-prefixed fold of every saga field in sorted-id order.
-    /// insertion-order-independent and idempotent — and sensitive to every
-    /// field, so any transition (status, attempt, lease, result) yields a
-    /// distinct root. the preimage IS the snapshot encoding (see
-    /// [`SagaModule::snapshot`]).
+    /// the REAL merkle root over all committed records, cached by the store —
+    /// never a re-serialization of the ledger.
     fn root(&self) -> StateRoot {
-        committed_root(&self.sagas)
+        self.staged.root()
     }
 
-    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
-        Some(self.snapshot())
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        self.staged.state_sync_handle()
+    }
+
+    /// the network state-sync serve lane: answers the shared qmdb wire requests
+    /// (historical proof-carrying op ranges) from committed state. read-only.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.staged.serve_sync(req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        self.staged.sync_target().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -1248,30 +1376,36 @@ impl Module for SagaModule {
         // bounded retention, STAGED like every other write this op makes —
         // never deferred to the block boundary (see the crate header, `## GC`,
         // for why the two runtimes would disagree if it were).
-        let evictions = terminal_evictions(&self.visible());
-        for saga_id in evictions {
-            self.stage_remove(saga_id);
+        for saga_id in terminal_evictions(&self.load_terminal().await?) {
+            let saga = self.require(&saga_id).await?;
+            self.remove(&saga_id, &saga).await?;
         }
         Ok(())
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            SagaQuery::Get { saga_id } => Ok(encode_reply(&SagaReply::Saga(
-                self.get(&saga_id).map(Self::view),
-            ))),
+            SagaQuery::Get { saga_id } => {
+                let view = match self.load(&saga_id).await? {
+                    Some(saga) => {
+                        let spec = self.load_spec(&saga_id, saga.spec_len).await?;
+                        Some(Self::view(&saga, spec))
+                    }
+                    None => None,
+                };
+                Ok(encode_reply(&SagaReply::Saga(view)))
+            }
             SagaQuery::NextExpiry => {
                 // the crank pump's read: the earliest lease-expiry or
                 // deadline over PENDING sagas — once the current view reaches
                 // it, a Crank is guaranteed to transition something.
-                let next = self
-                    .visible_ids()
-                    .into_iter()
-                    .filter_map(|id| self.get(&id))
-                    .filter(|saga| !saga.status.is_terminal())
-                    .flat_map(|saga| [saga.lease_expires_at, saga.deadline])
-                    .flatten()
-                    .min();
+                let mut next: Option<u64> = None;
+                for saga_id in self.load_pending().await? {
+                    let saga = self.require(&saga_id).await?;
+                    for candidate in [saga.lease_expires_at, saga.deadline].into_iter().flatten() {
+                        next = Some(next.map_or(candidate, |n: u64| n.min(candidate)));
+                    }
+                }
                 Ok(encode_reply(&SagaReply::NextExpiry(next)))
             }
             SagaQuery::AssignedPending { assignee } => {
@@ -1279,67 +1413,49 @@ impl Module for SagaModule {
                 // WorkerRequest the effect lane carried for every pending
                 // attempt leased to `assignee`. a node that installs synced
                 // boundaries (and so never observes effects) discovers its
-                // own assigned work here; visible_ids is sorted, so the
+                // own assigned work here; the index is sorted, so the
                 // projection is deterministic.
-                let requests = self
-                    .visible_ids()
-                    .into_iter()
-                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
-                    .filter(|(_, saga)| {
-                        !saga.status.is_terminal()
-                            && saga.assignee.as_deref() == Some(assignee.as_slice())
-                    })
-                    .map(|(id, saga)| WorkerRequest {
-                        saga_id: id,
-                        attempt: saga.attempt,
-                        spec: saga.spec.clone(),
-                        deadline: saga.deadline,
-                        assignee: saga.assignee.clone(),
-                    })
-                    .collect();
+                let mut requests = Vec::new();
+                for saga_id in self.load_pending().await? {
+                    let saga = self.require(&saga_id).await?;
+                    if saga.assignee.as_deref() != Some(assignee.as_slice()) {
+                        continue;
+                    }
+                    let spec = self.load_spec(&saga_id, saga.spec_len).await?;
+                    requests.push(Self::worker_request(saga_id, &saga, spec));
+                }
                 Ok(encode_reply(&SagaReply::AssignedPending(requests)))
             }
             SagaQuery::UnassignedPending => {
                 // the claim lane's read: the announcement requests, which no
                 // node holds a lease on yet. Same projection shape as
-                // `AssignedPending` (and the same `visible_ids` ordering, so
-                // it is deterministic) — only the assignee predicate differs,
-                // and `assignee` rides through as `None` so the worker gate
-                // sees exactly the announcement the effect lane carried.
-                let requests = self
-                    .visible_ids()
-                    .into_iter()
-                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
-                    .filter(|(_, saga)| !saga.status.is_terminal() && saga.assignee.is_none())
-                    .map(|(id, saga)| WorkerRequest {
-                        saga_id: id,
-                        attempt: saga.attempt,
-                        spec: saga.spec.clone(),
-                        deadline: saga.deadline,
-                        assignee: None,
-                    })
-                    .collect();
+                // `AssignedPending` (and the same index ordering, so it is
+                // deterministic) — only the assignee predicate differs, and
+                // `assignee` rides through as `None` so the worker gate sees
+                // exactly the announcement the effect lane carried.
+                let mut requests = Vec::new();
+                for saga_id in self.load_pending().await? {
+                    let saga = self.require(&saga_id).await?;
+                    if saga.assignee.is_some() {
+                        continue;
+                    }
+                    let spec = self.load_spec(&saga_id, saga.spec_len).await?;
+                    requests.push(Self::worker_request(saga_id, &saga, spec));
+                }
                 Ok(encode_reply(&SagaReply::UnassignedPending(requests)))
             }
         }
     }
 
+    /// publish the block's staged writes AND deletes in ONE store batch.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        for (id, staged) in std::mem::take(&mut self.pending) {
-            match staged {
-                Some(saga) => {
-                    self.sagas.insert(id, saga);
-                }
-                None => {
-                    self.sagas.remove(&id);
-                }
-            }
-        }
-        Ok(())
+        self.staged.commit().await
     }
 
+    /// discard the block's staged writes — nothing reached the store, so
+    /// `root()` is unchanged.
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending.clear();
+        self.staged.abort();
         Ok(())
     }
 }
@@ -1353,6 +1469,7 @@ mod tests {
     };
     use futures::executor::block_on;
     use sdk::{Env, Event};
+    use sdk_testkit::MemStore;
     use std::collections::BTreeSet;
 
     /// a minimal `Ctx` that captures emitted msgs/effects and serves a canned
@@ -1561,6 +1678,19 @@ mod tests {
     fn exec(m: &mut SagaModule, ctx: &mut CaptureCtx, op: &Msg) -> Result<(), Error> {
         block_on(m.execute(ctx, op))
     }
+    /// the hot record straight out of the store view — for the cases that ask
+    /// about presence/status rather than the wire projection.
+    fn load(m: &SagaModule, id: &str) -> Option<Saga> {
+        block_on(m.load(id)).unwrap()
+    }
+    /// how many sagas the ledger retains. the store cannot enumerate, so the
+    /// two id indexes ARE the census — and they are exactly what a wasm
+    /// validator would count too.
+    fn retained(m: &SagaModule) -> usize {
+        block_on(async {
+            m.load_pending().await.unwrap().len() + m.load_terminal().await.unwrap().len()
+        })
+    }
     fn commit(m: &mut SagaModule) {
         block_on(m.commit_block()).unwrap();
     }
@@ -1572,8 +1702,13 @@ mod tests {
         // saga goes out as an announcement — which a host that does not
         // execute blocks can only ever see here.
         let me = b"claimer-key".to_vec();
-        let mut m =
-            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut m = SagaModule::with_assignment(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        );
         assert!(
             unassigned_pending(&m).is_empty(),
             "an empty ledger announces nothing"
@@ -1671,7 +1806,7 @@ mod tests {
 
     #[test]
     fn an_unassigned_cancel_emits_no_worker_control() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new();
         exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"work")).unwrap();
         commit(&mut m);
@@ -1690,7 +1825,7 @@ mod tests {
 
     #[test]
     fn trigger_stages_pending_and_emits_one_worker_request() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let r0 = m.root();
         let mut ctx = CaptureCtx::new();
         exec(
@@ -1742,7 +1877,7 @@ mod tests {
 
     #[test]
     fn duplicate_trigger_is_a_deterministic_no_op() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new();
         exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"first")).unwrap();
 
@@ -1784,7 +1919,7 @@ mod tests {
         let dispatch = Origin::Module("dispatch".into());
         let squatted = namespaced_id(&dispatch, "chat\u{1f}run-7");
 
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new().with_origin(mallory.clone());
         let err = exec(&mut m, &mut ctx, &trigger(&squatted, b"squat")).unwrap_err();
         assert!(
@@ -1811,7 +1946,7 @@ mod tests {
 
     #[test]
     fn zero_max_attempts_is_rejected() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new();
         let err = exec(
             &mut m,
@@ -1839,7 +1974,7 @@ mod tests {
     fn unknown_or_self_reply_to_is_rejected_at_trigger_time() {
         // the callback-poison pin, half (a): an unknown callback target would
         // abort every future terminal block, so it never becomes a saga.
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new().knowing("agent");
         let err = exec(
             &mut m,
@@ -1913,7 +2048,7 @@ mod tests {
 
     #[test]
     fn ok_result_lands_done_and_emits_the_callback() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new().knowing("agent");
         exec(
             &mut m,
@@ -1965,7 +2100,7 @@ mod tests {
 
     #[test]
     fn err_result_retries_then_lands_done() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new();
         exec(
             &mut m,
@@ -2030,7 +2165,7 @@ mod tests {
 
     #[test]
     fn err_result_with_attempts_exhausted_lands_failed() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new().knowing("agent");
         exec(
             &mut m,
@@ -2074,7 +2209,7 @@ mod tests {
 
     #[test]
     fn duplicate_and_stale_results_are_no_ops() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new();
         exec(
             &mut m,
@@ -2162,7 +2297,7 @@ mod tests {
         // the symmetric caps: spec and reply_payload at trigger time, the Err
         // string at result time — all the same commit-into-the-root-preimage
         // class as an oversized Ok result.
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let genesis_root = m.root();
 
         let mut ctx = CaptureCtx::new();
@@ -2245,7 +2380,7 @@ mod tests {
 
     #[test]
     fn oversized_result_aborts_and_the_boundary_is_accepted() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new();
         exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"w")).unwrap();
         commit(&mut m);
@@ -2285,7 +2420,12 @@ mod tests {
     #[test]
     fn crank_times_out_a_past_deadline_saga_and_deadline_dominates_lease() {
         let validators = vec![b"node-a".to_vec()];
-        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Strict,
+        );
         let mut ctx = CaptureCtx::new()
             .knowing("agent")
             .with_validators(validators.clone());
@@ -2359,7 +2499,12 @@ mod tests {
     #[test]
     fn crank_expires_a_lease_into_a_retry_then_a_failure() {
         let validators = vec![b"node-a".to_vec()];
-        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Strict,
+        );
         let mut ctx = CaptureCtx::new()
             .knowing("agent")
             .with_validators(validators.clone());
@@ -2434,7 +2579,12 @@ mod tests {
         // scenario lives in the `dispatch` namespace, not the default `system`.
         let sid = |id: &str| namespaced_id(&Origin::Module("dispatch".into()), id);
         let validators = vec![b"node-a".to_vec(), b"node-b".to_vec()];
-        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Strict,
+        );
         let mut ctx = CaptureCtx::new()
             .with_origin(Origin::Module("dispatch".into()))
             .with_validators(validators.clone());
@@ -2574,7 +2724,7 @@ mod tests {
 
     #[test]
     fn crank_budget_bounds_one_sweep_and_the_next_crank_finishes() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new();
         // 33 sagas, every one past its deadline at view 10. zero-padded ids
         // pin the sweep order.
@@ -2632,7 +2782,12 @@ mod tests {
         let mallory = Origin::External(b"mallory".to_vec());
         let validators = vec![b"node-a".to_vec()];
 
-        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Strict,
+        );
         let mut ctx = CaptureCtx::new()
             .with_origin(alice.clone())
             .knowing("agent")
@@ -2736,7 +2891,7 @@ mod tests {
         let sid = |id: &str| namespaced_id(&Origin::External(b"alice".to_vec()), id);
         let their = |id: &str| namespaced_id(&Origin::External(b"mallory".to_vec()), id);
 
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         // "done" and "open" belong to alice; "theirs" to mallory.
         let mut ctx = CaptureCtx::new().with_origin(alice.clone());
         exec(&mut m, &mut ctx, &trigger(&sid("done"), b"a")).unwrap();
@@ -2793,7 +2948,12 @@ mod tests {
     #[test]
     fn open_policy_with_valset_assigns_but_accepts_any_submitter() {
         let validators = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]];
-        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Open);
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Open,
+        );
         let mut ctx = CaptureCtx::new().at(4).with_validators(validators.clone());
         exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"w")).unwrap();
         commit(&mut m);
@@ -2822,7 +2982,12 @@ mod tests {
     #[test]
     fn strict_policy_gates_results_to_the_assignee() {
         let validators = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]];
-        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Strict,
+        );
         let mut ctx = CaptureCtx::new().with_validators(validators.clone());
         exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"w")).unwrap();
         commit(&mut m);
@@ -2874,7 +3039,12 @@ mod tests {
         // emitted request is an ANNOUNCEMENT — no result lands until a node
         // claims the attempt, first accept in consensus order wins, and only
         // the winner's result counts.
-        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Strict,
+        );
         let mut ctx = CaptureCtx::new().with_validators(Vec::new());
         exec(&mut m, &mut ctx, &trigger(&sid("s1"), b"w")).unwrap();
         commit(&mut m);
@@ -2971,7 +3141,12 @@ mod tests {
     #[test]
     fn accept_rejects_bad_origins_and_no_ops_on_assigned_or_stale_targets() {
         let validators = vec![vec![1u8; 32]];
-        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Strict,
+        );
         let mut ctx = CaptureCtx::new().with_validators(validators.clone());
         exec(&mut m, &mut ctx, &trigger(&sid("assigned"), b"w")).unwrap();
         commit(&mut m);
@@ -3061,8 +3236,13 @@ mod tests {
         // lane for a daemon to come back exhausted `max_attempts` and reached
         // `Failed` while no node had ever held it.
         let only = vec![9u8; 32];
-        let mut m =
-            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut m = SagaModule::with_assignment(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        );
         // the sole provider is announced at trigger time, so the attempt leases.
         let mut ctx = capability_ctx_with(vec![only.clone()], vec![only.clone()]);
         exec(
@@ -3135,8 +3315,13 @@ mod tests {
         // the sole provider is DISJOINT from the valset, so any valset leak
         // in pool selection fails the assertion.
         let provider = vec![9u8; 32];
-        let mut m =
-            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut m = SagaModule::with_assignment(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        );
         let mut ctx = CaptureCtx::new()
             .at(4)
             .with_validators(validators.clone())
@@ -3188,8 +3373,13 @@ mod tests {
 
     #[test]
     fn a_capability_nobody_provides_assigns_nobody_and_waits_for_a_claim() {
-        let mut m =
-            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut m = SagaModule::with_assignment(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        );
         let mut ctx = CaptureCtx::new()
             .with_validators(vec![vec![1u8; 32]])
             .with_providers(Vec::new());
@@ -3237,7 +3427,13 @@ mod tests {
     #[test]
     fn untagged_sagas_keep_valset_assignment_under_with_assignment() {
         let validators = vec![vec![1u8; 32], vec![2u8; 32]];
-        let mut m = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Open);
+        let mut m = SagaModule::with_assignment(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            "capability",
+            LeasePolicy::Open,
+        );
         let mut ctx = CaptureCtx::new()
             .with_validators(validators.clone())
             .with_providers(vec![vec![9u8; 32]]);
@@ -3255,8 +3451,13 @@ mod tests {
         // the pinned key is disjoint from the valset AND the provider pool,
         // so any rendezvous leak in assignment fails the assertions.
         let pinned = vec![7u8; 32];
-        let mut m =
-            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut m = SagaModule::with_assignment(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        );
         let mut ctx = CaptureCtx::new()
             .at(4)
             .with_validators(vec![vec![1u8; 32]])
@@ -3319,7 +3520,7 @@ mod tests {
 
     #[test]
     fn an_empty_pinned_assignee_is_rejected() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new();
         let err = exec(
             &mut m,
@@ -3343,7 +3544,7 @@ mod tests {
 
     #[test]
     fn empty_and_oversized_capability_tags_are_rejected() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new();
         let oversized = "x".repeat(MAX_CAPABILITY_BYTES + 1);
         for bad in ["", oversized.as_str()] {
@@ -3377,7 +3578,12 @@ mod tests {
         // `an_unassigned_announcement_does_not_burn_the_attempt_budget`), so a
         // ledger that assigns nobody is the wrong fixture for a test about
         // which expiry is earliest.
-        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Open);
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Open,
+        );
         assert_eq!(next_expiry(&m), None, "an empty ledger has no expiry");
 
         let validators = vec![b"node-a".to_vec()];
@@ -3436,8 +3642,13 @@ mod tests {
         // other keys see nothing, and a landed result retires it.
         let me = b"resident-key".to_vec();
         let other = b"someone-else".to_vec();
-        let mut m =
-            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut m = SagaModule::with_assignment(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        );
         assert!(
             assigned_pending(&m, &me).is_empty(),
             "an empty ledger assigns nothing"
@@ -3497,8 +3708,8 @@ mod tests {
     #[test]
     fn two_instances_replaying_one_script_land_on_byte_identical_roots() {
         // the determinism pin: the same op script, replayed on two fresh
-        // instances, must produce byte-identical snapshots (and thus roots)
-        // after every block.
+        // instances, must commit byte-identical roots after every block —
+        // the store's merkle root IS the state commitment now.
         fn script() -> Vec<Vec<Msg>> {
             let sid = |id: &str| namespaced_id(&Origin::External(b"alice".to_vec()), id);
             let alice = |saga_id: &str, max_attempts: u32, deadline: Option<u64>| {
@@ -3548,7 +3759,7 @@ mod tests {
         }
 
         let run = || {
-            let mut m = SagaModule::new("saga");
+            let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
             let mut roots = Vec::new();
             for (height, block) in script().into_iter().enumerate() {
                 let mut ctx = CaptureCtx::new()
@@ -3560,13 +3771,10 @@ mod tests {
                 commit(&mut m);
                 roots.push(m.root());
             }
-            (roots, m.snapshot())
+            roots
         };
 
-        let (roots_a, snapshot_a) = run();
-        let (roots_b, snapshot_b) = run();
-        assert_eq!(roots_a, roots_b, "identical roots after every block");
-        assert_eq!(snapshot_a, snapshot_b, "byte-identical final snapshots");
+        assert_eq!(run(), run(), "identical roots after every block");
     }
 
     #[test]
@@ -3575,8 +3783,13 @@ mod tests {
         // carrying demands must assign there, never to the small provider.
         let big = b"node-big".to_vec();
         let small = b"node-small".to_vec();
-        let mut m =
-            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut m = SagaModule::with_assignment(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        );
         let mut ctx = capability_ctx_with(vec![small.clone(), big.clone()], vec![big.clone()]);
         exec(
             &mut m,
@@ -3605,59 +3818,51 @@ mod tests {
     }
 
     #[test]
-    fn trigger_demands_survive_snapshot_round_trip() {
-        // same trigger as above, then snapshot/install into a fresh module:
-        // roots equal, and the reassignment pool still filters by demands.
+    fn stored_demands_still_filter_the_reassignment_pool() {
+        // the demands ride the RECORD, not just the trigger message: a later
+        // Reassign re-derives its pool from stored state, so excluding the
+        // sole demand-capable provider (big) from a pool that also holds a
+        // demand-incapable one (small) must find NO alternate — if
+        // reassignment fell back to the raw provider list instead of
+        // CapableProviders, it would (wrongly) hand the lease to `small`.
+        // (the joiner-side round trip is `tests/sync_round_trip.rs`.)
         let big = b"node-big".to_vec();
         let small = b"node-small".to_vec();
-        let trigger_msg = SagaMsg::Trigger {
-            saga_id: sid("s-demand"),
-            spec: b"w".to_vec(),
-            reply_to: None,
-            reply_payload: Vec::new(),
-            deadline: Some(100),
-            max_attempts: 3,
-            lease_views: Some(10),
-            capability: Some("codex".into()),
-            pinned_assignee: None,
-            demands: [("cores".to_string(), 8u64)].into_iter().collect(),
-        };
-
-        let mut m =
-            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        let mut m = SagaModule::with_assignment(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        );
         let mut ctx = capability_ctx_with(vec![small.clone(), big.clone()], vec![big.clone()]);
-        exec(&mut m, &mut ctx, &msg(&trigger_msg)).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                saga_id: sid("s-demand"),
+                spec: b"w".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: Some(100),
+                max_attempts: 3,
+                lease_views: Some(10),
+                capability: Some("codex".into()),
+                pinned_assignee: None,
+                demands: [("cores".to_string(), 8u64)].into_iter().collect(),
+            }),
+        )
+        .unwrap();
         commit(&mut m);
-        let src_root = m.root();
         assert_eq!(
             get(&m, &sid("s-demand")).unwrap().assignee,
             Some(big.clone()),
             "the demand-capable node holds the initial lease"
         );
 
-        let mut dst =
-            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
-        dst.install(&m.snapshot(), src_root).unwrap();
-        assert_eq!(
-            dst.root(),
-            src_root,
-            "installed root must equal the source root — demands ride the snapshot"
-        );
-        assert_eq!(
-            get(&dst, &sid("s-demand")),
-            get(&m, &sid("s-demand")),
-            "query parity after install"
-        );
-
-        // the reassignment pool is STILL demand-filtered on the installed
-        // module: excluding the sole demand-capable provider (big) from a
-        // pool that also contains a demand-incapable one (small) must find
-        // NO alternate — if reassignment fell back to the raw provider list
-        // instead of CapableProviders, it would (wrongly) hand the lease to
-        // `small`.
         let mut ctx2 = capability_ctx_with(vec![small.clone(), big.clone()], vec![big.clone()]);
         let err = exec(
-            &mut dst,
+            &mut m,
             &mut ctx2,
             &msg(&SagaMsg::Reassign {
                 saga_id: sid("s-demand"),
@@ -3673,7 +3878,7 @@ mod tests {
 
     #[test]
     fn oversized_or_malformed_demands_reject_at_trigger() {
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new();
 
         // validate_resources is THE rule: too many dimensions...
@@ -3724,65 +3929,179 @@ mod tests {
         assert_eq!(get(&m, &sid("s2")), None, "nothing was staged");
     }
 
-    // ---- retention ---------------------------------------------------------
+    #[test]
+    fn oversized_saga_ids_and_pinned_keys_are_refused_before_they_poison_a_record() {
+        // the two write-time caps the store adds. an op frame carries up to
+        // 1 MiB + 16 KiB, so BOTH of these were reachable: the id rides the
+        // ONE shared `pending` index record, and `pinned_assignee` was the only
+        // wire-supplied field on the hot record with no size bound.
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+        let mut ctx = CaptureCtx::new();
 
-    fn saga_state(status: SagaStatus, updated_at: u64, spec_bytes: usize) -> Saga {
-        Saga {
-            origin: SagaOrigin::System,
-            reply_to: None,
-            reply_payload: Vec::new(),
-            spec: vec![b'x'; spec_bytes],
-            capability: None,
-            demands: BTreeMap::new(),
-            status,
-            attempt: 0,
-            max_attempts: 1,
-            assignee: None,
-            pinned_assignee: None,
-            lease_views: None,
-            lease_expires_at: None,
-            deadline: None,
-            result: None,
-            error: None,
-            created_at: updated_at,
-            updated_at,
-        }
+        let long_id = sid(&"x".repeat(MAX_SAGA_ID_BYTES + 1));
+        let err = exec(&mut m, &mut ctx, &trigger(&long_id, b"w")).unwrap_err();
+        assert!(err.to_string().contains("saga_id is"), "got: {err}");
+
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                pinned_assignee: Some(vec![7; MAX_ASSIGNEE_BYTES + 1]),
+                saga_id: sid("s-pin"),
+                spec: b"w".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 1,
+                lease_views: None,
+                capability: None,
+                demands: Default::default(),
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pinned_assignee is"), "got: {err}");
+
+        // neither refusal staged anything — not the record, not the index.
+        assert!(ctx.events.is_empty(), "rejected triggers fire no worker");
+        assert_eq!(get(&m, &long_id), None);
+        assert_eq!(get(&m, &sid("s-pin")), None);
+        assert_eq!(retained(&m), 0, "no index row survived either refusal");
+
+        // and an id AT the cap is ordinary work.
+        let ok_id = sid(&"x".repeat(MAX_SAGA_ID_BYTES - sid("").len()));
+        exec(&mut m, &mut ctx, &trigger(&ok_id, b"w")).unwrap();
+        assert_eq!(get(&m, &ok_id).map(|v| v.status), Some(SagaStatus::Pending));
     }
 
-    /// the retention decision reads a borrowed view; these unit cases own
-    /// their fixture map.
-    fn borrowed(map: &BTreeMap<String, Saga>) -> BTreeMap<&str, &Saga> {
-        map.iter().map(|(id, saga)| (id.as_str(), saga)).collect()
+    #[test]
+    fn a_ledger_emptied_again_hashes_like_a_never_used_one() {
+        // the empty-collection-drops-its-key rule, which the whole-state
+        // encoding used to give for free: an index that kept an empty record
+        // would leave a ledger pruned back to nothing on a DIFFERENT root than
+        // one that never ran a saga.
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+        let genesis = m.root();
+        let id = sid("s1");
+
+        let mut ctx = CaptureCtx::new().at(1);
+        exec(&mut m, &mut ctx, &trigger(&id, b"a spec")).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Cancel {
+                saga_id: id.clone(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_ne!(m.root(), genesis, "the ledger really held a saga");
+
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Prune {
+                saga_ids: vec![id.clone()],
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, &id), None);
+        assert_eq!(
+            m.root(),
+            genesis,
+            "an emptied ledger must hash like a never-used one"
+        );
+    }
+
+    #[test]
+    fn a_chunked_spec_survives_every_attempt_and_leaves_no_orphan_on_prune() {
+        // a spec over SPEC_CHUNK_BYTES spans several store keys, so the retry
+        // path has to REASSEMBLE it (the work order the worker seam decodes
+        // carries the whole thing) and the prune path has to delete every
+        // chunk — an orphan would keep bytes in the root forever.
+        let spec: Vec<u8> = (0..SPEC_CHUNK_BYTES + 7).map(|i| i as u8).collect();
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+        let genesis = m.root();
+        let id = sid("s-chunked");
+
+        let mut ctx = CaptureCtx::new().at(1);
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
+                saga_id: id.clone(),
+                spec: spec.clone(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 2,
+                lease_views: None,
+                capability: None,
+                demands: Default::default(),
+            }),
+        )
+        .unwrap();
+        // the RETRY re-emits the spec from the store, not from the op.
+        exec(&mut m, &mut ctx, &oracle(&id, 0, Err("again".into()))).unwrap();
+        let requests = ctx.worker_requests();
+        assert_eq!(requests.len(), 2, "trigger + retry");
+        assert!(
+            requests.iter().all(|r| r.spec == spec),
+            "a work order carried a truncated spec"
+        );
+        assert_eq!(get(&m, &id).unwrap().spec, spec, "the Get view reassembles");
+        commit(&mut m);
+
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Cancel {
+                saga_id: id.clone(),
+            }),
+        )
+        .unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Prune { saga_ids: vec![id] }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(
+            m.root(),
+            genesis,
+            "a chunk outlived its saga — the prune left an orphan in the root"
+        );
+    }
+
+    // ---- retention ---------------------------------------------------------
+
+    /// one row of the terminal index — everything the ranking reads. a PENDING
+    /// saga has no row at all (`put` puts it in the live index instead), which
+    /// is why age alone can never make live work eligible; the module-level
+    /// pin for that is `sustained_saga_traffic_keeps_the_committed_ledger_bounded`.
+    fn receipt(updated_at: u64, bytes: u64) -> TerminalEntry {
+        TerminalEntry { updated_at, bytes }
     }
 
     #[test]
     fn the_retention_decision_evicts_the_oldest_terminal_and_nothing_else() {
-        // the pending saga carries the OLDEST timestamp: age alone must never
-        // make live work eligible.
-        let mut map = BTreeMap::new();
-        map.insert("pending".to_string(), saga_state(SagaStatus::Pending, 0, 4));
+        let mut index = BTreeMap::new();
         let overflow = 5;
-        let terminal = [
-            SagaStatus::Done,
-            SagaStatus::Failed,
-            SagaStatus::TimedOut,
-            SagaStatus::Cancelled,
-        ];
         for i in 0..MAX_RETAINED_TERMINAL + overflow {
-            let status = terminal[i % terminal.len()];
-            map.insert(format!("s{i:04}"), saga_state(status, 100 + i as u64, 4));
+            index.insert(format!("s{i:04}"), receipt(100 + i as u64, 4));
         }
 
-        let mut evicted = terminal_evictions(&borrowed(&map));
+        let mut evicted = terminal_evictions(&index);
         evicted.sort();
         let expected: Vec<String> = (0..overflow).map(|i| format!("s{i:04}")).collect();
         assert_eq!(evicted, expected, "exactly the oldest terminal receipts go");
 
         // under the cap it evicts nothing at all.
         let mut small = BTreeMap::new();
-        small.insert("pending".to_string(), saga_state(SagaStatus::Pending, 0, 4));
-        small.insert("one".to_string(), saga_state(SagaStatus::Done, 9, 4));
-        assert!(terminal_evictions(&borrowed(&small)).is_empty());
+        small.insert("one".to_string(), receipt(9, 4));
+        assert!(terminal_evictions(&small).is_empty());
     }
 
     #[test]
@@ -3790,34 +4109,34 @@ mod tests {
         // four half-budget receipts: the running total is checked BEFORE each
         // entry is added, so three are kept (the last one crossing the line)
         // and the oldest is evicted — count cap untouched.
-        let half = MAX_RETAINED_TERMINAL_BYTES / 2;
-        let mut map = BTreeMap::new();
+        let half = MAX_RETAINED_TERMINAL_BYTES as u64 / 2;
+        let mut index = BTreeMap::new();
         for i in 0..4u64 {
-            map.insert(format!("s{i}"), saga_state(SagaStatus::Done, i, half));
+            index.insert(format!("s{i}"), receipt(i, half));
         }
-        assert_eq!(terminal_evictions(&borrowed(&map)), vec!["s0".to_string()]);
+        assert_eq!(terminal_evictions(&index), vec!["s0".to_string()]);
 
         // one oversized receipt is still kept — the newest always survives —
         // but it pushes every older one out.
-        let mut map = BTreeMap::new();
-        map.insert("old".to_string(), saga_state(SagaStatus::Done, 1, 8));
-        map.insert(
+        let mut index = BTreeMap::new();
+        index.insert("old".to_string(), receipt(1, 8));
+        index.insert(
             "huge".to_string(),
-            saga_state(SagaStatus::Done, 2, MAX_RETAINED_TERMINAL_BYTES + 1),
+            receipt(2, MAX_RETAINED_TERMINAL_BYTES as u64 + 1),
         );
-        assert_eq!(terminal_evictions(&borrowed(&map)), vec!["old".to_string()]);
+        assert_eq!(terminal_evictions(&index), vec!["old".to_string()]);
     }
 
     #[test]
     fn retention_is_staged_inside_the_op_not_deferred_to_the_block_boundary() {
-        // the wasm shell (`snapshot_guest!`) calls the inner `commit_block`
+        // the wasm shell (`store_guest!`) calls the inner `commit_block`
         // once per OP; the native module once per BLOCK — and both run as
         // chain participants. a trim living in `commit_block` would therefore
         // evict mid-block under wasm and only at the boundary natively, and
         // the two would disagree on the state root of any block that crosses
         // the cap. staged inside the op, the eviction lands in the same
         // read-your-writes overlay every later op of the block already reads.
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
         let mut ctx = CaptureCtx::new().at(1);
         for i in 0..=MAX_RETAINED_TERMINAL {
             let id = sid(&format!("s{i:04}"));
@@ -3828,17 +4147,21 @@ mod tests {
         // newest-first ranks the LOWEST id last, and it is the one that goes.
         let evicted = sid("s0000");
         assert!(
-            m.get(&evicted).is_none(),
+            load(&m, &evicted).is_none(),
             "the eviction must be visible to the rest of THIS block"
         );
         // and the freed id is new work to the very next op — what a wasm
         // validator sees, so a native one must see it too.
         exec(&mut m, &mut ctx, &trigger(&evicted, b"again")).unwrap();
-        assert_eq!(m.get(&evicted).map(|s| s.status), Some(SagaStatus::Pending));
+        assert_eq!(
+            load(&m, &evicted).map(|s| s.status),
+            Some(SagaStatus::Pending)
+        );
         commit(&mut m);
         assert_eq!(
-            m.sagas.get(&evicted).map(|s| s.status),
-            Some(SagaStatus::Pending)
+            load(&m, &evicted).map(|s| s.status),
+            Some(SagaStatus::Pending),
+            "and it survives the boundary as a committed record"
         );
     }
 
@@ -3847,7 +4170,7 @@ mod tests {
         // the growth-bound pin: three capfuls of sagas triggered and settled,
         // one per block. without the per-op trim this ledger is 1:1 with
         // every saga ever triggered — the state-growth cliff.
-        let mut m = SagaModule::new("saga");
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
 
         // one long-lived pending saga, triggered FIRST (so it is also the
         // oldest thing in the ledger) — live work is never retention's to take.
@@ -3870,14 +4193,14 @@ mod tests {
             commit(&mut m);
 
             assert!(
-                m.sagas.len() <= MAX_RETAINED_TERMINAL + 1,
+                retained(&m) <= MAX_RETAINED_TERMINAL + 1,
                 "round {i}: {} sagas retained",
-                m.sagas.len()
+                retained(&m)
             );
         }
 
         // the cap, plus the one pending saga that is not retention's business.
-        assert_eq!(m.sagas.len(), MAX_RETAINED_TERMINAL + 1);
+        assert_eq!(retained(&m), MAX_RETAINED_TERMINAL + 1);
         assert_eq!(
             get(&m, &sid("long-lived")).unwrap().status,
             SagaStatus::Pending,
