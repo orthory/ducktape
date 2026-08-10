@@ -533,7 +533,8 @@ on select_shell_tab(next)
   // in backend/shell.rs carries the argument — including why the live `plane`
   // arm above must carry no tab gate of its own. New loader here: a chain
   // PLANE gets a `tab_reads_plane` row; a loader keyed on one pane's own state
-  // (explorer, files, forge) keeps the inline `shell_tab ==` above.
+  // or on device-local facts (explorer, files, forge, settings) keeps the
+  // inline `shell_tab ==` above.
   parallel
     run load_node_facts(connected_rpc, node_facts_generation) -> node_facts_loaded _ | node_facts_failed _
     run load_explorer(connected_rpc, keep_i64(shell_tab == "explorer", explorer_generation, -1)) -> explorer_loaded _ | explorer_failed _
@@ -541,7 +542,16 @@ on select_shell_tab(next)
     run files_history(connected_rpc, keep_i64(shell_tab == "files", fs_generation, -1)) -> fs_history_loaded _ | fs_failed _
     run load_members(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "members"), members_generation, -1)) -> members_loaded _ | members_failed _
     run load_governance(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "governance"), gov_generation, -1)) -> governance_loaded _ | governance_failed _
-    run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
+    // SETTINGS FACTS ARE NOT A CHAIN PLANE, so they take the inline gate and
+    // no `tab_reads_plane` row: the loader reads `/v1/status`, this device's
+    // key file, its prefs and its workspace dir — nothing a module commits, so
+    // no live arm can refresh them and no table can say which panes "draw" a
+    // device fact. Only the settings screen draws them; chat reads `user_key`
+    // off the same load, but chat returns above this block, so the trip into
+    // Members or Files was never what kept it fresh — the CONNECT load is, and
+    // the key is a boot-stable file reading (`user key status` answers for an
+    // encrypted key too).
+    run load_settings_facts(connected_rpc, keep_i64(shell_tab == "settings", settings_generation, -1)) -> settings_loaded _ | settings_failed _
     // PEERS IS A HEAVY LOADER AND WAS FILED WITH THE LIGHT ONES. `/v1/peers`
     // encodes the node's whole metrics registry per call (485 KB, ~10 ms), so
     // running it on entry to Explorer, Files, Members, Agents and Forge — none

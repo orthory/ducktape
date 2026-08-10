@@ -28,6 +28,7 @@ pub async fn load_settings_facts(
     rpc: String,
     generation: i64,
 ) -> Result<SettingsFacts, HydrationError> {
+    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let status = client.status().await?;

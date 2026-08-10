@@ -648,6 +648,26 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
             "a {module} commit must refresh {loader} on any tab: {live}"
         );
     }
+
+    // THE SETTINGS FACTS ARE THE INLINE HALF OF THE SAME GATE. No module
+    // commits `/v1/status`, a key file or the local prefs, so they get no
+    // `tab_reads_plane` row and no live arm — just the tab that draws them.
+    // The EXACT SET is the pin, both lines: the CONNECT load must stay
+    // ungated (it is what fills chat's `user_key`, which chat cannot refetch
+    // for itself — a move into chat returns above the tab block), and the tab
+    // move must carry the gate.
+    let settings_loads: Vec<_> = lifecycle
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("run load_settings_facts("))
+        .collect();
+    assert_eq!(
+        settings_loads,
+        [
+            "run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _",
+            "run load_settings_facts(connected_rpc, keep_i64(shell_tab == \"settings\", settings_generation, -1)) -> settings_loaded _ | settings_failed _",
+        ]
+    );
 }
 
 #[test]
