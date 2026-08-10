@@ -3896,6 +3896,152 @@ mod tests {
         assert_eq!(get(&m, &sid("s2")), None, "nothing was staged");
     }
 
+    #[test]
+    fn oversized_saga_ids_and_pinned_keys_are_refused_before_they_poison_a_record() {
+        // the two write-time caps the store adds. an op frame carries up to
+        // 1 MiB + 16 KiB, so BOTH of these were reachable: the id rides the
+        // ONE shared `pending` index record, and `pinned_assignee` was the only
+        // wire-supplied field on the hot record with no size bound.
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+        let mut ctx = CaptureCtx::new();
+
+        let long_id = sid(&"x".repeat(MAX_SAGA_ID_BYTES + 1));
+        let err = exec(&mut m, &mut ctx, &trigger(&long_id, b"w")).unwrap_err();
+        assert!(err.to_string().contains("saga_id is"), "got: {err}");
+
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                pinned_assignee: Some(vec![7; MAX_ASSIGNEE_BYTES + 1]),
+                saga_id: sid("s-pin"),
+                spec: b"w".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 1,
+                lease_views: None,
+                capability: None,
+                demands: Default::default(),
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pinned_assignee is"), "got: {err}");
+
+        // neither refusal staged anything — not the record, not the index.
+        assert!(ctx.events.is_empty(), "rejected triggers fire no worker");
+        assert_eq!(get(&m, &long_id), None);
+        assert_eq!(get(&m, &sid("s-pin")), None);
+        assert_eq!(retained(&m), 0, "no index row survived either refusal");
+
+        // and an id AT the cap is ordinary work.
+        let ok_id = sid(&"x".repeat(MAX_SAGA_ID_BYTES - sid("").len()));
+        exec(&mut m, &mut ctx, &trigger(&ok_id, b"w")).unwrap();
+        assert_eq!(get(&m, &ok_id).map(|v| v.status), Some(SagaStatus::Pending));
+    }
+
+    #[test]
+    fn a_ledger_emptied_again_hashes_like_a_never_used_one() {
+        // the empty-collection-drops-its-key rule, which the whole-state
+        // encoding used to give for free: an index that kept an empty record
+        // would leave a ledger pruned back to nothing on a DIFFERENT root than
+        // one that never ran a saga.
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+        let genesis = m.root();
+        let id = sid("s1");
+
+        let mut ctx = CaptureCtx::new().at(1);
+        exec(&mut m, &mut ctx, &trigger(&id, b"a spec")).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Cancel {
+                saga_id: id.clone(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_ne!(m.root(), genesis, "the ledger really held a saga");
+
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Prune {
+                saga_ids: vec![id.clone()],
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, &id), None);
+        assert_eq!(
+            m.root(),
+            genesis,
+            "an emptied ledger must hash like a never-used one"
+        );
+    }
+
+    #[test]
+    fn a_chunked_spec_survives_every_attempt_and_leaves_no_orphan_on_prune() {
+        // a spec over SPEC_CHUNK_BYTES spans several store keys, so the retry
+        // path has to REASSEMBLE it (the work order the worker seam decodes
+        // carries the whole thing) and the prune path has to delete every
+        // chunk — an orphan would keep bytes in the root forever.
+        let spec: Vec<u8> = (0..SPEC_CHUNK_BYTES + 7).map(|i| i as u8).collect();
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+        let genesis = m.root();
+        let id = sid("s-chunked");
+
+        let mut ctx = CaptureCtx::new().at(1);
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
+                saga_id: id.clone(),
+                spec: spec.clone(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 2,
+                lease_views: None,
+                capability: None,
+                demands: Default::default(),
+            }),
+        )
+        .unwrap();
+        // the RETRY re-emits the spec from the store, not from the op.
+        exec(&mut m, &mut ctx, &oracle(&id, 0, Err("again".into()))).unwrap();
+        let requests = ctx.worker_requests();
+        assert_eq!(requests.len(), 2, "trigger + retry");
+        assert!(
+            requests.iter().all(|r| r.spec == spec),
+            "a work order carried a truncated spec"
+        );
+        assert_eq!(get(&m, &id).unwrap().spec, spec, "the Get view reassembles");
+        commit(&mut m);
+
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Cancel {
+                saga_id: id.clone(),
+            }),
+        )
+        .unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Prune { saga_ids: vec![id] }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(
+            m.root(),
+            genesis,
+            "a chunk outlived its saga — the prune left an orphan in the root"
+        );
+    }
+
     // ---- retention ---------------------------------------------------------
 
     /// one row of the terminal index — everything the ranking reads. a PENDING
