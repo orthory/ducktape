@@ -14,8 +14,10 @@
 //!   several store keys the joiner has to reassemble,
 //! * record DELETES: an explicit `Prune`, and the retention trim EVICTING a
 //!   receipt when a block crosses [`saga::MAX_RETAINED_TERMINAL`],
-//! * and the two sentinel indexes (`pending` / `terminal`) that ride the same
-//!   root and are the only reason the store-backed module can enumerate at all.
+//! * and the sentinel indexes that ride the same root and are the only reason
+//!   the store-backed module can enumerate at all: `terminal`, and the
+//!   hash-SHARDED `pending` — the capful of sagas below writes rows into many
+//!   of its shard records and clears them again inside ONE block.
 //!
 //! a `SagaModule` consumes its injected store, so the handoff-as-resolver form
 //! is only reachable on the raw store: REOPEN the committed partitions under
