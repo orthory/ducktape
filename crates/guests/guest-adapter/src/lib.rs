@@ -24,9 +24,8 @@
 //!   as ONE value in the host-owned store each dispatch (under [`STATE_KEY`],
 //!   with its 32-byte root under [`ROOT_KEY`] so reloads verify-then-adopt).
 //!   the `WasmModule` root is therefore the host-KV encoding over these two
-//!   keys — a STATE-SCHEMA BREAK versus the native module's root, declared by
-//!   bumping the module's state-schema revision in the same change. there is
-//!   no back-compat constraint (beta networks re-genesis on a schema break).
+//!   keys and intentionally differs from the native module's root. greenfield
+//!   networks re-genesis when adopting such a cutover.
 //! * [`load_config`] — the GENESIS-CONFIG read for tenants whose native
 //!   constructor takes per-network parameters (a chain id, an invite binding):
 //!   the host installs an `sdk::genesis_config`-encoded `__config` store entry
@@ -153,6 +152,10 @@ impl Ctx for WitCtx {
 
     fn emit_event(&mut self, ev: Event) {
         host::emit_event(&ev.source, &ev.payload);
+    }
+
+    fn set_assigned(&mut self, bytes: Vec<u8>) {
+        host::set_assigned(&bytes);
     }
 }
 
@@ -402,6 +405,18 @@ pub fn load_config() -> Option<Vec<u8>> {
     host::state_get(sdk::genesis_config::CONFIG_KEY)
 }
 
+/// the [`load_config`] twin for STORE-BACKED tenants: their state lives in a
+/// host-owned merkle store whose keys are fixed 32-byte digests, so the
+/// reserved `__config` entry sits at [`sdk::store_key`] of
+/// [`sdk::genesis_config::CONFIG_KEY`] — the exact slot the module's own
+/// `StagedStore` would map that logical key to, seeded there by the host at
+/// genesis construction. semantics are otherwise identical: the config is
+/// consensus state, in the store's merkle root from genesis, and it rides
+/// state-sync like any other record (a joiner's rebuilt store carries it).
+pub fn load_store_config() -> Option<Vec<u8>> {
+    host::state_get(&sdk::store_key(sdk::genesis_config::CONFIG_KEY))
+}
+
 /// decode this network's `chain_id` genesis parameter as a utf-8 string — the
 /// per-network id the identity/gateway constructors fold into every signed
 /// preimage. the config hook for the `chain_id` twins: it is exactly the
@@ -414,7 +429,26 @@ pub fn genesis_chain_id(module_label: &str) -> Result<String, host::Error> {
     let raw = load_config().ok_or_else(|| {
         host::Error::Rejected(format!("{module_label} genesis config missing (__config)"))
     })?;
-    let params = sdk::genesis_config::decode_config(&raw)
+    decode_chain_id(&raw, module_label)
+}
+
+/// the [`genesis_chain_id`] twin for STORE-BACKED tenants: the identical
+/// decode over [`load_store_config`] — the `__config` record the host seeded
+/// into the module's qmdb store at genesis construction
+/// (`bin/node/src/host_state.rs` `seed_store_config`). same wiring-corruption
+/// contract: missing or malformed config rejects deterministically, never a
+/// guessed default.
+pub fn store_genesis_chain_id(module_label: &str) -> Result<String, host::Error> {
+    let raw = load_store_config().ok_or_else(|| {
+        host::Error::Rejected(format!("{module_label} genesis config missing (__config)"))
+    })?;
+    decode_chain_id(&raw, module_label)
+}
+
+/// decode the `chain_id` parameter out of raw genesis-config bytes — the
+/// shared tail of the two loaders above.
+fn decode_chain_id(raw: &[u8], module_label: &str) -> Result<String, host::Error> {
+    let params = sdk::genesis_config::decode_config(raw)
         .map_err(|e| host::Error::Rejected(format!("{module_label} genesis config: {e}")))?;
     let chain_id = sdk::genesis_config::find(&params, "chain_id").ok_or_else(|| {
         host::Error::Rejected(format!("{module_label} genesis config carries no chain_id"))
@@ -517,8 +551,10 @@ macro_rules! snapshot_guest {
 }
 
 /// store-backed guest shell (pages, chat). `new` is the native constructor over
-/// [`WitStore`]; there is NO snapshot — the host owns the real store, and the
-/// module is rebuilt fresh per dispatch.
+/// [`WitStore`] (may use `?` — the loader returns `Result<_, host::Error>`, the
+/// [`snapshot_guest!`] contract, so a config-carrying tenant can thread
+/// [`load_store_config`] through its builder); there is NO snapshot — the host
+/// owns the real store, and the module is rebuilt fresh per dispatch.
 #[macro_export]
 macro_rules! store_guest {
     (id: $id:expr, module: $module:ty, new: $new:expr $(,)?) => {
@@ -528,8 +564,8 @@ macro_rules! store_guest {
         /// dispatch. no state load: the store IS the state, and the module's own
         /// `pending` overlay is per-dispatch by design (cross-dispatch read-
         /// your-writes comes from the host's outer staged overlay).
-        fn module() -> $module {
-            $new
+        fn module() -> ::core::result::Result<$module, $crate::host::Error> {
+            ::core::result::Result::Ok($new)
         }
 
         /// map an inner sdk error onto the wit surface. `Module` is the native
@@ -547,7 +583,7 @@ macro_rules! store_guest {
                 payload: ::std::vec::Vec<u8>,
             ) -> ::core::result::Result<(), $crate::host::Error> {
                 use ::sdk::Module as _;
-                let mut module = module();
+                let mut module = module()?;
                 let mut ctx = $crate::WitCtx::new();
                 $crate::block_on(module.execute(
                     &mut ctx,
@@ -566,7 +602,7 @@ macro_rules! store_guest {
                 use ::sdk::Module as _;
                 // a fresh module's `pending` is empty, so the native query reads
                 // straight through the staged-over-committed store view.
-                let module = module();
+                let module = module()?;
                 $crate::block_on(module.query(&req)).map_err(to_wit_error)
             }
         }

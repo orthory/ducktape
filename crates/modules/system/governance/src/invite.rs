@@ -8,8 +8,8 @@
 //! full node standing, `Client` = submit authorization only), and `expires`
 //! is the unix-seconds redemption deadline.
 //!
-//! EVERY invite is BEARER (무기명): there is no target lock. the join protocol
-//! dropped targeted (기명) invites — the target key was self-minted by the
+//! EVERY invite is BEARER: there is no target lock. the join protocol dropped
+//! targeted invites — the target key was self-minted by the
 //! joiner, so it authenticated nothing that mint did not already decide. The
 //! joiner proves possession of the key it redeems under by signing `binding ‖
 //! nonce ‖ joiner`; this is HYGIENE (it stops standing being granted to a key

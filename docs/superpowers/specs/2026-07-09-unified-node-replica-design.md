@@ -3,7 +3,11 @@
 Status: SHIPPED through phase 4 (2026-07-10; PRs #291, #293, #296 + the
 phase-4 closeout). Residents fold finalized frames, restart by journal
 replay, cross epochs by in-loop follower swap, and promote from their own
-state; state sync is join-time bootstrap only. Two deltas against the plan
+state; state sync is join-time bootstrap only. The phase-3 re-exec question
+is SETTLED (2026-07-24): promotion seats the engine IN-PROCESS — the park
+loop hands a `PromotionBaton` to `validator::run_promoted` over the same
+started mesh (the replica banks reclaimable engine lanes per epoch), and
+`reboot_self` is gone. Two deltas against the plan
 below, both forced by reality and recorded in the PRs: the promotion
 collapse (phase 3 here) landed IN phase 2 — a quorum-widening cutover halts
 the source awaiting the promoted node, so wait-for-the-source promotion
@@ -27,7 +31,7 @@ This replaces the current split where validators fold blocks while residents
 loop the joiner bootstrap — re-installing whole boundaries and never
 executing anything — with everything that split costs: no per-block
 continuity on non-validators, derived indexes healed instead of folded,
-read-your-writes gaps, and a promotion dance (app-hash equality wait,
+read-your-writes gaps, and a promotion dance (root-hash equality wait,
 fabricated checkpoint, re-exec, post-reboot catch-up) that exists only
 because a resident's journal is a fiction.
 
@@ -35,7 +39,7 @@ because a resident's journal is a fiction.
 
 The fold path is trait-shaped today. `node::OrderedNode` — the component
 that WAL-journals a finalized frame (`BlockSink::pre_apply`), folds it via
-`host.submit_block`, seals it with roots + app-hash, and hands it to the
+`host.submit_block`, seals it with roots + root-hash, and hands it to the
 per-block index fold — is generic over `node::Orderer`. Validators plug in
 `consensus::SimplexOrderer` (the live engine). The replica plugs in a
 **follower orderer** behind the identical trait; the fold, the journal
@@ -80,7 +84,7 @@ joiner path is `unimplemented!`. Phase 1 wires real verification for the
 follower AND retrofits it into the floor check. A replica therefore trusts
 its frame source for nothing: payload bytes are content-addressed, the
 certificate proves finalization by the epoch's quorum, and the fold's own
-seal verification (disposition, module roots, app-hash) catches divergence
+seal verification (disposition, module roots, root-hash) catches divergence
 at the first block, exactly as `apply_verified_suffix_frame` does today.
 
 The rejected alternative — generalizing the post-reboot `fetch_frames` +
@@ -117,7 +121,7 @@ the follower orderer for `SimplexOrderer` — the same swap `respawn_if_due`
 already performs between epochs on validators. The process re-exec survives
 only if the per-epoch channel-bank registration genuinely requires it (to be
 settled in Phase 3 — the follower already registers the full bank). Deleted
-outright: `choose_promotion_boundary`'s app-hash equality wait, checkpoint
+outright: `choose_promotion_boundary`'s root-hash equality wait, checkpoint
 fabrication (`next_seq = 1`), the post-reboot frame catch-up and its
 full-sync fallback, and the boot-time `heal_index` at the converged tip.
 

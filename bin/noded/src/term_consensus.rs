@@ -11,7 +11,7 @@
 //!
 //! ## Why chat, and why no new module
 //!
-//! A new consensus module changes the genesis app-hash — a flag day that kills
+//! A new consensus module changes the genesis root-hash — a flag day that kills
 //! every existing network. So we reuse the CHAT module, already in genesis and
 //! already an ordered, origin-signed, durable per-channel append log: a shared
 //! session's command lane IS a dedicated chat channel, a submitted command IS a
@@ -29,25 +29,47 @@
 //! chat's `validate_channel_namespace` forbids a `User` origin any colon id.
 //! System origin is genesis/catch-up only, unreachable from a live submit lane.
 //! So the node creates a non-colon channel it CAN author, `PostPolicy::Open`
-//! lets any member post commands (external `User` authors pass the open policy;
-//! `validate_channel_namespace` is not consulted on `PostMessage`), and the app
-//! hides it via an `isModuleChannel` extension that also matches `term-<hex>`.
+//! keeps the log readable and writable as ordinary chat (external `User`
+//! authors pass the open policy; `validate_channel_namespace` is not consulted
+//! on `PostMessage`) while the DRIVER gate below decides what reaches the pty,
+//! and the app hides it via an `isModuleChannel` extension that also matches
+//! `term-<hex>`.
 //!
-//! ## Authorization posture (deferred ACL — read this before trusting it)
+//! ## Authorization: the pty is driven by the channel's OWNER
 //!
-//! `PostPolicy::Open` means ANY network member can post a command the projector
-//! feeds into the pty — NOT only the session's participants, and NOT only those
-//! "who know the id". The channel id is not a secret: `term-<id>` lands in
-//! committed chat state and is enumerable via `ChatQuery::Channels`; the
-//! `isModuleChannel` hide is UI-only. What contains the blast radius is the
-//! session posture, not the channel: a Shared session runs the RESTRICTED,
-//! read-only, non-prompting argv, the pty is Podman-sandboxed under the node
-//! identity, and the credential never enters the container — so an injected
-//! command can only spend tokens + inject conversation text, never write/exec.
-//! The NAMED next step is per-channel membership (`PostPolicy::MembersOnly`)
-//! once a shared session carries an on-chain participant set; per-member spend
-//! caps are the epic's finding #2. Until then, treat a shared session as
-//! open-to-the-network by construction.
+//! Posting to `term-<id>` is open — the channel is a public, committed log and
+//! its id is not a secret (it lands in chat state and is enumerable). DRIVING
+//! the pty is not: [`project_message`] feeds a committed message to the pty
+//! only when its cryptographically verified author equals the channel's
+//! `owner`, and every other post is refused with `command_not_channel_owner`.
+//!
+//! `Channel.owner` is the right anchor and it needs nothing new. Chat sets it
+//! from the SIGNED author at `CreateChannel` (`chat/src/lib.rs` `stage_channel`)
+//! and already enforces it for rename/archive (`check_channel_admin`) — it is
+//! the tree's existing answer to "who owns this channel". Because
+//! [`ensure_channel`] is submitted by the node that owns the pty, the owner IS
+//! that host, on both binaries and with no node-key plumbing: `bin/node` signs
+//! with its node key, `bin/noded` with its configured origin, and the projector
+//! reads back whichever one consensus recorded.
+//!
+//! **The gate is here, not on the post policy, and that is deliberate.**
+//! `SetMembership` IS author-gated now — chat routes it through
+//! `check_channel_admin`, so only the channel's owner writes the roster — which
+//! means a multi-driver participant set has become expressible. It is still not
+//! adopted here, for a reason that is a product decision rather than a missing
+//! primitive: a `Shared` session spends the HOST's own env credential, which
+//! carries no grant record and therefore no grantee, so widening the driver set
+//! widens who spends the operator's personal subscription. Until that question
+//! is answered the rightful set stays ONE — the owner — and it is enforced
+//! where the effect happens rather than where the bytes become durable.
+//! `JoinHuddle` under an open policy remains self-service, so a huddle roster
+//! is not a candidate for this gate either.
+//!
+//! What this does NOT change: the node-local ws `TermCommand` lane
+//! (`crate::stream::handle_term_command`) still drives the same FIFO with a
+//! caller-supplied `origin`. That lane is trusted-local by construction — it
+//! rides the same surface as `/v1/submit`, and a local process can already read
+//! the node's key off disk — so it is gated by reachability, not by this.
 //!
 //! ## Why a projector, not a `host::worker::Worker`
 //!
@@ -71,7 +93,7 @@ use crate::{NodeCommand, NodeHandle};
 
 /// how often the projector polls committed chat for new commands. A shared
 /// terminal is human-driven, so ~200 ms adds no perceptible latency while
-/// keeping the poll cheap (at most [`crate::term::MAX_TERM_SESSIONS`] live
+/// keeping the poll cheap (at most [`agent_service::MAX_TERM_SESSIONS`] live
 /// sessions, one bounded query each).
 /// `ponytail:` fixed interval poll; a block-commit watch (StreamHub already
 /// has `subscribe_blocks`) would cut idle polls and trim the latency floor if a
@@ -134,32 +156,74 @@ fn render_author(author: &chat::AuthorRef) -> String {
 /// one committed command ready for the pty: the verified `origin` and the
 /// decoded `text`. Deliberately does NOT carry the seq — the projector owns the
 /// per-session cursor.
+#[derive(Debug, PartialEq, Eq)]
 struct Projected {
     origin: String,
     text: String,
 }
 
-/// the project-or-skip decision for one committed message — the unit-testable
-/// core of the projector. A tombstoned (deleted) message is skipped (its
-/// content and reactions are cleared; running an empty redaction would be
-/// wrong), but the caller still advances its cursor past it. Everything else
-/// projects with the verified author and decoded text.
-fn project_message(view: &chat::MessageView) -> Option<Projected> {
-    if view.head.deleted {
-        return None;
+/// true when a committed message's verified author IS the channel owner — the
+/// driver gate. Only a `User` author can be one: chat mints `Channel.owner`
+/// from `AuthorRef::User` bytes and leaves it `None` for module/system-minted
+/// channels, so no module, agent, or system origin can ever match one.
+fn author_is_owner(author: &chat::AuthorRef, owner: &[u8]) -> bool {
+    match author {
+        chat::AuthorRef::User(user) => user == owner,
+        chat::AuthorRef::Agent { .. } | chat::AuthorRef::Module(_) | chat::AuthorRef::System => {
+            false
+        }
     }
-    Some(Projected {
+}
+
+/// the drive-or-refuse decision for one committed message — the unit-testable
+/// core of the projector. `Err` is a stable snake_case reason the caller logs;
+/// it advances its cursor either way, so a refused post is skipped, never
+/// retried. Two refusals:
+///
+/// - `command_deleted` — the message is tombstoned (content and reactions are
+///   cleared; running an empty redaction would be wrong).
+/// - `command_not_channel_owner` — the verified author is not this channel's
+///   owner, i.e. not the node that owns the pty. THIS is the gate: the channel
+///   is open to post to, and open to read, but only its owner drives.
+fn project_message(view: &chat::MessageView, owner: &[u8]) -> Result<Projected, &'static str> {
+    let is_tombstone = view.head.deleted;
+    if is_tombstone {
+        return Err("command_deleted");
+    }
+    let from_owner = author_is_owner(&view.head.author, owner);
+    if !from_owner {
+        return Err("command_not_channel_owner");
+    }
+    Ok(Projected {
         origin: render_author(&view.head.author),
         text: command_text(&view.head.blocks),
     })
 }
 
+/// the channel's owner, or the stable reason there is none to gate on. FAILS
+/// CLOSED on both: a projector that cannot name the owner drives nothing.
+///
+/// - `channel_unreadable` — the channel record is absent (a create that never
+///   committed) or the query itself failed.
+/// - `channel_unowned` — the record exists with no owner, which for a
+///   `term-<id>` channel is impossible by construction (a live node can only
+///   author a `User` origin, and chat owns every user-created channel) and so
+///   means the id was squatted by a module/system-minted channel.
+fn channel_owner(channel: Option<chat::Channel>) -> Result<Vec<u8>, &'static str> {
+    let Some(channel) = channel else {
+        return Err("channel_unreadable");
+    };
+    channel.owner.ok_or("channel_unowned")
+}
+
 /// ensure the session's command channel exists (idempotent). Submits a chat
-/// `CreateChannel` under the node's own key with an OPEN post policy so any
-/// member can post commands. On `bin/node` the origin bytes are ignored and the
-/// node key signs; on `bin/noded` they become the external author — either way
-/// a `User` origin authoring a non-colon id, which chat accepts. An
-/// already-existing channel (a retry) is success.
+/// `CreateChannel` under the node's own key with an OPEN post policy — the log
+/// is public; [`project_message`] is what decides which post drives the pty. On
+/// `bin/node` the origin bytes are ignored and the node key signs; on
+/// `bin/noded` they become the external author — either way a `User` origin
+/// authoring a non-colon id, which chat accepts, and which becomes the
+/// `Channel.owner` the projector gates on. An already-existing channel (a
+/// retry) is success.
 pub(crate) async fn ensure_channel(handle: &NodeHandle, channel: &str) -> Result<(), String> {
     let (reply, rx) = futures::channel::oneshot::channel();
     let payload = chat::encode_msg(&chat::ChatMsg::CreateChannel {
@@ -215,6 +279,32 @@ async fn query_messages(
     }
 }
 
+/// query committed chat for the session channel's record — the projector reads
+/// it once, for `Channel.owner`. Rides the same command lane as
+/// [`query_messages`].
+async fn query_channel(
+    handle: &NodeHandle,
+    channel: &str,
+) -> Result<Option<chat::Channel>, String> {
+    let (reply, rx) = futures::channel::oneshot::channel();
+    let req = chat::encode_query(&chat::ChatQuery::Channel {
+        channel_id: channel.to_string(),
+    });
+    handle
+        .send(NodeCommand::Query {
+            target: chat::DEFAULT_CHAT_TARGET.to_string(),
+            req,
+            reply,
+        })
+        .await
+        .map_err(|_| "actor gone".to_string())?;
+    let bytes = rx.await.map_err(|_| "reply dropped".to_string())??;
+    match chat::decode_reply(&bytes)? {
+        chat::ChatReply::Channel(channel) => Ok(channel),
+        _ => Err("unexpected chat reply".to_string()),
+    }
+}
+
 /// spawn the off-loop projector for a freshly created `Shared` session. Wired
 /// once, from `create_session`, so it covers both binaries.
 pub(crate) fn spawn_projector(handle: NodeHandle, session_id: String) {
@@ -237,7 +327,25 @@ pub(crate) fn spawn_projector(handle: NodeHandle, session_id: String) {
 /// Lifecycle: the loop exits the moment the session leaves the manager (EOF,
 /// explicit close, or the wall-clock reaper), so it never outlives its pty and
 /// never leaks — the same drop-driven teardown the pump and consumer take.
+///
+/// The owner is resolved ONCE, before the first poll, and the projector refuses
+/// to start without one — fail closed. Once resolved it cannot change: chat has
+/// no op that rewrites `Channel.owner` (rename and archive touch other fields),
+/// so re-reading it per tick would buy nothing and cost a query every 200 ms.
 async fn projector_loop(handle: NodeHandle, session_id: String, channel: String) {
+    let resolved = query_channel(&handle, &channel)
+        .await
+        .map_err(|_| "channel_unreadable")
+        .and_then(channel_owner);
+    let owner = match resolved {
+        Ok(owner) => owner,
+        // once per session, and the session keeps working on the node-local ws
+        // lane — only the consensus lane is refused. No id, no author bytes.
+        Err(reason) => {
+            tracing::warn!(target: "ducktape::term", reason, "term_consensus_projector_refused");
+            return;
+        }
+    };
     tracing::info!(target: "ducktape::term", session = %session_id, "term_consensus_projector_started");
     // the per-session cursor: the highest chat seq already projected. Starts at
     // 0 — the channel is minted empty at session create, so seq 1 is the first
@@ -245,18 +353,27 @@ async fn projector_loop(handle: NodeHandle, session_id: String, channel: String)
     // restart), so there is no durable cursor to restore.
     let mut cursor = 0u64;
     loop {
-        // stop as soon as the pty is gone. `session()` returning None means the
-        // entry left the manager map; nothing more can be driven.
+        // stop as soon as the pty is gone. A session has a `mode` exactly while
+        // it is in the bridge's map, so `None` means the entry left it (EOF,
+        // close, reaper, or the agent service detaching) and nothing more can be
+        // driven.
         match handle.terminals() {
-            Some(terminals) if terminals.session(&session_id).is_some() => {}
+            Some(terminals) if terminals.mode(&session_id).is_some() => {}
             _ => break,
         }
         match query_messages(&handle, &channel, cursor + 1).await {
             Ok(views) => {
                 for view in &views {
                     cursor = view.seq;
-                    let Some(projected) = project_message(view) else {
-                        continue;
+                    let projected = match project_message(view, &owner) {
+                        Ok(projected) => projected,
+                        // per-post, so `debug` — a member who spams the open
+                        // channel must not evict the log ring. The reason is the
+                        // whole diagnosis; the author and the text stay out.
+                        Err(reason) => {
+                            tracing::debug!(target: "ducktape::term", reason, "term_command_refused");
+                            continue;
+                        }
                     };
                     // re-fetch the manager each command: it may have gone away
                     // between the query and here. enqueue_command logs the per-
@@ -301,8 +418,6 @@ mod tests {
                 reply_count: 0,
                 last_reply_seq: None,
             },
-            reactions: Vec::new(),
-            channel_head_seq: seq,
         }
     }
 
@@ -337,18 +452,98 @@ mod tests {
         assert_eq!(command_text(&blocks), "echo hi\nls -la");
     }
 
+    /// the channel owner every test below gates against — the host node that
+    /// created the session's channel.
+    const HOST: [u8; 2] = [0xab, 0xcd];
+
+    fn channel(owner: Option<Vec<u8>>) -> chat::Channel {
+        chat::Channel {
+            id: "term-0000000000000001".into(),
+            name: "term-0000000000000001".into(),
+            created_at: 0,
+            head_seq: 0,
+            post_policy: chat::PostPolicy::Open,
+            hooks: Vec::new(),
+            pinned: Vec::new(),
+            huddle: Vec::new(),
+            owner,
+            archived: false,
+        }
+    }
+
     #[test]
-    fn project_skips_a_tombstone_but_projects_a_live_command() {
-        // a deleted (redacted) message must NOT run; a live one projects with
-        // the decoded text.
-        assert!(project_message(&view(2, AuthorRef::System, Vec::new(), true)).is_none());
-        let projected =
-            project_message(&view(1, AuthorRef::User(vec![0xab, 0xcd]), command_blocks("pwd"), false))
-                .expect("a live command projects");
+    fn the_channel_owner_drives_the_pty() {
+        let projected = project_message(
+            &view(
+                1,
+                AuthorRef::User(HOST.into()),
+                command_blocks("pwd"),
+                false,
+            ),
+            &HOST,
+        )
+        .expect("the owner's command projects");
         assert_eq!(projected.text, "pwd");
         // the verified User author renders to hex — a spoof-proof identity, not
         // a caller string (spec finding #5).
         assert_eq!(projected.origin, "abcd");
+    }
+
+    #[test]
+    fn any_other_member_is_refused_at_the_pty() {
+        // THE HOLE THIS GATE CLOSES: the command channel is `PostPolicy::Open`,
+        // so an admitted member's post commits exactly like the owner's — it is
+        // signed, ordered, durable and indistinguishable at the chat layer. The
+        // projector is the only thing between it and a live pty spending the
+        // host's own subscription. Mutating `author_is_owner` to `true` reddens
+        // this and nothing else.
+        let stranger = AuthorRef::User(vec![0x99, 0x99]);
+        assert_eq!(
+            project_message(&view(1, stranger, command_blocks("rm -rf /"), false), &HOST),
+            Err("command_not_channel_owner"),
+        );
+    }
+
+    #[test]
+    fn no_module_agent_or_system_author_drives_a_session() {
+        // an owner is always `AuthorRef::User` bytes, so no non-user origin can
+        // equal one — asserted per kind so a new `AuthorRef` variant has to be
+        // routed here rather than silently defaulting open.
+        for author in [
+            AuthorRef::Module("chat".into()),
+            AuthorRef::Agent {
+                module: "runs".into(),
+                agent_id: "a1".into(),
+            },
+            AuthorRef::System,
+        ] {
+            assert!(!author_is_owner(&author, &HOST));
+        }
+    }
+
+    #[test]
+    fn a_tombstone_is_refused_even_from_the_owner() {
+        // a deleted (redacted) message must NOT run: its content is cleared, and
+        // running an empty redaction would be wrong.
+        assert_eq!(
+            project_message(
+                &view(2, AuthorRef::User(HOST.into()), Vec::new(), true),
+                &HOST
+            ),
+            Err("command_deleted"),
+        );
+    }
+
+    #[test]
+    fn a_projector_with_no_owner_to_gate_on_refuses_to_start() {
+        // fail closed, both ways: no channel record and an unowned channel each
+        // yield a named refusal, never an owner the gate would compare against.
+        assert_eq!(channel_owner(None), Err("channel_unreadable"));
+        assert_eq!(channel_owner(Some(channel(None))), Err("channel_unowned"));
+        assert_eq!(
+            channel_owner(Some(channel(Some(HOST.into())))),
+            Ok(HOST.to_vec()),
+        );
     }
 
     #[test]
@@ -361,7 +556,10 @@ mod tests {
             }),
             "agent:runs/a1"
         );
-        assert_eq!(render_author(&AuthorRef::Module("chat".into())), "module:chat");
+        assert_eq!(
+            render_author(&AuthorRef::Module("chat".into())),
+            "module:chat"
+        );
         assert_eq!(render_author(&AuthorRef::System), "system");
     }
 }

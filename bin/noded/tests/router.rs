@@ -41,7 +41,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                             // identity without a second channel.
                             Ok(BlockSummary {
                                 height: 7,
-                                app_hash: String::from_utf8_lossy(&origin).into_owned(),
+                                root_hash: String::from_utf8_lossy(&origin).into_owned(),
                             })
                         }
                     };
@@ -49,15 +49,15 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                 }
                 // the signed-frame lane, answered as BOTH real binaries answer
                 // it: the origin is the frame's VERIFIED signer, never a caller
-                // string. echoed back through app_hash — the same origin probe
+                // string. echoed back through root_hash — the same origin probe
                 // the frameless arm above uses.
                 NodeCommand::SubmitFrame { frame, reply } => {
                     let result = match node::decode_frame(&frame) {
-                        Ok((sdk::Origin::External(key), msg, _cont)) => {
+                        Ok((sdk::Origin::External(key), msg)) => {
                             assert_eq!(msg.target, "chat");
                             Ok(BlockSummary {
                                 height: 11,
-                                app_hash: noded::hex_bytes(&key),
+                                root_hash: noded::hex_bytes(&key),
                             })
                         }
                         Ok((origin, ..)) => Err(format!("a frame cannot carry {origin:?}")),
@@ -73,39 +73,6 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                     let _ = reply.send(Ok(
                         serde_json::to_vec(&serde_json::json!({ "tasks": [] })).unwrap()
                     ));
-                }
-                NodeCommand::Status { reply } => {
-                    let _ = reply.send(NodeStatus {
-                        version: "9.9.9".into(),
-                        app_hash: "cd".repeat(32),
-                        height: 3,
-                        modules: vec![ModuleStatus {
-                            id: "chat".into(),
-                            root: "ef".repeat(32),
-                            category: ModuleCategory::of("chat"),
-                        }],
-                        public_key: "ab".repeat(32),
-                        operations: noded::OperationalStatus {
-                            role: noded::NodeRole::Validator,
-                            phase: noded::NodePhase::Validating,
-                            phase_since: 1_720_000_000,
-                            ..Default::default()
-                        },
-                    });
-                }
-                NodeCommand::Peers { reply } => {
-                    // answered as the real lanes answer it: a sample parsed
-                    // from an exposition — here one connected peer.
-                    let _ = reply.send(noded::peers::peers_from_exposition(
-                        "network_tracker_directory_connected{peer=\"ab\"} 1000\n",
-                        2000,
-                    ));
-                }
-                NodeCommand::Metrics { reply } => {
-                    let _ = reply.send(
-                        "# HELP ducktape_blocks_total blocks\nducktape_blocks_total 3\n# EOF\n"
-                            .to_string(),
-                    );
                 }
             }
         }
@@ -147,7 +114,7 @@ async fn submit_forwards_the_payload_and_returns_the_block() {
     assert_eq!(body["height"], 7);
     // the fake actor echoes the stamped origin here — no origin sent, so the
     // daemon default applies
-    assert_eq!(body["appHash"], "noded");
+    assert_eq!(body["root_hash"], "noded");
 }
 
 #[tokio::test]
@@ -169,7 +136,7 @@ async fn submit_stamps_the_client_origin() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body["appHash"], "jess");
+    assert_eq!(body["root_hash"], "jess");
 }
 
 // ---- the signed-frame lane (`POST /v1/submit/frame`) -----------------------
@@ -206,7 +173,7 @@ async fn a_signed_frame_lands_with_the_signers_key_as_the_origin() {
     spawn_fake_actor(cmd_rx, None);
 
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
-    let frame = node::encode_frame(&signer, 1, &chat_op(), None);
+    let frame = node::encode_frame(&signer, 1, &chat_op());
     let response = noded::router(handle)
         .oneshot(post_frame(frame))
         .await
@@ -218,12 +185,12 @@ async fn a_signed_frame_lands_with_the_signers_key_as_the_origin() {
     // the actor echoes the origin it VERIFIED — the signer's public key, which
     // no part of the request could have claimed.
     assert_eq!(
-        body["appHash"],
+        body["root_hash"],
         noded::hex_bytes(signer.public_key().as_ref())
     );
     // the receipt addresses the op PAYLOAD, exactly as the frameless lane does.
     assert_eq!(
-        body["opHash"].as_str().map(str::len),
+        body["op_hash"].as_str().map(str::len),
         Some(64),
         "the frame lane returns the same receipt shape"
     );
@@ -235,11 +202,19 @@ async fn a_tampered_frame_is_refused_before_it_reaches_the_actor() {
     spawn_fake_actor(cmd_rx, None);
 
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
-    let mut frame = node::encode_frame(&signer, 1, &chat_op(), None);
+    let op = chat_op();
+    let mut frame = node::encode_frame(&signer, 1, &op);
     // flip one byte of the PAYLOAD: the signature binds (origin, seq, target,
     // payload), so the frame no longer verifies — and the actor never sees it.
-    let last = frame.len() - 65;
-    frame[last] ^= 0x01;
+    // located by SEARCHING for the payload rather than counting back from the
+    // tail: an offset measured against the frame's trailer silently slides onto
+    // a structural byte when the layout gains a field, and the refusal becomes
+    // "does not parse" — a different gate than the one under test.
+    let at = frame
+        .windows(op.payload.len())
+        .position(|window| window == op.payload.as_slice())
+        .expect("the frame carries the op payload verbatim");
+    frame[at] ^= 0x01;
 
     let response = noded::router(handle)
         .oneshot(post_frame(frame))
@@ -265,7 +240,7 @@ async fn a_frame_cannot_claim_another_keys_origin() {
     // signed preimage, so B's key cannot be swapped in without breaking it.
     let a = commonware_cryptography::ed25519::PrivateKey::from_seed(1);
     let b = commonware_cryptography::ed25519::PrivateKey::from_seed(2);
-    let mut frame = node::encode_frame(&a, 1, &chat_op(), None);
+    let mut frame = node::encode_frame(&a, 1, &chat_op());
     let b_key = b.public_key();
     // the origin is the first length-prefixed field: 8 bytes of length, then the
     // 32 key bytes.
@@ -302,7 +277,7 @@ async fn submit_receipt_op_hash_addresses_the_committed_payload() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    let op_hash = body["opHash"].as_str().expect("receipt carries opHash");
+    let op_hash = body["op_hash"].as_str().expect("receipt carries op_hash");
     assert_eq!(op_hash.len(), 64);
     assert!(
         op_hash
@@ -368,9 +343,29 @@ async fn query_returns_the_decoded_module_reply() {
 }
 
 #[tokio::test]
-async fn status_reports_app_hash_height_and_module_roots() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
-    spawn_fake_actor(cmd_rx, None);
+async fn status_reports_root_hash_height_and_module_roots() {
+    // deliberately NO actor: /v1/status serves the last-published snapshot
+    // straight off the handle's cell, so it must answer even when nothing
+    // drains the command lane — the wedged-behind-sync regression this cell
+    // exists to prevent.
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    handle.status_cell().publish(NodeStatus {
+        version: "9.9.9".into(),
+        root_hash: "cd".repeat(32),
+        height: 3,
+        modules: vec![ModuleStatus {
+            id: "chat".into(),
+            root: "ef".repeat(32),
+            category: ModuleCategory::of("chat"),
+        }],
+        public_key: "ab".repeat(32),
+        operations: noded::OperationalStatus {
+            role: noded::NodeRole::Validator,
+            phase: noded::NodePhase::Validating,
+            phase_since: 1_720_000_000,
+            ..Default::default()
+        },
+    });
 
     let response = noded::router(handle)
         .oneshot(
@@ -385,7 +380,7 @@ async fn status_reports_app_hash_height_and_module_roots() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["version"], "9.9.9");
-    assert_eq!(body["appHash"], "cd".repeat(32));
+    assert_eq!(body["root_hash"], "cd".repeat(32));
     assert_eq!(body["height"], 3);
     assert_eq!(body["modules"][0]["id"], "chat");
     assert_eq!(body["modules"][0]["root"], "ef".repeat(32));
@@ -393,13 +388,25 @@ async fn status_reports_app_hash_height_and_module_roots() {
     assert_eq!(body["modules"][0]["category"], "workspace");
     assert_eq!(body["operations"]["role"], "validator");
     assert_eq!(body["operations"]["phase"], "validating");
-    assert_eq!(body["operations"]["phaseSince"], 1_720_000_000u64);
+    assert_eq!(body["operations"]["phase_since"], 1_720_000_000u64);
 }
 
 #[tokio::test]
 async fn peers_reports_the_direct_peer_sample() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
-    spawn_fake_actor(cmd_rx, None);
+    // NO actor: the sample parses from the wired exposition source and the
+    // published standing — like status, peers must answer while a sync
+    // stage has the pump busy.
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let cell = handle.status_cell();
+    cell.wire_exposition(|| {
+        "network_tracker_directory_connected{peer=\"ab\"} 1000\n".to_string()
+    });
+    cell.publish_peers(noded::PeersStanding {
+        validators: ["ab".to_string()].into(),
+        residents: Default::default(),
+        height: 41,
+        epoch: Some(7),
+    });
 
     let response = noded::router(handle)
         .oneshot(
@@ -413,16 +420,24 @@ async fn peers_reports_the_direct_peer_sample() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body["sampledAtMs"], 2000);
+    assert_eq!(body["height"], 41);
+    assert_eq!(body["epoch"], 7);
     assert_eq!(body["peers"][0]["peer"], "ab");
     assert_eq!(body["peers"][0]["connected"], true);
-    assert_eq!(body["peers"][0]["connectedSinceMs"], 1000);
+    assert_eq!(body["peers"][0]["connected_since_ms"], 1000);
+    assert_eq!(
+        body["peers"][0]["role"], "validator",
+        "the published standing stamps roles onto the live sample"
+    );
 }
 
 #[tokio::test]
 async fn metrics_forwards_the_encoded_registry_as_openmetrics_text() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
-    spawn_fake_actor(cmd_rx, None);
+    // NO actor: the scrape reads the wired exposition source directly.
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    handle.status_cell().wire_exposition(|| {
+        "# HELP ducktape_blocks_total blocks\nducktape_blocks_total 3\n# EOF\n".to_string()
+    });
 
     let response = noded::router(handle)
         .oneshot(
@@ -449,25 +464,60 @@ async fn metrics_forwards_the_encoded_registry_as_openmetrics_text() {
     let text = String::from_utf8(bytes.to_vec()).expect("metrics body is utf-8");
     assert!(
         text.contains("ducktape_blocks_total 3"),
-        "actor body passed through: {text:?}"
+        "the wired exposition passed through: {text:?}"
     );
+}
+
+/// this test node's operator credential — what a real node mints 0600 into its
+/// workspace and hands only to whoever can read that directory.
+const OPERATOR: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+/// a handle whose admin namespace is gated on [`OPERATOR`], default exposure.
+fn operator_handle() -> (NodeHandle, mpsc::Receiver<NodeCommand>) {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let handle = handle.with_admin(AdminConfig {
+        operator_token: Some(OPERATOR.to_string()),
+        ..Default::default()
+    });
+    (handle, cmd_rx)
+}
+
+/// an admin request with the method the route actually serves — `logs/tail` is
+/// a GET, and `post()` would answer 405 there long before the gate ran.
+fn admin_request(method: &str, uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap()
+}
+
+/// stamp the operator credential onto a request the way a client that read
+/// `admin.token` out of the node's workspace would.
+fn with_operator(mut req: Request<Body>) -> Request<Body> {
+    req.headers_mut().insert(
+        noded::admin::ADMIN_TOKEN_HEADER,
+        OPERATOR.parse().expect("token is a header value"),
+    );
+    req
 }
 
 #[tokio::test]
 async fn shutdown_acknowledges_then_signals() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx) = operator_handle();
     spawn_fake_actor(cmd_rx, None);
     let signal = handle.clone();
 
     // shutdown moved to the owner-gated admin namespace (ADR A2). the default
-    // handle is loopback-trust with no on-chain owner; the loopback check is
-    // FAIL-CLOSED on a missing ConnectInfo, so the test stamps a loopback peer
-    // exactly as the connect-info make-service would.
+    // handle has no on-chain owner, so the operator credential is the gate; the
+    // loopback check is FAIL-CLOSED on a missing ConnectInfo, so the test stamps
+    // a loopback peer exactly as the connect-info make-service would.
     let response = noded::router(handle)
-        .oneshot(with_peer(
+        .oneshot(with_operator(with_peer(
             post("/v1/admin/shutdown", serde_json::json!({})),
             "127.0.0.1:40000",
-        ))
+        )))
         .await
         .unwrap();
 
@@ -550,6 +600,152 @@ async fn a_non_loopback_peer_is_refused_under_loopback_exposure() {
     );
 }
 
+/// THE regression this gate exists for: a LOOPBACK process with no operator
+/// credential — a service daemon, a stray script, anything that can dial the
+/// port — must not be able to stop the node or stage module wasm. The operator,
+/// who read `admin.token` out of the node's own workspace, still can.
+#[tokio::test]
+async fn a_loopback_caller_without_the_operator_credential_cannot_drive_admin() {
+    // the two destructive routes AND the one that READS: shutdown stops the
+    // process, module-code/stage ingests a wasm artifact and fans it out to
+    // members, and logs/tail drains the 4096-line ring — every line the node
+    // ever logged, which is a real secret-read surface, not merely a noisy one.
+    // Each route with the method it actually serves: a POST to logs/tail is a
+    // 405 that would pass this assertion for entirely the wrong reason.
+    for (method, route) in [
+        ("POST", "/v1/admin/shutdown"),
+        ("POST", "/v1/admin/module-code/stage"),
+        ("GET", "/v1/admin/logs/tail"),
+    ] {
+        let (handle, cmd_rx) = operator_handle();
+        spawn_fake_actor(cmd_rx, None);
+        let response = noded::router(handle)
+            .oneshot(with_peer(admin_request(method, route), "127.0.0.1:40000"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{route} must refuse an uncredentialed loopback caller"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["reason"], "operator_token_missing");
+        // the refusal must never hand back the credential it wanted.
+        assert!(
+            !body.to_string().contains(OPERATOR),
+            "a refusal must never echo the expected credential"
+        );
+    }
+
+    // a WRONG credential is a distinct, and distinctly named, refusal.
+    let (handle, cmd_rx) = operator_handle();
+    spawn_fake_actor(cmd_rx, None);
+    let mut guessed = with_peer(
+        post("/v1/admin/shutdown", serde_json::json!({})),
+        "127.0.0.1:40000",
+    );
+    guessed
+        .headers_mut()
+        .insert(noded::admin::ADMIN_TOKEN_HEADER, "deadbeef".parse().unwrap());
+    let response = noded::router(handle).oneshot(guessed).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["reason"], "operator_token_mismatch");
+
+    // and the operator still gets through — a gate that locks the owner out is
+    // a worse bug than the one it closes.
+    let (handle, cmd_rx) = operator_handle();
+    spawn_fake_actor(cmd_rx, None);
+    let signal = handle.clone();
+    let response = noded::router(handle)
+        .oneshot(with_operator(with_peer(
+            post("/v1/admin/shutdown", serde_json::json!({})),
+            "127.0.0.1:40000",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // wait on the system's own event, not on a duration.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        signal.shutdown_requested(),
+    )
+    .await
+    .expect("the operator's shutdown reached the node");
+}
+
+/// the stage lane's body cap is EXPLICIT, and over it is a NAMED refusal.
+///
+/// Two cliffs, one test. Without a `DefaultBodyLimit` layer axum applies its
+/// implicit 2 MiB default, and `crates/modules/apps/runs/component.wasm` is
+/// already 1.73 MB of that — so the next module to grow would have become
+/// un-stageable behind an opaque tower error with no reason token. Above the
+/// real cap the refusal must still be a reason a client can branch on.
+#[tokio::test]
+async fn the_module_stage_body_cap_is_explicit_and_its_refusal_is_named() {
+    fn stage(body: Vec<u8>) -> Request<Body> {
+        with_operator(with_peer(
+            Request::builder()
+                .method("POST")
+                // fanout=false: this handle wires no code plane, and the
+                // network fan-out is not what the body cap is about.
+                .uri("/v1/admin/module-code/stage?fanout=false")
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(body))
+                .unwrap(),
+            "127.0.0.1:40000",
+        ))
+    }
+
+    // 3 MiB — over axum's implicit default, under ours. The cliff is gone.
+    let (handle, cmd_rx) = operator_handle();
+    spawn_fake_actor(cmd_rx, None);
+    let response = noded::router(handle)
+        .oneshot(stage(vec![7u8; 3 * 1024 * 1024]))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "an artifact past axum's implicit 2 MiB default must still stage"
+    );
+
+    // over the explicit cap — refused, with a token rather than tower's prose.
+    let (handle, cmd_rx) = operator_handle();
+    spawn_fake_actor(cmd_rx, None);
+    let response = noded::router(handle)
+        .oneshot(stage(vec![7u8; 16 * 1024 * 1024 + 1]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        body_json(response).await["reason"],
+        "module_artifact_too_large"
+    );
+}
+
+/// FAIL CLOSED: a node that minted no operator credential verifies nothing, so
+/// it refuses every admin request. There is no "unauthenticated if unset" arm —
+/// that fallback IS the hole this gate closes.
+#[tokio::test]
+async fn a_node_with_no_minted_credential_refuses_every_admin_request() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    // the default config carries no token, and the default exposure is Loopback.
+    assert_eq!(AdminConfig::default().operator_token, None);
+    let response = noded::router(handle)
+        .oneshot(with_operator(with_peer(
+            post("/v1/admin/shutdown", serde_json::json!({})),
+            "127.0.0.1:40000",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body_json(response).await["reason"],
+        "operator_token_unavailable"
+    );
+}
+
 /// an actor that answers exactly one thing: `identity` `OfNode` → the account
 /// that owns `node_key`, whose sole member is `owner_key`. everything else is a
 /// module error (the admin owner path only ever asks this one question).
@@ -619,12 +815,16 @@ async fn public_admin_enforces_the_committed_owner_pop() {
         .as_secs();
     let owner_key_hex = duckfs_core::to_hex(&owner_key);
 
+    // the handle carries a REAL operator credential on purpose: a `Public` node
+    // with a committed owner must be on the owner path and nothing else, so
+    // every assertion below is made against a node that HAS the other secret.
     let mk_handle = || {
         let (handle, cmd_rx, _e) = NodeHandle::channel();
         spawn_owner_actor(cmd_rx, node_key.clone(), owner_key.clone());
         handle.with_admin(AdminConfig {
             exposure: AdminExposure::Public,
             node_key: Some(node_key.clone()),
+            operator_token: Some(OPERATOR.to_string()),
             ..Default::default()
         })
     };
@@ -668,6 +868,32 @@ async fn public_admin_enforces_the_committed_owner_pop() {
         "a signature minted for another node is refused here"
     );
 
+    // THE cross-check: the operator credential is NOT an alternative credential
+    // here. Once an owner is committed, `Public` is the owner path and only the
+    // owner path — otherwise anyone who can read the workspace would keep a
+    // standing bypass around the very PoP that `Public` exposure exists for,
+    // and the two gates would be an OR instead of a ladder. A loopback peer
+    // presenting a VALID operator token and no signature is still refused.
+    let mut token_only = with_operator(with_peer(
+        post("/v1/admin/shutdown", serde_json::json!({})),
+        "127.0.0.1:40000",
+    ));
+    // and a smuggled owner-key header changes nothing without the signature.
+    token_only
+        .headers_mut()
+        .insert(noded::admin::ADMIN_KEY_HEADER, owner_key_hex.parse().unwrap());
+    let refused = noded::router(mk_handle()).oneshot(token_only).await.unwrap();
+    assert_eq!(
+        refused.status(),
+        StatusCode::UNAUTHORIZED,
+        "the operator token must not stand in for the owner PoP"
+    );
+    assert_eq!(
+        body_json(refused).await["reason"],
+        "owner_signature_invalid",
+        "a token-only caller must fail the OWNER check, not pass some operator arm"
+    );
+
     // the committed owner's signature for THIS node ⇒ 200.
     let ok = noded::router(mk_handle())
         .oneshot(admin_signed_post(
@@ -679,7 +905,11 @@ async fn public_admin_enforces_the_committed_owner_pop() {
         ))
         .await
         .unwrap();
-    assert_eq!(ok.status(), StatusCode::OK, "the node owner may drive control");
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "the node owner may drive control"
+    );
 }
 
 /// the loopback gate FAILS CLOSED: a request with no ConnectInfo at all (an
@@ -836,8 +1066,9 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
                 "path_and_query": "/api/items",
                 "headers": [{ "name": "content-type", "value": "application/json" }],
                 "body_len": request_body.len(),
+                "upgrade": false,
             },
-            "bodyB64": base64::engine::general_purpose::STANDARD.encode(request_body),
+            "body_b64": base64::engine::general_purpose::STANDARD.encode(request_body),
         }),
     );
     let response = noded::router(handle.with_gateway(lane))
@@ -849,7 +1080,7 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
     assert_eq!(body["head"]["status"], 201);
     assert_eq!(
         base64::engine::general_purpose::STANDARD
-            .decode(body["bodyB64"].as_str().unwrap())
+            .decode(body["body_b64"].as_str().unwrap())
             .unwrap(),
         br#"{"ok":true}"#
     );
@@ -1086,7 +1317,7 @@ fn spawn_files_actor(
                         Some(err) => Err(err.to_string()),
                         None => Ok(BlockSummary {
                             height: 9,
-                            app_hash: "ab".repeat(32),
+                            root_hash: "ab".repeat(32),
                         }),
                     };
                     let _ = reply.send(result);

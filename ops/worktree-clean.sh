@@ -1,17 +1,8 @@
 #!/usr/bin/env bash
-# Reap finished worktrees and the QA fleet instances they leave behind.
+# Reap worktrees whose work is fully merged into origin/dev.
 #
-# THE LEAK THIS EXISTS TO CLOSE. A Fleet instance's teardown hook
-# (`cleanupInstance` in .tauri-agent/fleet.json) is a path INSIDE the worktree
-# — `qa/fleet/cleanup-instance.ts`. Its workspace, pidfile and detached
-# `ducktape-node` live OUTSIDE it, under FLEET_HOME. So deleting a worktree
-# deletes the only thing that could have stopped its node, and the node then
-# runs forever: we found one still up 40 hours after its worktree was gone, and
-# 9.2 GB of instance homes belonging to worktrees that no longer existed.
-#
-# `fleet down <id>` is the correct teardown and it works. The failure is one of
-# ORDER: remove the worktree first and there is nothing left to run. So the
-# sequence is always stop-then-remove, and this script is that sequence.
+# A worktree's life ends when its PR merges; what it leaves behind is ~20 GB of
+# Cargo target and nothing else. Twelve of them once ate 250 GB.
 #
 # Dry-run by default. It removes worktrees; that is not something to do on a
 # typo. Pass --yes to act.
@@ -32,13 +23,12 @@ for arg in "$@"; do
   case "$arg" in
     --yes) YES=1 ;;
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,26p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
 
 PRIMARY="$(pwd -P)"
-FLEET_ROOT="${FLEET_ROOT:-$HOME/.local/opt/remote-tauri/fleet}"
 say() { [ "$YES" = 1 ] && echo "  $*" || echo "  [dry-run] $*"; }
 run() { [ "$YES" = 1 ] && "$@"; }
 
@@ -57,58 +47,6 @@ pids_under() {
   done
 }
 
-# ── kill one Fleet instance's node, identity-verified ────────────────────────
-# Mirrors qa/fleet/cleanup-instance.ts: confirm the pid really IS the node for
-# THIS workspace (exe + --config) before signalling, so a recycled pid is never
-# the victim. Signals the process GROUP — the node detaches children.
-kill_instance_node() {
-  local workspace="$1" pid exe cfg pgid
-  pid=$(cat "$workspace/node.pid" 2>/dev/null) || return 0
-  [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || { run rm -f "$workspace/node.pid"; return 0; }
-  [ -d "/proc/$pid" ] || { say "stale pidfile (pid $pid gone)"; run rm -f "$workspace/node.pid"; return 0; }
-
-  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null)
-  cfg=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -A1 -x -- '--config' | tail -1)
-  # `*ducktape-node` matches pre-rename zombies; `*ducktape` the unified CLI.
-  case "$exe" in *ducktape-node|*ducktape) ;; *)
-    say "REFUSING to kill pid $pid — not a ducktape node ($exe)"; return 0 ;;
-  esac
-  if [ "$(readlink -f "$cfg" 2>/dev/null)" != "$(readlink -f "$workspace/node.toml" 2>/dev/null)" ]; then
-    say "REFUSING to kill pid $pid — its --config is not this workspace's"; return 0
-  fi
-
-  pgid=$(awk '{print $5}' "/proc/$pid/stat" 2>/dev/null)
-  say "stopping node pid $pid (pgid $pgid)"
-  if [ "$YES" = 1 ]; then
-    kill -TERM "-$pgid" 2>/dev/null
-    for _ in $(seq 20); do kill -0 "-$pgid" 2>/dev/null || break; sleep 0.25; done
-    kill -0 "-$pgid" 2>/dev/null && kill -KILL "-$pgid" 2>/dev/null
-    rm -f "$workspace/node.pid"
-  fi
-}
-
-# ── 1. orphaned fleet instance homes ─────────────────────────────────────────
-# An instance whose worktree is gone can never be torn down by Fleet, because
-# the hook went with it. This is the only thing that can still stop it.
-echo "Orphaned Fleet instances under $FLEET_ROOT:"
-found=0
-for home in "$FLEET_ROOT"/*/; do
-  [ -d "$home" ] || continue
-  id=$(basename "$home")
-  # An instance is orphaned when no worktree of this repo still claims its id.
-  if git worktree list --porcelain | grep -q "^worktree .*/$id\$"; then continue; fi
-  found=1
-  echo "- $id ($(du -sh "$home" 2>/dev/null | cut -f1))"
-  for ws in "$home"/home/.ducktape/workspaces/*/; do
-    [ -d "$ws" ] && kill_instance_node "${ws%/}"
-  done
-  say "rm -rf $home"
-  run rm -rf "$home"
-done
-[ "$found" = 0 ] && echo "  none"
-
-# ── 2. finished worktrees ────────────────────────────────────────────────────
-echo
 echo "Worktrees whose work is fully in origin/dev:"
 found=0
 # Process substitution, not a pipe: a piped `while` runs in a subshell, so

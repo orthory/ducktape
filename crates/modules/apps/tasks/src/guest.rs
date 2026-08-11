@@ -10,14 +10,27 @@
 //! unix-only IO), never consensus state — so the ported state machine is the
 //! FULL consensus surface.
 //!
-//! the whole-state dispatch model and its equivalence argument are spelled out
-//! in `agent`'s guest port (a whole-state tenant) and `guest-adapter`; tasks is
-//! the same shape: a pure `SnapshotBytes` module whose canonical snapshot is
-//! persisted as ONE host-KV value per dispatch. that host-KV encoding is a
-//! STATE-SCHEMA BREAK versus the native root (revision 3 — the tasks+jobs merge
-//! folded the former `jobs` module's job board into this one, so the canonical
-//! snapshot is now the task board and job board concatenated; beta networks
-//! re-genesis, no back-compat shim).
+//! ## the STORE-BACKED dispatch model
+//!
+//! tasks is pure logic over a host-injected [`sdk::MerkleStore`] — so the port
+//! injects [`WitStore`], the adapter's `MerkleStore` over the wit `state-*`
+//! imports, and the REAL qmdb store stays host-side
+//! (`WasmModule::with_store`). there is NO per-dispatch snapshot: the store IS
+//! the state and the wasm root is the store's Merkle root, so this port is
+//! ROOT-CONTINUOUS with the native module (pinned block-by-block by
+//! `wasm_tasks_parity`). see the `pages` guest port for the staging contract
+//! spelled out point by point — tasks rides the identical seams:
+//!
+//! * the guest rebuilds the module FRESH per dispatch over the production
+//!   constructor (`Tasks::new("tasks", store)`); its inner `pending` overlay is
+//!   per-dispatch, and cross-dispatch read-your-writes comes from the host's
+//!   outer staged overlay via `WitStore::get` (staged-over-committed).
+//! * each successful `execute` flushes the inner staging with the inner
+//!   `commit_block` — `state-set`/`state-delete` OUTER staging the host
+//!   publishes into the real store in ONE `commit_batch` at the true block
+//!   boundary. the accepted no-ops (a same-status task update, an already-
+//!   registered worker) stage NOTHING on either side, so the op log — and the
+//!   root — stays byte-identical there too.
 
 use crate::Tasks;
 
@@ -25,10 +38,12 @@ use crate::Tasks;
 /// `Env::me` and follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "tasks";
 
-// whole-state port: the shell loads/saves the canonical snapshot and runs the
-// native module per dispatch (see `guest_adapter::snapshot_guest!`).
-guest_adapter::snapshot_guest! {
+use guest_adapter::WitStore;
+
+// store-backed port: no snapshot — the host owns the real qmdb store and the
+// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+guest_adapter::store_guest! {
     id: MODULE_ID,
     module: Tasks,
-    new: Tasks::new(MODULE_ID),
+    new: Tasks::new(MODULE_ID, Box::new(WitStore)),
 }

@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Worktree: `/home/eddy/dev/ducktape/.worktree/simnode-lib`, branch `feat/simnode-lib`, PR target `dev`.
+- Worktree: `<repo>/.worktree/simnode-lib`, branch `feat/simnode-lib`, PR target `dev`.
 - `CARGO_INCREMENTAL=0` on every cargo command. If rustc SIGSEGVs on the dep graph: `sccache --stop-server; export RUSTC_WRAPPER=""; export RUST_MIN_STACK=2147483648` and retry.
 - Lint gates: `cargo clippy -p simnode --tests --no-deps` AND `cargo clippy -p noded --tests --no-deps` (handle.rs is touched). Never `cargo fmt --all`.
 - The behavior of the BINARY must not change: same flags, same defaults (including the `temp_dir()` storage default and exit-1 on fatal), same stdout lines. The 11 suites in `bin/simnode/tests/` are the regression net — they all spawn the binary.

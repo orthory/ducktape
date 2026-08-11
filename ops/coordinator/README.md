@@ -2,13 +2,14 @@
 
 Three ready-to-use artifacts for running `bin/coordinator` as
 `p2p.ducktape.byeongsu.dev`. The coordinator is the private-cutover reachability
-helper: STUN reflexive + rendezvous over a single UDP socket — rendezvous
-only, it never carries peer traffic. It **holds no keys, serves no state, and
-is untrusted by design** — see `docs/deploy/coordinator.md` for the maintained
-operator recipe and trust-model notes.
+helper: UDP STUN/rendezvous plus an optional TCP fallback for the sealed
+first-contact intro. It never carries the established overlay or peer data. It
+**holds no keys, serves no state, and is untrusted by design** — see
+`docs/deploy/coordinator.md` for the maintained operator recipe and trust-model
+notes.
 
 - **`ducktape-coordinator.service`** — hardened systemd unit (DynamicUser,
-  empty capability set, read-only filesystem, UDP-only address families).
+  empty capability set, read-only filesystem, Internet IP sockets only).
 - **`coordinator.env.example`** — the single operator-edited line, the bind
   address, plus optional auth-mode args. **Not a secret**; the coordinator has
   none.
@@ -28,14 +29,22 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ducktape-coordinator
 
 ```sh
 docker build -f ops/coordinator/Dockerfile -t ducktape-coordinator .
-docker run --rm -p 3478:3478/udp ducktape-coordinator
+docker run --rm -p 3478:3478/udp ducktape-coordinator \
+  --listen 0.0.0.0:3478 --relay-listen none
+```
+
+To expose the sealed-intro fallback without granting the non-root container a
+privileged bind, map host TCP 443 to an unprivileged container port:
+
+```sh
+docker run --rm -p 3478:3478/udp -p 443:8443/tcp ducktape-coordinator \
+  --listen 0.0.0.0:3478 --relay-listen 0.0.0.0:8443
 ```
 
 Auth modes:
 
 - default: public proof-of-possession (`COORDINATOR_ARGS=--workers 4 --metrics-interval 10`).
 - private: append `--genesis-set /etc/ducktape/network.toml`.
-- local/dev legacy: append `--allow-anonymous`.
 
 `coordinator_metrics` lines report request counters, bounded-window saturation,
 in-flight work, process CPU, and RSS. The cross-host/flood/24-hour probe commands

@@ -49,11 +49,8 @@
 //!   restores the pre-dispatch overlay — the native execute's error paths
 //!   likewise leave `pending` untouched.
 //!
-//! the persisted encoding is the native module's canonical snapshot stored as
-//! ONE host-KV value, so the wasm root is the host-KV encoding over the two
-//! reserved keys — a STATE-SCHEMA BREAK versus the native root (revision 2 of
-//! the capability canonical state, declared at cutover in
-//! `MODULE_STATE_SCHEMAS`; beta networks re-genesis, no back-compat shim).
+//! the canonical snapshot is stored as one host-KV value under the adapter's
+//! reserved keys.
 
 use crate::CapabilityRegistry;
 
@@ -61,10 +58,14 @@ use crate::CapabilityRegistry;
 /// `Env::me` and follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "capability";
 
-// whole-state port: the shell loads/saves the canonical snapshot and runs the
-// native module per dispatch (see `guest_adapter::snapshot_guest!`).
-guest_adapter::snapshot_guest! {
+use guest_adapter::WitStore;
+
+// store-backed port: no snapshot — the host owns the real qmdb store and the
+// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+// no genesis config: capability carries no per-network parameter; the valset
+// sibling id is genesis-constant wiring, compiled in like every other port's.
+guest_adapter::store_guest! {
     id: MODULE_ID,
     module: CapabilityRegistry,
-    new: CapabilityRegistry::new(MODULE_ID, Some("valset".into())),
+    new: CapabilityRegistry::new(MODULE_ID, Box::new(WitStore), Some("valset".into())),
 }

@@ -84,7 +84,7 @@ and the per-view files named in §4, and match them.
 
 ---
 
-## 2. Frontend architecture (the "리팩토링")
+## 2. Frontend architecture (the refactor)
 
 Current state: one **918-line `DucktapeProvider.tsx`** + a **61-field
 `ConsoleState`** mixing domain projections, transient UI state (`hoverMsg`,
@@ -221,7 +221,7 @@ what our node actually serves. Be **honest** — show real data, mark the rest.
   - NETWORK stat cards: **HEIGHT** (real), **ROUND** / **PEERS** / **FINALITY**
     → honest `"—"` placeholders today (the reference did the same) — these are
     the one genuine node-work follow-up (add fields to `/v1/status`, §5).
-  - **STATE COMMITMENT** — our real strength: show `appHash` + **per-module
+  - **STATE COMMITMENT** — our real strength: show `rootHash` + **per-module
     merkle roots** from `NodeStatus.modules` (each `{id, root}`),
     click-to-copy. This is real, verifiable, and the honest centerpiece of the
     panel. Feature it.
@@ -230,7 +230,7 @@ what our node actually serves. Be **honest** — show real data, mark the rest.
 - **Activity tab**: node log tail — only if we add a cheap Tauri command to tail
   the workspace `daemon.log` (small app work); otherwise defer.
 - **Ledger tab**: an event ledger needs an `events_since`-style query the node
-  doesn't expose → **defer** (or show a live block-height/appHash feed from
+  doesn't expose → **defer** (or show a live block-height/rootHash feed from
   `/v1/ws`). Note as node-work.
 
 ---

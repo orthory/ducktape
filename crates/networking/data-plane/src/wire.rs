@@ -32,7 +32,13 @@ pub const MAX_DATAGRAM_PAYLOAD: usize = MAX_DATAGRAM - DATAGRAM_HEADER_LEN;
 
 /// Hello body length ahead of meta: ver + service + flow + intent.
 const HELLO_FIXED_LEN: usize = 11;
-pub const MAX_HELLO_META: usize = 1024;
+/// The gateway plane packs a proxied request's HEAD (method, path, and the
+/// forwarded HTTP headers) into the stream Hello's `meta`. Real HTTP heads —
+/// an airlock `/v1/messages` carries `anthropic-version`, `anthropic-beta`, the
+/// scoped bearer, and the seal marker — run past 1.5 KiB, so a 1 KiB cap
+/// silently 502'd every cross-node airlock request. Bounded by the `u16` length
+/// prefix (< 64 KiB); 16 KiB is generous for any HTTP head while staying small.
+pub const MAX_HELLO_META: usize = 16 * 1024;
 
 /// The single byte an acceptor answers a hello with. Anything else (or a
 /// closed stream) means the open was refused.

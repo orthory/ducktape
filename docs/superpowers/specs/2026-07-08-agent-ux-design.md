@@ -185,7 +185,7 @@ sequenced after WS-B lands in the same files):**
 **WS-D1 is lockstep-class.** The runs envelope + ⚠ failure posts change
 consensus **execution**: `render_payload` commits different payload bytes,
 and `on_result_event` writes chat posts that old validators never write — so
-mixed-version validators app-hash-fork at the first agent dispatch (or the
+mixed-version validators root-hash-fork at the first agent dispatch (or the
 first failed-run delivery). State *shape* and snapshot codecs are untouched
 (no migration, forward-only), but live networks (Ducktape-2 class) must take
 the height-gated lockstep upgrade path — same class as PR #232; the

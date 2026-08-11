@@ -137,7 +137,7 @@ pub enum ForgeQuery {
 
 /// the git oid hex of a repo's HEAD (a 40-char sha1 oid), or `None` on an unborn
 /// repo (no commits yet). a consumer can git-address the exact commit forge
-/// holds while the app-hash keeps sha256-strength (the head oid is the root's
+/// holds while the root-hash keeps sha256-strength (the head oid is the root's
 /// preimage material).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

@@ -193,7 +193,7 @@ fn clean_rejection_stays_rejected() {
         ])
         .expect("genesis");
 
-        let app0 = host.app_hash();
+        let app0 = host.root_hash();
         let err = host
             .submit(Msg {
                 target: "fanout".into(),
@@ -203,7 +203,7 @@ fn clean_rejection_stays_rejected() {
             .expect_err("the boom follow-up must fail the block");
 
         assert_eq!(err, SubmitError::Rejected(Error::Module("boom".into())));
-        assert_eq!(host.app_hash(), app0, "a rejected block leaves no trace");
+        assert_eq!(host.root_hash(), app0, "a rejected block leaves no trace");
     });
 }
 
@@ -272,6 +272,6 @@ fn abort_fault_still_aborts_the_remaining_modules() {
             })
             .await
             .expect("direct clean block");
-        assert_ne!(out.app_hash, StateRoot::ZERO);
+        assert_ne!(out.root_hash, StateRoot::ZERO);
     });
 }

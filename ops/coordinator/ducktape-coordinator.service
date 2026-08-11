@@ -50,7 +50,7 @@ MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 RestrictNamespaces=yes
-# UDP only — no unix sockets, no raw/packet families.
+# Internet IP sockets only — no unix sockets, no raw/packet families.
 RestrictAddressFamilies=AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service

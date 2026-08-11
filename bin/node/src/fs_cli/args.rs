@@ -1,8 +1,8 @@
-//! the CLI error type, the shared node-addressing flags, and node-address
-//! resolution. clap owns the parsing now; this file only turns the typed
-//! addressing flags into an http base.
+//! the `fs` CLI error type, and the exit code it maps an unresolved node
+//! address to. The addressing flags and the resolution ladder itself are
+//! [`crate::cli_args::NodeAddr`] — ONE ladder for every family.
 
-use crate::config;
+pub use crate::cli_args::NodeAddr;
 
 /// a CLI failure carrying the process exit code. code 2 is a usage error (an
 /// unresolved node) and a commit conflict; code 1 is a general operational
@@ -43,59 +43,18 @@ impl CliError {
     }
 }
 
-/// the node-addressing flags every verb but `status` shares. `-n` is the short
-/// alias for `--network`, the workspace selector shared with the node family.
-#[derive(Debug, clap::Args)]
-pub struct NodeAddr {
-    /// the node's http base url (wins over -n/--network and DUCKTAPE_NODE)
-    #[arg(long, value_name = "HTTP-URL")]
-    pub node: Option<String>,
-    /// a registered workspace's chain id — resolves to its node.toml http_listen
-    #[arg(short = 'n', long, value_name = "CHAIN-ID")]
-    pub network: Option<String>,
-}
-
-/// resolve the node http base honoring the fs addressing precedence: an explicit
-/// `--node <url>` wins, then `-n/--network <id>` (registry → the workspace
-/// node.toml's `http_listen`), then the `DUCKTAPE_NODE` env. `None` only when
-/// NONE of the three is set — worktree verbs then fall back to the checkout
-/// index. a set-but-broken `--network` (unknown/ambiguous workspace, or one with
-/// no http listen) is a hard usage error, never a silent fall-through to env.
-pub fn resolve_node_addr(addr: &NodeAddr) -> Result<Option<String>, CliError> {
-    if let Some(url) = addr.node.as_deref().filter(|url| !url.is_empty()) {
-        return Ok(Some(url.to_string()));
-    }
-    if let Some(needle) = addr.network.as_deref().filter(|needle| !needle.is_empty()) {
-        let (_dir, http) = config::resolve_network(needle).map_err(CliError::usage)?;
-        let base = http.ok_or_else(|| {
-            CliError::usage(format!(
-                "network {needle:?} resolves to a workspace with no http listen \
-                 (its node.toml sets no http_listen) — pass --node <http-url>"
-            ))
-        })?;
-        return Ok(Some(base));
-    }
-    Ok(std::env::var("DUCKTAPE_NODE")
-        .ok()
-        .filter(|url| !url.is_empty()))
-}
-
-/// resolve the node http base for a read verb: the addressing chain above, which
-/// read verbs require (they have no working-copy index to fall back to — worktree
-/// verbs add that fallback in `work_cmds`).
+/// resolve the node http base for a verb with no ambient address of its own:
+/// [`NodeAddr::resolve`], the ONE ladder every family shares. Worktree verbs
+/// that DO have one (a checkout's `.duckfs` index) call
+/// [`NodeAddr::resolve_with`] in `work_cmds` instead.
 pub fn resolve_node(addr: &NodeAddr) -> Result<String, CliError> {
-    resolve_node_addr(addr)?.ok_or_else(|| {
-        CliError::usage(
-            "no node address: pass --node <http-url>, -n/--network <id>, or set DUCKTAPE_NODE",
-        )
-    })
+    addr.resolve().map_err(CliError::usage)
 }
 
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
 
-    use super::*;
     use crate::fs_cli::FsCmd;
 
     /// a top-level `Parser` wrapper so the tests can drive clap over `FsCmd`
@@ -162,17 +121,15 @@ mod tests {
         assert!(parse(&["ls", "/p", "--limit", "abc"]).is_err());
     }
 
-    /// --node short-circuits before any registry walk, so a bogus -n never
-    /// errors: the explicit flag is the top of the precedence chain.
+    /// `--node` binds through the shared addressing group. The PRECEDENCE it
+    /// sits at the top of is pinned once, in
+    /// `cli_args::tests::the_node_address_ladder_ranks_flag_network_env_context_registry`
+    /// — not re-asserted per family, which is how four of them drifted apart.
     #[test]
-    fn explicit_node_wins_over_network_without_touching_the_registry() {
-        let addr = NodeAddr {
-            node: Some("http://explicit:8844".into()),
-            network: Some("no-such-workspace".into()),
+    fn dash_dash_node_binds_its_url() {
+        let FsCmd::Ls(a) = parse(&["ls", "--node", "http://explicit:8844", "/p"]).unwrap() else {
+            panic!("expected ls");
         };
-        assert_eq!(
-            resolve_node_addr(&addr).unwrap(),
-            Some("http://explicit:8844".to_string())
-        );
+        assert_eq!(a.addr.node.as_deref(), Some("http://explicit:8844"));
     }
 }

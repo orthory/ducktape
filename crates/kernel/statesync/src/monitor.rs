@@ -189,13 +189,12 @@ mod tests {
     fn manifest_at(height: u64) -> Manifest {
         Manifest {
             height,
-            app_hash: StateRoot([7u8; 32]),
+            root_hash: StateRoot([7u8; 32]),
             epoch: 0,
             view_base: 0,
             participants: vec![],
             residents: vec![],
             floor_cert: None,
-            state_schema: [0u8; 32],
             entries: vec![],
         }
     }
@@ -206,7 +205,7 @@ mod tests {
             frame: vec![],
             disposition: FrameDisposition::Applied,
             roots: vec![],
-            app_hash: StateRoot([9u8; 32]),
+            root_hash: StateRoot([9u8; 32]),
         }
     }
 
@@ -256,7 +255,7 @@ mod tests {
         // sync done; the parked resident's routine detection poll arrives.
         let coords = SyncResponse::TipCoords(TipCoords {
             height: 489,
-            app_hash: StateRoot([1u8; 32]),
+            root_hash: StateRoot([1u8; 32]),
             epoch: 0,
             view_base: 0,
             participants: vec![],
@@ -279,7 +278,7 @@ mod tests {
         let monitor = ServeMonitor::with_now(|| SystemTime::UNIX_EPOCH);
         let coords = SyncResponse::TipCoords(TipCoords {
             height: 42,
-            app_hash: StateRoot([1u8; 32]),
+            root_hash: StateRoot([1u8; 32]),
             epoch: 0,
             view_base: 0,
             participants: vec![],

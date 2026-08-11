@@ -46,8 +46,7 @@ renamed to "system", so no directory ever changes meaning across history.
 - The `crates/networking/` crates are still consensus modules (they appear in
   `MODULE_IDS`); the tree groups by function, not mechanism. The workspace
   header comment states this explicitly.
-- `MODULE_IDS`, `MODULE_STATE_SCHEMAS`, app-hash ordering, and all consensus
-  state are untouched.
+- `MODULE_IDS`, root-hash ordering, and all consensus state are untouched.
 
 ## Mechanical scope
 

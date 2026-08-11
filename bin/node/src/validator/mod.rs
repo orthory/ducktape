@@ -2,7 +2,6 @@
 //! pre-start mesh lane, resume the epoch engine, then hand ownership to the
 //! consensus pump.
 
-pub(crate) mod announce;
 mod boot;
 pub(crate) mod code_announce;
 mod engine;
@@ -10,12 +9,13 @@ mod run;
 mod wiring;
 
 use commonware_cryptography::{Signer as _, ed25519};
-use commonware_p2p::Ingress;
 use commonware_p2p::authenticated::discovery::{self, Network};
+use commonware_p2p::{Ingress, Manager as _};
 use commonware_runtime::Quota;
 use recovery::{Manifest, Recovery};
 
 use crate::explorer::IndexFold;
+use crate::rpc::spawn_rpc_listener;
 
 /// Run the validator role after the shared boot conductor has selected it.
 #[allow(clippy::too_many_arguments)]
@@ -25,6 +25,7 @@ pub(crate) async fn run_validator(
     oracle: discovery::Oracle<ed25519::PublicKey>,
     quota: Quota,
     metrics: noded::NodeMetrics,
+    status: noded::StatusCell,
     sync_source: Option<ed25519::PublicKey>,
     advertised_reach: Ingress,
     status_public_key: String,
@@ -47,20 +48,18 @@ pub(crate) async fn run_validator(
     checkpoint_blocks: u64,
     promoted: bool,
     dev_demo: bool,
-    announce_capabilities: bool,
-    sandbox: capability_host::SandboxBackend,
-    sandbox_capacity: std::collections::BTreeMap<String, u64>,
     rpc_listener: Option<std::net::TcpListener>,
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
+    session_manager: Option<noded::TerminalSessions>,
+    session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
+    local_gateway_via: String,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     blobs: noded::blobs::BlobHandle,
-    agent_provisioner: dispatch_oracle::SharedProvisioner,
-    agent_dirs: capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
     planes: data_plane::PlaneMonitor,
@@ -170,7 +169,6 @@ pub(crate) async fn run_validator(
         signer.clone(),
         label.clone(),
         namespace.clone(),
-        identity_chain_id.clone(),
         validators.clone(),
         forge_repo.clone(),
         duckfs_dir.clone(),
@@ -183,7 +181,6 @@ pub(crate) async fn run_validator(
         participants,
         resume_epoch,
         pending_boot,
-        bank_base,
         mesh_oracle,
         channel_bank,
         gateway_book,
@@ -195,7 +192,6 @@ pub(crate) async fn run_validator(
     } = wiring::finish(
         &context,
         &index,
-        &host,
         resumed.as_ref(),
         recovery_manifest_for_resume.as_ref(),
         boot_fold,
@@ -210,8 +206,8 @@ pub(crate) async fn run_validator(
         planes.clone(),
         sync_monitor,
         gateway_requests,
-        gateway_commands,
-        gateway_workspace,
+        gateway_commands.clone(),
+        gateway_workspace.clone(),
         blobs.clone(),
         initial_member_keys,
         initial_resident_keys,
@@ -240,7 +236,9 @@ pub(crate) async fn run_validator(
             stream_hub.run_output(),
         );
         // the terminal-session plane: forwards a session's output ring and
-        // ordered command log to peers, so a member on another node streams it.
+        // ordered command log to peers, hosts the directed create/close +
+        // creator-gated input control lanes, and drains the guest-side session
+        // lane (the client half).
         crate::term_plane::spawn(
             label.clone(),
             crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
@@ -250,6 +248,11 @@ pub(crate) async fn run_validator(
             planes.clone(),
             stream_hub.terminals(),
             stream_hub.term_commands(),
+            session_manager,
+            gateway_commands,
+            local_gateway_via,
+            gateway_workspace,
+            session_requests,
         );
         // the module-code plane: serves push/pull transfers and drains the
         // admin RPC's stage fan-outs. same overlay book as the agent plane.
@@ -271,7 +274,6 @@ pub(crate) async fn run_validator(
         signer.clone(),
         namespace.clone(),
         label.clone(),
-        bank_base,
         channel_bank,
     );
     // with the serve lane wired, realize code-registry swaps through the
@@ -284,6 +286,15 @@ pub(crate) async fn run_validator(
         crate::constants::MAX_MODULE_CODE_BYTES,
         crate::constants::BLOB_FETCH_ATTEMPTS,
     )));
+    // the same lane, for forge's packs: a validator that was DOWN during a push
+    // was not a fanout target either, so it holds a committed head whose
+    // objects never arrived — see `blob_fetch::sweep_forge_packs`.
+    tokio::spawn(crate::blob_fetch::sweep_forge_packs(
+        blob_client.clone(),
+        blobs.clone(),
+        forge_repo.clone(),
+        label.clone(),
+    ));
 
     let engine::EngineState {
         node,
@@ -312,6 +323,26 @@ pub(crate) async fn run_validator(
         node = %label,
         epoch = orchestrator.epoch()
     );
+    // the local rpc bridge: blocking listener threads push parsed requests
+    // into this bounded queue; the run loop answers between drains. (a
+    // promoted node's listener pump instead carries over from its parked
+    // life — see run_promoted.)
+    let (rpc_tx, rpc_ingress) = futures::channel::mpsc::channel::<crate::rpc::RpcJob>(64);
+    if let Some(listener) = rpc_listener {
+        let listen = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        tracing::info!(
+            target: "ducktape::node",
+            node = %label,
+            %listen,
+            "rpc listening on {listen}"
+        );
+        spawn_rpc_listener(listener, rpc_tx);
+    } else {
+        drop(rpc_tx); // rpc off: the ingress arm just stays pending forever.
+    }
     run::run(run::ValidatorLoopState {
         context: &context,
         node,
@@ -340,17 +371,345 @@ pub(crate) async fn run_validator(
         dev_demo,
         checkpoint_blocks,
         sync_lease,
-        announce_capabilities,
-        sandbox,
-        sandbox_capacity,
-        rpc_listener,
+        rpc_ingress,
         http_cmds,
         stream_hub,
         index,
         blobs,
-        agent_provisioner,
-        agent_dirs,
         metrics,
+        status,
+        status_public_key,
+        coordination,
+    })
+    .await;
+}
+
+/// Seat a freshly promoted replica as a validator INSIDE the running
+/// process — the continuation of [`crate::replica::run`]'s promotion baton.
+/// everything the parked role already owned (mesh, planes, books, ingress
+/// lanes) carries over; this wires only what a parked node never ran: the
+/// statesync serve lanes, the member-flavored reachability plane (join
+/// doorbell included), the code plane, and the epoch engine itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_promoted(
+    baton: PromotionBaton,
+    oracle: discovery::Oracle<ed25519::PublicKey>,
+    metrics: noded::NodeMetrics,
+    status: noded::StatusCell,
+    status_public_key: String,
+    signer: ed25519::PrivateKey,
+    label: String,
+    namespace: Vec<u8>,
+    peers: Vec<ed25519::PublicKey>,
+    validators: Vec<ed25519::PublicKey>,
+    coordinated: Vec<(ed25519::PublicKey, Ingress, ed25519::PublicKey)>,
+    wireguard_listen: Option<std::net::SocketAddr>,
+    wireguard_key_file: std::path::PathBuf,
+    primary_coordinator: Option<String>,
+    wireguard_advertised: Option<Ingress>,
+    invite_listen: Option<std::net::SocketAddr>,
+    coordination: crate::config::Coordination,
+    coord_cap: Option<nat_traversal::CoordCap>,
+    chain_id: String,
+    mesh_state_file: std::path::PathBuf,
+    advertised_reach: Ingress,
+    checkpoint_blocks: u64,
+    dev_demo: bool,
+    stream_hub: noded::StreamHub,
+    index: std::sync::Arc<indexer::IndexStore>,
+    code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
+    blobs: noded::blobs::BlobHandle,
+    overlay_slot: overlay_net::userspace::StackSlot,
+    bulk_pacer: data_plane::BulkPacer,
+    planes: data_plane::PlaneMonitor,
+    sync_monitor: statesync::monitor::ServeMonitor,
+) {
+    use commonware_codec::DecodeExt as _;
+    use commonware_utils::ordered::Set;
+
+    use crate::constants::{
+        BLOB_FETCH_ATTEMPTS, CUTOVER_DELAY, EPOCH_CHANNEL_BANK, MAX_MODULE_CODE_BYTES,
+    };
+    use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
+    use crate::util::fatal;
+
+    let PromotionBaton {
+        context,
+        host,
+        mut recovery,
+        epoch,
+        view_base,
+        height,
+        root_hash,
+        participants: participant_bytes,
+        residents: resident_bytes,
+        floor,
+        mut lane_bank,
+        sync_tx,
+        sync_rx,
+        relay_tx,
+        relay_ingress,
+        reach_lane,
+        media_peers,
+        gateway_book,
+        rpc_ingress,
+        http_ingress,
+        prev_ckpt,
+    } = baton;
+    metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Recovering);
+    tracing::info!(
+        event = "node_phase_transition",
+        role = "validator",
+        phase = "recovering",
+        node = %label,
+        reason = "promotion"
+    );
+
+    // the seat's membership, decoded strictly: a promotion manifest whose
+    // participant bytes fail to decode is corrupt — halt loudly, never seat
+    // a quorum this key can't verify against.
+    let member_keys: Vec<ed25519::PublicKey> = participant_bytes
+        .iter()
+        .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+        .collect();
+    if member_keys.len() != participant_bytes.len() {
+        fatal!(label, "promotion seat carries undecodable participant keys");
+    }
+    if !member_keys.contains(&signer.public_key()) {
+        fatal!(label, "promotion seat does not include this key");
+    }
+    let resident_keys: Vec<ed25519::PublicKey> = resident_bytes
+        .iter()
+        .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+        .collect();
+    let participants: Set<ed25519::PublicKey> =
+        Set::try_from(member_keys.clone()).expect("valset membership has no duplicates");
+    let transport: std::collections::BTreeSet<ed25519::PublicKey> = member_keys
+        .iter()
+        .chain(resident_keys.iter())
+        .cloned()
+        .collect();
+
+    // the seat epoch's transport mesh, tracked at index = epoch — the same
+    // union every member tracks at this index.
+    let mut mesh_oracle = oracle.clone();
+    mesh_oracle.track(epoch, wiring::mesh_at(&peers, &transport));
+    if !lane_bank.covers(epoch) {
+        fatal!(
+            label,
+            "seat epoch {epoch} is outside the pre-registered lane bank \
+             ({EPOCH_CHANNEL_BANK}) — restart; boot re-banks from the \
+             promotion checkpoint"
+        );
+    }
+    lane_bank.blackhole_below(epoch, &context);
+
+    // the validator-only serve lanes over the reclaimed sync channel: the
+    // statesync server (joiners sync from this node now) and the blob
+    // co-client its own code fetches ride.
+    let wiring::ServeLanes {
+        blob_peers,
+        blob_client,
+        sync_state_rx,
+        sync_lease,
+    } = wiring::wire_serve_lanes(
+        &context,
+        &signer,
+        &namespace,
+        transport.iter().cloned().collect(),
+        blobs.clone(),
+        sync_monitor,
+        sync_tx,
+        sync_rx,
+    );
+
+    // the books the parked role already runs its planes over follow the
+    // seat's transport union.
+    if let Some(book) = &gateway_book {
+        book.set_peers(transport.iter());
+    }
+    if let Some(book) = &media_peers {
+        book.set_peers(transport.iter());
+    }
+    // the module-code plane — the one overlay plane a parked node never
+    // hosts. voice/agent/term planes carried over live.
+    if let Some(book) = &media_peers {
+        let me: [u8; 32] = signer
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("ed25519 keys are 32 bytes");
+        crate::code_plane::spawn(
+            label.clone(),
+            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
+            std::sync::Arc::clone(book),
+            me,
+            bulk_pacer,
+            planes.clone(),
+            blobs.clone(),
+            code_stage_requests,
+        );
+    }
+
+    // the MEMBER-flavored reachability plane over the reclaimed lane: the
+    // standby plane is already shut down (orderly — its UAPI socket is
+    // unlinked), so this restore rides the persisted mesh and the seat
+    // starts connected. the join doorbell now rings THIS node's gate.
+    let (gate_fwd_tx, gate_fwd_rx) = tokio::sync::mpsc::channel::<crate::lobby::GateForward>(256);
+    let gate_outcomes = GateOutcomes::default();
+    let gate_fwd_keepalive = gate_fwd_tx.clone();
+    let reach_cmd = match (wireguard_listen, reach_lane) {
+        (Some(wg_addr), Some((reach_tx, reach_rx))) => {
+            let mut coordinators: Vec<Ingress> =
+                coordinated.iter().map(|(_, c, _)| c.clone()).collect();
+            match crate::config::coordinator_ingress(primary_coordinator.as_deref()) {
+                Ok(Some(ambient)) => {
+                    if !coordinators.contains(&ambient) {
+                        coordinators.push(ambient);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    target: "ducktape::reachability",
+                    node = %label,
+                    error = %e,
+                    reason = "ambient_coordinator_unusable",
+                    "registering with descriptor-hinted coordinators only"
+                ),
+            }
+            Some(wire_reachability_plane(
+                &context,
+                &label,
+                &chain_id,
+                &signer,
+                &wireguard_key_file,
+                &mesh_state_file,
+                wg_addr,
+                overlay_slot,
+                advertised_reach,
+                wireguard_advertised,
+                coordinators,
+                invite_listen,
+                coord_cap.clone(),
+                Some(GateHook {
+                    forward: gate_fwd_tx.clone(),
+                    outcomes: gate_outcomes.clone(),
+                }),
+                reach_tx,
+                reach_rx,
+                None,
+            ))
+        }
+        // no wireguard: no plane on either side. a reclaim timeout
+        // (wedged standby plane) already warned at the seat.
+        _ => None,
+    };
+
+    // re-derive whatever the parked fold could not have indexed — the cold
+    // seat's synced boundary above all; exact indexes make this a no-op.
+    crate::explorer::heal_index(&index, height, &label);
+    // code-registry swaps realize through the serve-lane fetching source
+    // for the rest of this validator's life, exactly the fresh boot.
+    recovery.set_code_source(std::sync::Arc::new(
+        crate::blob_fetch::FetchingCodeSource::new(
+            blobs.clone(),
+            blob_client.clone(),
+            MAX_MODULE_CODE_BYTES,
+            BLOB_FETCH_ATTEMPTS,
+        ),
+    ));
+
+    // THE SEAT: the engine over the seat epoch's claimed lanes, wrapped
+    // around the carried host + journal at the promotion boundary.
+    let mut epoch_spawner = engine::EpochSpawner::new(
+        &context,
+        oracle,
+        signer.clone(),
+        namespace.clone(),
+        label.clone(),
+        lane_bank,
+    );
+    let floor_bytes = floor
+        .as_ref()
+        .filter(|f| f.epoch == epoch)
+        .map(|f| f.cert.clone());
+    let last_cert_height = floor.as_ref().map(|f| f.height);
+    let latest_floor = floor;
+    let orderer = epoch_spawner
+        .spawn(
+            epoch,
+            participants.clone(),
+            consensus::ContentStore::new(),
+            floor_bytes,
+        )
+        .await;
+    let code_source = recovery.code_source();
+    let mut node = node::OrderedNode::resume(
+        host,
+        orderer,
+        recovery,
+        Some(host::FinalizedBlock { height, root_hash }),
+        view_base,
+    );
+    node.set_code_source(code_source);
+    // the observation barrier (see engine::resume): every drain batch ends
+    // AT a valset-moving block, so cutovers arm at the same view on every
+    // validator.
+    node.watch_module("valset");
+    let orchestrator = consensus::ValsetOrchestrator::resume(
+        CUTOVER_DELAY,
+        member_keys.iter().cloned(),
+        resident_keys.clone(),
+        epoch,
+        view_base,
+        None,
+    );
+    metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Validating);
+    tracing::info!(
+        event = "node_phase_transition",
+        role = "validator",
+        phase = "validating",
+        node = %label,
+        epoch,
+        reason = "promotion"
+    );
+    run::run(run::ValidatorLoopState {
+        context: &context,
+        node,
+        orchestrator,
+        epoch_spawner,
+        last_cert_height,
+        latest_floor,
+        mesh_oracle,
+        gateway_book,
+        media_peers,
+        blob_peers,
+        blob_client,
+        reach_cmd,
+        relay_tx,
+        sync_state_rx,
+        gate_fwd_rx,
+        gate_fwd_keepalive,
+        gate_outcomes,
+        relay_ingress,
+        // the promotion checkpoint's seq — the fabricated-checkpoint
+        // rejoin edge, accepted until submit sequences ride app state.
+        next_seq: 1,
+        prev_ckpt,
+        signer,
+        label,
+        peers,
+        validators,
+        dev_demo,
+        checkpoint_blocks,
+        sync_lease,
+        rpc_ingress,
+        http_cmds: http_ingress,
+        stream_hub,
+        index,
+        blobs,
+        metrics,
+        status,
         status_public_key,
         coordination,
     })
@@ -358,24 +717,234 @@ pub(crate) async fn run_validator(
 }
 
 type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tokio::Context>;
-type MeshSender = commonware_p2p::authenticated::discovery::Sender<
+pub(crate) type MeshSender = commonware_p2p::authenticated::discovery::Sender<
     commonware_cryptography::ed25519::PublicKey,
     OverlayCtx,
 >;
-type MeshReceiver =
+pub(crate) type MeshReceiver =
     commonware_p2p::authenticated::discovery::Receiver<commonware_cryptography::ed25519::PublicKey>;
-type MeshChannel = (MeshSender, MeshReceiver);
-type EpochChannels = (
+pub(crate) type MeshChannel = (MeshSender, MeshReceiver);
+pub(crate) type EpochChannels = (
     MeshChannel,
     MeshChannel,
     MeshChannel,
     MeshChannel,
     MeshChannel,
 );
-type ChannelBank = Vec<Option<EpochChannels>>;
+
+/// one engine lane whose receiver is currently owned by a parked drainer
+/// task: `stop` revokes the drainer, which hands the receiver back over
+/// `handback`. the sender was never given away — it rides here.
+pub(crate) struct ReclaimableLane {
+    pub(crate) tx: MeshSender,
+    pub(crate) stop: futures::channel::oneshot::Sender<()>,
+    pub(crate) handback: futures::channel::oneshot::Receiver<MeshReceiver>,
+}
+
+impl ReclaimableLane {
+    /// own `lane` behind a revocable drainer task: every received frame is
+    /// handed to `on_frame` (an unread lane would jam its peer connection),
+    /// until a claim revokes the drainer and takes the lane back for an
+    /// engine. the task exits silently on mesh shutdown — a claim can never
+    /// follow that, the process is already unwinding.
+    pub(crate) fn drain(
+        context: &commonware_runtime::tokio::Context,
+        kind: &str,
+        channel: u64,
+        lane: MeshChannel,
+        mut on_frame: impl FnMut(Vec<u8>) + Send + 'static,
+    ) -> Self {
+        use commonware_p2p::Receiver as _;
+        use commonware_runtime::{Spawner as _, Supervisor as _};
+        use futures::FutureExt as _;
+        let (tx, mut rx) = lane;
+        let (stop_tx, mut stop_rx) = futures::channel::oneshot::channel::<()>();
+        let (handback_tx, handback_rx) = futures::channel::oneshot::channel();
+        let label: &'static str = Box::leak(format!("{kind}_{channel}").into_boxed_str());
+        context.child(label).spawn(move |_ctx| async move {
+            loop {
+                futures::select_biased! {
+                    _ = stop_rx => {
+                        let _ = handback_tx.send(rx);
+                        return;
+                    }
+                    frame = rx.recv().fuse() => {
+                        let Ok((_peer, msg)) = frame else { return };
+                        on_frame(msg.into());
+                    }
+                }
+            }
+        });
+        Self {
+            tx,
+            stop: stop_tx,
+            handback: handback_rx,
+        }
+    }
+
+    /// revoke the drainer and take the lane. the drainer's in-flight
+    /// `recv()` future is dropped when the stop wins its select — an eaten
+    /// frame there is covered by the lanes' own loss tolerance (a shed cert
+    /// re-anchors off the next one's parent linkage, a shed payload
+    /// backfills over the Frames lane, votes rebroadcast per view).
+    async fn claim(self) -> MeshChannel {
+        let ReclaimableLane { tx, stop, handback } = self;
+        let _ = stop.send(());
+        let rx = handback
+            .await
+            .expect("a revoked lane drainer hands its receiver back");
+        (tx, rx)
+    }
+}
+
+/// one epoch's five reclaimable engine lanes, in `engine_channels` order.
+pub(crate) struct DrainingSlot {
+    pub(crate) vote: ReclaimableLane,
+    pub(crate) certificate: ReclaimableLane,
+    pub(crate) resolver: ReclaimableLane,
+    pub(crate) payload: ReclaimableLane,
+    pub(crate) fetch: ReclaimableLane,
+}
+
+impl DrainingSlot {
+    async fn claim(self) -> EpochChannels {
+        (
+            self.vote.claim().await,
+            self.certificate.claim().await,
+            self.resolver.claim().await,
+            self.payload.claim().await,
+            self.fetch.claim().await,
+        )
+    }
+}
+
+/// everything the parked replica hands the validator role at its promotion
+/// seat — the in-process replacement for the retired exec reboot. produced
+/// by `replica::park` (at the activation cutover its own fold observed, or
+/// after the cold direct-admission boundary sync), consumed by
+/// [`run_promoted`]. the cutover journal record and the promotion
+/// checkpoint are already on disk when this exists, so a crash between
+/// here and the seated engine restarts straight into the validator path.
+pub(crate) struct PromotionBaton {
+    pub(crate) context: commonware_runtime::tokio::Context,
+    /// the application state the seat resumes from — the replica's own
+    /// folded host (warm) or the freshly synced boundary host (cold).
+    pub(crate) host: host::Host,
+    /// the node's recovery journal, promotion checkpoint included.
+    pub(crate) recovery: recovery::Recovery<commonware_runtime::tokio::Context>,
+    pub(crate) epoch: u64,
+    pub(crate) view_base: u64,
+    pub(crate) height: u64,
+    pub(crate) root_hash: sdk::StateRoot,
+    pub(crate) participants: Vec<Vec<u8>>,
+    pub(crate) residents: Vec<Vec<u8>>,
+    /// the seat boundary's verified finalization floor when it sits past
+    /// the epoch base (cold admission); a fresh-epoch seat starts from the
+    /// epoch's genesis floor.
+    pub(crate) floor: Option<recovery::FloorCert>,
+    pub(crate) lane_bank: LaneBank,
+    pub(crate) sync_tx: MeshSender,
+    pub(crate) sync_rx: MeshReceiver,
+    pub(crate) relay_tx: MeshSender,
+    pub(crate) relay_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
+    /// the reachability lane, reclaimed from the shut-down standby plane
+    /// (`None`: no wireguard — no plane on either side — or the old plane
+    /// wedged past its shutdown grace and kept its lane).
+    pub(crate) reach_lane: Option<MeshChannel>,
+    pub(crate) media_peers: Option<std::sync::Arc<crate::voice_plane::MediaPeers>>,
+    pub(crate) gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
+    pub(crate) rpc_ingress: futures::channel::mpsc::Receiver<crate::rpc::RpcJob>,
+    pub(crate) http_ingress: futures::channel::mpsc::Receiver<noded::NodeCommand>,
+    /// the promotion checkpoint's (height, oplog position) — the run
+    /// loop's prune anchor.
+    pub(crate) prev_ckpt: (Option<u64>, u64),
+}
+
+/// one epoch's slot in the [`LaneBank`].
+pub(crate) enum LaneSlot {
+    /// registered before `network.start()` and never touched since — a
+    /// fresh validator's future epochs. claim is immediate.
+    Banked(EpochChannels),
+    /// owned by parked drainer tasks (the replica's bank): claim revokes
+    /// each drainer and collects the receivers.
+    Draining(DrainingSlot),
+    /// this epoch's engine (or a below-resume blackhole) took the lanes.
+    Spent,
+}
+
+/// the pre-registered per-epoch engine-lane bank, shared by both roles: a
+/// fresh validator banks untouched channel pairs, a parked replica banks
+/// revocable drainers, and every engine spawn claims through the same seam.
+/// `EPOCH_CHANNEL_BANK` bounds membership changes per process RUN — the
+/// bank re-arms from the checkpoint epoch on the next boot.
+pub(crate) struct LaneBank {
+    base: u64,
+    slots: Vec<LaneSlot>,
+}
+
+impl LaneBank {
+    pub(crate) fn new(base: u64, slots: Vec<LaneSlot>) -> Self {
+        Self { base, slots }
+    }
+
+    pub(crate) fn covers(&self, epoch: u64) -> bool {
+        epoch >= self.base && epoch < self.base + self.slots.len() as u64
+    }
+
+    /// take epoch's lanes for its engine. a claim outside the bank or on a
+    /// spent slot is a boot-configuration bug the caller turns into its own
+    /// fatal — `None` here, no policy.
+    pub(crate) async fn claim(&mut self, epoch: u64) -> Option<EpochChannels> {
+        let index = epoch.checked_sub(self.base)? as usize;
+        let slot = std::mem::replace(self.slots.get_mut(index)?, LaneSlot::Spent);
+        match slot {
+            LaneSlot::Banked(channels) => Some(channels),
+            LaneSlot::Draining(draining) => Some(draining.claim().await),
+            LaneSlot::Spent => None,
+        }
+    }
+
+    /// retire every epoch below `resume_epoch`: banked slots get plain
+    /// blackhole drainers (a lagging peer still gossips there, and an
+    /// unread lane would jam its connection); draining slots already have
+    /// drainers — they just keep running.
+    pub(crate) fn blackhole_below(
+        &mut self,
+        resume_epoch: u64,
+        context: &commonware_runtime::tokio::Context,
+    ) {
+        use commonware_p2p::Receiver as _;
+        use commonware_runtime::{Spawner as _, Supervisor as _};
+        for epoch in self.base..resume_epoch.min(self.base + self.slots.len() as u64) {
+            let index = (epoch - self.base) as usize;
+            let keep_draining = matches!(self.slots[index], LaneSlot::Draining(_));
+            if keep_draining {
+                continue;
+            }
+            let slot = std::mem::replace(&mut self.slots[index], LaneSlot::Spent);
+            let LaneSlot::Banked(channels) = slot else {
+                continue;
+            };
+            let (vote, cert, res, payload, fetch) = channels;
+            for (suffix, (_tx, mut rx)) in [
+                ("vote", vote),
+                ("cert", cert),
+                ("resolver", res),
+                ("payload", payload),
+                ("fetch", fetch),
+            ] {
+                let label: &'static str =
+                    Box::leak(format!("blackhole_e{epoch}_{suffix}").into_boxed_str());
+                context
+                    .child(label)
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
+        }
+    }
+}
 
 /// the mesh-carrier REAL arm: one epoch's pre-registered discovery channels
-/// (a [`ChannelBank`] slot) + the [`discovery::Oracle`] the resolver keys on.
+/// (a [`LaneBank`] slot) + the [`discovery::Oracle`] the resolver keys on.
 /// This is the `authenticated::discovery` network's per-spawn transport bundle —
 /// the discovery `Network` (`MeshHead`) registers the channels into the bank
 /// before start, and this bundles one slot with the oracle at the point

@@ -171,7 +171,6 @@ impl RunsModule {
             .map_err(|e| format!("jobs lookup failed: {e}"))?;
         let job = match jobs_decode_reply(&reply) {
             Ok(JobsReply::Job(job)) => job,
-            Ok(_) => return Err("unexpected jobs reply for a job lookup".into()),
             Err(e) => return Err(format!("undecodable jobs reply: {e}")),
         };
         Ok(job.is_some_and(|job| {

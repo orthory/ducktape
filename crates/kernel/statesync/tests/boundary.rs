@@ -8,16 +8,109 @@ use statesync::{
     decode_response, encode_request, encode_response,
 };
 
+const DEGRADED_ID: &str = "degraded";
+const HEALTHY_ID: &str = "healthy";
+
+struct HealthyModule;
+
+#[async_trait::async_trait(?Send)]
+impl sdk::Module for HealthyModule {
+    fn id(&self) -> sdk::ModuleId {
+        HEALTHY_ID.into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot([1u8; 32])
+    }
+
+    fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
+        Ok(sdk::StateSyncHandle::SnapshotBytes(vec![42]))
+    }
+
+    async fn execute(
+        &mut self,
+        _ctx: &mut dyn sdk::Ctx,
+        _msg: &sdk::Msg,
+    ) -> Result<(), sdk::Error> {
+        Ok(())
+    }
+}
+
+struct DegradedModule;
+
+#[async_trait::async_trait(?Send)]
+impl sdk::Module for DegradedModule {
+    fn id(&self) -> sdk::ModuleId {
+        DEGRADED_ID.into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot([2u8; 32])
+    }
+
+    fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
+        Err(sdk::Error::Module("no pack for committed head".into()))
+    }
+
+    async fn execute(
+        &mut self,
+        _ctx: &mut dyn sdk::Ctx,
+        _msg: &sdk::Msg,
+    ) -> Result<(), sdk::Error> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_module_that_cannot_serve_is_refused_per_module_not_by_the_whole_boundary() {
+    // the joiner's answer to "one module cannot serve": it still gets the
+    // boundary and every other module's payload, and that ONE module comes
+    // back Unsupported. before, the module's error aborted the capture and
+    // this node could not admit anyone at all.
+    let host =
+        Host::genesis(vec![Box::new(HealthyModule), Box::new(DegradedModule)]).expect("genesis");
+    let coords = BoundaryCoords {
+        epoch: 1,
+        view_base: 0,
+        participants: vec![],
+        residents: vec![],
+        floor_cert: None,
+    };
+    let finalized = host::FinalizedBlock {
+        height: 12,
+        root_hash: host.root_hash(),
+    };
+
+    let (id, data) = block_on(statesync::capture_boundary(&host, finalized, &coords))
+        .expect("a degraded module must not take the boundary down");
+
+    let mut srv = SyncServer::new();
+    srv.install_capture(id, data);
+    let SyncResponse::Manifest(manifest) = srv.manifest_for(id).expect("manifest") else {
+        panic!("manifest_for must answer with a manifest");
+    };
+
+    let healthy = manifest.entry(HEALTHY_ID).expect("healthy entry");
+    assert_eq!(healthy.kind, PayloadKind::Snapshot);
+    let degraded = manifest.entry(DEGRADED_ID).expect("degraded entry");
+    assert_eq!(degraded.kind, PayloadKind::Unsupported);
+    assert_eq!(
+        degraded.root,
+        StateRoot([2u8; 32]),
+        "the committed root is still known — only the transfer surface is gone",
+    );
+}
+
 #[test]
 fn captures_keyed_by_boundary_id_not_height() {
     let mut srv = SyncServer::new();
     let b1 = BoundaryId {
         height: 32,
-        app_hash: StateRoot([1u8; 32]),
+        root_hash: StateRoot([1u8; 32]),
     };
     let b2 = BoundaryId {
         height: 32,
-        app_hash: StateRoot([2u8; 32]),
+        root_hash: StateRoot([2u8; 32]),
     };
 
     srv.insert_capture_for_test(b1);
@@ -31,7 +124,7 @@ fn leased_capture_survives_eviction() {
     let mut srv = SyncServer::new();
     let held = BoundaryId {
         height: 10,
-        app_hash: StateRoot([9u8; 32]),
+        root_hash: StateRoot([9u8; 32]),
     };
     srv.insert_capture_for_test(held);
     srv.lease(held);
@@ -39,7 +132,7 @@ fn leased_capture_survives_eviction() {
     for h in 100..100 + (MAX_CAPTURES as u64) + 3 {
         let b = BoundaryId {
             height: h,
-            app_hash: StateRoot([(h % 251) as u8; 32]),
+            root_hash: StateRoot([(h % 251) as u8; 32]),
         };
         srv.insert_capture_for_test(b);
     }
@@ -59,7 +152,7 @@ fn fresh_install_serves_its_manifest_under_full_lease_pressure() {
     for h in 1..=(MAX_CAPTURES as u64) {
         let b = BoundaryId {
             height: h,
-            app_hash: StateRoot([(h % 251) as u8; 32]),
+            root_hash: StateRoot([(h % 251) as u8; 32]),
         };
         srv.install_capture_for_test(b);
         srv.lease(b);
@@ -67,7 +160,7 @@ fn fresh_install_serves_its_manifest_under_full_lease_pressure() {
 
     let tip = BoundaryId {
         height: 1000,
-        app_hash: StateRoot([42u8; 32]),
+        root_hash: StateRoot([42u8; 32]),
     };
     srv.install_capture_for_test(tip);
     let manifest = srv.manifest_for(tip);
@@ -90,7 +183,7 @@ fn leased_boundaries_are_bounded_and_oldest_is_released() {
     for h in 1..=(MAX_CAPTURES as u64) + 2 {
         let boundary = BoundaryId {
             height: h,
-            app_hash: StateRoot([(h % 251) as u8; 32]),
+            root_hash: StateRoot([(h % 251) as u8; 32]),
         };
         srv.insert_capture_for_test(boundary);
         srv.lease(boundary);
@@ -126,7 +219,7 @@ fn tip_coords_roundtrip_over_the_wire() {
 
     let coords = TipCoords {
         height: 1880,
-        app_hash: StateRoot([7u8; 32]),
+        root_hash: StateRoot([7u8; 32]),
         epoch: 3,
         view_base: 1800,
         participants: vec![vec![1u8; 32], vec![2u8; 32]],
@@ -170,13 +263,12 @@ fn tip_coords_request_never_touches_the_capture_cache() {
 fn manifest_roundtrip_carries_pinned_resolver_target() {
     let m = Manifest {
         height: 77,
-        app_hash: StateRoot([4u8; 32]),
+        root_hash: StateRoot([4u8; 32]),
         epoch: 2,
         view_base: 70,
         participants: vec![vec![3u8; 32]],
         residents: vec![],
         floor_cert: Some(vec![0xCC; 96]),
-        state_schema: [0xAB; 32],
         entries: vec![ManifestEntry {
             module_id: "kv".into(),
             root: StateRoot([7u8; 32]),
@@ -205,7 +297,7 @@ fn server_rejects_chunk_for_unleased_boundary() {
     let mut srv = SyncServer::new();
     let stale = BoundaryId {
         height: 5,
-        app_hash: StateRoot([3u8; 32]),
+        root_hash: StateRoot([3u8; 32]),
     };
     let host = Host::genesis(vec![]).unwrap();
     let coords = BoundaryCoords::default();
@@ -232,17 +324,14 @@ fn shipped_index_serves_only_attached_leased_boundaries() {
     let mut srv = SyncServer::new();
     let boundary = BoundaryId {
         height: 12,
-        app_hash: StateRoot([6u8; 32]),
+        root_hash: StateRoot([6u8; 32]),
     };
     let host = Host::genesis(vec![]).unwrap();
     let coords = BoundaryCoords::default();
     let ask = |srv: &mut SyncServer, req| block_on(srv.handle(&host, None, &coords, req));
 
     // unleased boundary: refused like every other per-boundary request.
-    let resp = ask(
-        &mut srv,
-        SyncRequest::IndexModules { boundary },
-    );
+    let resp = ask(&mut srv, SyncRequest::IndexModules { boundary });
     assert!(matches!(resp, SyncResponse::Error(_)));
 
     srv.insert_capture_for_test(boundary);
@@ -315,7 +404,7 @@ fn shipped_index_serves_only_attached_leased_boundaries() {
     // attaching to an unleased boundary is refused.
     let stale = BoundaryId {
         height: 99,
-        app_hash: StateRoot([7u8; 32]),
+        root_hash: StateRoot([7u8; 32]),
     };
     assert!(srv.attach_index(stale, Default::default()).is_err());
 }

@@ -1,4 +1,4 @@
-//! deterministic in-memory inbox module: per-member notification queues held as
+//! qmdb-backed inbox module: per-member notification queues held as
 //! consensus state.
 //!
 //! other modules deliver notifications as FOLLOW-UP ops, so a notification
@@ -7,14 +7,40 @@
 //! which is also the air-gap-native notification story. an external submitter
 //! may self-deliver a note; a module follow-up is the primary writer.
 //!
-//! like the tasks module this slice is state-based rather than qmdb-backed: the
-//! API needs ordered per-member list/query semantics over a small canonical
-//! state. writes are STAGED during `execute` (a per-member overlay), published
-//! only at `commit_block`, and discarded at `abort_block`; `root()` is computed
-//! from committed state alone, so a staged or aborted block leaves the root
-//! byte-identical. `snapshot`/`install` use the exact canonical byte stream that
-//! `root()` hashes, so a joiner verifies a peer image against the committed root
-//! before adopting it.
+//! ## Who owns a queue — DELIVERING and ACKING are different authorities
+//!
+//! a `member` is a queue name in the shared ACTOR-STRING domain
+//! ([`sdk::Origin::actor_string`]): the same domain this module already derives
+//! [`Notification::source`] in, and the one tasks' job board and files' owner
+//! use. that is the identity decision this module had deferred, and reusing the
+//! sdk convention rather than inventing a second spelling is the whole of it —
+//! a queue named `origin.actor_string()` is OWNED by that origin.
+//!
+//! - `Deliver` takes ANY origin and ANY member, unchanged. writing into someone
+//!   else's queue IS the feature: a notification is delivered BY one principal
+//!   TO another, and gating that would break every module follow-up.
+//! - `MarkRead`/`Clear` are refused unless `member` is the submitter's own
+//!   actor string ([`check_queue_owner`]). a submitter can therefore only ever
+//!   name their own queue, and "permanently delete another member's whole
+//!   notification history, unattributed" stops being expressible.
+//! - only an AUTHENTICATED EXTERNAL submitter owns a queue. `Origin::Module`
+//!   and `Origin::System` are refused outright (the `vaults` posture), as is
+//!   the pre-consensus default `Origin::External(vec![])`: nothing in the tree
+//!   emits an ack as a follow-up, so admitting a module origin would only have
+//!   handed the delivering module a lever over the queue it delivered to —
+//!   different principals, deliberately kept different.
+//!
+//! ## State model
+//!
+//! pure logic over a host-injected [`sdk::MerkleStore`]: one META record per
+//! member (`meta\0{member}` → next_seq + the sorted live-seq list, borsh),
+//! one record per live notification (`item\0{len|member}{seq}`), and the
+//! `member_count` scalar the distinct-member cap reads — every record is
+//! bounded by the field caps below, and NOTHING enumerates members (the
+//! whole read surface lives on the index tier), so no roster exists. writes
+//! are staged during a block and flushed in one batch at `commit_block`; the
+//! module root IS the store's merkle root, and sync belongs to the store
+//! (`QmdbStore::sync_from`).
 //!
 //! CAP POLICY (enforced at execute, with rejection, so oversized bytes never
 //! enter the root preimage):
@@ -27,93 +53,184 @@
 //! - at most [`MAX_MEMBERS`] distinct members: a `Deliver` that would introduce
 //!   a NEW member beyond the cap is REJECTED.
 //!
-//! NO-OP TOLERANCE: `MarkRead`/`Clear` against an unknown member or seq are
-//! deterministic no-ops, never errors — a notification ack must never abort the
-//! block cascade that a delivering module started.
+//! NO-OP TOLERANCE: `MarkRead`/`Clear` against the submitter's OWN unknown
+//! member or seq are deterministic no-ops, never errors — acking a queue that
+//! holds nothing yet is a race a client cannot avoid, not an error. that
+//! tolerance is scoped to the seq/member LOOKUP and stops at the owner gate: a
+//! foreign member is a hard rejection, and no cascade is at risk from it
+//! because nothing in the tree emits an ack as a follow-up.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
 
-use std::collections::BTreeMap;
+// the derived-tier read model: the PURE decision core (fold + view over
+// index_guest::StateRead), compiled everywhere and unit-tested natively.
+// the engine shell that runs it inside the module's index database is
+// `index_guest` below.
+pub mod index;
 
-use sdk::codec::{self, Cursor};
-use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, StateRoot};
-use sha2::{Digest, Sha256};
+// the CLIENT view model: the rendered bell item + the member-scoped delta
+// fold a feed-following UI splices with. pure, ui.wasm-portable.
+pub mod client;
 
-/// one member's queue: a monotonic seq counter plus its live items. `next_seq`
-/// is the NEXT seq to assign; it starts at 1 and NEVER rewinds (a `Clear`
-/// removes items but leaves `next_seq` alone, so replays and gap-free ordering
-/// survive deletion).
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct MemberQueue {
-    next_seq: u64,
-    items: BTreeMap<u64, Notification>,
+// the wasm index-mapper shell: wires the pure core into the fluent31 engine.
+// compiled only by `guest-builder --index`'s synthesized wasm32 workspace
+// (feature `index-guest`), never by the native build.
+#[cfg(feature = "index-guest")]
+mod index_guest;
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use sdk::{
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
+    StateRoot, StateSyncHandle,
+};
+
+/// the ONE ack-authority decision: `MarkRead`/`Clear` may only touch the
+/// submitter's OWN queue.
+///
+/// exhaustive on purpose. a queue's name IS its owner's
+/// [`Origin::actor_string`], so the owner is derived from the dispatch origin
+/// and compared — never taken from the payload. `Origin::Module` and
+/// `Origin::System` are refused outright rather than allowed to ack the queue
+/// named after them: no module or system op emits an ack anywhere in the tree,
+/// and admitting one would give a DELIVERING module a lever over the queue it
+/// delivered into. `Origin::External(vec![])` is the host's pre-consensus
+/// default, not a submitter, so it owns nothing either.
+fn check_queue_owner(origin: &Origin, member: &str) -> Result<(), Error> {
+    let owner = match origin {
+        Origin::External(key) => {
+            let is_authenticated_submitter = !key.is_empty();
+            if !is_authenticated_submitter {
+                return Err(Error::Module(
+                    "external origin must carry a non-empty submitter id".into(),
+                ));
+            }
+            origin.actor_string()
+        }
+        Origin::Module(id) => {
+            return Err(Error::Module(format!(
+                "a module origin owns no inbox queue: {id}"
+            )));
+        }
+        Origin::System => {
+            return Err(Error::Module("a system origin owns no inbox queue".into()));
+        }
+    };
+    let is_own_queue = owner == member;
+    if !is_own_queue {
+        return Err(Error::Module(format!(
+            "only the queue's own member may ack it: {owner} is not {member}"
+        )));
+    }
+    Ok(())
 }
 
-impl MemberQueue {
+/// per-member META record key: prefix + 0 + member identity. safe because
+/// every key literal below is fixed and none is another followed by a 0 byte.
+fn meta_key(member: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + 1 + member.len());
+    key.extend_from_slice(b"meta");
+    key.push(0);
+    key.extend_from_slice(member.as_bytes());
+    key
+}
+
+/// per-notification record key: prefix + 0 + length-framed member + big-endian
+/// seq. the length frame keeps the key injective for arbitrary member bytes.
+fn item_key(member: &str, seq: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + 1 + 8 + member.len() + 8);
+    key.extend_from_slice(b"item");
+    key.push(0);
+    key.extend_from_slice(&(member.len() as u64).to_le_bytes());
+    key.extend_from_slice(member.as_bytes());
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// the distinct-member counter's whole key — the ONE aggregate the member cap
+/// reads (a full member roster would be a 16 MiB poison record at the cap;
+/// nothing enumerates members, so a scalar count is the honest aggregate).
+const MEMBER_COUNT_KEY: &[u8] = b"member_count";
+
+/// one member's queue metadata: the monotonic seq counter plus the sorted
+/// live-seq list. `next_seq` is the NEXT seq to assign; it starts at 1 and
+/// NEVER rewinds (a `Clear` removes items but leaves `next_seq` alone, so
+/// replays and gap-free ordering survive deletion). bounded by construction:
+/// at most [`MAX_ITEMS_PER_MEMBER`] seqs.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+struct MemberMeta {
+    next_seq: u64,
+    seqs: Vec<u64>,
+}
+
+impl MemberMeta {
     fn new() -> Self {
         Self {
             next_seq: 1,
-            items: BTreeMap::new(),
+            seqs: Vec::new(),
         }
     }
 }
 
 pub struct Inbox {
     id: ModuleId,
-    /// committed per-member queues, keyed by member identity.
-    members: BTreeMap<String, MemberQueue>,
-    /// staged overlay: a member present here shadows its committed queue for the
-    /// duration of the block. published at `commit_block`, dropped at
-    /// `abort_block`.
-    pending: BTreeMap<String, MemberQueue>,
-    /// number of staged members that are NOT yet committed — kept incrementally
-    /// so the distinct-member cap check stays O(1) instead of re-unioning the
-    /// two maps on every `Deliver`.
-    new_pending: usize,
+    /// the host-injected authenticated store plus this block's staging overlay
+    /// (read-your-writes, folded into `root()` at `commit_block`). store key
+    /// is `sha256(logical_key)`, owned by [`StagedStore`].
+    staged: StagedStore,
 }
 
 impl Inbox {
-    pub fn new(id: impl Into<ModuleId>) -> Self {
+    /// wrap the host-constructed store under module identity `id`.
+    pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {
         Self {
             id: id.into(),
-            members: BTreeMap::new(),
-            pending: BTreeMap::new(),
-            new_pending: 0,
+            staged: StagedStore::new(store),
         }
     }
 
-    /// the effective (staged-over-committed) queue for a member, for reads.
-    fn effective(&self, member: &str) -> Option<&MemberQueue> {
-        self.pending
-            .get(member)
-            .or_else(|| self.members.get(member))
-    }
+    // ---- staged-over-committed reads ----------------------------------------
 
-    /// distinct members currently known: committed members plus staged members
-    /// not yet committed. O(1) via [`Inbox::new_pending`].
-    fn distinct_members(&self) -> usize {
-        self.members.len() + self.new_pending
-    }
-
-    /// stage a member queue for mutation, cloning the committed queue on first
-    /// touch (or creating a fresh one for a brand-new member) and maintaining
-    /// [`Inbox::new_pending`].
-    fn stage_queue(&mut self, member: &str) -> &mut MemberQueue {
-        if !self.pending.contains_key(member) {
-            let (base, is_new) = match self.members.get(member) {
-                Some(q) => (q.clone(), false),
-                None => (MemberQueue::new(), true),
-            };
-            if is_new {
-                self.new_pending += 1;
-            }
-            self.pending.insert(member.to_owned(), base);
+    async fn load<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
+    where
+        T: BorshDeserialize,
+    {
+        match self.staged.get(key).await? {
+            Some(bytes) => Ok(Some(
+                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+            )),
+            None => Ok(None),
         }
-        self.pending
-            .get_mut(member)
-            .expect("staged queue just inserted")
+    }
+
+    /// stage a value — every inbox record is bounded by construction (the
+    /// field caps below), so no byte gate is needed.
+    fn store<T>(&mut self, key: Vec<u8>, value: &T)
+    where
+        T: BorshSerialize,
+    {
+        self.staged.stage(
+            key,
+            borsh::to_vec(value).expect("inbox value is serializable"),
+        );
+    }
+
+    async fn meta(&self, member: &str) -> Result<Option<MemberMeta>, Error> {
+        self.load(&meta_key(member)).await
+    }
+
+    /// a live item the meta's seq list points at. a listed seq without its
+    /// record is a store bug — loud, never skipped.
+    async fn item(&self, member: &str, seq: u64) -> Result<Notification, Error> {
+        self.load(&item_key(member, seq))
+            .await?
+            .ok_or_else(|| Error::Module("missing notification record".into()))
+    }
+
+    /// distinct members ever delivered to — the cap denominator.
+    async fn member_count(&self) -> Result<u64, Error> {
+        Ok(self.load(MEMBER_COUNT_KEY).await?.unwrap_or(0))
     }
 
     fn validate_deliver(member: &str, kind: &str, body: &str) -> Result<(), Error> {
@@ -138,42 +255,49 @@ impl Inbox {
         Ok(())
     }
 
-    fn stage_deliver(
+    async fn stage_deliver(
         &mut self,
         member: String,
         kind: String,
         body: String,
         source: String,
         created_at: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Self::validate_deliver(&member, &kind, &body)?;
 
         // reject a NEW member beyond the cap BEFORE staging, so an over-cap
         // delivery never touches state.
-        let is_new = !self.members.contains_key(&member) && !self.pending.contains_key(&member);
-        if is_new && self.distinct_members() >= MAX_MEMBERS {
-            return Err(Error::Module(format!(
-                "inbox is at member capacity ({MAX_MEMBERS})"
-            )));
+        let current = self.meta(&member).await?;
+        if current.is_none() {
+            let count = self.member_count().await?;
+            if count >= MAX_MEMBERS as u64 {
+                return Err(Error::Module(format!(
+                    "inbox is at member capacity ({MAX_MEMBERS})"
+                )));
+            }
+            self.store(MEMBER_COUNT_KEY.to_vec(), &(count + 1));
         }
+        let mut meta = current.unwrap_or_else(MemberMeta::new);
 
         // seq-space exhaustion is a deterministic rejection, checked BEFORE any
         // mutation — never a panic or a wrapping re-assignment of an old seq.
-        let seq = self
-            .effective(&member)
-            .map(|queue| queue.next_seq)
-            .unwrap_or(1);
-        let bumped = seq
+        let seq = meta.next_seq;
+        meta.next_seq = seq
             .checked_add(1)
             .ok_or_else(|| Error::Module(format!("member seq space exhausted: {member}")))?;
 
-        let queue = self.stage_queue(&member);
-        queue.next_seq = bumped;
-        queue.items.insert(
-            seq,
-            Notification {
+        meta.seqs.push(seq);
+        // overflow: drop the OLDEST (lowest seq) item. we insert exactly one
+        // per call, so at most one drop is ever needed.
+        while meta.seqs.len() > MAX_ITEMS_PER_MEMBER {
+            let oldest = meta.seqs.remove(0);
+            self.staged.delete(item_key(&member, oldest));
+        }
+        self.store(
+            item_key(&member, seq),
+            &Notification {
                 seq,
-                member,
+                member: member.clone(),
                 kind,
                 body,
                 source,
@@ -181,192 +305,55 @@ impl Inbox {
                 read: false,
             },
         );
-        // overflow: drop the OLDEST (lowest seq) item. we insert exactly one per
-        // call, so at most one drop is ever needed.
-        while queue.items.len() > MAX_ITEMS_PER_MEMBER {
-            let oldest = *queue
-                .items
-                .keys()
-                .next()
-                .expect("non-empty over-capacity queue");
-            queue.items.remove(&oldest);
-        }
-        Ok(())
+        self.store(meta_key(&member), &meta);
+        Ok(seq)
     }
 
-    fn stage_mark_read(&mut self, member: String, up_to_seq: u64) {
+    async fn stage_mark_read(
+        &mut self,
+        origin: &Origin,
+        member: String,
+        up_to_seq: u64,
+    ) -> Result<(), Error> {
+        // BEFORE the unknown-member short-circuit: a gate a no-op walks past is
+        // not a gate, and a stranger must not learn whether a queue exists from
+        // which answer comes back.
+        check_queue_owner(origin, &member)?;
         // unknown member: deterministic no-op (never stage, never error).
-        if self.effective(&member).is_none() {
-            return;
-        }
-        let queue = self.stage_queue(&member);
-        for (_, item) in queue.items.range_mut(..=up_to_seq) {
-            item.read = true;
-        }
-    }
-
-    fn stage_clear(&mut self, member: String, up_to_seq: u64) {
-        // unknown member: deterministic no-op.
-        if self.effective(&member).is_none() {
-            return;
-        }
-        let queue = self.stage_queue(&member);
-        let doomed: Vec<u64> = queue
-            .items
-            .range(..=up_to_seq)
-            .map(|(seq, _)| *seq)
-            .collect();
-        for seq in doomed {
-            queue.items.remove(&seq);
-        }
-        // next_seq is intentionally left untouched: it never rewinds.
-    }
-
-    fn list(&self, member: &str, from_seq: u64, limit: u64) -> Vec<Notification> {
-        let limit = limit.min(MAX_QUERY_LIMIT) as usize;
-        match self.effective(member) {
-            Some(queue) => queue
-                .items
-                .range(from_seq..)
-                .take(limit)
-                .map(|(_, item)| item.clone())
-                .collect(),
-            None => Vec::new(),
-        }
-    }
-
-    fn unread(&self, member: &str) -> u64 {
-        self.effective(member)
-            .map(|queue| queue.items.values().filter(|item| !item.read).count() as u64)
-            .unwrap_or(0)
-    }
-
-    fn root_of(members: &BTreeMap<String, MemberQueue>) -> StateRoot {
-        let mut h = Sha256::new();
-        h.update(Self::encode(members));
-        StateRoot(h.finalize().into())
-    }
-
-    /// canonical byte encoding — the exact `root()` preimage AND the snapshot
-    /// wire. deterministic: members ascend by identity, items ascend by seq,
-    /// strings are length-prefixed, integers are little-endian. the member
-    /// identity is encoded once at the queue level; each item's redundant
-    /// `member` field is reconstructed from the key on decode.
-    fn encode(members: &BTreeMap<String, MemberQueue>) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&(members.len() as u64).to_le_bytes());
-        for (member, queue) in members {
-            codec::push_str(&mut out, member);
-            out.extend_from_slice(&queue.next_seq.to_le_bytes());
-            out.extend_from_slice(&(queue.items.len() as u64).to_le_bytes());
-            for item in queue.items.values() {
-                out.extend_from_slice(&item.seq.to_le_bytes());
-                codec::push_str(&mut out, &item.kind);
-                codec::push_str(&mut out, &item.body);
-                codec::push_str(&mut out, &item.source);
-                out.extend_from_slice(&item.created_at.to_le_bytes());
-                out.push(item.read as u8);
+        let Some(meta) = self.meta(&member).await? else {
+            return Ok(());
+        };
+        for seq in meta.seqs.iter().take_while(|s| **s <= up_to_seq) {
+            let mut item = self.item(&member, *seq).await?;
+            if !item.read {
+                item.read = true;
+                self.store(item_key(&member, *seq), &item);
             }
         }
-        out
-    }
-
-    pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode(&self.members)
-    }
-
-    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let members = decode_snapshot(bytes)?;
-        sdk::verify_snapshot_root(Self::root_of(&members), expected)?;
-        self.members = members;
-        self.pending.clear();
-        self.new_pending = 0;
         Ok(())
     }
-}
 
-/// decode (and validate) a snapshot. install must accept every
-/// execute-reachable state — the root comparison is the integrity check — but
-/// states execute can NEVER produce are rejected as defense-in-depth: the caps
-/// below are all enforced at execute time, so an image violating them is
-/// corrupt or hostile, never an honest validator's state.
-fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, MemberQueue>, Error> {
-    let mut c = Cursor::new(bytes);
-    let member_count = c.u64("snapshot member count")?;
-    if member_count > MAX_MEMBERS as u64 {
-        return Err(Error::Module("snapshot exceeds member capacity".into()));
+    async fn stage_clear(
+        &mut self,
+        origin: &Origin,
+        member: String,
+        up_to_seq: u64,
+    ) -> Result<(), Error> {
+        // BEFORE the unknown-member short-circuit (see `stage_mark_read`).
+        check_queue_owner(origin, &member)?;
+        // unknown member: deterministic no-op.
+        let Some(mut meta) = self.meta(&member).await? else {
+            return Ok(());
+        };
+        let keep = meta.seqs.partition_point(|s| *s <= up_to_seq);
+        for seq in meta.seqs.drain(..keep) {
+            self.staged.delete(item_key(&member, seq));
+        }
+        // next_seq is intentionally left untouched: it never rewinds — the
+        // (possibly item-less) meta record persists so replays stay gap-free.
+        self.store(meta_key(&member), &meta);
+        Ok(())
     }
-
-    let mut members: BTreeMap<String, MemberQueue> = BTreeMap::new();
-    for _ in 0..member_count {
-        let member = c.string("snapshot member id")?;
-        if member.is_empty() {
-            return Err(Error::Module("snapshot member id is empty".into()));
-        }
-        if member.len() > MAX_MEMBER_BYTES {
-            return Err(Error::Module("snapshot member id exceeds cap".into()));
-        }
-        if members
-            .last_key_value()
-            .is_some_and(|(last, _)| last.as_str() >= member.as_str())
-        {
-            return Err(Error::Module(
-                "snapshot member ids not strictly ascending".into(),
-            ));
-        }
-
-        let next_seq = c.u64("snapshot next_seq")?;
-        if next_seq == 0 {
-            // next_seq starts at 1 and only ever increments.
-            return Err(Error::Module("snapshot next_seq is zero".into()));
-        }
-        let item_count = c.u64("snapshot item count")?;
-        if item_count > MAX_ITEMS_PER_MEMBER as u64 {
-            return Err(Error::Module(
-                "snapshot member queue exceeds item capacity".into(),
-            ));
-        }
-        let mut items: BTreeMap<u64, Notification> = BTreeMap::new();
-        for _ in 0..item_count {
-            let seq = c.u64("snapshot item seq")?;
-            if items.last_key_value().is_some_and(|(last, _)| *last >= seq) {
-                return Err(Error::Module(
-                    "snapshot item seqs not strictly ascending".into(),
-                ));
-            }
-            if seq >= next_seq {
-                // every assigned seq was strictly below next_seq at assignment;
-                // a seq at/above it is not execute-reachable.
-                return Err(Error::Module("snapshot item seq exceeds next_seq".into()));
-            }
-            let kind = c.string("snapshot kind")?;
-            if kind.len() > MAX_KIND_BYTES {
-                return Err(Error::Module("snapshot kind exceeds cap".into()));
-            }
-            let body = c.string("snapshot body")?;
-            if body.len() > MAX_BODY_BYTES {
-                return Err(Error::Module("snapshot body exceeds cap".into()));
-            }
-            let source = c.string("snapshot source")?;
-            let created_at = c.u64("snapshot created_at")?;
-            let read = c.bool("snapshot read flag")?;
-            items.insert(
-                seq,
-                Notification {
-                    seq,
-                    member: member.clone(),
-                    kind,
-                    body,
-                    source,
-                    created_at,
-                    read,
-                },
-            );
-        }
-        members.insert(member, MemberQueue { next_seq, items });
-    }
-    c.finish("inbox snapshot")?;
-    Ok(members)
 }
 
 #[async_trait::async_trait(?Send)]
@@ -375,62 +362,105 @@ impl Module for Inbox {
         self.id.clone()
     }
 
+    /// the store's merkle root over all committed records, verbatim — the
+    /// staged overlay is invisible here until `commit_block`.
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.members)
+        self.staged.root()
     }
 
-    /// advertise the snapshot lane: [`Inbox::snapshot`] is the exact preimage of
-    /// `root()`, and [`Inbox::install`] verifies before adopting.
-    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
-        Some(self.snapshot())
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        self.staged.state_sync_handle()
+    }
+
+    /// the network state-sync serve lane: answers the shared qmdb wire requests
+    /// (historical proof-carrying op ranges) from committed state. read-only;
+    /// the joiner's sync engine merkle-verifies every batch.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.staged.serve_sync(req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        self.staged.sync_target().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let Env { consensus_time, .. } = *ctx.env();
+        // the submitter is bound ONCE, before the payload is decoded, and every
+        // arm receives it — an arm that took no origin would be exactly the
+        // class of bug the ack gate exists to close. `Deliver` uses it to derive
+        // `source`; the ack family uses it to derive the queue owner.
+        let consensus_time = ctx.env().consensus_time;
+        let origin = ctx.env().origin.clone();
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             InboxMsg::Deliver { member, kind, body } => {
                 // the delivering `source` is origin-derived — the only source of
-                // truth for who delivered, NEVER caller-supplied.
-                let source = ctx.env().origin.actor_string();
-                self.stage_deliver(member, kind, body, source, consensus_time)
+                // truth for who delivered, NEVER caller-supplied. ANY origin may
+                // deliver to ANY member: that is the module's purpose, and it is
+                // routed here without ever reaching the owner gate.
+                let source = origin.actor_string();
+                let seq = self
+                    .stage_deliver(member, kind, body, source, consensus_time)
+                    .await?;
+                ctx.set_assigned(encode_assigned(&InboxAssigned::Delivered { seq }));
+                Ok(())
             }
             InboxMsg::MarkRead { member, up_to_seq } => {
-                self.stage_mark_read(member, up_to_seq);
-                Ok(())
+                self.stage_mark_read(&origin, member, up_to_seq).await
             }
             InboxMsg::Clear { member, up_to_seq } => {
-                self.stage_clear(member, up_to_seq);
-                Ok(())
+                self.stage_clear(&origin, member, up_to_seq).await
             }
         }
     }
 
-    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match decode_query(req).map_err(Error::Module)? {
-            InboxQuery::List {
-                member,
-                from_seq,
-                limit,
-            } => Ok(encode_reply(&InboxReply::Items(
-                self.list(&member, from_seq, limit),
-            ))),
-            InboxQuery::Unread { member } => {
-                Ok(encode_reply(&InboxReply::UnreadCount(self.unread(&member))))
-            }
-        }
-    }
+    // NO `query`: nothing in any execute() path reads an inbox, so the whole
+    // read surface (paged lists, unread counts) is the index guest's job
+    // (`index.rs`) on the derived tier. the default `Error::QueryUnsupported`
+    // is the honest answer here.
 
+    /// publish the block's staged writes in ONE store batch. no-op (and no
+    /// root movement) if nothing was staged.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        for (member, queue) in std::mem::take(&mut self.pending) {
-            self.members.insert(member, queue);
-        }
-        self.new_pending = 0;
-        Ok(())
+        self.staged.commit().await
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending.clear();
-        self.new_pending = 0;
+        self.staged.abort();
+        Ok(())
+    }
+}
+
+// test-only inspection reads. dev-only: inbox deliberately has NO wire query
+// surface (the index tier owns every read), so the state-side tests probe the
+// records through this feature-gated seam instead of golden byte images.
+#[cfg(feature = "testkit")]
+impl Inbox {
+    /// one member's staged-over-committed queue: `(next_seq, live items in seq
+    /// order)`; `None` for a member never delivered to.
+    pub async fn queue_view(
+        &self,
+        member: &str,
+    ) -> Result<Option<(u64, Vec<Notification>)>, Error> {
+        let Some(meta) = self.meta(member).await? else {
+            return Ok(None);
+        };
+        let mut items = Vec::with_capacity(meta.seqs.len());
+        for seq in &meta.seqs {
+            items.push(self.item(member, *seq).await?);
+        }
+        Ok(Some((meta.next_seq, items)))
+    }
+
+    /// stage a member whose seq space is one delivery from exhaustion — the
+    /// boundary state is execute-reachable only after 2^64 - 2 deliveries, so
+    /// the exhaustion test injects it instead.
+    pub async fn testkit_saturate_seq(&mut self, member: &str) -> Result<(), Error> {
+        if self.meta(member).await?.is_none() {
+            let count = self.member_count().await?;
+            self.store(MEMBER_COUNT_KEY.to_vec(), &(count + 1));
+        }
+        let mut meta = self.meta(member).await?.unwrap_or_else(MemberMeta::new);
+        meta.next_seq = u64::MAX;
+        self.store(meta_key(member), &meta);
         Ok(())
     }
 }

@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Worktree: `/home/eddy/dev/ducktape/.worktree/iced-sim-lane`, branch `feat/iced-sim-lane`, PR target **`feat/iced-app`**.
+- Worktree: `<repo>/.worktree/iced-sim-lane`, branch `feat/iced-sim-lane`, PR target **`feat/iced-app`**.
 - Phase A (`simnode` lib) must be MERGED into `dev` and `origin/dev` merged into this branch before Task 2 — Task 1 does that merge.
 - `CARGO_INCREMENTAL=0` on every cargo command; SIGSEGV recovery: `sccache --stop-server; export RUSTC_WRAPPER=""; export RUST_MIN_STACK=2147483648`.
 - Lint gate: `cargo clippy -p ducktape-iced --tests --no-deps`. Never `cargo fmt --all`.
@@ -35,7 +35,7 @@
 - [ ] **Step 1: Revert the v1 harness commit**
 
 ```bash
-cd /home/eddy/dev/ducktape/.worktree/iced-sim-lane
+cd <repo>/.worktree/iced-sim-lane
 git revert --no-edit 069e714dc9
 ```
 

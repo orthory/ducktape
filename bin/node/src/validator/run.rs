@@ -13,13 +13,12 @@ use futures::{FutureExt as _, StreamExt as _};
 
 use recovery::Manifest;
 
-use super::announce::CapabilityAnnouncer;
 use crate::constants::DRAIN_TICK;
 use crate::reachability_plane::GateOutcomes;
-use crate::rpc::{JoinRequestRecord, RpcJob, spawn_rpc_listener};
+use crate::rpc::{JoinRequestRecord, RpcJob};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
-use crate::{lobby, oracle_pool, relay_runtime, voice_plane};
+use crate::{lobby, relay_runtime, voice_plane};
 
 pub(super) type ValidatorNode = node::OrderedNode<
     consensus::SimplexOrderer,
@@ -49,6 +48,41 @@ fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: lobby::IntroRepl
         .lock()
         .expect("gate outcomes lock")
         .insert(joiner, reply);
+}
+
+/// assemble this node's boundary facts and publish them into the shared
+/// `/v1/status` cell — the http route reads the cell directly, never the
+/// command lane, so this is the ONE place a validator's status becomes
+/// visible (reached via [`ValidatorRuntime::publish_status`] at startup and
+/// after every drain turn). pure assembly over the node's committed state;
+/// the operations section is stamped from the shared metrics projection
+/// (and overlaid live on the read side anyway).
+pub(super) fn publish_boundary_status(
+    status: &noded::StatusCell,
+    node: &ValidatorNode,
+    metrics: &noded::NodeMetrics,
+    status_public_key: &str,
+) {
+    let modules = crate::constants::MODULE_IDS
+        .iter()
+        .map(|m| noded::ModuleStatus {
+            id: (*m).into(),
+            root: node
+                .host()
+                .module_root(m)
+                .map(|r| crate::util::hex(&r))
+                .unwrap_or_default(),
+            category: noded::ModuleCategory::of(m),
+        })
+        .collect();
+    status.publish(noded::NodeStatus {
+        version: env!("CARGO_PKG_VERSION").into(),
+        root_hash: crate::util::hex(&node.root_hash()),
+        height: node.finalized().map(|f| f.height).unwrap_or(0),
+        modules,
+        public_key: status_public_key.into(),
+        operations: metrics.operational_status(),
+    });
 }
 
 /// The long-lived state owned by the validator event loop.
@@ -92,17 +126,20 @@ pub(super) struct ValidatorLoopState<'a> {
     /// sync retention lease (unix secs of the last served state-sync request)
     /// — the drain defers oplog pruning while it is fresh.
     pub(super) sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub(super) announce_capabilities: bool,
-    pub(super) sandbox: capability_host::SandboxBackend,
-    pub(super) sandbox_capacity: std::collections::BTreeMap<String, u64>,
-    pub(super) rpc_listener: Option<std::net::TcpListener>,
+    /// the local rpc bridge's parsed-request queue — the caller owns the
+    /// listener spawn (a promoted node's listener pump carries over from
+    /// its parked life; a fresh boot spawns one), so both entries feed the
+    /// same seam.
+    pub(super) rpc_ingress: futures::channel::mpsc::Receiver<RpcJob>,
     pub(super) http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     pub(super) stream_hub: noded::StreamHub,
     pub(super) index: std::sync::Arc<indexer::IndexStore>,
     pub(super) blobs: noded::blobs::BlobHandle,
-    pub(super) agent_provisioner: dispatch_oracle::SharedProvisioner,
-    pub(super) agent_dirs: capability_host::AgentDirs,
+    /// the volatile service-signaling catalog: the live half of the capability
+    /// announce (`grant ∩ hello`). Shared with the http surface's handle, so a
+    /// daemon's hello is visible to the announce pump the moment it lands.
     pub(super) metrics: noded::NodeMetrics,
+    pub(super) status: noded::StatusCell,
     pub(super) status_public_key: String,
     pub(super) coordination: crate::config::Coordination,
 }
@@ -132,13 +169,17 @@ struct ValidatorRuntime<'a> {
     dev_demo: bool,
     checkpoint_blocks: u64,
     sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    announce_capabilities: bool,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     blobs: noded::blobs::BlobHandle,
     metrics: noded::NodeMetrics,
+    status: noded::StatusCell,
     status_public_key: String,
     coordination: crate::config::Coordination,
+    /// the earliest instant the NEXT `refresh_operations` may run — the
+    /// exposition parse is the pricey part of a status publish, so it is
+    /// paced here instead of riding every drained boundary.
+    next_ops_refresh: std::time::SystemTime,
     expected: usize,
     applied: usize,
     converged: bool,
@@ -161,10 +202,25 @@ struct ValidatorRuntime<'a> {
     last_published: Option<u64>,
     join_requests: std::collections::BTreeMap<Vec<u8>, JoinRequestRecord>,
     blocks_since_checkpoint: u64,
+    /// the earliest a checkpoint may START again — see `cooldown_until`.
+    /// blocks alone cannot express what a checkpoint COSTS the loop, and
+    /// the loop is what answers `/v1/query` and SIGTERM (#1018).
+    checkpoint_not_before: std::time::SystemTime,
     last_reach_view: Option<u64>,
     last_flush: std::time::SystemTime,
     pending_retarget: Option<reachability::MeshEpochEvent>,
     heartbeat_disabled: bool,
+    /// the sender half of the finalization delivery wake — re-installed on
+    /// every epoch cutover's fresh orderer so event-driven draining survives
+    /// the engine respawn.
+    delivery_wake_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// whether our un-finalized proposals include REAL ops (a parked idle nop
+    /// never sets this) — the condition for the leader-nudge escort. set at
+    /// eager flush and cutover carry, cleared when the orderer FIFO drains.
+    real_work_parked: bool,
+    /// the last locally-estimated view a leader nudge was sent for — one
+    /// nudge per view; every finalized block moves the estimate and re-arms.
+    last_nudged_view: Option<u64>,
     last_crank: std::time::SystemTime,
     last_nudge: std::time::SystemTime,
     workers: Vec<Box<dyn host::worker::Worker>>,
@@ -173,7 +229,6 @@ struct ValidatorRuntime<'a> {
     /// a failed fetch retries next tick (the sender rides in each task).
     fetch_done_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
     fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<[u8; 32]>,
-    announcer: CapabilityAnnouncer,
     next_drain: std::time::SystemTime,
 }
 
@@ -206,38 +261,17 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         dev_demo,
         checkpoint_blocks,
         sync_lease,
-        announce_capabilities,
-        sandbox,
-        sandbox_capacity,
-        rpc_listener,
+        rpc_ingress,
         http_cmds,
         stream_hub,
         index,
         blobs,
-        agent_provisioner,
-        agent_dirs,
         metrics,
+        status,
         status_public_key,
         coordination,
     } = state;
-    // the local rpc bridge: blocking listener threads push parsed requests
-    // into this bounded queue; the pump answers between drains.
-    let (rpc_tx, mut rpc_ingress) = futures::channel::mpsc::channel::<RpcJob>(64);
-    if let Some(listener) = rpc_listener {
-        let listen = listener
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_default();
-        tracing::info!(
-            target: "ducktape::node",
-            node = %label,
-            %listen,
-            "rpc listening on {listen}"
-        );
-        spawn_rpc_listener(listener, rpc_tx);
-    } else {
-        drop(rpc_tx); // rpc off: the branch below just stays pending forever.
-    }
+    let mut rpc_ingress = rpc_ingress;
 
     // the ordered lane SIGNS every frame. rpc submits are signed by THIS
     // node's identity (the node is the local caller's custodian until user
@@ -291,11 +325,15 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         std::collections::BTreeMap::new();
     // recovery cadence: sealed blocks since the last checkpoint manifest.
     let blocks_since_checkpoint: u64 = 0;
+    // no cooldown owed at boot: the first checkpoint's own cost is the
+    // estimate every later one is held off by.
+    let checkpoint_not_before = context.current();
     // the last absolute view ticked to the reachability plane — one
     // ViewTick per actual advance, not one per 100ms drain pass.
     let last_reach_view: Option<u64> = None;
-    // the per-block-time flush cadence: packs the window's enqueued frames
-    // (real ops and/or an idle nop) into one batch block. see the flush loop.
+    // the IDLE beat grid: when the last flush (or restamp) happened, pacing
+    // the one-nop-per-BLOCK_TIME idle heartbeat. busy flushing is event-driven
+    // and merely restamps this. see `pump_heartbeat` / `pump_eager_flush`.
     let last_flush = context.current();
     // a cutover Retarget the plane's command queue could not take yet
     // (NON-BLOCKING sends: the plane is not consensus, so the loop never
@@ -313,60 +351,28 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let last_crank = context.current();
     // throttle for the dispatch delivery-nudge pump below.
     let last_nudge = context.current();
-    // the host-owned worker set (reactor seam): effects of finalized
-    // blocks are offered here, and claimed follow-ups re-enter the ordered
-    // lane as their own blocks.
-    // load capability specs and discover this host's installed executor
-    // CLIs (BYO — no credential handling here). the discovered tag set is
-    // BOTH what the oracle worker can run and what this node announces to
-    // the capability registry, so an announce can never claim more than
-    // the host provides (`announce_capabilities = false` narrows the
-    // announced set to nothing — never the reverse). routing and
-    // default models live in the specs (docs/records/specs/capability-spec.md); a broken
-    // operator spec is a boot error, not a silently dropped executor.
-    let providers = capability_host::discover(
-        signer.public_key().as_ref(),
-        agent_dirs.clone(),
-        Some(stream_hub.run_output().output_sink()),
-        // the operator's `node.toml sandbox` choice: Direct (default) or a
-        // Podman container that enforces this node's announced capacity.
-        sandbox,
-        // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
-        false,
-    )
-    .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
-    let my_capabilities = providers.capabilities();
-    // OFF-LOOP execution: the pool gates effects inline (lease check —
-    // WorkerRequests leased to another node's key are skipped, not
-    // double-run — under this node's submit key) but runs the provider
-    // CLI on spawned background tasks; completed results come back over
-    // `oracle_results` (an ingress arm below) and re-enter the ordered
-    // lane as ordinary signed submits, so a minutes-long run never
-    // stalls the drain/rpc/heartbeat arms of this loop.
-    let (oracle_worker, _oracle_control, mut oracle_results) = oracle_pool::build(
-        context,
-        providers,
-        signer.public_key().as_ref().to_vec(),
-        agent_provisioner.clone(),
-        // the announced capacity IS the pool's ledger — one source, so the
-        // scheduler never promises what this node can't seat.
-        sandbox_capacity.clone(),
-    );
-    let workers: Vec<Box<dyn host::worker::Worker>> = vec![oracle_worker];
+    // the host-owned worker set (reactor seam): effects of finalized blocks are
+    // offered here. It is EMPTY — dispatch work is executed by the standalone
+    // compute daemon (`ducktape service run compute`), which discovers its
+    // assignments from committed state and submits results over this node's own
+    // /v1 surface. The node constructs no provider set, no dispatch pool and no
+    // resource ledger; an unclaimed effect still surfaces through the drain's
+    // module notes, which is the honest diagnostic on a node whose daemon is
+    // not running.
+    //
+    // PODMAN IS NOT THE NODE'S ANY MORE. Both planes that used to need it are
+    // out of process: compute serves dispatch work and agent serves interactive
+    // ptys, and each daemon starts its OWN node-private podman service under its
+    // own root (`<storage>/services/<kind>/podman`). Separate roots are what make
+    // them separate failure domains — one daemon restarting can no longer take
+    // the other's containers down with a shared `kill_on_drop` service child.
+    let workers: Vec<Box<dyn host::worker::Worker>> = Vec::new();
     // the CODE readiness self-signaller for pending code swaps — verifies (or
     // fetches) the committed component bytes and emits one truthful
     // `SignalReady` per swap.
     let code_signaller =
         super::code_announce::CodeReadinessSignaller::new(signer.public_key().as_ref().to_vec());
     let (fetch_done_tx, fetch_done_rx) = tokio::sync::mpsc::unbounded_channel();
-    // the capability self-announcer: publishes this node's discovered
-    // provider set into the capability registry once (state-driven,
-    // idempotent). inert when this host installed no executor CLIs.
-    let announcer = CapabilityAnnouncer::new(
-        signer.public_key().as_ref().to_vec(),
-        my_capabilities,
-        sandbox_capacity,
-    );
     // graceful checkpoint on process signals (SIGTERM/SIGINT): the desktop
     // shell SIGTERMs the daemon on quit, so it must take the SAME safe path
     // as an rpc `Shutdown` — a best-effort final manifest + journal barrier
@@ -408,6 +414,12 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         }
     };
 
+    // the finalization delivery wake: the engine's reporter pings it the
+    // moment a finalized block becomes drainable, and the loop below drains
+    // event-driven on it — the periodic drain tick stays only as the backstop.
+    let (delivery_wake_tx, mut delivery_wake) = tokio::sync::mpsc::unbounded_channel::<()>();
+    node.orderer().set_delivery_wake(delivery_wake_tx.clone());
+
     let mut runtime = ValidatorRuntime {
         context,
         node,
@@ -433,13 +445,14 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         dev_demo,
         checkpoint_blocks,
         sync_lease,
-        announce_capabilities,
         stream_hub,
         index,
         blobs,
         metrics,
+        status,
         status_public_key,
         coordination,
+        next_ops_refresh: context.current(),
         expected,
         applied,
         converged,
@@ -451,19 +464,25 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         last_published,
         join_requests,
         blocks_since_checkpoint,
+        checkpoint_not_before,
         last_reach_view,
         last_flush,
         pending_retarget,
         heartbeat_disabled,
+        delivery_wake_tx,
+        real_work_parked: false,
+        last_nudged_view: None,
         last_crank,
         last_nudge,
         workers,
         code_signaller,
         fetch_done_tx,
         fetch_done_rx,
-        announcer,
         next_drain: context.current() + DRAIN_TICK,
     };
+    // the startup snapshot: the RECOVERED boundary serves on /v1/status the
+    // moment the loop exists, not after the first drain.
+    runtime.publish_status().await;
 
     loop {
         // Resolve on whichever signal stream installed. If neither did,
@@ -494,14 +513,19 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         futures::select_biased! {
             _ = signalled => runtime.on_signal().await,
             _ = context.sleep_until(next_drain).fuse() => runtime.on_drain().await,
+            wake = delivery_wake.recv().fuse() => {
+                // a finalized block is drainable NOW — drain event-driven
+                // instead of waiting out the tick. coalesce a finalization
+                // burst into one pass; `None` (all senders dropped) cannot
+                // happen while `runtime.delivery_wake_tx` lives.
+                if wake.is_some() {
+                    while delivery_wake.try_recv().is_ok() {}
+                    runtime.on_drain().await;
+                }
+            }
             job = rpc_ingress.next() => {
                 if let Some(job) = job {
                     runtime.on_rpc(job).await;
-                }
-            }
-            result = oracle_results.next() => {
-                if let Some(msg) = result {
-                    runtime.on_oracle_result(msg).await;
                 }
             }
             fwd = gate_fwd_rx.recv().fuse() => {
@@ -528,6 +552,17 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
                 }
             }
         }
+        // the BUSY block path, event-driven: whatever this turn enqueued
+        // (an ingress submit, a relay frame, a drain-arm system op) flushes
+        // into a proposed block NOW — unless a batch of ours is already in
+        // flight, in which case it aggregates until that batch clears and
+        // the delivery wake turns the loop again. no interval anywhere: the
+        // network's own agreement speed is the pacer.
+        runtime.pump_eager_flush().await;
+        // ...and while that real work waits on OUR leadership turn, escort it:
+        // nudge the current view's leader to close its idle view now, so
+        // rotation reaches us at network speed instead of the 1s idle beat.
+        runtime.pump_leader_nudge().await;
     }
 }
 

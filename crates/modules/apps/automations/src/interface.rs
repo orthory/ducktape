@@ -5,12 +5,13 @@
 //! payload; the automations module decodes it inside its origin-gated hook arm
 //! (see [`AutomationsMsg::HookEvent`]).
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 /// what makes a rule fire: a chat message-posted filter. every `None` field is
 /// a wildcard; every `Some` field must match the triggering event. a flat
 /// single-shape struct in both the JSON wire and the snapshot codec.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 // deny_unknown_fields is load-bearing: every field is an Option, so without
 // it the RETIRED tagged shape ({"message_posted":{...}}) would silently parse
 // as an all-None trigger that fires on every message — a quiet-corruption
@@ -19,8 +20,9 @@ use serde::{Deserialize, Serialize};
 pub struct Trigger {
     /// an exact channel id, or `None` for any channel.
     pub channel_id: Option<String>,
-    /// a substring tested against each mention's display form (see the
-    /// module's `display_author`); `None` = no mention constraint.
+    /// a substring tested against each mention's ACTOR string (see the module's
+    /// `actor_of`) — `ext:{hex}` for a user, `{module}/{agent_id}` for an
+    /// agent; `None` = no mention constraint.
     pub mention: Option<String>,
     /// a case-sensitive substring tested against the post's concatenated
     /// text blocks; `None` = no text constraint.
@@ -28,7 +30,7 @@ pub struct Trigger {
 }
 
 /// what a firing rule does.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     /// post `template` (after placeholder substitution) into `channel_id`. the
@@ -46,6 +48,12 @@ pub enum Action {
     },
     /// deliver an inbox notification. `kind` is literal; `member_template` and
     /// `body_template` are substituted at fire time.
+    ///
+    /// `member_template` must substitute to an inbox QUEUE NAME, which is an
+    /// origin's `sdk::Origin::actor_string` — inbox refuses an ack from anyone
+    /// but that origin. `{author}` is the ownable form (a rule only ever fires
+    /// on a user-authored post, so it renders `ext:{hex}`); a literal or a
+    /// `{mention}` of a non-user names a queue nobody can ever ack.
     DeliverInbox {
         member_template: String,
         kind: String,
@@ -54,9 +62,20 @@ pub enum Action {
 }
 
 /// a user-defined automation rule.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     pub rule_id: String,
+    /// who created it, and the ONLY principal that may enable, disable, or
+    /// delete it: the authenticated external submitter's raw key bytes — the
+    /// same principal domain `chat::Channel::owner` records.
+    ///
+    /// REQUIRED, never optional. A rule is a STANDING capability: once created
+    /// it keeps firing under `Origin::Module("automations")` — posting to
+    /// channels, creating tasks, delivering to inboxes — until someone deletes
+    /// it. An ownerless rule would be an unattributable standing grant, so the
+    /// record makes one unrepresentable and the create op refuses every origin
+    /// that is not an external submitter.
+    pub owner: Vec<u8>,
     pub enabled: bool,
     pub trigger: Trigger,
     pub action: Action,
@@ -66,7 +85,7 @@ pub struct Rule {
 }
 
 /// one entry in the module's bounded global run-history ring.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RunRecord {
     pub rule_id: String,
     /// the triggering channel id.
@@ -79,21 +98,24 @@ pub struct RunRecord {
     pub detail: String,
 }
 
+/// the admin family is OWNER-BOUND: the submitter of a `CreateRule` becomes the
+/// new rule's [`Rule::owner`], and `SetEnabled`/`DeleteRule` are refused unless
+/// the submitter IS that owner. only an external submitter may own a rule, so
+/// module and system origins are refused outright on all three.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationsMsg {
+    /// register a rule owned by the submitter.
     CreateRule {
         rule_id: String,
         trigger: Trigger,
         action: Action,
     },
-    SetEnabled {
-        rule_id: String,
-        enabled: bool,
-    },
-    DeleteRule {
-        rule_id: String,
-    },
+    /// enable or disable an OWN rule — a disabled rule stays registered and
+    /// stops firing.
+    SetEnabled { rule_id: String, enabled: bool },
+    /// delete an OWN rule.
+    DeleteRule { rule_id: String },
     /// the chat hook payload: the `chat::ChatEvent` bytes chat delivers
     /// as a follow-up. HONORED ONLY when the dispatch origin is the chat module;
     /// a non-chat origin claiming a hook event is rejected as a spoof.

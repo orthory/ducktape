@@ -1,7 +1,7 @@
 //! the wasm port of this module, built the ADAPTER way: the native crate is
 //! compiled to wasm32 unmodified (minus the `native`-feature off-consensus
 //! submodules — the derived index and the voice/video media engines, which
-//! never touch the app-hash) and adapted to the `ducktape:module` world
+//! never touch the root-hash) and adapted to the `ducktape:module` world
 //! through `guest-adapter`, so the module's logic is single-sourced (a
 //! behavior change in the native crate IS the wasm change). the packaging
 //! cdylib around this port is synthesized by `guest-builder` — this module is
@@ -13,9 +13,8 @@
 //! injects [`WitStore`], the adapter's `MerkleStore` over the wit `state-*`
 //! imports, and the REAL qmdb store stays host-side
 //! (`WasmModule::with_store`). there is NO per-dispatch snapshot: the store
-//! IS the state, the wasm root IS the store's merkle root, and the cutover is
-//! ROOT-CONTINUOUS (state schema revision stays 1; pre-cutover workspaces
-//! reopen unchanged). see the `pages` guest port for the staging-contract argument
+//! IS the state and the wasm root is the store's Merkle root. See the `pages`
+//! guest port for the staging-contract argument
 //! spelled out point by point — chat rides the identical seams:
 //!
 //! * the guest rebuilds the module FRESH per dispatch over the exact
@@ -44,8 +43,7 @@ use crate::Chat;
 /// the genesis-constant id this module registers under (the native twin's id:
 /// `Env::me` and follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "chat";
-/// the engagement plane every post is reported to — EXACTLY the production
-/// wiring the host builder chain used pre-cutover
+/// the engagement plane every post is reported to — the production wiring in
 /// (`bin/node/src/host_state.rs`): `.with_tagging("tagging")`. the wiring is
 /// genesis config compiled into the guest; drift here would be a consensus
 /// fork.

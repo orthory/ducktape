@@ -273,7 +273,7 @@ force-fitting (ask-first rule for boundary shape changes).
   `OrderedNode<SimplexOrderer>` over `Host`s with the native `directory`
   example module — on one `simulated::Network` in one process; submit ops via
   each node; wait on delivered frames (event-driven, no sleeps); assert all
-  app-hashes equal. FAIL (no way to construct without the carrier).
+  root-hashes equal. FAIL (no way to construct without the carrier).
 - [ ] **Step 2:** define `MeshCarrier`, implement sim arm, make the test pass.
 - [ ] **Step 3:** convert `boot/mesh.rs`/`engine.rs` to the real arm.
   `cargo check -p node-bin`; clippy consensus + node-bin; `cargo test -p

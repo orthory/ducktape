@@ -2,9 +2,9 @@
 //! root by pulling a source store's operation range through commonware's qmdb
 //! sync. this is the storage-backed joiner surface; replaying exported records
 //! in sorted order is not enough because the qmdb root commits to the live
-//! operation log. the source content covers every record family: channel +
-//! index, message heads, a thread index, an edit revision, reaction sets, and
-//! membership records.
+//! operation log. the source content covers every record family: a channel
+//! record, message heads (a thread root and its reply), an edit revision,
+//! reaction sets, and a membership point record.
 //!
 //! the source is driven through the real module so the op log carries genuine
 //! chat history (edits, deletes-by-overwrite, index churn). the
@@ -12,7 +12,10 @@
 //! consumes its injected store, so the source module is dropped and its
 //! partitions REOPENED as a bare `QmdbStore` — recovery of a committed store
 //! lands exactly on the committed root, which the test pins before handing
-//! the reopened store to the joiner.
+//! the reopened store to the joiner. query parity is asserted over the three
+//! kept dispatch reads (`Channel` / `MessagesRange` / `Message`); every other
+//! record family (revisions, reactions, membership) is pinned by the root
+//! equality, which commits to the full op log.
 
 use chat::Chat;
 use chat::{Block, ChatMsg, ChatQuery, PostPolicy, encode_msg, encode_query};
@@ -141,27 +144,19 @@ fn synced_store_reconstructs_source_root_and_history() {
         assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
 
         let queries = [
-            ChatQuery::Channels,
-            ChatQuery::MessagesLatest {
+            ChatQuery::Channel {
                 channel_id: "general".into(),
+            },
+            ChatQuery::MessagesRange {
+                channel_id: "general".into(),
+                from_seq: 1,
                 limit: 16,
             },
-            ChatQuery::Thread {
-                channel_id: "general".into(),
-                root_seq: 1,
-                from: 0,
-                limit: 16,
+            ChatQuery::Message {
+                message_id: "m2".into(),
             },
-            ChatQuery::Revisions {
-                channel_id: "general".into(),
-                seq: 2,
-            },
-            ChatQuery::Reactions {
-                channel_id: "general".into(),
-                seq: 2,
-            },
-            ChatQuery::Members {
-                channel_id: "general".into(),
+            ChatQuery::Message {
+                message_id: "r1".into(),
             },
         ];
         let mut expected = Vec::new();

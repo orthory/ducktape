@@ -367,6 +367,109 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SyncClient for ServeLaneBlobC
     }
 }
 
+// ---- the forge pack sweep -----------------------------------------------------
+
+/// how often the sweep re-reads forge's catch-up map. a missed pack is a
+/// quality-of-service gap, not an availability one (the committed head is
+/// durable and the root is correct either way), so this is deliberately slow:
+/// it costs one `stat` per tick when nothing is outstanding.
+const PACK_SWEEP_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// the largest forge pack this lane will pull — the smart-HTTP push lane's own
+/// body limit (`GIT_PACK_BODY_LIMIT`), because that is the ceiling on a pack
+/// that could legitimately have reached consensus in the first place.
+///
+/// The bound is load-bearing, not tidiness. A digest here was chosen by whoever
+/// submitted the push; naming an enormous blob some colluding node will serve
+/// would otherwise have every node in the network stage it, every tick, before
+/// the hash check could reject it. Sizing the cap to what a real push can be
+/// keeps that to one legitimate pack's worth of disk.
+pub const MAX_FORGE_PACK_BYTES: u64 = 512 * 1024 * 1024;
+
+/// pull the packs forge is waiting on, forever.
+///
+/// forge's submit-time fanout reaches only the CURRENT validators, so a
+/// resident — or a validator that was down during the push — holds a committed
+/// head whose objects never arrive. its on-disk git ref then lags that head
+/// indefinitely and `git clone` from this node serves a stale branch. nothing
+/// else breaks: the committed head is durable and the root is correct with or
+/// without the objects (that decoupling IS forge's fork-safety invariant).
+///
+/// this closes the gap from the OUTSIDE: read the digests forge published in
+/// its own catch-up file, fetch the bytes through the same verified ranged lane
+/// module code uses, and stop. forge picks them up from its blob store on its
+/// next `commit_block` — nothing here touches the repo, the module, or the
+/// host, so it can never influence a root.
+pub async fn sweep_forge_packs<C: SyncClient + SourceRotate>(
+    client: C,
+    blobs: blobstore::BlobHandle,
+    forge_repo: std::path::PathBuf,
+    label: String,
+) {
+    loop {
+        tokio::time::sleep(PACK_SWEEP_TICK).await;
+        sweep_packs_once(&client, &blobs, &forge_repo, &label).await;
+    }
+}
+
+/// one sweep tick — the whole body, so it is reachable without a clock.
+/// returns how many packs this tick pulled.
+async fn sweep_packs_once<C: SyncClient + SourceRotate>(
+    client: &C,
+    blobs: &blobstore::BlobHandle,
+    forge_repo: &std::path::Path,
+    label: &str,
+) -> usize {
+    // a corrupt map is forge's own fail-stop at boot; from out here it is just
+    // a sweep with nothing it can act on.
+    let outstanding = match forge::pending_digests(forge_repo) {
+        Ok(digests) => digests,
+        Err(e) => {
+            tracing::debug!(
+                target: "ducktape::forge",
+                node = %label,
+                error = %e,
+                reason = "pending_unreadable",
+                "pack sweep idle"
+            );
+            return 0;
+        }
+    };
+    let mut pulled = 0usize;
+    for digest in outstanding {
+        if blobs.has_chunk(&digest) {
+            continue; // held already; forge materializes it on its own.
+        }
+        if let Err(e) = fetch_blob(
+            client,
+            blobs,
+            &digest,
+            MAX_FORGE_PACK_BYTES,
+            crate::constants::BLOB_FETCH_ATTEMPTS,
+        )
+        .await
+        {
+            // every tick retries, so this is per-attempt noise, not a failure:
+            // the branch simply stays behind one more tick.
+            tracing::debug!(
+                target: "ducktape::forge",
+                node = %label,
+                reason = "pack_fetch_failed",
+                error = %e,
+                "pack sweep could not pull a committed head's objects"
+            );
+            continue;
+        }
+        pulled += 1;
+        tracing::info!(
+            target: "ducktape::forge",
+            node = %label,
+            "pulled a forge pack this node was missing"
+        );
+    }
+    pulled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,6 +670,85 @@ mod tests {
         assert_eq!(
             serve_blob(&blobs, &big),
             statesync::SyncResponse::Blob { bytes: None }
+        );
+    }
+
+    /// a forge workspace holding a committed head whose pack never arrived —
+    /// the exact state a resident lands in, since it is never a submit-time
+    /// fanout target. built through forge's real push path, so the catch-up
+    /// file is written by the code that owns it.
+    fn workspace_missing_a_pack(tag: &str, pack: Vec<u8>) -> (tempfile::TempDir, [u8; 32]) {
+        let dir = tempfile::Builder::new().prefix(tag).tempdir().expect("tmp");
+        // the digest is content-addressed, so name the pack without holding it.
+        let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&pack).into();
+        let mut forge = forge::Forge::with_blobs(
+            "forge",
+            dir.path().to_path_buf(),
+            blobstore::BlobHandle::default(),
+        )
+        .expect("forge");
+        let msg = sdk::Msg {
+            target: "forge".into(),
+            payload: forge::encode_msg(&forge::ForgeMsg::PushRefs {
+                repo: "demo".into(),
+                updates: vec![forge::RefUpdate {
+                    ref_name: "main".into(),
+                    prev_oid: None,
+                    new_oid: Some(vec![7u8; 20]),
+                }],
+                pack_digest: Some(digest.to_vec()),
+            }),
+        };
+        let mut ctx = sdk_testkit::TestCtx::with_env(sdk::Env {
+            height: 0,
+            consensus_time: 1,
+            origin: sdk::Origin::External(vec![1u8; 32]),
+            me: "forge".into(),
+        });
+        futures::executor::block_on(async {
+            <forge::Forge as sdk::Module>::execute(&mut forge, &mut ctx, &msg)
+                .await
+                .expect("push");
+            <forge::Forge as sdk::Module>::commit_block(&mut forge)
+                .await
+                .expect("commit");
+        });
+        (dir, digest)
+    }
+
+    #[tokio::test]
+    async fn the_sweep_pulls_a_pack_forge_is_waiting_on_and_then_goes_quiet() {
+        let pack = payload();
+        let (dir, digest) = workspace_missing_a_pack("sweep-pull", pack.clone());
+
+        let source = blobstore::BlobHandle::default();
+        assert_eq!(source.put_chunk(pack.clone()), digest, "content-addressed");
+        let local = blobstore::BlobHandle::default();
+        let client = StoreClient::new(vec![source]);
+
+        assert_eq!(
+            sweep_packs_once(&client, &local, dir.path(), "n").await,
+            1,
+            "the outstanding pack is pulled"
+        );
+        assert_eq!(local.get_chunk(&digest), Some(pack));
+
+        // forge has not run a block yet, so the head is still outstanding — but
+        // the bytes are held now, so the sweep must not re-fetch them.
+        assert_eq!(
+            sweep_packs_once(&client, &local, dir.path(), "n").await,
+            0,
+            "a held pack is forge's to materialize, not ours to re-pull"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_is_inert_without_a_forge_workspace() {
+        let dir = tempfile::Builder::new().prefix("sweep-none").tempdir().unwrap();
+        let client = StoreClient::new(vec![blobstore::BlobHandle::default()]);
+        assert_eq!(
+            sweep_packs_once(&client, &blobstore::BlobHandle::default(), dir.path(), "n").await,
+            0,
         );
     }
 }

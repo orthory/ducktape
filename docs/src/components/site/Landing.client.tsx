@@ -147,7 +147,7 @@ export function Landing() {
       <Hero
         eyebrow="Consensus-based workplace OS"
         title={<>A workplace super-app, <em>replicated by consensus.</em></>}
-        subtitle="Ducktape is one BFT-replicated state machine that hosts isolated, authenticated product modules — pages, forge, chat, agent workflows. Each module owns its state and exposes a single 32-byte root; the host folds them into one app-hash that consensus commits."
+        subtitle="Ducktape is one BFT-replicated state machine that hosts isolated, authenticated product modules — pages, forge, chat, agent workflows. Each module owns its state and exposes a single 32-byte root; the host folds them into one root-hash that consensus commits."
         actions={(
           <>
             <Action href="/en/human">Explore the platform</Action>
@@ -162,7 +162,7 @@ export function Landing() {
         <Stat value="12" label="Product modules" />
         <Stat value="10" label="Kernel crates" />
         <Stat value="17" label="System modules" />
-        <Stat value="1" label="Global app-hash" />
+        <Stat value="1" label="Global root-hash" />
       </StatRow>
 
       <SectionHead eyebrow="The module rule" title="Isolation you can review, composition you can verify">
@@ -180,9 +180,9 @@ export function Landing() {
           Cross-module reads go through host-routed queries. Cross-module writes are
           emitted as messages the host drains as follow-up ops inside the same block.
         </Feature>
-        <Feature icon="hash" title="One app-hash">
-          The host folds every module's sorted root into a single global app-hash. If
-          two nodes agree on the app-hash, they agree on every module's state.
+        <Feature icon="hash" title="One root-hash">
+          The host folds every module's sorted root into a single global root-hash. If
+          two nodes agree on the root-hash, they agree on every module's state.
         </Feature>
       </FeatureGrid>
 
@@ -199,11 +199,11 @@ export function Landing() {
         </Feature>
         <Feature icon="lock" title="Authenticated state">
           Each module commits an authenticated root — QMDB key-value, a git head, or
-          canonical snapshot bytes — that the app-hash makes tamper-evident.
+          canonical snapshot bytes — that the root-hash makes tamper-evident.
         </Feature>
         <Feature icon="sync" title="Verifiable state sync">
           Joiners rebuild committed state over the sync wire and land on the exact
-          source app-hash before they ever apply a new block.
+          source root-hash before they ever apply a new block.
         </Feature>
         <Feature icon="agent" title="Agent-native">
           Runs, dispatch, and a deterministic saga seam let coding agents act as
@@ -220,8 +220,8 @@ export function Landing() {
       </FeatureGrid>
 
       <SectionHead eyebrow="Two reader tracks" title="Docs for the people building it — and the agents running it">
-        Every topic is written twice, on purpose. Pick the track that matches how you
-        read; switch languages from the top navigation.
+        Pick the track that matches how you read: product context for people or
+        implementation detail for coding agents.
       </SectionHead>
 
       <TrackCards>
@@ -229,8 +229,7 @@ export function Landing() {
           kind="human"
           title="Product & architecture"
           links={[
-            { label: 'English', href: '/en/human' },
-            { label: '한국어', href: '/ko/human' },
+            { label: 'Read docs', href: '/en/human' },
           ]}
         >
           Platform shape, the consensus core, the module model, product modules,
@@ -241,8 +240,7 @@ export function Landing() {
           kind="agent"
           title="Operating notes for agents"
           links={[
-            { label: 'English', href: '/en/agent' },
-            { label: '한국어', href: '/ko/agent' },
+            { label: 'Read docs', href: '/en/agent' },
           ]}
         >
           Tighter implementation maps: determinism and state-sync contracts, validator

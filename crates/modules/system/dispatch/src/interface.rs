@@ -86,7 +86,7 @@ pub enum OutputContract {
 }
 
 /// one registered what-to-run manifest — an ordered-op registration, so which
-/// capability and contract a recipe binds is part of the app-hash. `owner` is
+/// capability and contract a recipe binds is part of the root-hash. `owner` is
 /// the registration origin and gates every mutation.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Recipe {
@@ -133,8 +133,11 @@ pub struct DispatchView {
     /// module (`Dispatch` is module-origin-only).
     pub receiver: String,
     pub status: DispatchStatus,
-    /// the contract-checked outcome, present from `AwaitingDelivery` on.
-    /// `Err` carries the saga failure or the contract violation.
+    /// the contract-checked outcome, present ONLY while `AwaitingDelivery`.
+    /// `Err` carries the saga failure or the contract violation. delivery
+    /// hands the bytes to the receiver and drops this copy — a `Delivered`
+    /// record is a fixed-size receipt, never a second ledger of every result
+    /// the network ever produced.
     pub outcome: Option<Result<Vec<u8>, String>>,
     pub created_at: u64,
     pub updated_at: u64,

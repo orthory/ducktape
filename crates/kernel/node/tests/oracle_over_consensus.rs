@@ -17,7 +17,7 @@
 //!    consensus broadcast; per-node `RoundOrderer`s share no wire, exactly as the
 //!    agreed-order convergence test feeds the same op-set to each node).
 //! 4. draining it advances every validator's saga to `Done` on the agreed result;
-//!    all converge on the byte-identical app-hash.
+//!    all converge on the byte-identical root-hash.
 //!
 //! this proves the OracleResult re-entered as an ORDERED OP: the worker never
 //! touched saga state; it only produced a `Msg` that went through `submit`.
@@ -33,6 +33,16 @@ use saga::{
     encode_msg, encode_query,
 };
 use sdk::{Event, Msg};
+
+/// saga's id space is namespaced per trigger origin, and an op submitted
+/// through `OrderedNode::submit` carries its SIGNER's key as that origin.
+fn sid(signer: &commonware_cryptography::ed25519::PrivateKey, id: &str) -> String {
+    use commonware_cryptography::Signer as _;
+    saga::namespaced_id(
+        &sdk::Origin::External(signer.public_key().as_ref().to_vec()),
+        id,
+    )
+}
 
 fn trigger(id: &str, spec: &[u8]) -> Msg {
     Msg {
@@ -114,45 +124,51 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
         const N: usize = 3;
         let mut nodes: Vec<OrderedNode<RoundOrderer>> = (0..N)
             .map(|_| {
-                let host = Host::genesis(vec![Box::new(SagaModule::new("saga"))]).expect("genesis");
+                let host = Host::genesis(vec![Box::new(SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new())))]).expect("genesis");
                 OrderedNode::new(host, RoundOrderer::new())
             })
             .collect();
 
-        // identical genesis -> identical app-hash on every validator.
-        let genesis = nodes[0].app_hash();
+        // identical genesis -> identical root-hash on every validator.
+        let genesis = nodes[0].root_hash();
         for n in &nodes {
             assert_eq!(
-                n.app_hash(),
+                n.root_hash(),
                 genesis,
-                "identical genesis -> identical app-hash"
+                "identical genesis -> identical root-hash"
             );
         }
 
         // (1) the Trigger op is agreed -> submit to every validator's order, drain.
-        broadcast(&mut nodes, &sk(1), 0, &trigger("s1", b"hello")).await;
+        broadcast(
+            &mut nodes,
+            &sk(1),
+            0,
+            &trigger(&sid(&sk(1), "s1"), b"hello"),
+        )
+        .await;
         for n in &mut nodes {
             drain_fixpoint(n).await;
         }
 
         // every validator holds the saga at Pending (agreed), moved off genesis,
         // and surfaced exactly one WorkerRequest effect.
-        let pending = nodes[0].app_hash();
+        let pending = nodes[0].root_hash();
         assert_ne!(
             pending, genesis,
-            "creating the pending saga moved the app-hash off genesis"
+            "creating the pending saga moved the root-hash off genesis"
         );
         let events_per_node: Vec<Vec<Event>> =
             nodes.iter_mut().map(|n| n.take_events()).collect();
         for (i, n) in nodes.iter().enumerate() {
-            assert_eq!(n.app_hash(), pending, "all validators converge at Pending");
+            assert_eq!(n.root_hash(), pending, "all validators converge at Pending");
             assert_eq!(
                 events_per_node[i].len(),
                 1,
                 "each node surfaced one WorkerRequest event"
             );
             assert_eq!(
-                saga_view(n, "s1").await.unwrap().status,
+                saga_view(n, &sid(&sk(1), "s1")).await.unwrap().status,
                 SagaStatus::Pending,
                 "still Pending: no oracle op yet"
             );
@@ -170,19 +186,19 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
         }
 
         // THE MILESTONE: every validator advanced to Done on the AGREED result and
-        // converged on the byte-identical app-hash.
-        let done = nodes[0].app_hash();
+        // converged on the byte-identical root-hash.
+        let done = nodes[0].root_hash();
         assert_ne!(
             done, pending,
-            "the oracle op moved the app-hash off Pending"
+            "the oracle op moved the root-hash off Pending"
         );
         for n in &nodes {
             assert_eq!(
-                n.app_hash(),
+                n.root_hash(),
                 done,
-                "all validators converge on the Done app-hash"
+                "all validators converge on the Done root-hash"
             );
-            let v = saga_view(n, "s1").await.expect("saga exists");
+            let v = saga_view(n, &sid(&sk(1), "s1")).await.expect("saga exists");
             assert_eq!(v.status, SagaStatus::Done, "every validator's saga is Done");
             assert_eq!(
                 v.result,

@@ -20,7 +20,8 @@ use lifecycle::{
     Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply, decode_reply as lifecycle_decode,
     encode_msg as lifecycle_encode, encode_query as lifecycle_query,
 };
-use sdk::{Error, Module as _, Msg, Origin};
+use sdk::{Error, Msg, Origin};
+use sdk_testkit::MemStore;
 use valset::Valset;
 
 fn member_key(seed: u8) -> Vec<u8> {
@@ -39,13 +40,21 @@ fn hash(seed: u8) -> Vec<u8> {
 /// a host with valset (members 1,2) + governance wired to the REAL code
 /// registry, and the `hello` module pre-registered (active code = hash(1)).
 async fn gov_host_with_modreg() -> Host {
-    let mut valset = Valset::new("valset");
-    valset.insert(member_key(1));
-    valset.insert(member_key(2));
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+    valset.seed(member_key(1)).await.expect("seed valset");
+    valset.seed(member_key(2)).await.expect("seed valset");
+    valset.finish_seed().await.expect("seed valset");
     let mut host = Host::genesis(vec![
         Box::new(valset),
-        Box::new(Governance::new("governance", "valset", "identity").with_code_registry("lifecycle")),
-        Box::new(Lifecycle::new("lifecycle", "valset")),
+        Box::new(
+            Governance::new("governance", Box::new(MemStore::new()), "valset", "identity")
+                .with_code_registry("lifecycle"),
+        ),
+        Box::new(Lifecycle::new(
+            "lifecycle",
+            Box::new(MemStore::new()),
+            "valset",
+        )),
     ])
     .expect("genesis");
     // genesis-bootstrap the swappable module's initial code (System origin).
@@ -171,7 +180,7 @@ fn a_passing_update_module_lands_a_pending_swap_in_the_registry() {
             1,
             "mod-1",
             GovAction::UpdateModule {
-                name: "hello-v2".into(),
+                name: "hello-replacement".into(),
                 module_id: "hello".into(),
                 activation_height: 500,
                 code_hash: hash(2),
@@ -186,7 +195,7 @@ fn a_passing_update_module_lands_a_pending_swap_in_the_registry() {
         let code = hello_code(&host).await;
         assert_eq!(code.active_code_hash, hash(1), "active untouched until H");
         let pending = code.pending.expect("pending swap landed");
-        assert_eq!(pending.name, "hello-v2");
+        assert_eq!(pending.name, "hello-replacement");
         assert_eq!(pending.activation_height, 500);
         assert_eq!(pending.code_hash, hash(2));
     });
@@ -202,7 +211,7 @@ fn a_passing_cancel_module_update_clears_the_pending_swap() {
             1,
             "mod-1",
             GovAction::UpdateModule {
-                name: "hello-v2".into(),
+                name: "hello-replacement".into(),
                 module_id: "hello".into(),
                 activation_height: 500,
                 code_hash: hash(2),
@@ -216,7 +225,7 @@ fn a_passing_cancel_module_update_clears_the_pending_swap() {
             10,
             "mod-cancel",
             GovAction::CancelModuleUpdate {
-                name: "hello-v2".into(),
+                name: "hello-replacement".into(),
                 module_id: "hello".into(),
             },
         )
@@ -241,7 +250,7 @@ fn a_refused_schedule_fails_execute_atomically() {
             gov_encode(&GovMsg::Propose {
                 proposal_id: "mod-ghost".into(),
                 action: GovAction::UpdateModule {
-                    name: "v2".into(),
+                    name: "replacement".into(),
                     module_id: "ghost".into(), // never registered
                     activation_height: 500,
                     code_hash: hash(2),
@@ -298,7 +307,7 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
             gov_encode(&GovMsg::Propose {
                 proposal_id: "mod-short".into(),
                 action: GovAction::UpdateModule {
-                    name: "v2".into(),
+                    name: "replacement".into(),
                     module_id: "hello".into(),
                     activation_height: 500,
                     code_hash: vec![1, 2, 3],
@@ -315,11 +324,17 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
         assert_eq!(proposal_status(&host, "mod-short").await, None);
 
         // an UNWIRED registry (Governance::new without with_code_registry).
-        let mut valset = Valset::new("valset");
-        valset.insert(member_key(1));
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        valset.seed(member_key(1)).await.expect("seed valset");
+        valset.finish_seed().await.expect("seed valset");
         let mut unwired = Host::genesis(vec![
             Box::new(valset),
-            Box::new(Governance::new("governance", "valset", "identity")),
+            Box::new(Governance::new(
+                "governance",
+                Box::new(MemStore::new()),
+                "valset",
+                "identity",
+            )),
         ])
         .expect("genesis");
         let err = submit_as(
@@ -329,7 +344,7 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
             gov_encode(&GovMsg::Propose {
                 proposal_id: "mod-unwired".into(),
                 action: GovAction::UpdateModule {
-                    name: "v2".into(),
+                    name: "replacement".into(),
                     module_id: "hello".into(),
                     activation_height: 500,
                     code_hash: hash(2),
@@ -346,97 +361,6 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
     });
 }
 
-/// tags 7 (UpdateModule) and 8 (CancelModuleUpdate) round-trip through
-/// encode/decode_state — snapshot bytes reconstruct the exact action fields.
-#[test]
-fn snapshot_install_round_trips_module_update_proposals() {
-    block_on(async {
-        let mut host = gov_host_with_modreg().await;
-        let m1 = member_key(1);
-        for (id, action) in [
-            (
-                "mod-snap-update",
-                GovAction::UpdateModule {
-                    name: "hello-v2".into(),
-                    module_id: "hello".into(),
-                    activation_height: 900,
-                    code_hash: hash(3),
-                },
-            ),
-            (
-                "mod-snap-cancel",
-                GovAction::CancelModuleUpdate {
-                    name: "hello-v2".into(),
-                    module_id: "hello".into(),
-                },
-            ),
-        ] {
-            submit_as(
-                &mut host,
-                &m1,
-                1,
-                gov_encode(&GovMsg::Propose {
-                    proposal_id: id.into(),
-                    action,
-                    voting_period: 100,
-                }),
-            )
-            .await
-            .expect("propose");
-        }
-
-        let root = host.module_root("governance").expect("gov root");
-        let sdk::StateSyncHandle::SnapshotBytes(bytes) = ({
-            let finalized = host::FinalizedBlock {
-                height: 1,
-                app_hash: host.app_hash(),
-            };
-            host.capture_finalized_snapshot(finalized)
-                .expect("capture")
-                .module("governance")
-                .expect("gov entry")
-                .state_sync
-                .clone()
-        }) else {
-            panic!("governance must advertise snapshot bytes");
-        };
-
-        let mut rebuilt =
-            Governance::new("governance", "valset", "identity").with_code_registry("lifecycle");
-        rebuilt.install(&bytes, root).expect("install");
-        assert_eq!(rebuilt.root(), root, "installed root equals the source root");
-
-        for (id, want) in [
-            (
-                "mod-snap-update",
-                GovAction::UpdateModule {
-                    name: "hello-v2".into(),
-                    module_id: "hello".into(),
-                    activation_height: 900,
-                    code_hash: hash(3),
-                },
-            ),
-            (
-                "mod-snap-cancel",
-                GovAction::CancelModuleUpdate {
-                    name: "hello-v2".into(),
-                    module_id: "hello".into(),
-                },
-            ),
-        ] {
-            let reply = rebuilt
-                .query(&gov_query(&GovQuery::Proposal {
-                    proposal_id: id.into(),
-                }))
-                .await
-                .expect("query");
-            let GovReply::Proposal(Some(view)) = gov_decode(&reply).expect("decode") else {
-                panic!("proposal {id} must be present after install");
-            };
-            assert_eq!(view.action, want);
-        }
-    });
-}
 
 /// the module lookup, admission flavor: any id, absent allowed.
 async fn module_code(host: &Host, id: &str) -> Option<lifecycle::ModuleCode> {
@@ -581,4 +505,3 @@ fn register_module_of_an_existing_id_fails_execute_atomically() {
         assert!(code.pending.is_none(), "no pending landed");
     });
 }
-

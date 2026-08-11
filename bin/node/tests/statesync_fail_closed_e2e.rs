@@ -35,7 +35,7 @@ fn a_non_standing_peer_is_refused_statesync() {
     // validator set and holds no resident grant — i.e. no committed standing.
     let mut cluster = Cluster::new(&[0, 1], &[0]);
     cluster.spawn(0);
-    cluster.wait_marker(0, "genesis app_hash=", Duration::from_secs(60));
+    cluster.wait_marker(0, "genesis root_hash=", Duration::from_secs(60));
 
     // give the founder REAL, servable state and a finalized boundary, so the
     // ONLY reason node 1 cannot obtain a manifest is the fail-closed refusal —
@@ -65,7 +65,7 @@ fn a_non_standing_peer_is_refused_statesync() {
          instead synced:\n{log}"
     );
     assert!(
-        !log.contains("synced app_hash="),
+        !log.contains("synced root_hash="),
         "no boundary may be served to a standing-less key:\n{log}"
     );
     // it DID reach the wire and get refused (not merely fail to connect): the

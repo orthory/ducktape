@@ -1,6 +1,6 @@
 //! the saga module's public wire surface — types only.
 //!
-//! saga v2 is the deterministic async-RPC ledger: one effect, one agreed
+//! Saga is the deterministic async-RPC ledger: one effect, one agreed
 //! result, with attempts, leases, deadlines, and a requester callback. six op
 //! shapes cross this surface, all as [`SagaMsg`]:
 //!
@@ -22,19 +22,49 @@
 //!   past-deadline timeouts and expires stale leases (retry or fail). anyone
 //!   may crank; safety never depends on who does.
 //! - `Cancel` terminates a pending saga — gated to the trigger origin.
-//! - `Prune` removes TERMINAL sagas — gated to the trigger origin per id. GC
-//!   is explicit; there is no lazy retention sweep.
+//! - `Prune` removes TERMINAL sagas on demand — gated to the trigger origin
+//!   per id. it is the owner's EAGER GC on top of a bounded automatic trim:
+//!   every op also drops the terminal tail past a fixed count/byte cap
+//!   (newest kept first), so a terminal saga is never guaranteed to still be
+//!   readable — treat the callback, not the ledger, as the durable result.
 //!
 //! every terminal transition with a `reply_to` emits a [`SagaCallback`] msg to
 //! the requester in the SAME block — requesters depend only on this crate to
 //! decode it. reads go via [`SagaQuery`] -> [`SagaReply`].
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use sdk::codec;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// a saga's stable id, chosen by the trigger.
+/// a saga's stable id, chosen by the trigger — inside the trigger's OWN
+/// namespace (see [`namespaced_id`]).
 pub type SagaId = String;
+
+/// compose the only saga id a given origin may trigger: its own actor
+/// namespace ([`sdk::Origin::actor_string`] — a module id verbatim,
+/// `ext:<hex>` for an external submitter, `system`), then [`sdk::KEY_SEP`],
+/// then the caller's local id.
+///
+/// the id space is OWNED, not first-come: a saga id is a public handle other
+/// components re-derive (dispatch's `dispatch{SEP}{receiver}{SEP}{id}`, and
+/// `runs`' mirror of it), so an unowned space lets any member SQUAT a
+/// predictable id ahead of its producer. the producer's own trigger would
+/// then hit the duplicate no-op and its work would sit at `Pending` forever,
+/// under the squatter's `Cancel`/`Prune`. the namespace makes the id prove
+/// who created it, and [`SagaMsg::Trigger`] enforces it.
+pub fn namespaced_id(origin: &sdk::Origin, local_id: &str) -> SagaId {
+    format!("{}{}{local_id}", origin.actor_string(), sdk::KEY_SEP)
+}
+
+/// true when `saga_id` sits inside `origin`'s own namespace — the exact
+/// admission [`SagaMsg::Trigger`] applies, factored out so producers and
+/// tests can ask the same question without rebuilding the string.
+pub fn owns_id(origin: &sdk::Origin, saga_id: &str) -> bool {
+    saga_id
+        .strip_prefix(&origin.actor_string())
+        .is_some_and(|rest| rest.starts_with(sdk::KEY_SEP))
+}
 
 /// hard cap on an accepted oracle result's byte length — a consensus constant,
 /// enforced at execute time so an oversized result can never commit into the
@@ -71,7 +101,18 @@ pub const MAX_CAPABILITY_BYTES: usize = 64;
 /// recorded trigger origin may act) and rides in the committed encoding —
 /// `sdk::Origin` itself is neither `Ord` nor serializable, so this type is the
 /// wire/state form.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SagaOrigin {
     /// an external submitter, identified by (e.g.) an ed25519 id.
@@ -124,6 +165,9 @@ pub enum SagaMsg {
     /// must name a registered module (validated at trigger time — the
     /// callback-poison rule) and `max_attempts` must be >= 1.
     Trigger {
+        /// must sit in the trigger origin's OWN namespace ([`namespaced_id`]);
+        /// a trigger for anyone else's namespace is REJECTED, so the duplicate
+        /// no-op above can only ever swallow the id owner's own retrigger.
         saga_id: SagaId,
         /// opaque work spec (e.g. a dispatch WorkSpec), echoed to the worker.
         spec: Vec<u8>,
@@ -281,7 +325,9 @@ pub enum WorkerControlCommand {
 /// where a saga is in its (deterministic) lifecycle. `Pending` until an
 /// ordered op resolves it into one of the four terminal states — the ledger
 /// only advances via ordered ops, never node-local.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SagaStatus {
     Pending,
@@ -343,6 +389,20 @@ pub enum SagaQuery {
     AssignedPending {
         assignee: Vec<u8>,
     },
+    /// every PENDING saga whose current attempt is UNASSIGNED, projected as
+    /// the [`WorkerRequest`]s the effect lane would have carried — the
+    /// ANNOUNCEMENT requests, which a capable host claims with
+    /// [`SagaMsg::Accept`] and the first accept in consensus order wins.
+    ///
+    /// The twin of [`Self::AssignedPending`], and needed for the same reason:
+    /// a host that does not execute blocks never observes the effect that
+    /// carried the announcement. Without this read, an announcement can only
+    /// be claimed by a node running the pool in-process — which is no node at
+    /// all now that compute is a standalone daemon.
+    ///
+    /// Read-only, like every other variant here: it derives a projection from
+    /// committed state and stages nothing.
+    UnassignedPending,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -357,6 +417,7 @@ pub enum SagaReply {
     Saga(Option<SagaView>),
     NextExpiry(Option<u64>),
     AssignedPending(Vec<WorkerRequest>),
+    UnassignedPending(Vec<WorkerRequest>),
 }
 
 /// a saga's observable state — the full read projection.

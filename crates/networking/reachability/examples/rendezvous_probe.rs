@@ -80,7 +80,7 @@ async fn main() {
     println!("coordinator: {coord_host} -> {coord}");
 
     let started = std::time::Instant::now();
-    let mut resolver = NatResolver::bind(key, vec![coord], Some((signer, None)))
+    let mut resolver = NatResolver::bind(key, vec![coord], (signer, None))
         .await
         .unwrap_or_else(|e| {
             eprintln!("binding the rendezvous socket failed: {e}");

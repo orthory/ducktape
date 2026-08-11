@@ -1,185 +1,156 @@
-//! the task board (assigned-list kind): an ordered, deterministic in-memory
-//! task list.
+//! the task board (assigned-list kind): an ordered, deterministic task list
+//! over the module's qmdb store.
 //!
-//! writes stage during `execute` and publish only at `commit`; the canonical
-//! bytes `encode_committed` produces are hashed into the module root. it is a
-//! plain shared list -- no claims, no origin-derived identity.
+//! each task is its OWN record (`t/{task_id}`), so a create or a status change
+//! touches one key. the store hashes its keys and cannot enumerate, so the
+//! ascending id order [`TaskQuery::List`] answers in lives in ONE enumeration
+//! index record (`t#`) -- the same shape `pages` uses for its page index.
+//!
+//! writes stage during `execute` and publish only at `commit_block`; reads go
+//! through the staged overlay, so a later op in the same block sees an earlier
+//! one's write. `List` reads through it too -- DELIBERATELY, and unlike the job
+//! board's committed-only `Get`: `automations` probes this list mid-block for a
+//! duplicate id before emitting its create, so a task staged earlier in the
+//! SAME block must be visible or the probe passes and the create aborts the
+//! block. do not "harmonize" the two boards' read visibility.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
-use sdk::codec::{self, Cursor};
-use sdk::{Error, require_non_empty};
+use sdk::{Error, StagedStore, require_non_empty};
 
-use crate::{Task, TaskMsg, TaskReply, TaskStatus};
+use crate::{Task, TaskMsg, TaskReply, TaskStatus, check_record, stage_record};
 
-#[derive(Default)]
-pub(crate) struct TaskBoard {
-    tasks: BTreeMap<String, Task>,
-    pending: BTreeMap<String, Task>,
+/// max bytes of a `task_id`, matching the job board's [`crate::MAX_JOB_ID`].
+///
+/// this cap is load-bearing, not cosmetic: every id shares the ONE `t#` index
+/// record bounded by [`crate::MAX_RECORD_BYTES`], so an UNCAPPED id let two or
+/// three ops (an op frame carries up to `node::MAX_FRAME_BYTES`, 1 MiB + 16 KiB)
+/// pack that record to just under the cap and refuse EVERY later create, for
+/// every user, forever -- there is no delete op to recover with.
+pub const MAX_TASK_ID: usize = 256;
+
+/// one task record per id.
+const RECORD_PREFIX: &[u8] = b"t/";
+/// the enumeration index: every live task id, ascending.
+///
+// ponytail: ONE index record holds every task id, so a create is O(all ids) in
+// bytes and the board stops where that record hits MAX_RECORD_BYTES (~4k ids at
+// the MAX_TASK_ID cap, ~26k at uuid-shaped ids). that stop is PERMANENT, not a
+// degradation: there is no delete op, so nothing frees index bytes once they
+// are committed. a human task list never gets there; if it must, shard the
+// index by id prefix BEFORE the board is used at that scale.
+const INDEX_KEY: &[u8] = b"t#";
+
+fn record_key(task_id: &str) -> Vec<u8> {
+    let mut key = RECORD_PREFIX.to_vec();
+    key.extend_from_slice(task_id.as_bytes());
+    key
 }
 
-impl TaskBoard {
-    pub(crate) fn new() -> Self {
-        Self::default()
+/// read one task through the staged overlay (`None` == absent).
+async fn load(staged: &StagedStore, task_id: &str) -> Result<Option<Task>, Error> {
+    let Some(bytes) = staged.get(&record_key(task_id)).await? else {
+        return Ok(None);
+    };
+    sdk::wire::decode(&bytes)
+        .map(Some)
+        .map_err(|e| Error::Module(format!("task record decode: {e}")))
+}
+
+/// read the enumeration index through the staged overlay. absent reads as the
+/// empty set; `BTreeSet` serializes ASCENDING, so the bytes are canonical and
+/// every validator commits the same index record.
+async fn load_index(staged: &StagedStore) -> Result<BTreeSet<String>, Error> {
+    let Some(bytes) = staged.get(INDEX_KEY).await? else {
+        return Ok(BTreeSet::new());
+    };
+    sdk::wire::decode(&bytes).map_err(|e| Error::Module(format!("task index decode: {e}")))
+}
+
+async fn create(
+    staged: &mut StagedStore,
+    task_id: String,
+    title: String,
+    consensus_time: u64,
+) -> Result<(), Error> {
+    sdk::validate_id("task_id", &task_id, MAX_TASK_ID)?;
+    require_non_empty("title", &title)?;
+    if load(staged, &task_id).await?.is_some() {
+        return Err(Error::Module(format!("task already exists: {task_id}")));
     }
 
-    fn get(&self, task_id: &str) -> Option<&Task> {
-        self.pending.get(task_id).or_else(|| self.tasks.get(task_id))
+    let task = Task {
+        id: task_id.clone(),
+        title,
+        status: TaskStatus::Open,
+        created_at: consensus_time,
+        updated_at: consensus_time,
+    };
+    let mut index = load_index(staged).await?;
+    index.insert(task_id.clone());
+
+    // a create writes TWO records; check both BEFORE staging either, so a
+    // refusal leaves the overlay untouched (never an index entry naming a task
+    // whose record was refused).
+    let record = sdk::wire::encode(&task);
+    let index_record = sdk::wire::encode(&index);
+    check_record(&record, "task record")?;
+    check_record(&index_record, "task index")?;
+    staged.stage(record_key(&task_id), record);
+    staged.stage(INDEX_KEY.to_vec(), index_record);
+    Ok(())
+}
+
+async fn update_status(
+    staged: &mut StagedStore,
+    task_id: String,
+    status: TaskStatus,
+    consensus_time: u64,
+) -> Result<(), Error> {
+    sdk::validate_id("task_id", &task_id, MAX_TASK_ID)?;
+    let mut task = load(staged, &task_id)
+        .await?
+        .ok_or_else(|| Error::Module(format!("task not found: {task_id}")))?;
+    // an accepted no-op: it stages NOTHING, so the block's root holds.
+    if task.status == status {
+        return Ok(());
     }
 
-    fn list(&self) -> Vec<Task> {
-        let mut merged = self.tasks.clone();
-        for (id, task) in &self.pending {
-            merged.insert(id.clone(), task.clone());
+    task.status = status;
+    task.updated_at = consensus_time;
+    stage_record(
+        staged,
+        record_key(&task_id),
+        sdk::wire::encode(&task),
+        "task record",
+    )
+}
+
+pub(crate) async fn execute(
+    staged: &mut StagedStore,
+    msg: TaskMsg,
+    consensus_time: u64,
+) -> Result<(), Error> {
+    match msg {
+        TaskMsg::CreateTask { task_id, title } => {
+            create(staged, task_id, title, consensus_time).await
         }
-        merged.into_values().collect()
-    }
-
-    pub(crate) fn create(
-        &mut self,
-        task_id: String,
-        title: String,
-        consensus_time: u64,
-    ) -> Result<(), Error> {
-        require_non_empty("task_id", &task_id)?;
-        require_non_empty("title", &title)?;
-        if self.get(&task_id).is_some() {
-            return Err(Error::Module(format!("task already exists: {task_id}")));
+        TaskMsg::UpdateStatus { task_id, status } => {
+            update_status(staged, task_id, status, consensus_time).await
         }
-
-        self.pending.insert(
-            task_id.clone(),
-            Task {
-                id: task_id,
-                title,
-                status: TaskStatus::Open,
-                created_at: consensus_time,
-                updated_at: consensus_time,
-            },
-        );
-        Ok(())
-    }
-
-    pub(crate) fn update_status(
-        &mut self,
-        task_id: String,
-        status: TaskStatus,
-        consensus_time: u64,
-    ) -> Result<(), Error> {
-        require_non_empty("task_id", &task_id)?;
-        let mut task = self
-            .get(&task_id)
-            .cloned()
-            .ok_or_else(|| Error::Module(format!("task not found: {task_id}")))?;
-        if task.status == status {
-            return Ok(());
-        }
-
-        task.status = status;
-        task.updated_at = consensus_time;
-        self.pending.insert(task_id, task);
-        Ok(())
-    }
-
-    pub(crate) fn execute(&mut self, msg: TaskMsg, consensus_time: u64) -> Result<(), Error> {
-        match msg {
-            TaskMsg::CreateTask { task_id, title } => self.create(task_id, title, consensus_time),
-            TaskMsg::UpdateStatus { task_id, status } => {
-                self.update_status(task_id, status, consensus_time)
-            }
-        }
-    }
-
-    pub(crate) fn query_list(&self) -> TaskReply {
-        TaskReply::Tasks(self.list())
-    }
-
-    pub(crate) fn commit(&mut self) {
-        for (id, task) in std::mem::take(&mut self.pending) {
-            self.tasks.insert(id, task);
-        }
-    }
-
-    pub(crate) fn abort(&mut self) {
-        self.pending.clear();
-    }
-
-    /// append the canonical committed encoding (count-prefixed, ascending ids).
-    pub(crate) fn encode_committed(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&(self.tasks.len() as u64).to_le_bytes());
-        for task in self.tasks.values() {
-            codec::push_str(out, &task.id);
-            codec::push_str(out, &task.title);
-            out.push(status_byte(&task.status));
-            out.extend_from_slice(&task.created_at.to_le_bytes());
-            out.extend_from_slice(&task.updated_at.to_le_bytes());
-        }
-    }
-
-    /// read this board's portion off a shared cursor. does NOT `finish` the
-    /// cursor -- the job board's portion follows in the same snapshot stream.
-    pub(crate) fn decode_from(c: &mut Cursor) -> Result<Self, Error> {
-        let count = c.u64("snapshot task count")?;
-        // each task costs at least 33 bytes (two length prefixes, the status
-        // byte, two u64 stamps), bounding a forged count before the loop.
-        c.bound(count, 33, "snapshot task count")?;
-
-        let mut tasks: BTreeMap<String, Task> = BTreeMap::new();
-        for _ in 0..count {
-            let id = c.string("snapshot task_id")?;
-            let title = c.string("snapshot title")?;
-            let status = status_from_byte(c.byte("snapshot status")?)?;
-            let created_at = c.u64("snapshot created_at")?;
-            let updated_at = c.u64("snapshot updated_at")?;
-
-            require_non_empty("task_id", &id)?;
-            require_non_empty("title", &title)?;
-            // no updated_at >= created_at check: `update_status` stamps
-            // updated_at with the block's consensus_time unconditionally and
-            // NOTHING guarantees cross-block monotonicity, so a legitimately
-            // committed state can hold updated_at < created_at. install must
-            // accept every execute-reachable state -- the root comparison is
-            // the integrity check.
-            if tasks
-                .last_key_value()
-                .is_some_and(|(last, _)| last.as_str() >= id.as_str())
-            {
-                return Err(Error::Module(
-                    "snapshot task ids not strictly ascending".into(),
-                ));
-            }
-
-            tasks.insert(
-                id.clone(),
-                Task {
-                    id,
-                    title,
-                    status,
-                    created_at,
-                    updated_at,
-                },
-            );
-        }
-        Ok(Self {
-            tasks,
-            pending: BTreeMap::new(),
-        })
     }
 }
 
-fn status_byte(status: &TaskStatus) -> u8 {
-    match status {
-        TaskStatus::Open => 0,
-        TaskStatus::InProgress => 1,
-        TaskStatus::Done => 2,
+/// the whole board in ascending id order -- read through the staged overlay,
+/// so this block's staged creates and status changes are visible.
+pub(crate) async fn query_list(staged: &StagedStore) -> Result<TaskReply, Error> {
+    let index = load_index(staged).await?;
+    let mut tasks = Vec::with_capacity(index.len());
+    for task_id in &index {
+        let task = load(staged, task_id)
+            .await?
+            .ok_or_else(|| Error::Module(format!("task index names a missing task: {task_id}")))?;
+        tasks.push(task);
     }
-}
-
-fn status_from_byte(value: u8) -> Result<TaskStatus, Error> {
-    match value {
-        0 => Ok(TaskStatus::Open),
-        1 => Ok(TaskStatus::InProgress),
-        2 => Ok(TaskStatus::Done),
-        _ => Err(Error::Module("snapshot has invalid task status".into())),
-    }
+    Ok(TaskReply::Tasks(tasks))
 }

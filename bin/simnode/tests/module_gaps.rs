@@ -186,7 +186,12 @@ fn removing_the_last_member_key_is_refused() {
 fn a_squatted_post_id_downgrades_the_rule_without_aborting_the_post() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
-    sim.submit_ok("chat", create_channel("general", "General"), None);
+    // the operator owns the channel — hook registration is the owner's call.
+    sim.submit_ok(
+        "chat",
+        create_channel("general", "General"),
+        Some("operator"),
+    );
 
     // the rival squats the id the rule WILL compose for the next post. the rule
     // fires on message seq 2 (this squat is seq 1), so the composed id is
@@ -259,7 +264,12 @@ fn a_squatted_post_id_downgrades_the_rule_without_aborting_the_post() {
 fn a_task_id_collision_aborts_the_entire_triggering_block() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
-    sim.submit_ok("chat", create_channel("general", "General"), None);
+    // the operator owns the channel — hook registration is the owner's call.
+    sim.submit_ok(
+        "chat",
+        create_channel("general", "General"),
+        Some("operator"),
+    );
     sim.submit_ok(
         "chat",
         serde_json::json!({ "register_hook": { "channel_id": "general", "module_id": "automations" } }),
@@ -285,7 +295,7 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
     // snapshot the chain tip BEFORE the doomed submit.
     let before = sim.status();
     let before_height = before["height"].as_u64().expect("height");
-    let before_hash = before["appHash"].as_str().expect("app hash").to_string();
+    let before_hash = before["root_hash"].as_str().expect("root hash").to_string();
 
     // the triggering post fires both rules; the second CreateTask collides with
     // the first's staged id, and the WHOLE block aborts (P2) — the op is rejected
@@ -309,7 +319,7 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
 
     // NO STATE survives: the rejected op journals a block (validator parity — so
     // the HEIGHT advances by one) but the atomic abort rolled back every write,
-    // so the app-hash is byte-identical, the triggering message never entered
+    // so the root-hash is byte-identical, the triggering message never entered
     // chat, no task landed, and neither rule recorded a fire.
     let after = sim.status();
     assert_eq!(
@@ -318,9 +328,9 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
         "the rejected op sealed its own block (validator parity): {after}"
     );
     assert_eq!(
-        after["appHash"].as_str(),
+        after["root_hash"].as_str(),
         Some(before_hash.as_str()),
-        "app-hash unmoved (the rejected op rolled back): {after}"
+        "root-hash unmoved (the rejected op rolled back): {after}"
     );
     let message = sim.query(
         "chat",

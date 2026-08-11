@@ -400,16 +400,13 @@ fn should_attempt_rendezvous_fallback(previous: Option<(Duration, u32)>) -> bool
     }
 }
 
-/// How every coordinator request is presented: `Some((signer, cap))`
-/// authenticates each request with a proof-of-possession over `signer`
-/// (whose public key MUST match the resolver's node key), carrying `cap`
-/// for a private (genesis-gated) coordinator or `None` for a public
-/// PoP-only one; `None` sends bare requests — the legacy unauthenticated
-/// dev path for fully-open coordinators.
-pub type CoordinatorAuth = Option<(
+/// Credentials presented on every coordinator request. `signer` proves
+/// possession of the resolver's node key; `cap` admits it to a private
+/// coordinator and is absent for public coordination.
+pub type CoordinatorAuth = (
     commonware_cryptography::ed25519::PrivateKey,
     Option<nat_traversal::CoordCap>,
-)>;
+);
 
 /// The production resolver: a handle to the rendezvous PUMP task that owns
 /// the `NatClient`'s receive side. The pump answers unsolicited `PunchSync`
@@ -499,12 +496,8 @@ impl NatResolver {
                 status: None,
             });
         }
-        let client = match auth {
-            Some((signer, cap)) => {
-                NatClient::bind_multi_auth(key, coordinators, signer, cap).await?
-            }
-            None => NatClient::bind_multi(key, coordinators).await?,
-        };
+        let (signer, cap) = auth;
+        let client = NatClient::bind(key, coordinators, signer, cap).await?;
         Ok(Self::from_client(client, keepalive))
     }
 
@@ -603,8 +596,9 @@ async fn establish_then_pump(
         // is dropped before the backoff arm below serves the socket.
         let outcome = {
             let attempt = async {
-                let (_idx, reflexive) =
-                    client.discover_reflexive_failover(COORD_STEP_TIMEOUT).await?;
+                let (_idx, reflexive) = client
+                    .discover_reflexive_failover(COORD_STEP_TIMEOUT)
+                    .await?;
                 client.register().await?;
                 Ok::<SocketAddr, std::io::Error>(reflexive)
             };
@@ -1361,10 +1355,12 @@ where
                 })
                 .await;
         };
-        if !self.restore_tried {
+        let restored_standbys = if self.restore_tried {
+            Vec::new()
+        } else {
             self.restore_tried = true;
-            self.restore(&event).await?;
-        }
+            self.restore(&event).await?
+        };
         let set = binding::active_set(&self.config.chain_id, event.epoch, identities.clone())?;
         let pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey> = event
             .members
@@ -1425,6 +1421,19 @@ where
         if role == Role::Member {
             state.records.insert(self.me, own.clone());
         }
+        // the restored standby records seed the boot epoch's pre-warm layer
+        // as if just delivered — the epoch's own apply REPLACES the restored
+        // interface, and a parked standby cannot re-deliver its record over
+        // the dead overlay it is parked behind. Nonces stay unseeded so the
+        // owner's live re-offer re-runs the full accept path: an idempotent
+        // reinstall plus the first-contact gossip-back it heals by.
+        for signed in restored_standbys {
+            let identity = signed.record.validator_identity;
+            state
+                .prewarm_peers
+                .insert(identity, self.standby_peer_config(&signed.record));
+            state.standby_records.insert(identity, signed);
+        }
         let peers = state.peers.clone();
         let standbys = state.standbys.clone();
         self.state = Some(state);
@@ -1462,19 +1471,26 @@ where
     /// Strictly best-effort and strictly a bootstrap: failures degrade to
     /// the pre-persistence behavior (live assembly only), and the boot
     /// epoch's own assembly replaces the restored interface at its apply.
-    async fn restore(&mut self, event: &MeshEpochEvent) -> Result<(), ReachabilityError> {
+    ///
+    /// Returns the resident-gated standby records it reinstalled, for the
+    /// caller to seed into the boot epoch's pre-warm layer — on the
+    /// restored interface alone they would die at that very replace.
+    async fn restore(
+        &mut self,
+        event: &MeshEpochEvent,
+    ) -> Result<Vec<SignedEndpointRecord>, ReachabilityError> {
         let Some(path) = &self.config.persist_file else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let mesh = match store::load(path, &self.config.chain_id) {
             Ok(Some(mesh)) => mesh,
-            Ok(None) => return Ok(()),
+            Ok(None) => return Ok(Vec::new()),
             Err(err) => {
-                return self
-                    .emit(ReachabilityEvent::RestoreFailed {
-                        reason: err.to_string(),
-                    })
-                    .await;
+                self.emit(ReachabilityEvent::RestoreFailed {
+                    reason: err.to_string(),
+                })
+                .await?;
+                return Ok(Vec::new());
             }
         };
         // the BOOT epoch's members gate the restore: a departed member's
@@ -1494,8 +1510,27 @@ where
                     && member_pk_of.contains_key(&record.validator_identity)
             })
             .collect();
-        if records.is_empty() {
-            return Ok(());
+        // the boot epoch's RESIDENT set gates the persisted standby records
+        // exactly as its member set gates the adverts: a departed standby's
+        // tunnel is dead weight. One still parked is why these persist at
+        // all — it cannot re-introduce itself to a member that forgot its
+        // WireGuard key (invite token consumed at admission, every remaining
+        // transport rides this overlay), so only this reinstall lets its
+        // ongoing handshake retries land again after a reboot.
+        let standby_ids: HashSet<ValidatorIdentity> = event
+            .standbys
+            .iter()
+            .map(binding::identity_of)
+            .filter(|id| *id != self.me && !member_pk_of.contains_key(id))
+            .collect();
+        let standby_records: Vec<SignedEndpointRecord> = mesh
+            .standby_records
+            .iter()
+            .filter(|signed| standby_ids.contains(&signed.record.validator_identity))
+            .cloned()
+            .collect();
+        if records.is_empty() && standby_records.is_empty() {
+            return Ok(Vec::new());
         }
         let mut peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig> = BTreeMap::new();
         for record in &records {
@@ -1524,9 +1559,7 @@ where
                     },
                 ),
             };
-            let allowed_ips = self
-                .overlay
-                .identity_allowed_ips(record.validator_identity);
+            let allowed_ips = self.overlay.identity_allowed_ips(record.validator_identity);
             peers.insert(
                 record.validator_identity,
                 PeerTunnelConfig {
@@ -1535,6 +1568,12 @@ where
                     allowed_ips,
                     keepalive_seconds: Some(KEEPALIVE_SECONDS),
                 },
+            );
+        }
+        for signed in &standby_records {
+            peers.insert(
+                signed.record.validator_identity,
+                self.standby_peer_config(&signed.record),
             );
         }
         let local_interface_ips = self
@@ -1573,22 +1612,40 @@ where
         match outcome {
             Ok(()) => {
                 self.interface_live = true;
-                // the restored mesh is the interface's base — the pre-warm
-                // layer merges its record-derived peers over it.
+                // the restored mesh — standby entries included — is the
+                // interface's base; the pre-warm layer merges its live
+                // record-derived peers over it (same identity: fresher wins).
                 self.base_peers = Some(peers);
                 self.emit(ReachabilityEvent::MeshRestored {
                     epoch: mesh.epoch,
                     interface: self.interface.clone(),
                     peers: peer_count,
                 })
-                .await
+                .await?;
+                Ok(standby_records)
             }
             Err(err) => {
                 self.emit(ReachabilityEvent::RestoreFailed {
                     reason: format!("wireguard effect: {err:?}"),
                 })
-                .await
+                .await?;
+                Ok(Vec::new())
             }
+        }
+    }
+
+    /// A standby record's peer tunnel config, endpoint taken VERBATIM (no
+    /// rendezvous resolution): the parked side initiates (and roams), so
+    /// its recorded endpoint is a first target, not a requirement — the
+    /// install's real cargo is the WireGuard key.
+    fn standby_peer_config(&self, record: &EndpointRecord) -> PeerTunnelConfig {
+        PeerTunnelConfig {
+            wireguard_public_key: record.wireguard_public_key,
+            endpoint: record.wireguard_endpoint.map(|e| e.socket_addr()),
+            allowed_ips: self
+                .overlay
+                .identity_allowed_ips(record.validator_identity),
+            keepalive_seconds: Some(KEEPALIVE_SECONDS),
         }
     }
 
@@ -2017,6 +2074,32 @@ where
         self.advance().await
     }
 
+    /// Persist the mesh snapshot the cold-restart restore reads back: the
+    /// member adverts AND the accepted standby records. The records ride
+    /// along because a parked resident cannot re-introduce itself to a
+    /// member that forgot its WireGuard key — its invite token was consumed
+    /// at admission and its every remaining transport rides this overlay —
+    /// so this file is its only way back onto a rebooted member's interface.
+    async fn persist_mesh(&mut self) -> Result<(), ReachabilityError> {
+        let Some(path) = self.config.persist_file.as_deref() else {
+            return Ok(());
+        };
+        let state = self.state.as_ref().expect("persist inside an epoch");
+        let mesh = PersistedMesh::new(
+            self.config.chain_id.clone(),
+            state.epoch,
+            state.adverts.values().cloned().collect(),
+            state.standby_records.values().cloned().collect(),
+        );
+        let Err(err) = store::save(path, &mesh) else {
+            return Ok(());
+        };
+        self.emit(ReachabilityEvent::PersistFailed {
+            reason: err.to_string(),
+        })
+        .await
+    }
+
     /// A standby's owner-signed record (member role): validate, resolve its
     /// endpoint, and merge the tunnel onto the live interface — the pre-warm
     /// layer's whole trick. A higher nonce supersedes in place (the live
@@ -2065,14 +2148,17 @@ where
         } else if via == owner {
             state.routes.remove(&owner);
         }
+        // the accepted record reaches disk NOW, not at the epoch apply: a
+        // solo member never mints plans, and a reboot between accept and the
+        // next apply would otherwise strand this standby for good (it cannot
+        // re-introduce itself — see the restore).
+        self.persist_mesh().await?;
         // endpoint-less standby: install without an endpoint — it initiates.
         let endpoint = match signed.record.wireguard_endpoint.map(|e| e.socket_addr()) {
             None => None,
             Some(advertised) => Some(self.resolve_prewarm_endpoint(owner, advertised).await?),
         };
-        let allowed_ips = self
-            .overlay
-            .identity_allowed_ips(owner);
+        let allowed_ips = self.overlay.identity_allowed_ips(owner);
         let state = self.state.as_mut().expect("still in epoch");
         state.prewarm_peers.insert(
             owner,
@@ -2228,19 +2314,8 @@ where
                 true
             }
         };
-        if accepted && let Some(path) = &self.config.persist_file {
-            let state = self.state.as_ref().expect("still in epoch");
-            let mesh = PersistedMesh::new(
-                self.config.chain_id.clone(),
-                state.epoch,
-                state.adverts.values().cloned().collect(),
-            );
-            if let Err(err) = store::save(path, &mesh) {
-                self.emit(ReachabilityEvent::PersistFailed {
-                    reason: err.to_string(),
-                })
-                .await?;
-            }
+        if accepted {
+            self.persist_mesh().await?;
         }
         let record = advert.record.clone();
         self.merge_member_prewarm(&record).await
@@ -2282,9 +2357,7 @@ where
             None => None,
             Some(advertised) => Some(self.resolve_prewarm_endpoint(owner, advertised).await?),
         };
-        let allowed_ips = self
-            .overlay
-            .identity_allowed_ips(owner);
+        let allowed_ips = self.overlay.identity_allowed_ips(owner);
         let state = self.state.as_mut().expect("still in epoch");
         state.prewarm_peers.insert(
             owner,
@@ -2370,7 +2443,6 @@ where
             let epoch = state.epoch;
             let plans: Vec<TunnelInstallPlan> = state.plans.values().cloned().collect();
             let overrides = state.overrides.clone();
-            let adverts: Vec<EndpointAdvertisement> = state.adverts.values().cloned().collect();
             // the epoch's validated plans become the interface's new BASE;
             // the pre-warm peers merge over it (same identity: the fresher
             // pre-warm entry wins), so a standby tunnel that assembled
@@ -2400,9 +2472,7 @@ where
                 let peers: Vec<PeerTunnelConfig> = merged.values().cloned().collect();
                 // the plane's overlay is ula_v6: the local side is the same
                 // identity-derived /128 every validated plan carries.
-                let local_interface_ips = self
-                    .overlay
-                    .identity_allowed_ips(self.me);
+                let local_interface_ips = self.overlay.identity_allowed_ips(self.me);
                 if let Err(err) = apply_peer_tunnels(
                     &mut self.effect,
                     self.interface.clone(),
@@ -2423,18 +2493,11 @@ where
                 // the epoch's mesh is now REAL — remember it for the
                 // cold-restart re-apply. Only with member plans: an
                 // all-peers-failed epoch must not clobber the last mesh that
-                // actually carried member tunnels (pre-warm peers alone are
-                // not it — their owners persist their own side).
-                if !plans.is_empty()
-                    && let Some(path) = &self.config.persist_file
-                {
-                    let mesh = PersistedMesh::new(self.config.chain_id.clone(), epoch, adverts);
-                    if let Err(err) = store::save(path, &mesh) {
-                        self.emit(ReachabilityEvent::PersistFailed {
-                            reason: err.to_string(),
-                        })
-                        .await?;
-                    }
+                // actually carried member tunnels. (The accepted standby
+                // records ride every snapshot regardless — their own persist
+                // trigger is the accept itself.)
+                if !plans.is_empty() {
+                    self.persist_mesh().await?;
                 }
             }
             self.emit(ReachabilityEvent::TunnelsApplied {
@@ -2656,20 +2719,21 @@ where
     /// config), and the epoch apply's full interface rebuild can re-initiate
     /// immediately instead of deadlocking endpoint-less.
     fn merge_invite_layer(&mut self, merged: &mut BTreeMap<ValidatorIdentity, PeerTunnelConfig>) {
-        self.invite_peers.retain(|id, invite| match merged.get_mut(id) {
-            Some(entry) => {
-                let graft = entry.endpoint.is_none()
-                    && entry.wireguard_public_key == invite.wireguard_public_key;
-                if graft {
-                    entry.endpoint = invite.endpoint;
+        self.invite_peers
+            .retain(|id, invite| match merged.get_mut(id) {
+                Some(entry) => {
+                    let graft = entry.endpoint.is_none()
+                        && entry.wireguard_public_key == invite.wireguard_public_key;
+                    if graft {
+                        entry.endpoint = invite.endpoint;
+                    }
+                    // grafting keeps the invite entry (later re-merges rebuild
+                    // `merged` from the still-endpoint-less records); a concrete
+                    // or re-keyed stronger entry retires it.
+                    graft
                 }
-                // grafting keeps the invite entry (later re-merges rebuild
-                // `merged` from the still-endpoint-less records); a concrete
-                // or re-keyed stronger entry retires it.
-                graft
-            }
-            None => true,
-        });
+                None => true,
+            });
         for (id, cfg) in &self.invite_peers {
             merged.entry(*id).or_insert_with(|| cfg.clone());
         }
@@ -2692,9 +2756,7 @@ where
                 .send(Err("refusing an invite tunnel to self".into()));
             return Ok(());
         }
-        let allowed_ips = self
-            .overlay
-            .identity_allowed_ips(identity);
+        let allowed_ips = self.overlay.identity_allowed_ips(identity);
         self.invite_peers.insert(
             identity,
             PeerTunnelConfig {
@@ -2713,9 +2775,7 @@ where
         self.merge_invite_layer(&mut merged);
         merged.remove(&self.me);
         let peers: Vec<PeerTunnelConfig> = merged.values().cloned().collect();
-        let local_interface_ips = self
-            .overlay
-            .identity_allowed_ips(self.me);
+        let local_interface_ips = self.overlay.identity_allowed_ips(self.me);
         let outcome = if self.interface_live {
             update_peer_tunnels(
                 &mut self.effect,
@@ -2842,9 +2902,7 @@ where
         // today, cheap to keep impossible.
         merged.remove(&self.me);
         let peers: Vec<PeerTunnelConfig> = merged.values().cloned().collect();
-        let local_interface_ips = self
-            .overlay
-            .identity_allowed_ips(self.me);
+        let local_interface_ips = self.overlay.identity_allowed_ips(self.me);
         let outcome = if self.interface_live {
             update_peer_tunnels(
                 &mut self.effect,
@@ -3253,7 +3311,15 @@ mod tests {
 
     mod nat_pump {
         use super::super::*;
+        use commonware_cryptography::ed25519;
         use tokio::net::UdpSocket;
+
+        fn identity(seed: u64) -> (NodeKey, ed25519::PrivateKey) {
+            let signer = ed25519::PrivateKey::from_seed(seed);
+            let mut key = [0; 32];
+            key.copy_from_slice(signer.public_key().as_ref());
+            (NodeKey(key), signer)
+        }
 
         /// Wait (bounded) until a resolver's rendezvous establishment lands —
         /// construction returns before discovery now, so tests that need a
@@ -3276,15 +3342,15 @@ mod tests {
             let coord_addr = coord_sock.local_addr().unwrap();
             tokio::spawn(nat_traversal::run_coordinator(
                 coord_sock,
-                nat_traversal::AuthPolicy::Open { require_pop: false },
+                nat_traversal::AuthPolicy::Public,
             ));
 
-            let a_key = binding::node_key(ValidatorIdentity([0xaa; 32]));
-            let b_key = binding::node_key(ValidatorIdentity([0xbb; 32]));
-            let mut a = NatResolver::bind(a_key, vec![coord_addr], None)
+            let (a_key, a_signer) = identity(1);
+            let (b_key, b_signer) = identity(2);
+            let mut a = NatResolver::bind(a_key, vec![coord_addr], (a_signer, None))
                 .await
                 .unwrap();
-            let b = NatResolver::bind(b_key, vec![coord_addr], None)
+            let b = NatResolver::bind(b_key, vec![coord_addr], (b_signer, None))
                 .await
                 .unwrap();
             ready(&a).await;
@@ -3312,25 +3378,25 @@ mod tests {
             let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let coord_addr = coord_sock.local_addr().unwrap();
             let coordinator = nat_traversal::Coordinator::with_policy_and_ttl(
-                nat_traversal::AuthPolicy::Open { require_pop: false },
+                nat_traversal::AuthPolicy::Public,
                 1,
             );
             tokio::spawn(nat_traversal::run_coordinator_with(coord_sock, coordinator));
 
             // A keeps itself alive on a 300ms keepalive; X registers once and
             // goes silent.
-            let a_key = binding::node_key(ValidatorIdentity([0x0a; 32]));
-            let x_key = binding::node_key(ValidatorIdentity([0x0f; 32]));
+            let (a_key, a_signer) = identity(3);
+            let (x_key, x_signer) = identity(4);
             let a = NatResolver::bind_with_keepalive(
                 a_key,
                 vec![coord_addr],
-                None,
+                (a_signer, None),
                 Duration::from_millis(300),
             )
             .await
             .unwrap();
             ready(&a).await;
-            let x = nat_traversal::NatClient::bind(x_key, coord_addr)
+            let x = nat_traversal::NatClient::bind(x_key, vec![coord_addr], x_signer, None)
                 .await
                 .unwrap();
             x.register().await.unwrap();
@@ -3340,12 +3406,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(2_500)).await;
 
             // A probe client resolves A (kept alive) but not X (expired).
-            let probe = nat_traversal::NatClient::bind(
-                binding::node_key(ValidatorIdentity([0x01; 32])),
-                coord_addr,
-            )
-            .await
-            .unwrap();
+            let (probe_key, probe_signer) = identity(5);
+            let probe =
+                nat_traversal::NatClient::bind(probe_key, vec![coord_addr], probe_signer, None)
+                    .await
+                    .unwrap();
             tokio::time::timeout(Duration::from_secs(2), probe.lookup(a_key))
                 .await
                 .expect("bounded")
@@ -3370,17 +3435,17 @@ mod tests {
             let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let coord_addr = coord_sock.local_addr().unwrap();
             let coordinator = nat_traversal::Coordinator::with_policy_and_ttl(
-                nat_traversal::AuthPolicy::Open { require_pop: false },
+                nat_traversal::AuthPolicy::Public,
                 1,
             );
             tokio::spawn(nat_traversal::run_coordinator_with(coord_sock, coordinator));
 
-            let a_key = binding::node_key(ValidatorIdentity([0x1a; 32]));
-            let x_key = binding::node_key(ValidatorIdentity([0x1f; 32]));
+            let (a_key, a_signer) = identity(6);
+            let (x_key, x_signer) = identity(7);
             let mut a = NatResolver::bind_with_keepalive(
                 a_key,
                 vec![coord_addr],
-                None,
+                (a_signer, None),
                 Duration::from_millis(300),
             )
             .await
@@ -3388,7 +3453,7 @@ mod tests {
             ready(&a).await;
             // X: a raw client (answers nothing) kept registered by a test task.
             let x = std::sync::Arc::new(
-                nat_traversal::NatClient::bind(x_key, coord_addr)
+                nat_traversal::NatClient::bind(x_key, vec![coord_addr], x_signer, None)
                     .await
                     .unwrap(),
             );
@@ -3413,12 +3478,11 @@ mod tests {
             assert!(err.contains("hole-punch failed"), "unexpected error: {err}");
 
             // A's own registration survived the busy window.
-            let probe = nat_traversal::NatClient::bind(
-                binding::node_key(ValidatorIdentity([0x11; 32])),
-                coord_addr,
-            )
-            .await
-            .unwrap();
+            let (probe_key, probe_signer) = identity(8);
+            let probe =
+                nat_traversal::NatClient::bind(probe_key, vec![coord_addr], probe_signer, None)
+                    .await
+                    .unwrap();
             tokio::time::timeout(Duration::from_secs(2), probe.lookup(a_key))
                 .await
                 .expect("bounded")
@@ -3434,12 +3498,12 @@ mod tests {
             let coord_addr = placeholder.local_addr().unwrap();
             drop(placeholder);
 
-            let a_key = binding::node_key(ValidatorIdentity([0x2a; 32]));
-            let b_key = binding::node_key(ValidatorIdentity([0x2b; 32]));
+            let (a_key, a_signer) = identity(9);
+            let (b_key, _) = identity(10);
             let mut a = NatResolver::bind_with_keepalive(
                 a_key,
                 vec![coord_addr],
-                None,
+                (a_signer, None),
                 Duration::from_millis(300),
             )
             .await
@@ -3449,12 +3513,9 @@ mod tests {
             // error — never a hang (a caller parked on this reply is exactly
             // the silent forever-stall this path used to produce).
             let advertised: SocketAddr = "203.0.113.9:1".parse().unwrap();
-            let early = tokio::time::timeout(
-                Duration::from_secs(1),
-                a.resolve(b_key, advertised),
-            )
-            .await
-            .expect("resolve during establishment must answer promptly, not hang");
+            let early = tokio::time::timeout(Duration::from_secs(1), a.resolve(b_key, advertised))
+                .await
+                .expect("resolve during establishment must answer promptly, not hang");
             assert!(
                 early.is_err(),
                 "rendezvous cannot resolve before the coordinator ever answered"
@@ -3464,7 +3525,7 @@ mod tests {
             let coord_sock = UdpSocket::bind(coord_addr).await.unwrap();
             tokio::spawn(nat_traversal::run_coordinator(
                 coord_sock,
-                nat_traversal::AuthPolicy::Open { require_pop: false },
+                nat_traversal::AuthPolicy::Public,
             ));
 
             // ...and the resolver heals on its own: reflexive discovery and
@@ -3479,12 +3540,11 @@ mod tests {
             }
 
             // Registration is live at the coordinator: a probe can look A up.
-            let probe = nat_traversal::NatClient::bind(
-                binding::node_key(ValidatorIdentity([0x2c; 32])),
-                coord_addr,
-            )
-            .await
-            .unwrap();
+            let (probe_key, probe_signer) = identity(11);
+            let probe =
+                nat_traversal::NatClient::bind(probe_key, vec![coord_addr], probe_signer, None)
+                    .await
+                    .unwrap();
             tokio::time::timeout(Duration::from_secs(2), probe.lookup(a_key))
                 .await
                 .expect("bounded")
@@ -3493,8 +3553,10 @@ mod tests {
 
         #[tokio::test]
         async fn no_coordinators_still_passes_through_to_advertised() {
-            let key = binding::node_key(ValidatorIdentity([0x33; 32]));
-            let mut r = NatResolver::bind(key, Vec::new(), None).await.unwrap();
+            let (key, signer) = identity(12);
+            let mut r = NatResolver::bind(key, Vec::new(), (signer, None))
+                .await
+                .unwrap();
             assert_eq!(r.reflexive(), None);
             let advertised: SocketAddr = "203.0.113.7:51820".parse().unwrap();
             assert!(matches!(

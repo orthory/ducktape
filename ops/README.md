@@ -1,10 +1,11 @@
 # Operator scripts
 
-Repo-side helpers for running, seeding, and maintaining a ducktape node. There
-is no desktop app in this tree anymore — the native iced shell was removed; the
+Repo-side helpers for running, seeding, and maintaining a ducktape node. The
 runnable surfaces are the node daemon (`node-bin`/`noded`), the deterministic
-`simnode`, and the UDP coordinator. Most scripts here back a `make` target; see
-the repository `Makefile`.
+`simnode`, the UDP coordinator, and the native Iced desktop app (`app/`,
+`cargo run -p ducktape-app`) — the scripts here drive the node side, and
+`demo-seed.sh` seeds a workspace the app can then open. Most scripts back a
+`make` target; see the repository `Makefile`.
 
 ## Demo network
 
@@ -38,10 +39,16 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
   coordinator (see `coordinator/README.md`).
 - `wg-smoke/` — WireGuard smoke, interop, and bench harnesses.
 
+## Wasm guests
+
+- `wasm-repro-check.sh` (`make wasm-repro-check`) — builds one guest component
+  from this checkout and from a copy of the tree at a different absolute path
+  and asserts the bytes are identical, so a committed artifact never depends on
+  the builder's `/home/...`. Needs the wasm32 target and `wasm-tools`.
+
 ## Worktree cleanup
 
-Current native QA has no Fleet configuration or external instance manager.
-`ops/worktree-clean.sh` intentionally retains a self-contained, identity-
-verified reaper for homes left by the retired Fleet workflow. Always dry-run it
-before removing merged worktrees, then pass `--yes`; it refuses dirty or
-unmerged work and never uses `pkill -f`.
+Always dry-run `ops/worktree-clean.sh` before removing merged worktrees, then
+pass `--yes`. It refuses a worktree that is dirty, carries a commit not in
+`dev`, or has live processes under it, and it finds those processes by cwd —
+never `pkill -f`.

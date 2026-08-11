@@ -61,7 +61,7 @@ Alternatives weighed:
   is abandoned.
 - **External object store (MinIO/Garage/SeaweedFS)** — a second service to
   operate (breaks the one-binary thesis); no atomic cross-file commits or
-  snapshots; contents can't be attested by the app-hash.
+  snapshots; contents can't be attested by the root-hash.
 - **Syncthing-style sync** — eventual consistency with conflict-copies;
   cannot be consensus state or pin reproducible inputs.
 - **Git/forge as the substrate** — rejected: sha1, packfile behavior on
@@ -418,7 +418,7 @@ daemon is a ~day of work on top of the existing scan/status/commit engine).
   round-trips; root determinism across encode/decode.
 - **Kernel integration:** torn-commit recovery for the disk cohort; restart
   e2e proving bytes survive reboot; statesync joiner e2e reaching full
-  possession; app-hash continuity across all of the above.
+  possession; root-hash continuity across all of the above.
 - **Client:** checkout/commit round-trip; conflict + auto-rebase + genuine
   conflict report; cross-OS path edges (NFC forms, simulated case collision).
 - **App:** FilesView + files-client vitest suites.
@@ -473,5 +473,5 @@ New/changed surfaces: `crates/apps/files` (single crate: pure core +
 `native` feature incl. `FsCap`, per the modularization section), `crates/apps/memory` (deleted), a new `duckfs-client` crate, noded (blob-receipt store internalized; duckfs HTTP
 endpoints; sandbox workspace RPC), bin/node + bin/demo registration sites,
 kernel statesync resolver wiring for `duckfs-odb`, app TS client + FilesView,
-docs (en+ko module pages). Branching per `.project/work.md`: worktree from
+docs module pages. Branching per `.project/work.md`: worktree from
 `origin/dev`, PR to `dev`.

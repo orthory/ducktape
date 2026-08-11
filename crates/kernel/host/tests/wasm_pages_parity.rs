@@ -5,10 +5,9 @@
 //! the store's root, and qmdb's batch canonicalizes mutations by hashed key,
 //! so the native logical-key commit order and the wasm hashed-key drain order
 //! produce the same op log), the same query replies, and the same resolver
-//! sync surface. the state schema revision therefore STAYS 1 — this cutover
-//! changes the executor, not one committed byte — and this proof pins that
-//! explicitly, unlike the whole-state adapter ports whose roots diverge by
-//! declared schema break.
+//! sync surface. this cutover changes the executor, not one committed byte, and
+//! this proof pins that explicitly, unlike whole-state adapter ports whose root
+//! representations differ.
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
@@ -110,7 +109,10 @@ async fn native_host(context: &deterministic::Context) -> Host {
         // isolation: this proof is about the pages cutover, and an identical
         // native tagging on both sides absorbs the emitted follow-ups
         // identically.
-        Box::new(TaggingModule::new("tagging")),
+        Box::new(TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(QueryProbe::new()),
     ])
     .expect("genesis")
@@ -124,21 +126,44 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
             // production builder chain (`Pages::new(..).with_tagging`) in.
             WasmModule::with_store("pages", PAGES_WASM, Box::new(store)).expect("load component"),
         ),
-        Box::new(TaggingModule::new("tagging")),
+        Box::new(TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(QueryProbe::new()),
     ])
     .expect("genesis")
 }
 
-/// the read matrix: every query family, including the `None`/absent shapes.
+/// the read matrix: every kept query family, including the `None`/absent
+/// shapes. (the page/thread LISTING reads are index-tier now, so the matrix
+/// probes the dispatch surface only.)
 async fn replies(h: &Host) -> Vec<Vec<u8>> {
     let queries = [
-        encode_query(&PageQuery::ListPages),
         encode_query(&PageQuery::GetPage {
             page_id: "home".into(),
+            after: None,
+            limit: 1,
+        }),
+        encode_query(&PageQuery::GetPage {
+            page_id: "home".into(),
+            after: Some("home".into()),
+            limit: 1,
         }),
         encode_query(&PageQuery::GetPage {
             page_id: "absent".into(),
+            after: None,
+            limit: 1,
+        }),
+        encode_query(&PageQuery::GetPage {
+            page_id: "empty".into(),
+            after: None,
+            limit: 1,
+        }),
+        encode_query(&PageQuery::GetPage {
+            page_id: "empty".into(),
+            after: Some("empty".into()),
+            limit: 1,
         }),
         encode_query(&PageQuery::GetBlock {
             block_id: "b1".into(),
@@ -149,8 +174,8 @@ async fn replies(h: &Host) -> Vec<Vec<u8>> {
         encode_query(&PageQuery::GetBlock {
             block_id: "gone".into(),
         }),
-        encode_query(&PageQuery::ThreadsForTargets {
-            targets: vec!["b1".into(), "home".into()],
+        encode_query(&PageQuery::TargetThreadCount {
+            target: "b1".into(),
         }),
         encode_query(&PageQuery::CommentThread {
             thread_id: "t1".into(),
@@ -182,7 +207,7 @@ fn same_ops_identical_roots_block_by_block() {
 
         // ROOT CONTINUITY from block zero: both sides commit to the SAME
         // (empty) qmdb store, so unlike the whole-state ports the roots are
-        // EQUAL, not a declared schema break.
+        // EQUAL.
         assert_eq!(roots(&native), roots(&wasm), "genesis roots diverge");
 
         // the host's snapshot orchestration sees the wasm tenant exactly as it
@@ -190,7 +215,7 @@ fn same_ops_identical_roots_block_by_block() {
         assert!(native.resolver_backed_ids().contains("pages"));
         assert!(wasm.resolver_backed_ids().contains("pages"));
 
-        // every op family, one block each: tree edits, folder nesting, the
+        // every op family, one block each: tree edits, page nesting, the
         // comment plane (which also emits the tagging follow-up), and subtree
         // removal. `moves` marks blocks that must change the pages root.
         let ops: Vec<(Vec<u8>, PageMsg)> = vec![
@@ -199,7 +224,6 @@ fn same_ops_identical_roots_block_by_block() {
                 PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
-                    parent: None,
                 },
             ),
             (
@@ -252,23 +276,34 @@ fn same_ops_identical_roots_block_by_block() {
                 alice.clone(),
                 PageMsg::MoveBlock {
                     block_id: "b2".into(),
-                    parent: "b3".into(),
+                    parent: Some("b3".into()),
                     after: None,
                 },
             ),
+            // Empty nested pages terminate at their own root even though the
+            // containing document has a following sibling (`b3`).
             (
                 alice.clone(),
-                PageMsg::CreatePage {
-                    page_id: "notes".into(),
-                    title: "Notes".into(),
-                    parent: Some("home".into()),
+                PageMsg::InsertBlock {
+                    parent: "home".into(),
+                    after: Some("b1".into()),
+                    block: nb("empty", BlockKind::Page, "Empty"),
                 },
             ),
             (
                 alice.clone(),
-                PageMsg::SetPageParent {
-                    page_id: "notes".into(),
+                PageMsg::InsertBlock {
+                    parent: "home".into(),
+                    after: Some("b3".into()),
+                    block: nb("notes", BlockKind::Page, "Notes"),
+                },
+            ),
+            (
+                alice.clone(),
+                PageMsg::MoveBlock {
+                    block_id: "notes".into(),
                     parent: None,
+                    after: None,
                 },
             ),
             // the comment plane: authorship derives from origin, the staged
@@ -329,8 +364,8 @@ fn same_ops_identical_roots_block_by_block() {
             ),
             (
                 alice.clone(),
-                PageMsg::DeletePage {
-                    page_id: "notes".into(),
+                PageMsg::RemoveBlock {
+                    block_id: "notes".into(),
                 },
             ),
         ];
@@ -415,13 +450,6 @@ fn revision_stays_one_and_the_sync_handle_matches_native() {
         )
         .expect("load component");
 
-        // the committed encoding is UNCHANGED (same store, same op log, same
-        // root — proven above), so the canonical-state revision must stay 1:
-        // pre-cutover workspaces reopen without a schema fence.
-        assert_eq!(Module::state_schema_revision(&native), 1);
-        assert_eq!(Module::state_schema_revision(&wasm), 1);
-
-        // and the declared sync surface is verbatim the native declaration.
         let n_handle = native.state_sync_handle().expect("native handle");
         let w_handle = wasm.state_sync_handle().expect("wasm handle");
         assert_eq!(n_handle, w_handle, "sync handles diverge");
@@ -447,7 +475,7 @@ fn rejections_match_and_leave_no_trace() {
     deterministic::Runner::default().start(|context| async move {
         let mut native = native_host(&context).await;
         let mut wasm = wasm_host_(&context).await;
-        let alice = key(0xA1);
+        let (alice, bob) = (key(0xA1), key(0xB2));
 
         for host in [&mut native, &mut wasm] {
             host.submit_at(
@@ -455,7 +483,6 @@ fn rejections_match_and_leave_no_trace() {
                 op(&PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
-                    parent: None,
                 }),
             )
             .await
@@ -470,12 +497,39 @@ fn rejections_match_and_leave_no_trace() {
             )
             .await
             .expect("insert");
+            // a second block to re-home a thread ONTO, and a thread ALICE
+            // opened on the first — the inputs of the opener gate below.
+            host.submit_at(
+                block(3, &alice),
+                op(&PageMsg::InsertBlock {
+                    parent: "home".into(),
+                    after: Some("b1".into()),
+                    block: nb("b2", BlockKind::Paragraph, "second"),
+                }),
+            )
+            .await
+            .expect("insert");
+            host.submit_at(
+                block(4, &alice),
+                op(&PageMsg::AddComment {
+                    thread_id: "t1".into(),
+                    comment_id: "c1".into(),
+                    target: "b1".into(),
+                    text: "looks good".into(),
+                    mentions: vec![],
+                    as_agent: None,
+                    anchor: None,
+                }),
+            )
+            .await
+            .expect("comment");
         }
 
         // the rejection matrix: distinct refusal families. each rejected block
         // must leave BOTH roots byte-identical (staged writes discarded).
-        let rejects: Vec<(PageMsg, &str)> = vec![
+        let rejects: Vec<(Vec<u8>, PageMsg, &str)> = vec![
             (
+                alice.clone(),
                 PageMsg::InsertBlock {
                     parent: "ghost".into(),
                     after: None,
@@ -484,6 +538,7 @@ fn rejections_match_and_leave_no_trace() {
                 "parent block not found",
             ),
             (
+                alice.clone(),
                 PageMsg::InsertBlock {
                     parent: "home".into(),
                     after: None,
@@ -492,28 +547,33 @@ fn rejections_match_and_leave_no_trace() {
                 "duplicate block id",
             ),
             (
-                PageMsg::InsertBlock {
-                    parent: "home".into(),
-                    after: None,
-                    block: nb("p", BlockKind::Page, "sneaky page"),
+                alice.clone(),
+                PageMsg::SetKind {
+                    block_id: "b1".into(),
+                    kind: BlockKind::Page,
                 },
-                "created by CreatePage",
+                "page blocks cannot",
             ),
             (
+                alice.clone(),
                 PageMsg::MoveBlock {
                     block_id: "home".into(),
-                    parent: "b1".into(),
+                    parent: Some("b1".into()),
                     after: None,
                 },
-                "page roots cannot",
+                "inside the moved subtree",
             ),
             (
-                PageMsg::RemoveBlock {
-                    block_id: "home".into(),
+                alice.clone(),
+                PageMsg::MoveBlock {
+                    block_id: "b1".into(),
+                    parent: None,
+                    after: None,
                 },
-                "page roots cannot",
+                "only page blocks",
             ),
             (
+                alice.clone(),
                 PageMsg::EditComment {
                     comment_id: "nope".into(),
                     text: "x".into(),
@@ -521,19 +581,50 @@ fn rejections_match_and_leave_no_trace() {
                 },
                 "comment not found",
             ),
+            // THE OPENER GATE, proven in the compiled component and not just
+            // natively: it reads `env().origin`, the one authorization input
+            // that crosses the WIT boundary, so a gate keyed on it is exactly
+            // the kind that can compile, review as correct, and be inert
+            // inside the guest.
+            //
+            // alice opened t1, so bob may not re-home it — and an ungated move
+            // was the aiming device for `RemoveBlock`'s comment purge: put a
+            // stranger's thread on a throwaway block, remove the block, and
+            // their comments are hard-deleted past `DeleteComment`'s own
+            // author check.
+            (
+                bob.clone(),
+                PageMsg::MoveCommentThread {
+                    thread_id: "t1".into(),
+                    target: "b2".into(),
+                    anchor: None,
+                },
+                "not the comment author",
+            ),
+            // and the pre-consensus empty external origin never passes as a
+            // real user here, exactly as on the four sibling comment ops.
+            (
+                Vec::new(),
+                PageMsg::MoveCommentThread {
+                    thread_id: "t1".into(),
+                    target: "b2".into(),
+                    anchor: None,
+                },
+                "empty origin",
+            ),
         ];
 
-        for (height, (msg, needle)) in rejects.into_iter().enumerate() {
-            let height = height as u64 + 3;
+        for (height, (who, msg, needle)) in rejects.into_iter().enumerate() {
+            let height = height as u64 + 5;
             let before = roots(&native);
             assert_eq!(before, roots(&wasm));
 
             let n_err = native
-                .submit_at(block(height, &alice), op(&msg))
+                .submit_at(block(height, &who), op(&msg))
                 .await
                 .expect_err("native must reject");
             let w_err = wasm
-                .submit_at(block(height, &alice), op(&msg))
+                .submit_at(block(height, &who), op(&msg))
                 .await
                 .expect_err("wasm must reject");
 
@@ -569,18 +660,18 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
 
         // ONE block, four dispatches: the insert reads the page CREATED one
         // dispatch earlier (staged, not committed), the probe host-routes a
-        // GetPage query MID-BLOCK (the wasm side answers it staged-over-store
-        // through the replay), and the comment reads the staged block. on the
-        // wasm side dispatch N+1's reads come from the OUTER staged overlay —
-        // the guest's inner pending died with dispatch N — which is exactly
-        // the native pending-persists-across-dispatches view.
+        // GetPage continuation MID-BLOCK (the wasm side answers it
+        // staged-over-store through the replay), and the comment reads the
+        // staged block. on the wasm side dispatch N+1's reads come from the
+        // OUTER staged overlay — the guest's inner pending died with dispatch
+        // N — which is exactly the native pending-persists-across-dispatches
+        // view.
         let batch = vec![
             (
                 Origin::External(alice.clone()),
                 op(&PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
-                    parent: None,
                 }),
             ),
             (
@@ -597,6 +688,8 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                     target: "probe".into(),
                     payload: encode_query(&PageQuery::GetPage {
                         page_id: "home".into(),
+                        after: Some("home".into()),
+                        limit: 1,
                     }),
                 },
             ),
@@ -647,6 +740,8 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                 "pages",
                 &encode_query(&PageQuery::GetPage {
                     page_id: "home".into(),
+                    after: Some("home".into()),
+                    limit: 1,
                 }),
             )
             .await

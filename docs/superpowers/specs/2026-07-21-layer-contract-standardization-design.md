@@ -132,7 +132,7 @@ promotion, not invention. Constraint: `SimplexOrderer::build` is already
 generic over the channel types, so consensus-crate changes should be
 minimal-to-none; the trait lives at the bin/node boundary.
 **Deliverable proof: an in-process multi-validator test** (3 validators, one
-process, simulated network) converging to the same app-hash in seconds — the
+process, simulated network) converging to the same root-hash in seconds — the
 first mesh-free multi-validator coverage in the repo.
 
 ## Exclusions (recorded; do not silently re-add)

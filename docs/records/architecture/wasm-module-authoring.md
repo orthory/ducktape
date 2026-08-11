@@ -3,12 +3,12 @@
 How to write, build, and live-update a Ducktape wasm module. The runtime is
 `crates/kernel/wasm-host` (wasmtime, pinned `=46.0.1`); the authoring contract is
 the `ducktape:module` WIT world (`crates/kernel/module-guest/wit/module.wit`);
-the reference modules are `crates/guests/hello-wasm` (v1),
-`crates/guests/hello-wasm-v2` (its live-update target), and
+the reference modules are `crates/guests/hello-wasm`,
+`crates/guests/hello-wasm-replacement` (its live-update target), and
 `crates/guests/sibling-wasm` (the cross-module-read reference). The first
 REAL production tenant is `crates/guests/directory-wasm` — the wasm port of
 the `directory` module, bytes-compatible with the native implementation it
-replaced (same root, same snapshot encoding: the cutover left the app-hash
+replaced (same root, same snapshot encoding: the cutover left the root-hash
 untouched).
 
 ## The model (design-B: host-owned state, guest as pure logic)
@@ -20,7 +20,7 @@ capability, staged during `execute` and published only at the block-commit
 boundary. Consequences you design around:
 
 - `root()` is host-computed from the host-owned store, never by the guest. A
-  code swap keeps the store, so the module's root — and with it the app-hash —
+  code swap keeps the store, so the module's root — and with it the root-hash —
   is byte-identical across the swap. **That is the live-update primitive.**
 - Never cache anything in guest globals/statics expecting it to survive: it
   will not. Read what you need via `state-get`, write via `state-set`.
@@ -74,16 +74,15 @@ answer memoized. Design consequences:
   Host-routed queries (`ctx.query` from a native peer, external node queries)
   resolve sibling reads for real.
 
-## State layout is the compatibility contract
+## State layout is the code-swap contract
 
-A live update swaps CODE while KEEPING the store. Version N+1 of your module
-reads the store version N wrote, so the state layout — keys and value
-encodings — is your compatibility surface across updates:
+A live update swaps code while keeping the store, so it is valid only when the
+replacement reads the exact same keys and value encodings:
 
-- Keep it byte-stable, or make N+1 read both layouts and migrate lazily on
-  write. There is no offline migration hook: the swap boundary is a plain block
-  boundary.
-- `hello-wasm-v2` demonstrates the discipline: same `count` key, same
+- Keep the layout byte-stable for a code-only swap.
+- If the layout changes while greenfield, replace it outright and re-genesis.
+  Do not add a second decoder or lazy migration.
+- `hello-wasm-replacement` demonstrates the discipline: same `count` key, same
   little-endian `u64` value, different logic (`inc` steps 100, not 1).
 
 ## Build: crate → component
@@ -128,7 +127,7 @@ content-addressed on the node blob plane. The flow:
    the boundary with `GovAction::CancelModuleUpdate`.
 4. At the first applied block at/after `activation_height`, two things happen
    on every node: the drain's injected lifecycle `Advance` flips the committed
-   active hash (in the app-hash), and the host's out-of-block realization
+   active hash (in the root-hash), and the host's out-of-block realization
    (`Host::realize_module_swaps`) verifies `sha256(bytes) == hash` and swaps
    the running component, keeping the host-owned state.
 
@@ -162,7 +161,7 @@ error), and choose the guest's state layout so the host store's canonical
 encoding reproduces the native root — if the native module already hashes
 `le-u64 count ‖ sorted (len‖key ‖ len‖value)`, storing the raw key/value bytes
 makes root(), snapshot(), and install() BYTE-IDENTICAL across the cutover: the
-app-hash does not move and pre-cutover workspaces restore unchanged. Pin that
+root-hash does not move and pre-cutover workspaces restore unchanged. Pin that
 claim with a parity test before wiring the module into `host_state`.
 
 Point your module's tests at a committed fixture (`include_bytes!`) so the

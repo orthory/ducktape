@@ -5,7 +5,7 @@ version.workspace = true
 
 # Ducktape module adapter for duckfs. The reusable deterministic state machine
 # lives in duckfs-core; disk persistence lives in duckfs-disk. `files` keeps the
-# consensus module id and SDK capability glue, plus a compatibility re-export.
+# consensus module id and SDK capability glue, plus the public core re-export.
 [features]
 default = ["native"]
 native = ["dep:duckfs-disk", "dep:sdk", "dep:async-trait", "dep:serde_json", "dep:wasm-host"]

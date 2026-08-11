@@ -49,13 +49,14 @@ mod wiring;
 pub(crate) type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tokio::Context>;
 
 /// the joiner/replica role (unified-node phase 2): park on the mesh,
-/// bootstrap a boundary, fold the head, and — on staged admission —
-/// promote to a validator. entered by `run_node` exactly when this key
-/// holds neither a recovery checkpoint's participant seat nor genesis
-/// validator standing (`!checkpoint_seats_me && !validators.contains(…)`);
-/// every exit is [`reboot_self`] or `std::process::exit`, so this never
-/// returns — the validator path in `run_node` picks up only when the
-/// condition was false to begin with.
+/// bootstrap a boundary, fold the head, and — at the activation cutover
+/// that seats this key — promote to a validator IN-PROCESS. entered by
+/// `run_node` exactly when this key holds neither a recovery checkpoint's
+/// participant seat nor genesis validator standing (`!checkpoint_seats_me
+/// && !validators.contains(…)`); the promotion seat is the ONLY return —
+/// the [`crate::validator::PromotionBaton`] carries everything the
+/// validator role continues with — and every other exit is
+/// `std::process::exit`.
 ///
 /// wiring (phase 6a: per-epoch channel bank, reachability standby, lobby)
 /// happens in [`wiring::wire`]; the resulting [`wiring::ReplicaChannels`]
@@ -75,7 +76,6 @@ pub(crate) async fn run(
     signer: ed25519::PrivateKey,
     label: String,
     namespace: Vec<u8>,
-    identity_chain_id: String,
     peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     wireguard_listen: Option<std::net::SocketAddr>,
@@ -95,21 +95,19 @@ pub(crate) async fn run(
     chain_id: String,
     mesh_state_file: std::path::PathBuf,
     checkpoint_blocks: u64,
-    sync_index: bool,
-    announce_capabilities: bool,
-    sandbox: capability_host::SandboxBackend,
-    sandbox_capacity: std::collections::BTreeMap<String, u64>,
     rpc_listener: Option<std::net::TcpListener>,
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
+    session_manager: Option<noded::TerminalSessions>,
+    session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
+    local_gateway_via: String,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     metrics: noded::NodeMetrics,
+    status: noded::StatusCell,
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     blobs: noded::blobs::BlobHandle,
-    agent_provisioner: &dispatch_oracle::SharedProvisioner,
-    agent_dirs: &capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
     planes: data_plane::PlaneMonitor,
@@ -118,7 +116,7 @@ pub(crate) async fn run(
     manifest: &Option<Manifest>,
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
-) -> ! {
+) -> crate::validator::PromotionBaton {
     // `wire` and `park` both read `signer`/`label`/`namespace`/`overlay_slot`
     // — cheap plain-data (or, for `overlay_slot`, an Arc-backed handle)
     // clones so each phase owns its copy outright (no needless
@@ -160,15 +158,10 @@ pub(crate) async fn run(
         signer,
         label,
         namespace,
-        identity_chain_id,
         peers,
         validators,
         wireguard_listen,
         checkpoint_blocks,
-        sync_index,
-        announce_capabilities,
-        sandbox,
-        sandbox_capacity,
         sync_sources,
         sync_source,
         status_public_key,
@@ -176,12 +169,14 @@ pub(crate) async fn run(
         http_cmds,
         gateway_requests,
         gateway_commands,
+        session_manager,
+        session_requests,
+        local_gateway_via,
         stream_hub,
         index,
         metrics,
+        status,
         blobs,
-        agent_provisioner,
-        agent_dirs,
         overlay_slot,
         bulk_pacer,
         planes,
@@ -193,35 +188,6 @@ pub(crate) async fn run(
         recovery,
     )
     .await
-}
-
-/// replace this process with a fresh invocation of itself (same argv): the
-/// clean way to re-enter boot with a different network topology — discovery
-/// channels can only be registered before `network.start()`, so a promoted
-/// joiner cannot grow a consensus engine in-process.
-fn reboot_self() -> ! {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        let exe = std::env::current_exe().expect("current exe path");
-        let err = std::process::Command::new(exe)
-            .args(std::env::args_os().skip(1))
-            .exec();
-        tracing::error!(
-            target: "ducktape::node",
-            error = %err,
-            "FATAL: validator reboot exec failed"
-        );
-        std::process::exit(1);
-    }
-    #[cfg(not(unix))]
-    {
-        tracing::info!(
-            target: "ducktape::node",
-            "promoted — restart this node to run as a validator"
-        );
-        std::process::exit(0);
-    }
 }
 
 /// one finalization observed on the cert lane, shape-decoded (NOT yet

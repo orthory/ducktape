@@ -5,13 +5,13 @@
 //! `execute`, then drains the intents that execute emitted. emitted [`Msg`]s are
 //! re-dispatched as LOCAL-ONLY follow-up ops (never re-broadcast); emitted
 //! [`Event`]s/[`Effect`]s are collected and handed back for the effectful node
-//! layer (out of scope this slice). after the drain, the app-hash is recomposed
+//! layer (out of scope this slice). after the drain, the root-hash is recomposed
 //! over the registry via [`global_root`].
 //!
 //! ## determinism
 //!
 //! `submit` is a pure function of `(registry state, msg, env)`:
-//! - the registry is a [`BTreeMap`], so snapshot + app-hash iteration is sorted
+//! - the registry is a [`BTreeMap`], so snapshot + root-hash iteration is sorted
 //!   and order-stable across nodes;
 //! - the follow-up queue is FIFO and dispatched purely locally;
 //! - the drain is hard-capped at [`MAX_DISPATCHES`], so it always terminates
@@ -29,17 +29,18 @@
 //! never vanish from the registry.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Duration;
 
 use sdk::{
-    Continuation, Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, Relay,
-    ResolverSyncTarget, StateRoot, StateSyncHandle,
+    Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
+    StateSyncHandle,
 };
 use sha2::{Digest, Sha256};
 
 pub mod topology;
 pub mod worker;
 
-/// compute the global app-hash over `modules` — the composition consensus
+/// compute the global root-hash over `modules` — the composition consensus
 /// commits to: a deterministic hash over every module's `(id, root)`. because
 /// a module's own [`StateRoot`] already commits to its children (a qmdb merkle
 /// root commits to its keys; a git HEAD oid commits to the whole repo tree),
@@ -49,42 +50,31 @@ pub mod worker;
 /// global root or the chain forks — so modules are sorted by id, and each id is
 /// length-prefixed before hashing (otherwise ("ab", r) and ("a", "b"||r) would
 /// collide). deliberately a plain sorted hash, NOT a qmdb-of-heads: qmdb's root
-/// is an order-dependent HISTORY commitment, while an app-hash must be
+/// is an order-dependent HISTORY commitment, while a root-hash must be
 /// `f(current state)` — order-independent + idempotent — so a state-synced node
 /// computes the same root. upgrade to a small merkle tree only when a light
 /// client needs log-n membership proofs.
 pub fn global_root(modules: &[&dyn Module]) -> StateRoot {
-    let mut pairs: Vec<(ModuleId, StateRoot)> =
-        modules.iter().map(|m| (m.id(), m.root())).collect();
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let pairs: Vec<(ModuleId, StateRoot)> = modules.iter().map(|m| (m.id(), m.root())).collect();
+    global_root_of(&pairs)
+}
+
+/// [`global_root`] over roots the caller ALREADY has. `root()` is a full state
+/// serialization + hash for a map-backed module, so a caller holding every
+/// module's root must never pay for it twice — a checkpoint capture computed
+/// each root four times before this seam existed (#1018).
+pub fn global_root_of(pairs: &[(ModuleId, StateRoot)]) -> StateRoot {
+    let mut sorted: Vec<&(ModuleId, StateRoot)> = pairs.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut h = Sha256::new();
-    h.update((pairs.len() as u64).to_le_bytes());
-    for (id, root) in &pairs {
+    h.update((sorted.len() as u64).to_le_bytes());
+    for (id, root) in sorted {
         h.update((id.len() as u64).to_le_bytes());
         h.update(id.as_bytes());
         h.update(root.0);
     }
     StateRoot(h.finalize().into())
-}
-
-/// Canonical fingerprint of a module set's committed-state schemas.
-///
-/// Entries are sorted by module id before hashing, so registry construction
-/// order is irrelevant. Length-prefixing keeps ids unambiguous; the domain tag
-/// prevents this digest from being confused with an app hash.
-pub fn state_schema_fingerprint<'a>(modules: impl IntoIterator<Item = (&'a str, u32)>) -> [u8; 32] {
-    let mut modules: Vec<(&str, u32)> = modules.into_iter().collect();
-    modules.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    let mut h = Sha256::new();
-    h.update(b"ducktape-state-schema-v1");
-    h.update((modules.len() as u64).to_le_bytes());
-    for (id, revision) in modules {
-        h.update((id.len() as u64).to_le_bytes());
-        h.update(id.as_bytes());
-        h.update(revision.to_le_bytes());
-    }
-    h.finalize().into()
 }
 
 /// hard cap on dispatches per `submit` (the root op plus all follow-ups). a
@@ -204,13 +194,20 @@ pub struct DispatchRecord {
     pub emitted_msgs: usize,
     /// count of observability `Event`s this dispatch emitted.
     pub emitted_events: usize,
+    /// the module-assigned stamp of this dispatch ([`sdk::Ctx::set_assigned`]):
+    /// values the module assigned while applying the op (a sequence, a
+    /// revision) that the payload cannot carry. module-encoded, host-opaque —
+    /// a consensus-deterministic function of `(state, msg)`, so the trace
+    /// stays a pure structural record. empty when the dispatch assigned
+    /// nothing.
+    pub assigned: Vec<u8>,
 }
 
 /// the result of applying one block (`submit`).
 #[derive(Debug)]
 pub struct BlockOutcome {
-    /// the app-hash over the registry after the drain settled.
-    pub app_hash: StateRoot,
+    /// the root-hash over the registry after the drain settled.
+    pub root_hash: StateRoot,
     /// events emitted during the block, in dispatch order — observability, and
     /// the lane the host-owned worker seam claims off-consensus work from.
     pub events: Vec<Event>,
@@ -227,25 +224,15 @@ pub struct BlockOutcome {
 /// members); an op that rejects DETERMINISTICALLY is isolated — its stage rolled
 /// back and the accepted ops replayed — so the committed state is exactly the
 /// accepted subset applied in input order. every applied member shares the ONE
-/// post-batch [`app_hash`](BatchOutcome::app_hash).
+/// post-batch [`root_hash`](BatchOutcome::root_hash).
 #[derive(Debug)]
 pub struct BatchOutcome {
-    /// the one post-batch app-hash, shared by every applied member.
-    pub app_hash: StateRoot,
+    /// the one post-batch root-hash, shared by every applied member.
+    pub root_hash: StateRoot,
     /// one outcome per input op, in input order.
     pub members: Vec<MemberOutcome>,
-    /// derived continuation members, `(parent input index, outcome)` in
-    /// release order (a parent's continuation releases immediately after that
-    /// parent's disposition settles). NOT counted in [`members`](Self::members)
-    /// — the 1:1 input-order contract there holds; a continuation is envelope-
-    /// derived work, dispatched `Origin::Module(parent_target)` with the relay
-    /// slot populated, and isolated exactly like a member (a rejecting
-    /// continuation never takes its parent's committed stage down). empty when
-    /// no input op carried a continuation.
-    pub continuations: Vec<(usize, MemberOutcome)>,
-    /// aggregate events, in drain order: every applied member's trace in input
-    /// order (each parent's accepted continuation immediately after it), then
-    /// the once-per-block injections.
+    /// aggregate events, in drain order: every applied member's trace in
+    /// input order, then the once-per-block injections.
     pub events: Vec<Event>,
     /// the dispatch trace from the once-per-block System injections
     /// (`pending_lifecycle_advance` / `pending_deliveries`),
@@ -255,28 +242,17 @@ pub struct BatchOutcome {
 
 impl BatchOutcome {
     /// flatten this outcome into the block-level facts the replay paths seal
-    /// and fold from: whether the block RAN REAL WORK (any member applied, any
-    /// released continuation applied, or a once-per-block System injection
-    /// dispatched — the live drain's seal-disposition rule), and the aggregate
-    /// dispatch trace in the live index order — each applied member in input
-    /// order with its applied continuation immediately after it, then the
-    /// System injections. recovery replay and suffix catch-up fold THIS exact
-    /// order, so a re-derived per-module op index matches the live one row for
-    /// row.
+    /// and fold from: whether the block RAN REAL WORK (any member applied, or
+    /// a once-per-block System injection dispatched — the live drain's
+    /// seal-disposition rule), and the aggregate dispatch trace in the live
+    /// index order — each applied member in input order, then the System
+    /// injections. recovery replay and suffix catch-up fold THIS exact order,
+    /// so a re-derived per-module op index matches the live one row for row.
     pub fn into_trace(self) -> (bool, Vec<DispatchRecord>) {
-        let mut cont_by_parent: Vec<Option<MemberOutcome>> =
-            self.members.iter().map(|_| None).collect();
-        for (parent, cont) in self.continuations {
-            cont_by_parent[parent] = Some(cont);
-        }
         let mut dispatches = Vec::new();
         let mut ran = !self.system_dispatches.is_empty();
-        for (member, cont) in self.members.into_iter().zip(cont_by_parent) {
+        for member in self.members {
             if let MemberOutcome::Applied { dispatches: d } = member {
-                ran = true;
-                dispatches.extend(d);
-            }
-            if let Some(MemberOutcome::Applied { dispatches: d }) = cont {
                 ran = true;
                 dispatches.extend(d);
             }
@@ -297,77 +273,44 @@ pub enum MemberOutcome {
     Rejected { reason: String },
 }
 
-/// one submitted op at the batch seam: the verified origin and root msg the
-/// `(Origin, Msg)` pair always carried, plus the envelope's optional
-/// continuation and its content id. [`Host::submit_block`] wraps bare pairs
-/// into continuation-free `BlockOp`s, so pre-envelope callers are untouched;
-/// the node's frame drain builds these directly.
+/// one submitted op at the batch seam: the frame's verified origin, its root
+/// msg, and its content id. [`Host::submit_block`] wraps bare pairs; the
+/// node's frame drain builds these directly.
+///
+/// An op carries EXACTLY ONE dispatch. There is no envelope continuation: a
+/// frame cannot append a second op that runs under a caller-chosen
+/// `Origin::Module`. See `no_continuation_lane.rs`.
 #[derive(Clone, Debug)]
 pub struct BlockOp {
-    /// the frame's verified authorship — the envelope AUTHOR, threaded into
-    /// the continuation relay's `author` slot.
+    /// the frame's verified authorship.
     pub origin: Origin,
-    /// the root msg (the PARENT op of any attached continuation).
+    /// the op's msg.
     pub msg: Msg,
-    /// the envelope's `continue` body, released after the parent's
-    /// disposition settles. depth 1 by shape ([`sdk::Continuation`]).
-    pub continuation: Option<Continuation>,
-    /// the envelope's content id (frame id), threaded into the relay slot for
-    /// correlation. all-zero for pre-envelope callers — a relay never
-    /// materializes without a continuation, so the placeholder is unread.
+    /// the frame's content id. all-zero for callers that have no frame.
     pub frame: [u8; 32],
 }
 
 impl BlockOp {
-    /// a continuation-free op — the [`Host::submit_block`] wrapping.
+    /// an op with no frame id — the [`Host::submit_block`] wrapping.
     pub fn bare(origin: Origin, msg: Msg) -> Self {
         Self {
             origin,
             msg,
-            continuation: None,
             frame: [0; 32],
         }
     }
 }
 
-/// one accepted drain unit (a member op or a released continuation) inside
-/// [`Host::apply_block`]'s per-op isolation: the inputs needed to REPLAY it
-/// verbatim after an isolation rollback, plus its authoritative trace.
+/// one accepted member op inside [`Host::apply_block`]'s per-op isolation: the
+/// inputs needed to REPLAY it verbatim after an isolation rollback, plus its
+/// authoritative trace.
 struct AcceptedUnit {
     origin: Origin,
     msg: Msg,
-    /// the relay the unit's root dispatch carried (continuations only) —
-    /// captured at first execution and reused verbatim on replay (determinism
-    /// makes recapture equal; reuse is the cheaper identity).
-    relay: Option<Relay>,
-    /// where the unit's outcome lands in the [`BatchOutcome`].
-    slot: UnitSlot,
+    /// which `members[i]` this unit's outcome lands in.
+    member: usize,
     events: Vec<Event>,
     dispatches: Vec<DispatchRecord>,
-}
-
-/// the [`BatchOutcome`] slot an [`AcceptedUnit`]'s trace is written to.
-enum UnitSlot {
-    /// `members[i]` — an input op.
-    Member(usize),
-    /// `continuations[row]` — a derived continuation unit.
-    Continuation(usize),
-}
-
-/// cap a parent rejection reason for the relay's `Err` arm at
-/// [`sdk::MAX_RELAY_ERROR_BYTES`], truncating on a char boundary — identical
-/// on every node (the string itself is deterministic; the cap keeps a prose
-/// reason from bloating a consensus op).
-fn cap_relay_reason(reason: &Error) -> String {
-    let mut s = reason.to_string();
-    if s.len() > sdk::MAX_RELAY_ERROR_BYTES {
-        let mut cut = sdk::MAX_RELAY_ERROR_BYTES;
-        while !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        s.truncate(cut);
-    }
-    s
 }
 
 /// a finalized consensus boundary the host is allowed to serve from.
@@ -375,8 +318,8 @@ fn cap_relay_reason(reason: &Error) -> String {
 pub struct FinalizedBlock {
     /// finalized block height.
     pub height: u64,
-    /// app-hash consensus committed at `height`.
-    pub app_hash: StateRoot,
+    /// root-hash consensus committed at `height`.
+    pub root_hash: StateRoot,
 }
 
 /// one module's committed root plus the sync surface it can currently serve.
@@ -387,32 +330,57 @@ pub struct ModuleSnapshot {
     pub state_sync: StateSyncHandle,
 }
 
-/// a consistent registry view captured at a finalized app-hash boundary.
+/// one module that could NOT prepare a sync surface at this boundary. its
+/// committed root is still known — `root()` is pure and cannot fail — so the
+/// boundary stays describable; only this module's transfer surface is missing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DegradedModule {
+    pub id: ModuleId,
+    pub root: StateRoot,
+    pub reason: Error,
+}
+
+/// a consistent registry view captured at a finalized root-hash boundary.
+///
+/// a module that fails to prepare its handle lands in `degraded` instead of
+/// aborting the capture: one module's bad state must not discard the rest of
+/// the registry's perfectly good snapshots, and every failure of the boundary
+/// is reported at once rather than only the first in registry order.
+/// what that means for the caller is the CALLER's policy, and the two differ —
+/// a joiner is told per-module (`statesync` serves the degraded module as
+/// `Unsupported`), while a recovery checkpoint refuses outright, because a
+/// checkpoint that cannot restore is worse than no checkpoint at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalizedSnapshot {
     pub height: u64,
-    pub app_hash: StateRoot,
+    pub root_hash: StateRoot,
     pub modules: Vec<ModuleSnapshot>,
+    pub degraded: Vec<DegradedModule>,
 }
 
 impl FinalizedSnapshot {
-    /// find a module entry by id.
+    /// find a module entry by id. degraded modules are NOT entries — they have
+    /// no `state_sync` to return; they are listed in `degraded` instead.
     pub fn module(&self, id: &str) -> Option<&ModuleSnapshot> {
         self.modules.iter().find(|m| m.id == id)
     }
 
     /// true only when every module supplied self-contained snapshot bytes.
     pub fn has_all_snapshot_bytes(&self) -> bool {
-        self.modules
-            .iter()
-            .all(|m| m.state_sync.has_snapshot_bytes())
+        self.degraded.is_empty()
+            && self
+                .modules
+                .iter()
+                .all(|m| m.state_sync.has_snapshot_bytes())
     }
 
     /// true when every module can be rebuilt without an external resolver.
     pub fn is_self_contained(&self) -> bool {
-        self.modules
-            .iter()
-            .all(|m| m.state_sync.is_self_contained())
+        self.degraded.is_empty()
+            && self
+                .modules
+                .iter()
+                .all(|m| m.state_sync.is_self_contained())
     }
 }
 
@@ -433,7 +401,7 @@ pub enum BoundaryPhase {
 /// error inside `commit_block`, a module that could not discard its stage) hit
 /// only THIS node — its registry state is now indeterminate relative to its
 /// peers. the only sound response is fail-stop: surface the fault and stop
-/// applying blocks; continuing would silently fork this node's app-hash.
+/// applying blocks; continuing would silently fork this node's root-hash.
 #[derive(Debug, PartialEq, Eq)]
 pub struct FatalError {
     /// the module whose boundary hook failed.
@@ -508,31 +476,25 @@ impl From<Error> for SubmitError {
     }
 }
 
-/// failures while capturing a finalized snapshot.
+/// the one failure that aborts a whole capture: the boundary itself is wrong.
+/// a MODULE failure is not one of these — it is per-module and reported in
+/// [`FinalizedSnapshot::degraded`], so it can never take the boundary down.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SnapshotError {
     /// the caller asked for a boundary that no longer matches the host state.
-    AppHashMismatch {
+    RootHashMismatch {
         expected: StateRoot,
         actual: StateRoot,
     },
-    /// a module failed while preparing its state-sync handle.
-    Module { id: ModuleId, source: Error },
 }
 
 impl core::fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::AppHashMismatch { expected, actual } => write!(
+            Self::RootHashMismatch { expected, actual } => write!(
                 f,
-                "finalized app-hash mismatch: expected {expected:?}, actual {actual:?}",
+                "finalized root-hash mismatch: expected {expected:?}, actual {actual:?}",
             ),
-            Self::Module { id, source } => {
-                write!(
-                    f,
-                    "module {id} failed to prepare state-sync handle: {source}"
-                )
-            }
         }
     }
 }
@@ -542,7 +504,7 @@ impl std::error::Error for SnapshotError {}
 /// the deterministic state machine: a module registry + dispatch + drain.
 #[derive(Default)]
 pub struct Host {
-    /// deterministic iteration order is load-bearing for snapshot + app-hash.
+    /// deterministic iteration order is load-bearing for snapshot + root-hash.
     registry: BTreeMap<ModuleId, Box<dyn Module>>,
     /// instantiates post-genesis ADMISSIONS at the activation boundary.
     /// `None` fails closed the moment an admission arms — never before.
@@ -566,20 +528,6 @@ impl Host {
     /// register a module under its own [`Module::id`]. genesis-time wiring.
     pub fn register(&mut self, module: Box<dyn Module>) {
         self.registry.insert(module.id(), module);
-    }
-
-    /// Sorted module ids and their canonical-state revisions.
-    pub fn state_schema(&self) -> Vec<(ModuleId, u32)> {
-        self.registry
-            .iter()
-            .map(|(id, module)| (id.clone(), module.state_schema_revision()))
-            .collect()
-    }
-
-    /// Fingerprint persisted in recovery/state-sync manifests.
-    pub fn state_schema_fingerprint(&self) -> [u8; 32] {
-        let schema = self.state_schema();
-        state_schema_fingerprint(schema.iter().map(|(id, revision)| (id.as_str(), *revision)))
     }
 
     /// build a host from a declared module set (registry-as-genesis-state). errors
@@ -686,8 +634,7 @@ impl Host {
     /// until the module is registered — the query errors → `None`, keeping
     /// the drain byte-identical on a net without dispatch.
     async fn pending_deliveries(&self) -> Option<Msg> {
-        let req =
-            dispatch::encode_query(&dispatch::DispatchQuery::PendingDeliveries);
+        let req = dispatch::encode_query(&dispatch::DispatchQuery::PendingDeliveries);
         let bytes = self.query(DISPATCH_MODULE_ID, &req).await.ok()?;
         let dispatch::DispatchReply::PendingDeliveries(pending) =
             dispatch::decode_reply(&bytes).ok()?
@@ -696,9 +643,7 @@ impl Host {
         };
         (pending > 0).then(|| Msg {
             target: DISPATCH_MODULE_ID.into(),
-            payload: dispatch::encode_msg(
-                &dispatch::DispatchMsg::DeliverPending {},
-            ),
+            payload: dispatch::encode_msg(&dispatch::DispatchMsg::DeliverPending {}),
         })
     }
 
@@ -741,8 +686,8 @@ impl Host {
     /// registry's committed decision for block `height`, realizing any swap that
     /// has armed. this is the per-node, NON-consensus half of a live code update;
     /// the consensus half is the in-block [`Host::pending_lifecycle_advance`] tick
-    /// that flips the committed active hash into the app-hash. code is invisible
-    /// to `root()`, so a swap keeps the module's state and the app-hash is
+    /// that flips the committed active hash into the root-hash. code is invisible
+    /// to `root()`, so a swap keeps the module's state and the root-hash is
     /// byte-continuous across it.
     ///
     /// keyed PURELY on committed registry state + `height`, so it reconstructs
@@ -820,8 +765,8 @@ impl Host {
             match current {
                 Some(_) => self.swap_module_code(&m.module_id, &bytes)?,
                 None => {
-                    // the admission path: registration changes app-hash by
-                    // construction (the registry set is what `app_hash`
+                    // the admission path: registration changes root-hash by
+                    // construction (the registry set is what `root_hash`
                     // composes over), which is exactly why it rides the same
                     // readiness/height gate as a swap and realizes at one
                     // deterministic boundary on every validator.
@@ -846,8 +791,8 @@ impl Host {
         Ok(())
     }
 
-    /// the current app-hash: [`global_root`] over the registered modules.
-    pub fn app_hash(&self) -> StateRoot {
+    /// the current root-hash: [`global_root`] over the registered modules.
+    pub fn root_hash(&self) -> StateRoot {
         let mods: Vec<&dyn Module> = self.registry.values().map(|b| b.as_ref()).collect();
         global_root(&mods)
     }
@@ -858,7 +803,7 @@ impl Host {
     }
 
     /// every registered module's `(id, root)`, in registry (sorted-id) order —
-    /// the exact input [`Host::app_hash`] composes over. a recovery journal
+    /// the exact input [`Host::root_hash`] composes over. a recovery journal
     /// seals each applied block with these so a restarted node can locate every
     /// module's replay position by root equality.
     pub fn module_roots(&self) -> Vec<(ModuleId, StateRoot)> {
@@ -897,13 +842,15 @@ impl Host {
     /// reads this to bound-and-verify a disk module's TRAILING durable commit
     /// whose journal seal was lost to a power cut.
     pub fn durable_commit_height(&self, id: &str) -> Option<u64> {
-        self.registry.get(id).and_then(|m| m.durable_commit_height())
+        self.registry
+            .get(id)
+            .and_then(|m| m.durable_commit_height())
     }
 
     /// capture the committed registry view for a finalized block.
     ///
-    /// The caller supplies the finalized app-hash from consensus. The host
-    /// recomputes its current app-hash first and refuses to serve if it has
+    /// The caller supplies the finalized root-hash from consensus. The host
+    /// recomputes its current root-hash first and refuses to serve if it has
     /// already advanced, preventing a node from labeling current module state as
     /// an older height. Because this borrows `&self`, it can only run outside the
     /// mutable `submit_at` block lifecycle; module roots and state-sync handles
@@ -912,38 +859,93 @@ impl Host {
         &self,
         finalized: FinalizedBlock,
     ) -> Result<FinalizedSnapshot, SnapshotError> {
-        let actual = self.app_hash();
-        if actual != finalized.app_hash {
-            return Err(SnapshotError::AppHashMismatch {
-                expected: finalized.app_hash,
-                actual,
-            });
+        self.snapshot_at(finalized.height, Some(finalized.root_hash), || {
+            Duration::ZERO
+        })
+        .map(|(snapshot, _)| snapshot)
+    }
+
+    /// capture the committed registry view at the host's CURRENT root, which
+    /// this computes rather than verifying. For a caller that has no
+    /// independently-known finalized hash to check against, passing
+    /// [`Host::root_hash`] into [`Host::capture_finalized_snapshot`] is a
+    /// tautology that costs a SECOND full pass over every module root — and
+    /// `root()` is a whole state serialization + hash for a map-backed module.
+    ///
+    /// `now` is the CALLER's clock (the host owns none, by design): it is read
+    /// around each module's capture and the deltas are returned ALONGSIDE the
+    /// snapshot — what a module cost is wall-clock, so it is not part of the
+    /// boundary's identity and must stay out of its `Eq`. Registry order,
+    /// degraded modules included. Pass `|| Duration::ZERO` to opt out.
+    pub fn capture_current_snapshot(
+        &self,
+        height: u64,
+        now: impl FnMut() -> Duration,
+    ) -> (FinalizedSnapshot, Vec<(ModuleId, Duration)>) {
+        self.snapshot_at(height, None, now)
+            .expect("an unverified capture has no root to mismatch")
+    }
+
+    /// the one capture body: every module root computed EXACTLY ONCE, the
+    /// composite root derived from those, and the state-sync handles taken only
+    /// after the root check passes (a mismatched capture must not pay to
+    /// materialize snapshot bytes it will throw away).
+    fn snapshot_at(
+        &self,
+        height: u64,
+        expected: Option<StateRoot>,
+        mut now: impl FnMut() -> Duration,
+    ) -> Result<(FinalizedSnapshot, Vec<(ModuleId, Duration)>), SnapshotError> {
+        let mut roots: Vec<(ModuleId, StateRoot)> = Vec::with_capacity(self.registry.len());
+        let mut capture_cost: Vec<(ModuleId, Duration)> = Vec::with_capacity(self.registry.len());
+        for (id, module) in self.registry.iter() {
+            let started = now();
+            let root = module.root();
+            roots.push((id.clone(), root));
+            capture_cost.push((id.clone(), now().saturating_sub(started)));
         }
 
-        let modules = self
-            .registry
-            .iter()
-            .map(|(id, module)| {
-                let state_sync =
-                    module
-                        .state_sync_handle()
-                        .map_err(|source| SnapshotError::Module {
-                            id: id.clone(),
-                            source,
-                        })?;
-                Ok(ModuleSnapshot {
-                    id: id.clone(),
-                    root: module.root(),
-                    state_sync,
-                })
-            })
-            .collect::<Result<Vec<_>, SnapshotError>>()?;
+        let actual = global_root_of(&roots);
+        if let Some(expected) = expected
+            && actual != expected
+        {
+            return Err(SnapshotError::RootHashMismatch { expected, actual });
+        }
 
-        Ok(FinalizedSnapshot {
-            height: finalized.height,
-            app_hash: finalized.app_hash,
-            modules,
-        })
+        let mut modules = Vec::with_capacity(self.registry.len());
+        let mut degraded = Vec::new();
+        for ((module, (id, root)), cost) in self
+            .registry
+            .values()
+            .zip(roots.iter())
+            .zip(capture_cost.iter_mut())
+        {
+            let started = now();
+            let handle = module.state_sync_handle();
+            cost.1 += now().saturating_sub(started);
+            match handle {
+                Ok(state_sync) => modules.push(ModuleSnapshot {
+                    id: id.clone(),
+                    root: *root,
+                    state_sync,
+                }),
+                Err(reason) => degraded.push(DegradedModule {
+                    id: id.clone(),
+                    root: *root,
+                    reason,
+                }),
+            }
+        }
+
+        Ok((
+            FinalizedSnapshot {
+                height,
+                root_hash: actual,
+                modules,
+                degraded,
+            },
+            capture_cost,
+        ))
     }
 
     /// apply one inbound message as a block: route, execute, drain follow-ups,
@@ -960,7 +962,7 @@ impl Host {
     /// later `execute` erroring, or [`Error::BudgetExceeded`]) it calls
     /// [`Module::abort_block`] on every touched module, so a half-applied block
     /// leaves NO trace — every module root is byte-identical to its pre-block
-    /// value. the app-hash is recomposed AFTER the commit, so it reflects exactly
+    /// value. the root-hash is recomposed AFTER the commit, so it reflects exactly
     /// the committed state.
     ///
     /// ## the two failure modes
@@ -995,7 +997,7 @@ impl Host {
             Ok((events, dispatches)) => {
                 // clean drain: publish every touched module's staged writes. this
                 // is the ONLY place a module's state advances, so recompose the
-                // app-hash AFTER. a commit failure is FATAL, not a rejection: the
+                // root-hash AFTER. a commit failure is FATAL, not a rejection: the
                 // modules before this one in registry order already published,
                 // so the block is half-committed on this node alone.
                 for id in &touched {
@@ -1010,7 +1012,7 @@ impl Host {
                     }
                 }
                 Ok(BlockOutcome {
-                    app_hash: self.app_hash(),
+                    root_hash: self.root_hash(),
                     events,
                     dispatches,
                 })
@@ -1043,7 +1045,7 @@ impl Host {
     }
 
     /// apply a BATCH of ops as ONE block: per-op isolation, a SINGLE commit
-    /// boundary, and ONE post-batch app-hash shared by every applied member.
+    /// boundary, and ONE post-batch root-hash shared by every applied member.
     ///
     /// each op is drained in input order on top of the prior accepted ops' staged
     /// writes (read-your-writes across members). an op that rejects
@@ -1071,10 +1073,8 @@ impl Host {
         self.apply_block(ctx, ops, None).await
     }
 
-    /// [`Host::submit_block`] over full [`BlockOp`]s — the entry for envelope
-    /// ops that may carry a continuation. a parent's continuation is released
-    /// immediately after that parent's disposition settles, as its own
-    /// isolated unit (see [`BatchOutcome::continuations`]).
+    /// [`Host::submit_block`] over full [`BlockOp`]s — the entry the node's
+    /// frame drain uses, so each op carries its frame's content id.
     pub async fn submit_block_ops(
         &mut self,
         ctx: BlockContext,
@@ -1084,15 +1084,15 @@ impl Host {
     }
 
     /// RECOVERY-ONLY selective-commit variant of [`Host::submit_block`]: identical
-    /// per-op isolation and single-app-hash composition, but at the boundary it
+    /// per-op isolation and single-root-hash composition, but at the boundary it
     /// partitions the touched set — commit the modules in `commit_only`, abort the
     /// rest. this heals a TORN block at boot: a block that committed a
     /// per-block-durable disk substrate (already at its sealed post-root on disk)
     /// but whose in-memory cohort was rolled back to the checkpoint; replay re-runs
     /// the frame and commits ONLY the at-pre cohort, aborting the durable substrate
     /// (re-committing it would move its op-log root and fork). NOT the live path.
-    /// takes full [`BlockOp`]s: a journaled envelope frame's continuation must re-run
-    /// on the heal exactly as it ran live, or the sealed roots cannot reproduce.
+    /// takes full [`BlockOp`]s: a journaled frame must re-run on the heal
+    /// exactly as it ran live, or the sealed roots cannot reproduce.
     pub async fn submit_block_committing(
         &mut self,
         ctx: BlockContext,
@@ -1130,56 +1130,40 @@ impl Host {
             injections.push_back((Origin::System, deliver));
         }
 
-        // 2. per-op isolation, over UNITS: each input op is one unit, and its
-        // envelope continuation (if any) is a DERIVED unit released right
-        // after the parent's disposition settles — with the SAME isolation (a
-        // rejecting continuation rolls back and the accepted units replay, so
-        // it never takes its parent's stage down). `touched` and the modules'
-        // own staging accumulate ACROSS units (never committed mid-batch);
-        // accepted units (parents AND continuations) all replay on a later
-        // rejection — one shared stage.
+        // 2. per-op isolation: each input op is one unit. `touched` and the
+        // modules' own staging accumulate ACROSS units (never committed
+        // mid-batch); accepted units all replay on a later rejection — one
+        // shared stage.
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
         let mut accepted: Vec<AcceptedUnit> = Vec::new();
         let mut results: Vec<Option<MemberOutcome>> = (0..ops.len()).map(|_| None).collect();
-        let mut continuations: Vec<(usize, MemberOutcome)> = Vec::new();
 
         for (i, op) in ops.into_iter().enumerate() {
             let BlockOp {
                 origin,
                 msg,
-                continuation,
-                frame,
+                frame: _frame,
             } = op;
 
-            // the parent unit.
             let mut ev: Vec<Event> = Vec::new();
             let mut di: Vec<DispatchRecord> = Vec::new();
             let queue: VecDeque<(Origin, Msg)> = VecDeque::from([(origin.clone(), msg.clone())]);
-            // the relay outcome the continuation (if any) will carry: the
-            // parent's declared output on accept, its capped deterministic
-            // rejection string on reject. the CONTINUATION ALWAYS FIRES —
-            // dropping it on failure would strand the very reentry flow the
-            // envelope composed it for.
-            let relay_outcome: Result<Vec<u8>, String>;
             match self
                 .drain_queue(
                     height,
                     consensus_time,
                     queue,
-                    None,
                     &mut touched,
                     &mut ev,
                     &mut di,
                 )
                 .await
             {
-                Ok(output) => {
-                    relay_outcome = Ok(output.unwrap_or_default());
+                Ok(()) => {
                     accepted.push(AcceptedUnit {
-                        origin: origin.clone(),
-                        msg: msg.clone(),
-                        relay: None,
-                        slot: UnitSlot::Member(i),
+                        origin,
+                        msg,
+                        member: i,
                         events: ev,
                         dispatches: di,
                     });
@@ -1195,103 +1179,23 @@ impl Host {
                     // roll the WHOLE stage back, then replay only the accepted
                     // units to rebuild their writes without this one.
                     self.abort_all(&mut touched).await?;
-                    self.replay_accepted(
-                        height,
-                        consensus_time,
-                        &mut accepted,
-                        &mut touched,
-                    )
-                    .await?;
-                    relay_outcome = Err(cap_relay_reason(&reason));
+                    self.replay_accepted(height, consensus_time, &mut accepted, &mut touched)
+                        .await?;
                     results[i] = Some(MemberOutcome::Rejected {
                         reason: reason.to_string(),
                     });
                 }
             }
-
-            // the derived continuation unit: `Origin::Module(parent_target)`
-            // is the sending LANE; the authenticated AUTHOR travels in the
-            // relay slot (the authorization rule — attaching a continuation
-            // grants nothing).
-            let Some(cont) = continuation else { continue };
-            let relay = Relay {
-                author: origin,
-                parent_target: msg.target.clone(),
-                parent_frame: frame,
-                outcome: relay_outcome,
-            };
-            let corigin = Origin::Module(msg.target);
-            let cmsg = Msg {
-                target: cont.target,
-                payload: cont.payload,
-            };
-            let mut cev: Vec<Event> = Vec::new();
-            let mut cdi: Vec<DispatchRecord> = Vec::new();
-            let cqueue: VecDeque<(Origin, Msg)> =
-                VecDeque::from([(corigin.clone(), cmsg.clone())]);
-            match self
-                .drain_queue(
-                    height,
-                    consensus_time,
-                    cqueue,
-                    Some(relay.clone()),
-                    &mut touched,
-                    &mut cev,
-                    &mut cdi,
-                )
-                .await
-            {
-                Ok(_cont_output) => {
-                    // a continuation's own declared output has no consumer —
-                    // depth 1 by shape means nothing continues IT.
-                    let row = continuations.len();
-                    continuations.push((
-                        i,
-                        MemberOutcome::Applied {
-                            dispatches: Vec::new(),
-                        },
-                    ));
-                    accepted.push(AcceptedUnit {
-                        origin: corigin,
-                        msg: cmsg,
-                        relay: Some(relay),
-                        slot: UnitSlot::Continuation(row),
-                        events: cev,
-                        dispatches: cdi,
-                    });
-                }
-                Err(reason) => {
-                    self.abort_all(&mut touched).await?;
-                    self.replay_accepted(
-                        height,
-                        consensus_time,
-                        &mut accepted,
-                        &mut touched,
-                    )
-                    .await?;
-                    continuations.push((
-                        i,
-                        MemberOutcome::Rejected {
-                            reason: reason.to_string(),
-                        },
-                    ));
-                }
-            }
         }
 
         // 3. write each accepted unit's authoritative trace into its slot and
-        // accumulate the aggregate events in execution order (input order,
-        // each parent's accepted continuation immediately after it).
+        // accumulate the aggregate events in execution order (input order).
         let mut events: Vec<Event> = Vec::new();
         for unit in accepted {
             events.extend(unit.events);
-            let outcome = MemberOutcome::Applied {
+            results[unit.member] = Some(MemberOutcome::Applied {
                 dispatches: unit.dispatches,
-            };
-            match unit.slot {
-                UnitSlot::Member(pos) => results[pos] = Some(outcome),
-                UnitSlot::Continuation(row) => continuations[row].1 = outcome,
-            }
+            });
         }
 
         // 4. drain the once-per-block injections ONCE, on top of the accepted
@@ -1305,7 +1209,6 @@ impl Host {
                 height,
                 consensus_time,
                 injections,
-                None,
                 &mut touched,
                 &mut sys_events,
                 &mut system_dispatches,
@@ -1359,11 +1262,10 @@ impl Host {
             }
         }
 
-        // 6. ONE app-hash over the committed registry, shared by every member.
+        // 6. ONE root-hash over the committed registry, shared by every member.
         Ok(BatchOutcome {
-            app_hash: self.app_hash(),
+            root_hash: self.root_hash(),
             members: results.into_iter().map(Option::unwrap).collect(),
-            continuations,
             events,
             system_dispatches,
         })
@@ -1393,9 +1295,8 @@ impl Host {
         }
     }
 
-    /// replay every accepted unit (member op or released continuation) after
-    /// an isolation rollback, rebuilding their staged writes and overwriting
-    /// their authoritative traces. an accepted unit drained Ok in this same
+    /// replay every accepted unit after an isolation rollback, rebuilding
+    /// their staged writes and overwriting their authoritative traces. an accepted unit drained Ok in this same
     /// context before, so a reject on replay is NON-DETERMINISM → fatal.
     async fn replay_accepted(
         &mut self,
@@ -1409,40 +1310,32 @@ impl Host {
             let mut rdi: Vec<DispatchRecord> = Vec::new();
             let rq: VecDeque<(Origin, Msg)> =
                 VecDeque::from([(unit.origin.clone(), unit.msg.clone())]);
-            self.drain_queue(
-                height,
-                consensus_time,
-                rq,
-                unit.relay.clone(),
-                touched,
-                &mut rev,
-                &mut rdi,
-            )
-            .await
-            .map_err(|re| {
-                // the kernel's ONLY in-band detector of module
-                // non-determinism, and the most fork-relevant event that
-                // can occur — a module that rejects on replay what it
-                // accepted on first execution. it was being wrapped into
-                // a FatalError mislabelled as an Abort-phase boundary
-                // fault and returned in SILENCE.
-                tracing::error!(
-                    target: "ducktape::consensus",
-                    module = %unit.msg.target,
-                    error = %re,
-                    "NON-DETERMINISTIC module: rejected on replay what it \
-                     accepted during per-op isolation — this node's state \
-                     may diverge from its peers"
-                );
-                SubmitError::Fatal(FatalError {
-                    module: unit.msg.target.clone(),
-                    phase: BoundaryPhase::Abort,
-                    source: Error::Module(format!(
-                        "non-deterministic reject replaying accepted batch \
+            self.drain_queue(height, consensus_time, rq, touched, &mut rev, &mut rdi)
+                .await
+                .map_err(|re| {
+                    // the kernel's ONLY in-band detector of module
+                    // non-determinism, and the most fork-relevant event that
+                    // can occur — a module that rejects on replay what it
+                    // accepted on first execution. it was being wrapped into
+                    // a FatalError mislabelled as an Abort-phase boundary
+                    // fault and returned in SILENCE.
+                    tracing::error!(
+                        target: "ducktape::consensus",
+                        module = %unit.msg.target,
+                        error = %re,
+                        "NON-DETERMINISTIC module: rejected on replay what it \
+                         accepted during per-op isolation — this node's state \
+                         may diverge from its peers"
+                    );
+                    SubmitError::Fatal(FatalError {
+                        module: unit.msg.target.clone(),
+                        phase: BoundaryPhase::Abort,
+                        source: Error::Module(format!(
+                            "non-deterministic reject replaying accepted batch \
                          member during per-op isolation: {re}"
-                    )),
-                })
-            })?;
+                        )),
+                    })
+                })?;
             unit.events = rev;
             unit.dispatches = rdi;
         }
@@ -1471,7 +1364,7 @@ impl Host {
         // DETERMINISTIC ACTIVATION INJECTION. at a finalized boundary where the
         // committed `lifecycle` module holds an armed code swap, append EXACTLY
         // ONE System-origin `Advance` so the module reconciles its own
-        // app-hashed state in-block (flip every armed active hash — the
+        // root-hashed state in-block (flip every armed active hash — the
         // consensus commitment to the new code; the actual component swap is
         // realized out-of-block by `realize_module_swaps`). it rides this drain
         // (not the respawn side-path), so live, recovery-replay, and state-sync
@@ -1497,16 +1390,8 @@ impl Host {
         // submit_block reuses — once per member, then once for the injections.
         let mut events: Vec<Event> = Vec::new();
         let mut dispatches: Vec<DispatchRecord> = Vec::new();
-        self.drain_queue(
-            height,
-            consensus_time,
-            queue,
-            None,
-            touched,
-            &mut events,
-            &mut dispatches,
-        )
-        .await?;
+        self.drain_queue(height, consensus_time, queue, touched, &mut events, &mut dispatches)
+            .await?;
         Ok((events, dispatches))
     }
 
@@ -1520,33 +1405,22 @@ impl Host {
     /// (never cleared), so a caller can thread one set of sinks across several
     /// calls or hand in fresh ones per call. the dispatch budget is per-call:
     /// each queue-run gets a fresh [`MAX_DISPATCHES`].
-    ///
-    /// `relay` rides ONLY the queue's ROOT dispatch (a released continuation);
-    /// follow-ups never inherit it — the relay slot marks "this dispatch IS
-    /// the continuation", nothing downstream. the return is the root
-    /// dispatch's declared output ([`Ctx::set_output`]) — what a parent's
-    /// continuation relays on its `Ok` arm; `None` when the root declared
-    /// nothing (relayed as empty).
-    #[allow(clippy::too_many_arguments)]
     async fn drain_queue(
         &mut self,
         height: u64,
         consensus_time: u64,
         mut queue: VecDeque<(Origin, Msg)>,
-        mut relay: Option<Relay>,
         touched: &mut BTreeSet<ModuleId>,
         events: &mut Vec<Event>,
         dispatches: &mut Vec<DispatchRecord>,
-    ) -> Result<Option<Vec<u8>>, Error> {
+    ) -> Result<(), Error> {
         let mut n: u32 = 0;
-        let mut root_output: Option<Vec<u8>> = None;
 
         while let Some((origin, msg)) = queue.pop_front() {
             n += 1;
             if n > MAX_DISPATCHES {
                 return Err(Error::BudgetExceeded);
             }
-            let is_root = n == 1;
 
             // remove → owned module, decoupled from the map's borrow.
             let mut me = self
@@ -1579,10 +1453,8 @@ impl Host {
                 registry: &self.registry, // the rest — for query routing
                 out_msgs: Vec::new(),
                 out_events: Vec::new(),
-                // the relay rides the root dispatch only: `take` empties the
-                // slot after the first iteration, so follow-ups see `None`.
-                relay: if is_root { relay.take() } else { None },
                 out_output: None,
+                out_assigned: Vec::new(),
             };
 
             // owned `me` (&mut) and `ctx` (holding &rest) are disjoint borrows,
@@ -1594,6 +1466,7 @@ impl Host {
                 out_msgs,
                 out_events,
                 out_output,
+                out_assigned,
                 ..
             } = ctx;
 
@@ -1613,8 +1486,12 @@ impl Host {
                     sdk::MAX_OUTPUT_BYTES
                 )));
             }
-            if is_root {
-                root_output = out_output;
+            if out_assigned.len() > sdk::MAX_ASSIGNED_BYTES {
+                return Err(Error::Module(format!(
+                    "op assigned stamp exceeds cap ({} > {})",
+                    out_assigned.len(),
+                    sdk::MAX_ASSIGNED_BYTES
+                )));
             }
 
             // record this (successful) dispatch for the deterministic trace. only
@@ -1627,6 +1504,7 @@ impl Host {
                 payload: msg.payload,
                 emitted_msgs: out_msgs.len(),
                 emitted_events: out_events.len(),
+                assigned: out_assigned,
             });
 
             // local-only re-entry: emitted msgs become follow-up ops, never
@@ -1637,7 +1515,7 @@ impl Host {
             events.extend(out_events);
         }
 
-        Ok(root_output)
+        Ok(())
     }
 }
 
@@ -1650,11 +1528,13 @@ struct HostCtx<'a> {
     registry: &'a BTreeMap<ModuleId, Box<dyn Module>>,
     out_msgs: Vec<Msg>,
     out_events: Vec<Event>,
-    /// the relay slot — `Some` iff THIS dispatch is a released continuation.
-    relay: Option<Relay>,
     /// the op's declared output ([`Ctx::set_output`]), staged with the
-    /// dispatch; the drain caps it and threads the root's into the relay.
+    /// dispatch; the drain caps it. DEAD: nothing reads it — its only consumer
+    /// was the deleted continuation relay.
     out_output: Option<Vec<u8>>,
+    /// the dispatch's assigned stamp ([`Ctx::set_assigned`]), staged with the
+    /// dispatch; the drain caps it and records it on the trace.
+    out_assigned: Vec<u8>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1695,12 +1575,12 @@ impl Ctx for HostCtx<'_> {
         self.out_msgs.push(msg);
     }
 
-    fn relay(&self) -> Option<&Relay> {
-        self.relay.as_ref()
-    }
-
     fn set_output(&mut self, bytes: Vec<u8>) {
         self.out_output = Some(bytes);
+    }
+
+    fn set_assigned(&mut self, bytes: Vec<u8>) {
+        self.out_assigned = bytes;
     }
 
     fn emit_event(&mut self, ev: Event) {
@@ -1759,21 +1639,4 @@ impl Ctx for ReadOnlyQueryCtx<'_> {
     fn emit_msg(&mut self, _msg: Msg) {}
 
     fn emit_event(&mut self, _ev: Event) {}
-}
-
-#[cfg(test)]
-mod state_schema_tests {
-    use super::state_schema_fingerprint;
-
-    #[test]
-    fn fingerprint_is_canonically_sorted_and_revision_sensitive() {
-        let first = state_schema_fingerprint([("runs", 2), ("chat", 1)]);
-        let reordered = state_schema_fingerprint([("chat", 1), ("runs", 2)]);
-        let old_runs = state_schema_fingerprint([("chat", 1), ("runs", 1)]);
-        assert_eq!(
-            first, reordered,
-            "registry construction order is irrelevant"
-        );
-        assert_ne!(first, old_runs, "a canonical schema change requires a bump");
-    }
 }

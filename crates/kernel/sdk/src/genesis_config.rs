@@ -11,7 +11,7 @@
 //! [`decode_config`], and constructs the native module with those parameters.
 //!
 //! the config is CONSENSUS STATE: identical on every node of a network, part
-//! of the module's root (and therefore the app-hash) from genesis — which is
+//! of the module's root (and therefore the root-hash) from genesis — which is
 //! correct, because these ARE genesis consensus parameters. two networks with
 //! different parameters honestly diverge at their genesis roots. on restore /
 //! state-sync nothing special happens: the checkpoint snapshot carries
@@ -29,9 +29,7 @@ use crate::codec::{Cursor, push_bytes, push_str};
 /// the reserved host-store key the config travels under.
 pub const CONFIG_KEY: &[u8] = b"__config";
 
-/// the one encoding version this codec speaks. a future shape change bumps it
-/// (and, since the config is consensus state, is a state-schema break for
-/// every tenant that carries one).
+/// The current encoding tag.
 pub const CONFIG_VERSION: u8 = 1;
 
 /// canonical bytes of a genesis parameter list. keys must be strictly

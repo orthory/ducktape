@@ -26,6 +26,7 @@
 //! traffic is answered by the same stand-in the plane tests use. the `runs` ops
 //! are the ones that reach real consensus.
 
+use crate::NodeHandle;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +35,7 @@ use agent::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg};
 use chat::{Block, Chat, ChatMsg, Mark, PostPolicy, Span};
 use commonware_runtime::{Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
-use dispatch_oracle::{DeliverFn, DispatchPool, SpawnFn};
+use compute_service::{DeliverFn, DispatchPool, SpawnFn};
 use futures::StreamExt as _;
 use host::worker::{WorkOutcome, Worker as _};
 use host::{BlockContext, Host};
@@ -61,18 +62,18 @@ const CHANNEL: &str = "general";
 /// see, so `DUCKTAPE_RUN_ID` here is the id the MCP server would stamp onto every
 /// mid-run write.
 struct RecordingProvider {
-    seen: Arc<std::sync::Mutex<Option<capability_host::RunContext>>>,
+    seen: Arc<std::sync::Mutex<Option<provider_host::RunContext>>>,
 }
 
 #[async_trait::async_trait]
-impl capability_host::Provider for RecordingProvider {
+impl provider_host::Provider for RecordingProvider {
     fn capability(&self) -> &str {
         CAPABILITY
     }
     async fn run(
         &self,
         _prompt: &str,
-        ctx: &capability_host::RunContext,
+        ctx: &provider_host::RunContext,
     ) -> Result<String, String> {
         *self.seen.lock().unwrap() = Some(ctx.clone());
         Ok(r#"{"reply_blocks":[],"actions":[]}"#.to_string())
@@ -80,9 +81,9 @@ impl capability_host::Provider for RecordingProvider {
 }
 
 fn provider_set(
-    seen: Arc<std::sync::Mutex<Option<capability_host::RunContext>>>,
-) -> Arc<capability_host::ProviderSet> {
-    let spec = capability_host::CapabilitySpec::parse(
+    seen: Arc<std::sync::Mutex<Option<provider_host::RunContext>>>,
+) -> Arc<provider_host::ProviderSet> {
+    let spec = provider_host::CapabilitySpec::parse(
         &format!(
             r#"
 spec = 1
@@ -100,8 +101,8 @@ format = "text"
         "test",
     )
     .expect("the mock capability spec parses");
-    Arc::new(capability_host::ProviderSet::assemble(
-        capability_host::SpecSet::from_specs(vec![spec]),
+    Arc::new(provider_host::ProviderSet::assemble(
+        provider_host::SpecSet::from_specs(vec![spec]),
         vec![Box::new(RecordingProvider { seen })],
     ))
 }
@@ -128,11 +129,22 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
     .with_tagging("tagging");
     Host::genesis(vec![
         Box::new(chat),
-        Box::new(TaggingModule::new("tagging")),
-        Box::new(SagaModule::new("saga")),
-        Box::new(DispatchModule::new("dispatch", "saga")),
+        Box::new(TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
+        Box::new(SagaModule::new(
+            "saga",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
+        Box::new(DispatchModule::new(
+            "dispatch",
+            "saga",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(agent::AgentModule::new(
             "agent",
+            Box::new(QmdbStore::init(context.child("agent"), "agent").await),
             "saga",
             Some("runs".into()),
         )),
@@ -146,7 +158,7 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
             Some("tasks".into()),
             Some("tasks".into()),
         )),
-        Box::new(Tasks::new("tasks")),
+        Box::new(Tasks::new("tasks", Box::new(sdk_testkit::MemStore::new()))),
     ])
     .expect("genesis")
 }
@@ -310,7 +322,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             // a bare node's ledger fits the demandless jobs it dispatches.
             Default::default(),
             Arc::new(
-                NodedProvisioner::new(handle, &runs_root)
+                NodedProvisioner::new(crate::agent_provision::test_link(handle).await, &runs_root)
                     .with_node_url(Some("http://127.0.0.1:8844".into())),
             ),
         );

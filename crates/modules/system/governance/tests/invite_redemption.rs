@@ -3,7 +3,7 @@
 //! joiner's proof-of-possession grants standing with no ballot — and the
 //! redeemed-nonce set makes every token single-use.
 //!
-//! the join protocol: EVERY invite is bearer (무기명). There is no target lock;
+//! the join protocol: EVERY invite is bearer. There is no target lock;
 //! whoever presents a valid join proof for the nonce first wins the grant, and
 //! single-use bounds it. The role (`Resident`/`Client`) selects which standing
 //! plane the grant lands in.
@@ -23,12 +23,13 @@ use governance::{
     GovMsg, GovQuery, GovReply, Governance, decode_reply as gov_decode, encode_msg as gov_encode,
     encode_query as gov_query,
 };
+use host::{BlockContext, Host, SubmitError};
 use identity::Identity;
 use identity::{
     IdentityQuery, IdentityReply, decode_reply as identity_decode, encode_query as identity_query,
 };
-use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Msg, Origin};
+use sdk_testkit::MemStore;
 use valset::Valset;
 use valset::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode, encode_query as valset_query,
@@ -47,9 +48,14 @@ fn key_bytes(k: &PrivateKey) -> Vec<u8> {
 
 /// re-state the invite-grant preimage here rather than reach into
 /// `governance::invite`: a preimage drift in the crate then FAILS these tests
-/// loudly instead of silently signing a stale shape. v2: `binding ‖ nonce ‖
-/// role ‖ expiry` — no kind byte, no target.
-fn grant_preimage_for_tests(binding: &[u8], nonce: &[u8], role: InviteRole, expires: u64) -> Vec<u8> {
+/// loudly instead of silently signing a stale shape: `binding ‖ nonce ‖ role ‖
+/// expiry` — no kind byte, no target.
+fn grant_preimage_for_tests(
+    binding: &[u8],
+    nonce: &[u8],
+    role: InviteRole,
+    expires: u64,
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(binding);
     out.extend_from_slice(nonce);
@@ -88,15 +94,21 @@ fn redeem_msg(token: &InviteToken, joiner: &PrivateKey) -> Vec<u8> {
 
 /// a host with governance (invite-wired) gating a valset seeded with members
 /// 1 and 2.
-fn gov_host() -> Host {
-    let mut valset = Valset::new("valset");
-    valset.insert(key_bytes(&keypair(1)));
-    valset.insert(key_bytes(&keypair(2)));
+async fn gov_host() -> Host {
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+    valset.seed(key_bytes(&keypair(1))).await.expect("seed valset");
+    valset.seed(key_bytes(&keypair(2))).await.expect("seed valset");
+    valset.finish_seed().await.expect("seed valset");
     Host::genesis(vec![
         Box::new(valset),
-        Box::new(Identity::new("identity", None, "testnet".into())),
+        Box::new(Identity::new(
+            "identity",
+            Box::new(MemStore::new()),
+            None,
+            "testnet".into(),
+        )),
         Box::new(
-            Governance::new("governance", "valset", "identity")
+            Governance::new("governance", Box::new(MemStore::new()), "valset", "identity")
                 .with_invite_binding(BINDING),
         ),
     ])
@@ -146,21 +158,26 @@ async fn clients(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
-async fn redemptions(host: &Host) -> Vec<governance::RedemptionView> {
+async fn redemption(host: &Host, nonce: &[u8]) -> Option<governance::RedemptionView> {
     let reply = host
-        .query("governance", &gov_query(&GovQuery::Redemptions))
+        .query(
+            "governance",
+            &gov_query(&GovQuery::Redemption {
+                nonce: nonce.to_vec(),
+            }),
+        )
         .await
         .expect("gov query");
     match gov_decode(&reply).expect("decode") {
-        GovReply::Redemptions(r) => r,
-        other => panic!("expected Redemptions, got {other:?}"),
+        GovReply::Redemption(r) => r,
+        other => panic!("expected Redemption, got {other:?}"),
     }
 }
 
 #[test]
 fn a_valid_redemption_grants_full_node_standing_without_a_ballot() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (member, joiner) = (keypair(1), keypair(9));
         let token = mint(&member, 7, InviteRole::Resident, u64::MAX);
 
@@ -178,18 +195,23 @@ fn a_valid_redemption_grants_full_node_standing_without_a_ballot() {
             vec![key_bytes(&joiner)],
             "the joiner holds resident standing in the same block"
         );
-        let audit = redemptions(&host).await;
-        assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].joiner, key_bytes(&joiner));
-        assert_eq!(audit[0].issuer, key_bytes(&member));
-        assert_eq!(audit[0].height, 1);
+        let audit = redemption(&host, &token.nonce)
+            .await
+            .expect("the admission is recorded under its nonce");
+        assert_eq!(audit.joiner, key_bytes(&joiner));
+        assert_eq!(audit.issuer, key_bytes(&member));
+        assert_eq!(audit.height, 1);
+        assert!(
+            redemption(&host, &[0u8; 16]).await.is_none(),
+            "an unspent nonce reads as absent"
+        );
     });
 }
 
 #[test]
-fn a_token_is_single_use_and_survives_snapshot_round_trip() {
+fn a_token_is_single_use() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (member, joiner) = (keypair(1), keypair(9));
         let token = mint(&member, 7, InviteRole::Resident, u64::MAX);
 
@@ -218,36 +240,13 @@ fn a_token_is_single_use_and_survives_snapshot_round_trip() {
                 if m.contains("already redeemed") || m.contains("already holds resident standing")),
             "a replay must be refused as a double-admit, got {err:?}"
         );
-
-        // the redeemed set is state: it rides the snapshot, and a rebuilt
-        // instance reproduces the exact root.
-        use sdk::Module as _;
-        let expected_root = host.module_root("governance").expect("gov root");
-        let sdk::StateSyncHandle::SnapshotBytes(bytes) = ({
-            let finalized = host::FinalizedBlock {
-                height: 2,
-                app_hash: host.app_hash(),
-            };
-            host.capture_finalized_snapshot(finalized)
-                .expect("capture")
-                .module("governance")
-                .expect("gov entry")
-                .state_sync
-                .clone()
-        }) else {
-            panic!("governance must advertise snapshot bytes");
-        };
-        let mut rebuilt = Governance::new("governance", "valset", "identity")
-            .with_invite_binding(BINDING);
-        rebuilt.install(&bytes, expected_root).expect("install");
-        assert_eq!(rebuilt.root(), expected_root, "round-trip root");
     });
 }
 
 #[test]
 fn forged_or_unauthorized_redemptions_are_refused() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (member, outsider, joiner) = (keypair(1), keypair(8), keypair(9));
 
         // a token minted by a NON-member verifies cryptographically but fails
@@ -297,13 +296,15 @@ fn forged_or_unauthorized_redemptions_are_refused() {
 #[test]
 fn a_network_without_a_binding_refuses_redemption() {
     block_on(async {
-        let mut valset = Valset::new("valset");
-        valset.insert(key_bytes(&keypair(1)));
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        valset.seed(key_bytes(&keypair(1))).await.expect("seed valset");
+        valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
             Box::new(valset),
             // no with_invite_binding — the dev-seed shape.
             Box::new(Governance::new(
                 "governance",
+                Box::new(MemStore::new()),
                 "valset",
                 "identity",
             )),
@@ -330,7 +331,7 @@ fn a_network_without_a_binding_refuses_redemption() {
 #[test]
 fn a_bearer_resident_token_is_first_wins_single_use() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let issuer = keypair(1);
         // ONE bearer Resident token; two different keys race to redeem it.
         let token = mint(&issuer, 1, InviteRole::Resident, u64::MAX);
@@ -340,7 +341,10 @@ fn a_bearer_resident_token_is_first_wins_single_use() {
         submit_as(&mut host, &key_bytes(&a), 10, redeem_msg(&token, &a))
             .await
             .expect("A redeems the bearer resident invite");
-        assert!(residents(&host).await.contains(&key_bytes(&a)), "A holds resident standing");
+        assert!(
+            residents(&host).await.contains(&key_bytes(&a)),
+            "A holds resident standing"
+        );
 
         // key B presents the SAME token with its OWN valid proof: the nonce is
         // spent — single-use first-wins is the whole bearer containment story.
@@ -349,7 +353,10 @@ fn a_bearer_resident_token_is_first_wins_single_use() {
             .await
             .expect_err("second redemption of a spent bearer token");
         assert!(format!("{err:?}").contains("already redeemed"), "{err:?}");
-        assert!(!residents(&host).await.contains(&key_bytes(&b)), "B gained nothing");
+        assert!(
+            !residents(&host).await.contains(&key_bytes(&b)),
+            "B gained nothing"
+        );
 
         // expiry is deliberately NOT consensus-enforced: consensus_time is
         // block height on this chain (no deterministic wall clock exists
@@ -370,7 +377,7 @@ fn a_bearer_resident_token_is_first_wins_single_use() {
 #[test]
 fn a_client_role_token_grants_client_standing_not_residency() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (member, client) = (keypair(1), keypair(9));
         let token = mint(&member, 3, InviteRole::Client, u64::MAX);
 
@@ -394,17 +401,18 @@ fn a_client_role_token_grants_client_standing_not_residency() {
             residents(&host).await.is_empty(),
             "a Client redeem grants NO resident standing — the tiers are distinct"
         );
-        // the admission is still audited in the shared redemption set.
-        let audit = redemptions(&host).await;
-        assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].joiner, key_bytes(&client));
+        // the admission is still recorded in the shared redemption keyspace.
+        let audit = redemption(&host, &token.nonce)
+            .await
+            .expect("the admission is recorded under its nonce");
+        assert_eq!(audit.joiner, key_bytes(&client));
     });
 }
 
 #[test]
 fn a_client_token_is_single_use() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (member, client) = (keypair(1), keypair(9));
         let token = mint(&member, 4, InviteRole::Client, u64::MAX);
 
@@ -432,14 +440,18 @@ fn a_client_token_is_single_use() {
                 if m.contains("already redeemed") || m.contains("already holds client standing")),
             "got {err:?}"
         );
-        assert_eq!(clients(&host).await, vec![key_bytes(&client)], "still one client");
+        assert_eq!(
+            clients(&host).await,
+            vec![key_bytes(&client)],
+            "still one client"
+        );
     });
 }
 
 #[test]
 fn the_join_proof_is_enforced_for_a_client_token_too() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let issuer = keypair(1);
 
         // claim keypair(10) as the joiner but sign the proof with keypair(8):
@@ -460,7 +472,10 @@ fn the_join_proof_is_enforced_for_a_client_token_too() {
         let err = submit_as(&mut host, &key_bytes(&claimed), 11, forged)
             .await
             .expect_err("bad join proof");
-        assert!(format!("{err:?}").contains("proof-of-possession"), "{err:?}");
+        assert!(
+            format!("{err:?}").contains("proof-of-possession"),
+            "{err:?}"
+        );
 
         assert!(clients(&host).await.is_empty(), "nothing was granted");
     });

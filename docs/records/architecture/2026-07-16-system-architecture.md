@@ -21,8 +21,8 @@ One BFT-replicated state machine hosting isolated product modules — the
 CosmWasm isolation *pattern* in native Rust. Each module owns its own
 authenticated state substrate and exposes exactly one 32-byte
 `sdk::StateRoot`; the host composes the sorted `(ModuleId, StateRoot)` pairs
-into a global app-hash that consensus commits. Two nodes that agree on the
-app-hash agree on every module's state.
+into a global root-hash that consensus commits. Two nodes that agree on the
+root-hash agree on every module's state.
 
 Five invariants govern everything (`docs/src/content/docs/en/human/architecture/platform-invariants.mdx`):
 
@@ -35,7 +35,7 @@ Five invariants govern everything (`docs/src/content/docs/en/human/architecture/
 3. **Host-lent atomicity** — modules stage writes; the host calls
    `commit_block` for every touched module on a clean drain, `abort_block`
    on any failure. A failed block moves no roots.
-4. **App-hash commits to everything** — every durable state that matters sits
+4. **Root-hash commits to everything** — every durable state that matters sits
    under some module's root.
 5. **Single-store step** — a deterministic step writes one store; cross-store
    work sequences through follow-up messages or the saga/worker pattern.
@@ -100,7 +100,7 @@ The load-bearing facts:
   never exec or wait on the node directly. Secrets cross only via stdin.
 - **`bin/node` is one binary with three role arms**, chosen at boot
   (`bin/node/src/main.rs:409-591`): `--sync-only` (join the mesh, pull every
-  module over statesync, print the composed app-hash, exit), **replica/joiner**
+  module over statesync, print the composed root-hash, exit), **replica/joiner**
   (`replica::run` — park on the mesh, run the join gate, sync, and possibly
   promote), and **validator** (`validator::run_validator` — consensus engine +
   statesync service + all planes). A key outside the genesis set that no
@@ -206,7 +206,7 @@ The storage seam is `sdk::MerkleStore` (`lib.rs:360-383`): the host constructs
 the concrete store (qmdb via `statesync::qmdb::QmdbStore`) and *injects* the
 handle, so qmdb-backed modules are pure logic that never name a storage crate.
 
-### 4.2 `host` — registry, drain, app-hash
+### 4.2 `host` — registry, drain, root-hash
 
 `host::Host` owns `BTreeMap<ModuleId, Box<dyn Module>>` (deterministic
 iteration is load-bearing). `submit_at` (one op = one block) and
@@ -225,9 +225,9 @@ async functions — a caller invokes them per block.
   member that rejects *on replay* after accepting in isolation is the kernel's
   only in-band non-determinism detector and escalates to Fatal
   (`lib.rs:1233-1266`).
-- **App-hash** (`host/src/lib.rs:41-68`): sort `(id, root)` pairs, hash with
+- **Root-hash** (`host/src/lib.rs:41-68`): sort `(id, root)` pairs, hash with
   length prefixes. Deliberately a plain sorted sha256, *not* a qmdb-of-heads:
-  an app-hash must be `f(current state)` — order-independent and idempotent —
+  a root-hash must be `f(current state)` — order-independent and idempotent —
   so a state-synced node computes the same root without replaying history.
 - **The worker seam** (`host/src/worker.rs`): `Event`s that request
   off-consensus work are offered to `host::worker::Worker`s *beside* the
@@ -279,7 +279,7 @@ valset cutover.
 - **statesync** = join-time bootstrap, never steady state
   (`statesync/src/lib.rs:1-12`). Five request shapes (Manifest / Chunk /
   Module / Frames / Index*) over an untrusted server — every installable
-  payload verifies against a manifest root, and the manifest app-hash is
+  payload verifies against a manifest root, and the manifest root-hash is
   recomposed. `QmdbStore` implements `sdk::MerkleStore`;
   `RemoteQmdbResolver` plugs into commonware's qmdb sync engine.
 - **recovery** = boot-time replay. WAL op journal + periodic checkpoint;
@@ -301,7 +301,7 @@ A `ducktape:module` wasm component runs *as* a native `sdk::Module`
 (`wasm-host/src/lib.rs:1-33`). Design-B: the guest is pure logic,
 re-instantiated per call; all durable state lives host-side (`StateBacking::Map`
 or an injected qmdb `MerkleStore`), so `root()` is host-computed and
-**`swap_code` moves logic without moving the app-hash** — the live-update
+**`swap_code` moves logic without moving the root-hash** — the live-update
 primitive. The sync guest bridges to the async host by memoized replay: an
 unresolved cross-module read traps deterministically, the wrapper resolves it,
 and the pure guest re-runs with the answer memoized. wasmtime is pinned
@@ -309,7 +309,7 @@ and the pure guest re-runs with the answer memoized. wasmtime is pinned
 upgraded only as a binary upgrade. `deterministic_config()` turns off every
 nondeterministic feature and turns on fuel + NaN canonicalization.
 
-> **Review here:** the app-hash's plain-sorted-hash choice trades light-client
+> **Review here:** the root-hash's plain-sorted-hash choice trades light-client
 > membership proofs for state-sync idempotence (`host/src/lib.rs:50-54` says
 > "upgrade to a small merkle tree only when a light client needs proofs") —
 > agree with that deferral? And: is `MAX_DISPATCHES = 1024` /
@@ -642,8 +642,8 @@ saga/dispatch/oracle async engine. §5 lists the loops this rides.
    `host.submit_block(BlockContext { height, consensus_time, origin }, ops)`:
    the host drains each op plus its same-block follow-up messages
    (`Ctx::emit_msg` intents, the only cross-module write path), commits every
-   touched module in registry order, and recomposes the app-hash. The whole
-   delivered batch is one block with one app-hash.
+   touched module in registry order, and recomposes the root-hash. The whole
+   delivered batch is one block with one root-hash.
 4. **Index + stream.** The binary folds the block into the fluent31 derived
    tier (`IndexStore::apply_block` — canonical state is already committed, so
    an index failure degrades read models, never the block), then
@@ -666,7 +666,7 @@ saga/dispatch/oracle async engine. §5 lists the loops this rides.
 Non-determinism never runs inside `execute`; it is modeled as **oracle
 results** that re-enter as ordinary ordered ops:
 
-- **saga** (consensus) stores continuation state under the app-hash: a trigger
+- **saga** (consensus) stores continuation state under the root-hash: a trigger
   records pending work and emits a worker request as an `Event`. Idempotency
   (`(saga_id, attempt)`), same-block terminal callbacks, and deterministic
   deadlines via a permissionless `Crank` are its contract
@@ -851,7 +851,7 @@ Architecture questions this doc wants your judgment on (collected from the
 section-level review prompts):
 
 - §2 noded/node genesis drift — pin by test or intended divergence?
-- §4 plain-sorted app-hash vs light-client proofs — keep the deferral?
+- §4 plain-sorted root-hash vs light-client proofs — keep the deferral?
 - §5 loop inventory — anything missing; anything that should be a crate?
 - §6 no-relay stance for symmetric-NAT pairs; invite/standby/validated
   three-layer tunnel management complexity.

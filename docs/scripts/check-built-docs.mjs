@@ -53,9 +53,7 @@ if (!notFound.includes('<title>Page not found | Ducktape</title>')) failures.pus
 if (!notFound.includes('<meta name="robots" content="noindex">')) failures.push('404 must be noindex')
 
 const en = readFileSync(join(dist, 'en/human/index.html'), 'utf8')
-const ko = readFileSync(join(dist, 'ko/human/index.html'), 'utf8')
 if (!en.includes('<html lang="en"')) failures.push('English pages must declare lang="en"')
-if (!ko.includes('<html lang="ko"')) failures.push('Korean pages must declare lang="ko"')
 if (!en.includes('/opengraph.png')) failures.push('pages must advertise the static social card')
 if (!en.includes('data-md-url="/en/human/index.md"') || !en.includes('href="/en/human/index.md"')) {
   failures.push('Markdown page actions must use a host-relative URL')
@@ -63,7 +61,7 @@ if (!en.includes('data-md-url="/en/human/index.md"') || !en.includes('href="/en/
 if (!/<div data-nb-page-actions[^>]*data-pagefind-ignore/.test(en)) {
   failures.push('Page actions must stay out of Pagefind snippets')
 }
-for (const label of ['Human · English', 'Human · 한국어', 'Agent · English', 'Agent · 한국어']) {
+for (const label of ['Human · English', 'Agent · English']) {
   if (!en.includes(label)) failures.push(`header is missing ${label}`)
 }
 assertSidebarOrder(en, [
@@ -103,20 +101,14 @@ if (!pagination.includes('href="/en/human/start/quick-start/"')) {
   failures.push('human overview must paginate to Quick Start')
 }
 
-const css = walk(join(dist, '_astro'))
-  .filter((path) => path.endsWith('.css'))
-  .map((path) => readFileSync(path, 'utf8'))
-  .join('\n')
-if (!css.includes('Noto Sans KR Variable')) failures.push('built CSS must bundle Korean glyphs')
-
 const markdownTwin = readFileSync(join(dist, 'en/human/index.md'), 'utf8')
 const fullCorpus = readFileSync(join(dist, 'llms-full.txt'), 'utf8')
 if (/^import /m.test(markdownTwin)) failures.push('Markdown twins must omit MDX imports')
 if (/^import /m.test(fullCorpus)) failures.push('llms-full.txt must omit MDX imports')
 
 const htmlPages = walk(dist).filter((path) => path.endsWith('.html'))
-if (sources.length !== 54) failures.push(`expected 54 sources, found ${sources.length}`)
-if (htmlPages.length !== 56) failures.push(`expected 56 HTML pages, found ${htmlPages.length}`)
+if (sources.length !== 25) failures.push(`expected 25 sources, found ${sources.length}`)
+if (htmlPages.length !== 27) failures.push(`expected 27 HTML pages, found ${htmlPages.length}`)
 
 if (failures.length) {
   console.error('built docs check failed:')
@@ -124,7 +116,7 @@ if (failures.length) {
   process.exit(1)
 }
 
-console.log('built docs ok (54 routes + landing + 404, Markdown twins, social card, search, sitemap, hydrated diagrams)')
+console.log('built docs ok (25 routes + landing + 404, Markdown twins, social card, search, sitemap, hydrated diagrams)')
 
 function walk(dir) {
   const files = []

@@ -6,7 +6,6 @@
 //! wire surface carries [`AuthorRef`] only in replies and events.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 
 pub const DEFAULT_CHAT_TARGET: &str = "chat";
 
@@ -171,29 +170,14 @@ pub struct MessageHead {
     pub last_reply_seq: Option<u64>,
 }
 
-/// one emoji's reactors on a message. set semantics per (emoji, author).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ReactionSummary {
-    pub emoji: String,
-    pub reactors: BTreeSet<AuthorRef>,
-}
-
-/// a query-side message view: the head plus its reaction summary and the
-/// channel's head-sequence watermark at read time.
+/// a query-side message view: one sequence's head, addressed. reaction
+/// summaries and head-sequence watermarks are read-model decoration and
+/// live on the index tier — dispatch consumers read heads.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MessageView {
     pub channel_id: String,
     pub seq: u64,
     pub head: MessageHead,
-    pub reactions: Vec<ReactionSummary>,
-    pub channel_head_seq: u64,
-}
-
-/// a thread: the root message plus one page of replies.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct Thread {
-    pub root: MessageView,
-    pub replies: Vec<MessageView>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -209,10 +193,10 @@ pub enum ChatMsg {
         post_policy: PostPolicy,
     },
     /// rename a channel, reusing `CreateChannel`'s name validation (non-empty +
-    /// the reserved `:` namespace gate + the record byte cap). only the
-    /// channel's `owner` (a `User` origin) may rename an owned channel; an
-    /// unowned (module/system-minted) channel admits any user, mirroring
-    /// `SetMembership`. module and system origins pass as elsewhere.
+    /// the reserved `:` namespace gate + the record byte cap). channel-admin
+    /// authority: only the channel's `owner` may rename an owned channel, and
+    /// no user at all may rename an unowned (module/system-minted) one. module
+    /// and system origins pass as elsewhere.
     RenameChannel { channel_id: String, name: String },
     /// archive or unarchive a channel. an archived channel rejects posts,
     /// reactions, and huddle joins; membership, rename, and unarchive stay
@@ -254,18 +238,23 @@ pub enum ChatMsg {
         seq: u64,
         emoji: String,
     },
-    /// subscribe a module to this channel's post notifications. any non-empty
-    /// origin may register for now — admin gating is future work.
+    /// subscribe a module to this channel's post notifications. channel-admin
+    /// authority (same rule as `RenameChannel`): a hook sees everything posted
+    /// to the channel, so attaching one is the owner's call.
     RegisterHook {
         channel_id: String,
         module_id: String,
     },
+    /// detach a hook module. channel-admin authority, and the sharper half of
+    /// the pair — an ungated unregister silently disables every automation
+    /// registered on the channel.
     UnregisterHook {
         channel_id: String,
         module_id: String,
     },
-    /// add/remove an external user from the channel member set. any non-empty
-    /// origin may modify for now — admin gating is future work.
+    /// add/remove an external user from the channel member set. channel-admin
+    /// authority: this roster IS `PostPolicy::MembersOnly`'s admission list, so
+    /// only the owner writes it — a self-service roster is no admission rule.
     SetMembership {
         channel_id: String,
         user: Vec<u8>,
@@ -281,79 +270,48 @@ pub enum ChatMsg {
     LeaveHuddle { channel_id: String },
     /// evict a huddle member — call liveness is not consensus-observable
     /// (a crashed client cannot leave), so cleanup is social: any author the
-    /// channel's post policy admits may sweep a stale entry, mirroring
-    /// `SetMembership`'s trust posture. sweeping an absent user is a
+    /// channel's post policy admits may sweep a stale entry. deliberately NOT
+    /// channel-admin authority (unlike `SetMembership`): a huddle roster is
+    /// ephemeral call presence, not an admission list, and the only harm a
+    /// wrongful sweep does is a rejoin. sweeping an absent user is a
     /// deterministic no-op.
     SweepHuddle { channel_id: String, user: Vec<u8> },
 }
 
+/// the DISPATCH read surface — exactly the point/computed reads other
+/// modules' `execute()` paths consume through `Ctx::query` (runs' context
+/// pinning and existence probes, automations' event handling). every
+/// UI-shaped read (channel lists, latest pages, threads, revisions,
+/// reactions, members, search) is served by chat's index guest on the
+/// derived tier instead — consensus never reads the unverifiable index,
+/// and canonical state never grows scan machinery for a human surface.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatQuery {
-    Channels,
+    /// one channel record by id — the existence/policy probe.
     Channel {
         channel_id: String,
     },
-    /// the newest `limit` messages (all sequences — replies and tombstones
-    /// included, so pagination stays gap-free), ascending by sequence.
-    MessagesLatest {
-        channel_id: String,
-        limit: u64,
-    },
-    /// `limit` messages starting at `from_seq`, ascending.
+    /// `limit` messages starting at `from_seq`, ascending — the agent
+    /// context window. computed-key point reads driven by the gap-free
+    /// sequence space (P3), deterministic on every validator.
     MessagesRange {
         channel_id: String,
         from_seq: u64,
         limit: u64,
     },
-    /// the window of `limit` messages CENTERED on `seq`, ascending — the
-    /// jump-to-message read: a tag/search hit older than the newest `limit`
-    /// is in no [`MessagesLatest`](ChatQuery::MessagesLatest) page. half the
-    /// window sits before `seq`, the rest from `seq` on; both ends clamp to the
-    /// channel's live range and `limit` to [`MAX_QUERY_LIMIT`]. carries every
-    /// sequence (replies, tombstones) like the other pages.
-    MessagesAround {
-        channel_id: String,
-        seq: u64,
-        limit: u64,
-    },
-    /// global message-id lookup.
+    /// global message-id lookup — the id-collision probe.
     Message {
         message_id: String,
-    },
-    /// the immutable edit history of one message, ascending by revision.
-    Revisions {
-        channel_id: String,
-        seq: u64,
-    },
-    /// the thread root plus one page of replies; `from` is a 0-based offset
-    /// into the reply list.
-    Thread {
-        channel_id: String,
-        root_seq: u64,
-        from: u64,
-        limit: u64,
-    },
-    Reactions {
-        channel_id: String,
-        seq: u64,
-    },
-    Members {
-        channel_id: String,
     },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatReply {
-    Channels(Vec<Channel>),
     Channel(Option<Channel>),
     Messages(Vec<MessageView>),
     Message(Option<MessageView>),
-    Revisions(Vec<MessageHead>),
-    Thread(Option<Thread>),
-    Reactions(Vec<ReactionSummary>),
-    Members(Vec<Vec<u8>>),
 }
 
 /// the hook notification payload: one follow-up [`sdk::Msg`]-shaped dispatch
@@ -368,6 +326,20 @@ pub enum ChatEvent {
         author: AuthorRef,
         mentions: Vec<AuthorRef>,
     },
+}
+
+/// the assigned stamp chat declares per applied op ([`sdk::Ctx::set_assigned`]):
+/// the values the module assigned in-state that the op payload cannot carry.
+/// rides the dispatch trace onto the derived-tier op-feed row, so feed
+/// followers (the index fold, clients) consume exact assignments instead of
+/// re-deriving them by counting.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatAssigned {
+    /// `PostMessage`: the message's assigned per-channel sequence.
+    Posted { seq: u64 },
+    /// `EditMessage`: the new head's assigned revision.
+    Edited { rev: u32 },
 }
 
 pub fn encode_msg(m: &ChatMsg) -> Vec<u8> {
@@ -399,5 +371,13 @@ pub fn encode_event(e: &ChatEvent) -> Vec<u8> {
 }
 
 pub fn decode_event(b: &[u8]) -> Result<ChatEvent, String> {
+    sdk::wire::decode(b)
+}
+
+pub fn encode_assigned(a: &ChatAssigned) -> Vec<u8> {
+    sdk::wire::encode(a)
+}
+
+pub fn decode_assigned(b: &[u8]) -> Result<ChatAssigned, String> {
     sdk::wire::decode(b)
 }

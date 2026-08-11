@@ -1,7 +1,7 @@
 //! the worker seam — the host-owned, NON-DETERMINISTIC lane beside the drain.
 //!
 //! the host's within-block drain is the DETERMINISTIC re-entry lane: `emit_msg`
-//! follow-ups re-dispatch inside ONE block, one app-hash. this seam is the
+//! follow-ups re-dispatch inside ONE block, one root-hash. this seam is the
 //! non-deterministic lane: a block may emit [`Event`]s, and each event that a
 //! [`Worker`] claims produces a follow-up op submitted as a SEPARATE block —
 //! because on a real node it is a separate consensus transaction (the

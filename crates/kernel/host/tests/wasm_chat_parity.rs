@@ -5,8 +5,8 @@
 //! the store's root; qmdb's batch canonicalizes mutations by hashed key, so
 //! the native logical-key commit order and the wasm hashed-key drain order
 //! produce the same op log), including the byte-identical NO-OP blocks the
-//! idempotent reaction ops rely on. the state schema revision therefore STAYS
-//! 1 — this cutover changes the executor, not one committed byte. hook fan-out
+//! idempotent reaction ops rely on. this cutover changes the executor, not one
+//! committed byte. hook fan-out
 //! (`emit-msg` follow-ups) and `RegisterHook`'s registry check — a sibling
 //! `module-root` read resolved by the runtime's memoized replay — are pinned
 //! against a shared sink module.
@@ -41,10 +41,16 @@ fn op(m: &ChatMsg) -> Msg {
 
 /// one block's agreed context: both runtimes must see the identical env.
 fn block(height: u64, who: &[u8]) -> BlockContext {
+    block_as(height, Origin::External(who.to_vec()))
+}
+
+/// the same, for the origin KINDS an external key cannot express — a
+/// module-minted (and therefore UNOWNED) channel is one of them.
+fn block_as(height: u64, origin: Origin) -> BlockContext {
     BlockContext {
         height,
         consensus_time: 1_000 + height,
-        origin: Origin::External(who.to_vec()),
+        origin,
     }
 }
 
@@ -108,7 +114,10 @@ async fn native_host(context: &deterministic::Context) -> Host {
         // isolation: this proof is about the chat cutover, and an identical
         // native tagging on both sides absorbs the emitted follow-ups
         // identically.
-        Box::new(TaggingModule::new("tagging")),
+        Box::new(TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(HookSink::new()),
     ])
     .expect("genesis")
@@ -122,30 +131,28 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
             // production builder chain (`Chat::new(..).with_tagging`) in.
             WasmModule::with_store("chat", CHAT_WASM, Box::new(store)).expect("load component"),
         ),
-        Box::new(TaggingModule::new("tagging")),
+        Box::new(TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(HookSink::new()),
     ])
     .expect("genesis")
 }
 
-/// the read matrix over one existing channel (`channel` — queries against an
-/// absent channel REJECT on several families, and a native rejection and its
-/// wit-wrapped rendering are legitimately different strings, so the byte-equal
-/// matrix only probes channels both hosts hold) plus a members probe against
-/// `members_of` and the global id lookups. the absent CHANNEL record itself
-/// answers a comparable `None`.
-async fn replies(h: &Host, channel: &str, members_of: &str, message_id: &str) -> Vec<Vec<u8>> {
+/// the read matrix — the three kept dispatch queries — over one existing
+/// channel (`channel` — a range read against an absent channel REJECTS, and a
+/// native rejection and its wit-wrapped rendering are legitimately different
+/// strings, so the byte-equal matrix only probes channels both hosts hold)
+/// plus the global id lookups. the absent CHANNEL record and the absent
+/// message id answer a comparable `None`.
+async fn replies(h: &Host, channel: &str, message_id: &str) -> Vec<Vec<u8>> {
     let queries = [
-        encode_query(&ChatQuery::Channels),
         encode_query(&ChatQuery::Channel {
             channel_id: channel.into(),
         }),
         encode_query(&ChatQuery::Channel {
             channel_id: "absent".into(),
-        }),
-        encode_query(&ChatQuery::MessagesLatest {
-            channel_id: channel.into(),
-            limit: 16,
         }),
         encode_query(&ChatQuery::MessagesRange {
             channel_id: channel.into(),
@@ -157,23 +164,6 @@ async fn replies(h: &Host, channel: &str, members_of: &str, message_id: &str) ->
         }),
         encode_query(&ChatQuery::Message {
             message_id: "ghost".into(),
-        }),
-        encode_query(&ChatQuery::Revisions {
-            channel_id: channel.into(),
-            seq: 1,
-        }),
-        encode_query(&ChatQuery::Thread {
-            channel_id: channel.into(),
-            root_seq: 1,
-            from: 0,
-            limit: 16,
-        }),
-        encode_query(&ChatQuery::Reactions {
-            channel_id: channel.into(),
-            seq: 1,
-        }),
-        encode_query(&ChatQuery::Members {
-            channel_id: members_of.into(),
         }),
     ];
     let mut out = Vec::new();
@@ -200,7 +190,7 @@ fn same_ops_identical_roots_block_by_block() {
         let (alice, bob, carol) = (key(0xA1), key(0xB2), key(0xC3));
 
         // ROOT CONTINUITY from block zero: both sides commit to the SAME
-        // (empty) qmdb store — equal roots, not a declared schema break.
+        // (empty) qmdb store — equal roots.
         assert_eq!(roots(&native), roots(&wasm), "genesis roots diverge");
         assert!(native.resolver_backed_ids().contains("chat"));
         assert!(wasm.resolver_backed_ids().contains("chat"));
@@ -362,8 +352,10 @@ fn same_ops_identical_roots_block_by_block() {
                 },
                 true,
             ),
+            // alice, not bob: hook (un)registration is channel-admin authority
+            // and alice owns "general".
             (
-                bob.clone(),
+                alice.clone(),
                 ChatMsg::UnregisterHook {
                     channel_id: "general".into(),
                     module_id: "sink".into(),
@@ -402,8 +394,8 @@ fn same_ops_identical_roots_block_by_block() {
                 );
             }
             assert_eq!(
-                replies(&native, "general", "private", "m1").await,
-                replies(&wasm, "general", "private", "m1").await,
+                replies(&native, "general", "m1").await,
+                replies(&wasm, "general", "m1").await,
                 "replies diverge after block {height}"
             );
         }
@@ -442,13 +434,13 @@ fn same_ops_identical_roots_block_by_block() {
 
         // queries are read-only on the wasm side too.
         let settled = roots(&wasm);
-        let _ = replies(&wasm, "general", "private", "m1").await;
+        let _ = replies(&wasm, "general", "m1").await;
         assert_eq!(roots(&wasm), settled, "a query moved a root");
     });
 }
 
 #[test]
-fn revision_stays_one_and_the_sync_handle_matches_native() {
+fn sync_handle_matches_native() {
     deterministic::Runner::default().start(|context| async move {
         let native = Chat::new(
             "chat",
@@ -462,13 +454,6 @@ fn revision_stays_one_and_the_sync_handle_matches_native() {
         )
         .expect("load component");
 
-        // the committed encoding is UNCHANGED (same store, same op log, same
-        // root — proven above), so the canonical-state revision must stay 1:
-        // pre-cutover workspaces reopen without a schema fence.
-        assert_eq!(Module::state_schema_revision(&native), 1);
-        assert_eq!(Module::state_schema_revision(&wasm), 1);
-
-        // and the declared sync surface is verbatim the native declaration.
         let n_handle = native.state_sync_handle().expect("native handle");
         let w_handle = wasm.state_sync_handle().expect("wasm handle");
         assert_eq!(n_handle, w_handle, "sync handles diverge");
@@ -510,6 +495,19 @@ fn rejections_match_and_leave_no_trace() {
             host.submit_at(block(3, &alice), op(&post("general", "m1", "hello", None)))
                 .await
                 .expect("post");
+            // a MODULE-minted channel — the `forge:<repo>:<n>` shape — which
+            // is UNOWNED by construction: the principal that minted it is a
+            // module, and no user is it.
+            host.submit_at(
+                block_as(4, Origin::Module("sink".into())),
+                op(&ChatMsg::CreateChannel {
+                    channel_id: "sink:room".into(),
+                    name: "Sink Room".into(),
+                    post_policy: PostPolicy::Open,
+                }),
+            )
+            .await
+            .expect("module-minted channel");
         }
 
         // the rejection matrix: distinct refusal families. each rejected block
@@ -590,10 +588,61 @@ fn rejections_match_and_leave_no_trace() {
                 },
                 "unknown hook module",
             ),
+            // CHANNEL-ADMIN AUTHORITY, proven in the compiled component and
+            // not just natively: the gate reads `env().origin`, the one
+            // authorization input that crosses the WIT boundary, so a gate
+            // keyed on it is exactly the kind that can compile, review as
+            // correct, and be inert inside the guest.
+            //
+            // alice owns "general"; carol writes neither its roster nor its
+            // hook list. the roster IS `PostPolicy::MembersOnly`'s admission
+            // list, so an ungated `SetMembership` let carol admit HERSELF and
+            // post straight through the only admission rule chat has.
+            (
+                carol.clone(),
+                ChatMsg::SetMembership {
+                    channel_id: "general".into(),
+                    user: carol.clone(),
+                    member: true,
+                },
+                "only the owner",
+            ),
+            // a hook is a standing subscription to everything posted there.
+            (
+                carol.clone(),
+                ChatMsg::RegisterHook {
+                    channel_id: "general".into(),
+                    module_id: "sink".into(),
+                },
+                "only the owner",
+            ),
+            // and the sharper half: an ungated unregister is a one-message off
+            // switch for every automation on the channel.
+            (
+                carol.clone(),
+                ChatMsg::UnregisterHook {
+                    channel_id: "general".into(),
+                    module_id: "sink".into(),
+                },
+                "only the owner",
+            ),
+            // an UNOWNED channel admits NO user — not even alice, who
+            // administers channels of her own. the module that minted it is
+            // its principal, and `check_channel_admin` fails closed rather
+            // than letting the `None` owner fall through.
+            (
+                alice.clone(),
+                ChatMsg::SetMembership {
+                    channel_id: "sink:room".into(),
+                    user: alice.clone(),
+                    member: true,
+                },
+                "is unowned",
+            ),
         ];
 
         for (height, (who, msg, needle)) in rejects.into_iter().enumerate() {
-            let height = height as u64 + 4;
+            let height = height as u64 + 5;
             let before = roots(&native);
             assert_eq!(before, roots(&wasm));
 
@@ -625,8 +674,8 @@ fn rejections_match_and_leave_no_trace() {
             assert_eq!(roots(&native), before, "native root moved on reject");
             assert_eq!(roots(&wasm), before, "wasm root moved on reject");
             assert_eq!(
-                replies(&native, "general", "private", "m1").await,
-                replies(&wasm, "general", "private", "m1").await
+                replies(&native, "general", "m1").await,
+                replies(&wasm, "general", "m1").await
             );
         }
     });
@@ -686,8 +735,8 @@ fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
         }
         assert_eq!(roots(&native), roots(&wasm));
         assert_eq!(
-            replies(&native, "room", "room", "r1").await,
-            replies(&wasm, "room", "room", "r1").await
+            replies(&native, "room", "r1").await,
+            replies(&wasm, "room", "r1").await
         );
 
         // ONE block where the SECOND member rejects: the runtime aborts the
@@ -724,8 +773,8 @@ fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
         assert_ne!(roots(&native), before, "accepted member must land");
         assert_eq!(roots(&native), roots(&wasm));
         assert_eq!(
-            replies(&native, "room", "room", "r1").await,
-            replies(&wasm, "room", "room", "r1").await
+            replies(&native, "room", "r1").await,
+            replies(&wasm, "room", "r1").await
         );
         for host in [&native, &wasm] {
             let reply = host

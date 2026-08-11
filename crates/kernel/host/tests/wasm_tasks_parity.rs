@@ -1,20 +1,27 @@
-//! the adapter-port equivalence proof for the merged `tasks` work module: the
-//! tasks guest component (the NATIVE `tasks` crate compiled to wasm behind
-//! `guest-adapter`, with `default-features = false` dropping only the node-local
-//! derived index) and the native `Tasks` module answer the SAME op sequence with
-//! IDENTICAL query replies across BOTH boards (the assigned-list task board AND
-//! the first-claim job board), and their roots move in lockstep (move on commit,
-//! hold on abort AND on an accepted no-op). the roots THEMSELVES differ — the
-//! port persists the native canonical snapshot as one host-KV value, a declared
-//! state-schema break (revision 3, the merge) — and this proof pins that
-//! difference so it can never be mistaken for accidental compatibility.
+//! the STORE-BACKED cutover-continuity proof for the merged `tasks` work
+//! module: the tasks guest component over `WasmModule::with_store(QmdbStore)`
+//! and the native `Tasks` over the same store shape are ROOT-CONTINUOUS — the
+//! same op sequence commits the IDENTICAL qmdb merkle root after every block
+//! across BOTH boards (the assigned-list task board AND the first-claim job
+//! board). both roots ARE the store's root; qmdb's batch canonicalizes
+//! mutations by hashed key, so the native logical-key commit order and the
+//! wasm hashed-key drain order produce the same op log. this executor swap
+//! changes not one committed byte — including the byte-identical NO-OP blocks
+//! (a same-status task update) that stage nothing on either side.
+//!
+//! query replies match after every block over the whole read matrix,
+//! rejections carry the native reason and leave both roots byte-identical, and
+//! multi-dispatch blocks exercise the read-your-writes seam (a claim reading
+//! the submit staged one dispatch earlier).
 
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use sdk::{Error, Msg, Origin, StateRoot};
+use sdk::{Error, Module, Msg, Origin, StateRoot, StateSyncHandle};
+use statesync::qmdb::QmdbStore;
 use tasks::{
-    BoardCounts, JobStatus, JobsMsg, JobsQuery, JobsReply, TaskMsg, TaskQuery, TaskReply,
-    TaskStatus, Tasks, decode_job_reply, decode_task_reply, encode_job_msg, encode_job_query,
-    encode_task_msg, encode_task_query,
+    JobStatus, JobsMsg, JobsQuery, JobsReply, TaskMsg, TaskQuery, TaskReply, TaskStatus, Tasks,
+    decode_job_reply, decode_task_reply, encode_job_msg, encode_job_query, encode_task_msg,
+    encode_task_query,
 };
 use wasm_host::WasmModule;
 
@@ -22,20 +29,17 @@ use wasm_host::WasmModule;
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const TASKS_WASM: &[u8] = include_bytes!("fixtures/tasks.component.wasm");
 
-fn wasm_tasks() -> WasmModule {
-    WasmModule::from_bytes("tasks", TASKS_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 3 of the tasks
-        // canonical state (revision 3 = the tasks+jobs merge).
-        .with_state_schema_revision(3)
+async fn native_host(context: &deterministic::Context, label: &'static str) -> Host {
+    let store = QmdbStore::init(context.child(label), "tasks").await;
+    Host::genesis(vec![Box::new(Tasks::new("tasks", Box::new(store)))]).expect("genesis")
 }
 
-fn native_host() -> Host {
-    Host::genesis(vec![Box::new(Tasks::new("tasks"))]).expect("genesis")
-}
-
-fn wasm_host_() -> Host {
-    Host::genesis(vec![Box::new(wasm_tasks())]).expect("genesis")
+async fn wasm_host_(context: &deterministic::Context, label: &'static str) -> Host {
+    let store = QmdbStore::init(context.child(label), "tasks").await;
+    Host::genesis(vec![Box::new(
+        WasmModule::with_store("tasks", TASKS_WASM, Box::new(store)).expect("load component"),
+    )])
+    .expect("genesis")
 }
 
 fn key(tag: u8) -> Vec<u8> {
@@ -84,7 +88,8 @@ fn block(height: u64, origin: Origin) -> BlockContext {
 }
 
 /// the read matrix: the task board's whole surface (the unpaged `List`) plus
-/// every job-board query family, including the `None`/absent shapes.
+/// the job board's kept dispatch read — `Get`, hit and absent shapes alike
+/// (board enumeration is the index guest's job on the derived tier).
 async fn replies(h: &Host) -> Vec<Vec<u8>> {
     let queries = [
         encode_task_query(&TaskQuery::List),
@@ -97,17 +102,6 @@ async fn replies(h: &Host) -> Vec<Vec<u8>> {
         encode_job_query(&JobsQuery::Get {
             job_id: "absent".into(),
         }),
-        encode_job_query(&JobsQuery::List {
-            status: None,
-            kind_prefix: String::new(),
-            limit: 64,
-        }),
-        encode_job_query(&JobsQuery::List {
-            status: Some(JobStatus::Pending),
-            kind_prefix: "c".into(),
-            limit: 64,
-        }),
-        encode_job_query(&JobsQuery::Counts {}),
     ];
     let mut out = Vec::new();
     for q in &queries {
@@ -130,22 +124,23 @@ fn root_of(h: &Host) -> StateRoot {
 }
 
 #[test]
-fn same_ops_same_replies_roots_in_lockstep_schema_break_pinned() {
-    futures::executor::block_on(same_ops_inner());
+fn same_ops_same_replies_and_roots_stay_continuous() {
+    deterministic::Runner::default().start(|context| async move {
+        same_ops_inner(&context).await;
+    });
 }
 
-async fn same_ops_inner() {
-    let mut native = native_host();
-    let mut wasm = wasm_host_();
+async fn same_ops_inner(context: &deterministic::Context) {
+    let mut native = native_host(context, "same_native").await;
+    let mut wasm = wasm_host_(context, "same_wasm").await;
     let (alice, bob, carol) = (key(0xA1), key(0xB2), key(0xC3));
 
-    // the schema break is visible from genesis: the native empty root is over
-    // the combined (empty task board ++ empty job board) canonical encoding,
-    // the wasm root commits to the (empty) host-KV store.
-    assert_ne!(
+    // ROOT CONTINUITY starts at genesis: both roots ARE the (empty) qmdb
+    // store's merkle root, so the cutover moves nothing.
+    assert_eq!(
         root_of(&native),
         root_of(&wasm),
-        "genesis roots must differ — the port is a DECLARED schema break"
+        "genesis roots must match — the port is root-continuous"
     );
 
     // every op family across BOTH boards, in one deterministic sequence, each
@@ -259,9 +254,17 @@ async fn same_ops_inner() {
         // and t2 moves once.
         (24, ext(&alice), op_task(&create("t1", "ship the port"))),
         (25, ext(&alice), op_task(&create("t2", "prove the port"))),
-        (26, ext(&alice), op_task(&update("t1", TaskStatus::InProgress))),
+        (
+            26,
+            ext(&alice),
+            op_task(&update("t1", TaskStatus::InProgress)),
+        ),
         (27, ext(&alice), op_task(&update("t1", TaskStatus::Done))),
-        (28, ext(&alice), op_task(&update("t2", TaskStatus::InProgress))),
+        (
+            28,
+            ext(&alice),
+            op_task(&update("t2", TaskStatus::InProgress)),
+        ),
     ];
 
     for (height, origin, msg) in ops {
@@ -284,8 +287,12 @@ async fn same_ops_inner() {
         // boundaries must move their module root...
         assert_ne!(root_of(&native), n_before, "native root stuck at {height}");
         assert_ne!(root_of(&wasm), w_before, "wasm root stuck at {height}");
-        // ...to values that differ from each other (the pinned schema break).
-        assert_ne!(root_of(&native), root_of(&wasm));
+        // ...to the SAME value: the executor changed, not one committed byte.
+        assert_eq!(
+            root_of(&native),
+            root_of(&wasm),
+            "roots diverge after block {height}"
+        );
     }
 
     // an ACCEPTED no-op on the task board: a same-status update commits fine but
@@ -324,22 +331,36 @@ async fn same_ops_inner() {
     assert_eq!(job.created_at_height, 2);
     assert_eq!(job.updated_at_height, 18);
 
-    // decoded census: the pruned job is GONE, the reclaimed one pending, the
-    // cancelled one terminal-but-retained.
+    // per-id spot checks (the census itself is index-tier now): the pruned
+    // job is GONE, the cancelled one terminal-but-retained (the reclaimed one
+    // is asserted Pending above).
     let reply = wasm
-        .query("tasks", &encode_job_query(&JobsQuery::Counts {}))
+        .query(
+            "tasks",
+            &encode_job_query(&JobsQuery::Get {
+                job_id: "build".into(),
+            }),
+        )
         .await
-        .expect("counts query");
+        .expect("get query");
     assert_eq!(
         decode_job_reply(&reply).expect("decode"),
-        JobsReply::Counts(BoardCounts {
-            pending: 1,
-            processing: 0,
-            done: 0,
-            failed: 0,
-            cancelled: 1,
-        })
+        JobsReply::Job(None),
+        "the pruned job answers None"
     );
+    let reply = wasm
+        .query(
+            "tasks",
+            &encode_job_query(&JobsQuery::Get {
+                job_id: "temp".into(),
+            }),
+        )
+        .await
+        .expect("get query");
+    let JobsReply::Job(Some(job)) = decode_job_reply(&reply).expect("decode") else {
+        panic!("the cancelled job is retained");
+    };
+    assert_eq!(job.status, JobStatus::Cancelled);
 
     // decoded task spot check: deterministic list order, statuses landed, and
     // the timestamps pin creation to its block and updates to the LAST real
@@ -366,12 +387,14 @@ async fn same_ops_inner() {
 
 #[test]
 fn rejections_match_and_leave_no_trace() {
-    futures::executor::block_on(rejections_inner());
+    deterministic::Runner::default().start(|context| async move {
+        rejections_inner(&context).await;
+    });
 }
 
-async fn rejections_inner() {
-    let mut native = native_host();
-    let mut wasm = wasm_host_();
+async fn rejections_inner(context: &deterministic::Context) {
+    let mut native = native_host(context, "rej_native").await;
+    let mut wasm = wasm_host_(context, "rej_wasm").await;
     let (alice, bob, carol) = (key(0xA1), key(0xB2), key(0xC3));
 
     // seed one task and one claimed job so both boards' guards have live state.
@@ -403,8 +426,24 @@ async fn rejections_inner() {
     // the rejection matrix across BOTH boards. each rejected block must leave
     // BOTH roots byte-identical (the abort path: staged writes discarded).
     let rejects: Vec<(Origin, Msg, &str)> = vec![
-        (ext(&alice), op_task(&create("", "no id")), "task_id must not be empty"),
-        (ext(&alice), op_task(&create("seed", "dup")), "task already exists"),
+        (
+            ext(&alice),
+            op_task(&create("", "no id")),
+            "task_id must be non-empty",
+        ),
+        (
+            // the id cap: every id shares the ONE `t#` index record, so an
+            // over-cap id must be refused IDENTICALLY on both ports -- a port
+            // that accepted it would fill the index and diverge forever.
+            ext(&alice),
+            op_task(&create(&"x".repeat(tasks::MAX_TASK_ID + 1), "over cap")),
+            "task_id is",
+        ),
+        (
+            ext(&alice),
+            op_task(&create("seed", "dup")),
+            "task already exists",
+        ),
         (
             ext(&alice),
             op_task(&update("ghost", TaskStatus::Done)),
@@ -514,18 +553,21 @@ async fn rejections_inner() {
 
 #[test]
 fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
-    futures::executor::block_on(multi_dispatch_inner());
+    deterministic::Runner::default().start(|context| async move {
+        multi_dispatch_inner(&context).await;
+    });
 }
 
-async fn multi_dispatch_inner() {
-    let mut native = native_host();
-    let mut wasm = wasm_host_();
+async fn multi_dispatch_inner(context: &deterministic::Context) {
+    let mut native = native_host(context, "multi_native").await;
+    let mut wasm = wasm_host_(context, "multi_wasm").await;
     let (alice, bob, carol) = (key(0xA1), key(0xB2), key(0xC3));
 
     // ONE block, two ops: the second op's claimability check READS the first
     // op's staged write (the job only exists in this block's overlay). on the
-    // wasm side that is the outer staged `__state` being reloaded by the second
-    // dispatch — the read-your-writes seam the adapter relies on.
+    // wasm side that read falls through `WitStore::get` to the host's OUTER
+    // staged overlay — the read-your-writes seam the adapter relies on, since
+    // the guest rebuilds the module (and its inner overlay) per dispatch.
     let batch = vec![
         (
             ext(&alice),
@@ -631,4 +673,34 @@ async fn multi_dispatch_inner() {
         };
         assert_eq!(job.status, JobStatus::Pending);
     }
+}
+
+/// the store-backed sync surface: the ported guest advertises EXACTLY what the
+/// native module does — no byte snapshot, the store's resolver lane.
+#[test]
+fn sync_handle_matches_native() {
+    deterministic::Runner::default().start(|context| async move {
+        let native = Tasks::new(
+            "tasks",
+            Box::new(QmdbStore::init(context.child("handle_native"), "tasks").await),
+        );
+        let wasm = WasmModule::with_store(
+            "tasks",
+            TASKS_WASM,
+            Box::new(QmdbStore::init(context.child("handle_wasm"), "tasks").await),
+        )
+        .expect("load component");
+
+        let n_handle = native.state_sync_handle().expect("native handle");
+        let w_handle = wasm.state_sync_handle().expect("wasm handle");
+        assert_eq!(n_handle, w_handle, "sync handles diverge");
+        assert!(
+            matches!(w_handle, StateSyncHandle::ResolverBacked { ref backend, .. } if backend == "qmdb"),
+            "store-backed tenant must stay resolver-backed: {w_handle:?}"
+        );
+        assert!(
+            native.snapshot_bytes().is_none(),
+            "a store-backed module ships no byte snapshot"
+        );
+    });
 }

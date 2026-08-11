@@ -5,7 +5,7 @@ version.workspace = true
 
 # the network-wide registry of node host capabilities as replicated state.
 # depends only on sdk + its own interface (+ valset wire types to gate
-# announcements to current members, sha2 for the state-based root).
+# announcements to current members).
 [features]
 # the wasm-guest port (src/guest.rs): the dispatch shell over
 # guest-adapter. non-default and wasm-only — enabled solely by the
@@ -18,11 +18,14 @@ guest = ["dep:guest-adapter"]
 guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 sdk = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# the store-record codec: compact, canonical, deterministic. wire stays sdk::wire.
+borsh = { workspace = true }
 valset = { workspace = true }
-sha2 = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+# the sync round-trip proof drives a real qmdb source/joiner pair.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }
 futures = { workspace = true }
 sdk-testkit = { workspace = true }

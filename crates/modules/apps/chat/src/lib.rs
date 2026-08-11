@@ -3,15 +3,19 @@
 //!
 //! pure logic over a host-injected [`sdk::MerkleStore`]: the HOST constructs
 //! the concrete store (qmdb today — `statesync::qmdb::QmdbStore`) and hands it
-//! to [`Chat::new`], so this crate never names a storage crate. the module
-//! stores one logical record per entity in that store:
-//! a channel index (enumeration only — hashed store keys cannot be listed; its
-//! 1 MiB codec bound is accepted debt), per-channel records, one record per
-//! message head, immutable per-edit revision records, per-emoji reaction sets,
-//! message-id pointers for global dedup, membership records, and small
-//! per-thread / per-message index records that stand in for range scans.
-//! store keys are hashed, so pagination is computed-key point lookups driven by
-//! the channel's `head_seq` counter — never derived from a stored list.
+//! to [`Chat::new`], so this crate never names a storage crate. the store is
+//! used for what it is — hash-addressable authenticated state, one logical
+//! record per entity, every read a point lookup the DISPATCH path needs:
+//! per-channel records, one record per message head, immutable per-edit
+//! revision records, per-emoji reaction sets (plus the bounded per-message
+//! emoji index the caps and tombstone cleanup require), message-id pointers
+//! for global dedup, and membership records for the post policy. no stored
+//! enumeration lists, no stand-in range indexes: everything a human scrolls,
+//! lists, or searches is served by the index guest (`index.rs`) on the
+//! derived tier. the one computed-key iteration that remains — the
+//! `MessagesRange` context window over the gap-free `head_seq` space — exists
+//! because CONSENSUS consumers (runs, automations) read it in `execute()`,
+//! and consensus can never depend on the unverifiable derived tier.
 //!
 //! authorship is derived from `ctx.env().origin` on every write; payloads
 //! carry no author field. an empty external origin (the pre-consensus default)
@@ -32,15 +36,30 @@ pub use interface::*;
 #[cfg(feature = "guest")]
 mod guest;
 // everything below is OFF-consensus and native-only: none of it touches qmdb
-// or the app-hash, and its deps (fluent31 IO, tokio, opus, the data plane)
+// or the root-hash, and its deps (fluent31 IO, tokio, opus, the data plane)
 // cannot cross into the wasm guest — so the consensus state machine
 // above compiles for wasm32 without them.
 //
-// the derived-tier materialized view; registered only by serving binaries.
-#[cfg(feature = "native")]
+// the derived-tier materialized view: the PURE decision core (fold + view
+// over index_guest::StateRead), compiled everywhere and unit-tested
+// natively. the engine shell that runs it inside the module's index
+// database is `index_guest` below.
 pub mod index;
+
+// the CLIENT view model: rendered row types, composer parsing, optimistic
+// merges, and the op-delta fold a feed-following UI splices state with.
+// module-owned beside the index fold (same feed, same vocabulary); pure
+// data-in/data-out, so the module-bundled-UI lane can compile it into the
+// shipped ui.wasm unchanged.
+pub mod client;
+
+// the wasm index-mapper shell: wires the pure core into the fluent31 engine.
+// compiled only by `guest-builder --index`'s synthesized wasm32 workspace
+// (feature `index-guest`), never by the native build.
+#[cfg(feature = "index-guest")]
+mod index_guest;
 // the real-time voice media engine (Opus over the data plane's datagram
-// class). Off-consensus: it touches no qmdb and no app-hash — the chat
+// class). Off-consensus: it touches no qmdb and no root-hash — the chat
 // module's consensus state (channels, membership) is what will drive its
 // admission and channel→flow derivation. Kept as a self-contained submodule.
 #[cfg(feature = "native")]
@@ -65,8 +84,6 @@ use sdk::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tagging::{TagEvent, TaggingMsg};
-
-const CHANNEL_INDEX_KEY: &[u8] = b"channel-index";
 
 /// single-component key: prefix + 0 + id. safe because every prefix is a fixed
 /// literal and no prefix is another prefix followed by a 0 byte.
@@ -134,20 +151,6 @@ fn member_key(channel_id: &str, user: &[u8]) -> Vec<u8> {
     key.extend_from_slice(b"member");
     component(&mut key, channel_id.as_bytes());
     component(&mut key, user);
-    key
-}
-
-fn memberidx_key(channel_id: &str) -> Vec<u8> {
-    keyed(b"memberidx", channel_id)
-}
-
-/// per-thread reply index: reply sequences in post order, bounded by
-/// [`MAX_THREAD_REPLIES`], so thread pages need no range scan.
-fn threadidx_key(channel_id: &str, root_seq: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(9 + 8 + channel_id.len() + 8);
-    key.extend_from_slice(b"threadidx");
-    component(&mut key, channel_id.as_bytes());
-    key.extend_from_slice(&root_seq.to_be_bytes());
     key
 }
 
@@ -317,10 +320,6 @@ impl Chat {
         self.staged.delete(key);
     }
 
-    async fn channel_index(&self) -> Result<BTreeSet<String>, Error> {
-        Ok(self.load(CHANNEL_INDEX_KEY).await?.unwrap_or_default())
-    }
-
     async fn channel(&self, channel_id: &str) -> Result<Option<Channel>, Error> {
         self.load(&channel_key(channel_id)).await
     }
@@ -379,6 +378,14 @@ impl Chat {
     /// so no origin can squat another's namespace. system origin is
     /// unrestricted. unconditional consensus rule — not version-gated.
     fn validate_channel_namespace(author: &AuthorRef, channel_id: &str) -> Result<(), Error> {
+        // '/' is the read model's key-path separator: a channel id carrying
+        // one would bleed across the index tier's prefix scans ("a" vs
+        // "a/b"). unconditional consensus rule, mirroring the ':' gate.
+        if channel_id.contains('/') {
+            return Err(Error::Module(
+                "chat: channel ids may not contain '/'".into(),
+            ));
+        }
         match author {
             AuthorRef::User(_) => {
                 if channel_id.contains(':') {
@@ -403,18 +410,34 @@ impl Chat {
         }
     }
 
-    /// authorize a channel-admin op (rename/archive). an owned channel admits
-    /// only its owner among `User` origins; an unowned (module/system-minted)
-    /// channel admits any user, mirroring `SetMembership`'s trust posture;
-    /// module/agent/system origins are genesis-fixed trusted code and always pass.
+    /// authorize a channel-admin op — rename, archive, membership, and hook
+    /// (un)registration, i.e. every write that changes who may write. an owned
+    /// channel admits only its owner among `User` origins; an UNOWNED
+    /// (module/system-minted) channel admits NO user, because the principal
+    /// that minted it is a module and a user is not it — `forge:<repo>:<n>` is
+    /// the live case, and admitting any user there would hand a stranger the
+    /// roster and the hook list of another module's channel. module/agent/system
+    /// origins are genesis-fixed trusted code and always pass.
+    ///
+    /// exhaustive on purpose, both levels: a security decision must never route
+    /// a new `AuthorRef` variant — or the `None` owner — through a wildcard.
     fn check_channel_admin(channel: &Channel, author: &AuthorRef) -> Result<(), Error> {
         match author {
             AuthorRef::User(user) => match &channel.owner {
-                Some(owner) if owner != user => Err(Error::Module(format!(
-                    "only the owner may administer channel {}",
+                None => Err(Error::Module(format!(
+                    "channel {} is unowned; no user may administer it",
                     channel.id
                 ))),
-                _ => Ok(()),
+                Some(owner) => {
+                    let is_owner = owner == user;
+                    if !is_owner {
+                        return Err(Error::Module(format!(
+                            "only the owner may administer channel {}",
+                            channel.id
+                        )));
+                    }
+                    Ok(())
+                }
             },
             AuthorRef::Module(_) | AuthorRef::Agent { .. } | AuthorRef::System => Ok(()),
         }
@@ -455,16 +478,12 @@ impl Chat {
             owner,
             archived: false,
         };
-        let mut index = self.channel_index().await?;
-        index.insert(channel_id.clone());
         self.store_bounded(
             channel_key(&channel_id),
             &channel,
             MAX_CHANNEL_RECORD_BYTES,
             "channel",
-        )?;
-        self.store(CHANNEL_INDEX_KEY.to_vec(), &index);
-        Ok(())
+        )
     }
 
     /// rename a channel. reuses `CreateChannel`'s name validation (non-empty +
@@ -551,24 +570,22 @@ impl Chat {
 
         if let Some(root_seq) = thread {
             // a reply is a normal message record with its own channel seq;
-            // the root tracks the summary. a tombstoned root still anchors its
-            // thread, so replying to it stays legal.
+            // the root tracks the summary (`reply_count` is the reply-cap
+            // authority — replies are enumerable from it as the root's
+            // sequence-ordered descendants, so no stored reply list exists).
+            // a tombstoned root still anchors its thread, so replying to it
+            // stays legal.
             let mut root = self.require_head(channel_id, root_seq).await?;
             if root.thread.is_some() {
                 return Err(Error::Module(format!(
                     "thread replies cannot start subthreads: {channel_id}/{root_seq}"
                 )));
             }
-            let mut replies: Vec<u64> = self
-                .load(&threadidx_key(channel_id, root_seq))
-                .await?
-                .unwrap_or_default();
-            if replies.len() >= MAX_THREAD_REPLIES {
+            if root.reply_count >= MAX_THREAD_REPLIES as u64 {
                 return Err(Error::Module(format!(
                     "thread reply cap reached: {channel_id}/{root_seq}"
                 )));
             }
-            replies.push(seq);
             root.reply_count += 1;
             root.last_reply_seq = Some(seq);
             self.store_bounded(
@@ -577,7 +594,6 @@ impl Chat {
                 MAX_MESSAGE_HEAD_BYTES,
                 "message",
             )?;
-            self.store(threadidx_key(channel_id, root_seq), &replies);
         }
 
         let head = MessageHead {
@@ -622,7 +638,7 @@ impl Chat {
         blocks: Vec<Block>,
         base_rev: Option<u32>,
         now: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<u32, Error> {
         Self::validate_non_empty("channel_id", channel_id)?;
         if blocks.is_empty() {
             return Err(Error::Module("blocks must not be empty".into()));
@@ -647,9 +663,10 @@ impl Chat {
         // the new head (base_rev != prior rev), never rejected — the author
         // gate makes conflicts same-author multi-device races.
         self.store(rev_key(channel_id, seq, head.rev), &head);
+        let rev = head.rev + 1;
         let new_head = MessageHead {
             blocks,
-            rev: head.rev + 1,
+            rev,
             edited_at: Some(now),
             base_rev,
             ..head
@@ -659,7 +676,8 @@ impl Chat {
             &new_head,
             MAX_MESSAGE_HEAD_BYTES,
             "message",
-        )
+        )?;
+        Ok(rev)
     }
 
     async fn stage_delete(
@@ -810,14 +828,19 @@ impl Chat {
         )
     }
 
+    /// register a hook module on a channel. channel-admin authority: a hook is
+    /// a standing subscription to everything posted there, so attaching one is
+    /// the owner's call, not any member's.
     async fn stage_register_hook(
         &mut self,
+        author: &AuthorRef,
         channel_id: &str,
         module_id: String,
     ) -> Result<(), Error> {
         Self::validate_non_empty("channel_id", channel_id)?;
         Self::validate_non_empty("module_id", &module_id)?;
         let mut channel = self.require_channel(channel_id).await?;
+        Self::check_channel_admin(&channel, author)?;
         if channel.hooks.contains(&module_id) {
             // idempotent: registering twice stages nothing.
             return Ok(());
@@ -834,13 +857,18 @@ impl Chat {
         )
     }
 
+    /// unregister a hook module. same authority as registration — an ungated
+    /// unregister is a one-message off switch for every automation on the
+    /// channel, which is the sharper half of the pair.
     async fn stage_unregister_hook(
         &mut self,
+        author: &AuthorRef,
         channel_id: &str,
         module_id: &str,
     ) -> Result<(), Error> {
         Self::validate_non_empty("channel_id", channel_id)?;
         let mut channel = self.require_channel(channel_id).await?;
+        Self::check_channel_admin(&channel, author)?;
         let before = channel.hooks.len();
         channel.hooks.retain(|hook| hook != module_id);
         if channel.hooks.len() == before {
@@ -854,8 +882,13 @@ impl Chat {
         )
     }
 
+    /// add/remove a user from the channel roster. channel-admin authority: the
+    /// roster IS `PostPolicy::MembersOnly`'s admission list, so a self-service
+    /// roster is no admission rule at all — anyone could add themselves and
+    /// post right through the policy.
     async fn stage_membership(
         &mut self,
+        author: &AuthorRef,
         channel_id: &str,
         user: Vec<u8>,
         member: bool,
@@ -864,17 +897,13 @@ impl Chat {
         if user.is_empty() {
             return Err(Error::Module("user must not be empty".into()));
         }
-        self.require_channel(channel_id).await?;
-        let mut index: BTreeSet<Vec<u8>> = self
-            .load(&memberidx_key(channel_id))
-            .await?
-            .unwrap_or_default();
-        let changed = if member {
-            index.insert(user.clone())
-        } else {
-            index.remove(&user)
-        };
-        if !changed {
+        let channel = self.require_channel(channel_id).await?;
+        Self::check_channel_admin(&channel, author)?;
+        // idempotent: an unchanged membership stages nothing, so the qmdb op
+        // log — and the root — is byte-identical to no write at all. the point
+        // record is the policy read; the roster VIEW lives on the index tier.
+        let already_member = self.get_raw(&member_key(channel_id, &user)).await?.is_some();
+        if already_member == member {
             return Ok(());
         }
         if member {
@@ -882,12 +911,7 @@ impl Chat {
         } else {
             self.delete(member_key(channel_id, &user));
         }
-        self.store_bounded(
-            memberidx_key(channel_id),
-            &index,
-            MAX_CHANNEL_RECORD_BYTES,
-            "membership index",
-        )
+        Ok(())
     }
 
     /// join (or start) the channel's huddle. only external users may — the
@@ -994,81 +1018,29 @@ impl Chat {
         )
     }
 
-    // ---- query assembly ------------------------------------------------------
-
-    async fn reactions(&self, channel_id: &str, seq: u64) -> Result<Vec<ReactionSummary>, Error> {
-        let emojis: BTreeSet<String> = self
-            .load(&reactidx_key(channel_id, seq))
-            .await?
-            .unwrap_or_default();
-        let mut summaries = Vec::with_capacity(emojis.len());
-        for emoji in emojis {
-            let reactors: BTreeSet<AuthorRef> = self
-                .load(&react_key(channel_id, seq, &emoji))
-                .await?
-                .unwrap_or_default();
-            if !reactors.is_empty() {
-                summaries.push(ReactionSummary { emoji, reactors });
-            }
-        }
-        Ok(summaries)
-    }
-
-    async fn view(&self, channel: &Channel, seq: u64) -> Result<Option<MessageView>, Error> {
-        let Some(head) = self.head(&channel.id, seq).await? else {
-            return Ok(None);
-        };
-        Ok(Some(MessageView {
-            channel_id: channel.id.clone(),
-            seq,
-            head,
-            reactions: self.reactions(&channel.id, seq).await?,
-            channel_head_seq: channel.head_seq,
-        }))
-    }
+    // ---- dispatch reads --------------------------------------------------
+    // the three reads other modules' execute() paths consume. everything a
+    // human lists, scrolls, or searches is the index guest's job (index.rs).
 
     /// point-lookup one page of message views for computed sequences. the
     /// sequence space is gap-free (P3), so a missing head is a store bug.
     async fn views(
         &self,
-        channel: &Channel,
+        channel_id: &str,
         seqs: impl Iterator<Item = u64>,
     ) -> Result<Vec<MessageView>, Error> {
         let mut views = Vec::new();
         for seq in seqs {
-            let view = self.view(channel, seq).await?.ok_or_else(|| {
-                Error::Module(format!("missing message record: {}/{seq}", channel.id))
+            let head = self.require_head(channel_id, seq).await.map_err(|_| {
+                Error::Module(format!("missing message record: {channel_id}/{seq}"))
             })?;
-            views.push(view);
+            views.push(MessageView {
+                channel_id: channel_id.to_string(),
+                seq,
+                head,
+            });
         }
         Ok(views)
-    }
-
-    async fn channels(&self) -> Result<Vec<Channel>, Error> {
-        let index = self.channel_index().await?;
-        let mut channels = Vec::with_capacity(index.len());
-        for id in index {
-            let channel = self
-                .channel(&id)
-                .await?
-                .ok_or_else(|| Error::Module(format!("missing channel record: {id}")))?;
-            channels.push(channel);
-        }
-        Ok(channels)
-    }
-
-    async fn messages_latest(
-        &self,
-        channel_id: &str,
-        limit: u64,
-    ) -> Result<Vec<MessageView>, Error> {
-        let channel = self.require_channel(channel_id).await?;
-        let limit = clamp_limit(limit);
-        if limit == 0 || channel.head_seq == 0 {
-            return Ok(Vec::new());
-        }
-        let from = channel.head_seq.saturating_sub(limit - 1).max(1);
-        self.views(&channel, from..=channel.head_seq).await
     }
 
     async fn messages_range(
@@ -1084,32 +1056,7 @@ impl Chat {
             return Ok(Vec::new());
         }
         let to = channel.head_seq.min(from.saturating_add(limit - 1));
-        self.views(&channel, from..=to).await
-    }
-
-    /// the window centered on `seq`: half the page before it, the rest from it
-    /// on. no new store walk — this is `messages_range` with the bounds
-    /// computed, so tombstoned and edited rows page exactly as they do for
-    /// `messages_latest`.
-    async fn messages_around(
-        &self,
-        channel_id: &str,
-        seq: u64,
-        limit: u64,
-    ) -> Result<Vec<MessageView>, Error> {
-        let channel = self.require_channel(channel_id).await?;
-        let limit = clamp_limit(limit);
-        // KEEP THIS GUARD ABOVE THE CLAMP: `clamp(1, head_seq)` PANICS when
-        // min > max, i.e. on an empty channel (head_seq == 0). The early return
-        // is the only thing keeping a user-supplied query off that panic.
-        if limit == 0 || channel.head_seq == 0 {
-            return Ok(Vec::new());
-        }
-        // a seq of 0 or one past the head names no message: window the nearest
-        // real one instead of answering an empty page.
-        let seq = seq.clamp(1, channel.head_seq);
-        let from = seq.saturating_sub(limit / 2).max(1);
-        self.messages_range(channel_id, from, limit).await
+        self.views(channel_id, from..=to).await
     }
 
     async fn message_by_id(&self, message_id: &str) -> Result<Option<MessageView>, Error> {
@@ -1117,64 +1064,12 @@ impl Chat {
         else {
             return Ok(None);
         };
-        let channel = self.require_channel(&channel_id).await?;
-        self.view(&channel, seq).await
-    }
-
-    async fn revisions(&self, channel_id: &str, seq: u64) -> Result<Vec<MessageHead>, Error> {
-        let Some(head) = self.head(channel_id, seq).await? else {
-            return Ok(Vec::new());
-        };
-        let mut revisions = Vec::with_capacity(head.rev as usize);
-        for rev in 0..head.rev {
-            let prior: MessageHead = self
-                .load(&rev_key(channel_id, seq, rev))
-                .await?
-                .ok_or_else(|| {
-                    Error::Module(format!("missing revision record: {channel_id}/{seq}/{rev}"))
-                })?;
-            revisions.push(prior);
-        }
-        Ok(revisions)
-    }
-
-    async fn thread(
-        &self,
-        channel_id: &str,
-        root_seq: u64,
-        from: u64,
-        limit: u64,
-    ) -> Result<Option<Thread>, Error> {
-        let channel = self.require_channel(channel_id).await?;
-        let Some(root) = self.view(&channel, root_seq).await? else {
-            return Ok(None);
-        };
-        if root.head.thread.is_some() {
-            // a reply is not a thread root.
-            return Ok(None);
-        }
-        let reply_seqs: Vec<u64> = self
-            .load(&threadidx_key(channel_id, root_seq))
-            .await?
-            .unwrap_or_default();
-        let limit = clamp_limit(limit) as usize;
-        let from = usize::try_from(from).unwrap_or(usize::MAX);
-        let page = reply_seqs
-            .iter()
-            .skip(from)
-            .take(limit)
-            .copied()
-            .collect::<Vec<_>>();
-        let replies = self.views(&channel, page.into_iter()).await?;
-        Ok(Some(Thread { root, replies }))
-    }
-
-    async fn members(&self, channel_id: &str) -> Result<Vec<Vec<u8>>, Error> {
-        let index: BTreeSet<Vec<u8>> = self
-            .load(&memberidx_key(channel_id))
-            .await?
-            .unwrap_or_default();
-        Ok(index.into_iter().collect())
+        let head = self.require_head(&channel_id, seq).await?;
+        Ok(Some(MessageView {
+            channel_id,
+            seq,
+            head,
+        }))
     }
 }
 
@@ -1256,6 +1151,7 @@ impl Module for Chat {
                 let posted = self
                     .stage_message(author.clone(), &channel_id, message_id, blocks, thread, now)
                     .await?;
+                ctx.set_assigned(encode_assigned(&ChatAssigned::Posted { seq: posted.seq }));
                 // one follow-up per registered hook, drained in this block —
                 // the message and every notification commit (or abort) as one
                 // atomic unit (P2). chat stays agent-agnostic: any subscriber
@@ -1295,8 +1191,11 @@ impl Module for Chat {
                 blocks,
                 base_rev,
             } => {
-                self.stage_edit(author, &channel_id, seq, blocks, base_rev, now)
-                    .await
+                let rev = self
+                    .stage_edit(author, &channel_id, seq, blocks, base_rev, now)
+                    .await?;
+                ctx.set_assigned(encode_assigned(&ChatAssigned::Edited { rev }));
+                Ok(())
             }
             ChatMsg::DeleteMessage { channel_id, seq } => {
                 self.stage_delete(author, &channel_id, seq).await
@@ -1321,26 +1220,33 @@ impl Module for Chat {
                 channel_id,
                 module_id,
             } => {
-                // any non-empty origin may (un)register for now — admin gating
-                // is future work. the target must be a registered module other
-                // than chat itself, or every later post would poison the block.
+                // the target must be a registered module other than chat
+                // itself, or every later post would poison the block. WHO may
+                // attach it is `check_channel_admin`, inside the stage fn.
                 if module_id == self.id {
                     return Err(Error::Module("chat cannot hook itself".into()));
                 }
                 if ctx.module_root(&module_id).is_none() {
                     return Err(Error::Module(format!("unknown hook module: {module_id}")));
                 }
-                self.stage_register_hook(&channel_id, module_id).await
+                self.stage_register_hook(&author, &channel_id, module_id)
+                    .await
             }
             ChatMsg::UnregisterHook {
                 channel_id,
                 module_id,
-            } => self.stage_unregister_hook(&channel_id, &module_id).await,
+            } => {
+                self.stage_unregister_hook(&author, &channel_id, &module_id)
+                    .await
+            }
             ChatMsg::SetMembership {
                 channel_id,
                 user,
                 member,
-            } => self.stage_membership(&channel_id, user, member).await,
+            } => {
+                self.stage_membership(&author, &channel_id, user, member)
+                    .await
+            }
             ChatMsg::JoinHuddle { channel_id, node } => {
                 self.stage_join_huddle(author, &channel_id, node, now).await
             }
@@ -1355,13 +1261,9 @@ impl Module for Chat {
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            ChatQuery::Channels => Ok(encode_reply(&ChatReply::Channels(self.channels().await?))),
             ChatQuery::Channel { channel_id } => Ok(encode_reply(&ChatReply::Channel(
                 self.channel(&channel_id).await?,
             ))),
-            ChatQuery::MessagesLatest { channel_id, limit } => Ok(encode_reply(
-                &ChatReply::Messages(self.messages_latest(&channel_id, limit).await?),
-            )),
             ChatQuery::MessagesRange {
                 channel_id,
                 from_seq,
@@ -1369,32 +1271,8 @@ impl Module for Chat {
             } => Ok(encode_reply(&ChatReply::Messages(
                 self.messages_range(&channel_id, from_seq, limit).await?,
             ))),
-            ChatQuery::MessagesAround {
-                channel_id,
-                seq,
-                limit,
-            } => Ok(encode_reply(&ChatReply::Messages(
-                self.messages_around(&channel_id, seq, limit).await?,
-            ))),
             ChatQuery::Message { message_id } => Ok(encode_reply(&ChatReply::Message(
                 self.message_by_id(&message_id).await?,
-            ))),
-            ChatQuery::Revisions { channel_id, seq } => Ok(encode_reply(&ChatReply::Revisions(
-                self.revisions(&channel_id, seq).await?,
-            ))),
-            ChatQuery::Thread {
-                channel_id,
-                root_seq,
-                from,
-                limit,
-            } => Ok(encode_reply(&ChatReply::Thread(
-                self.thread(&channel_id, root_seq, from, limit).await?,
-            ))),
-            ChatQuery::Reactions { channel_id, seq } => Ok(encode_reply(&ChatReply::Reactions(
-                self.reactions(&channel_id, seq).await?,
-            ))),
-            ChatQuery::Members { channel_id } => Ok(encode_reply(&ChatReply::Members(
-                self.members(&channel_id).await?,
             ))),
         }
     }

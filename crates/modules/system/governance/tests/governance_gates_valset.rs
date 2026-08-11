@@ -17,7 +17,8 @@ use governance::{
     encode_msg as gov_encode, encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
-use sdk::{Error, Module as _, Msg, Origin};
+use sdk::{Error, Msg, Origin};
+use sdk_testkit::MemStore;
 use valset::Valset;
 use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode,
@@ -34,14 +35,16 @@ fn member_key(seed: u8) -> Vec<u8> {
 }
 
 /// a host with governance gating a valset seeded with members 1 and 2.
-fn gov_host() -> Host {
-    let mut valset = Valset::new("valset");
-    valset.insert(member_key(1));
-    valset.insert(member_key(2));
+async fn gov_host() -> Host {
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+    valset.seed(member_key(1)).await.expect("seed valset");
+    valset.seed(member_key(2)).await.expect("seed valset");
+    valset.finish_seed().await.expect("seed valset");
     Host::genesis(vec![
         Box::new(valset),
         Box::new(Governance::new(
             "governance",
+            Box::new(MemStore::new()),
             "valset",
             "identity",
         )),
@@ -113,7 +116,7 @@ async fn proposal_status(host: &Host, id: &str) -> Option<ProposalStatus> {
 #[test]
 fn a_passing_proposal_admits_the_validator_and_direct_writes_are_refused() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (m1, m2, newcomer) = (member_key(1), member_key(2), member_key(9));
 
         // DIRECT external valset writes are refused — the old one-message
@@ -205,7 +208,7 @@ fn an_add_resident_proposal_grants_resident_standing_at_v0() {
     // Grant follow-up — resident standing lands with no protocol upgrade.
     // before this change the Propose itself rejected below protocol version 3.
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (m1, m2, friend) = (member_key(1), member_key(2), member_key(9));
 
         submit_as(
@@ -269,7 +272,7 @@ fn an_add_resident_proposal_grants_resident_standing_at_v0() {
 #[test]
 fn a_passing_proposal_removes_the_validator_and_emits_leave() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (m1, m2) = (member_key(1), member_key(2));
         assert_eq!(validators(&host).await.len(), 2, "seeded with two members");
 
@@ -355,7 +358,7 @@ fn a_passing_proposal_removes_the_validator_and_emits_leave() {
 #[test]
 fn a_member_leaves_by_removing_itself_pending_the_remaining_majority() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (m1, m2) = (member_key(1), member_key(2));
         assert_eq!(validators(&host).await.len(), 2, "seeded with two members");
 
@@ -458,12 +461,14 @@ fn a_single_member_ballot_is_a_deciding_majority() {
     block_on(async {
         let founder = member_key(1);
         let friend = member_key(9);
-        let mut valset = Valset::new("valset");
-        valset.insert(founder.clone());
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        valset.seed(founder.clone()).await.expect("seed valset");
+        valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
             Box::new(valset),
             Box::new(Governance::new(
                 "governance",
+                Box::new(MemStore::new()),
                 "valset",
                 "identity",
             )),
@@ -548,12 +553,14 @@ fn a_single_member_ballot_is_a_deciding_majority() {
 fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
     block_on(async {
         let founder = member_key(1);
-        let mut valset = Valset::new("valset");
-        valset.insert(founder.clone());
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        valset.seed(founder.clone()).await.expect("seed valset");
+        valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
             Box::new(valset),
             Box::new(Governance::new(
                 "governance",
+                Box::new(MemStore::new()),
                 "valset",
                 "identity",
             )),
@@ -625,8 +632,9 @@ fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
 fn a_direct_module_origin_leave_of_the_last_validator_is_refused() {
     block_on(async {
         let founder = member_key(1);
-        let mut valset = Valset::new("valset");
-        valset.insert(founder.clone());
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        valset.seed(founder.clone()).await.expect("seed valset");
+        valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![Box::new(valset)]).expect("genesis");
 
         // a System-origin op (genesis orchestration shape) that would empty the
@@ -662,7 +670,7 @@ fn a_direct_module_origin_leave_of_the_last_validator_is_refused() {
 #[test]
 fn non_members_cannot_propose_or_vote_and_minority_rejects() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (m1, m2, outsider) = (member_key(1), member_key(2), member_key(7));
 
         // an outsider cannot propose...
@@ -760,7 +768,7 @@ fn non_members_cannot_propose_or_vote_and_minority_rejects() {
 #[test]
 fn votes_close_at_the_deadline_and_ballots_are_per_member() {
     block_on(async {
-        let mut host = gov_host();
+        let mut host = gov_host().await;
         let (m1, m2) = (member_key(1), member_key(2));
 
         submit_as(
@@ -837,78 +845,3 @@ fn votes_close_at_the_deadline_and_ballots_are_per_member() {
     });
 }
 
-#[test]
-fn snapshot_install_round_trips_and_rejects_tampering() {
-    block_on(async {
-        let mut host = gov_host();
-        let m1 = member_key(1);
-        submit_as(
-            &mut host,
-            &m1,
-            1,
-            "governance",
-            gov_encode(&GovMsg::Propose {
-                proposal_id: "p".into(),
-                action: GovAction::Signal {
-                    text: "snapshot me".into(),
-                },
-                voting_period: 50,
-            }),
-        )
-        .await
-        .expect("propose");
-        submit_as(
-            &mut host,
-            &m1,
-            2,
-            "governance",
-            gov_encode(&GovMsg::Vote {
-                proposal_id: "p".into(),
-                approve: true,
-            }),
-        )
-        .await
-        .expect("vote");
-
-        // rebuild a fresh instance from the snapshot, gated on the root.
-        let root = host.module_root("governance").expect("gov root");
-        let sdk::StateSyncHandle::SnapshotBytes(bytes) = ({
-            // reach the handle through the host's finalized-snapshot surface.
-            let finalized = host::FinalizedBlock {
-                height: 2,
-                app_hash: host.app_hash(),
-            };
-            host.capture_finalized_snapshot(finalized)
-                .expect("capture")
-                .module("governance")
-                .expect("gov entry")
-                .state_sync
-                .clone()
-        }) else {
-            panic!("governance must advertise snapshot bytes");
-        };
-
-        let mut rebuilt = Governance::new("governance", "valset", "identity");
-        rebuilt.install(&bytes, root).expect("install");
-        assert_eq!(
-            rebuilt.root(),
-            root,
-            "installed root equals the source root"
-        );
-
-        // a flipped bit must be refused without touching state.
-        let mut tampered = bytes.clone();
-        let last = tampered.len() - 1;
-        tampered[last] ^= 0x01;
-        let mut fresh = Governance::new("governance", "valset", "identity");
-        assert!(
-            fresh.install(&tampered, root).is_err(),
-            "tampered snapshot refused"
-        );
-        assert_eq!(
-            fresh.root(),
-            sdk::StateRoot::ZERO,
-            "refused install leaves no trace"
-        );
-    });
-}

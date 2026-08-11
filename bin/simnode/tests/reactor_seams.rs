@@ -1,7 +1,7 @@
 //! reactor-seam scenarios: the block-COMPOSITION seams the real host and the
 //! sim driver own, not any one module's semantics. every block here is
 //! composed by the REAL `host::Host` (route → drain FIFO under
-//! `MAX_DISPATCHES` → commit-or-abort → recompose app-hash), driven over
+//! `MAX_DISPATCHES` → commit-or-abort → recompose root-hash), driven over
 //! noded's exact /v1 wire plus the /sim control lane. what these pin:
 //!
 //! - the self-retriggering rule: an automation that posts into its own hooked
@@ -13,7 +13,7 @@
 //! - saga's callback-poison wedge cap: a callback that would wedge a saga at
 //!   Pending forever is rejected at trigger time, minting no saga and no block.
 //! - whole-registry determinism: one script over (almost) every registered
-//!   module walks byte-identical app-hashes on two fresh dirs, and through the
+//!   module walks byte-identical root-hashes on two fresh dirs, and through the
 //!   auto and stepped commit paths alike — the standing guard against
 //!   HashMap-iteration / wall-clock nondeterminism creeping into any module.
 //! - restart/resume: the sim's own height-resume-above-the-watermark path
@@ -30,6 +30,13 @@ use serde_json::{Value, json};
 type Ed = commonware_cryptography::ed25519::PrivateKey;
 
 // ── shared wire builders ────────────────────────────────
+
+/// saga's id space is namespaced per trigger origin, and the sim stamps the
+/// caller-named origin verbatim as `Origin::External(name.as_bytes())` — so a
+/// caller can only ever trigger inside its own namespace.
+fn sid(origin: &str, id: &str) -> String {
+    saga::namespaced_id(&sdk::Origin::External(origin.as_bytes().to_vec()), id)
+}
 
 /// a fire-and-forget saga trigger carrying `spec` as its opaque work spec. the
 /// echo worker (behind `--echo-oracle`) claims the emitted `WorkerRequest`
@@ -58,7 +65,7 @@ fn echo_work_spec() -> Vec<u8> {
         capability: "echo".into(),
         payload: b"hi".to_vec(),
         demands: Default::default(),
-        // `Queue` — the legacy wait-for-capacity behavior this seam exercises.
+        // `Queue` — the wait-for-capacity behavior this seam exercises.
         admission: Default::default(),
     })
 }
@@ -76,7 +83,8 @@ fn echo_work_spec() -> Vec<u8> {
 fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
-    sim.submit_ok("chat", create_channel("loop", "Loop"), None);
+    // the operator owns the channel — hook registration is the owner's call.
+    sim.submit_ok("chat", create_channel("loop", "Loop"), Some("operator"));
     sim.submit_ok(
         "chat",
         json!({ "register_hook": { "channel_id": "loop", "module_id": "automations" } }),
@@ -95,7 +103,7 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
     );
 
     let before = sim.status();
-    let before_hash = before["appHash"].as_str().expect("app hash").to_string();
+    let before_hash = before["root_hash"].as_str().expect("root hash").to_string();
     let before_height = before["height"].as_u64().expect("height");
 
     // a USER post fires the rule; the rule's own reply is MODULE-authored, so
@@ -109,9 +117,9 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
         "the rule fire rides the triggering block — no runaway follow-up blocks"
     );
     // the block COMMITTED — the guard prevented the loop, so there was never a
-    // BudgetExceeded abort (which would have rolled the app-hash back unchanged).
+    // BudgetExceeded abort (which would have rolled the root-hash back unchanged).
     assert_ne!(
-        sim.status()["appHash"].as_str().map(str::to_string),
+        sim.status()["root_hash"].as_str().map(str::to_string),
         Some(before_hash),
         "the triggering block committed atomically, not aborted"
     );
@@ -153,7 +161,7 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
 /// follow-up parks in the oracle queue. two follow-ups queue without coalescing;
 /// each `/sim/step` commits EXACTLY ONE as its own `oracle`-kind block; and a
 /// peer block wedged between two drains commits fine without disturbing queue
-/// order (`oracleQueued` tracks the count throughout).
+/// order (`oracle_queued` tracks the count throughout).
 #[test]
 fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     let storage = tempfile::tempdir().expect("storage dir");
@@ -161,13 +169,13 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     let spec = echo_work_spec();
 
     // two peer blocks commit two triggers; each enqueues one worker follow-up.
-    let b1 = sim.peer_block("saga", saga_trigger("s1", &spec), "peer");
+    let b1 = sim.peer_block("saga", saga_trigger(&sid("peer", "s1"), &spec), "peer");
     assert_eq!(b1["height"], 1, "first trigger committed: {b1}");
-    assert_eq!(sim.sim_state()["oracleQueued"], 1, "one follow-up queued");
-    let b2 = sim.peer_block("saga", saga_trigger("s2", &spec), "peer");
+    assert_eq!(sim.sim_state()["oracle_queued"], 1, "one follow-up queued");
+    let b2 = sim.peer_block("saga", saga_trigger(&sid("peer", "s2"), &spec), "peer");
     assert_eq!(b2["height"], 2, "second trigger committed: {b2}");
     assert_eq!(
-        sim.sim_state()["oracleQueued"],
+        sim.sim_state()["oracle_queued"],
         2,
         "follow-ups queue behind each other — they never coalesce"
     );
@@ -180,7 +188,7 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     );
     assert_eq!(r["committed"]["height"], 3);
     assert_eq!(
-        sim.sim_state()["oracleQueued"],
+        sim.sim_state()["oracle_queued"],
         1,
         "one drained, one still queued"
     );
@@ -193,7 +201,7 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
         "the wedge committed ahead of the queue: {wedge}"
     );
     assert_eq!(
-        sim.sim_state()["oracleQueued"],
+        sim.sim_state()["oracle_queued"],
         1,
         "the peer wedge did not disturb the parked follow-up"
     );
@@ -202,7 +210,7 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     let r = sim.step();
     assert_eq!(r["committed"]["kind"], "oracle");
     assert_eq!(r["committed"]["height"], 5);
-    assert_eq!(sim.sim_state()["oracleQueued"], 0, "queue drained");
+    assert_eq!(sim.sim_state()["oracle_queued"], 0, "queue drained");
 
     // nothing left: a further step commits nothing (both queues empty).
     let r = sim.step();
@@ -212,7 +220,7 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     );
 
     // both echo results actually landed — the sagas are Done, in submit order.
-    for id in ["s1", "s2"] {
+    for id in [sid("peer", "s1"), sid("peer", "s2")] {
         let saga = sim.query("saga", json!({ "get": { "saga_id": id } }));
         assert_eq!(
             saga["saga"]["status"], "done",
@@ -249,13 +257,21 @@ fn a_callback_that_would_wedge_a_saga_is_rejected_at_trigger_time() {
     };
 
     // a callback aimed at the saga module itself: rejected.
-    let error = sim.submit_rejected("saga", with_reply("s1", "saga"), Some("owner"));
+    let error = sim.submit_rejected(
+        "saga",
+        with_reply(&sid("owner", "s1"), "saga"),
+        Some("owner"),
+    );
     assert!(
         error.contains("reply_to must not target the saga module itself"),
         "self-targeting callback: {error}"
     );
     // a callback aimed at a module that was never registered: rejected.
-    let error = sim.submit_rejected("saga", with_reply("s2", "ghost"), Some("owner"));
+    let error = sim.submit_rejected(
+        "saga",
+        with_reply(&sid("owner", "s2"), "ghost"),
+        Some("owner"),
+    );
     assert!(
         error.contains("reply_to targets unknown module ghost"),
         "unknown-module callback: {error}"
@@ -271,7 +287,7 @@ fn a_callback_that_would_wedge_a_saga_is_rejected_at_trigger_time() {
         "each rejected trigger seals its own block (validator parity)"
     );
     // …and no wedged saga exists to be stuck at Pending.
-    for id in ["s1", "s2"] {
+    for id in [sid("owner", "s1"), sid("owner", "s2")] {
         let saga = sim.query("saga", json!({ "get": { "saga_id": id } }));
         assert!(saga["saga"].is_null(), "no wedged saga {id} exists: {saga}");
     }
@@ -290,7 +306,7 @@ fn a_callback_that_would_wedge_a_saga_is_rejected_at_trigger_time() {
 /// TWO modules stay absent (see the report): `files` (duckfs takes a BINARY
 /// op-frame, not a JSON submit) and `forge` (a libgit2-on-disk module whose
 /// determinism is repo-internal — its own e2e owns it, and it stays out of this
-/// cross-dir app-hash-equality assertion). `gateway` was the third until its
+/// cross-dir root-hash-equality assertion). `gateway` was the third until its
 /// SetRoute MemberAuthorization ceremony joined the sweep here — a route the
 /// account's founding Ed25519 member signs, keyed on the just-bound node.
 fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
@@ -319,7 +335,7 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
         // inbox
         (
             "inbox",
-            json!({ "deliver": { "member": "eddy", "kind": "note", "body": "hi" } }),
+            json!({ "deliver": { "member": "alice", "kind": "note", "body": "hi" } }),
             Some("courier".into()),
         ),
         // the job board (the merged tasks module's `job` arm)
@@ -341,7 +357,11 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
         ),
         // saga — fire-and-forget: stages a pending saga, emits a WorkerRequest
         // effect no worker claims (dropped). no follow-up in either mode.
-        ("saga", saga_trigger("s1", &spec), Some("owner".into())),
+        (
+            "saga",
+            saga_trigger(&sid("owner", "s1"), &spec),
+            Some("owner".into()),
+        ),
         // dispatch — an external RegisterRecipe (module-origin is only needed
         // for Dispatch itself).
         (
@@ -390,7 +410,7 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
         // duckdns — claim a handle on the just-bound account (32-byte origin).
         (
             "gateway",
-            json!({ "set_handle": { "handle": "eddy" } }),
+            json!({ "set_handle": { "handle": "alice" } }),
             Some(node.clone()),
         ),
         // gateway — the account's founding key signs a route from the just-bound
@@ -445,7 +465,7 @@ fn gateway_set_route(key: &Ed, node: &str) -> Value {
 }
 
 /// run the script through the HOLD path (submit parks, a step commits it),
-/// collecting the app-hash committed at every height.
+/// collecting the root-hash committed at every height.
 fn run_stepped(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &[]);
@@ -455,7 +475,7 @@ fn run_stepped(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> 
         sim.await_sim_state("held", 1);
         let report = sim.step();
         hashes.push(
-            report["committed"]["appHash"]
+            report["committed"]["root_hash"]
                 .as_str()
                 .unwrap_or_else(|| panic!("{target} did not commit: {report}"))
                 .to_string(),
@@ -467,7 +487,7 @@ fn run_stepped(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> 
 }
 
 /// run the script through the AUTO path (each submit commits inline); the
-/// receipt IS the commit, carrying the same per-height app-hash.
+/// receipt IS the commit, carrying the same per-height root-hash.
 fn run_auto(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
@@ -475,18 +495,18 @@ fn run_auto(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> {
         .iter()
         .map(|(target, payload, origin)| {
             let receipt = sim.submit_ok(target, payload.clone(), origin.as_deref());
-            receipt["appHash"]
+            receipt["root_hash"]
                 .as_str()
-                .unwrap_or_else(|| panic!("{target} receipt has no app hash: {receipt}"))
+                .unwrap_or_else(|| panic!("{target} receipt has no root hash: {receipt}"))
                 .to_string()
         })
         .collect()
 }
 
 #[test]
-fn the_whole_registry_walks_identical_app_hashes() {
+fn the_whole_registry_walks_identical_root_hashes() {
     let script = sweep_script();
-    // same script, two fresh storage dirs → byte-identical app-hash at EVERY
+    // same script, two fresh storage dirs → byte-identical root-hash at EVERY
     // height. any HashMap-iteration or wall-clock read in any touched module
     // would fork one of these.
     assert_eq!(
@@ -495,7 +515,7 @@ fn the_whole_registry_walks_identical_app_hashes() {
         "the same script on two fresh dirs diverged"
     );
     // the two commit paths (auto's inline drain vs. hold's stepped commit) must
-    // walk the identical app-hashes for the identical script — per height, and
+    // walk the identical root-hashes for the identical script — per height, and
     // so also at the final tip.
     assert_eq!(
         run_stepped(&script),
@@ -509,8 +529,8 @@ fn the_whole_registry_walks_identical_app_hashes() {
 /// the sim resumes height ABOVE the index watermark (`index.resume_height()`) —
 /// sim-only code otherwise untested. kill the child, respawn on the SAME storage
 /// dir, and the chain continues: height does not restart at 0, the qmdb-backed
-/// module state (and hence the app-hash) survives the boot, a query serves the
-/// persisted data, and a new commit lands at watermark+1 with a moved app-hash.
+/// module state (and hence the root-hash) survives the boot, a query serves the
+/// persisted data, and a new commit lands at watermark+1 with a moved root-hash.
 #[test]
 fn a_restart_on_the_same_storage_resumes_height_and_state() {
     let storage = tempfile::tempdir().expect("storage dir");
@@ -522,7 +542,7 @@ fn a_restart_on_the_same_storage_resumes_height_and_state() {
         let status = sim.status();
         (
             status["height"].as_u64().expect("height"),
-            status["appHash"].as_str().expect("app hash").to_string(),
+            status["root_hash"].as_str().expect("root hash").to_string(),
         )
         // the sim (and its child) drops here: Drop kills + waits, releasing the
         // storage before the respawn opens it.
@@ -538,20 +558,24 @@ fn a_restart_on_the_same_storage_resumes_height_and_state() {
         "height resumed above the watermark, not restarted at 0: {status}"
     );
     assert_eq!(
-        status["appHash"].as_str(),
+        status["root_hash"].as_str(),
         Some(pre_hash.as_str()),
-        "committed module state survived the restart (app-hash byte-identical)"
+        "committed module state survived the restart (root-hash byte-identical)"
     );
 
-    // the persisted channels are served from the reloaded qmdb.
-    let channels = sim.query("chat", json!("channels"));
-    assert_eq!(
-        channels["channels"].as_array().map(Vec::len),
-        Some(2),
-        "the qmdb-backed channels reloaded from disk: {channels}"
-    );
+    // the persisted channels are served from the reloaded qmdb — both of them,
+    // by name, so a half-reload cannot pass as a count.
+    for (id, name) in [("room", "Room"), ("den", "Den")] {
+        let channel = sim
+            .channel(id)
+            .unwrap_or_else(|| panic!("{id} reloaded from the qmdb-backed store"));
+        assert_eq!(
+            channel["name"], name,
+            "{id} reloaded with its record intact"
+        );
+    }
 
-    // a NEW commit continues the chain at watermark+1 with a changed app-hash.
+    // a NEW commit continues the chain at watermark+1 with a changed root-hash.
     let receipt = sim.submit_ok("chat", create_channel("hall", "Hall"), Some("owner"));
     assert_eq!(
         receipt["height"],
@@ -559,8 +583,8 @@ fn a_restart_on_the_same_storage_resumes_height_and_state() {
         "the new block continues the height: {receipt}"
     );
     assert_ne!(
-        sim.status()["appHash"].as_str(),
+        sim.status()["root_hash"].as_str(),
         Some(pre_hash.as_str()),
-        "the new commit moved the app-hash off the resumed root"
+        "the new commit moved the root-hash off the resumed root"
     );
 }

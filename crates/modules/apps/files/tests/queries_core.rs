@@ -322,6 +322,46 @@ fn ls_on_a_file_path_errors() {
     );
 }
 
+/// The two STRUCTURAL namespace roots list EMPTY on a fresh filesystem, exactly
+/// as `/` does — they are not directories anyone made.
+///
+/// `check_authority` refuses to write `/home` or `/shared` ("root is not
+/// writable") and nothing materializes them in the tree, so before the first
+/// write under one it exists in the rule and not in the store. Answering
+/// `path not found` there told a caller to create a directory the authority rule
+/// forbids it from creating — and it is what put an error banner on the Files
+/// pane of every fresh workspace.
+#[test]
+fn a_namespace_root_lists_empty_before_anything_is_written_under_it() {
+    let d = tempfile::tempdir().unwrap();
+    let f = open_files(&d);
+
+    for root in ["/", "/shared", "/home"] {
+        let reply = ls_query(&f, root, None, None, 256).expect("a namespace root lists");
+        assert!(
+            matches!(&reply, FilesReply::Ls { entries, next } if entries.is_empty() && next.is_none()),
+            "{root}: got {reply:?}"
+        );
+    }
+}
+
+/// The teeth of the rule above: it is EXACTLY the one-segment roots. A path
+/// under one that nobody wrote is genuinely absent and must still say so, or the
+/// listing would silently answer empty for every typo.
+#[test]
+fn only_the_roots_themselves_list_empty_never_a_path_under_one() {
+    let d = tempfile::tempdir().unwrap();
+    let f = open_files(&d);
+
+    for absent in ["/shared/nope", "/home/nobody", "/shared/a/b", "/elsewhere"] {
+        let reply = ls_query(&f, absent, None, None, 256);
+        assert!(
+            matches!(&reply, Err(sdk::Error::Module(m)) if m.contains("path not found")),
+            "{absent}: got {reply:?}"
+        );
+    }
+}
+
 #[test]
 fn ls_on_absent_path_errors() {
     let d = tempfile::tempdir().unwrap();
@@ -722,7 +762,7 @@ fn has_chunks_reports_only_staging_not_the_odb() {
     // its stage). has_chunks reports it ABSENT so the client RE-STAGES it: odb
     // presence is per-node (orphan sets diverge across the set), so probing it
     // would tell one client to skip a stage another node needs — the finding #1
-    // split app-hash. re-staging is consensus-safe (the bytes ride the block).
+    // split root-hash. re-staging is consensus-safe (the bytes ride the block).
     let committed_bytes = b"committed-inline-body";
     commit(
         &mut f,

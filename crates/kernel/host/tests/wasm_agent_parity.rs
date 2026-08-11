@@ -1,13 +1,11 @@
-//! the adapter-port equivalence proof for the agent-registry cutover: the
-//! `agent` guest component (the NATIVE `agent` crate compiled to wasm behind
-//! `guest-adapter`) and the native `AgentModule` answer the SAME op sequence
-//! with IDENTICAL query replies, and their roots move in lockstep. the
-//! first state-schema break is pinned with agent's OWN genesis shape: like saga,
-//! agent's empty canonical encoding (a bare zero count) hashes to the SAME
-//! digest as the wasm port's empty host-KV store — the roots COINCIDE at
-//! genesis and diverge at the first committed write. Revision 2 declares that
-//! adapter break; revision 3 declares the later role tail in the persisted
-//! native snapshot value.
+//! the STORE-BACKED cutover-continuity proof for the agent registry: the
+//! `agent` guest component over `WasmModule::with_store(QmdbStore)` and the
+//! native `AgentModule` over the same store shape are ROOT-CONTINUOUS — the
+//! same op sequence commits the IDENTICAL qmdb merkle root after every block
+//! (both roots ARE the store's root; qmdb's batch canonicalizes mutations by
+//! hashed key, so the native logical-key commit order and the wasm hashed-key
+//! drain order produce the same op log), including the byte-identical NO-OP
+//! blocks the idempotent pause/resume ops rely on.
 //!
 //! the registry itself is self-contained (no sibling queries), so this proof
 //! pins its two FOLLOW-UP lanes across the seam:
@@ -23,31 +21,32 @@
 //!   an actual trigger → result → callback flow into the agent module.
 
 use agent::{
-    AgentModule, AgentMsg, AgentQuery, AgentReply, LoadMode, ResourceCaps, SkillRef,
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg, encode_query,
-    MAX_AGENT_ID_LEN, MAX_SKILLS_PER_AGENT, RECIPE_HASH_LEN,
+    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentModule, AgentMsg, AgentQuery, AgentReply, LoadMode,
+    MAX_AGENT_ID_LEN, MAX_SKILLS_PER_AGENT, RECIPE_HASH_LEN, ResourceCaps, SkillRef, decode_event,
+    decode_reply, encode_msg, encode_query,
 };
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use saga::{SagaModule, SagaMsg, encode_msg as saga_encode_msg};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::Digest as _;
+use statesync::qmdb::{QmdbStore, QmdbSyncReq, encode_qmdb_req};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `agent` module's guest port by
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const AGENT_WASM: &[u8] = include_bytes!("fixtures/agent.component.wasm");
 
-fn wasm_agent() -> WasmModule {
-    WasmModule::from_bytes("agent", AGENT_WASM)
-        .expect("load component")
-        // Revision 2 was the adapter port; revision 3 adds the role tail inside
-        // the persisted native snapshot value.
-        .with_state_schema_revision(3)
+fn wasm_agent(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    // NOTE: no saga/hook wiring here — the guest compiles the exact
+    // production builder chain (`AgentModule::new(.., "saga", Some("runs"))`)
+    // in; only the store arrives host-constructed.
+    WasmModule::with_store("agent", AGENT_WASM, store).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
-fn native_agent() -> AgentModule {
-    AgentModule::new("agent", "saga", Some("runs".into()))
+fn native_agent(store: Box<dyn sdk::MerkleStore>) -> AgentModule {
+    AgentModule::new("agent", store, "saga", Some("runs".into()))
 }
 
 /// the runs-shaped hook recorder: registered under the PRODUCTION hook id, it
@@ -99,19 +98,21 @@ impl Module for HookRecorder {
 /// both hosts carry the REAL native saga (the dead-letter lane's counterpart;
 /// the open-policy constructor keeps the callback flow origin-free) and the
 /// hook recorder under the production ids.
-fn native_host() -> Host {
+async fn native_host(context: &deterministic::Context) -> Host {
+    let store = QmdbStore::init(context.child("native_agent"), "agent").await;
     Host::genesis(vec![
-        Box::new(native_agent()),
-        Box::new(SagaModule::new("saga")),
+        Box::new(native_agent(Box::new(store))),
+        Box::new(SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new()))),
         Box::new(HookRecorder::new()),
     ])
     .expect("genesis")
 }
 
-fn wasm_host_() -> Host {
+async fn wasm_host_(context: &deterministic::Context) -> Host {
+    let store = QmdbStore::init(context.child("wasm_agent"), "agent").await;
     Host::genesis(vec![
-        Box::new(wasm_agent()),
-        Box::new(SagaModule::new("saga")),
+        Box::new(wasm_agent(Box::new(store))),
+        Box::new(SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new()))),
         Box::new(HookRecorder::new()),
     ])
     .expect("genesis")
@@ -195,9 +196,9 @@ fn hook_root(h: &Host) -> StateRoot {
     h.module_root("runs").expect("runs registered")
 }
 
-/// submit one ACCEPTED op to both hosts: identical replies, identical hook
-/// lane (recorder roots agree — and move iff `hook_fires`), lockstep agent
-/// root movement.
+/// submit one ACCEPTED op to both hosts: IDENTICAL agent roots (both are the
+/// store's merkle root), identical replies, identical hook lane (recorder
+/// roots agree — and move iff `hook_fires`), lockstep root movement.
 #[allow(clippy::too_many_arguments)]
 async fn roundtrip(
     native: &mut Host,
@@ -219,6 +220,11 @@ async fn roundtrip(
         .await
         .expect("wasm submit");
     assert_eq!(
+        root_of(native),
+        root_of(wasm),
+        "roots diverge after block {height}"
+    );
+    assert_eq!(
         replies(native, ids).await,
         replies(wasm, ids).await,
         "replies diverge after block {height}"
@@ -232,7 +238,11 @@ async fn roundtrip(
         assert_ne!(hook_root(native), n_hook, "no native hook at {height}");
         assert_ne!(hook_root(wasm), w_hook, "no wasm hook at {height}");
     } else {
-        assert_eq!(hook_root(native), n_hook, "spurious native hook at {height}");
+        assert_eq!(
+            hook_root(native),
+            n_hook,
+            "spurious native hook at {height}"
+        );
         assert_eq!(hook_root(wasm), w_hook, "spurious wasm hook at {height}");
     }
     if moves {
@@ -286,46 +296,34 @@ async fn reject_roundtrip(
 }
 
 #[test]
-fn same_ops_same_replies_hooks_in_lockstep() {
-    futures::executor::block_on(same_ops_inner());
+fn same_ops_identical_roots_hooks_in_lockstep() {
+    deterministic::Runner::default().start(|context| async move {
+        same_ops_inner(&context).await;
+    });
 }
 
-async fn same_ops_inner() {
+async fn same_ops_inner(context: &deterministic::Context) {
     let owner = Origin::External(vec![0xAA; 32]);
     let stranger = Origin::External(vec![0xBB; 32]);
     let ids = ["quacksmith", "curator"];
 
-    let mut native = native_host();
-    let mut wasm = wasm_host_();
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
 
-    assert_eq!(
-        native
-            .state_schema()
-            .into_iter()
-            .find(|(id, _)| id == "agent")
-            .map(|(_, revision)| revision),
-        Some(2),
-        "the native role-tail encoding is revision 2"
+    // ROOT CONTINUITY from block zero: both sides commit to the SAME (empty)
+    // qmdb store — equal roots, and both ride the resolver sync lane.
+    assert_ne!(
+        root_of(&native),
+        StateRoot::ZERO,
+        "agent has no ZERO sentinel"
     );
-    assert_eq!(
-        wasm.state_schema()
-            .into_iter()
-            .find(|(id, _)| id == "agent")
-            .map(|(_, revision)| revision),
-        Some(3),
-        "the adapter wrapper plus role-tail encoding is revision 3"
-    );
-
-    // the adapter SCHEMA-BREAK pin, agent-shaped: the empty canonical map and
-    // the empty host-KV store share the 8-zero-byte preimage, so genesis roots
-    // COINCIDE and the adapter break surfaces at the first committed write.
-    // The revision assertions above separately pin the later role-tail break.
-    assert_ne!(root_of(&native), StateRoot::ZERO, "agent has no ZERO sentinel");
     assert_eq!(
         root_of(&native),
         root_of(&wasm),
-        "empty-canonical-map module: genesis roots coincide by construction"
+        "genesis roots diverge"
     );
+    assert!(native.resolver_backed_ids().contains("agent"));
+    assert!(wasm.resolver_backed_ids().contains("agent"));
 
     // ---- registration fires the hook (Registered) in the SAME block, with
     // the full runtime-identity tail carried through.
@@ -358,8 +356,6 @@ async fn same_ops_inner() {
         true,
     )
     .await;
-    // the roots diverged at the first write (the declared schema break).
-    assert_ne!(root_of(&native), root_of(&wasm));
 
     // ---- a MODULE origin is a legitimate owner.
     roundtrip(
@@ -430,7 +426,7 @@ async fn same_ops_inner() {
     .await;
 
     // ---- pause / resume: owner-gated flips; re-flipping is an idempotent
-    // no-op (nothing staged, root byte-identical).
+    // no-op (nothing staged, op log — and root — byte-identical).
     roundtrip(
         &mut native,
         &mut wasm,
@@ -475,6 +471,9 @@ async fn same_ops_inner() {
     // at the agent module; the terminal result's same-block callback must be
     // swallowed as a no-op breadcrumb on BOTH runtimes (the agent root holds
     // through both blocks — the trigger's, and the callback's).
+    // saga's id space is namespaced per trigger origin, so the stranger's
+    // dead letter can only live under the stranger's own namespace.
+    let dead_letter = saga::namespaced_id(&stranger, "dead-letter");
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
     for host in [&mut native, &mut wasm] {
         host.submit_at(
@@ -482,7 +481,7 @@ async fn same_ops_inner() {
             Msg {
                 target: "saga".into(),
                 payload: saga_encode_msg(&SagaMsg::Trigger {
-                    saga_id: "dead-letter".into(),
+                    saga_id: dead_letter.clone(),
                     spec: b"noise".to_vec(),
                     reply_to: Some("agent".into()),
                     reply_payload: b"corr".to_vec(),
@@ -504,7 +503,7 @@ async fn same_ops_inner() {
             Msg {
                 target: "saga".into(),
                 payload: saga_encode_msg(&SagaMsg::OracleResult {
-                    saga_id: "dead-letter".into(),
+                    saga_id: dead_letter.clone(),
                     attempt: 0,
                     outcome: Ok(b"done".to_vec()),
                     usage: None,
@@ -519,7 +518,7 @@ async fn same_ops_inner() {
             Msg {
                 target: "saga".into(),
                 payload: saga_encode_msg(&SagaMsg::OracleResult {
-                    saga_id: "dead-letter".into(),
+                    saga_id: dead_letter.clone(),
                     attempt: 0,
                     outcome: Ok(b"done".to_vec()),
                     usage: None,
@@ -545,9 +544,30 @@ async fn same_ops_inner() {
     assert_eq!(root_of(&wasm), w_before, "the dead letter staged nothing");
     assert_eq!(replies(&native, &ids).await, replies(&wasm, &ids).await);
 
-    // decoded spot check: the hook stream both recorders hold is the same
-    // three events, in order.
-    // (roots already pinned equal; this is the human-readable rendering.)
+    // ---- the sync serve lane answers identically from both executors.
+    let n_target = native
+        .resolver_sync_target("agent")
+        .await
+        .expect("native target");
+    let w_target = wasm
+        .resolver_sync_target("agent")
+        .await
+        .expect("wasm target");
+    assert_eq!(n_target, w_target, "resolver sync targets diverge");
+    let req = encode_qmdb_req(&QmdbSyncReq::Ops {
+        op_count: n_target.op_count,
+        start_loc: n_target.start,
+        max_ops: 64,
+        include_pinned: true,
+    });
+    assert_eq!(
+        native
+            .serve_sync("agent", &req)
+            .await
+            .expect("native serve"),
+        wasm.serve_sync("agent", &req).await.expect("wasm serve"),
+        "sync serve bytes diverge"
+    );
 
     // queries are read-only on the wasm side too.
     let settled = root_of(&wasm);
@@ -556,17 +576,39 @@ async fn same_ops_inner() {
 }
 
 #[test]
-fn rejections_match_and_leave_no_trace() {
-    futures::executor::block_on(rejections_inner());
+fn sync_handle_matches_native() {
+    deterministic::Runner::default().start(|context| async move {
+        let native = native_agent(Box::new(
+            QmdbStore::init(context.child("rev_native"), "agent").await,
+        ));
+        let wasm = wasm_agent(Box::new(
+            QmdbStore::init(context.child("rev_wasm"), "agent").await,
+        ));
+
+        let n_handle = native.state_sync_handle().expect("native handle");
+        let w_handle = wasm.state_sync_handle().expect("wasm handle");
+        assert_eq!(n_handle, w_handle, "sync handles diverge");
+        assert!(
+            matches!(w_handle, StateSyncHandle::ResolverBacked { ref backend, .. } if backend == "qmdb"),
+            "store-backed tenant must stay resolver-backed: {w_handle:?}"
+        );
+    });
 }
 
-async fn rejections_inner() {
+#[test]
+fn rejections_match_and_leave_no_trace() {
+    deterministic::Runner::default().start(|context| async move {
+        rejections_inner(&context).await;
+    });
+}
+
+async fn rejections_inner(context: &deterministic::Context) {
     let owner = Origin::External(vec![0xAA; 32]);
     let stranger = Origin::External(vec![0xBB; 32]);
     let ids = ["quacksmith"];
 
-    let mut native = native_host();
-    let mut wasm = wasm_host_();
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
 
     for host in [&mut native, &mut wasm] {
         host.submit_at(block(1, owner.clone()), agent_op(&reg("quacksmith").into()))
@@ -801,21 +843,24 @@ async fn rejections_inner() {
 
 #[test]
 fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
-    futures::executor::block_on(multi_dispatch_inner());
+    deterministic::Runner::default().start(|context| async move {
+        multi_dispatch_inner(&context).await;
+    });
 }
 
-async fn multi_dispatch_inner() {
+async fn multi_dispatch_inner(context: &deterministic::Context) {
     let owner = Origin::External(vec![0xAA; 32]);
     let ids = ["a1", "a2"];
 
-    let mut native = native_host();
-    let mut wasm = wasm_host_();
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
 
     // ONE block, three ops: the update reads the registration STAGED by the
     // first dispatch, and the pause reads the update's staged record — on the
-    // wasm side each later dispatch reloads the prior dispatch's staged
-    // `__state`. the register fires its hook; the capability change fires the
-    // retune hook from the SECOND dispatch of the same block.
+    // wasm side each later dispatch reads the prior dispatch's writes through
+    // the host's outer staged overlay. the register fires its hook; the
+    // capability change fires the retune hook from the SECOND dispatch of the
+    // same block.
     let batch = vec![
         (owner.clone(), agent_op(&reg("a1").into())),
         (
@@ -854,6 +899,7 @@ async fn multi_dispatch_inner() {
             out.members
         );
     }
+    assert_eq!(root_of(&native), root_of(&wasm), "roots diverge");
     assert_eq!(replies(&native, &ids).await, replies(&wasm, &ids).await);
     assert_eq!(hook_root(&native), hook_root(&wasm));
     // both hook events (Registered + CapabilityChanged) committed.
@@ -907,6 +953,7 @@ async fn multi_dispatch_inner() {
     }
     assert_ne!(root_of(&native), n_before);
     assert_ne!(root_of(&wasm), w_before);
+    assert_eq!(root_of(&native), root_of(&wasm), "roots diverge");
     assert_eq!(replies(&native, &ids).await, replies(&wasm, &ids).await);
     assert_eq!(hook_root(&native), hook_root(&wasm));
 }

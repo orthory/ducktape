@@ -15,12 +15,12 @@ fn page_trigger_thread() -> pages::ThreadView {
             comment_ids: vec!["comment-1".into()],
         },
         comments: vec![pages::Comment {
-            id: "comment-1".into(),
-            thread_id: "thread-1".into(),
-            author: pages::AuthorRef::User(vec![4; 32]),
-            text: "@bot review".into(),
-            created_at: 1,
-            edited_at: None,
+                id: "comment-1".into(),
+                thread_id: "thread-1".into(),
+                author: pages::AuthorRef::User(vec![4; 32]),
+                text: "@bot review".into(),
+                created_at: 1,
+                edited_at: None,
             deleted: false,
         }],
     }

@@ -74,9 +74,9 @@ const rememberedUrl = () => {
     const active = registry.workspaces?.find((workspace) => workspace.id === registry.active);
     if (active?.ports?.http) return `http://127.0.0.1:${active.ports.http}`;
   } catch {
-    // Fall through to the legacy default.
+    // Fall through to the explicit-selection error.
   }
-  return "http://127.0.0.1:8844";
+  die("no node selected; run `ops/agent-system use URL` or start an active workspace");
 };
 
 let base = localUrl(rememberedUrl());
@@ -102,7 +102,7 @@ const post = (pathname, body) =>
 const query = (target, queryBody) => post("/v1/query", { target, query: queryBody });
 const submit = (target, payload) => post("/v1/submit", { target, payload });
 const receipt = (value) =>
-  console.log(`height=${value.height} app=${value.appHash}${value.opHash ? ` op=${value.opHash}` : ""}`);
+  console.log(`height=${value.height} root=${value.root_hash}${value.op_hash ? ` op=${value.op_hash}` : ""}`);
 
 const stdin = async () => {
   let text = "";
@@ -152,8 +152,8 @@ switch (command) {
     break;
   case "status": {
     const value = await request("/v1/status");
-    const key = value.publicKey ?? value.public_key ?? value.node_key ?? "unknown";
-    console.log(`${key}@nodes.duck height=${value.height ?? "?"} app=${value.appHash ?? value.app_hash ?? "?"}`);
+    const key = value.public_key ?? "unknown";
+    console.log(`${key}@nodes.duck height=${value.height ?? "?"} root=${value.root_hash ?? "?"}`);
     break;
   }
   case "q":

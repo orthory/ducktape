@@ -276,8 +276,7 @@ pub struct EndpointRecord {
     /// router). Peers install its tunnel WITHOUT an endpoint and wait: the
     /// endpoint-less side holds every peer's endpoint from these records, so
     /// it initiates, and WireGuard's roaming pins the observed source. On the
-    /// wire `None` omits the field, keeping endpoint-ful records bit-identical
-    /// to the pre-Option encoding (and old records decodable).
+    /// wire `None` omits the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wireguard_endpoint: Option<Endpoint>,
     pub nonce: u64,

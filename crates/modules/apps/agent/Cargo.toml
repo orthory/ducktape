@@ -19,6 +19,9 @@ guest = ["dep:guest-adapter"]
 # crate, pulled only when the guest build compiles this crate for wasm32.
 guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 sdk = { workspace = true }
+# the store-record codec (and, for interface types, the stored-embedded
+# derive): compact, canonical, deterministic. wire stays sdk::wire.
+borsh = { workspace = true }
 # default-features = false: only the wire types (SagaOrigin) cross this edge,
 # and the `agent` guest builds this crate for wasm32 — saga's native-only
 # index module (indexer -> unix-only IO) must not ride along. a direct path
@@ -27,7 +30,6 @@ sdk = { workspace = true }
 # binaries (which enable saga's default `native`) whole.
 saga = { path = "../../system/saga", default-features = false }
 capability = { workspace = true }
-sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
@@ -35,6 +37,10 @@ async-trait = { workspace = true }
 [dev-dependencies]
 futures = "0.3"
 sdk-testkit = { workspace = true }
+# the sync round-trip drives the module the way a host does: construct the
+# concrete QmdbStore and inject it as `Box<dyn MerkleStore>`.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }
 # TEST-ONLY (no layering edge at build time): the agent id rule is a copy of
 # duckdns's `.duck` label rule — because the id IS the local part of
 # `<agent_id>@agents.duck`. `agent_id_shape_matches_the_duckdns_label_rule`

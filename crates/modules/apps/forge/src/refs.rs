@@ -17,6 +17,7 @@ use std::path::Path;
 use git2::{Oid, Repository};
 use sdk::Error;
 
+use crate::codec::{self, Reader};
 use crate::git;
 use crate::tracker_iface::MAX_BRANCH_BYTES;
 
@@ -26,7 +27,9 @@ pub const MAIN_BRANCH: &str = "main";
 /// the protected, explicit-release branch.
 pub const INTEGRATION_BRANCH: &str = "dev";
 
-fn is_protected_branch(branch: &str) -> bool {
+/// `main` and the shared integration branch are the branches an owner gate
+/// covers — everything else is a feature branch anyone may force-push.
+pub(crate) fn is_protected_branch(branch: &str) -> bool {
     branch == MAIN_BRANCH || branch == INTEGRATION_BRANCH
 }
 
@@ -102,6 +105,49 @@ pub struct RepoState {
     warned: BTreeSet<String>,
 }
 
+/// one repo's catch-up map: `branch -> (COMMITTED head, pack digest)`.
+pub type PendingMap = BTreeMap<String, (Oid, [u8; 32])>;
+
+/// append a catch-up map — the shared encoding of the on-disk pending file and
+/// the snapshot container's per-repo pending section.
+pub fn put_pending(out: &mut Vec<u8>, pending: &PendingMap) {
+    codec::put_u32(out, pending.len() as u32);
+    for (branch, (oid, digest)) in pending {
+        codec::put_str(out, branch);
+        out.extend_from_slice(oid.as_bytes());
+        out.extend_from_slice(digest);
+    }
+}
+
+/// read a catch-up map from UNTRUSTED bytes (a tampered file, a byzantine
+/// snapshot). nothing is pre-allocated from the count: every entry consumes
+/// bytes, so an inflated count fails on truncation instead of on memory.
+pub fn take_pending(r: &mut Reader) -> Result<PendingMap, Error> {
+    let count = r.u32()?;
+    let mut out = PendingMap::new();
+    for _ in 0..count {
+        let branch = r.str_()?;
+        norm_branch(&branch)?;
+        let oid = Oid::from_bytes(r.take(git::OID_RAW_LEN)?)
+            .map_err(|e| Error::Module(format!("forge pending: {e}")))?;
+        if oid.is_zero() {
+            return Err(Error::Module(format!(
+                "forge pending: branch {branch} carries a zero oid"
+            )));
+        }
+        let digest: [u8; 32] = r
+            .take(32)?
+            .try_into()
+            .expect("take(32) yields exactly 32 bytes");
+        if out.insert(branch, (oid, digest)).is_some() {
+            return Err(Error::Module(
+                "forge pending: duplicate branch in the catch-up map".into(),
+            ));
+        }
+    }
+    Ok(out)
+}
+
 impl RepoState {
     /// a fresh state over an adopted/installed committed branch map.
     pub fn with_refs(refs: BTreeMap<String, Oid>) -> Self {
@@ -109,6 +155,22 @@ impl RepoState {
             refs,
             ..Default::default()
         }
+    }
+
+    /// re-adopt a catch-up map from the pending file or a snapshot. each
+    /// entry's oid IS this branch's COMMITTED head — the on-disk git ref is a
+    /// node-local cache that legitimately lags it — so it overrides whatever
+    /// the ref cache said.
+    pub fn adopt_pending(&mut self, pending: PendingMap) {
+        for (branch, target) in pending {
+            self.refs.insert(branch.clone(), target.0);
+            self.pending.insert(branch, target);
+        }
+    }
+
+    /// the branches whose committed head this node cannot serve objects for.
+    pub fn pending(&self) -> &PendingMap {
+        &self.pending
     }
 
     /// read-your-writes head of one branch: a staged fate shadows the
@@ -232,11 +294,15 @@ impl RepoState {
             }
             let Some(pack) = blobs.get_chunk(digest) else {
                 if self.warned.insert(branch.clone()) {
-                    eprintln!(
-                        "[forge] materialize: pack {} for repo {name} branch {branch} head {head} \
-                         not in the blob store yet; on-disk ref stays behind, root already \
-                         reflects the committed head",
-                        crate::hex(digest)
+                    tracing::warn!(
+                        target: "ducktape::forge",
+                        reason = "pack_missing",
+                        repo = %name,
+                        branch = %branch,
+                        head = %head,
+                        digest = %crate::hex(digest),
+                        "materialize: on-disk ref stays behind; root already reflects the \
+                         committed head"
                     );
                 }
                 continue;
@@ -250,9 +316,14 @@ impl RepoState {
                 is_protected_branch(branch),
             ) {
                 if self.warned.insert(branch.clone()) {
-                    eprintln!(
-                        "[forge] materialize: cannot advance repo {name} branch {branch} to head \
-                         {head}: {why}; leaving ref behind (root already correct)"
+                    tracing::warn!(
+                        target: "ducktape::forge",
+                        reason = "materialize_refused",
+                        repo = %name,
+                        branch = %branch,
+                        head = %head,
+                        why = %why,
+                        "materialize: leaving the on-disk ref behind; root already correct"
                     );
                 }
                 continue;
@@ -318,7 +389,7 @@ mod tests {
         }
         for bad in [
             "", "/x", "x/", "a//b", "-x", ".x", "a/.hidden", "a/-b", "x.lock", "a/b.lock",
-            "a b", "a:b", "a~b", "한글",
+            "a b", "a:b", "a~b", "café",
         ] {
             assert!(norm_branch(bad).is_err(), "{bad:?} must be rejected");
         }

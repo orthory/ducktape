@@ -12,10 +12,11 @@
 //! mode keys a ballot by that node; share mode resolves it to one Identity
 //! account, so no validator can forge another principal's ballot.
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 /// what a passing proposal DOES.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GovAction {
     /// admit a validator: emits `ValsetMsg::Join { key }` on execution.
@@ -76,14 +77,14 @@ pub enum GovAction {
 }
 
 /// one non-transferable governance-share allocation.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ShareAllocation {
     pub account_id: Vec<u8>,
     pub shares: u64,
 }
 
 /// what principal the proposal's ballot keys identify.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VoterKind {
     ValidatorNode,
@@ -91,7 +92,7 @@ pub enum VoterKind {
 }
 
 /// the exact decision rule frozen with a proposal.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VotingRule {
     /// Pass once `yes_power >= required_yes`; this covers validator-set
@@ -137,7 +138,7 @@ pub enum GovMsg {
         /// the invite role byte (`Resident = 0`, `Client = 1`). a `Resident`
         /// redeem grants valset resident standing; a `Client` redeem grants
         /// submit-only client standing in the identity module. EVERY invite
-        /// is bearer (기명 dropped — see the join ADR): no `target` — the
+        /// is bearer (the targeted form was dropped — see the join ADR): no `target` — the
         /// `proof` binds the redemption to whichever key presents it and the
         /// nonce set makes that exactly-once.
         role: u8,
@@ -147,7 +148,7 @@ pub enum GovMsg {
 }
 
 /// a proposal's lifecycle. `Open` accepts votes; the rest are terminal.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalStatus {
     Open,
@@ -181,8 +182,8 @@ pub struct SharesView {
     pub total: u64,
 }
 
-/// the readable projection of one settled invite redemption — the audit
-/// trail of who invited whom.
+/// the readable projection of one settled invite redemption — who invited
+/// whom, and when it landed.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RedemptionView {
     /// the redeemed token's nonce (the single-use key).
@@ -198,12 +199,15 @@ pub struct RedemptionView {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GovQuery {
-    /// every proposal, sorted by id.
+    /// every proposal, sorted by id (the roster-served enumeration — see the
+    /// module doc for why this listing stays canonical).
     Proposals,
     /// one proposal by id.
     Proposal { proposal_id: String },
-    /// every settled invite redemption, sorted by nonce.
-    Redemptions,
+    /// one settled invite redemption by token nonce — the point read the
+    /// node's join-lobby spent-invite pre-check (V6) consumes. redemptions
+    /// have no enumeration: the set is point records alone.
+    Redemption { nonce: Vec<u8> },
     /// the current share registry and whether it governs new proposals.
     Shares,
 }
@@ -213,7 +217,7 @@ pub enum GovQuery {
 pub enum GovReply {
     Proposals(Vec<ProposalView>),
     Proposal(Option<ProposalView>),
-    Redemptions(Vec<RedemptionView>),
+    Redemption(Option<RedemptionView>),
     Shares(SharesView),
 }
 

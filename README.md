@@ -6,8 +6,8 @@ way CosmWasm isolates contracts, but in native Rust.
 
 Each module owns its authenticated state substrate and exposes exactly one
 32-byte root to the host. The host dispatches modules over BFT consensus and
-composes the sorted module roots into a global app-hash that consensus commits.
-If two nodes agree on the app-hash, they agree on every module's state.
+composes the sorted module roots into a global root-hash that consensus commits.
+If two nodes agree on the root-hash, they agree on every module's state.
 
 ## The Module Rule
 
@@ -26,16 +26,21 @@ The tree groups by function into three layers — module / kernel / networking:
 
 | Path | Contents |
 | --- | --- |
-| `crates/kernel/` | The platform: `sdk` (module contract + codec), `host` (submit/execute loop, app-hash composition, the `host::worker` non-deterministic-effect seam), `node` (ordered replication), `consensus` (commonware Simplex BFT orderer), `statesync`, `recovery`, `indexer` (derived read-model tier), `wasm-host` (pinned wasmtime runtime for hot-swappable module components) |
-| `crates/networking/` | The netstack: host-side transport infra — `wireguard`, `nat-traversal`, `reachability`, `data-plane`, `overlay-net` — plus the consensus modules that govern it, `duckdns` and `gateway` (the merged name→AccountId→route module) |
-| `crates/modules/system/` | System modules and their host-side counterparts: `kv` (byte-KV), `valset` (ed25519 validator membership), `clients`, `governance`, `identity`, `lifecycle` (module code registry), `saga` (deterministic async continuations), `capability`, `dispatch`, `tagging`, `airlock` (exec/credential gateway), plus `blobstore`, `dispatch-oracle`, `capability-host` |
-| `crates/modules/apps/` | Product modules: `forge` (git-backed project state), `pages` (documents), `chat`, `agent` (LLM-run orchestrator), `runs`, `tasks`, `vaults`, `inbox` (per-member notification queues), `automations` (rules over chat hooks), `files` (consensus manifests, node-local bytes; wraps `duckfs`), `jobs` (first-claim-wins work board) |
+| `crates/kernel/` | The platform: `sdk` (module contract + codec), `host` (submit/execute loop, root-hash composition, the `host::worker` non-deterministic-effect seam), `node` (ordered replication), `consensus` (commonware Simplex BFT orderer), `statesync`, `recovery`, `indexer` (derived read-model tier), `blobstore` (node-local op-receipt byte store — like `indexer`, never in any root), `wasm-host` (pinned wasmtime runtime for hot-swappable module components) |
+| `crates/networking/` | The netstack: host-side transport infra only — `wireguard`, `nat-traversal`, `reachability`, `data-plane`, `overlay-net`. Owns no consensus module |
+| `crates/modules/` | **Consensus modules and nothing else** — every crate under `system/` or `apps/` implements `sdk::Module`. Module = onchain, service = offchain; a crate that holds no consensus state belongs in `kernel/`, `services/`, or beside `airlock`/`duckdns` |
+| `crates/modules/system/` | System modules: `kv` (byte-KV), `valset` (ed25519 validator membership), `governance`, `identity`, `lifecycle` (module code registry), `saga` (deterministic async continuations), `capability`, `dispatch`, `tagging`, `gateway` (the merged name→AccountId→route module, which absorbed the on-chain half of `duckdns`) |
+| `crates/modules/apps/` | Product modules: `forge` (git-backed project state), `pages` (documents), `chat`, `agent` (LLM-run orchestrator), `runs`, `tasks`, `vaults`, `inbox` (per-member notification queues), `automations` (rules over chat hooks), `files` (consensus manifests, node-local bytes; wraps `duckfs`) |
+| `crates/services/` | Off-chain service crates — the host-side executors that serve a consensus module without being one: `compute` (the dispatch WorkSpec pool/ledger/gate), `provider` (executor spec layer + the `CliProvider` run loop), `sandbox` (node-private podman, egress firewall, backend probe), `broker` (run-scoped credential loopback + airlock client), `agent` (interactive pty daemon), `airlock` (the credential-LENDING gateway: node-local store + router, no TEE) |
+| `crates/airlock/` | The two-party execution/auth contract (`client`/`server`/`verify`/`testkit` features). Not a module and not one party's crate: the lender service, the borrower broker and the enclave binary all consume it |
+| `crates/duckdns/` | The `.duck` account naming library — hostname grammar, handle registry, wire types, canonical state codec. Not a module: the `gateway` module embeds it for the on-chain half, and `node`/`noded`/`simnode`/`demo` validate names host-side |
 | `crates/duckfs/` | The versioned-filesystem engine: `core` (pure, wasm-ready — the `files` module wraps it), `disk`, `client` (OS-side) |
 | `crates/guests/` | Shared wasm-port infra only: `guest-adapter` (the `ducktape:module` world binding every port shares), the wasm32 dep stubs, and the kernel-fixture test guests. Every module carries its own port (`src/guest.rs` behind the `guest` feature) and `bin/guest-builder` synthesizes the packaging — no per-module crate lives here |
 | `crates/examples/` | Reference modules: `directory` (also bin/node's liveness canary), `greeter` (types-only composition example) |
 | `crates/labs/` | Quarantined experimental modules (`evm`, `multisig`): in-tree and tested but registered by NO genesis set, kept as a standalone crate EXCLUDED from the workspace so its heavy deps (revm, alloy) never tax the shipping build — gated via `make labs-gate` |
-| `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (validator), `noded` (app-facing daemon), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous), `fs` (duckfs CLI), `mcp` (MCP tool server), `airlock-gateway` / `airlock-broker` / `airlock-cli` (credential gateway), `guest-builder` (module → wasm component packaging tool) |
-| `docs/` | Nimbus documentation site (human/agent tracks, English/Korean) |
+| `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (validator), `noded` (app-facing daemon), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous), `fs` (duckfs CLI), `mcp` (MCP tool server), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool) |
+| `app/` | `ducktape-app`, the native Iced desktop client (Chat + Pages), UI declared in `src/ui/*.ice`; `crates/design` is its design system |
+| `docs/` | Nimbus documentation site (human and agent tracks) |
 
 Each module publishes its wire surface — types-only payload/query/reply shapes
 and codecs — at its own crate root; those wire types plus host-routed queries
@@ -89,7 +94,7 @@ cargo test --workspace
 ```
 
 Run the in-process super-app demo — registers the platform and product modules
-together and shows their roots moving under one composed app-hash:
+together and shows their roots moving under one composed root-hash:
 
 ```sh
 cargo run -p demo
@@ -98,14 +103,14 @@ cargo run -p demo
 Run the real-socket cluster e2e — REAL node processes over localhost TCP,
 driven through the rpc: BFT convergence, a chat product loop, a governance
 vote, a live epoch cutover, a crash-fault liveness check, and a sync-only
-joiner rebuilding every module to the identical app-hash:
+joiner rebuilding every module to the identical root-hash:
 
 ```sh
 cargo test -p node-bin --test cluster_e2e
 ```
 
 Run the joiner state-sync proof — a fresh joiner rebuilds every module and
-lands on the source app-hash:
+lands on the source root-hash:
 
 ```sh
 cargo test -p demo --test network_joiner_full
@@ -169,8 +174,7 @@ is `skills/module-dev/SKILL.md`.
 
 ## Run a node
 
-The product ships as headless surfaces — there is no bundled desktop app in
-this tree. Three binaries are runnable:
+Three binaries plus the desktop app are runnable:
 
 - **`node-bin`** (the `ducktape` daemon) — the networked node that serves the
   module HTTP/WebSocket surface. Release build with `make node`; run a
@@ -190,6 +194,10 @@ this tree. Three binaries are runnable:
 
 - **`coordinator`** — the untrusted UDP rendezvous (see the operator path
   above).
+
+- **`ducktape-app`** (`app/`) — the native Iced desktop client for Chat and
+  Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`; it
+  dials `DUCKTAPE_NODE`, else `http://127.0.0.1:8844`. See `app/README.md`.
 
 Install the `ducktape` operator CLI into `~/.cargo/bin`:
 
@@ -218,13 +226,13 @@ bun run docs:check   # docs gate
 bun run dev          # local preview
 ```
 
-Pages are split by reader (human vs. coding agent) and language (English,
-Korean) under `docs/src/content/docs`.
+Pages are split by reader (human vs. coding agent) under
+`docs/src/content/docs/en`.
 
 ## Status
 
 The platform spine is checked in and verified: the module contract, host
-registry, global app-hash, ordered node path, commonware Simplex orderer,
+registry, global root-hash, ordered node path, commonware Simplex orderer,
 the saga async seam, and several root-backed product modules, plus state
 sync for QMDB-backed, forge, and snapshot-style modules.
 

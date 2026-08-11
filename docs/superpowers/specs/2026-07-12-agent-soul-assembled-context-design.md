@@ -56,7 +56,7 @@ pub struct AgentRecord {
 ```
 
 `RegisterAgent` / `UpdateAgent` lose `prompt_hash` and gain the per-skill load
-mode. Snapshot/root encoding changes → app-hash moves. This is a deliberate
+mode. Snapshot/root encoding changes → root-hash moves. This is a deliberate
 flag day; existing agents re-register with their persona written into duckfs.
 No in-consensus migration op — the repo re-genesises on flag days.
 

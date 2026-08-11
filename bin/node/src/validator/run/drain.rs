@@ -11,10 +11,11 @@ use directory::{DirQuery, DirReply, decode_reply, encode_query};
 use recovery::Manifest;
 use sdk::Msg;
 
-use super::super::announce::{dispatch_pending_deliveries, saga_next_expiry};
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET};
-use crate::drain_actions::{CutoverTrigger, EpochActions};
+use crate::drain_actions::{
+    CutoverTrigger, EpochActions, capture_breakdown, checkpoint_due, cooldown_until,
+};
 use noded::projection::{BlockProjection, project_block};
 use crate::host_reads::{
     read_valset_members, read_valset_residents,
@@ -23,7 +24,16 @@ use crate::{lobby, relay};
 use crate::util::{fatal, hex, participant_bytes, resident_bytes};
 
 impl ValidatorRuntime<'_> {
+    /// one drain turn: the pass over delivered finalizations, then the
+    /// `/v1/status` publish — the boundary a pass settles must be visible on
+    /// the cell the moment the turn ends, and `publish_status` owns the
+    /// (throttled) operations refresh, so the pass itself stays free of it.
     pub(super) async fn on_drain(&mut self) {
+        self.drain_pass().await;
+        self.publish_status().await;
+    }
+
+    async fn drain_pass(&mut self) {
 
         let Self {
             context,
@@ -58,9 +68,12 @@ impl ValidatorRuntime<'_> {
             validator_relay,
             last_published,
             blocks_since_checkpoint,
+            checkpoint_not_before,
             last_reach_view,
             pending_retarget,
             next_drain,
+            delivery_wake_tx,
+            real_work_parked,
             ..
         } = self;
         let context = *context;
@@ -112,15 +125,26 @@ impl ValidatorRuntime<'_> {
         // batch's member count. count DISTINCT sealed heights so the
         // checkpoint cadence stays per-block; applied and rejected
         // members both seal, discarded frames never sealed a height.
-        *blocks_since_checkpoint += drained
+        let sealed_heights = drained
             .iter()
             .filter(|d| d.disposition != node::Disposition::Discarded)
             .map(|d| d.height)
             .collect::<std::collections::BTreeSet<u64>>()
             .len() as u64;
+        *blocks_since_checkpoint += sealed_heights;
         // The orderer-independent projection keeps member/System order,
         // explorer rows, and discard handling identical to the replica.
-        for projection in project_block(&drained, node.take_system_dispatches(), blobs) {
+        let projections = project_block(&drained, node.take_system_dispatches(), blobs);
+        // THE PASS PUBLISHES ONE TIP FRAME FOR N BLOCKS, so the wake is the OR
+        // over all of them and never the tip block's alone. A pass of
+        // [chat@10, nop@11] publishes h=11, and the 1s nop filler makes that the
+        // ORDINARY busy shape — taking the tip block's answer would strand the
+        // rows at h=10 until some later block happened to feed chat again.
+        let pass_wake = match projections.iter().any(|p| !p.dispatches.is_empty()) {
+            true => noded::BlockWake::IndexChanged,
+            false => noded::BlockWake::TipOnly,
+        };
+        for projection in projections {
             let BlockProjection {
                 height,
                 dispatches,
@@ -240,7 +264,7 @@ impl ValidatorRuntime<'_> {
                 let outcome = match d.disposition {
                     node::Disposition::Applied => relay::RelayOutcome::Applied {
                         height: d.height,
-                        app_hash: hex(&d.app_hash),
+                        root_hash: hex(&d.root_hash),
                     },
                     node::Disposition::Rejected => relay::RelayOutcome::Rejected {
                         // carry the module's VERBATIM reason (node-
@@ -269,18 +293,21 @@ impl ValidatorRuntime<'_> {
             // consensus produced no record ANYWHERE: the submitter's own log says
             // SUCCESS (the submit was accepted) while the state machine says NO.
             //
-            // and the internal submits — oracle results, capability announces,
-            // upgrade readiness, code-ready signals — are fire-and-forget and never
-            // enter `pending_submits` at all, so the `continue` below swallows their
-            // rejection whole. That is exactly how an announcer that latches on
-            // submit-Ok wedges FOREVER: silently out of every rendezvous pool, the
-            // upgrade stuck at R<n, and nothing anywhere saying why.
+            // and the internal submits — oracle results, upgrade readiness,
+            // code-ready signals — are fire-and-forget and never enter
+            // `pending_submits` at all, so the `continue` below swallows their
+            // rejection whole. The capability announce used to be the worst case
+            // of that and no longer travels this lane at all (it is a settling
+            // `/v1/submit` from outside this loop now); the rest are still
+            // unrouted, which is its own item.
             let module = d.op.as_ref().map_or("system", |op| op.target.as_str());
             // the idle-chain NOP filler is rejected BY DESIGN — it targets a module
             // that deliberately does not exist. warning on it would fire every block
             // forever on an idle chain, evicting the whole 4096-line ring in ~68
             // minutes and drowning the very evidence someone came to read.
-            if d.disposition == node::Disposition::Rejected && module != NOP_TARGET {
+            let rejected = d.disposition == node::Disposition::Rejected;
+            let is_idle_nop = module == NOP_TARGET;
+            if rejected && !is_idle_nop {
                 tracing::warn!(
                     target: "ducktape::submit",
                     node = %label,
@@ -300,7 +327,7 @@ impl ValidatorRuntime<'_> {
                     // the PER-BLOCK boundary this frame settled at
                     // (not the end-of-drain hash — a drain can
                     // apply several blocks).
-                    app_hash: hex(&d.app_hash),
+                    root_hash: hex(&d.root_hash),
                 }),
                 node::Disposition::Rejected => Err(d.reason.clone().unwrap_or_else(|| {
                     // the module's VERBATIM reason when the drain
@@ -395,7 +422,7 @@ impl ValidatorRuntime<'_> {
         if let Some(f) = node.finalized()
             && *last_published != Some(f.height)
         {
-            stream_hub.publish_block(f.height, hex(&f.app_hash));
+            stream_hub.publish_block(f.height, hex(&f.root_hash), pass_wake);
             *last_published = Some(f.height);
         }
 
@@ -447,11 +474,32 @@ impl ValidatorRuntime<'_> {
         // prune the op journal below the PREVIOUS checkpoint once
         // the persisted floor has passed it (pruned frames must
         // never be needed to resolve a re-reported finalization).
-        if *blocks_since_checkpoint >= checkpoint_blocks
-            && let Some(f) = node.finalized()
+        // A BLOCK COUNT ALONE CANNOT EXPRESS WHAT A CHECKPOINT COSTS. 32 blocks
+        // is ~30 s of chain, and one capture measured 59–70 s on a real
+        // workspace (#1018) — so the trigger fired again before the previous
+        // one had finished paying for itself, and the node spent two thirds of
+        // its life in this branch, unable to poll any other arm of the loop.
+        // The cadence is therefore gated on BOTH: enough blocks, and enough
+        // recovery time since the last attempt to keep the loop's occupancy
+        // under one part in `CHECKPOINT_DUTY_LIMIT`.
+        if checkpoint_due(
+            *blocks_since_checkpoint,
+            checkpoint_blocks,
+            context.current(),
+            *checkpoint_not_before,
+        ) && let Some(f) = node.finalized()
         {
+            // EVERY STAGE BELOW RUNS ON THE SELECT LOOP, so its duration is
+            // time the `http_ingress` arm is not polled and `/v1/query` is
+            // unserviced (issue #1018). The stage timings ARE the diagnosis,
+            // so they ride the checkpoint event itself rather than needing a
+            // profiler on a box where the stall only shows under real state.
             let pos = node.sink_mut().oplog_pos().await;
-            let captured = Manifest::capture(
+            let checkpoint_started = context.current();
+            // the capture reads the LOOP's clock per module (the host and the
+            // recovery crate own none) so a slow capture names its module
+            // instead of leaving `capture_ms` to be attributed by guesswork.
+            let captured = Manifest::capture_timed(
                 node.host(),
                 Some(f.height),
                 orchestrator.epoch(),
@@ -461,10 +509,18 @@ impl ValidatorRuntime<'_> {
                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
                 pos,
                 *next_seq,
+                || {
+                    context
+                        .current()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                },
             );
+            let captured_at = context.current();
             match captured {
-                Ok(m) => match node.sink_mut().write_manifest(&m).await {
+                Ok((m, capture_cost)) => match node.sink_mut().write_manifest(&m).await {
                     Ok(()) => {
+                        let written_at = context.current();
                         *blocks_since_checkpoint = 0;
                         let floor_passed = matches!(
                             node.sink_mut().floor_cert(),
@@ -494,11 +550,19 @@ impl ValidatorRuntime<'_> {
                             );
                         }
                         *prev_ckpt = (m.height, pos);
+                        let since = |a: std::time::SystemTime, b: std::time::SystemTime| {
+                            b.duration_since(a).unwrap_or_default().as_millis()
+                        };
+                        let done_at = context.current();
                         tracing::info!(
                             target: "ducktape::recovery",
                             event = "node_checkpoint_written",
                             node = %label,
-                            height = m.height.unwrap_or_default()
+                            height = m.height.unwrap_or_default(),
+                            capture_ms = since(checkpoint_started, captured_at),
+                            write_ms = since(captured_at, written_at),
+                            prune_ms = since(written_at, done_at),
+                            capture_modules = %capture_breakdown(&capture_cost)
                         );
                     }
                     Err(e) => {
@@ -520,6 +584,16 @@ impl ValidatorRuntime<'_> {
                     );
                 }
             }
+            // SET OUTSIDE THE MATCH, ON PURPOSE. A capture that FAILS costs the
+            // loop everything a successful one does, and the failure path does
+            // not reset `blocks_since_checkpoint` — so without this the retry
+            // is immediate and the node re-pays the full cost on every drain
+            // tick, forever. The cooldown is what makes the failure survivable.
+            let attempt = context
+                .current()
+                .duration_since(checkpoint_started)
+                .unwrap_or_default();
+            *checkpoint_not_before = cooldown_until(context.current(), attempt);
         }
 
         // the VALSET ORCHESTRATION step: observe the finalized
@@ -665,8 +739,12 @@ impl ValidatorRuntime<'_> {
                         .expect("orchestrator membership has no duplicates");
                 // a fresh epoch: new store (pins of the torn-down
                 // epoch die with it), genesis floor.
-                let orderer =
-                    epoch_spawner.spawn(plan.epoch(), participants, ContentStore::new(), None);
+                let orderer = epoch_spawner
+                    .spawn(plan.epoch(), participants, ContentStore::new(), None)
+                    .await;
+                // the fresh engine must keep draining event-driven —
+                // re-install the finalization delivery wake on its inbox.
+                orderer.set_delivery_wake(delivery_wake_tx.clone());
                 match node
                     .cutover(
                         orderer,
@@ -681,13 +759,18 @@ impl ValidatorRuntime<'_> {
                     // every locally-accepted op the old epoch
                     // never resolved was re-proposed into the
                     // new engine.
-                    Ok(carried) if carried > 0 => tracing::info!(
-                        target: "ducktape::consensus",
-                        node = %label,
-                        carried,
-                        epoch = plan.epoch(),
-                        "accepted ops carried across the cutover"
-                    ),
+                    Ok(carried) if carried > 0 => {
+                        // carried ops are real parked work in the fresh
+                        // engine — keep the leader-nudge escort walking them.
+                        *real_work_parked = true;
+                        tracing::info!(
+                            target: "ducktape::consensus",
+                            node = %label,
+                            carried,
+                            epoch = plan.epoch(),
+                            "accepted ops carried across the cutover"
+                        );
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         fatal!(label, "{e} — halting");
@@ -709,6 +792,7 @@ impl ValidatorRuntime<'_> {
                     pos,
                     *next_seq,
                 );
+                let post_cutover_started = context.current();
                 match captured {
                     Ok(m) => match node.sink_mut().write_manifest(&m).await {
                         Ok(()) => {
@@ -731,6 +815,16 @@ impl ValidatorRuntime<'_> {
                          covers a restart"
                     ),
                 }
+                // THE CUTOVER CHECKPOINT IS NOT GATED — a restart must land on
+                // the new epoch's boundary — but it costs the loop exactly what
+                // the periodic one does, so it is charged the same cooldown.
+                // Otherwise the periodic branch fires immediately after it and
+                // the node pays twice back to back.
+                let post_cutover_cost = context
+                    .current()
+                    .duration_since(post_cutover_started)
+                    .unwrap_or_default();
+                *checkpoint_not_before = cooldown_until(context.current(), post_cutover_cost);
                 tracing::info!(
                     target: "ducktape::consensus",
                     node = %label,
@@ -749,7 +843,6 @@ impl ValidatorRuntime<'_> {
         // saga crank, dispatch delivery nudge.
         self.pump_heartbeat().await;
         self.pump_code_readiness().await;
-        self.pump_capability_announce().await;
         self.pump_saga_crank().await;
         self.pump_dispatch_nudge().await;
 
@@ -805,10 +898,10 @@ impl ValidatorRuntime<'_> {
         }
         notes.finish();
         if dev_demo && !*converged && *applied >= expected {
-            let h = node.app_hash();
+            let h = node.root_hash();
             tracing::info!(
                 target: "ducktape::consensus",
-                "node={label} converged app_hash={}", hex(&h)
+                "node={label} converged root_hash={}", hex(&h)
             );
             // dump every directory key so the demo can eyeball the ops
             // (each node ends holding the op it originated AND the peer's).
@@ -837,73 +930,189 @@ impl ValidatorRuntime<'_> {
         }
     }
 
-    // BLOCK CADENCE + heartbeat, unified. `submit`/`submit_frame`
-    // now ENQUEUE into the node's `pending_batch`; this is the one
-    // place per block-time that FLUSHES the window — packing every
-    // frame that arrived in it (real ops and/or an idle nop) into
-    // ONE batch super-frame and proposing it as a single block.
-    // that is the aggregation: at most one block per BLOCK_TIME,
-    // carrying all the window's txs, never 1-tx-1-block.
+    // BLOCK CADENCE + heartbeat. `submit`/`submit_frame` ENQUEUE into the
+    // node's `pending_batch`; a flush packs every frame the window holds into
+    // batch super-frames, each proposed as a single block. flushing happens on
+    // TWO paths:
     //
-    // the idle nop still exists: finalized views only advance with
-    // a proposed frame, so an idle network would freeze (its height
-    // never ticks and a pending cutover, which crosses only when
-    // finalized views REACH it, would park forever). so on an EMPTY
-    // window inject one deterministically-rejected nop (unknown
-    // module target: rejects identically everywhere, leaves no
-    // state) and flush that. a window with real ops needs no nop —
-    // the ops ARE the block.
+    // - BUSY — [`ValidatorRuntime::pump_eager_flush`], event-driven, NO
+    //   interval: the run loop flushes at the end of any turn that left real
+    //   ops pending while nothing of ours is in flight. the network's own
+    //   agreement speed is the pacer; this heartbeat arm plays no part in
+    //   busy pacing.
+    // - IDLE — this arm: an empty window beats one nop per `BLOCK_TIME`.
+    //   finalized views only advance with a proposed frame, so an idle
+    //   network would freeze (its height never ticks and a pending cutover,
+    //   which crosses only when finalized views REACH it, would park
+    //   forever). the nop targets an unregistered module: it rejects
+    //   identically everywhere and leaves no state. a chain with real ops
+    //   needs no nop — the ops ARE the blocks.
     //
-    // GATE the idle nop on an empty orderer FIFO too: a nop pushed
-    // while a batch still awaits finalization only piles behind a
-    // finalization stall (a flapping quorum peer would stack idle
-    // blocks). real ops are never gated — they must not wait.
+    // GATE the idle nop on an empty window AND an empty orderer FIFO: a nop
+    // pushed while real ops wait (or while a batch still awaits finalization)
+    // only piles behind them — a flapping quorum peer would stack idle
+    // blocks. a due beat that finds the chain non-quiet RESTAMPS the grid
+    // instead, so the nop returns one full `BLOCK_TIME` after the chain goes
+    // quiet, never the instant a stall clears.
     async fn pump_heartbeat(&mut self) {
+        let now = self.context.current();
+        let heartbeat_due = now.duration_since(self.last_flush).unwrap_or_default()
+            >= consensus::BLOCK_TIME;
+        let ops_pending = self.node.pending_batch_len() > 0;
+        let orderer_idle = self.node.orderer().pending_len() == 0;
+        match heartbeat_action(self.heartbeat_disabled, ops_pending, heartbeat_due, orderer_idle) {
+            HeartbeatAction::Idle => {}
+            HeartbeatAction::Restamp => self.last_flush = now,
+            HeartbeatAction::BeatNop => self.beat_nop(now).await,
+        }
+    }
+
+    /// the BUSY block path — event-driven, no interval anywhere. the run loop
+    /// calls this at the end of EVERY turn: whatever the turn enqueued (an
+    /// ingress submit, a relayed frame, a drain-arm system op) flushes into a
+    /// proposed block immediately — unless a batch of ours is already in
+    /// flight, in which case everything aggregates until that batch clears
+    /// and the finalization delivery wake turns the loop again. that in-flight
+    /// gate is the whole aggregation story: a lone op ships instantly, and
+    /// under load a block naturally carries everything that arrived during
+    /// the previous block's consensus round — block size scales with traffic,
+    /// with no timer and no 1-tx-1-block regime.
+    pub(super) async fn pump_eager_flush(&mut self) {
+        let ops_pending = self.node.pending_batch_len() > 0;
+        let orderer_idle = self.node.orderer().pending_len() == 0;
+        if eager_flush_due(self.heartbeat_disabled, ops_pending, orderer_idle) {
+            let now = self.context.current();
+            let flushed = self.flush_window(now).await;
+            // these batches carry REAL ops (the idle nop flushes via
+            // `beat_nop`, never here) — they are what the leader-nudge
+            // escort walks through other validators' idle views.
+            if flushed > 0 {
+                self.real_work_parked = true;
+            }
+        }
+    }
+
+    /// escort parked REAL work through other validators' idle views: while
+    /// our un-finalized proposals include real ops and the (locally
+    /// estimated) current view's leader is someone else, nudge that leader to
+    /// close its view now. one nudge per estimated view — every finalized
+    /// block moves the estimate and re-arms the next — so the escort advances
+    /// at network speed and goes silent the moment nothing real is parked. a
+    /// mis-aimed nudge (stale tip estimate, mid-cutover membership) costs at
+    /// most one deterministic nop on the receiver; correctness never depends
+    /// on the aim. a parked idle NOP is deliberately not escorted — the 1s
+    /// beat owns that pace.
+    pub(super) async fn pump_leader_nudge(&mut self) {
+        let orderer_idle = self.node.orderer().pending_len() == 0;
+        if orderer_idle {
+            // nothing of ours awaits finalization — the escort stands down.
+            self.real_work_parked = false;
+            self.last_nudged_view = None;
+            return;
+        }
+        if !self.real_work_parked {
+            return;
+        }
+        let current_view = self
+            .node
+            .orderer()
+            .newest_finalized_view()
+            .map_or(1, |tip| tip + 1);
+        if self.last_nudged_view == Some(current_view) {
+            return;
+        }
+        let epoch = self.orchestrator.epoch();
+        let members = self.orchestrator.current_members();
+        let Some(leader) = round_robin_leader(epoch, current_view, members) else {
+            return;
+        };
+        if *leader == self.signer.public_key() {
+            // our own view: propose serves our queue by itself.
+            return;
+        }
+        let leader = leader.clone();
+        self.last_nudged_view = Some(current_view);
+        crate::relay_runtime::send_nudge(&mut self.relay_tx, &leader);
+        tracing::debug!(
+            target: "ducktape::consensus",
+            node = %self.label,
+            view = current_view,
+            "leader nudge sent"
+        );
+    }
+
+    /// a peer validator holds real parked proposals and (by its local
+    /// estimate) we lead the current view: close it NOW by beating the idle
+    /// nop early, so rotation reaches the parked work at network speed
+    /// instead of the 1s idle beat. gated exactly like the beat — quiet chain
+    /// only — so a nudge can never pile a nop behind real work or an
+    /// in-flight batch, and repeated nudges self-limit (the parked nop keeps
+    /// the orderer non-idle until it finalizes). only a CURRENT validator's
+    /// transport identity is honored: the nudge is harmless by construction,
+    /// but nobody else gets to tick our view clock.
+    pub(super) async fn on_leader_nudge(&mut self, peer: &ed25519::PublicKey) {
+        let from_current_validator = self.orchestrator.current_members().contains(peer);
+        if !from_current_validator {
+            return;
+        }
+        let ops_pending = self.node.pending_batch_len() > 0;
+        let orderer_idle = self.node.orderer().pending_len() == 0;
+        let beat_now =
+            heartbeat_action(self.heartbeat_disabled, ops_pending, true, orderer_idle)
+                == HeartbeatAction::BeatNop;
+        if beat_now {
+            self.beat_nop(self.context.current()).await;
+        }
+    }
+
+    /// submit one heartbeat nop, then flush it as the idle beat's block.
+    async fn beat_nop(&mut self, now: std::time::SystemTime) {
         let Self {
-            context,
             node,
             next_seq,
             signer,
             label,
-            last_flush,
-            heartbeat_disabled,
             ..
         } = self;
-        let now = context.current();
-        let flush_due = now.duration_since(*last_flush).unwrap_or_default() >= consensus::BLOCK_TIME;
-        if !*heartbeat_disabled && flush_due {
-            *last_flush = now;
-            if node.pending_batch_len() == 0 && node.orderer().pending_len() == 0 {
-                let seq = *next_seq;
-                *next_seq += 1;
-                if let Err(e) = node
-                    .submit(
-                        signer,
-                        seq,
-                        Msg {
-                            target: NOP_TARGET.into(),
-                            payload: Vec::new(),
-                        },
-                    )
-                    .await
-                {
-                    tracing::debug!(
-                        target: "ducktape::submit",
-                        node = %label,
-                        error = %e,
-                        "heartbeat nop submit failed"
-                    );
-                }
-            }
-            // flush the window: no-op when `pending_batch` is empty
-            // (idle with a batch already in flight — wait for it).
-            if let Err(e) = node.flush_batch().await {
+        let seq = *next_seq;
+        *next_seq += 1;
+        if let Err(e) = node
+            .submit(
+                signer,
+                seq,
+                Msg {
+                    target: NOP_TARGET.into(),
+                    payload: Vec::new(),
+                },
+            )
+            .await
+        {
+            tracing::debug!(
+                target: "ducktape::submit",
+                node = %label,
+                error = %e,
+                "heartbeat nop submit failed"
+            );
+        }
+        self.flush_window(now).await;
+    }
+
+    /// restart the beat grid, then flush the window: no-op when
+    /// `pending_batch` is empty (idle with a batch already in flight — wait
+    /// for it). returns the number of batches proposed (0 on a no-op or a
+    /// failed flush).
+    async fn flush_window(&mut self, now: std::time::SystemTime) -> usize {
+        self.last_flush = now;
+        match self.node.flush_batch().await {
+            Ok(batches) => batches,
+            Err(e) => {
                 tracing::debug!(
                     target: "ducktape::submit",
-                    node = %label,
+                    node = %self.label,
                     error = %e,
                     "batch flush failed"
                 );
+                0
             }
         }
     }
@@ -996,55 +1205,6 @@ impl ValidatorRuntime<'_> {
                         node = %label,
                         error = %e,
                         "code readiness submit failed; retrying"
-                    );
-                }
-            }
-        }
-    }
-
-    // CAPABILITY ANNOUNCE: a current member whose discovered
-    // provider set differs from the committed registry
-    // self-submits ONE declarative `Announce`. member-gated (the
-    // module rejects non-members) and idempotent (committed-read
-    // + local latch). inert on a host with no executor CLIs, and
-    // suppressed entirely under `announce_capabilities = false`
-    // (the accept-lane-only provider: this node still executes
-    // what it can, but only by claiming unassigned announcements
-    // — it never enters a tag's rendezvous pool).
-    async fn pump_capability_announce(&mut self) {
-        let Self {
-            node,
-            orchestrator,
-            next_seq,
-            signer,
-            label,
-            announce_capabilities,
-            announcer,
-            ..
-        } = self;
-        if *announce_capabilities
-            && orchestrator
-                .current_members()
-                .contains(&signer.public_key())
-            && let Some(msg) = announcer.maybe_announce(node.host()).await
-        {
-            let seq = *next_seq;
-            *next_seq += 1;
-            match node.submit(signer, seq, msg).await {
-                Ok(_) => tracing::info!(
-                    target: "ducktape::modules",
-                    node = %label,
-                    capabilities = ?announcer.capabilities,
-                    "capabilities announced"
-                ),
-                Err(e) => {
-                    // un-latch so a transient submit failure retries.
-                    announcer.announced = None;
-                    tracing::debug!(
-                        target: "ducktape::modules",
-                        node = %label,
-                        error = %e,
-                        "capability announce submit failed; retrying"
                     );
                 }
             }
@@ -1157,6 +1317,282 @@ impl ValidatorRuntime<'_> {
                     node = %label,
                     "dispatch delivery nudge submitted"
                 );
+            }
+        }
+    }
+}
+
+/// what one heartbeat beat does — the pure decision behind
+/// [`ValidatorRuntime::pump_heartbeat`], separate so the idle cadence stays
+/// unit-testable without a runtime. the BUSY path is [`eager_flush_due`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatAction {
+    /// the beat is not due (or the heartbeat is disabled).
+    Idle,
+    /// the beat is due but the chain is not quiet — ops are pending (the
+    /// eager path owns them) or a batch is still in flight. restart the beat
+    /// grid without flushing, so the nop returns one full `BLOCK_TIME` after
+    /// the chain goes quiet.
+    Restamp,
+    /// the beat is due on a quiet chain: submit one nop, then flush it.
+    BeatNop,
+}
+
+fn heartbeat_action(
+    disabled: bool,
+    ops_pending: bool,
+    heartbeat_due: bool,
+    orderer_idle: bool,
+) -> HeartbeatAction {
+    if disabled {
+        return HeartbeatAction::Idle;
+    }
+    if !heartbeat_due {
+        return HeartbeatAction::Idle;
+    }
+    let chain_quiet = !ops_pending && orderer_idle;
+    if chain_quiet {
+        HeartbeatAction::BeatNop
+    } else {
+        HeartbeatAction::Restamp
+    }
+}
+
+/// the pure decision behind [`ValidatorRuntime::pump_eager_flush`]: flush the
+/// moment real ops are pending with nothing of ours in flight — event-driven,
+/// no interval. the in-flight gate (`orderer_idle`) is what makes blocks
+/// aggregate under load instead of reviving the 1-tx-1-block regime.
+fn eager_flush_due(disabled: bool, ops_pending: bool, orderer_idle: bool) -> bool {
+    !disabled && ops_pending && orderer_idle
+}
+
+/// the round-robin leader for `view`, MIRRORING the engine's elector
+/// (`RoundRobin::<Sha256>::default()` — UNSHUFFLED, so the permutation is the
+/// identity over the sorted participant set and the index is
+/// `(epoch + view) % n`). a drifted mirror only mis-aims a nudge — the nudged
+/// peer beats at most one harmless nop — so consensus never depends on this
+/// staying in sync with the engine.
+fn round_robin_leader(
+    epoch: u64,
+    view: u64,
+    participants: &std::collections::BTreeSet<ed25519::PublicKey>,
+) -> Option<&ed25519::PublicKey> {
+    if participants.is_empty() {
+        return None;
+    }
+    let index = epoch.wrapping_add(view) as usize % participants.len();
+    participants.iter().nth(index)
+}
+
+/// the committed dispatch mailbox's undelivered-result count — the nudge
+/// pump's read. `0` when the module is absent or the mailbox is empty.
+pub(crate) async fn dispatch_pending_deliveries(host: &host::Host) -> u64 {
+    use dispatch::{DispatchQuery, DispatchReply, decode_reply, encode_query};
+    let Ok(reply) = host
+        .query("dispatch", &encode_query(&DispatchQuery::PendingDeliveries))
+        .await
+    else {
+        return 0;
+    };
+    match decode_reply(&reply) {
+        Ok(DispatchReply::PendingDeliveries(n)) => n,
+        _ => 0,
+    }
+}
+
+/// the committed saga ledger's earliest pending lease-expiry/deadline — the
+/// crank pump's read. `None` when the module is absent or nothing pending
+/// carries one.
+pub(crate) async fn saga_next_expiry(host: &host::Host) -> Option<u64> {
+    use saga::{SagaQuery, SagaReply, decode_reply, encode_query};
+    let reply = host
+        .query("saga", &encode_query(&SagaQuery::NextExpiry))
+        .await
+        .ok()?;
+    match decode_reply(&reply).ok()? {
+        SagaReply::NextExpiry(v) => v,
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod block_cadence_tests {
+    use super::{HeartbeatAction, eager_flush_due, heartbeat_action};
+
+    #[test]
+    fn pending_ops_flush_immediately_with_nothing_in_flight() {
+        // the busy path is event-driven: no beat, no tick, no interval —
+        // pending ops with an idle orderer flush now.
+        assert!(eager_flush_due(false, true, true));
+    }
+
+    #[test]
+    fn in_flight_batch_aggregates_instead_of_flushing() {
+        // one batch in flight at a time: ops arriving during a consensus
+        // round pile into the NEXT block — natural aggregation, never
+        // 1-tx-1-block.
+        assert!(!eager_flush_due(false, true, false));
+    }
+
+    #[test]
+    fn empty_window_never_eager_flushes() {
+        assert!(!eager_flush_due(false, false, true));
+        assert!(!eager_flush_due(false, false, false));
+    }
+
+    #[test]
+    fn idle_beat_waits_for_block_time() {
+        assert_eq!(
+            heartbeat_action(false, false, false, true),
+            HeartbeatAction::Idle
+        );
+        assert_eq!(
+            heartbeat_action(false, false, true, true),
+            HeartbeatAction::BeatNop
+        );
+    }
+
+    #[test]
+    fn due_beat_on_a_non_quiet_chain_restamps_without_a_nop() {
+        // ops pending (the eager path owns them) or a batch in flight: no
+        // nop — restart the grid so the nop returns one full BLOCK_TIME
+        // after the chain goes quiet.
+        assert_eq!(
+            heartbeat_action(false, true, true, true),
+            HeartbeatAction::Restamp
+        );
+        assert_eq!(
+            heartbeat_action(false, false, true, false),
+            HeartbeatAction::Restamp
+        );
+        assert_eq!(
+            heartbeat_action(false, true, true, false),
+            HeartbeatAction::Restamp
+        );
+    }
+
+    #[test]
+    fn round_robin_leader_mirrors_the_unshuffled_elector() {
+        use commonware_cryptography::{Signer as _, ed25519};
+        // three sorted participants: the leader index is (epoch + view) % 3
+        // over the SORTED set — the identity permutation the engine's
+        // unshuffled RoundRobin elector uses.
+        let keys: std::collections::BTreeSet<ed25519::PublicKey> = (0..3u64)
+            .map(|seed| ed25519::PrivateKey::from_seed(seed).public_key())
+            .collect();
+        let sorted: Vec<&ed25519::PublicKey> = keys.iter().collect();
+        for view in 0..7u64 {
+            let expected = sorted[(5u64.wrapping_add(view)) as usize % 3];
+            assert_eq!(
+                super::round_robin_leader(5, view, &keys),
+                Some(expected),
+                "view {view}"
+            );
+        }
+        // rotation advances by exactly one participant per view.
+        assert_ne!(
+            super::round_robin_leader(5, 1, &keys),
+            super::round_robin_leader(5, 2, &keys)
+        );
+    }
+
+    /// THE BLOCK COUNT ALONE MUST NO LONGER AUTHORIZE A CHECKPOINT. This is the
+    /// assertion that fails if the cooldown is dropped from the decision —
+    /// testing the arithmetic of `cooldown_until` on its own would not, since
+    /// nothing would be consulting it.
+    #[test]
+    fn a_sealed_block_count_alone_does_not_authorize_an_expensive_checkpoint() {
+        let finished = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let owed = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
+
+        // 32 blocks have sealed — the ENTIRE old trigger — but only ~30s of
+        // chain has passed, which is exactly the shape that had the node
+        // spending two thirds of its life inside the branch.
+        assert!(
+            !crate::drain_actions::checkpoint_due(
+                32,
+                32,
+                finished + std::time::Duration::from_secs(30),
+                owed
+            ),
+            "a 60s checkpoint must not be re-authorized 30s later just because 32 blocks sealed"
+        );
+        // ...and it does fire once the cost has been paid back.
+        assert!(crate::drain_actions::checkpoint_due(
+            32,
+            32,
+            finished + std::time::Duration::from_secs(420),
+            owed
+        ));
+        // A CHEAP CHECKPOINT IS NEVER DELAYED: 25ms owes 175ms of quiet, long
+        // gone by the time 32 blocks seal, so the configured cadence governs.
+        let cheap = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_millis(25));
+        assert!(crate::drain_actions::checkpoint_due(
+            32,
+            32,
+            finished + std::time::Duration::from_secs(30),
+            cheap
+        ));
+        // The cooldown never SUBSTITUTES for the cadence: quiet is necessary,
+        // not sufficient.
+        assert!(!crate::drain_actions::checkpoint_due(
+            31,
+            32,
+            finished + std::time::Duration::from_secs(420),
+            owed
+        ));
+    }
+
+    /// THE COOLDOWN IS PROPORTIONAL TO THE COST, which is the whole point: a
+    /// cheap checkpoint keeps the configured block cadence, an expensive one
+    /// backs itself off without anyone tuning a constant per workspace.
+    #[test]
+    fn a_checkpoint_holds_the_next_one_off_by_what_it_cost() {
+        let finished = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        // the demo workspace's pre-#1023 checkpoint: 60s of loop occupancy
+        // every 32 blocks (~30s of chain), i.e. it never stopped.
+        let expensive = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
+        assert_eq!(
+            expensive,
+            finished + std::time::Duration::from_secs(420),
+            "a 60s checkpoint must buy 7 minutes of quiet — 1/8 duty"
+        );
+        // post-#1023: 25ms. The hold is 175ms, far under the 32-block cadence,
+        // so the configured cadence still governs and this guard is invisible.
+        let cheap = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_millis(25));
+        assert_eq!(cheap, finished + std::time::Duration::from_millis(175));
+    }
+
+    /// A NODE THAT STOPS CHECKPOINTING IS WORSE OFF THAN ONE THAT STUTTERS —
+    /// it cannot recover quickly or admit a joiner. So the overflow direction
+    /// is "no cooldown", never "never again".
+    #[test]
+    fn an_absurd_cost_does_not_disable_checkpointing_forever() {
+        let finished = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        assert_eq!(
+            crate::drain_actions::cooldown_until(finished, std::time::Duration::MAX),
+            finished,
+            "an unrepresentable cooldown must collapse to none, not to forever"
+        );
+    }
+
+    #[test]
+    fn no_participants_elects_no_leader() {
+        let empty = std::collections::BTreeSet::new();
+        assert_eq!(super::round_robin_leader(1, 1, &empty), None);
+    }
+
+    #[test]
+    fn disabled_heartbeat_beats_and_flushes_nothing() {
+        for ops_pending in [false, true] {
+            for heartbeat_due in [false, true] {
+                for orderer_idle in [false, true] {
+                    assert_eq!(
+                        heartbeat_action(true, ops_pending, heartbeat_due, orderer_idle),
+                        HeartbeatAction::Idle
+                    );
+                    assert!(!eager_flush_due(true, ops_pending, orderer_idle));
+                }
             }
         }
     }

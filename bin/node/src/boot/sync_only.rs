@@ -9,7 +9,7 @@ use statesync::fetch_manifest;
 use statesync::p2p::P2pSyncClient;
 
 use crate::constants::*;
-use crate::host_state::{NetworkBindings, SyncSubstrates, sync_all_modules};
+use crate::host_state::{SyncSubstrates, sync_all_modules};
 use crate::util::hex;
 
 /// `run_node`'s terminal `--sync-only` branch (phase P4): registers every
@@ -34,7 +34,6 @@ pub(crate) async fn run(
     metrics: noded::NodeMetrics,
     storage_for_sync: std::path::PathBuf,
     namespace: Vec<u8>,
-    identity_chain_id: String,
     blobs: noded::blobs::BlobHandle,
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
 ) {
@@ -65,9 +64,9 @@ pub(crate) async fn run(
         for ch in [vote, cert, res, payload, fetch] {
             let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
             let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
-            context.child(label).spawn(move |_ctx| async move {
-                while rx.recv().await.is_ok() {}
-            });
+            context
+                .child(label)
+                .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
         }
     }
     let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
@@ -123,6 +122,8 @@ pub(crate) async fn run(
         None,
         sync_requester,
         sync_proof,
+        // sync-only never promotes: the lane is the dispatch task's for life.
+        None,
     );
 
     // the mesh takes a moment to connect, and the server only serves
@@ -153,24 +154,9 @@ pub(crate) async fn run(
         target: "ducktape::statesync",
         node = %label,
         height = manifest.height,
-        app_hash = %hex(&manifest.app_hash),
+        root_hash = %hex(&manifest.root_hash),
         "manifest ready"
     );
-
-    if let Err(e) = crate::host_state::preflight_sync_schema(&manifest) {
-        metrics.record_sync_failure(e.to_string());
-        metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
-        tracing::error!(
-            target: "ducktape::statesync",
-            event = "node_sync_refused",
-            role = "sync_only",
-            node = %label,
-            stage = "schema_preflight",
-            error = %e,
-            "SYNC REFUSED: {e}"
-        );
-        std::process::exit(1);
-    }
 
     // rebuild EVERY module in the manifest (a REAL joiner owns its
     // disk, so every store opens under its canonical module id) and
@@ -181,10 +167,6 @@ pub(crate) async fn run(
         &context,
         &client,
         &manifest,
-        NetworkBindings {
-            invite: &namespace,
-            identity_chain_id: &identity_chain_id,
-        },
         SyncSubstrates {
             forge_repo: &forge_repo,
             duckfs_dir: &duckfs_dir,
@@ -208,7 +190,7 @@ pub(crate) async fn run(
             );
             tracing::info!(
                 target: "ducktape::statesync",
-                "node={label} synced app_hash={}", hex(&host.app_hash())
+                "node={label} synced root_hash={}", hex(&host.root_hash())
             );
         }
         Err(e) => {

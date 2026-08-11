@@ -129,14 +129,14 @@ module reports `unavailable` cleanly otherwise (no fake success).
 
 1. **Founding onboarding (signed build):** mnemonic ceremony unchanged
    (consensus rule: only Ed25519 can found) → account created → immediately
-   offer "패스키 등록" (add-member, WebauthnP256) → mint first session →
+   offer "Register passkey" (add-member, WebauthnP256) → mint first session →
    founding vault goes cold. Skipping passkey leaves today's behavior.
 2. **Unlock:** session key present + unexpired → open, no prompt. Expired or
    absent → passkey assertion sheet → `GrantSession` → open. The session key
    sits in the login keychain (ThisDeviceOnly, no presence ACL) — losing it
    is harmless by construction (scoped, expiring, revocable).
 3. **New Mac:** workspace invite (existing join machinery) for transport →
-   "패스키로 이 맥 연결" → assertion → `GrantSession` → working. No mnemonic,
+   "Connect this Mac with a passkey" → assertion → `GrantSession` → working. No mnemonic,
    no vault, no add-member.
 4. **Key management (settings):** Keybase-style list of member keys —
    kind, label, added-at; add (passkey / paste hardware pubkey+proof),

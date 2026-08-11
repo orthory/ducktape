@@ -519,8 +519,7 @@ async fn established(resolver: &reachability::NatResolver) -> std::net::SocketAd
     let mut status = resolver.status().expect("resolver has coordinators");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let reachability::RendezvousStatus::Ready { reflexive } =
-                *status.borrow_and_update()
+            if let reachability::RendezvousStatus::Ready { reflexive } = *status.borrow_and_update()
             {
                 return reflexive;
             }
@@ -539,15 +538,17 @@ async fn nat_resolver_punches_over_loopback() {
     let coord_addr = coord_sock.local_addr().unwrap();
     tokio::spawn(nat_traversal::client::run_coordinator(
         coord_sock,
-        nat_traversal::AuthPolicy::Open { require_pop: false },
+        nat_traversal::AuthPolicy::Public,
     ));
 
-    let key_a = NodeKey([0xaa; 32]);
-    let key_b = NodeKey([0xbb; 32]);
-    let mut a = reachability::NatResolver::bind(key_a, vec![coord_addr], None)
+    let signer_a = PrivateKey::from_seed(490);
+    let signer_b = PrivateKey::from_seed(491);
+    let key_a = node_key_of(&signer_a.public_key());
+    let key_b = node_key_of(&signer_b.public_key());
+    let mut a = reachability::NatResolver::bind(key_a, vec![coord_addr], (signer_a, None))
         .await
         .unwrap();
-    let mut b = reachability::NatResolver::bind(key_b, vec![coord_addr], None)
+    let mut b = reachability::NatResolver::bind(key_b, vec![coord_addr], (signer_b, None))
         .await
         .unwrap();
     established(&a).await;
@@ -577,10 +578,12 @@ async fn resolver_datagram_roundtrip_over_loopback() {
     let coord_addr = coord_sock.local_addr().unwrap();
     tokio::spawn(nat_traversal::client::run_coordinator(
         coord_sock,
-        nat_traversal::AuthPolicy::Open { require_pop: false },
+        nat_traversal::AuthPolicy::Public,
     ));
 
-    let client = nat_traversal::NatClient::bind_multi(NodeKey([0xcc; 32]), vec![coord_addr])
+    let signer = PrivateKey::from_seed(492);
+    let key = node_key_of(&signer.public_key());
+    let client = nat_traversal::NatClient::bind(key, vec![coord_addr], signer, None)
         .await
         .unwrap();
     let (sink_tx, mut sink_rx) = mpsc::channel(8);
@@ -657,10 +660,9 @@ async fn private_coordinator_admits_authenticated_bind() {
 
     // a genesis member: admitted by membership, no cap needed.
     let member_key = node_key_of(&member.public_key());
-    let m =
-        reachability::NatResolver::bind(member_key, vec![coord_addr], Some((member.clone(), None)))
-            .await
-            .expect("a genesis member's authenticated bind is admitted");
+    let m = reachability::NatResolver::bind(member_key, vec![coord_addr], (member.clone(), None))
+        .await
+        .expect("a genesis member's authenticated bind is admitted");
     established(&m).await;
     assert!(
         m.reflexive().is_some(),
@@ -670,13 +672,10 @@ async fn private_coordinator_admits_authenticated_bind() {
     // a non-genesis joiner carrying a genesis-minted cap: admitted by the cap.
     let joiner_key = node_key_of(&joiner.public_key());
     let cap = nat_traversal::mint_coord_cap(&g, joiner_key, nat_traversal::now_secs() + 3600);
-    let j = reachability::NatResolver::bind(
-        joiner_key,
-        vec![coord_addr],
-        Some((joiner.clone(), Some(cap))),
-    )
-    .await
-    .expect("a capped joiner's authenticated bind is admitted");
+    let j =
+        reachability::NatResolver::bind(joiner_key, vec![coord_addr], (joiner.clone(), Some(cap)))
+            .await
+            .expect("a capped joiner's authenticated bind is admitted");
     established(&j).await;
     assert!(
         j.reflexive().is_some(),
@@ -710,21 +709,17 @@ async fn private_coordinator_denies_uncredentialed_bind() {
     // genesis member: every request, BindRequest included, is dropped by the
     // admission gate, so establishment can never discover a reflexive.
     let outsider_key = node_key_of(&outsider.public_key());
-    let denied = reachability::NatResolver::bind(
-        outsider_key,
-        vec![coord_addr],
-        Some((outsider.clone(), None)),
-    )
-    .await
-    .expect("the local socket binds; admission shows up as never-Ready");
+    let denied =
+        reachability::NatResolver::bind(outsider_key, vec![coord_addr], (outsider.clone(), None))
+            .await
+            .expect("the local socket binds; admission shows up as never-Ready");
 
     // control: a credentialed member establishes against the SAME coordinator
     // while the outsider is still being refused — the transport works.
     let member_key = node_key_of(&member.public_key());
-    let ok =
-        reachability::NatResolver::bind(member_key, vec![coord_addr], Some((member.clone(), None)))
-            .await
-            .expect("a genesis member's socket binds");
+    let ok = reachability::NatResolver::bind(member_key, vec![coord_addr], (member.clone(), None))
+        .await
+        .expect("a genesis member's socket binds");
     established(&ok).await;
 
     // one full discovery attempt (3s) has certainly concluded by now — the
@@ -764,14 +759,12 @@ async fn private_coordinator_cross_peer_punch() {
     let a_cap = nat_traversal::mint_coord_cap(&g, a_key, nat_traversal::now_secs() + 3600);
     let b_cap = nat_traversal::mint_coord_cap(&g, b_key, nat_traversal::now_secs() + 3600);
 
-    let mut a =
-        reachability::NatResolver::bind(a_key, vec![coord_addr], Some((a_signer, Some(a_cap))))
-            .await
-            .expect("A's authenticated bind is admitted");
-    let mut b =
-        reachability::NatResolver::bind(b_key, vec![coord_addr], Some((b_signer, Some(b_cap))))
-            .await
-            .expect("B's authenticated bind is admitted");
+    let mut a = reachability::NatResolver::bind(a_key, vec![coord_addr], (a_signer, Some(a_cap)))
+        .await
+        .expect("A's authenticated bind is admitted");
+    let mut b = reachability::NatResolver::bind(b_key, vec![coord_addr], (b_signer, Some(b_cap)))
+        .await
+        .expect("B's authenticated bind is admitted");
     established(&a).await;
     established(&b).await;
     assert!(a.reflexive().is_some() && b.reflexive().is_some());
@@ -791,7 +784,9 @@ async fn private_coordinator_cross_peer_punch() {
 /// An empty coordinator set degrades to pass-through resolution.
 #[tokio::test]
 async fn nat_resolver_without_coordinators_is_pass_through() {
-    let mut r = reachability::NatResolver::bind(NodeKey([1; 32]), vec![], None)
+    let signer = PrivateKey::from_seed(493);
+    let key = node_key_of(&signer.public_key());
+    let mut r = reachability::NatResolver::bind(key, vec![], (signer, None))
         .await
         .unwrap();
     assert_eq!(r.reflexive(), None);
@@ -1226,6 +1221,114 @@ async fn cold_restart_filters_departed_members() {
                     fake.applied[0].peers[0].allowed_ips,
                     vec![ula(other.identity)]
                 );
+            }
+        })
+        .await;
+}
+
+/// The parked-resident restart gap: a solo member (the founder shape) whose
+/// only WireGuard peer is an admitted-but-parked standby reboots. The
+/// standby cannot re-deliver its record — every transport it has rides the
+/// overlay the reboot tore down — so the member's restore must reinstall
+/// the standby from disk, or the joiner is stranded forever initiating
+/// handshakes at a peer that no longer knows its key.
+#[tokio::test]
+async fn solo_member_cold_restart_reinstalls_the_parked_standby() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // life 1: the member applies its solo epoch, then the standby's record
+    // pre-warms its tunnel — the accepted record must reach disk (a solo
+    // member has no other persist trigger: no peer adverts, no plans).
+    {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2], vec![]);
+                retarget_all(&nodes, &[0], &[1], 1, 10).await;
+                spawn_nudgers(&local, &nodes);
+                await_prewarmed(&mut collected, &[0], &[(0, 1), (1, 1)], 1).await;
+            })
+            .await;
+    }
+    assert!(
+        dir.path().join("mesh-0.json").exists(),
+        "the member persisted the standby's accepted record"
+    );
+
+    // life 2: same directory, ZERO transport — the founder reboot. The
+    // member's restore alone must put the standby's key back on the
+    // interface (endpoint verbatim from the persisted record: the standby
+    // initiates and roams, so the endpoint is a first target, not a
+    // requirement).
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (nodes, mut collected) =
+                spawn_mesh_gated(&local, dir.path(), &[1, 2], vec![], links_up.clone());
+            retarget_all(&nodes, &[0], &[1], 1, 10).await;
+
+            let restored = await_restored(&mut collected, &[0, 1]).await;
+            assert_eq!(restored[&0], (1, 1), "member: the standby from disk");
+            assert_eq!(restored[&1], (1, 1), "standby: the member from disk");
+            let (standby_keys, _) =
+                WireGuardKeypair::load_or_generate(&dir.path().join("wg-1.key")).unwrap();
+            let config = latest_config(&nodes[0]);
+            let entry = config
+                .peers
+                .iter()
+                .find(|p| p.allowed_ips == vec![ula(nodes[1].identity)])
+                .expect("member: the parked standby is back on the interface");
+            assert_eq!(entry.public_key.as_array(), standby_keys.public_key().0);
+            assert_eq!(
+                entry.endpoint,
+                Some("8.8.8.20:51820".parse().unwrap()),
+                "member: the standby's persisted endpoint as first target"
+            );
+
+            // links back: the standby's ongoing re-offer supersedes the disk
+            // entry live — the full heal the reboot interrupted.
+            spawn_nudgers(&local, &nodes);
+            links_up.store(true, std::sync::atomic::Ordering::Relaxed);
+            await_prewarmed(&mut collected, &[], &[(0, 1)], 1).await;
+        })
+        .await;
+}
+
+/// A boot whose resident set no longer lists a persisted standby restores
+/// only the members: the departed standby's tunnel is dead weight and is
+/// never applied — the exact gate the member restore applies to adverts.
+#[tokio::test]
+async fn cold_restart_filters_departed_standbys() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+                retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
+                spawn_nudgers(&local, &nodes);
+                await_prewarmed(&mut collected, &[0, 1], &[(0, 1), (1, 1), (2, 2)], 1).await;
+            })
+            .await;
+    }
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (nodes, mut collected) =
+                spawn_mesh_gated(&local, dir.path(), &[1, 2, 3], vec![], links_up);
+            // the resumed epoch dropped the standby.
+            retarget_all(&nodes, &[0, 1], &[], 2, 20).await;
+
+            let restored = await_restored(&mut collected, &[0, 1]).await;
+            for i in 0..2 {
+                assert_eq!(restored[&i], (1, 1), "node {i}: only the member peer");
+                let config = latest_config(&nodes[i]);
+                assert_eq!(config.peers.len(), 1, "node {i}: no departed-standby entry");
+                assert_eq!(config.peers[0].allowed_ips, vec![ula(nodes[1 - i].identity)]);
             }
         })
         .await;

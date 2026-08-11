@@ -27,7 +27,7 @@ by default a node serves no agent work at all.
 `capabilities: Vec<String>`. Empty map = node offers no metered capacity
 (tags-only announce stays legal — a direct-spawn node).
 
-- Snapshot/root encoding extends to include the resources map → app-hash
+- Snapshot/root encoding extends to include the resources map → root-hash
   moves: **flag day** (routine on dev).
 - `CapabilityReply::Node`/`All` expose resources; `Providers` unchanged.
 - Same validation posture: bounded map size, bounded key length, key charset

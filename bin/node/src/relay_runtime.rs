@@ -165,32 +165,10 @@ impl ResidentRelay {
         Ok(frame_id)
     }
 
-    /// Resident-owned pumps have no caller hold and never reference a forge
-    /// pack. Keep that contract explicit instead of silently dropping a bulk
-    /// transfer's acknowledgement state.
-    pub(crate) fn submit_unheld<S>(
-        &mut self,
-        signer: &ed25519::PrivateKey,
-        targets: &[ed25519::PublicKey],
-        relay_tx: &mut S,
-        target: String,
-        payload: Vec<u8>,
-    ) -> Result<node::FrameId, String>
-    where
-        S: P2pSender<PublicKey = ed25519::PublicKey>,
-    {
-        let (frame_id, frame, custodian) = self.signed_frame(signer, targets, target, payload)?;
-        if relay::required_blob_digest(&frame).is_some() {
-            return Err("an unheld resident pump cannot submit a forge pack".into());
-        }
-        if !send(relay_tx, &custodian, relay::RelayMsg::Submit { frame }) {
-            return Err("validator unreachable - retry shortly".into());
-        }
-        Ok(frame_id)
-    }
-
     /// Handle validator acknowledgements and final outcomes. An unclaimed
-    /// final reply belongs to a resident-owned pump and is returned to main.
+    /// final reply belongs to nobody now that the resident announce pump is
+    /// gone; it is still returned, and still routed for its release side
+    /// effect.
     pub(crate) fn on_message<S>(
         &mut self,
         peer: ed25519::PublicKey,
@@ -295,7 +273,7 @@ impl ResidentRelay {
         self.seq += 1;
         std::fs::write(&self.seq_file, self.seq.to_string())
             .map_err(|e| format!("cannot persist the submit seq: {e}"))?;
-        let frame = node::encode_frame(signer, self.seq, &Msg { target, payload }, None);
+        let frame = node::encode_frame(signer, self.seq, &Msg { target, payload });
         let frame_id = node::frame_id(&frame);
         Ok((frame_id, frame, custodian))
     }
@@ -322,8 +300,8 @@ fn resolve_resident_hold(hold: ResidentHold, outcome: relay::RelayOutcome) {
         | (ResidentHold::Rpc(tx), relay::RelayOutcome::Refused { detail }) => {
             let _ = tx.send(RpcReply::err(detail));
         }
-        (ResidentHold::Http(tx), relay::RelayOutcome::Applied { height, app_hash }) => {
-            let _ = tx.send(Ok(noded::BlockSummary { height, app_hash }));
+        (ResidentHold::Http(tx), relay::RelayOutcome::Applied { height, root_hash }) => {
+            let _ = tx.send(Ok(noded::BlockSummary { height, root_hash }));
         }
         (ResidentHold::Http(tx), relay::RelayOutcome::Rejected { detail })
         | (ResidentHold::Http(tx), relay::RelayOutcome::Refused { detail }) => {
@@ -588,6 +566,9 @@ impl ValidatorRelay {
                 })
             }
             relay::RelayMsg::Reply { .. } => None,
+            // dispatched in `on_relay` BEFORE the protocol machine (it carries
+            // no frame and touches no relay state) — never reaches here.
+            relay::RelayMsg::Nudge => None,
         }
     }
 
@@ -712,6 +693,15 @@ fn send_blob_result<S>(
     );
 }
 
+/// fire a leader nudge at `peer` — best-effort, no reply expected: a lost or
+/// mis-aimed nudge costs at most one idle beat of latency, never correctness.
+pub(crate) fn send_nudge<S>(relay_tx: &mut S, peer: &ed25519::PublicKey)
+where
+    S: P2pSender<PublicKey = ed25519::PublicKey>,
+{
+    let _ = send(relay_tx, peer, relay::RelayMsg::Nudge);
+}
+
 fn send<S>(relay_tx: &mut S, peer: &ed25519::PublicKey, msg: relay::RelayMsg) -> bool
 where
     S: P2pSender<PublicKey = ed25519::PublicKey>,
@@ -759,8 +749,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay-submit-seq");
         std::fs::write(&path, "41").unwrap();
-        let relay =
-            ResidentRelay::new(path.clone(), std::sync::Arc::new(blobstore::BlobHandle::default()));
+        let relay = ResidentRelay::new(
+            path.clone(),
+            std::sync::Arc::new(blobstore::BlobHandle::default()),
+        );
         assert_eq!(relay.seq, 41);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "41");
     }

@@ -1,12 +1,11 @@
-//! the adapter-port equivalence proof for the automations cutover: the
-//! `automations` guest component (the NATIVE `automations` crate compiled to
-//! wasm behind `guest-adapter`) and the native `Automations` module answer
-//! the SAME op sequence with IDENTICAL query replies, and their roots move in
-//! lockstep. the roots THEMSELVES differ — the port persists the native
-//! canonical snapshot as one host-KV value, a declared state-schema break
-//! (revision 2) — and this proof pins that difference from genesis
-//! (automations' empty encoding carries TWO zero counts, so unlike saga/agent
-//! its genesis root already differs from the empty host-KV store's).
+//! the STORE-BACKED cutover-continuity proof for automations: the
+//! `automations` guest component over `WasmModule::with_store(QmdbStore)` and
+//! the native `Automations` over the same store shape are ROOT-CONTINUOUS —
+//! the same op sequence commits the IDENTICAL qmdb merkle root after every
+//! block (both roots ARE the store's root; qmdb's batch canonicalizes
+//! mutations by hashed key, so the native logical-key commit order and the
+//! wasm hashed-key drain order produce the same op log), including the
+//! byte-identical NO-OP blocks the idempotent SetEnabled relies on.
 //!
 //! automations is a chat-HOOK SUBSCRIBER: both hosts carry the REAL native
 //! siblings under the production ids (`bin/node/src/host_state.rs` —
@@ -21,13 +20,13 @@
 //! a RunRecord instead of aborting the posting user's block.
 
 use automations::{
-    Action, Automations, AutomationsMsg, AutomationsQuery, AutomationsReply, Trigger,
-    decode_reply, encode_msg, encode_query, MAX_FILTER_BYTES, MAX_ID_BYTES, MAX_TEMPLATE_BYTES,
+    Action, Automations, AutomationsMsg, AutomationsQuery, AutomationsReply, MAX_FILTER_BYTES,
+    MAX_ID_BYTES, MAX_TEMPLATE_BYTES, Trigger, decode_reply, encode_msg, encode_query,
 };
 use chat::{Block, Chat, ChatMsg, PostPolicy, encode_msg as chat_encode_msg};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use inbox::{Inbox, InboxQuery, encode_query as inbox_encode_query};
+use inbox::Inbox;
 use sdk::{Error, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 use tasks::{
@@ -40,17 +39,16 @@ use wasm_host::WasmModule;
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const AUTOMATIONS_WASM: &[u8] = include_bytes!("fixtures/automations.component.wasm");
 
-fn wasm_automations() -> WasmModule {
-    WasmModule::from_bytes("automations", AUTOMATIONS_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 2 of the
-        // automations canonical state.
-        .with_state_schema_revision(2)
+fn wasm_automations(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    // NOTE: no sibling wiring here — the guest compiles the exact production
+    // builder chain (`Automations::new(.., "chat", "tasks", "inbox")`) in;
+    // only the store arrives host-constructed.
+    WasmModule::with_store("automations", AUTOMATIONS_WASM, store).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
-fn native_automations() -> Automations {
-    Automations::new("automations", "chat", "tasks", "inbox")
+fn native_automations(store: Box<dyn sdk::MerkleStore>) -> Automations {
+    Automations::new("automations", store, "chat", "tasks", "inbox")
 }
 
 /// a 32-byte submitter key (the ordered lane hands modules verified ed25519
@@ -68,20 +66,22 @@ async fn siblings(
     let store = QmdbStore::init(context.child(label), "chat").await;
     vec![
         Box::new(Chat::new("chat", Box::new(store))),
-        Box::new(Tasks::new("tasks")),
-        Box::new(Inbox::new("inbox")),
+        Box::new(Tasks::new("tasks", Box::new(sdk_testkit::MemStore::new()))),
+        Box::new(Inbox::new("inbox", Box::new(sdk_testkit::MemStore::new()))),
     ]
 }
 
 async fn native_host(context: &deterministic::Context) -> Host {
     let mut modules = siblings(context, "native_chat").await;
-    modules.push(Box::new(native_automations()));
+    let store = QmdbStore::init(context.child("native_auto"), "automations").await;
+    modules.push(Box::new(native_automations(Box::new(store))));
     Host::genesis(modules).expect("genesis")
 }
 
 async fn wasm_host_(context: &deterministic::Context) -> Host {
     let mut modules = siblings(context, "wasm_chat").await;
-    modules.push(Box::new(wasm_automations()));
+    let store = QmdbStore::init(context.child("wasm_auto"), "automations").await;
+    modules.push(Box::new(wasm_automations(Box::new(store))));
     Host::genesis(modules).expect("genesis")
 }
 
@@ -155,15 +155,17 @@ async fn replies(h: &Host) -> Vec<Vec<u8>> {
 }
 
 fn root_of(h: &Host) -> StateRoot {
-    h.module_root("automations").expect("automations registered")
+    h.module_root("automations")
+        .expect("automations registered")
 }
 
 const SIBLING_IDS: [&str; 3] = ["chat", "tasks", "inbox"];
 
-/// submit one ACCEPTED op to both hosts: identical replies, per-sibling
-/// cross-host agreement (the follow-up lanes — a diverging or missing
+/// submit one ACCEPTED op to both hosts: IDENTICAL automations roots (both
+/// are the store's merkle root), identical replies, per-sibling cross-host
+/// agreement (the follow-up lanes — a diverging or missing
 /// PostMessage/CreateTask/Deliver diverges the sibling roots), lockstep
-/// automations-root movement.
+/// root movement.
 async fn roundtrip(
     native: &mut Host,
     wasm: &mut Host,
@@ -180,6 +182,11 @@ async fn roundtrip(
     wasm.submit_at(block(height, origin), m)
         .await
         .expect("wasm submit");
+    assert_eq!(
+        root_of(native),
+        root_of(wasm),
+        "roots diverge after block {height}"
+    );
     assert_eq!(
         replies(native).await,
         replies(wasm).await,
@@ -199,8 +206,6 @@ async fn roundtrip(
         assert_eq!(root_of(native), n_before, "native root moved at {height}");
         assert_eq!(root_of(wasm), w_before, "wasm root moved at {height}");
     }
-    // the roots themselves always differ (the pinned schema break).
-    assert_ne!(root_of(native), root_of(wasm));
 }
 
 /// submit one REJECTED op to both hosts: reasons carry the same needle, and
@@ -241,6 +246,26 @@ async fn reject_roundtrip(
     assert_eq!(replies(native).await, replies(wasm).await);
 }
 
+/// one rule's run-history details off one host — the seam a `DeliverInbox`
+/// action records the member string it ACTUALLY emitted into, which is
+/// otherwise only observable as an inbox root (inbox has no wire query).
+async fn run_details(h: &Host, rule_id: &str) -> Vec<String> {
+    let reply = h
+        .query(
+            "automations",
+            &encode_query(&AutomationsQuery::RunHistory {
+                rule_id: rule_id.into(),
+                limit: 64,
+            }),
+        )
+        .await
+        .expect("history query");
+    let AutomationsReply::History(records) = decode_reply(&reply).expect("decode") else {
+        panic!("expected a history reply");
+    };
+    records.into_iter().map(|r| r.detail).collect()
+}
+
 /// decoded task list off one host (cross-host equality is separately pinned
 /// via the sibling roots; this is for spot checks).
 async fn task_ids(h: &Host) -> Vec<String> {
@@ -260,17 +285,17 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         let user = Origin::External(key(0xA1));
         let ops = Origin::External(key(0xB2));
 
-        // the schema break is visible from GENESIS here: automations' empty
-        // canonical encoding is TWO zero counts (rules + history), the wasm
-        // port's empty host-KV store is ONE — different preimages, different
-        // roots (contrast saga/agent, whose single-count empty encodings
-        // coincide with the empty store until the first write).
+        // ROOT CONTINUITY from block zero: both sides commit to the SAME
+        // (empty) qmdb store — equal roots, and both ride the resolver sync
+        // lane (never the checkpoint-snapshot lane).
         assert_ne!(root_of(&native), StateRoot::ZERO);
-        assert_ne!(
-            root_of(&native),
-            root_of(&wasm),
-            "genesis roots must differ — the port is a DECLARED schema break"
-        );
+        assert_eq!(root_of(&native), root_of(&wasm), "genesis roots diverge");
+        assert!(native.resolver_backed_ids().contains("automations"));
+        assert!(wasm.resolver_backed_ids().contains("automations"));
+        // the inbox sibling's empty root, for the delivery-landed claims below
+        // (the inbox has no read surface — its module root is the whole
+        // observable committed state).
+        let inbox_genesis = native.module_root("inbox").expect("inbox registered");
 
         // ---- the shared world: a hooked channel. sibling-only blocks leave
         // automations alone on both runtimes.
@@ -349,7 +374,12 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
                 "r-inbox",
                 on_general(None),
                 Action::DeliverInbox {
-                    member_template: "ops-{channel}".into(),
+                    // `{author}` is the member domain's whole point: an inbox
+                    // queue is named in `Origin::actor_string`, so the rendering
+                    // the GUEST computes has to be one the triggering author can
+                    // ack. rendered wrong, the delivered member differs from
+                    // native's and the inbox sibling root diverges below.
+                    member_template: "{author}".into(),
                     kind: "note".into(),
                     body_template: "{author} said: {text}".into(),
                 },
@@ -390,6 +420,27 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         )
         .await;
         assert_eq!(task_ids(&wasm).await, vec!["job-general-1".to_string()]);
+        // r-inbox's Deliver landed ATOMICALLY in the posting block: the inbox
+        // sibling root moved off empty (cross-host agreement on it is pinned
+        // inside `roundtrip` via SIBLING_IDS).
+        assert_ne!(
+            native.module_root("inbox").expect("inbox registered"),
+            inbox_genesis,
+            "the hooked post delivered nothing to the inbox"
+        );
+        // and it delivered into the ACKABLE queue: the member the COMPILED
+        // COMPONENT substituted for `{author}` is the triggering author's own
+        // actor string, derived here and never spelled. inbox refuses an ack
+        // from anyone but that origin, so any other rendering is mail nobody
+        // can ever mark read.
+        assert_eq!(
+            run_details(&wasm, "r-inbox").await,
+            vec![format!(
+                "delivered inbox note to {}",
+                Origin::External(key(0xA1)).actor_string()
+            )],
+            "the guest rendered the member outside the actor-string domain"
+        );
 
         // ---- a post WITHOUT the text filter's needle: r-post skips (its
         // fire_count must not bump), the unfiltered rules still fire.
@@ -471,7 +522,11 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         )
         .await;
         // no NEW task landed (the squat is the only "job-general-6").
-        assert_eq!(task_ids(&wasm).await.len(), 3, "the probe downgraded the fire");
+        assert_eq!(
+            task_ids(&wasm).await.len(),
+            3,
+            "the probe downgraded the fire"
+        );
 
         // ---- DeleteRule: the tombstone hides the rule from reads.
         roundtrip(
@@ -499,23 +554,20 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
             AutomationsReply::Rule(None)
         );
 
-        // the inbox lane really landed (decoded spot check on the wasm side;
-        // cross-host equality is already pinned via the sibling roots).
-        let reply = wasm
-            .query(
-                "inbox",
-                &inbox_encode_query(&InboxQuery::Unread {
-                    member: "ops-general".into(),
-                }),
-            )
-            .await
-            .expect("inbox query");
-        let inbox::InboxReply::UnreadCount(unread) =
-            inbox::decode_reply(&reply).expect("decode")
-        else {
-            panic!("expected UnreadCount");
-        };
-        assert_eq!(unread, 4, "one delivery per hooked user post");
+        // the inbox lane really landed, and landed IDENTICALLY: the sibling
+        // inbox roots moved off empty and agree across the hosts (the inbox
+        // has no read surface — its decoded views are the index guest's job;
+        // the module root IS its whole observable committed state).
+        assert_eq!(
+            native.module_root("inbox"),
+            wasm.module_root("inbox"),
+            "the inbox deliveries diverged between the runtimes"
+        );
+        assert_ne!(
+            native.module_root("inbox").expect("inbox registered"),
+            inbox_genesis,
+            "the hooked posts delivered nothing to the inbox"
+        );
 
         // queries are read-only on the wasm side too.
         let settled = root_of(&wasm);
@@ -690,6 +742,60 @@ fn rejections_match_and_leave_no_trace() {
         for (height, (m, needle)) in rejects.into_iter().enumerate() {
             let height = height as u64 + 2;
             reject_roundtrip(&mut native, &mut wasm, height, ops.clone(), m, needle).await;
+        }
+
+        // the OWNER gate, proven in the compiled component and not just
+        // natively: `ops` owns `r-post`, and neither a stranger nor a
+        // module/system origin may touch it or mint a rule of their own.
+        // `env().origin` is the one authorization input that crosses the WIT
+        // boundary, so a gate keyed on it has to be checked on both sides.
+        let stranger = Origin::External(key(0xC3));
+        let unownable = [
+            (Origin::External(Vec::new()), "non-empty submitter id"),
+            // a NON-chat module id: the chat origin is the hook lane, which is
+            // routed before the owner gate and never rejects by design.
+            (Origin::Module("governance".into()), "module origin"),
+            (Origin::System, "system origin"),
+        ];
+        let mut height = 100;
+        for op in [
+            auto_op(&AutomationsMsg::SetEnabled {
+                rule_id: "r-post".into(),
+                enabled: false,
+            }),
+            auto_op(&AutomationsMsg::DeleteRule {
+                rule_id: "r-post".into(),
+            }),
+        ] {
+            reject_roundtrip(
+                &mut native,
+                &mut wasm,
+                height,
+                stranger.clone(),
+                op,
+                "only the owner",
+            )
+            .await;
+            height += 1;
+        }
+        for (origin, needle) in unownable {
+            reject_roundtrip(
+                &mut native,
+                &mut wasm,
+                height,
+                origin,
+                create_rule(
+                    "r-unowned",
+                    on_general(None),
+                    Action::CreateTask {
+                        task_id_prefix: "p".into(),
+                        title_template: "t".into(),
+                    },
+                ),
+                needle,
+            )
+            .await;
+            height += 1;
         }
     });
 }

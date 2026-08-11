@@ -21,24 +21,35 @@
 //! a peer present only in the serve series was served within the monitor's
 //! expiry window but is not currently connection-tracked (`connected: false`).
 //! cumulative fields never carry rates — a consumer (the `node peers` CLI)
-//! derives rates by diffing two samples' counters over their `sampledAtMs`.
+//! derives rates by diffing two samples' counters over their `sampled_at_ms`.
+//!
+//! the sample also stamps the answering node's OWN chain position (`height`,
+//! `epoch`) so one read anchors the peer set to a block without a second
+//! `/v1/status` round-trip. these are the sampler's coordinates, not the
+//! peers': the mesh gossips no per-peer head, so a peer-reported height only
+//! ever appears via the statesync serve fields above.
 
 use std::collections::BTreeMap;
 
 /// the `/v1/peers` (and rpc `peers`) reply: one sample of the peer set.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct PeersView {
     /// when this sample was taken (unix ms) — the denominator anchor for
     /// rate-deriving consumers.
     pub sampled_at_ms: u64,
+    /// the answering node's last finalized block height at sample time — the
+    /// same figure `/v1/status` reports.
+    pub height: u64,
+    /// the answering node's consensus epoch; absent on lanes with no
+    /// consensus (the embedded daemon, a parked joiner, the sim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
     /// every known direct peer, sorted by key hex for a stable order.
     pub peers: Vec<PeerView>,
 }
 
 /// one direct peer's sample.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct PeerView {
     /// the peer's mesh key, hex.
     pub peer: String,
@@ -65,7 +76,6 @@ pub struct PeerView {
 /// the statesync serve lane's view of one peer (mirrors the
 /// `ducktape_statesync_serve_*` series).
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct StatesyncServeView {
     /// cumulative wire bytes served to the peer.
     pub bytes_tx: u64,
@@ -174,10 +184,17 @@ impl PeerAccum {
 }
 
 /// assemble the peer sample from one metrics exposition. pure: the caller
-/// supplies the sample time (the lane's runtime clock). only the families
-/// this projection owns mint a peer entry — other peer-labeled series (the
-/// consensus engine's vote gauges include SELF under `peer=`) never do.
-pub fn peers_from_exposition(exposition: &str, sampled_at_ms: u64) -> PeersView {
+/// supplies the sample time (the lane's runtime clock) and its own chain
+/// position (`height`, plus `epoch` where the lane runs consensus). only the
+/// families this projection owns mint a peer entry — other peer-labeled
+/// series (the consensus engine's vote gauges include SELF under `peer=`)
+/// never do.
+pub fn peers_from_exposition(
+    exposition: &str,
+    sampled_at_ms: u64,
+    height: u64,
+    epoch: Option<u64>,
+) -> PeersView {
     let mut accums: BTreeMap<String, PeerAccum> = BTreeMap::new();
     for line in exposition.lines() {
         let Some((family, labels, value)) = parse_sample(line) else {
@@ -218,6 +235,8 @@ pub fn peers_from_exposition(exposition: &str, sampled_at_ms: u64) -> PeersView 
     }
     PeersView {
         sampled_at_ms,
+        height,
+        epoch,
         peers: accums
             .into_iter()
             .map(|(peer, accum)| accum.into_view(peer))
@@ -251,8 +270,10 @@ ducktape_statesync_serve_last_request{peer="e653",kind="tip_coords"} 1
 
     #[test]
     fn live_capture_projects_one_connected_peer() {
-        let view = peers_from_exposition(EXPOSITION, 7);
+        let view = peers_from_exposition(EXPOSITION, 7, 231, Some(3));
         assert_eq!(view.sampled_at_ms, 7);
+        assert_eq!(view.height, 231);
+        assert_eq!(view.epoch, Some(3));
         assert_eq!(
             view.peers,
             vec![PeerView {
@@ -280,7 +301,7 @@ ducktape_statesync_serve_last_request{peer="e653",kind="tip_coords"} 1
     #[test]
     fn serve_only_peer_is_listed_disconnected() {
         let exposition = "ducktape_statesync_serve_bytes{peer=\"aa\"} 128\n";
-        let view = peers_from_exposition(exposition, 0);
+        let view = peers_from_exposition(exposition, 0, 0, None);
         assert_eq!(view.peers.len(), 1);
         let peer = &view.peers[0];
         assert!(!peer.connected);
@@ -297,24 +318,26 @@ ducktape_statesync_serve_last_request{peer="e653",kind="tip_coords"} 1
     fn unrelated_peer_labels_and_missing_lanes_stay_absent() {
         let exposition = "consensus_e1_engine_batcher_latest_vote{peer=\"self\"} 3\n\
                           network_tracker_directory_connected{peer=\"bb\"} 1000\n";
-        let view = peers_from_exposition(exposition, 0);
+        let view = peers_from_exposition(exposition, 0, 0, None);
         assert_eq!(view.peers.len(), 1);
         assert_eq!(view.peers[0].peer, "bb");
         assert_eq!(view.peers[0].statesync, None);
     }
 
-    /// the json shape is camelCase with absent options omitted — the wire
-    /// contract the CLI and any dashboard key on.
+    /// the json shape is snake_case with absent options omitted (`epoch`
+    /// included) — the wire contract the CLI and any dashboard key on.
     #[test]
-    fn serializes_camel_case_without_absent_options() {
+    fn serializes_snake_case_without_absent_options() {
         let view = peers_from_exposition(
             "network_tracker_directory_connected{peer=\"bb\"} 1000\n",
             42,
+            9,
+            None,
         );
         let json = serde_json::to_string(&view).expect("serializes");
         assert_eq!(
             json,
-            r#"{"sampledAtMs":42,"peers":[{"peer":"bb","connected":true,"connectedSinceMs":1000,"msgsSent":0,"msgsReceived":0}]}"#
+            r#"{"sampled_at_ms":42,"height":9,"peers":[{"peer":"bb","connected":true,"connected_since_ms":1000,"msgs_sent":0,"msgs_received":0}]}"#
         );
     }
 }

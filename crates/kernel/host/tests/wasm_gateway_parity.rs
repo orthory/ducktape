@@ -1,11 +1,8 @@
-//! the adapter-port equivalence proof for the MERGED gateway module: the
-//! `gateway` guest component (the NATIVE `gateway` crate compiled to wasm
-//! behind `guest-adapter`) and the native `Gateway` module answer the SAME op
-//! sequence with IDENTICAL query replies, and their roots move in lockstep
-//! (move on commit, hold on no-ops and abort). the roots THEMSELVES differ —
-//! the port persists the native canonical snapshot as one host-KV value, a
-//! declared state-schema break (revision 3) — and this proof pins that
-//! difference so it can never be mistaken for accidental compatibility.
+//! the STORE-BACKED cutover-continuity proof for the MERGED gateway module:
+//! the `gateway` guest component over `WasmModule::with_store(QmdbStore)` and
+//! the native `Gateway` over the same store shape are ROOT-CONTINUOUS — the
+//! same op sequence commits the IDENTICAL qmdb merkle root after every block
+//! (both roots ARE the store's root).
 //!
 //! gateway now owns the WHOLE `.duck` name → AccountId → route pipeline: BOTH
 //! the route plane AND the `.duck` handle plane absorbed from the retired
@@ -14,9 +11,11 @@
 //! handle-plane test covers SetHandle / Resolve on the SAME merged tenant.
 //!
 //! like identity, gateway's constructor takes the PER-NETWORK chain id, which
-//! travels as GENESIS CONFIG (a host-installed `__config` store entry —
-//! `sdk::genesis_config`); the config-in-the-root and config-governs-the-guest
-//! pins ride at the end of this file.
+//! travels as GENESIS CONFIG — a `__config` RECORD seeded into the qmdb store
+//! under `sdk::store_key` (the production `seed_store_config` seam), read
+//! back by the guest's `store_genesis_chain_id` per dispatch. BOTH runtimes'
+//! stores carry the identical record; the config-in-the-root and
+//! config-governs-the-guest pins ride at the end of this file.
 //!
 //! every gateway execute depends on SIBLING reads: the valset standing gate
 //! (validators ∪ residents) and the identity `OfNode` account derivation plus
@@ -27,19 +26,22 @@
 //! WASM host carries NATIVE identity + valset: each parity proof isolates ONE
 //! wasm tenant.
 
-use commonware_cryptography::ed25519::PrivateKey;
 use commonware_cryptography::Signer as _;
+use commonware_cryptography::ed25519::PrivateKey;
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use gateway::{
-    decode_reply, encode_msg, encode_query, route_signing_preimage, DuckDnsName, Gateway,
-    GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, ResolvedAccount, RouteAudience,
-    RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget,
-    GATEWAY_ROUTE_NS, MAX_QUERY_LIMIT,
+    DuckDnsName, GATEWAY_ROUTE_NS, Gateway, GatewayMsg, GatewayQuery, GatewayReply,
+    MAX_QUERY_LIMIT, MemberAuthorization, ResolvedAccount, RouteAudience, RouteDefinition,
+    RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget, decode_reply, encode_msg,
+    encode_query, route_signing_preimage,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use identity::{bind_preimage, Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof,
-    IDENTITY_BIND_NS};
-use sdk::{Error, Module as _, Msg, Origin, StateRoot};
-use valset::{encode_msg as valset_encode_msg, Valset, ValsetMsg};
+use identity::{
+    IDENTITY_BIND_NS, Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof, bind_preimage,
+};
+use sdk::{Error, MerkleStore as _, Msg, Origin, StateRoot};
+use statesync::qmdb::QmdbStore;
+use valset::{Valset, ValsetMsg, encode_msg as valset_encode_msg};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `gateway` module's guest port by
@@ -51,56 +53,83 @@ const GATEWAY_WASM: &[u8] = include_bytes!("fixtures/gateway.component.wasm");
 /// identity sibling binds under the same id (one network, one chain id).
 const CHAIN_ID: &str = "test-chain";
 
-/// the wasm gateway at a given chain id: component + the host-computed initial
-/// store carrying the `__config` genesis parameters — exactly the production
-/// construction (`bin/node/src/host_state.rs`).
-fn wasm_gateway_with_chain(chain_id: &str) -> WasmModule {
-    let mut module = WasmModule::from_bytes("gateway", GATEWAY_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 3 of the merged
-        // gateway canonical state (route plane + absorbed handle plane).
-        .with_state_schema_revision(3);
+/// a fresh qmdb store carrying the seeded `__config` chain-id record —
+/// exactly the production genesis seam (`bin/node/src/host_state.rs`
+/// `seed_store_config`). BOTH runtimes' stores get the identical record:
+/// root-continuity demands it, and the guest reads its chain id from it.
+/// `label` doubles as the store id (the deterministic runtime keys storage
+/// partitions by id alone).
+async fn gw_store(
+    context: &deterministic::Context,
+    label: &'static str,
+    chain_id: &str,
+) -> QmdbStore<deterministic::Context> {
+    let mut store = QmdbStore::init(context.child(label), label).await;
     let config = sdk::genesis_config::encode_config(&[("chain_id", chain_id.as_bytes())]);
-    let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
-    module.install(&bytes, root).expect("install genesis config");
-    module
+    store
+        .commit_batch(vec![(
+            sdk::store_key(sdk::genesis_config::CONFIG_KEY),
+            Some(config),
+        )])
+        .await
+        .expect("seed genesis config");
+    store
 }
 
-fn wasm_gateway() -> WasmModule {
-    wasm_gateway_with_chain(CHAIN_ID)
+/// the wasm gateway over the host-constructed (config-seeded) store —
+/// exactly the production construction (`bin/node/src/host_state.rs`).
+fn wasm_gateway(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store("gateway", GATEWAY_WASM, store).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
-fn native_gateway() -> Gateway {
-    Gateway::new("gateway", "identity", Some("valset".into()), CHAIN_ID)
+fn native_gateway(store: Box<dyn sdk::MerkleStore>) -> Gateway {
+    Gateway::new(
+        "gateway",
+        store,
+        "identity",
+        Some("valset".into()),
+        CHAIN_ID,
+    )
 }
 
+/// the native identity SIBLING over a MemStore double — the store backend is
+/// irrelevant here (both hosts carry the same-shaped native sibling; only
+/// same-backend cross-host equality is asserted).
 fn native_identity() -> Identity {
-    Identity::new("identity", Some("valset".into()), CHAIN_ID.to_string())
+    Identity::new(
+        "identity",
+        Box::new(sdk_testkit::MemStore::new()),
+        Some("valset".into()),
+        CHAIN_ID.to_string(),
+    )
 }
 
-fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset");
+async fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
+    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
     for v in validators {
-        valset.insert(v.clone());
+        valset.seed(v.clone()).await.expect("seed valset");
     }
+    valset.finish_seed().await.expect("seed valset");
     valset
 }
 
-fn native_host(validators: &[Vec<u8>]) -> Host {
+async fn native_host(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+    let store = gw_store(context, "native_gw", CHAIN_ID).await;
     Host::genesis(vec![
-        Box::new(native_gateway()),
+        Box::new(native_gateway(Box::new(store))),
         Box::new(native_identity()),
-        Box::new(seeded_valset(validators)),
+        Box::new(seeded_valset(validators).await),
     ])
     .expect("genesis")
 }
 
-fn wasm_host_(validators: &[Vec<u8>]) -> Host {
+async fn wasm_host_(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+    let store = gw_store(context, "wasm_gw", CHAIN_ID).await;
     Host::genesis(vec![
-        Box::new(wasm_gateway()),
+        Box::new(wasm_gateway(Box::new(store))),
         Box::new(native_identity()),
-        Box::new(seeded_valset(validators)),
+        Box::new(seeded_valset(validators).await),
     ])
     .expect("genesis")
 }
@@ -370,28 +399,39 @@ async fn roundtrip(
         assert_eq!(root_of(native), n_before, "native root moved at {height}");
         assert_eq!(root_of(wasm), w_before, "wasm root moved at {height}");
     }
-    assert_ne!(root_of(native), root_of(wasm));
+    // THE continuity property: both roots ARE the same store root.
+    assert_eq!(
+        root_of(native),
+        root_of(wasm),
+        "the two runtimes diverged at {height}"
+    );
 }
 
 #[test]
-fn same_ops_same_replies_roots_in_lockstep_schema_break_pinned() {
-    futures::executor::block_on(same_ops_inner());
+fn same_ops_same_replies_roots_in_lockstep_and_continuous() {
+    deterministic::Runner::default().start(|context| async move {
+        same_ops_inner(&context).await;
+    });
 }
 
-async fn same_ops_inner() {
+async fn same_ops_inner(context: &deterministic::Context) {
     let w = World::new();
     let validators = vec![w.node_a.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
 
-    // the schema break is visible from GENESIS, asymmetrically: the native
-    // empty registry is the ZERO sentinel, the wasm root commits to the
-    // host-KV store already carrying the genesis config.
-    assert_eq!(root_of(&native), StateRoot::ZERO, "native genesis sentinel");
+    // ROOT-CONTINUITY from GENESIS: both roots are the store's merkle root,
+    // and the store already carries the seeded `__config` record — a real
+    // (non-sentinel) root, identical across the runtimes.
     assert_ne!(
         root_of(&native),
+        StateRoot::ZERO,
+        "the config record is in the root from block zero"
+    );
+    assert_eq!(
+        root_of(&native),
         root_of(&wasm),
-        "genesis roots must differ — the port is a DECLARED schema break"
+        "genesis roots must be continuous across the runtimes"
     );
 
     // sibling-only seeding (grants + binds) holds the gateway roots.
@@ -485,7 +525,13 @@ async fn same_ops_inner() {
         10,
         Origin::External(w.node_a.clone()),
         set_route(
-            statement(&w.a_id(), Some("web"), &w.node_a, 1, Some(content_route(0x33))),
+            statement(
+                &w.a_id(),
+                Some("web"),
+                &w.node_a,
+                1,
+                Some(content_route(0x33)),
+            ),
             &w.founder_a,
         ),
         true,
@@ -523,7 +569,10 @@ async fn same_ops_inner() {
         ),
         (b"definitely-not-json".to_vec(), "expected value"),
     ] {
-        let n_err = native.query("gateway", &q).await.expect_err("native rejects");
+        let n_err = native
+            .query("gateway", &q)
+            .await
+            .expect_err("native rejects");
         let w_err = wasm.query("gateway", &q).await.expect_err("wasm rejects");
         let Error::Module(n_msg) = n_err else {
             panic!("native query error shape: {n_err:?}");
@@ -546,16 +595,18 @@ async fn same_ops_inner() {
 
 #[test]
 fn rejections_match_and_leave_no_trace() {
-    futures::executor::block_on(rejections_inner());
+    deterministic::Runner::default().start(|context| async move {
+        rejections_inner(&context).await;
+    });
 }
 
-async fn rejections_inner() {
+async fn rejections_inner(context: &deterministic::Context) {
     let w = World::new();
     let outsider = ed_pub(&ed(99));
     let outsider_signer = ed(99);
     let validators = vec![w.node_a.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
     for host in [&mut native, &mut wasm] {
         w.seed(host).await;
         // one committed route so the revision matrix has a stream to violate.
@@ -572,7 +623,13 @@ async fn rejections_inner() {
 
     // a statement whose label the canonical grammar refuses (module-side
     // validation is under test, so the authorization is explicit junk).
-    let bad_label = statement(&w.a_id(), Some("Bad_Label"), &w.node_a, 1, Some(loopback_route()));
+    let bad_label = statement(
+        &w.a_id(),
+        Some("Bad_Label"),
+        &w.node_a,
+        1,
+        Some(loopback_route()),
+    );
     let zero_revision = statement(&w.a_id(), Some("api"), &w.node_a, 0, Some(loopback_route()));
     // a content route violating the signed content-policy shape (POST).
     let mut bad_content = content_route(0x44);
@@ -751,16 +808,18 @@ async fn rejections_inner() {
 
 #[test]
 fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
-    futures::executor::block_on(multi_dispatch_inner());
+    deterministic::Runner::default().start(|context| async move {
+        multi_dispatch_inner(&context).await;
+    });
 }
 
-async fn multi_dispatch_inner() {
+async fn multi_dispatch_inner(context: &deterministic::Context) {
     let w = World::new();
     let outsider = ed_pub(&ed(99));
     let outsider_signer = ed(99);
     let validators = vec![w.node_a.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
     w.seed(&mut native).await;
     w.seed(&mut wasm).await;
 
@@ -773,14 +832,26 @@ async fn multi_dispatch_inner() {
         (
             Origin::External(w.node_a.clone()),
             set_route(
-                statement(&w.a_id(), Some("multi"), &w.node_a, 1, Some(content_route(0x11))),
+                statement(
+                    &w.a_id(),
+                    Some("multi"),
+                    &w.node_a,
+                    1,
+                    Some(content_route(0x11)),
+                ),
                 &w.founder_a,
             ),
         ),
         (
             Origin::External(w.node_a.clone()),
             set_route(
-                statement(&w.a_id(), Some("multi"), &w.node_a, 2, Some(loopback_route())),
+                statement(
+                    &w.a_id(),
+                    Some("multi"),
+                    &w.node_a,
+                    2,
+                    Some(loopback_route()),
+                ),
                 &w.founder_a,
             ),
         ),
@@ -816,14 +887,26 @@ async fn multi_dispatch_inner() {
         (
             Origin::External(w.node_a.clone()),
             set_route(
-                statement(&w.a_id(), Some("iso"), &w.node_a, 1, Some(content_route(0x22))),
+                statement(
+                    &w.a_id(),
+                    Some("iso"),
+                    &w.node_a,
+                    1,
+                    Some(content_route(0x22)),
+                ),
                 &w.founder_a,
             ),
         ),
         (
             Origin::External(w.node_a.clone()),
             set_route(
-                statement(&w.a_id(), Some("iso"), &w.node_a, 1, Some(content_route(0x33))),
+                statement(
+                    &w.a_id(),
+                    Some("iso"),
+                    &w.node_a,
+                    1,
+                    Some(content_route(0x33)),
+                ),
                 &w.founder_a,
             ),
         ),
@@ -854,6 +937,7 @@ async fn multi_dispatch_inner() {
     }
     assert_ne!(root_of(&native), n_before);
     assert_ne!(root_of(&wasm), w_before);
+    assert_eq!(root_of(&native), root_of(&wasm));
     assert_eq!(
         replies(&native, &w.accounts()).await,
         replies(&wasm, &w.accounts()).await
@@ -893,6 +977,7 @@ async fn multi_dispatch_inner() {
     }
     assert_ne!(root_of(&native), n_before);
     assert_ne!(root_of(&wasm), w_before);
+    assert_eq!(root_of(&native), root_of(&wasm));
     assert_eq!(
         replies(&native, &w.accounts()).await,
         replies(&wasm, &w.accounts()).await
@@ -901,20 +986,24 @@ async fn multi_dispatch_inner() {
 
 #[test]
 fn genesis_config_is_consensus_state_and_governs_the_guest() {
-    futures::executor::block_on(genesis_config_inner());
+    deterministic::Runner::default().start(|context| async move {
+        genesis_config_inner(&context).await;
+    });
 }
 
-async fn genesis_config_inner() {
-    // the config is IN the root: per-network genesis roots, honestly.
-    let here = wasm_gateway_with_chain(CHAIN_ID);
-    let same = wasm_gateway_with_chain(CHAIN_ID);
-    let other = wasm_gateway_with_chain("other-chain");
+async fn genesis_config_inner(context: &deterministic::Context) {
+    // the config record is IN the store root: per-network genesis roots,
+    // honestly.
+    let here = gw_store(context, "cfg_here", CHAIN_ID).await;
+    let same = gw_store(context, "cfg_same", CHAIN_ID).await;
+    let other = gw_store(context, "cfg_other", "other-chain").await;
     assert_eq!(here.root(), same.root(), "same config, same genesis root");
     assert_ne!(
         here.root(),
         other.root(),
         "a different chain id IS a different genesis consensus state"
     );
+    drop((here, same));
 
     // and the config GOVERNS the guest: the same signed route statement
     // (scoped to CHAIN_ID) is accepted by the tenant configured with CHAIN_ID
@@ -922,11 +1011,11 @@ async fn genesis_config_inner() {
     // configured differently.
     let w = World::new();
     let validators = vec![w.node_a.clone()];
-    let mut wasm = wasm_host_(&validators);
+    let mut wasm = wasm_host_(context, &validators).await;
     let mut other_host = Host::genesis(vec![
-        Box::new(wasm_gateway_with_chain("other-chain")),
+        Box::new(wasm_gateway(Box::new(other))),
         Box::new(native_identity()),
-        Box::new(seeded_valset(&validators)),
+        Box::new(seeded_valset(&validators).await),
     ])
     .expect("genesis");
     w.seed(&mut wasm).await;
@@ -994,7 +1083,10 @@ async fn handle_replies(h: &Host) -> Vec<Vec<u8>> {
 }
 
 async fn resolved(h: &Host, handle: &str) -> Option<ResolvedAccount> {
-    let reply = h.query("gateway", &resolve_query(handle)).await.expect("resolve");
+    let reply = h
+        .query("gateway", &resolve_query(handle))
+        .await
+        .expect("resolve");
     match decode_reply(&reply).expect("decode") {
         GatewayReply::Resolved(r) => r,
         other => panic!("expected Resolved, got {other:?}"),
@@ -1003,24 +1095,25 @@ async fn resolved(h: &Host, handle: &str) -> Option<ResolvedAccount> {
 
 #[test]
 fn handle_plane_ops_stay_in_lockstep_on_the_merged_tenant() {
-    futures::executor::block_on(handle_plane_inner());
+    deterministic::Runner::default().start(|context| async move {
+        handle_plane_inner(&context).await;
+    });
 }
 
-async fn handle_plane_inner() {
+async fn handle_plane_inner(context: &deterministic::Context) {
     let w = World::new();
     let validators = vec![w.node_a.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
 
-    // the schema break is visible from genesis (native ZERO sentinel vs the
-    // wasm host-KV root that already commits to `__config`).
-    assert_eq!(root_of(&native), StateRoot::ZERO, "native genesis sentinel");
-    assert_ne!(root_of(&native), root_of(&wasm), "genesis roots differ (schema break)");
+    // root-continuity from genesis: both roots carry the seeded `__config`.
+    let genesis = root_of(&native);
+    assert_eq!(genesis, root_of(&wasm), "genesis roots must be continuous");
 
     // sibling-only seed blocks leave the gateway root untouched on both sides.
     w.seed(&mut native).await;
     w.seed(&mut wasm).await;
-    assert_eq!(root_of(&native), StateRoot::ZERO, "seed holds the native root");
+    assert_eq!(root_of(&native), genesis, "seed holds the native root");
 
     // every handle op family in one deterministic sequence; `moves` says
     // whether committed state changes — root movement must agree on both sides.
@@ -1038,7 +1131,10 @@ async fn handle_plane_inner() {
         let height = i as u64 + 5;
         let (n_before, w_before) = (root_of(&native), root_of(&wasm));
         native
-            .submit_at(block(height, Origin::External(who.clone())), set_handle(handle))
+            .submit_at(
+                block(height, Origin::External(who.clone())),
+                set_handle(handle),
+            )
             .await
             .expect("native submit");
         wasm.submit_at(block(height, Origin::External(who)), set_handle(handle))
@@ -1057,31 +1153,45 @@ async fn handle_plane_inner() {
             assert_eq!(root_of(&native), n_before, "native moved at {height}");
             assert_eq!(root_of(&wasm), w_before, "wasm moved at {height}");
         }
-        assert_ne!(root_of(&native), root_of(&wasm), "the pinned schema break");
+        assert_eq!(root_of(&native), root_of(&wasm), "continuity per block");
     }
 
     // resolution stops at the stable AccountId (the founding key), never a node.
     assert_eq!(
         resolved(&wasm, "renamed").await,
-        Some(ResolvedAccount { account_id: w.a_id() }),
+        Some(ResolvedAccount {
+            account_id: w.a_id()
+        }),
         "A's rename resolves to A's account id"
     );
     assert_eq!(
         resolved(&wasm, "orthory").await,
-        Some(ResolvedAccount { account_id: w.b_id() }),
+        Some(ResolvedAccount {
+            account_id: w.b_id()
+        }),
         "the freed handle now belongs to B's account"
     );
-    assert_eq!(resolved(&wasm, "quack-2").await, None, "B's old name is gone");
+    assert_eq!(
+        resolved(&wasm, "quack-2").await,
+        None,
+        "B's old name is gone"
+    );
 
     // a reserved root label is refused identically on both runtimes, and the
     // reject leaves BOTH roots byte-identical to pre-block (abort, no trace).
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
     let n_err = native
-        .submit_at(block(20, Origin::External(w.node_a.clone())), set_handle(Some("net")))
+        .submit_at(
+            block(20, Origin::External(w.node_a.clone())),
+            set_handle(Some("net")),
+        )
         .await
         .expect_err("native rejects reserved");
     let w_err = wasm
-        .submit_at(block(20, Origin::External(w.node_a.clone())), set_handle(Some("net")))
+        .submit_at(
+            block(20, Origin::External(w.node_a.clone())),
+            set_handle(Some("net")),
+        )
         .await
         .expect_err("wasm rejects reserved");
     for err in [n_err, w_err] {

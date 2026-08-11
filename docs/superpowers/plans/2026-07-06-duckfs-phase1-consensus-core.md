@@ -16,7 +16,7 @@
 - **Phase 2:** node integration — registration sites, memory-module deletion, disk-cohort recovery wiring, statesync resolver, noded HTTP endpoints, restart/joiner e2e.
 - **Phase 3:** `duckfs-client` checkout/commit engine + CLI.
 - **Phase 4:** FUSE mount (feature-gated).
-- **Phase 5:** app TS client + FilesView + en/ko docs.
+- **Phase 5:** app TS client + FilesView + docs.
 
 ## Global Constraints
 
@@ -1536,13 +1536,13 @@ Validation/apply order (all-or-nothing; any failure rejects the whole op with no
 - Modify: `crates/apps/files/src/lib.rs` (final docblock), `crates/apps/files/src/interface.rs` (doc polish)
 
 **Interfaces:**
-- Consumes: `host::Host` (`Host::genesis`, `submit_at`, `query`, `app_hash`) exactly as the old `host_dispatch_moves_app_hash_and_serves_query` test did (git history `tests/files_module.rs:663-699`).
+- Consumes: `host::Host` (`Host::genesis`, `submit_at`, `query`, `root_hash`) exactly as the old `host_dispatch_moves_root_hash_and_serves_query` test did (git history `tests/files_module.rs:663-699`).
 
 - [ ] **Step 1: Write the e2e tests**
 
-1. `host_flow`: genesis with `Files::open("files", tempdir)`; submit putblob ops + a commit + a pin through `submit_at` with `Origin::External(b"tester")`; app-hash moves on each; `query` Stat/Ls/Read round-trip; owner recorded as `ext:<hex>`.
-2. `two_hosts_converge`: two hosts over different tempdirs fed the identical op sequence (interleaved putblobs, commits, a rejected conflict, pins, an unwatch) → equal app-hashes after every block. This is the cross-node determinism gate for the whole crate.
-3. `rejects_never_move_app_hash`: every rejection class from Tasks 7–10 submitted through the host; app-hash byte-identical before/after each.
+1. `host_flow`: genesis with `Files::open("files", tempdir)`; submit putblob ops + a commit + a pin through `submit_at` with `Origin::External(b"tester")`; root-hash moves on each; `query` Stat/Ls/Read round-trip; owner recorded as `ext:<hex>`.
+2. `two_hosts_converge`: two hosts over different tempdirs fed the identical op sequence (interleaved putblobs, commits, a rejected conflict, pins, an unwatch) → equal root-hashes after every block. This is the cross-node determinism gate for the whole crate.
+3. `rejects_never_move_root_hash`: every rejection class from Tasks 7–10 submitted through the host; root-hash byte-identical before/after each.
 
 - [ ] **Step 2: Run** → `cargo test -p files` all green.
 - [ ] **Step 3: Final crate docblock** — rewrite `lib.rs` header: the two-plane story is gone; document objects/refs/root, the staging→commit byte path, disk-cohort durability, GC neutrality, the sync lane, and a pointer to the spec. Doc-check: `cargo doc -p files --no-deps` clean.

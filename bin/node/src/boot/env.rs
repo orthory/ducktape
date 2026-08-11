@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use capability_host::SandboxBackend;
+use provider_host::SandboxBackend;
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Ingress;
@@ -11,7 +11,7 @@ use crate::config::{self, Resolved, hex_bytes};
 
 /// `run_node`'s boot-time config derivation (phase P0): the `Resolved`
 /// destructure plus everything derived from it before the first listener
-/// bind — joiner/promoted state, the chain-id string, the mesh-state path,
+/// bind — promoted state, the chain-id string, the mesh-state path,
 /// and the cold-restart mesh dial seeds folded into `bootstrappers`.
 pub(crate) struct BootEnv {
     pub(crate) signer: ed25519::PrivateKey,
@@ -53,39 +53,58 @@ pub(crate) struct BootEnv {
     pub(crate) mesh_state_file: PathBuf,
     pub(crate) checkpoint_blocks: u64,
     pub(crate) dev_demo: bool,
+    /// ORPHANED by the in-process promotion seat (its only consumer was the
+    /// promotion exec-reboot's index staging); the config key survives until
+    /// the shipped-index lane is swept as one follow-up removal.
+    #[allow(dead_code)]
     pub(crate) sync_index: bool,
-    pub(crate) announce_capabilities: bool,
-    /// how provider runs are spawned (`node.toml sandbox`) — threaded to both
-    /// `capability_host::discover` call sites (validator + resident).
-    pub(crate) sandbox: SandboxBackend,
-    /// the capacity a sandboxed node announces AND enforces: the single source
-    /// for both the dispatch pool's ledger and the capability announce's
-    /// resources. EMPTY for a direct-spawn node.
+    /// the operator's `[sandbox]` table — HOW a run is isolated on this host.
+    /// `None` = consensus-only: no podman service, no terminal plane. The node
+    /// itself no longer executes provider work, so this drives the pty plane
+    /// and the podman service the compute daemon shares; the daemon resolves
+    /// the same table for its own provider set.
+    pub(crate) sandbox: Option<SandboxBackend>,
+    /// the same table, gated on the user's `services.toml` compute grant —
+    /// `None` when a sandbox is configured but compute was never enabled,
+    /// which is the one thing the boot warning needs to know.
+    pub(crate) compute_backend: Option<SandboxBackend>,
+    /// the capacity a compute node announces: the same map the daemon resolves
+    /// for its pool's ledger, so the scheduler can never be promised what this
+    /// host cannot seat. EMPTY for a consensus-only node.
     pub(crate) sandbox_capacity: BTreeMap<String, u64>,
     pub(crate) promoted: bool,
-    pub(crate) joiner: bool,
 }
 
 pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
     let Resolved {
+        // the keyless half this node shares VERBATIM with its service daemons.
+        // Destructured exhaustively (no `..`) on purpose: a new shared fact must
+        // be routed here rather than silently ignored.
+        service:
+            config::ServiceConfig {
+                workspace,
+                storage_dir: storage,
+                // the descriptor's own chain-id (network shape) or the raw
+                // dev-shape namespace — NOT `namespace` below, which is
+                // `genesis_namespace()` (chain_id@fingerprint) on the network
+                // shape. this is the string the desktop app records as
+                // `Workspace.chain_id`; threaded into `identity`'s certificate
+                // domain separation.
+                chain_id: identity_chain_id,
+                http_listen,
+                sandbox,
+                sandbox_capacity,
+            },
         signer,
         label,
         namespace,
-        // the descriptor's own chain-id (network shape) or the raw dev-shape
-        // namespace — NOT `namespace` below, which is `genesis_namespace()`
-        // (chain_id@fingerprint) on the network shape. this is the string the
-        // desktop app records as `Workspace.chain_id`; threaded into
-        // `identity`'s certificate domain separation.
-        chain_id: identity_chain_id,
         mesh: peers,
         validators,
         bootstrappers,
         coordinated,
         listen,
         advertised,
-        storage_dir: storage,
         rpc_listen,
-        http_listen,
         gateway_listen,
         wireguard_listen,
         wireguard_key_file,
@@ -96,15 +115,12 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         invite_wireguard,
         invite_fronts,
         sync_index,
-        announce_capabilities,
         coordination,
         coord_cap,
-        workspace,
         primary_coordinator,
         coordinator_relay,
         wireguard_advertised,
-        sandbox,
-        sandbox_capacity,
+        compute_backend,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
@@ -335,10 +351,9 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         checkpoint_blocks,
         dev_demo,
         sync_index,
-        announce_capabilities,
         sandbox,
+        compute_backend,
         sandbox_capacity,
         promoted,
-        joiner,
     }
 }

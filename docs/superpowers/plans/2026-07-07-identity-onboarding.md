@@ -20,7 +20,7 @@
 - New Rust deps (`bip39`, `argon2`, `chacha20poly1305`, `zeroize`) go in bin/node's Cargo.toml (workspace-deps entries fine); NOTHING new in `app/src-tauri`.
 - Password minimum 8 chars, enforced app-side AND in the `init`/`restore`/`encrypt` verbs.
 - Web build (no Tauri): identity gate never renders; behavior identical to today.
-- Commit per task; all work in worktree `/home/eddy/dev/ducktape/.claude/worktrees/feat+identity-onboarding` on branch `feat/identity-onboarding`. Run Rust tests `cargo test -p node-bin userkey` (module-scoped; the full node-bin suite only in the final sweep), app tests `cd app && bun run test -- --run`.
+- Commit per task; all work in worktree `<repo>/.claude/worktrees/feat+identity-onboarding` on branch `feat/identity-onboarding`. Run Rust tests `cargo test -p node-bin userkey` (module-scoped; the full node-bin suite only in the final sweep), app tests `cd app && bun run test -- --run`.
 
 ---
 
@@ -72,7 +72,7 @@ pub fn rewrite_user_key(path: &Path, line: &str) -> Result<(), String>      // t
   - Password < 8 chars → error in init/restore/encrypt.
 - [ ] **Step 1 (TDD where testable):** unit tests for the stdin-parsing helpers + an integration-style test module invoking the verb functions directly (the verb fns should take `&mut impl BufRead` for stdin so tests inject strings — mirror how existing verbs are structured; if they read `std::io::stdin()` inline, refactor the #205 sign verbs to the injectable shape as part of this task).
 - [ ] **Step 2:** RED → implement → GREEN (`cargo test -p node-bin userkey_verbs` or the module name you choose).
-- [ ] **Step 3: hand-verify the full lifecycle** in the scratchpad dir (`/tmp/claude-1000/-home-eddy-dev-ducktape/1be82b62-528e-4730-a8e3-aec6afacbcfc/scratchpad/`): init (capture mnemonic+pubkey) → status shows `encrypted <pubkey>` → unlock ok / wrong-password fails nonzero → reveal returns the same words → delete file → restore from words → status pubkey identical → user-sign-bind with v2 key + stdin password produces decodable JSON. Also: legacy flow — old `user-key --out` file → status `plaintext` → encrypt → status `encrypted`, reveal identical words before and after. Transcript in the report.
+- [ ] **Step 3: hand-verify the full lifecycle** in the scratchpad dir (`<your scratchpad dir>/`): init (capture mnemonic+pubkey) → status shows `encrypted <pubkey>` → unlock ok / wrong-password fails nonzero → reveal returns the same words → delete file → restore from words → status pubkey identical → user-sign-bind with v2 key + stdin password produces decodable JSON. Also: legacy flow — old `user-key --out` file → status `plaintext` → encrypt → status `encrypted`, reveal identical words before and after. Transcript in the report.
 - [ ] **Step 4:** commit `feat(node): user-key lifecycle verbs — init, restore, unlock, reveal, encrypt, status`
 
 ---
@@ -147,7 +147,7 @@ pub fn rewrite_user_key(path: &Path, line: &str) -> Result<(), String>      // t
 ### Task 7: Docs
 
 **Files:**
-- Modify: `docs/src/content/docs/en/human/start/*` (find the getting-started/onboarding page; add the identity-creation step + recovery-phrase guidance), `docs/src/content/docs/ko/...` mirror; `docs/src/content/docs/en/human/modules/product-modules.mdx` identity section (one paragraph: custody model — mnemonic recovers identity, password is local-only, node keys deliberately stay plaintext/disposable for liveness + full-disk-encryption pointer) + ko mirror; spec as-built amendments if any landed during implementation.
+- Modify: `docs/src/content/docs/en/human/start/*` (find the getting-started/onboarding page; add the identity-creation step + recovery-phrase guidance); `docs/src/content/docs/en/human/modules/product-modules.mdx` identity section (one paragraph: custody model — mnemonic recovers identity, password is local-only, node keys deliberately stay plaintext/disposable for liveness + full-disk-encryption pointer); spec as-built amendments if any landed during implementation.
 - [ ] **Step 1:** write; `cd docs && bun run build 2>&1 | tail -3` no new errors.
 - [ ] **Step 2:** commit `docs(identity): onboarding + custody model documentation`
 

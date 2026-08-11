@@ -56,7 +56,7 @@ impl From<host::SubmitError> for Error {
 // fan it out to peers) converges only for order-INdependent module roots (a
 // state-based `directory` root). a qmdb root is op-log/MMR-order-DEPENDENT:
 // the same SET of ops in different orders yields a different root, so the
-// instant two validators apply in different orders their app-hash FORKS.
+// instant two validators apply in different orders their root-hash FORKS.
 //
 // the fix is an AGREED TOTAL ORDER. a locally-originated msg is **NOT** applied
 // on submission — that optimistic echo is exactly what forks the chain the
@@ -84,15 +84,15 @@ use commonware_cryptography::{
     Signer as _, Verifier as _,
     ed25519::{PrivateKey, PublicKey, Signature},
 };
-use sdk::{Continuation, Origin};
+use sdk::Origin;
 
 /// the signing domain for op frames. domain-separated so an op signature can
 /// never double as a consensus vote, an endpoint advertisement, or any other
-/// signed artifact in the system. the ONE codec: length-prefixed fields plus a
-/// trailing continuation section (`cont_flag(u8)`, then `[len target][target]
-/// [len payload][payload]` when the flag is `1`). BOTH arms are inside the
-/// signed preimage: the signature binds the continuation to its parent op, so
-/// nobody can graft one onto (or strip one off) someone else's transaction.
+/// signed artifact in the system. the ONE codec: length-prefixed
+/// `(origin, seq, target, payload)` and nothing else. a frame carries EXACTLY
+/// ONE op — there is no envelope continuation section, so a frame cannot
+/// append a second op that dispatches under a caller-chosen `Origin::Module`
+/// (see `no_continuation_lane.rs`).
 const FRAME_NS: &[u8] = b"ducktape:op-frame:v1";
 
 /// the content address of an encoded frame — sha256 over the exact bytes the
@@ -135,7 +135,7 @@ pub fn frame_id(bytes: &[u8]) -> FrameId {
 // message cap — and commonware's `Sender::send` ASSERTS on that cap, so a
 // full-CHUNK_SIZE duckfs putblob panicked the proposer's gossip task instead
 // of rejecting (#215). the wire bytes are NOT consensus state (only the
-// app-hash must match across nodes), but every validator must speak the same
+// root-hash must match across nodes), but every validator must speak the same
 // codec — changing it is a flag-day, fine while the network rebuilds anyway.
 
 /// hard cap on ONE encoded op frame, enforced as a CLEAN deterministic
@@ -166,23 +166,14 @@ fn take_slice<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
     Some(head)
 }
 
-/// read one byte off the front of `buf`.
-fn take_byte(buf: &mut &[u8]) -> Option<u8> {
-    let (head, rest) = buf.split_at_checked(1)?;
-    *buf = rest;
-    Some(head[0])
-}
-
 /// the signed preimage AND the frame's wire prefix: length-prefixed fields so
 /// no two (seq, target, payload) triples can collide across a moving
-/// boundary, plus the trailing continuation section. depth 1 is BY SHAPE —
-/// the continuation section has no continuation slot of its own, so a nested
-/// continuation is unrepresentable rather than merely validated. a frame is
-/// exactly these bytes with the signature appended, so [`decode_frame`]
-/// verifies against the received prefix without rebuilding anything.
-fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg, cont: Option<&Continuation>) -> Vec<u8> {
+/// boundary. a frame is exactly these bytes with the signature appended, so
+/// [`decode_frame`] verifies against the received prefix without rebuilding
+/// anything.
+fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg) -> Vec<u8> {
     let target = msg.target.as_bytes();
-    let mut out = Vec::with_capacity(8 * 4 + 1 + origin.len() + target.len() + msg.payload.len());
+    let mut out = Vec::with_capacity(8 * 3 + origin.len() + target.len() + msg.payload.len());
     out.extend_from_slice(&(origin.len() as u64).to_le_bytes());
     out.extend_from_slice(origin);
     out.extend_from_slice(&seq.to_le_bytes());
@@ -190,48 +181,31 @@ fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg, cont: Option<&Continuation
     out.extend_from_slice(target);
     out.extend_from_slice(&(msg.payload.len() as u64).to_le_bytes());
     out.extend_from_slice(&msg.payload);
-    match cont {
-        None => out.push(0),
-        Some(c) => {
-            out.push(1);
-            let target = c.target.as_bytes();
-            out.extend_from_slice(&(target.len() as u64).to_le_bytes());
-            out.extend_from_slice(target);
-            out.extend_from_slice(&(c.payload.len() as u64).to_le_bytes());
-            out.extend_from_slice(&c.payload);
-        }
-    }
     out
 }
 
-/// frame and SIGN a locally-originated msg for the ordered lane, with an
-/// optional envelope continuation. the signer's public key becomes the
-/// frame's origin; the frame bytes are the signed preimage with the signature
-/// appended.
-pub fn encode_frame(
-    signer: &PrivateKey,
-    seq: u64,
-    msg: &Msg,
-    cont: Option<&Continuation>,
-) -> Vec<u8> {
+/// frame and SIGN a locally-originated msg for the ordered lane. the signer's
+/// public key becomes the frame's origin; the frame bytes are the signed
+/// preimage with the signature appended.
+pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {
     let origin = signer.public_key();
-    let mut frame = frame_preimage(origin.as_ref(), seq, msg, cont);
+    let mut frame = frame_preimage(origin.as_ref(), seq, msg);
     let sig = signer.sign(FRAME_NS, &frame);
     frame.extend_from_slice(sig.as_ref());
     frame
 }
 
-/// decode a delivered frame back to `(Origin, Msg, Option<Continuation>)`,
-/// VERIFYING the signature first. rejects deterministically on: a parse
-/// failure, a `cont_flag` outside `{0, 1}` (exactly one valid encoding per
-/// frame), an origin that is not a valid ed25519 key, a signature that does
-/// not bind the WHOLE preimage (continuation included), or a continuation
-/// payload over [`sdk::MAX_CONTINUATION_BYTES`]. the ordered drain treats any
-/// rejection as a deterministic no-op: every honest validator rejects the
+/// decode a delivered frame back to `(Origin, Msg)`, VERIFYING the signature
+/// first. rejects deterministically on: a parse failure, TRAILING BYTES
+/// between the payload and the signature (exactly one valid encoding per
+/// frame — this is what makes an appended continuation section
+/// unrepresentable), an origin that is not a valid ed25519 key, or a
+/// signature that does not bind the whole preimage. the ordered drain treats
+/// any rejection as a deterministic no-op: every honest validator rejects the
 /// identical forged frame identically. the verified `origin` becomes the
-/// block's root `Origin::External(pubkey)` — authorship a module can trust;
-/// the `seq` is ordering/replay metadata, not surfaced.
-pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>), Error> {
+/// block's `Origin::External(pubkey)` — authorship a module can trust; the
+/// `seq` is ordering/replay metadata, not surfaced.
+pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
     let parse_err = || Error::Host(sdk::Error::Module("frame does not parse".into()));
     let mut buf = bytes;
     let origin = take_slice(&mut buf).ok_or_else(parse_err)?;
@@ -242,23 +216,6 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>),
     let target = std::str::from_utf8(take_slice(&mut buf).ok_or_else(parse_err)?)
         .map_err(|_| parse_err())?;
     let payload = take_slice(&mut buf).ok_or_else(parse_err)?;
-    let cont = match take_byte(&mut buf).ok_or_else(parse_err)? {
-        0 => None,
-        1 => {
-            let cont_target = std::str::from_utf8(take_slice(&mut buf).ok_or_else(parse_err)?)
-                .map_err(|_| parse_err())?;
-            let cont_payload = take_slice(&mut buf).ok_or_else(parse_err)?;
-            Some(Continuation {
-                target: cont_target.to_string(),
-                payload: cont_payload.to_vec(),
-            })
-        }
-        flag => {
-            return Err(Error::Host(sdk::Error::Module(format!(
-                "frame cont_flag {flag} is not 0|1"
-            ))));
-        }
-    };
     let preimage_len = bytes.len() - buf.len();
     let pubkey = PublicKey::decode(origin)
         .map_err(|e| Error::Host(sdk::Error::Module(format!("frame origin: {e}"))))?;
@@ -266,17 +223,8 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>),
         .map_err(|e| Error::Host(sdk::Error::Module(format!("frame signature: {e}"))))?;
     if !pubkey.verify(FRAME_NS, &bytes[..preimage_len], &sig) {
         return Err(Error::Host(sdk::Error::Module(
-            "frame signature does not bind this op (and continuation) to its origin".into(),
+            "frame signature does not bind this op to its origin".into(),
         )));
-    }
-    if let Some(c) = &cont
-        && c.payload.len() > sdk::MAX_CONTINUATION_BYTES
-    {
-        return Err(Error::Host(sdk::Error::Module(format!(
-            "continuation payload exceeds cap ({} > {})",
-            c.payload.len(),
-            sdk::MAX_CONTINUATION_BYTES
-        ))));
     }
     Ok((
         Origin::External(origin.to_vec()),
@@ -284,7 +232,6 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>),
             target: target.to_string(),
             payload: payload.to_vec(),
         },
-        cont,
     ))
 }
 
@@ -299,19 +246,16 @@ pub fn frame_origin_seq(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
     Some((origin.to_vec(), seq))
 }
 
-/// decode ONE batch member into the [`host::BlockOp`] the block applies — the
-/// envelope carrying its continuation (if any) onto the op.
+/// decode ONE batch member into the [`host::BlockOp`] the block applies.
 ///
-/// stamps `frame` with the member's content id HERE — the relay slot's
-/// `parent_frame` is consensus input a module may commit to state, so live
-/// drain, recovery replay, and suffix catch-up must all derive it from the ONE
-/// definition rather than each stamping (or forgetting) it at the call site.
+/// stamps `frame` with the member's content id HERE, from the ONE definition,
+/// so live drain, recovery replay, and suffix catch-up cannot each stamp (or
+/// forget) it differently at the call site.
 pub fn decode_member(bytes: &[u8]) -> Result<host::BlockOp, Error> {
-    let (origin, msg, continuation) = decode_frame(bytes)?;
+    let (origin, msg) = decode_frame(bytes)?;
     Ok(host::BlockOp {
         origin,
         msg,
-        continuation,
         frame: frame_id(bytes),
     })
 }
@@ -326,7 +270,7 @@ pub fn decode_member(bytes: &[u8]) -> Result<host::BlockOp, Error> {
 // authenticated authorship live on each member, never on the container. the
 // container's own content address is `frame_id(&batch_bytes)`; the orderer
 // orders these containers, and [`OrderedNode::drain_delivered`] decodes one into
-// its members and applies them as ONE block at ONE height under ONE app-hash.
+// its members and applies them as ONE block at ONE height under ONE root-hash.
 
 /// hard cap on ONE encoded batch super-frame — the packing target for
 /// [`OrderedNode::flush_batch`]. equal to [`MAX_FRAME_BYTES`]: a single member
@@ -725,11 +669,11 @@ pub struct DrainedFrame {
     /// the app height stamped for this frame's view (`view_base + view`).
     pub height: u64,
     pub disposition: Disposition,
-    /// the composed app-hash after this frame settled. a rejected frame rolls
+    /// the composed root-hash after this frame settled. a rejected frame rolls
     /// back and a discarded one never runs (hash unchanged from the previous
     /// block in both cases) — recorded regardless, so every outcome carries
     /// the boundary it left behind.
-    pub app_hash: StateRoot,
+    pub root_hash: StateRoot,
     /// the decoded op this frame carried. `None` when there was nothing to
     /// decode: a frame discarded at the cutover ceiling (dropped before
     /// decoding) or one whose decode/signature check failed.
@@ -793,44 +737,16 @@ pub struct DrainedOp {
     /// (the apply-latency histogram), so it can never enter consensus. differs
     /// per node.
     pub latency_us: u64,
-    /// the envelope continuation this frame carried and its released outcome
-    /// (envelope frames only). the continuation ALWAYS fires — a rejected parent
-    /// still releases it with the `Err` relay — so this is present iff the
-    /// FRAME carried one, independent of the parent's own disposition.
-    pub continuation: Option<DrainedContinuation>,
 }
 
-/// the released continuation of one drained envelope frame: the
-/// `continue` body plus how the derived unit landed. its dispatches are part
-/// of the block's op stream exactly like a member's (the index consumer
-/// appends them right after the parent's — the [`host::BatchOutcome`] event
-/// order), and `Discarded` is unrepresentable here: a continuation only ever
-/// exists for a frame that resolved below the cutover ceiling.
-#[derive(Clone, Debug)]
-pub struct DrainedContinuation {
-    /// the continuation's target module.
-    pub target: sdk::ModuleId,
-    /// the continuation's opaque payload bytes.
-    pub payload: Vec<u8>,
-    /// how the derived unit landed: applied, or rejected in isolation (its
-    /// stage rolled back; the parent's committed stage survives).
-    pub disposition: Disposition,
-    /// the continuation unit's own dispatch trace — empty when rejected.
-    pub dispatches: Vec<host::DispatchRecord>,
-    /// node-local, NON-CONSENSUS: the rejection reason, unwrapped like a
-    /// member's ([`DrainedFrame::reason`]). `None` when applied.
-    pub reason: Option<String>,
-}
-
-/// one decoded member's identity and envelope, carried parallel to the block's
-/// ops (in member order) so the drained records can be built after the block
-/// settles — internal to [`OrderedNode::drain_delivered`].
+/// one decoded member's identity, carried parallel to the block's ops (in
+/// member order) so the drained records can be built after the block settles —
+/// internal to [`OrderedNode::drain_delivered`].
 struct MemberMeta {
     id: FrameId,
     origin: Origin,
     target: sdk::ModuleId,
     payload: Vec<u8>,
-    continuation: Option<Continuation>,
 }
 
 /// the durable outcome of one drained frame — everything a recovery journal
@@ -847,8 +763,8 @@ pub struct BlockSeal {
     /// every registered module's `(id, root)` AFTER this block settled, in
     /// registry (sorted-id) order — [`host::Host::module_roots`].
     pub roots: Vec<(sdk::ModuleId, StateRoot)>,
-    /// the composed app-hash after this block settled.
-    pub app_hash: StateRoot,
+    /// the composed root-hash after this block settled.
+    pub root_hash: StateRoot,
 }
 
 /// the recovery seam on the ordered lane: a write-ahead journal for finalized
@@ -967,7 +883,7 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// agreed-delivery order.
     events: Vec<Event>,
     /// the latest APPLIED consensus boundary: the last drained APP HEIGHT
-    /// (`view_base + engine view`) plus the app-hash after that drain settled.
+    /// (`view_base + engine view`) plus the root-hash after that drain settled.
     /// this is what a state-sync service serves from
     /// (`host::Host::capture_finalized_snapshot` demands exactly this pair) —
     /// `None` until the first frame applies.
@@ -1155,6 +1071,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.code_source = src;
     }
 
+    /// dismantle the node into its host and sink — the promotion seam: a
+    /// follower-ordered replica hands both to a validator-ordered rebuild
+    /// ([`Self::resume`] with an engine orderer) inside the same process.
+    /// everything else (undrained events, deferred frames, the orderer) is
+    /// dropped with `self`; callers only dismantle at a drained boundary.
+    pub fn into_parts(self) -> (Host, S) {
+        (self.host, self.sink)
+    }
+
     /// choose how each block's `consensus_time` is derived from its height (see
     /// [`ConsensusTimePolicy`]). the default `HeightIsTime` is the validator
     /// lane; the sim backend sets `Epoch{..}` for its logical millisecond clock.
@@ -1299,7 +1224,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
 
     /// SUBMIT — propose a locally-originated msg into the agreed order. framed
     /// with `(origin, seq)` for a tie-free order key + replay identity. does NOT
-    /// touch the local host: `app_hash()` is unchanged until the order delivers
+    /// touch the local host: `root_hash()` is unchanged until the order delivers
     /// this frame back through [`OrderedNode::drain_delivered`] (the semantic
     /// shift — no optimistic echo). returns the frame's [`FrameId`] so the
     /// caller can recognize this op's outcome in [`OrderedNode::take_drained`].
@@ -1309,7 +1234,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         seq: u64,
         msg: Msg,
     ) -> Result<FrameId, Error> {
-        let frame = encode_frame(signer, seq, &msg, None);
+        let frame = encode_frame(signer, seq, &msg);
         self.submit_frame(frame).await
     }
 
@@ -1412,9 +1337,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
 
     /// DRAIN — apply every BATCH the order delivered, STRICTLY in agreed order.
     /// each delivered `(view, frame)` is ONE batch super-frame applied via
-    /// `host.submit_block` as ONE block at ONE height under ONE app-hash, with
+    /// `host.submit_block` as ONE block at ONE height under ONE root-hash, with
     /// per-member outcomes surfaced as N [`DrainedFrame`]s (all sharing that
-    /// app-hash). returns the count of BATCHES processed (0 when idle) so a test
+    /// root-hash). returns the count of BATCHES processed (0 when idle) so a test
     /// can drive to a fixpoint deterministically.
     ///
     /// ## rejected vs fatal
@@ -1485,7 +1410,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                                 id: frame_id(member),
                                 height,
                                 disposition: Disposition::Discarded,
-                                app_hash: self.host.app_hash(),
+                                root_hash: self.host.root_hash(),
                                 op: None,
                                 reason: None,
                             });
@@ -1495,7 +1420,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         id: batch_id,
                         height,
                         disposition: Disposition::Discarded,
-                        app_hash: self.host.app_hash(),
+                        root_hash: self.host.root_hash(),
                         op: None,
                         reason: None,
                     }),
@@ -1537,7 +1462,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         id: batch_id,
                         height,
                         disposition: Disposition::Rejected,
-                        app_hash: self.host.app_hash(),
+                        root_hash: self.host.root_hash(),
                         op: None,
                         reason: Some("batch decode failed".to_string()),
                     });
@@ -1554,7 +1479,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // caught deterministically by the module's own (origin, seq) dedup —
             // identically live and on recovery replay. a member that fails to
             // decode is a deterministic no-op: EXCLUDED from the ops and recorded
-            // Rejected after the block settles (it shares the block app-hash).
+            // Rejected after the block settles (it shares the block root-hash).
             // the rest carry their identity parallel to `ops`, in member (=
             // applied, = enqueue/FIFO) order, for building the drained records.
             let mut ops: Vec<host::BlockOp> = Vec::new();
@@ -1569,7 +1494,6 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                             origin: op.origin.clone(),
                             target: op.msg.target.clone(),
                             payload: op.msg.payload.clone(),
-                            continuation: op.continuation.clone(),
                         });
                         ops.push(op);
                     }
@@ -1623,7 +1547,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         id: batch_id,
                         height,
                         disposition: Disposition::Rejected,
-                        app_hash: self.host.app_hash(),
+                        root_hash: self.host.root_hash(),
                         op: None,
                         reason: Some(member_reason(e.to_string())),
                     });
@@ -1632,14 +1556,14 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     continue;
                 }
             };
-            // N DrainedFrames per batch, all sharing the ONE post-batch app-hash.
-            let batch_hash = outcome.app_hash;
+            // N DrainedFrames per batch, all sharing the ONE post-batch root-hash.
+            let batch_hash = outcome.root_hash;
             self.events.extend(outcome.events);
-            // the block-level seal disposition is DRAIN-based, not app-hash-based:
+            // the block-level seal disposition is DRAIN-based, not root-hash-based:
             // a block is Applied iff it ran real work — any member applied, or a
             // once-per-block System injection dispatched. this is identical live,
             // on forward replay, AND on a torn-heal's PARTIAL commit (which aborts
-            // the already-durable mover, so its app-hash cannot be trusted). exactly
+            // the already-durable mover, so its root-hash cannot be trusted). exactly
             // one seal per batch, below.
             let has_system = !outcome.system_dispatches.is_empty();
             // surface the injections' dispatch traces beside the member
@@ -1653,26 +1577,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             }
             let mut any_applied = false;
             let (mut applied_count, mut rejected_count) = (0usize, 0usize);
-            // the released continuation outcomes, re-keyed by parent INPUT
-            // index (the host reports them in release = input order, at most
-            // one per envelope).
-            let mut cont_outcomes: Vec<Option<MemberOutcome>> =
-                op_meta.iter().map(|_| None).collect();
-            for (parent, cont_outcome) in outcome.continuations {
-                cont_outcomes[parent] = Some(cont_outcome);
-            }
             // one record per applying member, in member (input/FIFO) order; the
             // host guarantees `members` is 1:1 with `ops` in input order. custody
             // ends for each resolved member.
-            for (i, (meta, member_outcome)) in
-                op_meta.into_iter().zip(outcome.members).enumerate()
-            {
+            for (meta, member_outcome) in op_meta.into_iter().zip(outcome.members) {
                 let MemberMeta {
                     id: mid,
                     origin: op_origin,
                     target: op_target,
                     payload: op_payload,
-                    continuation: op_cont,
                 } = meta;
                 self.outstanding.remove(&mid);
                 let (disposition, dispatches, reason) = match member_outcome {
@@ -1687,56 +1600,30 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     // client keys on "files: conflict:"). node-local only.
                     MemberOutcome::Rejected { reason } => {
                         rejected_count += 1;
-                        (Disposition::Rejected, Vec::new(), Some(member_reason(reason)))
+                        (
+                            Disposition::Rejected,
+                            Vec::new(),
+                            Some(member_reason(reason)),
+                        )
                     }
                 };
-                // the envelope's continuation ALWAYS fired (an applied parent
-                // relays Ok, a rejected one Err) — its outcome is a block fact
-                // like a member's, and an APPLIED continuation is real work:
-                // it moves state, so it must reach the seal disposition or a
-                // continuation-only block would seal Rejected with a moved
-                // app-hash and recovery could never reproduce it.
-                let continuation = op_cont.map(|cont| {
-                    let released = cont_outcomes[i]
-                        .take()
-                        .expect("host releases exactly one outcome per envelope continuation");
-                    let (disposition, dispatches, reason) = match released {
-                        MemberOutcome::Applied { dispatches } => {
-                            any_applied = true;
-                            applied_count += 1;
-                            (Disposition::Applied, dispatches, None)
-                        }
-                        MemberOutcome::Rejected { reason } => {
-                            rejected_count += 1;
-                            (Disposition::Rejected, Vec::new(), Some(member_reason(reason)))
-                        }
-                    };
-                    DrainedContinuation {
-                        target: cont.target,
-                        payload: cont.payload,
-                        disposition,
-                        dispatches,
-                        reason,
-                    }
-                });
                 self.drained.push(DrainedFrame {
                     id: mid,
                     height,
                     disposition,
-                    app_hash: batch_hash,
+                    root_hash: batch_hash,
                     op: Some(DrainedOp {
                         origin: op_origin,
                         target: op_target,
                         payload: op_payload,
                         dispatches,
                         latency_us,
-                        continuation,
                     }),
                     reason,
                 });
             }
             // members that failed to decode: recorded AFTER the outcome so they
-            // share the block app-hash. custody ends — a decode-fail can never
+            // share the block root-hash. custody ends — a decode-fail can never
             // apply, so it must not be carried at a cutover.
             for (mid, decode_reason) in decode_fail {
                 self.outstanding.remove(&mid);
@@ -1744,7 +1631,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     id: mid,
                     height,
                     disposition: Disposition::Rejected,
-                    app_hash: batch_hash,
+                    root_hash: batch_hash,
                     op: None,
                     reason: Some(decode_reason),
                 });
@@ -1756,7 +1643,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             };
             self.seal(height, block_disp).await?;
             // the block spine. NOTHING in this repo ever said "height H produced
-            // app-hash X" — and fork triage, upgrade verification, and "is my node
+            // root-hash X" — and fork triage, upgrade verification, and "is my node
             // keeping up" all start exactly there.
             //
             // gated on `any_applied`: an idle chain heartbeats a nop block every
@@ -1767,7 +1654,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     target: "ducktape::consensus",
                     height,
                     view,
-                    app_hash = %hex_root(&batch_hash),
+                    root_hash = %hex_root(&batch_hash),
                     applied = applied_count,
                     rejected = rejected_count,
                     "block committed"
@@ -1800,7 +1687,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             if self.finalized.is_none_or(|f| height > f.height) {
                 self.finalized = Some(host::FinalizedBlock {
                     height,
-                    app_hash: self.host.app_hash(),
+                    root_hash: self.host.root_hash(),
                 });
                 self.finalized_view = Some(view);
             }
@@ -1809,13 +1696,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     }
 
     /// journal a settled block's outcome: disposition + the post-block root
-    /// vector (the replay positions) + the composed app-hash.
+    /// vector (the replay positions) + the composed root-hash.
     async fn seal(&mut self, height: u64, disposition: Disposition) -> Result<(), Error> {
         let seal = BlockSeal {
             height,
             disposition,
             roots: self.host.module_roots(),
-            app_hash: self.host.app_hash(),
+            root_hash: self.host.root_hash(),
         };
         self.sink.seal(&seal).await
     }
@@ -1834,9 +1721,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.finalized_view
     }
 
-    /// the current app-hash of the wrapped host.
-    pub fn app_hash(&self) -> StateRoot {
-        self.host.app_hash()
+    /// the current root-hash of the wrapped host.
+    pub fn root_hash(&self) -> StateRoot {
+        self.host.root_hash()
     }
 
     /// take the events accumulated by applied blocks since the last call. the
@@ -1902,7 +1789,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// to drive `Host::set_active_version` across the registry at `H` (design §4).
     /// this sets non-hashed dual-path branch selectors only; it never mutates
     /// hashed state (that rides the in-block System `Advance` the host drain
-    /// injects), so it cannot move the app-hash on its own.
+    /// injects), so it cannot move the root-hash on its own.
     pub fn host_mut(&mut self) -> &mut Host {
         &mut self.host
     }

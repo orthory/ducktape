@@ -1,6 +1,6 @@
 //! the lifecycle module's public wire surface — types only.
 //!
-//! lifecycle is the MODULE CODE coordination plane, folded into ONE app-hashed
+//! lifecycle is the MODULE CODE coordination plane, folded into ONE root-hashed
 //! `root()`: per hot-swappable module, the ACTIVE 32-byte code hash plus at
 //! most one pending `ScheduledSwap`; governance authorizes a
 //! register/schedule/cancel, each validator emits `SwapReady` once the target
@@ -10,6 +10,7 @@
 //! hash); this module is the consensus commitment to WHICH code is active,
 //! never the bytes.
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 /// the genesis-constant module id the lifecycle module registers under. the host
@@ -25,7 +26,7 @@ pub const CODE_HASH_LEN: usize = 32;
 
 /// coordinates of a scheduled code swap for one module. **at most one** is ever
 /// pending per module.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ScheduledSwap {
     pub name: String,
     pub activation_height: u64,

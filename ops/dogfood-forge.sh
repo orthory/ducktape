@@ -21,7 +21,6 @@
 #   2. the ACTIVE workspace's http_listen — ~/.ducktape/registry.json (.active)
 #                                            -> ~/.ducktape/workspaces/<active>/node.toml
 #      (the workspace flow assigns a RANDOM http port, so this is not a fixed :8844)
-#   3. http://127.0.0.1:8844             — the web/legacy default
 #
 # Env knobs:
 #   DUCKTAPE_DEV_FORGE_URL  node base URL override (no trailing /forge/<repo>)
@@ -77,7 +76,7 @@ resolve_base_url() {
       fi
     fi
   fi
-  printf 'http://127.0.0.1:8844'
+  die "no Forge node selected; set DUCKTAPE_DEV_FORGE_URL or start an active workspace"
 }
 
 BASE_URL="$(resolve_base_url)"
@@ -142,8 +141,8 @@ else
     command -v node >/dev/null || die "node is required to read the node identity"
     NODE_ID=$(
       curl -fsS -m 5 "$BASE_URL/v1/status" |
-        node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const k=JSON.parse(s).publicKey||"";if(!/^[0-9a-f]{64}$/i.test(k))process.exit(1);process.stdout.write(k.toLowerCase())})'
-    ) || die "the node status has no valid publicKey"
+        node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const k=JSON.parse(s).public_key||"";if(!/^[0-9a-f]{64}$/i.test(k))process.exit(1);process.stdout.write(k.toLowerCase())})'
+    ) || die "the node status has no valid public_key"
     TREE_OID=$(git rev-parse "$SOURCE_OID^{tree}")
     EXPECTED_OID=$(
       GIT_AUTHOR_NAME="$NODE_ID" \

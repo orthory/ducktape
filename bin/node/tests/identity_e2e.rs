@@ -32,11 +32,11 @@ fn boot(cluster: &mut Cluster) {
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
     cluster.spawn(1);
     let genesis: Vec<String> = (0..2)
-        .map(|i| cluster.wait_marker(i, "genesis app_hash=", Duration::from_secs(60)))
+        .map(|i| cluster.wait_marker(i, "genesis root_hash=", Duration::from_secs(60)))
         .collect();
     assert_eq!(genesis[0], genesis[1], "genesis fork between nodes 0 and 1");
     for i in 0..2 {
-        cluster.wait_marker(i, "converged app_hash=", CONVERGE);
+        cluster.wait_marker(i, "converged root_hash=", CONVERGE);
     }
 }
 

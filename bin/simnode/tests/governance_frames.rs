@@ -1,5 +1,5 @@
 //! account-signed governance FRAMES over the sim's real `/v1/submit/frame` wire
-//! (ADR A1, the W2 governance migration): admit/promote/demote/leave now leave
+//! (ADR A1, the account-signed governance lane): admit/promote/demote/leave leave
 //! the bespoke node-local re-signing lane and arrive as frames the app signs
 //! with the USER's ACCOUNT key. The governance module authorizes the verified
 //! frame origin by resolving it — via the committed `BindNode` — to the
@@ -64,7 +64,6 @@ fn gov_frame_ok(sim: &Sim, signer: &Ed, seq: u64, msg: &GovMsg) {
             target: "governance".into(),
             payload: gov_encode(msg),
         },
-        None,
     );
     let (code, reply) = sim.submit_frame(&frame);
     assert_eq!(code, 200, "governance frame must commit: {reply}");
@@ -149,7 +148,10 @@ fn an_account_signed_frame_admits_a_resident_through_its_bound_node_standing() {
     );
 
     // the proposer was recorded as the ACCOUNT, and the grant landed.
-    let proposal = sim.query("governance", json!({ "proposal": { "proposal_id": "admit" } }));
+    let proposal = sim.query(
+        "governance",
+        json!({ "proposal": { "proposal_id": "admit" } }),
+    );
     assert_eq!(proposal["proposal"]["status"], "passed", "{proposal}");
     assert_eq!(
         proposal["proposal"]["proposer"],
@@ -182,10 +184,12 @@ fn a_frame_from_a_key_without_standing_is_refused() {
                 voting_period: 20,
             }),
         },
-        None,
     );
     let (code, reply) = sim.submit_frame(&frame);
-    assert_eq!(code, 400, "a signer without standing must be refused: {reply}");
+    assert_eq!(
+        code, 400,
+        "a signer without standing must be refused: {reply}"
+    );
     let err = reply["error"].as_str().unwrap_or_default();
     assert!(
         err.contains("standing"),
@@ -245,7 +249,10 @@ fn an_account_signed_frame_demotes_a_validator() {
         },
     );
 
-    let proposal = sim.query("governance", json!({ "proposal": { "proposal_id": "demote" } }));
+    let proposal = sim.query(
+        "governance",
+        json!({ "proposal": { "proposal_id": "demote" } }),
+    );
     assert_eq!(proposal["proposal"]["status"], "passed", "{proposal}");
     let members = sim.query("valset", json!("validators"));
     assert!(

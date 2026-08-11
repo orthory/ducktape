@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use wireguard::EndpointAdvertisement;
+use wireguard::{EndpointAdvertisement, SignedEndpointRecord};
 
 /// Bumped whenever the on-disk layout changes shape; `load` refuses other
 /// versions (the restore is best-effort — a stale-format file just means one
@@ -44,27 +44,40 @@ pub enum StoreError {
         found: String,
         expected: String,
     },
-    #[error("mesh state file {path}: advert signature invalid")]
+    #[error("mesh state file {path}: persisted signature invalid")]
     BadSignature { path: String },
 }
 
 /// The persisted mesh: every member's signed advertisement from the last
-/// epoch this node applied tunnels for (this node's own included).
+/// epoch this node applied tunnels for (this node's own included), plus the
+/// standby records accepted by then.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedMesh {
     pub format: u32,
     pub chain_id: String,
     pub epoch: u64,
     pub adverts: Vec<EndpointAdvertisement>,
+    /// The pre-warm layer's accepted standby records (member side). These
+    /// persist because a parked resident cannot re-introduce itself to a
+    /// member that forgot its WireGuard key: its invite token was consumed
+    /// at admission and every transport it has left rides the overlay this
+    /// very file re-establishes.
+    pub standby_records: Vec<SignedEndpointRecord>,
 }
 
 impl PersistedMesh {
-    pub fn new(chain_id: String, epoch: u64, adverts: Vec<EndpointAdvertisement>) -> Self {
+    pub fn new(
+        chain_id: String,
+        epoch: u64,
+        adverts: Vec<EndpointAdvertisement>,
+        standby_records: Vec<SignedEndpointRecord>,
+    ) -> Self {
         Self {
             format: MESH_STORE_FORMAT,
             chain_id,
             epoch,
             adverts,
+            standby_records,
         }
     }
 }
@@ -129,6 +142,13 @@ pub fn load(path: &Path, chain_id: &str) -> Result<Option<PersistedMesh>, StoreE
             });
         }
     }
+    for record in &mesh.standby_records {
+        if record.verify().is_err() {
+            return Err(StoreError::BadSignature {
+                path: path.display().to_string(),
+            });
+        }
+    }
     Ok(Some(mesh))
 }
 
@@ -142,7 +162,7 @@ mod tests {
         ValidatorIdentity, X25519PublicKey,
     };
 
-    fn advert(seed: u64, octet: u8) -> EndpointAdvertisement {
+    fn record_of(seed: u64, octet: u8) -> (EndpointRecord, PrivateKey) {
         let policy = PortPolicy::production();
         let signer = PrivateKey::from_seed(seed);
         let endpoint = |port: u16, transport| {
@@ -165,11 +185,26 @@ mod tests {
             wireguard_endpoint: Some(endpoint(51820, Transport::Udp)),
             nonce: 1,
         };
+        (record, signer)
+    }
+
+    fn advert(seed: u64, octet: u8) -> EndpointAdvertisement {
+        let (record, signer) = record_of(seed, octet);
         EndpointAdvertisement::sign(record, MeshVersion([7; 32]), &signer)
     }
 
+    fn standby_record(seed: u64, octet: u8) -> SignedEndpointRecord {
+        let (record, signer) = record_of(seed, octet);
+        SignedEndpointRecord::sign(record, &signer)
+    }
+
     fn sample() -> PersistedMesh {
-        PersistedMesh::new("net#store".into(), 3, vec![advert(1, 10), advert(2, 20)])
+        PersistedMesh::new(
+            "net#store".into(),
+            3,
+            vec![advert(1, 10), advert(2, 20)],
+            vec![standby_record(3, 30)],
+        )
     }
 
     #[test]
@@ -194,6 +229,23 @@ mod tests {
         // longer covers what the file claims.
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, text.replace("\"epoch\": 3", "\"epoch\": 4")).unwrap();
+
+        assert!(matches!(
+            load(&path, "net#store"),
+            Err(StoreError::BadSignature { .. })
+        ));
+    }
+
+    #[test]
+    fn refuses_a_tampered_standby_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mesh-state.json");
+        save(&path, &sample()).unwrap();
+
+        // redirect the standby record's endpoint (its address is unique to
+        // it in the file): the owner signature no longer covers the claim.
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("8.8.8.30", "8.8.8.31")).unwrap();
 
         assert!(matches!(
             load(&path, "net#store"),

@@ -1,6 +1,6 @@
 ---
 name: module-dev
-description: Use when creating a new ducktape consensus module, porting a native module to a wasm guest, or wiring a module into the genesis set — MODULE_IDS, host_state, crates/guests, Makefile wasm-modules. Also when a module change breaks the app-hash, the registry parity test, include_bytes compilation, or wasm-modules-check.
+description: Use when creating a new ducktape consensus module, porting a native module to a wasm guest, or wiring a module into the genesis set — MODULE_IDS, host_state, crates/guests, Makefile wasm-modules. Also when a module change breaks the root-hash, the registry parity test, include_bytes compilation, or wasm-modules-check.
 ---
 
 # Module development — the end-to-end wiring runbook
@@ -13,7 +13,7 @@ A module is four layers: native crate (the logic) → wasm guest (the packaging)
 cutover pattern). This skill is the wiring checklist that record doesn't cover.
 External/third-party authoring rides `ducktape-quack`, not this path.
 
-## Decide first: genesis registration is an app-hash break
+## Decide first: genesis registration is a root-hash break
 
 A module in `MODULE_IDS` joins the genesis set: every existing workspace fails
 closed, dev networks re-genesis. Post-genesis admission (lifecycle
@@ -32,8 +32,8 @@ Clone the `tasks` shape:
   `commit_block`) + `snapshot()`/`install()`. Re-export `interface` at root.
 - `tests/` — happy path, every rejection, snapshot→install root round-trip.
 - Root `Cargo.toml`: `members` entry + `[workspace.dependencies]` alias.
-- Native-only deps (derived index, unix IO, tokio) must sit behind a `native`
-  feature or be absent — the guest build compiles this same crate to wasm32.
+- Native-only deps (media engines, unix IO, tokio) must sit behind a `native`
+  feature or be absent — the guest builds compile this same crate to wasm32.
 
 ## 2. Wasm guest — `src/guest.rs` in the module crate, packaged by guest-builder
 
@@ -51,11 +51,29 @@ canonical COMMITTED `component.wasm` into the module directory.
 `Makefile`: add the module to `BUILDER_MODULES` — that one entry covers the
 build, the fixture `cp`, and the `wasm-modules-check` `cmp`.
 
+## 2b. Index guest (optional) — the module's derived-tier mapper
+
+A module that wants a materialized view (search, listings — anything qmdb's
+point lookups can't serve) ships a SECOND wasm artifact: the index guest
+(spec: `docs/records/specs/indexable-spec.md`). Same two-file shape in the
+module crate:
+- `src/index.rs` — the pure decision core: `fold_op`/`serve_view` over the
+  `index_guest` contract crate (dep `index_guest = { workspace = true }`,
+  never `indexer`). Unit-test natively against a `BTreeMap`.
+- `src/index_guest.rs` behind `index-guest = ["index_guest/guest"]` — the
+  ~15-line engine shell (`EngineRead`, `apply`, `index_guest::fold!`/`view!`).
+
+`guest-builder --index <module-dir>` writes the committed `index.wasm`; add
+the module to `INDEX_MODULES` in the Makefile and to `index_guest_wasm()` in
+`bin/noded/src/index.rs` (the bundled include_bytes registry). The fold runs
+ASYNC behind a fluent31 changes-mode trigger — views trail the op feed
+observably (`/v1/index/status` `fold.{module}`), never atomically.
+
 ## 3. Registration — four bins compose modules
 
 | Bin | Runs | What to touch |
 |---|---|---|
-| `bin/node` | production set: native + wasm tenants | `constants.rs`: `MODULE_IDS` + `MODULE_STATE_SCHEMAS` (bump the `[..; N]` literals). `host_state.rs`: ~10 sites — grep an existing module id and mirror EVERY hit (`include_bytes!`, id const, `genesis_<id>_wasm`, `seeded_lifecycle`, `seed_genesis_components`, `ProductionModules` field, `compose`, `genesis_host`, `restore_host`, `sync_all_modules`). `Cargo.toml` dep. |
+| `bin/node` | production set: native + wasm tenants | `constants.rs`: `MODULE_IDS` (bump the `[..; N]` literal). `host_state.rs`: ~10 sites — grep an existing module id and mirror EVERY hit (`include_bytes!`, id const, `genesis_<id>_wasm`, `seeded_lifecycle`, `seed_genesis_components`, `ProductionModules` field, `compose`, `genesis_host`, `restore_host`, `sync_all_modules`). `Cargo.toml` dep. |
 | `bin/noded` | daemon, composes native instances | grep `"tasks"`: id list, `use`, construct, register |
 | `bin/simnode` | deterministic /v1 twin | same shape as noded |
 | `bin/demo` | in-process walkthrough | same shape |
@@ -64,9 +82,8 @@ noded/simnode/demo run a SUBSET — a wasm-only tenant (e.g. `vaults`) appears
 in `bin/node` alone. Decide whether the module belongs in the daemon/sim lanes;
 if it should be testable in sim-lane or visible in the app, it does.
 
-A new module joins the two live arrays — `MODULE_IDS` and
-`MODULE_STATE_SCHEMAS` — and keep each array's declared `[..; N]` length equal
-to its contents (the auto-merge count trap).
+A new module joins `MODULE_IDS`; keep its declared `[..; N]` length equal to
+its contents (the auto-merge count trap).
 
 ## 4. Gates — ordering is load-bearing
 

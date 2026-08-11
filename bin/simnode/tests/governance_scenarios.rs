@@ -200,9 +200,13 @@ fn a_redeemed_invite_grants_residency_in_its_own_block_and_audits_the_admission(
         "joiner is a resident: {residents}"
     );
 
-    // …and the audit row records who invited whom, at what height.
-    let redemptions = sim.query("governance", json!("redemptions"));
-    let row = &redemptions["redemptions"][0];
+    // …and the point read by nonce records who invited whom, at what height
+    // (the redeemed set has no enumeration — it is point records alone).
+    let redemptions = sim.query(
+        "governance",
+        json!({ "redemption": { "nonce": nonce.to_vec() } }),
+    );
+    let row = &redemptions["redemption"];
     assert_eq!(row["nonce"], json!(nonce.to_vec()), "row: {row}");
     assert_eq!(row["joiner"], json!(joiner.public_key().as_ref().to_vec()));
     assert_eq!(row["issuer"], json!(issuer.public_key().as_ref().to_vec()));

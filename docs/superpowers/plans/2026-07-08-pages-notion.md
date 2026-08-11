@@ -14,7 +14,7 @@
 - No changes under `crates/` or `bin/` (consensus safety); `app/src-tauri` only for the macOS menu.
 - Existing store actions (`ConsoleActions`) are the only data surface — no new transport calls.
 - Tests: run from `app/` with `bun run test -- <file>`; full suite `bun run test` + `bun run typecheck` must pass before PR.
-- Working dir: `/home/eddy/dev/ducktape/.claude/worktrees/pages-notion` (branch `feat/pages-notion`).
+- Working dir: `<repo>/.claude/worktrees/pages-notion` (branch `feat/pages-notion`).
 - All aria-labels referenced in tests must match exactly.
 
 ---

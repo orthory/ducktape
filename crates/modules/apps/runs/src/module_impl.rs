@@ -1,7 +1,154 @@
 use super::{
-    Ctx, Error, Module, ModuleId, Msg, Origin, RunsModule, RunsQuery, RunsReply, StateRoot,
-    StateSyncHandle, WatchView, committed_root, decode_query, encode_reply,
+    Ctx, Error, Event, Module, ModuleId, Msg, Origin, RunsModule, RunsQuery, RunsReply,
+    SiblingReadBudget, StateRoot, StateSyncHandle, WatchView, committed_root, decode_query,
+    encode_reply,
 };
+
+#[derive(Clone, Copy)]
+enum ExecuteKind {
+    Engagement,
+    Result,
+    Jobs,
+    Agent,
+    Saga,
+    Chat,
+    Admin,
+}
+
+struct BudgetCtx<'ctx, 'budget> {
+    inner: &'ctx mut dyn Ctx,
+    budget: &'budget SiblingReadBudget,
+}
+
+#[async_trait::async_trait(?Send)]
+impl Ctx for BudgetCtx<'_, '_> {
+    fn env(&self) -> &sdk::Env {
+        self.inner.env()
+    }
+
+    fn module_root(&self, target: &str) -> Option<StateRoot> {
+        self.budget
+            .reserve_root(target)
+            .then(|| self.inner.module_root(target))
+            .flatten()
+    }
+
+    async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
+        if !self.budget.reserve_query(target, req) {
+            return Err(Error::Module(format!(
+                "runs sibling-read budget exceeded ({})",
+                super::MAX_SIBLING_QUERY_READS
+            )));
+        }
+        self.inner.query(target, req).await
+    }
+
+    fn emit_msg(&mut self, msg: Msg) {
+        self.inner.emit_msg(msg);
+    }
+
+    fn emit_event(&mut self, event: Event) {
+        self.inner.emit_event(event);
+    }
+
+    fn relay(&self) -> Option<&sdk::Relay> {
+        self.inner.relay()
+    }
+
+    fn set_output(&mut self, bytes: Vec<u8>) {
+        self.inner.set_output(bytes);
+    }
+}
+
+impl RunsModule {
+    fn execute_kind(&self, origin: &Origin) -> ExecuteKind {
+        let Origin::Module(module) = origin else {
+            return ExecuteKind::Admin;
+        };
+        [
+            (Some(self.tagging.as_str()), ExecuteKind::Engagement),
+            (Some(self.dispatch.as_str()), ExecuteKind::Result),
+            (self.jobs.as_deref(), ExecuteKind::Jobs),
+            (Some(self.agent.as_str()), ExecuteKind::Agent),
+            (Some(self.saga.as_str()), ExecuteKind::Saga),
+            (Some(self.chat.as_str()), ExecuteKind::Chat),
+        ]
+        .into_iter()
+        .find_map(|(id, kind)| (id == Some(module.as_str())).then_some(kind))
+        .unwrap_or(ExecuteKind::Admin)
+    }
+
+    async fn execute_engagement(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
+        let budget = SiblingReadBudget::default();
+        self.on_engagement(
+            &mut BudgetCtx {
+                inner: ctx,
+                budget: &budget,
+            },
+            payload,
+            &budget,
+        )
+        .await
+    }
+
+    async fn execute_result(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
+        let budget = SiblingReadBudget::default();
+        self.on_result_event(
+            &mut BudgetCtx {
+                inner: ctx,
+                budget: &budget,
+            },
+            payload,
+        )
+        .await
+    }
+
+    async fn execute_jobs(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
+        let budget = SiblingReadBudget::default();
+        self.on_jobs_event(
+            &mut BudgetCtx {
+                inner: ctx,
+                budget: &budget,
+            },
+            payload,
+        )
+        .await
+    }
+
+    fn execute_agent(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
+        let budget = SiblingReadBudget::default();
+        self.on_agent_event(
+            &mut BudgetCtx {
+                inner: ctx,
+                budget: &budget,
+            },
+            payload,
+        )
+    }
+
+    fn drop_saga_callback(&mut self, ctx: &mut dyn Ctx) -> Result<(), Error> {
+        self.note(ctx, "dropped a direct saga callback".into());
+        Ok(())
+    }
+
+    fn drop_chat_follow_up(&mut self, ctx: &mut dyn Ctx) -> Result<(), Error> {
+        self.note(ctx, "dropped a direct chat follow-up".into());
+        Ok(())
+    }
+
+    async fn execute_admin(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        let budget = SiblingReadBudget::default();
+        self.on_admin(
+            &mut BudgetCtx {
+                inner: ctx,
+                budget: &budget,
+            },
+            msg,
+            &budget,
+        )
+        .await
+    }
+}
 
 #[async_trait::async_trait(?Send)]
 impl Module for RunsModule {
@@ -9,18 +156,11 @@ impl Module for RunsModule {
         self.id.clone()
     }
 
-    // Revision 3 makes pending run ids explicit and adds ephemeral delegation
-    // authority/results. Older snapshots clean-break at the coordinated module
-    // activation boundary instead of being mis-decoded under the new layout.
-    fn state_schema_revision(&self) -> u32 {
-        3
-    }
-
     /// state-based commitment: sha256 over the canonical committed encoding —
     /// a length-prefixed fold of every watch, pending-entry, and agent-session
     /// field in sorted-key order. sensitive to every field, so any transition
     /// moves the root — opening a session, spending one of its actions, and
-    /// pruning it each move the app-hash, because the session registry IS the
+    /// pruning it each move the root-hash, because the session registry IS the
     /// mid-run ACL and every validator must hold the same one. the preimage IS
     /// the snapshot encoding.
     fn root(&self) -> StateRoot {
@@ -37,41 +177,16 @@ impl Module for RunsModule {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        // payload namespaces routed by the HOST-ASSIGNED origin — spoof-proof
-        // by construction: only the tagging plane's follow-ups reach the
-        // engagement intake, only dispatch's reach the result intake, only
-        // the registry's reach the recipe hook, and everything else (external
-        // submitters included) must decode as a RunsMsg. saga and chat
-        // origins are dead-lettered: neither may ever abort the block that
-        // carried them.
-        let origin = ctx.env().origin.clone();
-        match origin {
-            Origin::Module(module) if module == self.tagging => {
-                self.on_engagement(ctx, &msg.payload).await
-            }
-            Origin::Module(module) if module == self.dispatch => {
-                self.on_result_event(ctx, &msg.payload).await
-            }
-            Origin::Module(module) if self.jobs.as_ref() == Some(&module) => {
-                self.on_jobs_event(ctx, &msg.payload).await
-            }
-            Origin::Module(module) if module == self.agent => {
-                self.on_agent_event(ctx, &msg.payload)
-            }
-            Origin::Module(module) if module == self.saga => {
-                // dead letter: nothing here rides the saga directly, but any
-                // trigger's reply_to can point a callback at this module —
-                // it must never abort the saga's terminal block.
-                self.note(ctx, "dropped a direct saga callback".into());
-                Ok(())
-            }
-            Origin::Module(module) if module == self.chat => {
-                // dead letter: chat never notifies this module directly. a
-                // stray follow-up must never abort a posting block.
-                self.note(ctx, "dropped a direct chat follow-up".into());
-                Ok(())
-            }
-            _ => self.on_admin(ctx, msg).await,
+        // The one visible origin dispatch. Each arm delegates once to a
+        // budgeted handler whose stack-owned ledger spans that whole execute.
+        match self.execute_kind(&ctx.env().origin) {
+            ExecuteKind::Engagement => self.execute_engagement(ctx, &msg.payload).await,
+            ExecuteKind::Result => self.execute_result(ctx, &msg.payload).await,
+            ExecuteKind::Jobs => self.execute_jobs(ctx, &msg.payload).await,
+            ExecuteKind::Agent => self.execute_agent(ctx, &msg.payload),
+            ExecuteKind::Saga => self.drop_saga_callback(ctx),
+            ExecuteKind::Chat => self.drop_chat_follow_up(ctx),
+            ExecuteKind::Admin => self.execute_admin(ctx, msg).await,
         }
     }
 

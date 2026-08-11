@@ -52,7 +52,17 @@ fn hash(seed: u8) -> Vec<u8> {
     vec![seed; CODE_HASH_LEN]
 }
 fn fresh() -> Lifecycle {
-    Lifecycle::new("lifecycle", "valset")
+    Lifecycle::new(
+        "lifecycle",
+        Box::new(sdk_testkit::MemStore::new()),
+        "valset",
+    )
+}
+
+/// the root of a store that never committed anything — the store-backed twin
+/// of the old ZERO sentinel.
+fn empty_root() -> StateRoot {
+    fresh().root()
 }
 fn msg(m: LifecycleMsg) -> Msg {
     Msg {
@@ -121,9 +131,10 @@ fn make_swap_ready(lc: &mut Lifecycle, module_id: &str, name: &str) {
     commit(lc);
 }
 fn module_status(lc: &Lifecycle) -> Vec<ModuleCode> {
-    let bytes = futures::executor::block_on(
-        lc.query_with(&ctx(Origin::System, 0), &encode_query(&LifecycleQuery::ModuleStatus)),
-    )
+    let bytes = futures::executor::block_on(lc.query_with(
+        &ctx(Origin::System, 0),
+        &encode_query(&LifecycleQuery::ModuleStatus),
+    ))
     .unwrap();
     match decode_reply(&bytes).unwrap() {
         LifecycleReply::ModuleStatus { modules } => modules,
@@ -174,10 +185,19 @@ fn register_and_schedule_origin_gate() {
     commit(&mut lc);
     assert_eq!(module_status(&lc)[0].active_code_hash, hash(1));
     assert!(matches!(
-        run(&mut lc, &mut ext, &schedule_swap("hello", "v2", 10, 2)),
+        run(
+            &mut lc,
+            &mut ext,
+            &schedule_swap("hello", "replacement", 10, 2)
+        ),
         Err(Error::Module(_))
     ));
-    run(&mut lc, &mut gov, &schedule_swap("hello", "v2", 10, 2)).unwrap();
+    run(
+        &mut lc,
+        &mut gov,
+        &schedule_swap("hello", "replacement", 10, 2),
+    )
+    .unwrap();
     commit(&mut lc);
     assert!(module_status(&lc)[0].pending.is_some());
 }
@@ -198,7 +218,8 @@ fn register_rejects_reregistration_and_bad_hash() {
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
     let mut sys = ctx(Origin::System, 0);
-    assert!(run(
+    assert!(
+        run(
         &mut lc,
         &mut sys,
         &msg(LifecycleMsg::RegisterModule {
@@ -206,8 +227,10 @@ fn register_rejects_reregistration_and_bad_hash() {
             code_hash: hash(9)
         })
     )
-    .is_err());
-    assert!(run(
+        .is_err()
+    );
+    assert!(
+        run(
         &mut lc,
         &mut sys,
         &msg(LifecycleMsg::RegisterModule {
@@ -215,7 +238,8 @@ fn register_rejects_reregistration_and_bad_hash() {
             code_hash: vec![1, 2, 3]
         })
     )
-    .is_err());
+        .is_err()
+    );
 }
 
 #[test]
@@ -224,15 +248,41 @@ fn schedule_swap_validation() {
     register_module(&mut lc, "hello", 1);
     let mut sys = ctx(Origin::System, 0);
     // unregistered module.
-    assert!(run(&mut lc, &mut sys, &schedule_swap("ghost", "v2", 10, 2)).is_err());
+    assert!(
+        run(
+            &mut lc,
+            &mut sys,
+            &schedule_swap("ghost", "replacement", 10, 2)
+        )
+        .is_err()
+    );
     // min lead.
-    assert!(run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 3, 2)).is_err());
+    assert!(
+        run(
+            &mut lc,
+            &mut sys,
+            &schedule_swap("hello", "replacement", 3, 2)
+        )
+        .is_err()
+    );
     // no-op swap.
-    assert!(run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 10, 1)).is_err());
-    run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 10, 2)).unwrap();
+    assert!(
+        run(
+            &mut lc,
+            &mut sys,
+            &schedule_swap("hello", "replacement", 10, 1)
+        )
+        .is_err()
+    );
+    run(
+        &mut lc,
+        &mut sys,
+        &schedule_swap("hello", "replacement", 10, 2),
+    )
+    .unwrap();
     commit(&mut lc);
     // second pending.
-    assert!(run(&mut lc, &mut sys, &schedule_swap("hello", "v3", 20, 3)).is_err());
+    assert!(run(&mut lc, &mut sys, &schedule_swap("hello", "other", 20, 3)).is_err());
 }
 
 #[test]
@@ -240,9 +290,14 @@ fn swap_advance_activates_at_height_and_frees_slot() {
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
     let mut sys = ctx(Origin::System, 0);
-    run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 10, 2)).unwrap();
+    run(
+        &mut lc,
+        &mut sys,
+        &schedule_swap("hello", "replacement", 10, 2),
+    )
+    .unwrap();
     commit(&mut lc);
-    make_swap_ready(&mut lc, "hello", "v2");
+    make_swap_ready(&mut lc, "hello", "replacement");
 
     // below activation: no-op.
     let root_before = lc.root();
@@ -265,20 +320,25 @@ fn swap_readiness_gate() {
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
     let mut sys = ctx(Origin::System, 0);
-    run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 10, 2)).unwrap();
+    run(
+        &mut lc,
+        &mut sys,
+        &schedule_swap("hello", "replacement", 10, 2),
+    )
+    .unwrap();
     commit(&mut lc);
     // no readiness: never arms.
     assert!(armed_at(&lc, u64::MAX).is_empty());
 
     let two = vec![member(1), member(2)];
     let mut m1 = ctx(Origin::External(member(1)), 0).with_members(two.clone());
-    run(&mut lc, &mut m1, &swap_ready("hello", "v2")).unwrap();
+    run(&mut lc, &mut m1, &swap_ready("hello", "replacement")).unwrap();
     commit(&mut lc);
     assert!(!module_status(&lc)[0].pending.clone().unwrap().ready);
     assert!(armed_at(&lc, 10).is_empty());
 
     let mut m2 = ctx(Origin::External(member(2)), 0).with_members(two);
-    run(&mut lc, &mut m2, &swap_ready("hello", "v2")).unwrap();
+    run(&mut lc, &mut m2, &swap_ready("hello", "replacement")).unwrap();
     commit(&mut lc);
     assert!(module_status(&lc)[0].pending.clone().unwrap().ready);
     assert_eq!(armed_at(&lc, 10).len(), 1);
@@ -289,11 +349,16 @@ fn swap_signal_gates_origin_and_identity() {
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
     let mut sys = ctx(Origin::System, 0);
-    run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 10, 2)).unwrap();
+    run(
+        &mut lc,
+        &mut sys,
+        &schedule_swap("hello", "replacement", 10, 2),
+    )
+    .unwrap();
     commit(&mut lc);
-    assert!(run(&mut lc, &mut sys, &swap_ready("hello", "v2")).is_err());
+    assert!(run(&mut lc, &mut sys, &swap_ready("hello", "replacement")).is_err());
     let mut stranger = ctx(Origin::External(member(9)), 0);
-    assert!(run(&mut lc, &mut stranger, &swap_ready("hello", "v2")).is_err());
+    assert!(run(&mut lc, &mut stranger, &swap_ready("hello", "replacement")).is_err());
     let mut m1 = ctx(Origin::External(member(1)), 0);
     assert!(run(&mut lc, &mut m1, &swap_ready("hello", "vX")).is_err());
 }
@@ -303,12 +368,17 @@ fn swap_cancel_guards_and_clears() {
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
     let mut sys = ctx(Origin::System, 0);
-    run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 10, 2)).unwrap();
+    run(
+        &mut lc,
+        &mut sys,
+        &schedule_swap("hello", "replacement", 10, 2),
+    )
+    .unwrap();
     commit(&mut lc);
     assert!(run(&mut lc, &mut sys, &cancel_swap("hello", "vX")).is_err());
     let mut late = ctx(Origin::System, 10);
-    assert!(run(&mut lc, &mut late, &cancel_swap("hello", "v2")).is_err());
-    run(&mut lc, &mut sys, &cancel_swap("hello", "v2")).unwrap();
+    assert!(run(&mut lc, &mut late, &cancel_swap("hello", "replacement")).is_err());
+    run(&mut lc, &mut sys, &cancel_swap("hello", "replacement")).unwrap();
     commit(&mut lc);
     assert!(module_status(&lc)[0].pending.is_none());
     assert_eq!(module_status(&lc)[0].active_code_hash, hash(1));
@@ -337,11 +407,25 @@ fn admission_realizes_and_refuses_bad_inputs() {
     register_module(&mut lc, "hello", 1);
     let mut sys = ctx(Origin::System, 0);
     assert!(run(&mut lc, &mut sys, &schedule_register("hello", "v1", 10, 5)).is_err());
-    assert!(run(&mut lc, &mut sys, &schedule_register("kanban", "v1", MIN_SWAP_LEAD, 5)).is_err());
+    assert!(
+        run(
+            &mut lc,
+            &mut sys,
+            &schedule_register("kanban", "v1", MIN_SWAP_LEAD, 5)
+        )
+        .is_err()
+    );
     let mut ext = ctx(Origin::External(member(1)), 0);
     assert!(run(&mut lc, &mut ext, &schedule_register("kanban", "v1", 10, 5)).is_err());
     let mut live = ctx(Origin::System, 0).with_module_root("valset", StateRoot::ZERO);
-    assert!(run(&mut lc, &mut live, &schedule_register("valset", "v1", 10, 5)).is_err());
+    assert!(
+        run(
+            &mut lc,
+            &mut live,
+            &schedule_register("valset", "v1", 10, 5)
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -360,46 +444,54 @@ fn cancelled_admission_removes_entry() {
 // ============================================================================
 
 #[test]
-fn root_zero_fresh_then_state_moves_it() {
+fn root_empty_fresh_then_state_moves_it() {
     let mut lc = fresh();
-    assert_eq!(lc.root(), StateRoot::ZERO);
+    assert_eq!(lc.root(), empty_root());
     register_module(&mut lc, "hello", 1);
     let after_register = lc.root();
-    assert_ne!(after_register, StateRoot::ZERO);
+    assert_ne!(after_register, empty_root());
     let mut sys = ctx(Origin::System, 0);
-    run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 10, 2)).unwrap();
+    run(
+        &mut lc,
+        &mut sys,
+        &schedule_swap("hello", "replacement", 10, 2),
+    )
+    .unwrap();
     commit(&mut lc);
     assert_ne!(lc.root(), after_register);
 }
 
 #[test]
-fn snapshot_round_trips_and_rejects_tampering() {
+fn genesis_seed_publishes_once_and_reseeding_is_a_no_op() {
     let mut lc = fresh();
-    let mut sys = ctx(Origin::System, 0);
-    register_module(&mut lc, "hello", 1);
-    run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 20, 2)).unwrap();
-    commit(&mut lc);
-    make_swap_ready(&mut lc, "hello", "v2");
+    futures::executor::block_on(async {
+        lc.seed("hello", hash(1)).await.unwrap();
+        lc.seed("directory", hash(2)).await.unwrap();
+        lc.finish_seed().await.unwrap();
+    });
+    let seeded = lc.root();
+    assert_ne!(seeded, empty_root(), "the seed set is committed state");
+    assert_eq!(module_status(&lc).len(), 2);
 
-    let bytes = lc.snapshot();
-    let root = lc.root();
-    let digest: [u8; 32] = Sha256::digest(&bytes).into();
-    assert_eq!(StateRoot(digest), root, "sha256(snapshot) == root");
-    let mut dst = fresh();
-    dst.install(&bytes, root).expect("install round-trips");
-    assert_eq!(dst.committed, lc.committed);
-    assert_eq!(dst.root(), root);
-
-    // tamper rejected, target untouched.
-    let mut flipped = bytes.clone();
-    flipped[0] ^= 0x01;
-    let mut other = fresh();
-    register_module(&mut other, "z", 7);
-    let pre = other.root();
-    assert!(other.install(&flipped, root).is_err());
-    assert!(other.install(&bytes[..bytes.len() - 1], root).is_err());
-    let mut trailing = bytes.clone();
-    trailing.push(0);
-    assert!(other.install(&trailing, root).is_err());
-    assert_eq!(other.root(), pre, "failed install left target untouched");
+    // a reopened workspace re-entering the genesis path re-seeds — the
+    // idempotence gate must leave the store byte-untouched.
+    futures::executor::block_on(async {
+        lc.seed("hello", hash(9)).await.unwrap();
+        lc.finish_seed().await.unwrap();
+    });
+    assert_eq!(
+        lc.root(),
+        seeded,
+        "re-seeding an initialized store is a no-op"
+    );
+    let status = module_status(&lc);
+    assert_eq!(
+        status
+            .iter()
+            .find(|m| m.module_id == "hello")
+            .unwrap()
+            .active_code_hash,
+        hash(1),
+        "the original seed survived the re-entry"
+    );
 }

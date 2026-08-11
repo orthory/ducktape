@@ -21,8 +21,11 @@ use sha2::Digest as _;
 use crate::{Error, MerkleStore, ResolverSyncTarget, StateRoot, StateSyncHandle};
 
 /// hash a logical key to its fixed-width store key. deterministic, so every
-/// validator maps a given logical key to the same store slot.
-fn hash_key(key: &[u8]) -> [u8; 32] {
+/// validator maps a given logical key to the same store slot. public because
+/// the mapping is a CONVENTION shared beyond this overlay: the host seeds a
+/// store-backed tenant's genesis-config record (`genesis_config::CONFIG_KEY`)
+/// at exactly this slot, and the guest adapter reads it back the same way.
+pub fn store_key(key: &[u8]) -> [u8; 32] {
     sha2::Sha256::digest(key).into()
 }
 
@@ -60,7 +63,16 @@ impl StagedStore {
         if let Some(staged) = self.pending.get(key) {
             return Ok(staged.clone());
         }
-        self.store.get(&hash_key(key)).await
+        self.store.get(&store_key(key)).await
+    }
+
+    /// read `key` from COMMITTED state only, bypassing the overlay — the
+    /// boundary-decider read: a kernel coordinator whose activation decides
+    /// over the frozen end-of-(H-1) state (lifecycle's `Advance`, dispatch's
+    /// committed-only query lane) must not see writes staged earlier in the
+    /// same block. everything else reads [`get`](StagedStore::get).
+    pub async fn get_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        self.store.get(&store_key(key)).await
     }
 
     /// stage `key -> value` (upsert) for this block WITHOUT committing. visible
@@ -95,7 +107,7 @@ impl StagedStore {
         let writes = self
             .pending
             .iter()
-            .map(|(key, value)| (hash_key(key), value.clone()))
+            .map(|(key, value)| (store_key(key), value.clone()))
             .collect();
         self.store.commit_batch(writes).await?;
         self.pending.clear();

@@ -101,8 +101,7 @@ pub struct ProxyRequestHead {
     pub headers: Vec<ProxyHeader>,
     pub body_len: u64,
     /// Request a WebSocket upgrade (GET, no body) on a route signed
-    /// `allow_upgrade`. Defaults false so older/non-WS callers stay wire-compatible.
-    #[serde(default)]
+    /// `allow_upgrade`.
     pub upgrade: bool,
 }
 
@@ -315,9 +314,7 @@ pub fn request_matches_record(head: &ProxyRequestHead, record: &RouteRecord) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        MemberAuthorization, RouteDefinition, RoutePolicy, RouteStatement, RouteTarget,
-    };
+    use crate::{MemberAuthorization, RouteDefinition, RoutePolicy, RouteStatement, RouteTarget};
 
     fn record() -> RouteRecord {
         RouteRecord {
@@ -381,6 +378,23 @@ mod tests {
     }
 
     #[test]
+    fn request_head_requires_the_upgrade_verdict() {
+        let mut value = serde_json::to_value(ProxyRequestHead {
+            account_id: vec![1; 32],
+            name: RouteName::named("api"),
+            revision: 7,
+            method: RouteMethod::Get,
+            path_and_query: "/".into(),
+            headers: Vec::new(),
+            body_len: 0,
+            upgrade: false,
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("upgrade");
+        assert!(decode_proxy_request_head(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
     fn absolute_urls_and_smuggling_fail_closed() {
         for path in [
             "https://evil.test",
@@ -430,7 +444,13 @@ mod tests {
         ] {
             assert!(!header_forwardable(name), "should have stripped {name}");
         }
-        for name in ["cookie", "authorization", "content-type", "accept", "if-none-match"] {
+        for name in [
+            "cookie",
+            "authorization",
+            "content-type",
+            "accept",
+            "if-none-match",
+        ] {
             assert!(header_forwardable(name), "should have forwarded {name}");
         }
     }

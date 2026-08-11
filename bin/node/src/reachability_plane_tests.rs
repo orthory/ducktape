@@ -39,7 +39,12 @@ fn joiner_wg_keypair() -> reachability::WireGuardKeypair {
 fn intro_bytes() -> (Vec<u8>, ed25519::PublicKey, reachability::WireGuardKeypair) {
     let issuer = ed25519::PrivateKey::from_seed(1);
     let joiner = ed25519::PrivateKey::from_seed(2);
-    let token = mint_invite_token(&issuer, BINDING, crate::config::InviteRole::Resident, u64::MAX);
+    let token = mint_invite_token(
+        &issuer,
+        BINDING,
+        crate::config::InviteRole::Resident,
+        u64::MAX,
+    );
     let wg = joiner_wg_keypair();
     let msg = lobby::intro_request(&joiner, BINDING, &token, wg.public_key().0);
     (lobby::encode_intro(&msg), joiner.public_key(), wg)
@@ -47,7 +52,9 @@ fn intro_bytes() -> (Vec<u8>, ed25519::PublicKey, reachability::WireGuardKeypair
 
 /// open a post-verify (SEALED) ack with the joiner's WG secret and decode it.
 fn open_sealed_ack(wg: &reachability::WireGuardKeypair, sealed: &[u8]) -> lobby::IntroAck {
-    let opened = wg.open_sealed(sealed).expect("sealed to the joiner's WG key");
+    let opened = wg
+        .open_sealed(sealed)
+        .expect("sealed to the joiner's WG key");
     lobby::decode_intro_ack(&opened).expect("a decodable ack")
 }
 
@@ -142,31 +149,33 @@ async fn junk_neither_installs_nor_acks() {
 }
 
 #[tokio::test]
-async fn a_failed_verification_acks_direct_and_stays_silent_coordinated() {
+async fn a_failed_verification_stays_silent() {
     // a well-formed intro minted for ANOTHER network: decodes, fails verify.
     let (bytes, _, _) = intro_bytes();
-    for (path, acks_back) in [(IntroPath::Direct, true), (IntroPath::Coordinated, false)] {
+    for path in [IntroPath::Direct, IntroPath::Coordinated] {
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(8);
         let weak = cmd_tx.downgrade();
         let acked: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
         let store = acked.clone();
-        let alive = handle_intro(&bytes, src(), b"other-net", "test", path, &weak, open_identity, None, |b| {
+        let alive = handle_intro(
+            &bytes,
+            src(),
+            b"other-net",
+            "test",
+            path,
+            &weak,
+            open_identity,
+            None,
+            |b| {
             store.lock().unwrap().push(b);
             async {}
-        })
+            },
+        )
         .await;
         assert!(alive);
         assert!(cmd_rx.try_recv().is_err(), "no install on failed verify");
-        let acked = acked.lock().unwrap();
-        if acks_back {
-            // a PRE-VERIFY refusal goes out in the CLEAR (no joiner key
-            // trusted yet) — it decodes without any seal.
-            let ack = lobby::decode_intro_ack(&acked[0]).expect("direct path acks the refusal");
-            assert!(matches!(ack.reply, lobby::IntroReply::Refused { .. }));
-        } else {
-            assert!(acked.is_empty(), "the coordinated path stays silent");
-        }
+        assert!(acked.lock().unwrap().is_empty());
     }
 }
 
@@ -186,20 +195,37 @@ async fn an_expired_token_neither_installs_nor_tunnels() {
         1, // 1970 — long expired
     );
     let wg = joiner_wg_keypair();
-    let bytes =
-        lobby::encode_intro(&lobby::intro_request(&joiner, BINDING, &token, wg.public_key().0));
+    let bytes = lobby::encode_intro(&lobby::intro_request(
+        &joiner,
+        BINDING,
+        &token,
+        wg.public_key().0,
+    ));
 
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(8);
     let weak = cmd_tx.downgrade();
     let acked: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
     let store = acked.clone();
-    let alive = handle_intro(&bytes, src(), BINDING, "test", IntroPath::Direct, &weak, open_identity, None, |b| {
+    let alive = handle_intro(
+        &bytes,
+        src(),
+        BINDING,
+        "test",
+        IntroPath::Direct,
+        &weak,
+        open_identity,
+        None,
+        |b| {
         store.lock().unwrap().push(b);
         async {}
-    })
+        },
+    )
     .await;
     assert!(alive);
-    assert!(cmd_rx.try_recv().is_err(), "no tunnel install for an expired token");
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "no tunnel install for an expired token"
+    );
     let acked = acked.lock().unwrap();
     // the expiry gate runs POST-verify, so its refusal is sealed.
     let ack = open_sealed_ack(&wg, &acked[0]);
@@ -217,19 +243,38 @@ async fn a_client_role_intro_neither_installs_nor_tunnels() {
     // the tunnel — a doomed join never obtains one.
     let issuer = ed25519::PrivateKey::from_seed(1);
     let joiner = ed25519::PrivateKey::from_seed(2);
-    let token = mint_invite_token(&issuer, BINDING, crate::config::InviteRole::Client, u64::MAX);
+    let token = mint_invite_token(
+        &issuer,
+        BINDING,
+        crate::config::InviteRole::Client,
+        u64::MAX,
+    );
     let wg = joiner_wg_keypair();
-    let bytes =
-        lobby::encode_intro(&lobby::intro_request(&joiner, BINDING, &token, wg.public_key().0));
+    let bytes = lobby::encode_intro(&lobby::intro_request(
+        &joiner,
+        BINDING,
+        &token,
+        wg.public_key().0,
+    ));
 
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(8);
     let weak = cmd_tx.downgrade();
     let acked: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
     let store = acked.clone();
-    let alive = handle_intro(&bytes, src(), BINDING, "test", IntroPath::Direct, &weak, open_identity, None, |b| {
+    let alive = handle_intro(
+        &bytes,
+        src(),
+        BINDING,
+        "test",
+        IntroPath::Direct,
+        &weak,
+        open_identity,
+        None,
+        |b| {
         store.lock().unwrap().push(b);
         async {}
-    })
+        },
+    )
     .await;
     assert!(alive);
     assert!(
@@ -252,10 +297,13 @@ fn a_sealed_intro_hides_the_token_and_opens_only_for_the_member() {
     // opaque bytes; only the member holding the matching secret can open it, and
     // the opened bundle verifies end to end. A DIFFERENT member cannot open it.
     let dir = tempfile::tempdir().unwrap();
-    let member =
-        reachability::WireGuardKeypair::load_or_generate(&dir.path().join("member.key")).unwrap().0;
+    let member = reachability::WireGuardKeypair::load_or_generate(&dir.path().join("member.key"))
+        .unwrap()
+        .0;
     let attacker =
-        reachability::WireGuardKeypair::load_or_generate(&dir.path().join("attacker.key")).unwrap().0;
+        reachability::WireGuardKeypair::load_or_generate(&dir.path().join("attacker.key"))
+            .unwrap()
+            .0;
 
     let (plaintext, joiner_pk, wg) = intro_bytes();
     let wg_pub = wg.public_key().0;
@@ -273,7 +321,9 @@ fn a_sealed_intro_hides_the_token_and_opens_only_for_the_member() {
     );
 
     // the member opens it and the bundle verifies exactly as before.
-    let opened = member.open_sealed(&sealed).expect("the member opens its own sealed intro");
+    let opened = member
+        .open_sealed(&sealed)
+        .expect("the member opens its own sealed intro");
     let msg = lobby::decode_intro(&opened).expect("decodes after open");
     let verified = lobby::verify_intro(&msg, BINDING).expect("verifies end to end");
     assert_eq!(verified.joiner, joiner_pk);
@@ -375,6 +425,9 @@ async fn a_gated_intro_forwards_once_and_answers_settled_outcomes() {
     let ack = open_sealed_ack(&wg, &acked.lock().unwrap()[1]);
     assert!(matches!(
         ack.reply,
-        lobby::IntroReply::Admitted { height: 12, cap: None }
+        lobby::IntroReply::Admitted {
+            height: 12,
+            cap: None
+        }
     ));
 }

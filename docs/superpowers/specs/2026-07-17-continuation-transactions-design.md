@@ -46,9 +46,9 @@ in its order. An await whose resumption lands in the SAME position (a
 deterministic read) may be real stack suspension, invisible to ordering.
 An await whose resumption lands in a LATER position cannot hold a stack
 at all: a parked frame is node-local memory, and nothing outside the
-app-hash may carry program state across blocks — so the frame must be
+root-hash may carry program state across blocks — so the frame must be
 reified into committed data, which is exactly what a continuation is.
-This system is an async runtime whose heap is the app-hash: the ticket is
+This system is an async runtime whose heap is the root-hash: the ticket is
 the suspended frame, `Resolve` is the waker, the `Release` injection is
 the executor, the deadline crank is the timeout, and `continue` is
 `.then()`. `.await` is syntactic sugar over reentrance; ordering is the
@@ -230,7 +230,7 @@ that reentry happens (with SOME outcome) is exactly the point of the
 system, so it must not depend on any off-consensus component behaving.
 
 Determinism inventory for the lane: ticket ids are frame-derived; the
-registry is a `BTreeMap` in a module root (part of the app-hash); stage,
+registry is a `BTreeMap` in a module root (part of the root-hash); stage,
 resolve, and release are all ops or deterministic drain injections;
 deadlines compare against consensus views, never wall clock. Nothing in the
 lane consults node-local state.
@@ -466,7 +466,7 @@ admission rejects any frame whose `cont_flag ≠ 0`.
   parse; caps enforced at submit; v2 signatures never verify under v3.
 - **Inline lane**: applied parent → continuation fires same unit with
   `Ok(output)`; rejected parent → fires with `Err(reason)`; rejecting
-  continuation is isolated (parent's commit survives, app-hash reflects
+  continuation is isolated (parent's commit survives, root-hash reflects
   both dispositions); `MAX_DISPATCHES` accounting includes the
   continuation chain.
 - **Deferred lane**: defer → stage on parent settle; rejected parent's
@@ -477,8 +477,8 @@ admission rejects any frame whose `cont_flag ≠ 0`.
   dispatch; `author_origin` returns the composer for continuations and the
   submitter otherwise.
 - **Determinism**: two hosts fed identical frames produce identical
-  app-hashes and `DispatchRecord` traces across both lanes, including
+  root-hashes and `DispatchRecord` traces across both lanes, including
   ticket ids and release order.
 - **Gating**: pre-activation frames with continuations reject at
-  admission; the flag-day boundary is height-gated and app-hash-continuous
+  admission; the flag-day boundary is height-gated and root-hash-continuous
   (upgrade-lane test pattern).

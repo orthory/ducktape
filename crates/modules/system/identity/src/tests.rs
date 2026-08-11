@@ -1,11 +1,15 @@
 //! account-model tests: creation, multi-scheme membership, the "any surviving
 //! member authorizes" recovery path, replay/last-member guards, the valset
-//! gate, and byzantine-resistant snapshot/install.
+//! gate, and the client-ACL facet — all over the store-backed module (a
+//! [`MemStore`] test double; the qmdb continuity proof lives in
+//! `tests/sync_round_trip.rs`).
 
 use super::*;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use commonware_cryptography::Signer as _;
 use futures::executor::block_on;
+use sdk_testkit::MemStore;
+use sha2::{Digest, Sha256};
 
 const CHAIN: &str = "test-chain";
 
@@ -149,10 +153,21 @@ fn wa_auth(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8])
 // ---- harness ------------------------------------------------------------
 
 fn new_identity() -> Identity {
-    Identity::new("identity", None, CHAIN.to_string())
+    Identity::new("identity", Box::new(MemStore::new()), None, CHAIN.to_string())
 }
 fn new_gated_identity() -> Identity {
-    Identity::new("identity", Some("valset".into()), CHAIN.to_string())
+    Identity::new(
+        "identity",
+        Box::new(MemStore::new()),
+        Some("valset".into()),
+        CHAIN.to_string(),
+    )
+}
+
+/// the root of a store that never committed anything — the store-backed twin
+/// of the old ZERO sentinel (a MemStore hash of the empty map, not ZERO).
+fn empty_root() -> StateRoot {
+    new_identity().root()
 }
 
 /// execute a message from `origin`, then commit the block.
@@ -328,6 +343,8 @@ fn any_surviving_member_can_evict_a_lost_key_but_not_the_last() {
     assert_eq!(acc.member_keys.len(), 1);
     assert_eq!(acc.member_keys[0].pubkey, ed_pub(&joiner));
     assert_eq!(acc.account_id, ed_pub(&founder), "account id is stable");
+    // the evicted key's ownership-index entry is gone with it.
+    assert!(account_of_member(&id, &ed_pub(&founder)).is_none());
 
     // removing the LAST member is refused.
     let nonce = acc.nonce;
@@ -695,7 +712,7 @@ fn set_profile_is_origin_gated_trims_caps_and_clears() {
 }
 
 #[test]
-fn node_label_survives_snapshot_and_drops_on_unbind() {
+fn node_label_sets_and_drops_with_its_node_on_unbind() {
     let mut id = new_identity();
     let founder = ed(1);
     let node = b"node-1";
@@ -710,19 +727,10 @@ fn node_label_survives_snapshot_and_drops_on_unbind() {
         },
     )
     .unwrap();
+    assert_eq!(node_label(&id, &account_id, node).as_deref(), Some("my box"));
 
-    // a fresh module installs the snapshot and answers with the SAME label.
-    let bytes = id.snapshot();
-    let root = id.root();
-    let mut joiner = new_identity();
-    joiner.install(&bytes, root).expect("install verifies + adopts");
-    assert_eq!(
-        get_account(&joiner, &account_id),
-        get_account(&id, &account_id)
-    );
-    assert_eq!(node_label(&joiner, &account_id, node).as_deref(), Some("my box"));
-
-    // unbinding the node drops it -- and its label -- from the account.
+    // unbinding the node drops it -- and its label -- from the account, and
+    // clears the node-ownership index.
     let nonce = get_account(&id, &account_id).unwrap().nonce;
     apply(
         &mut id,
@@ -738,6 +746,7 @@ fn node_label_survives_snapshot_and_drops_on_unbind() {
     )
     .expect("unbind");
     assert!(get_account(&id, &account_id).unwrap().nodes.is_empty());
+    assert!(account_of_node(&id, node).is_none(), "index entry dropped");
 }
 
 #[test]
@@ -766,8 +775,10 @@ fn bind_is_valset_gated_when_configured() {
 }
 
 #[test]
-fn snapshot_install_roundtrips_mixed_scheme_membership() {
-    // build an account with an ed25519 founder + a webauthn passkey + a node.
+fn mixed_scheme_membership_round_trips_the_store_records() {
+    // build an account with an ed25519 founder + a webauthn passkey + a node,
+    // set the global profile, and confirm every read model (record, roster
+    // listing, both ownership indexes) serves the mixed-scheme membership.
     let mut id = new_identity();
     let founder = ed(1);
     let node = b"node-1";
@@ -794,8 +805,6 @@ fn snapshot_install_roundtrips_mixed_scheme_membership() {
     )
     .unwrap();
 
-    // set the account's global profile (avatar ref + bio) so the roundtrip
-    // exercises the new fields too.
     apply(
         &mut id,
         node,
@@ -805,74 +814,27 @@ fn snapshot_install_roundtrips_mixed_scheme_membership() {
         },
     )
     .unwrap();
-    {
-        let acc = get_account(&id, &account_id).unwrap();
-        assert_eq!(
-            acc.avatar.as_deref(),
-            Some("/shared/attachments/avatars/0123456789abcdef.png")
-        );
-        assert_eq!(acc.bio.as_deref(), Some("building ducks"));
-    }
-
-    // a fresh module installs the snapshot against the served root ...
-    let bytes = id.snapshot();
-    let root = id.root();
-    let mut joiner = new_identity();
-    joiner
-        .install(&bytes, root)
-        .expect("install verifies + adopts");
-
-    // ... and now answers queries identically, including the passkey member.
-    assert_eq!(joiner.root(), root);
+    let acc = get_account(&id, &account_id).unwrap();
     assert_eq!(
-        get_account(&joiner, &account_id),
-        get_account(&id, &account_id)
+        acc.avatar.as_deref(),
+        Some("/shared/attachments/avatars/0123456789abcdef.png")
     );
+    assert_eq!(acc.bio.as_deref(), Some("building ducks"));
+
+    // the member index resolves the passkey (a webauthn key with its rp pin)
+    // to the same account the roster listing serves.
     assert_eq!(
-        account_of_member(&joiner, &wa_pub(&passkey))
+        account_of_member(&id, &wa_pub(&passkey))
             .unwrap()
             .account_id,
         account_id
     );
-
-    // a tampered snapshot (root won't match) is refused, state untouched.
-    let mut corrupt = bytes.clone();
-    *corrupt.last_mut().unwrap() ^= 0xff;
-    let mut victim = new_identity();
-    assert!(victim.install(&corrupt, root).is_err());
-    assert_eq!(victim.root(), StateRoot::ZERO);
-}
-
-#[test]
-fn byzantine_snapshots_are_rejected() {
-    // a legitimately-decoding baseline we then corrupt in targeted ways.
-    let mut id = new_identity();
-    let founder = ed(1);
-    found_account(&mut id, &founder, b"node-1");
-    let good = id.snapshot();
-    assert!(Identity::decode_snapshot(&good).is_ok());
-
-    // trailing byte.
-    let mut trailing = good.clone();
-    trailing.push(0);
-    assert!(Identity::decode_snapshot(&trailing).is_err());
-
-    // an account with zero members: hand-encode one and confirm it rejects.
-    // account count 1, id-len 1 + id byte, name/avatar/bio flags 0, nonce 0,
-    // member count 0.
-    let mut zero_members = Vec::new();
-    zero_members.extend_from_slice(&1u64.to_le_bytes()); // account count
-    zero_members.extend_from_slice(&1u64.to_le_bytes()); // id len
-    zero_members.push(0xAA); // id
-    zero_members.push(0u8); // name flag
-    zero_members.push(0u8); // avatar flag
-    zero_members.push(0u8); // bio flag
-    zero_members.extend_from_slice(&0u64.to_le_bytes()); // nonce
-    zero_members.extend_from_slice(&0u64.to_le_bytes()); // member count == 0
-    zero_members.extend_from_slice(&0u64.to_le_bytes()); // node count
-    zero_members.extend_from_slice(&0u64.to_le_bytes()); // updated_at
-    let err = Identity::decode_snapshot(&zero_members).unwrap_err();
-    assert!(format!("{err:?}").contains("no member keys"), "got {err:?}");
+    let reply = block_on(id.query(&encode_query(&IdentityQuery::All { from: 0, limit: 10 })))
+        .unwrap();
+    let IdentityReply::Accounts(listed) = decode_reply(&reply).unwrap() else {
+        panic!("expected Accounts");
+    };
+    assert_eq!(listed, vec![get_account(&id, &account_id).unwrap()]);
 }
 
 fn account_of_node(id: &Identity, node: &[u8]) -> Option<AccountView> {
@@ -937,7 +899,8 @@ fn run_client(id: &mut Identity, ctx: &mut TestCtx, msg: IdentityMsg) -> Result<
 #[test]
 fn client_grant_from_module_origin_moves_root_and_reads_back() {
     let mut id = new_identity();
-    assert_eq!(id.root(), StateRoot::ZERO, "empty plane -> ZERO");
+    let empty = empty_root();
+    assert_eq!(id.root(), empty, "nothing committed yet");
     let key = ed_pub(&ed(1));
 
     // staged: read-your-writes sees it before commit; root reflects committed.
@@ -947,11 +910,18 @@ fn client_grant_from_module_origin_moves_root_and_reads_back() {
         payload: encode_msg(&IdentityMsg::GrantClient { key: key.clone() }),
     };
     block_on(id.execute(&mut ctx, &m)).unwrap();
-    assert_eq!(id.root(), StateRoot::ZERO, "root reflects committed only");
+    assert_eq!(id.root(), empty, "root reflects committed only");
     assert_eq!(client_set(&id), vec![key.clone()], "read-your-writes");
     block_on(id.commit_block()).unwrap();
-    assert_ne!(id.root(), StateRoot::ZERO, "a committed grant moves the root");
-    assert_eq!(client_set(&id), vec![key]);
+    assert_ne!(id.root(), empty, "a committed grant moves the root");
+    assert_eq!(client_set(&id), vec![key.clone()]);
+
+    // re-granting a key that already holds standing stages NOTHING: the root
+    // is byte-identical after the duplicate commits.
+    let granted = id.root();
+    let mut ctx = ctx_module("governance");
+    run_client(&mut id, &mut ctx, IdentityMsg::GrantClient { key }).unwrap();
+    assert_eq!(id.root(), granted, "a duplicate grant is a staged no-op");
 }
 
 #[test]
@@ -974,15 +944,19 @@ fn client_grant_from_external_origin_is_refused() {
 #[test]
 fn client_revoke_restores_the_empty_plane_root() {
     let mut id = new_identity();
-    let empty = id.snapshot();
+    let empty = id.root();
     let key = ed_pub(&ed(2));
     let mut sys = ctx_system();
     run_client(&mut id, &mut sys, IdentityMsg::GrantClient { key: key.clone() }).unwrap();
     assert_eq!(client_set(&id), vec![key.clone()]);
-    run_client(&mut id, &mut sys, IdentityMsg::RevokeClient { key }).unwrap();
+    run_client(&mut id, &mut sys, IdentityMsg::RevokeClient { key: key.clone() }).unwrap();
     assert!(client_set(&id).is_empty(), "revoke removed it");
-    assert_eq!(id.root(), StateRoot::ZERO);
-    assert_eq!(id.snapshot(), empty, "revoking the last client restores the empty snapshot");
+    // revoking the last client DELETES the record: the store returns to its
+    // never-granted shape, so the root is the empty root again.
+    assert_eq!(id.root(), empty, "the last revoke restores the empty root");
+    // revoking a key that holds no standing stages nothing (still Ok).
+    run_client(&mut id, &mut sys, IdentityMsg::RevokeClient { key }).unwrap();
+    assert_eq!(id.root(), empty);
 }
 
 #[test]
@@ -995,27 +969,37 @@ fn client_grant_rejects_a_malformed_key() {
 }
 
 #[test]
-fn snapshot_round_trips_accounts_and_clients_together() {
+fn abort_block_drops_staged_accounts_and_clients_together() {
     let mut id = new_identity();
-    // an account AND a client, so the client tail rides a non-empty snapshot.
-    found_account(&mut id, &ed(3), b"node-x");
-    let ckey = ed_pub(&ed(7));
+    let empty = id.root();
+    let founder = ed(3);
+    let node = b"node-x";
+
+    // stage a founding bind AND a client grant in one block, then abort: no
+    // record, no roster entry, no index entry, no client survives, and the
+    // root never moved.
+    let auth = ed_auth(&founder, IDENTITY_BIND_NS, &bind_preimage(CHAIN, node, 0));
+    let mut ctx = ctx_external(node);
+    let m = Msg {
+        target: "identity".into(),
+        payload: encode_msg(&IdentityMsg::BindNode { authorizer: auth }),
+    };
+    block_on(id.execute(&mut ctx, &m)).unwrap();
     let mut sys = ctx_system();
-    run_client(&mut id, &mut sys, IdentityMsg::GrantClient { key: ckey.clone() }).unwrap();
+    let grant = Msg {
+        target: "identity".into(),
+        payload: encode_msg(&IdentityMsg::GrantClient {
+            key: ed_pub(&ed(7)),
+        }),
+    };
+    block_on(id.execute(&mut sys, &grant)).unwrap();
+    assert!(get_account(&id, &ed_pub(&founder)).is_some(), "staged read");
+    assert_eq!(client_set(&id).len(), 1, "staged read");
 
-    let bytes = id.snapshot();
-    let root = id.root();
-    let digest: [u8; 32] = Sha256::digest(&bytes).into();
-    assert_eq!(StateRoot(digest), root, "sha256(snapshot()) == root()");
-
-    let mut joiner = new_identity();
-    joiner.install(&bytes, root).unwrap();
-    assert_eq!(joiner.root(), root);
-    assert_eq!(client_set(&joiner), vec![ckey]);
-
-    // a flipped bit in the client tail is caught by the recomputed-root check.
-    let mut tampered = bytes.clone();
-    *tampered.last_mut().unwrap() ^= 0x01;
-    assert!(joiner.install(&tampered, root).is_err());
-    assert_eq!(joiner.root(), root, "a failed install left committed state intact");
+    block_on(id.abort_block()).unwrap();
+    assert!(get_account(&id, &ed_pub(&founder)).is_none());
+    assert!(account_of_node(&id, node).is_none());
+    assert!(account_of_member(&id, &ed_pub(&founder)).is_none());
+    assert!(client_set(&id).is_empty());
+    assert_eq!(id.root(), empty, "an aborted block leaves no trace");
 }

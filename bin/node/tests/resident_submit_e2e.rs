@@ -124,8 +124,9 @@ fn resident_posts_to_chat_with_its_own_authorship() {
             let raw = cluster.query(
                 0,
                 "chat",
-                &encode_query(&ChatQuery::MessagesLatest {
+                &encode_query(&ChatQuery::MessagesRange {
                     channel_id: "general".into(),
+                    from_seq: 1,
                     limit: 10,
                 }),
             )?;
@@ -225,7 +226,7 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     // (the drain's DrainedFrame.reason lane): proof the op reached execute and
     // was deterministically rejected there. governance gates in two steps —
     // "holds no validator-set standing" when the submitter has no member node
-    // bound at all (the v2-joined resident's shape), "not a current
+    // bound at all, "not a current
     // validator-set member" when it has a node outside the set — and either
     // one is the deterministic no-authority reject this test pins.
     let reason = gov["error"].as_str().unwrap_or_default();
@@ -245,10 +246,10 @@ fn validator_push_fans_pack_to_every_validator_before_consensus() {
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.spawn(0);
     cluster.spawn(1);
-    cluster.wait_marker(0, "genesis app_hash=", Duration::from_secs(60));
-    cluster.wait_marker(1, "genesis app_hash=", Duration::from_secs(60));
-    cluster.wait_marker(0, "converged app_hash=", CONVERGE);
-    cluster.wait_marker(1, "converged app_hash=", CONVERGE);
+    cluster.wait_marker(0, "genesis root_hash=", Duration::from_secs(60));
+    cluster.wait_marker(1, "genesis root_hash=", Duration::from_secs(60));
+    cluster.wait_marker(0, "converged root_hash=", CONVERGE);
+    cluster.wait_marker(1, "converged root_hash=", CONVERGE);
 
     let source = tempfile::tempdir().expect("git source dir");
     git_ok(source.path(), &["init"]);

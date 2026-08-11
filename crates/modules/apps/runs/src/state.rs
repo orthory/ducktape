@@ -12,8 +12,8 @@ use serde::de::DeserializeOwned;
 // prefixes for byte strings, single-byte discriminants for enums, a 0/1 tag
 // byte for options, u64-le integers (via the shared `sdk::codec` writers). this
 // is the exact preimage [`Module::root`] hashes, so a snapshot and the root that
-// must authenticate it cannot drift. no version byte — encoding changes are
-// flag-day (design principle: no backwards compatibility).
+// must authenticate it cannot drift. no version byte: this decoder accepts only
+// the current encoding.
 
 fn put_opt_string(out: &mut Vec<u8>, opt: &Option<String>) {
     codec::push_opt_str(out, opt.as_deref());

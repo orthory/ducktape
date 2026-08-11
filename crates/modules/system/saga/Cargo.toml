@@ -3,26 +3,27 @@ name = "saga"
 edition.workspace = true
 version.workspace = true
 
-# the consensus state machine, wire types, and sdk::Module impl always compile
-# (they are the surface the `saga` guest ports to wasm32). only the
-# node-local usage-ledger mapper rides the `native` feature: `indexer` drags
-# fluent31's unix-only IO, which cannot cross into a wasm guest — and the
-# ledger is a serving-binary materialized view, never consensus state.
-# `default-features = false` is therefore FULL consensus behavior, minus the
-# index module.
+# the consensus state machine, wire types, sdk::Module impl, AND the pure
+# usage-ledger decision core (src/index.rs) always compile — natively for the
+# node and to wasm32 for both guest artifacts. the two features are the guests:
 [features]
-# the wasm-guest port (src/guest.rs): the dispatch shell over
-# guest-adapter. non-default and wasm-only — enabled solely by the
-# guest-builder's synthesized cdylib workspace, never by the native gate.
+# the wasm consensus port (src/guest.rs): the dispatch shell over
+# guest-adapter. wasm-only — enabled solely by the guest-builder's
+# synthesized cdylib workspace.
 guest = ["dep:guest-adapter"]
-default = ["native"]
-native = ["dep:indexer"]
+# the wasm index mapper shell (src/index_guest.rs): wires the pure index core
+# into the fluent31 engine. wasm-only — enabled solely by
+# `guest-builder --index`.
+index-guest = ["index_guest/guest"]
 
 [dependencies]
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
 guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 sdk = { workspace = true }
+# the store-record codec (and, for interface types, the stored-embedded
+# derive): compact, canonical, deterministic. wire stays sdk::wire.
+borsh = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 valset = { workspace = true }
@@ -30,10 +31,17 @@ capability = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
 # the usage-ledger mapper (src/index.rs): node-local derived tier, no consensus.
-indexer = { workspace = true, optional = true }
+# the index CONTRACT (op-row envelope + the pure StateRead/Writes kit) — not
+# the engine: the default surface is pure types, wasm32-clean, and is all the
+# native build sees. the engine shell rides the `index-guest` feature.
+index_guest = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
 host = { workspace = true }
 sdk-testkit = { workspace = true }
 tempfile = "3"
+# the sync round trip drives the module the way a host does: construct the
+# concrete QmdbStore and inject it as `Box<dyn MerkleStore>`.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }

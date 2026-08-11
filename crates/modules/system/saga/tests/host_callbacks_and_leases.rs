@@ -99,6 +99,12 @@ fn at(height: u64, origin: Origin) -> BlockContext {
     }
 }
 
+/// the only id a given submitter may trigger: saga's id space is namespaced
+/// per origin, so a member cannot write another principal's ids.
+fn sid(submitter: &[u8], id: &str) -> String {
+    saga::namespaced_id(&Origin::External(submitter.to_vec()), id)
+}
+
 fn trigger(id: &str, reply_to: Option<&str>) -> Msg {
     Msg {
         target: "saga".into(),
@@ -154,19 +160,22 @@ async fn recorded(host: &Host) -> (u64, Option<SagaCallback>) {
 fn the_callback_lands_in_the_same_block_as_the_oracle_result() {
     block_on(async {
         let mut host = Host::genesis(vec![
-            Box::new(SagaModule::new("saga")) as Box<dyn Module>,
+            Box::new(SagaModule::new(
+                "saga",
+                Box::new(sdk_testkit::MemStore::new()),
+            )) as Box<dyn Module>,
             Box::new(Recorder::new("agent", false)),
         ])
         .expect("genesis");
 
         host.submit_at(
             at(1, Origin::External(b"alice".to_vec())),
-            trigger("s1", Some("agent")),
+            trigger(&sid(b"alice", "s1"), Some("agent")),
         )
         .await
         .expect("trigger");
         assert_eq!(
-            saga_view(&host, "s1").await.unwrap().status,
+            saga_view(&host, &sid(b"alice", "s1")).await.unwrap().status,
             SagaStatus::Pending
         );
         assert_eq!(recorded(&host).await.0, 0, "no callback before the result");
@@ -177,12 +186,12 @@ fn the_callback_lands_in_the_same_block_as_the_oracle_result() {
         // requester's callback commit at this single boundary (P6).
         host.submit_at(
             at(2, Origin::External(b"oracle".to_vec())),
-            oracle("s1", 0, Ok(b"answer".to_vec())),
+            oracle(&sid(b"alice", "s1"), 0, Ok(b"answer".to_vec())),
         )
         .await
         .expect("result block");
 
-        let v = saga_view(&host, "s1").await.unwrap();
+        let v = saga_view(&host, &sid(b"alice", "s1")).await.unwrap();
         assert_eq!(v.status, SagaStatus::Done);
         assert_eq!(v.result, Some(b"answer".to_vec()));
         let (count, last) = recorded(&host).await;
@@ -193,7 +202,7 @@ fn the_callback_lands_in_the_same_block_as_the_oracle_result() {
         assert_eq!(
             last.unwrap(),
             SagaCallback {
-                saga_id: "s1".into(),
+                saga_id: sid(b"alice", "s1"),
                 payload: b"corr-1".to_vec(),
                 outcome: SagaOutcome::Done(b"answer".to_vec()),
             },
@@ -219,22 +228,33 @@ fn a_trigger_with_an_unknown_reply_to_is_rejected_up_front() {
         // against ctx.module_root AT TRIGGER TIME, so a saga that could never
         // terminate cleanly is never created.
         let mut host = Host::genesis(vec![
-            Box::new(SagaModule::new("saga")) as Box<dyn Module>,
+            Box::new(SagaModule::new(
+                "saga",
+                Box::new(sdk_testkit::MemStore::new()),
+            )) as Box<dyn Module>,
             Box::new(Recorder::new("agent", false)),
         ])
         .expect("genesis");
-        let genesis = host.app_hash();
+        let genesis = host.root_hash();
 
         let err = host
             .submit_at(
                 at(1, Origin::External(b"alice".to_vec())),
-                trigger("s1", Some("nope")),
+                trigger(&sid(b"alice", "s1"), Some("nope")),
             )
             .await
             .expect_err("unknown reply_to must reject");
         assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
-        assert_eq!(saga_view(&host, "s1").await, None, "no saga was created");
-        assert_eq!(host.app_hash(), genesis, "the rejected block left no trace");
+        assert_eq!(
+            saga_view(&host, &sid(b"alice", "s1")).await,
+            None,
+            "no saga was created"
+        );
+        assert_eq!(
+            host.root_hash(),
+            genesis,
+            "the rejected block left no trace"
+        );
     });
 }
 
@@ -248,24 +268,27 @@ fn a_failing_callback_arm_aborts_the_whole_block_and_the_saga_stays_pending() {
         // failing. hence the no-fail-callback rule (design §4): requester
         // callback arms must treat bad input as a staged no-op, never an Err.
         let mut host = Host::genesis(vec![
-            Box::new(SagaModule::new("saga")) as Box<dyn Module>,
+            Box::new(SagaModule::new(
+                "saga",
+                Box::new(sdk_testkit::MemStore::new()),
+            )) as Box<dyn Module>,
             Box::new(Recorder::new("agent", true)),
         ])
         .expect("genesis");
 
         host.submit_at(
             at(1, Origin::External(b"alice".to_vec())),
-            trigger("s1", Some("agent")),
+            trigger(&sid(b"alice", "s1"), Some("agent")),
         )
         .await
         .expect("the trigger itself is fine — agent is registered");
-        let pending_hash = host.app_hash();
+        let pending_hash = host.root_hash();
         let saga_pending = host.module_root("saga").unwrap();
 
         let err = host
             .submit_at(
                 at(2, Origin::External(b"oracle".to_vec())),
-                oracle("s1", 0, Ok(b"answer".to_vec())),
+                oracle(&sid(b"alice", "s1"), 0, Ok(b"answer".to_vec())),
             )
             .await
             .expect_err("the poisoned callback aborts the block");
@@ -273,12 +296,12 @@ fn a_failing_callback_arm_aborts_the_whole_block_and_the_saga_stays_pending() {
 
         // no trace: the saga did NOT advance and no root moved.
         assert_eq!(
-            saga_view(&host, "s1").await.unwrap().status,
+            saga_view(&host, &sid(b"alice", "s1")).await.unwrap().status,
             SagaStatus::Pending
         );
         assert_eq!(host.module_root("saga").unwrap(), saga_pending);
         assert_eq!(
-            host.app_hash(),
+            host.root_hash(),
             pending_hash,
             "the aborted block left every root untouched"
         );
@@ -292,15 +315,17 @@ fn strict_lease_rejects_a_non_assignee_and_accepts_the_assignee() {
         // three (genesis-seeded) validators; the saga module assigns each
         // attempt over the valset and enforces the lease strictly.
         let keys = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]];
-        let mut valset = Valset::new("valset");
+        let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
         for key in &keys {
-            valset.insert(key.clone());
+            valset.seed(key.clone()).await.expect("seed valset");
         }
+        valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
             // no capability module is registered: these triggers are untagged,
             // so assignment stays on the valset path.
             Box::new(SagaModule::with_assignment(
                 "saga",
+                Box::new(sdk_testkit::MemStore::new()),
                 "valset",
                 "capability",
                 LeasePolicy::Strict,
@@ -312,7 +337,7 @@ fn strict_lease_rejects_a_non_assignee_and_accepts_the_assignee() {
         let outcome = host
             .submit_at(
                 at(5, Origin::External(b"requester".to_vec())),
-                trigger("s1", None),
+                trigger(&sid(b"requester", "s1"), None),
             )
             .await
             .expect("trigger");
@@ -323,39 +348,45 @@ fn strict_lease_rejects_a_non_assignee_and_accepts_the_assignee() {
             .expect("the valset assigned a lease holder");
         assert!(keys.contains(&assignee), "the assignee is a validator");
         assert_eq!(
-            saga_view(&host, "s1").await.unwrap().assignee,
+            saga_view(&host, &sid(b"requester", "s1"))
+                .await
+                .unwrap()
+                .assignee,
             Some(assignee.clone()),
             "the recorded lease matches the advertised one"
         );
         let non_assignee = keys.iter().find(|k| **k != assignee).unwrap().clone();
-        let pending_hash = host.app_hash();
+        let pending_hash = host.root_hash();
 
         // a finalized result from a NON-assignee is a deterministic no-op —
         // never an error, and no root moves.
         host.submit_at(
             at(6, Origin::External(non_assignee)),
-            oracle("s1", 0, Ok(b"intruder".to_vec())),
+            oracle(&sid(b"requester", "s1"), 0, Ok(b"intruder".to_vec())),
         )
         .await
         .expect("a foreign result must not abort the block");
         assert_eq!(
-            saga_view(&host, "s1").await.unwrap().status,
+            saga_view(&host, &sid(b"requester", "s1"))
+                .await
+                .unwrap()
+                .status,
             SagaStatus::Pending
         );
         assert_eq!(
-            host.app_hash(),
+            host.root_hash(),
             pending_hash,
-            "the no-op left the app-hash unchanged"
+            "the no-op left the root-hash unchanged"
         );
 
         // the assignee's result lands.
         host.submit_at(
             at(7, Origin::External(assignee)),
-            oracle("s1", 0, Ok(b"legit".to_vec())),
+            oracle(&sid(b"requester", "s1"), 0, Ok(b"legit".to_vec())),
         )
         .await
         .expect("the assignee's result");
-        let v = saga_view(&host, "s1").await.unwrap();
+        let v = saga_view(&host, &sid(b"requester", "s1")).await.unwrap();
         assert_eq!(v.status, SagaStatus::Done);
         assert_eq!(v.result, Some(b"legit".to_vec()));
     });

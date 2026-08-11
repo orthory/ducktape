@@ -36,8 +36,7 @@
 //!    path, and its commit is a single atomic unit — so the live root IS the
 //!    post-root the lost seal would have recorded.
 //!
-//! anything else stays fail-closed: no cursor (legacy disk modules, the
-//! in-memory cohort), a cursor at any other height, a claimed height with no
+//! anything else stays fail-closed: no cursor, a cursor at any other height, a claimed height with no
 //! trailing WAL record, more than one claimant (the multi-store atomicity
 //! limit), or a moved module a claim cannot explain — all still
 //! [`crate::Error::Torn`]. this is the "per-commit height cursor" fix the
@@ -45,16 +44,13 @@
 //!
 //! ## residual (shared with the pre-existing torn heal)
 //!
-//! the selective replay of a mixed trailing block re-executes the frame with
+//! selective replay of a mixed trailing block re-executes the frame with
 //! the claimant already at its post state; an op that READS the claimant's
 //! committed state could in principle observe post- instead of pre-state and
-//! diverge. this is the same exposure the sealed torn-block heal already
-//! accepts (there the per-module post-root verify backstops it; here the
-//! trailing block has no recorded roots to verify against, exactly as the
-//! pre-existing roll-forward paths). the alternative — sealing the observed
-//! MIXED roots, as the legacy roll-forward does — is known-wrong whenever the
-//! trailing block fanned out to the in-memory cohort, so re-derivation is the
-//! strictly safer reconstruction.
+//! diverge. The sealed torn-block heal has the same exposure, with a
+//! per-module post-root backstop; a trailing block has no recorded roots.
+//! Re-derivation is required because sealing observed mixed roots is wrong
+//! whenever the trailing block fanned out to the in-memory cohort.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -140,25 +136,6 @@ pub(crate) fn seed_trailing_claims(
     claims
 }
 
-/// how the boot-time roll-forward must treat a trailing unsealed block whose
-/// pre-block root check failed (some module already moved).
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TrailingPlan {
-    /// no moved module carries a verified trailing claim: the legacy
-    /// roll-forward — assume the apply completed before the crash and seal
-    /// the observed roots (exact for single-substrate blocks; see the crate
-    /// doc's multi-store note). behavior-identical to pre-cursor recovery.
-    AssumeApplied,
-    /// exactly one disk module VERIFIABLY committed the trailing block (its
-    /// cursor claims the trailing WAL height) and every other module is still
-    /// at its pre-block root: re-execute the WAL frame committing ONLY the
-    /// at-pre cohort and aborting the claimant — re-committing it would move
-    /// its op-log root and fork. reconstructs the writes the block fanned out
-    /// to the in-memory cohort (lost with RAM) instead of sealing a mixed
-    /// pre/post state.
-    SelectiveReplay,
-}
-
 /// classify the trailing block's moved set against the verified claims.
 /// fail-closed on every ambiguity:
 /// - a moved module WITHOUT a claim alongside a claimant is unexplained
@@ -174,15 +151,12 @@ pub(crate) fn classify_trailing(
     height: u64,
     moved: &BTreeSet<ModuleId>,
     claims: &BTreeSet<ModuleId>,
-) -> Result<TrailingPlan, Error> {
+) -> Result<(), Error> {
     let verified: BTreeSet<&ModuleId> = moved.intersection(claims).collect();
     if verified.is_empty() {
-        return Ok(TrailingPlan::AssumeApplied);
+        return Ok(());
     }
-    let unexplained: Vec<&ModuleId> = moved
-        .iter()
-        .filter(|id| !verified.contains(*id))
-        .collect();
+    let unexplained: Vec<&ModuleId> = moved.iter().filter(|id| !verified.contains(*id)).collect();
     if !unexplained.is_empty() {
         return Err(Error::Torn(format!(
             "trailing block {height}: module(s) {unexplained:?} moved off their pre-block \
@@ -200,7 +174,7 @@ pub(crate) fn classify_trailing(
             verified.len()
         )));
     }
-    Ok(TrailingPlan::SelectiveReplay)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -217,7 +191,7 @@ mod tests {
             height,
             disposition: Disposition::Applied,
             roots: vec![],
-            app_hash: StateRoot([0; 32]),
+            root_hash: StateRoot([0; 32]),
         }
     }
 
@@ -244,18 +218,13 @@ mod tests {
     }
 
     #[test]
-    fn classify_no_claims_is_the_legacy_roll_forward() {
-        // moved modules with no verified claim: pre-cursor behavior exactly.
-        let plan =
-            classify_trailing(7, &ids(&["kv"]), &BTreeSet::new()).expect("legacy path");
-        assert_eq!(plan, TrailingPlan::AssumeApplied);
+    fn classify_no_claims_allows_rederivation() {
+        classify_trailing(7, &ids(&["kv"]), &BTreeSet::new()).expect("rederive");
     }
 
     #[test]
     fn classify_single_verified_claim_selectively_replays() {
-        let plan =
             classify_trailing(7, &ids(&["files"]), &ids(&["files"])).expect("verified");
-        assert_eq!(plan, TrailingPlan::SelectiveReplay);
     }
 
     #[test]
@@ -269,8 +238,8 @@ mod tests {
 
     #[test]
     fn classify_two_claimants_fail_stops_at_the_multi_store_limit() {
-        let err = classify_trailing(7, &ids(&["a", "b"]), &ids(&["a", "b"]))
-            .expect_err("multi-store");
+        let err =
+            classify_trailing(7, &ids(&["a", "b"]), &ids(&["a", "b"])).expect_err("multi-store");
         match err {
             Error::Torn(msg) => assert!(msg.contains("multi-store"), "{msg}"),
             other => panic!("expected Torn, got {other:?}"),

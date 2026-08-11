@@ -8,7 +8,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 
 // Consensus rejects these handles — a seed that asks for one aborts the demo.
-// Mirrors RESERVED_ROOT_LABELS in crates/system/duckdns/src/wire.rs (the source
+// Mirrors RESERVED_ROOT_LABELS in crates/duckdns/src/wire.rs (the source
 // of truth); app/src/domain/duckdns-client.test.ts pins all three copies.
 const RESERVED_ROOT_LABELS = ["net", "agents"];
 
@@ -43,11 +43,14 @@ const INDEX_HTML = `<!doctype html>
 `;
 
 async function main() {
-  const [url, nodeBin, workdir, chain, requestedHandle = "demo"] = Bun.argv.slice(2);
+  const [url, nodeBin, workdir, chain, requestedHandle = "demo", userKeyArg, password = ""] = Bun.argv.slice(2);
   if (!url || !nodeBin || !workdir || !chain) {
-    throw new Error("usage: demo-gateway.mjs <http-url> <node-bin> <workdir> <chain-id> [handle]");
+    throw new Error("usage: demo-gateway.mjs <http-url> <node-bin> <workdir> <chain-id> [handle] [user-key] [password]");
   }
-  const userKey = join(workdir, "user.key");
+  // The signing key is the local user identity demo-seed provisioned (encrypted
+  // v1) — its password unlocks each sign-* call over stdin. Fall back to the
+  // legacy in-workdir path for older callers.
+  const userKey = userKeyArg || join(workdir, "user.key");
 
   async function post(path, body) {
     const response = await fetch(`${url}${path}`, {
@@ -63,7 +66,9 @@ async function main() {
   const submit = (target, payload) => post("/v1/submit", { target, payload });
   const query = (target, query) => post("/v1/query", { target, query });
   function sign(args) {
-    const result = spawnSync(nodeBin, args, { encoding: "utf8" });
+    // every `user sign-*` verb unlocks the encrypted key by reading its
+    // password as the first (only) stdin line — see load_user_signer.
+    const result = spawnSync(nodeBin, args, { encoding: "utf8", input: `${password}\n` });
     if (result.status !== 0) {
       const detail = (result.stderr || result.stdout || result.error?.message || "unknown error").trim();
       throw new Error(`[gateway] ${args[0]} failed: ${detail}`);
@@ -97,14 +102,14 @@ async function main() {
 
   let handle = requestedHandle;
   if (/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(handle) && !RESERVED_ROOT_LABELS.includes(handle)) {
-    await submit("duckdns", { set_handle: { handle } });
+    await submit("gateway", { set_handle: { handle } });
   } else {
     handle = null;
     console.log("[gateway] skipped .duck handle (workspace id is not a legal DNS label)");
   }
 
   const data = Buffer.from(INDEX_HTML);
-  // v2: the file table lives off consensus in .manifest.json; the signed route
+  // The file table lives off consensus in .manifest.json; the signed route
   // binds only the manifest's SHA-256.
   const manifest = {
     default_path: "index.html",

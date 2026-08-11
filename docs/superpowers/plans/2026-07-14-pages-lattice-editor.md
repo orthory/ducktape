@@ -59,7 +59,7 @@
 - [ ] Vitest green.
 - [ ] Commit `feat(pages): Lattice selection menu with turn-into and dismissal rules`.
 
-### Task 3: Per-range thread scoping (범위별 스레드)
+### Task 3: Per-range thread scoping
 
 **Files:**
 - Modify: `app/src/console/views/pages/PagesView.tsx` (commentCard state gains `range`; filter threads passed to card)

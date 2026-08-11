@@ -23,6 +23,10 @@ commonware-resolver = { workspace = true }
 commonware-codec = { workspace = true }
 bytes = "1"
 rand_core = "0.6.4"
+# the enqueue signal (tokio::sync::Notify) and the propose-side event select —
+# executor-agnostic sync/select primitives only, no runtime pulled in.
+futures = { workspace = true }
+tokio = { workspace = true }
 
 [features]
 # the mesh-carrier sim arm: `SimMesh` over commonware `simulated::Network`,
@@ -30,14 +34,22 @@ rand_core = "0.6.4"
 # `bin/node` wires the discovery real arm and never enables this.
 sim = []
 
-# the in-process multi-validator harness needs the sim carrier; gated so the
-# default `cargo test -p consensus` (no --features sim) SKIPS it instead of
-# failing to compile — run `cargo test -p consensus --features sim` for it.
+# the in-process multi-validator harness needs the sim carrier. The declaration
+# stays (it IS the dependency), but the self dev-dependency below now satisfies
+# it always: "skips instead of failing to compile" meant `cargo test -p
+# consensus` built 7 of 8 targets and printed a green that omitted the
+# N-validator convergence proof entirely, with nothing in the output saying so.
 [[test]]
 name = "in_process_cluster"
 required-features = ["sim"]
 
 [dev-dependencies]
+# a SELF dev-dependency (the `data-plane` / `airlock` / `node` pattern): it turns
+# `sim` on for our OWN test build, so the focused `cargo test -p consensus` an
+# agent actually runs includes `in_process_cluster` instead of silently dropping
+# it. `make test`'s explicit `-p consensus --features sim` line still covers the
+# same ground and is left as belt-and-braces.
+consensus = { path = ".", features = ["sim"] }
 # the host-side qmdb store handle injected into disk-backed modules.
 statesync = { workspace = true }
 # the N-validator convergence harness: real simplex Engines over one simulated

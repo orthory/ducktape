@@ -5,13 +5,12 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
-use futures::channel::oneshot;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    ConsensusOperationalStatus, IndexOperationalStatus, NodeCommand, NodeHandle, NodePhase,
-    NodeRole, OperationalStatus, SyncOperationalStatus, actor_gone,
+    ConsensusOperationalStatus, IndexOperationalStatus, NodeHandle, NodePhase, NodeRole,
+    OperationalStatus, SyncOperationalStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -48,6 +47,61 @@ struct OutcomeLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct SweepLabels {
+    cause: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct SnapshotLabels {
+    topic: String,
+}
+
+/// A snapshot topic re-composed its sample.
+///
+/// A closed set: these are the three topics whose catch-up rebuilds a whole
+/// document on the heartbeat rather than scanning a cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotTopic {
+    /// the whole OpenMetrics exposition.
+    Metrics,
+    /// the direct-peer sample — a WHOLE registry encode per sample.
+    Peers,
+    /// the node-status projection; a cell read, effectively free.
+    Status,
+}
+
+impl SnapshotTopic {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Metrics => "metrics",
+            Self::Peers => "peers",
+            Self::Status => "status",
+        }
+    }
+}
+
+/// What sent a ws session back to the derived index.
+///
+/// A closed set, so a caller cannot invent a label and split the series.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SweepCause {
+    /// a block that appended index rows — the intended path.
+    Block,
+    /// the periodic floor. Climbing means rows reached the index without their
+    /// writer announcing, and the wake is no longer carrying the plane.
+    Backstop,
+}
+
+impl SweepCause {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Backstop => "backstop",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ModuleLabels {
     module: String,
 }
@@ -69,7 +123,6 @@ fn origin_kind(origin: &sdk::Origin) -> &'static str {
 pub struct NodeMetrics {
     block_height: Registered<raw::Gauge>,
     blocks_total: Registered<raw::Counter>,
-    ops_total: Registered<raw::Counter>,
     apply_latency: Registered<raw::Histogram>,
     dispatch_total: Registered<raw::Family<DispatchLabels, raw::Counter>>,
     node_phase: Registered<raw::Family<PhaseLabels, raw::Gauge>>,
@@ -89,6 +142,8 @@ pub struct NodeMetrics {
     checkpoint_height: Registered<raw::Gauge>,
     index_poisoned: Registered<raw::Gauge>,
     index_height: Registered<raw::Family<ModuleLabels, raw::Gauge>>,
+    stream_index_sweeps: Registered<raw::Family<SweepLabels, raw::Counter>>,
+    stream_snapshot_samples: Registered<raw::Family<SnapshotLabels, raw::Counter>>,
     operations: Arc<RwLock<OperationalStatus>>,
 }
 
@@ -109,12 +164,28 @@ impl NodeMetrics {
                 "ducktape_blocks",
                 "committed local blocks since daemon start",
             ),
-            // one BLOCK now aggregates N member ops; `ducktape_blocks_total`
-            // counts blocks, `ducktape_ops_total` counts the aggregated ops, so
-            // ops/blocks is the average batch size.
-            ops_total: context.counter(
-                "ducktape_ops",
-                "member ops aggregated into committed local blocks since daemon start",
+            // THE FAN-OUT'S ONLY WITNESS. A block wake sweeps the index topics
+            // only when the block appended rows, so this counts how often a
+            // session was sent back to the store. Before that gate it ticked
+            // once per block per subscribed topic per session — on an idle
+            // chain, forever, finding nothing. If this climbs on a quiet chain
+            // the gate has stopped working, and nothing else would say so.
+            stream_index_sweeps: context.family(
+                "ducktape_stream_index_sweeps",
+                "ws sessions sent to re-scan the derived index, by what woke them",
+            ),
+            // THE SUBSCRIPTION-IS-THE-BUDGET CLAIM'S ONLY WITNESS. A snapshot
+            // topic re-composes its whole document per heartbeat tick, per
+            // session, for as long as the session holds it — and `peers`
+            // encodes the ENTIRE metrics registry to do it. The whole cost
+            // argument is that dropping the socket stops that at the source,
+            // which is a claim about session teardown that nothing else
+            // observes. If this keeps climbing after the last subscriber
+            // leaves, sessions are outliving their sockets and no other series
+            // would say so.
+            stream_snapshot_samples: context.family(
+                "ducktape_stream_snapshot_samples",
+                "snapshot-topic documents re-composed for a subscriber, by topic",
             ),
             apply_latency: context.histogram(
                 "ducktape_block_apply_latency_seconds",
@@ -217,16 +288,31 @@ impl NodeMetrics {
         }
     }
 
-    /// count the member ops an applied block aggregated (`ducktape_ops_total`).
-    /// called once per applied block alongside [`record_block`](Self::record_block).
-    pub fn record_ops(&self, ops: usize) {
-        self.ops_total.inc_by(ops as u64);
+    /// One ws session re-scanned the derived index, labelled by what sent it.
+    ///
+    /// The SPLIT is the point, not the total. `block` is the intended path.
+    /// `backstop` climbing means rows reached the index without their writer
+    /// announcing — the gate is then being carried by a 30s floor instead of
+    /// the wake, which is a bug upstream that nothing else would report.
+    pub fn record_index_sweep(&self, cause: SweepCause) {
+        self.stream_index_sweeps
+            .get_or_create(&SweepLabels {
+                cause: cause.label().to_string(),
+            })
+            .inc();
     }
 
-    /// Record deterministic finalized outcomes while retaining the older
-    /// aggregate `ducktape_ops_total` compatibility series.
+    /// One snapshot topic re-composed its document for one session.
+    pub fn record_snapshot_sample(&self, topic: SnapshotTopic) {
+        self.stream_snapshot_samples
+            .get_or_create(&SnapshotLabels {
+                topic: topic.label().to_string(),
+            })
+            .inc();
+    }
+
+    /// Record deterministic finalized operation outcomes.
     pub fn record_op_outcomes(&self, applied: usize, rejected: usize) {
-        self.record_ops(applied + rejected);
         for (outcome, count) in [("applied", applied), ("rejected", rejected)] {
             self.op_outcomes
                 .get_or_create(&OutcomeLabels {
@@ -273,6 +359,12 @@ impl NodeMetrics {
             .read()
             .expect("operations lock poisoned")
             .clone()
+    }
+
+    /// the shared operations projection itself, for the status cell's live
+    /// overlay ([`crate::StatusCell::wire_metrics`]).
+    pub(crate) fn operations_handle(&self) -> Arc<RwLock<OperationalStatus>> {
+        Arc::clone(&self.operations)
     }
 
     pub fn update_consensus(
@@ -388,22 +480,23 @@ fn quorum(validators: u64) -> u64 {
 /// the OpenMetrics content type a Prometheus scraper negotiates for `/metrics`.
 const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
-/// GET /metrics — the Prometheus scrape surface. the actor encodes the
-/// commonware runtime registry (which the daemon's `ducktape_*` series are
-/// registered into) to OpenMetrics text and hands it back over the command lane.
+/// GET /metrics — the Prometheus scrape surface. encodes the runtime
+/// registry (which the daemon's `ducktape_*` series are registered into)
+/// through the handle's wired exposition source — the registry is shared
+/// state, so a scrape never crosses the command lane and stays live while a
+/// sync/catch-up stage has the pump busy.
 pub(crate) async fn metrics(State(handle): State<NodeHandle>) -> Response {
-    let (reply, rx) = oneshot::channel();
-    if let Err(resp) = handle.send(NodeCommand::Metrics { reply }).await {
-        return resp;
-    }
-    match rx.await {
-        Ok(body) => (
+    match handle.status_cell().exposition() {
+        Some(body) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, OPENMETRICS_CONTENT_TYPE)],
             body,
         )
             .into_response(),
-        Err(_) => actor_gone(),
+        None => crate::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no metrics exposition is wired on this daemon",
+        ),
     }
 }
 
