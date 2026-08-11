@@ -436,67 +436,22 @@ const body = fs.readFileSync(bodyPath, "utf8");
 if (Buffer.byteLength(body) > 1024 * 1024) throw new Error("GitHub epic PR body exceeds 1 MiB");
 const start = "<!-- forge-epic-provenance:start -->";
 const end = "<!-- forge-epic-provenance:end -->";
-const legacy = "<!-- forge-epic-provenance:v1 -->";
-const legacyEnd = "<!-- /forge-epic-provenance -->";
 const starts = body.split(start).length - 1;
 const ends = body.split(end).length - 1;
-const legacies = body.split(legacy).length - 1;
-const legacyEnds = body.split(legacyEnd).length - 1;
-if (starts !== ends || starts > 1 || legacies > 1 || legacyEnds > 1 ||
-    (starts && (legacies || legacyEnds)) || (!legacies && legacyEnds)) {
+if (starts !== ends || starts > 1) {
   throw new Error("epic provenance markers are malformed or duplicated");
 }
-if (!starts && !legacies) {
+if (!starts) {
   fs.writeFileSync(recordsPath, "");
   process.exit(0);
 }
-if (legacies && legacyEnds) {
-  const a = body.indexOf(legacy) + legacy.length;
-  const b = body.indexOf(legacyEnd, a);
-  if (b < a) throw new Error("legacy epic provenance markers are out of order");
-  // PR #598's first writer stored literal "\\n" separators. Interpret either
-  // separator only inside this already-bounded legacy block; prefix and suffix
-  // bytes remain opaque and are preserved exactly during migration.
-  const lines = body.slice(a, b).split(/\r?\n|\\n/).map(line => line.trim()).filter(Boolean);
-  if (!lines.length || lines.length % 2 || lines.length > 256) {
-    throw new Error("legacy epic provenance block has an unsupported shape");
-  }
-  const comment = /^<!-- forge-provenance:([a-z0-9._-]{1,64})#([1-9][0-9]*) merge=([0-9a-f]{40}) source=([0-9a-f]{40}) target=([0-9a-f]{40}) -->$/;
-  const bullet = /^- ([a-z0-9._-]{1,64})#([1-9][0-9]*) — ([0-9a-f]{40}) \(Forge merge ([0-9a-f]{40})\)$/;
-  const records = [];
-  const seen = new Set();
-  for (let i = 0; i < lines.length; i += 2) {
-    const provenance = lines[i].match(comment);
-    const summary = lines[i + 1].match(bullet);
-    if (!provenance || !summary || provenance[1] !== summary[1] ||
-        provenance[2] !== summary[2] || provenance[3] !== summary[4] ||
-        provenance[4] !== summary[3]) {
-      throw new Error("legacy epic provenance comment and summary disagree");
-    }
-    const key = `${provenance[1]}#${provenance[2]}`;
-    if (seen.has(key)) throw new Error(`legacy epic provenance duplicates ${key}`);
-    seen.add(key);
-    records.push(["L", ...provenance.slice(1)].join("\t"));
-  }
-  fs.writeFileSync(recordsPath, records.join("\n") + "\n");
-  process.exit(0);
-}
-let raw;
-if (starts) {
-  const a = body.indexOf(start) + start.length;
-  const b = body.indexOf(end, a);
-  if (b < a) throw new Error("epic provenance markers are out of order");
-  raw = body.slice(a, b).trim();
-} else {
-  raw = body.slice(body.indexOf(legacy) + legacy.length).trim();
-  const fenced = raw.match(/^```(?:json)?\s*\n([\s\S]*?)\n```\s*$/);
-  if (fenced) raw = fenced[1].trim();
-}
+const a = body.indexOf(start) + start.length;
+const b = body.indexOf(end, a);
+if (b < a) throw new Error("epic provenance markers are out of order");
+const raw = body.slice(a, b).trim();
 let ledger;
 try { ledger = JSON.parse(raw); }
 catch { throw new Error("epic provenance ledger is not valid JSON"); }
-if (Array.isArray(ledger)) ledger = {version: 1, entries: ledger};
-if (ledger && !Array.isArray(ledger.entries) && ledger.repo) ledger = {version: 1, entries: [ledger]};
 if (!ledger || ledger.version !== 1 || !Array.isArray(ledger.entries) || ledger.entries.length > 128) {
   throw new Error("epic provenance ledger has an unsupported shape");
 }
@@ -533,10 +488,7 @@ let body = fs.readFileSync(bodyPath, "utf8");
 const entry = JSON.parse(fs.readFileSync(entryPath, "utf8"));
 const start = "<!-- forge-epic-provenance:start -->";
 const end = "<!-- forge-epic-provenance:end -->";
-const legacy = "<!-- forge-epic-provenance:v1 -->";
-const legacyEnd = "<!-- /forge-epic-provenance -->";
 const a = body.indexOf(start);
-const legacyAt = body.indexOf(legacy);
 let ledger = {version: 1, entries: []};
 if (recordsPath) {
   const lines = fs.readFileSync(recordsPath, "utf8").trim().split("\n").filter(Boolean);
@@ -569,7 +521,6 @@ if (recordsPath) {
 }
 let prefix = body;
 let suffix = "";
-if (a >= 0 && legacyAt >= 0) throw new Error("epic provenance markers changed while updating");
 if (a >= 0) {
   const contentStart = a + start.length;
   const b = body.indexOf(end, contentStart);
@@ -579,39 +530,13 @@ if (a >= 0) {
   if (!recordsPath) ledger = JSON.parse(body.slice(contentStart, b).trim());
   prefix = body.slice(0, a);
   suffix = body.slice(b + end.length);
-} else if (legacyAt >= 0) {
-  if (body.indexOf(legacy, legacyAt + legacy.length) >= 0) {
-    throw new Error("legacy epic provenance marker is duplicated");
-  }
-  prefix = body.slice(0, legacyAt);
-  const legacyEndAt = body.indexOf(legacyEnd, legacyAt + legacy.length);
-  if (legacyEndAt >= 0) {
-    if (body.indexOf(legacyEnd, legacyEndAt + legacyEnd.length) >= 0) {
-      throw new Error("legacy epic provenance end marker is duplicated");
-    }
-    suffix = body.slice(legacyEndAt + legacyEnd.length);
-    if (!recordsPath) {
-      throw new Error("legacy epic provenance requires verified commit mappings");
-    }
-  } else {
-    let raw = body.slice(legacyAt + legacy.length).trim();
-    const fenced = raw.match(/^```(?:json)?\s*\n([\s\S]*?)\n```\s*$/);
-    if (fenced) raw = fenced[1].trim();
-    if (!recordsPath) {
-      ledger = JSON.parse(raw);
-      if (Array.isArray(ledger)) ledger = {version: 1, entries: ledger};
-      if (ledger && !Array.isArray(ledger.entries) && ledger.repo) {
-        ledger = {version: 1, entries: [ledger]};
-      }
-    }
-  }
 }
 if (ledger.entries.some(old => old.repo === entry.repo && old.pr === entry.pr)) {
   throw new Error(`epic provenance already contains ${entry.repo}#${entry.pr}`);
 }
 ledger.entries.push(entry);
 const block = `${start}\n${JSON.stringify(ledger, null, 2)}\n${end}`;
-if (a >= 0 || legacyAt >= 0) {
+if (a >= 0) {
   body = `${prefix}${block}${suffix}`;
 } else {
   const separator = !prefix ? "" : prefix.endsWith("\n") ? "\n" : "\n\n";
@@ -967,46 +892,6 @@ main() {
           current_sources+=("$record_a")
           current_mirrors+=("$record_b")
         fi
-      elif [ "$record_kind" = L ]; then
-        if [ "$entry_open" -eq 1 ]; then
-          [ "$entry_source_index" -eq "${#entry_expected_sources[@]}" ] ||
-            die "epic provenance for $entry_label has a partial commit range"
-        fi
-        entry_open=0
-        in_current=0
-        entry_key="$record_a#$record_b"
-        [ -z "${seen_entries[$entry_key]+x}" ] || die "epic provenance duplicates $entry_key"
-        seen_entries[$entry_key]=1
-        validate_epic_item "$record_a" "$record_b" "$record_c" "$record_d" "$record_e" \
-          "$forge_dev" "$origin_oid" "$RUN_DIR/epic-item-$record_b.json"
-        local -a legacy_sources=("${VALIDATED_EPIC_COMMITS[@]}")
-        SOURCE_COMMITS=("${selected_source_commits[@]}")
-        if [ "$record_a" = "$FORGE_REPO" ] && [ "$record_b" = "$PR_NUMBER" ]; then
-          current_seen=1
-          [ "$record_c" = "$MERGE_OID" ] && [ "$record_d" = "$SOURCE_OID" ] &&
-            [ "$record_e" = "$forge_target" ] ||
-            die "legacy epic provenance for $FORGE_REPO#$PR_NUMBER does not match the selected Forge PR"
-          in_current=1
-        fi
-        printf 'E\t%s\t%s\t%s\t%s\t%s\n' \
-          "$record_a" "$record_b" "$record_c" "$record_d" "$record_e" \
-          >>"$RUN_DIR/epic-records-resolved"
-        local legacy_source legacy_mirror branch_index
-        for legacy_source in "${legacy_sources[@]}"; do
-          branch_index=${#ledger_mirrors[@]}
-          [ "$branch_index" -lt "${#branch_commits[@]}" ] ||
-            die "legacy epic provenance names history missing from the epic branch"
-          legacy_mirror=${branch_commits[$branch_index]}
-          verify_replayed_commit "$legacy_source" "$legacy_mirror" "$RUN_DIR" \
-            "legacy epic provenance" "$origin_oid"
-          ledger_mirrors+=("$legacy_mirror")
-          printf 'C\t%s\t%s\n' "$legacy_source" "$legacy_mirror" \
-            >>"$RUN_DIR/epic-records-resolved"
-          if [ "$in_current" -eq 1 ]; then
-            current_sources+=("$legacy_source")
-            current_mirrors+=("$legacy_mirror")
-          fi
-        done
       else
         die "epic provenance parser returned an invalid record"
       fi

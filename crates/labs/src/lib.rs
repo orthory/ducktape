@@ -2,7 +2,7 @@
 //!
 //! ## why this crate exists
 //!
-//! A module registered at genesis is in the app-hash. Every node on the network
+//! A module registered at genesis is in the root-hash. Every node on the network
 //! must then run it, agree on its state root at every height, and keep doing so
 //! forever. So putting an experiment in the production
 //! genesis registry is not a small thing. It commits the whole network to

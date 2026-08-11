@@ -112,14 +112,13 @@ pub(crate) struct BrowserGateway {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayProxyRequest {
     pub head: gateway::ProxyRequestHead,
     pub body_b64: String,
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct GatewayProxyReply {
     pub head: gateway::ProxyResponseHead,
     pub body_b64: String,
@@ -191,11 +190,13 @@ async fn current_route(
                 "gateway route is not published".into(),
             )),
         },
-        // a route `Get` must answer with a `Route`; the list and handle-plane
-        // replies (`Resolved`/`Registrations`) are all wrong shapes here.
+        // a route `Get` must answer with a `Route`; the list, handle-plane, and
+        // credential replies are all wrong shapes here.
         Ok(gateway::GatewayReply::Routes(_))
         | Ok(gateway::GatewayReply::Resolved(_))
-        | Ok(gateway::GatewayReply::Registrations(_)) => Err(GatewayFailure::Unavailable(
+        | Ok(gateway::GatewayReply::Registrations(_))
+        | Ok(gateway::GatewayReply::Credential(_))
+        | Ok(gateway::GatewayReply::Credentials(_)) => Err(GatewayFailure::Unavailable(
             "gateway returned an unexpected reply to a route query".into(),
         )),
         Err(error) => Err(GatewayFailure::Unavailable(error)),

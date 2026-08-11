@@ -83,6 +83,11 @@ interface host {
   emit-msg: func(target: string, payload: list<u8>);
   /// emit an observability event — leaves the state machine.
   emit-event: func(source: string, payload: list<u8>);
+  /// declare this dispatch's assigned stamp — values the module ASSIGNED
+  /// applying this op (a sequence, a revision), recorded on the dispatch
+  /// trace and carried on the derived-tier op-feed row. module-encoded,
+  /// host-opaque; last write wins within one dispatch.
+  set-assigned: func(stamp: list<u8>);
 }
 
 /// the contract every wasm module implements. the guest is PURE logic over

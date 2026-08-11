@@ -31,6 +31,12 @@ commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
 
 [dev-dependencies]
+# a SELF dev-dependency (the `data-plane` pattern): `tests/submit_decoded.rs`
+# opens with `#![cfg(feature = "sim")]` and `sim` is off by default, so
+# `cargo test -p node` compiled it to `running 0 tests` — a green that proved
+# nothing, alive only under `--workspace` or `-p simnode`, which is where the
+# feature happened to get unified in.
+node = { path = ".", features = ["sim"] }
 # the host-side qmdb store handle injected into disk-backed modules.
 statesync = { workspace = true }
 # tests stand hosts over in-memory directory modules and drive the async seams
@@ -43,6 +49,8 @@ kv = { workspace = true }
 # the oracle-over-consensus test: a saga tracker module + a mock worker prove an
 # async saga settles to Done when the OracleResult op finalizes on every node.
 saga = { workspace = true }
+# the in-memory MerkleStore double the store-backed saga module is injected with.
+sdk-testkit = { workspace = true }
 # a probe module (impl sdk::Module) in the env-from-view test needs async-trait.
 async-trait = { workspace = true }
 commonware-runtime = { workspace = true }

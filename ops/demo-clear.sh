@@ -70,8 +70,35 @@ try {
 } catch {}
 JS
 )"
-if [ -n "$HTTP_PORT" ]; then
-  curl -s -m 2 -X POST "http://127.0.0.1:$HTTP_PORT/v1/admin/shutdown" >/dev/null 2>&1
+# SAY SO on every path that does not gracefully stop the node. Falling silently
+# through to the SIGTERM sweep looks EXACTLY like a graceful stop that worked,
+# and hides which of three quite different things happened: no token on disk
+# (DUCKTAPE_ADMIN=off mints none; another uid's node writes one we cannot read),
+# or a node under DUCKTAPE_ADMIN=public, where the operator token is not the
+# credential at all — that wants an owner PoP from `ducktape user sign-admin`,
+# which needs the user key's password and is more than this script should carry.
+# The sweep below still stops the node either way; these lines are why it took a
+# signal to do it.
+if [ -z "$HTTP_PORT" ]; then
+  log "no http port in the registry for '$ID' — using the pid sweep"
+elif [ ! -r "$WSDIR/admin.token" ]; then
+  log "no readable $WSDIR/admin.token — reason=operator_token_unreadable, using the pid sweep"
+else
+  # /v1/admin/* is the OPERATOR's plane under the default loopback exposure:
+  # loopback presence is not authority (a service daemon is a loopback peer
+  # too), so the request carries the credential the node minted 0600 into its
+  # own workspace. Capture the STATUS — discarding it is what made a refusal
+  # indistinguishable from a stop.
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 2 \
+    -X POST "http://127.0.0.1:$HTTP_PORT/v1/admin/shutdown" \
+    -H "x-ducktape-admin-token: $(cat "$WSDIR/admin.token")" 2>/dev/null)"
+  case "$CODE" in
+    2*) : ;;
+    401) log "admin refused the operator token (401) — reason=wrong_credential_type, this node wants an owner PoP (DUCKTAPE_ADMIN=public); using the pid sweep" ;;
+    403) log "admin refused the operator token (403) — reason=operator_token_mismatch, the node restarted since this token was written; using the pid sweep" ;;
+    404) log "no admin namespace on this node (404) — reason=admin_disabled, using the pid sweep" ;;
+    *)   log "graceful shutdown did not succeed (http ${CODE:-none}) — using the pid sweep" ;;
+  esac
 fi
 
 PIDS="$(node_pids | xargs)"

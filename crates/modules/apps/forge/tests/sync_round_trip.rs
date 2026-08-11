@@ -11,10 +11,9 @@
 //! written, and each pack must hash-verify object by object BEFORE any ref moves
 //! — by asserting the rejected module's root AND its on-disk repos stay untouched.
 //!
-//! these tests drive the SINGLE default repo (empty `repo` -> back-compat
-//! default); the multi-repo container is exercised end-to-end in `multi_repo.rs`.
+//! these tests drive the SINGLE default repo (`repo: ""` is its canonical
+//! address); the multi-repo container is exercised end-to-end in `multi_repo.rs`.
 
-mod support;
 
 use std::path::{Path, PathBuf};
 
@@ -33,12 +32,15 @@ const DEFAULT_REPO: &str = "default";
 
 use sdk_testkit::TestCtx;
 
-// forge's execute reads only env (consensus_time); me/height are cosmetic.
+// forge's execute reads env (consensus_time / origin); me/height are cosmetic.
+// a push binds a PRINCIPAL, so the origin must be an authenticated external
+// key; with no `identity` handler registered it resolves to itself, and the
+// same key births and then owns every repo here.
 fn at(consensus_time: u64) -> TestCtx {
     TestCtx::with_env(sdk::Env {
         height: 0,
         consensus_time,
-        origin: sdk::Origin::System,
+        origin: sdk::Origin::External(vec![1u8; 32]),
         me: "forge".into(),
     })
 }
@@ -76,7 +78,7 @@ fn push(forge: &mut Forge, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) {
 /// closure, not just the tip).
 fn source(tag: &str) -> (PathBuf, Forge) {
     let base = tmp_base(tag);
-    let commits = support::history(tag, &[(1, "a.txt", "one", "c1"), (2, "b.txt", "two", "c2")]);
+    let commits = forge::testkit::history(tag, &[(1, "a.txt", "one", "c1"), (2, "b.txt", "two", "c2")]);
     let blobs = blobstore::BlobHandle::default();
     let digests = commits
         .iter()
@@ -167,7 +169,7 @@ fn snapshot_reconstructs_root_and_content_on_a_fresh_module() {
     assert_eq!(dst.root(), StateRoot::ZERO);
     dst.install(&bytes, root).unwrap();
 
-    // THE PROPERTY: identical composed root — the app-hash linkage a joiner needs.
+    // THE PROPERTY: identical composed root — the root-hash linkage a joiner needs.
     assert_eq!(
         dst.root(),
         root,
@@ -314,7 +316,7 @@ fn install_replaces_a_divergent_head() {
 
     let dst_base = tmp_base("replace-dst");
     let mut divergent =
-        support::history("replace-divergent", &[(9, "z.txt", "other", "unrelated")]);
+        forge::testkit::history("replace-divergent", &[(9, "z.txt", "other", "unrelated")]);
     let divergent = divergent.remove(0);
     let blobs = blobstore::BlobHandle::default();
     let digest = blobs.put_chunk(divergent.pack).to_vec();
@@ -388,7 +390,7 @@ fn empty_state_installed_over_a_born_repo_unbinds_it_durably() {
 
     // durability: a re-init re-adopts refs from DISK — if install had only
     // cleared the cached head and left the default repo's ref, the old root
-    // would resurrect here and the app-hash would diverge from ZERO.
+    // would resurrect here and the root-hash would diverge from ZERO.
     drop(dst);
     let reopened = Forge::init("forge", dst_base).unwrap();
     assert_eq!(reopened.root(), StateRoot::ZERO, "the on-disk ref is gone");

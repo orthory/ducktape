@@ -7,17 +7,16 @@ so Nimbus never publishes them accidentally.
 
 ## Reader Tracks
 
-- `src/content/docs/en/human` and `src/content/docs/ko/human` are for human readers.
-- `src/content/docs/en/agent` and `src/content/docs/ko/agent` are for coding agents.
+- `src/content/docs/en/human` is for human readers.
+- `src/content/docs/en/agent` is for coding agents.
 
 Human pages explain product shape, architecture, operations, and status without
 assuming the reader is about to edit code. Agent pages are tighter implementation
 maps: invariants, verification commands, module boundaries, and open work that a
 coding agent can use before touching files.
 
-Each reader track should stay structurally aligned across English and Korean.
-When adding a routed page, add all four language/reader variants unless the
-content is intentionally reader-specific.
+When adding a routed page, put it in the reader track whose audience it serves.
+Add a matching page to the other track only when both audiences need it.
 
 ## Where Docs Belong
 

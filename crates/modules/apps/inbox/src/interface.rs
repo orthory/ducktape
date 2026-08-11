@@ -1,16 +1,26 @@
 //! the inbox module's public wire surface — types only.
 //!
-//! writes go via [`InboxMsg`]; reads via [`InboxQuery`] -> [`InboxReply`]. the
+//! writes go via [`InboxMsg`]; the read surface (paged lists, unread counts)
+//! lives on the derived tier (`src/index.rs`), not here — the module serves no
+//! queries. the
 //! inbox holds per-member notification queues as consensus state: other modules
 //! deliver notifications as follow-up ops, so a notification commits atomically
 //! with the event that caused it (platform promise P2), and no external push
 //! service is involved (the air-gap-native notification story).
 //!
-//! `member` is an OPAQUE member-identity string. authorship is NOT modeled here:
-//! origin-bound member identity is a platform-wide open item, so this crate does
-//! not invent an auth scheme. `source` records the DELIVERING origin and is
-//! derived by the module from `Env.origin` (never caller-supplied).
+//! `member` names a queue in the shared ACTOR-STRING domain
+//! ([`sdk::Origin::actor_string`]) — the same domain [`Notification::source`]
+//! already records the delivering origin in, and the one tasks' job board and
+//! files' owner use. it is the module's whole identity model: a queue whose
+//! name is `origin.actor_string()` is OWNED by that origin, which is what makes
+//! an ack authorizable at all.
+//!
+//! DELIVERING and ACKING are different authorities. any origin may `Deliver` to
+//! any member (a module follow-up is the primary writer, and an external
+//! submitter may self-deliver); only the queue's OWN member may `MarkRead` or
+//! `Clear` it, and only an authenticated external submitter owns a queue.
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 // ---- write-time caps (consensus constants) ---------------------------------
@@ -29,16 +39,15 @@ pub const MAX_ITEMS_PER_MEMBER: usize = 4096;
 /// distinct members bound; a delivery that would introduce a new member beyond
 /// this is rejected.
 pub const MAX_MEMBERS: usize = 65536;
-/// query page bound; larger limits are clamped down to this.
-pub const MAX_QUERY_LIMIT: u64 = 256;
 
 /// one delivered notification. `seq` is assigned per member, monotonic and
 /// gap-free within what was ever assigned (a `Clear` removes items but never
 /// rewinds the member's `next_seq`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Notification {
     pub seq: u64,
-    /// the opaque member identity this notification belongs to.
+    /// the queue this notification belongs to, in the actor-string domain (see
+    /// the module header) — the principal that may ack it.
     pub member: String,
     pub kind: String,
     pub body: String,
@@ -51,6 +60,10 @@ pub struct Notification {
     pub read: bool,
 }
 
+/// the ack family (`MarkRead`, `Clear`) is MEMBER-BOUND: `member` must be the
+/// submitter's own [`sdk::Origin::actor_string`], so a submitter can only ever
+/// name their own queue. `Deliver` is deliberately outside that gate — writing
+/// INTO a queue is the module's whole purpose and every origin may do it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxMsg {
@@ -62,33 +75,26 @@ pub enum InboxMsg {
         kind: String,
         body: String,
     },
-    /// mark every item with `seq <= up_to_seq` as read. idempotent; an unknown
-    /// member or seq is a deterministic no-op (never an error).
+    /// mark every item with `seq <= up_to_seq` in the submitter's OWN queue as
+    /// read. idempotent; an unknown member or seq is a deterministic no-op
+    /// (never an error), but a member that is not the submitter is REFUSED.
     MarkRead { member: String, up_to_seq: u64 },
-    /// delete every item with `seq <= up_to_seq`. `next_seq` never rewinds. an
-    /// unknown member or seq is a deterministic no-op (never an error).
+    /// delete every item with `seq <= up_to_seq` from the submitter's OWN
+    /// queue. `next_seq` never rewinds. an unknown member or seq is a
+    /// deterministic no-op; a member that is not the submitter is REFUSED.
     Clear { member: String, up_to_seq: u64 },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+/// the assigned stamp inbox declares per applied op
+/// ([`sdk::Ctx::set_assigned`]): the per-member sequence a `Deliver`
+/// assigned in-state. rides the dispatch trace onto the derived-tier
+/// op-feed row, so the fold consumes the exact assignment instead of
+/// re-deriving it by counting.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum InboxQuery {
-    /// items for `member`, ascending by seq starting at `from_seq`, at most
-    /// `limit` (clamped to [`MAX_QUERY_LIMIT`]).
-    List {
-        member: String,
-        from_seq: u64,
-        limit: u64,
-    },
-    /// count of unread items for `member`.
-    Unread { member: String },
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum InboxReply {
-    Items(Vec<Notification>),
-    UnreadCount(u64),
+pub enum InboxAssigned {
+    /// `Deliver`: the notification's assigned per-member sequence.
+    Delivered { seq: u64 },
 }
 
 pub fn encode_msg(m: &InboxMsg) -> Vec<u8> {
@@ -99,18 +105,10 @@ pub fn decode_msg(b: &[u8]) -> Result<InboxMsg, String> {
     sdk::wire::decode(b)
 }
 
-pub fn encode_query(q: &InboxQuery) -> Vec<u8> {
-    sdk::wire::encode(q)
+pub fn encode_assigned(a: &InboxAssigned) -> Vec<u8> {
+    sdk::wire::encode(a)
 }
 
-pub fn decode_query(b: &[u8]) -> Result<InboxQuery, String> {
-    sdk::wire::decode(b)
-}
-
-pub fn encode_reply(r: &InboxReply) -> Vec<u8> {
-    sdk::wire::encode(r)
-}
-
-pub fn decode_reply(b: &[u8]) -> Result<InboxReply, String> {
+pub fn decode_assigned(b: &[u8]) -> Result<InboxAssigned, String> {
     sdk::wire::decode(b)
 }

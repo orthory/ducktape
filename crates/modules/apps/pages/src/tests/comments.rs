@@ -35,13 +35,7 @@ fn exact_comment_anchor_rebases_with_target_text() {
         if let PageMsg::AddComment { anchor, .. } = &mut anchored {
             *anchor = Some(RelativeAnchor { start: 0, end: 99 });
         }
-        apply_err_as(
-            &mut p,
-            &anchored,
-            user("alice"),
-            "invalid text range",
-        )
-        .await;
+        apply_err_as(&mut p, &anchored, user("alice"), "invalid text range").await;
         if let PageMsg::AddComment { anchor, .. } = &mut anchored {
             *anchor = Some(RelativeAnchor { start: 0, end: 2 });
         }
@@ -59,22 +53,23 @@ fn exact_comment_anchor_rebases_with_target_text() {
             query_thread(&p, "t1").await.unwrap().thread.anchor,
             Some(RelativeAnchor { start: 2, end: 4 })
         );
-        apply_commit(
+        // alice opened t1, so alice is who may re-home it.
+        apply_commit_as(
             &mut p,
             &PageMsg::MoveCommentThread {
                 thread_id: "t1".into(),
                 target: "b2".into(),
                 anchor: Some(RelativeAnchor { start: 0, end: 2 }),
             },
+            user("alice"),
         )
         .await;
-        let moved = query_threads(&p, &["b1", "b2"]).await;
-        assert!(moved[0].threads.is_empty());
-        assert_eq!(moved[1].threads[0].thread.target, "b2");
-        assert_eq!(
-            moved[1].threads[0].thread.anchor,
-            Some(RelativeAnchor { start: 0, end: 2 })
-        );
+        let moved = query_thread(&p, "t1").await.unwrap();
+        assert_eq!(moved.thread.target, "b2");
+        assert_eq!(moved.thread.anchor, Some(RelativeAnchor { start: 0, end: 2 }));
+        // the per-target index re-homed with it.
+        assert_eq!(target_thread_count(&p, "b1").await, 0);
+        assert_eq!(target_thread_count(&p, "b2").await, 1);
     });
 }
 
@@ -90,7 +85,7 @@ fn add_comment_reports_structured_agent_mentions_to_tagging() {
             module: "runs".into(),
             agent_id: "qa-luna".into(),
         });
-        let mut ctx = ctx_as(user("eddy"));
+        let mut ctx = ctx_as(user("carol"));
         p.execute(&mut ctx, &msg(&op)).await.unwrap();
         assert_eq!(ctx.msgs().len(), 1);
         assert_eq!(ctx.msgs()[0].target, "tagging");
@@ -100,7 +95,7 @@ fn add_comment_reports_structured_agent_mentions_to_tagging() {
         };
         assert_eq!(event.container, "t1");
         assert_eq!(event.content_seq, 1);
-        assert_eq!(event.author, tagging::Author::User(b"eddy".to_vec()));
+        assert_eq!(event.author, tagging::Author::User(b"carol".to_vec()));
         assert_eq!(
             event.tags,
             vec![tagging::EntityRef {
@@ -115,7 +110,7 @@ fn add_comment_reports_structured_agent_mentions_to_tagging() {
 fn edit_comment_reports_only_supplied_new_agent_mentions_to_tagging() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages").with_tagging("tagging");
-        apply_commit_as(&mut p, &add("t1", "c1", "page-1", "draft"), user("eddy")).await;
+        apply_commit_as(&mut p, &add("t1", "c1", "page-1", "draft"), user("carol")).await;
         let edit = PageMsg::EditComment {
             comment_id: "c1".into(),
             text: "@qa-luna please review".into(),
@@ -124,7 +119,7 @@ fn edit_comment_reports_only_supplied_new_agent_mentions_to_tagging() {
                 agent_id: "qa-luna".into(),
             }],
         };
-        let mut ctx = ctx_as(user("eddy"));
+        let mut ctx = ctx_as(user("carol"));
         p.execute(&mut ctx, &msg(&edit)).await.unwrap();
 
         let tagging::TaggingMsg::Tag(event) = tagging::decode_msg(&ctx.msgs()[0].payload).unwrap()
@@ -178,6 +173,31 @@ fn add_comment_rejects_over_length_ids_before_staging() {
             user("alice"),
         )
         .await;
+    });
+}
+
+#[test]
+fn add_comment_rejects_oversized_origins() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        for (comment, origin) in [
+            (
+                "m1",
+                sdk::Origin::External(vec![b'x'; MAX_COMMENT_AUTHOR_BYTES + 1]),
+            ),
+            (
+                "m2",
+                sdk::Origin::Module("m".repeat(MAX_COMMENT_AUTHOR_BYTES + 1)),
+            ),
+        ] {
+            apply_err_as(
+                &mut p,
+                &add("t1", comment, "b1", "hi"),
+                origin,
+                "comment author is too large",
+            )
+            .await;
+        }
     });
 }
 
@@ -246,6 +266,79 @@ fn bounded_ids_keep_the_derived_blocks_under_max_block_len() {
 }
 
 #[test]
+fn a_full_comment_thread_keeps_the_block_removal_escape_path() {
+    deterministic::Runner::default().start(|_context| async move {
+        assert_eq!(MAX_COMMENTS_PER_THREAD + 2, MAX_TRAVERSAL_WORK);
+        let mut p = Pages::new("pages", Box::new(sdk_testkit::MemStore::new()));
+        let comment_ids: Vec<_> = (0..MAX_COMMENTS_PER_THREAD)
+            .map(|index| format!("comment-{index}"))
+            .collect();
+        p.store_block(&Block {
+            id: "target".into(),
+            parent: None,
+            page: "target".into(),
+            kind: BlockKind::Page,
+            text: String::new(),
+            marks: Vec::new(),
+            checked: false,
+            children: Vec::new(),
+        })
+        .unwrap();
+        p.stage_index(&BTreeMap::from([("target".into(), None)]))
+            .unwrap();
+        p.stage(
+            "\0ct:thread",
+            serde_json::to_vec(&Thread {
+                id: "thread".into(),
+                target: "target".into(),
+                opener: AuthorRef::System,
+                created_at: 0,
+                anchor: None,
+                resolved: false,
+                resolved_by: None,
+                comment_ids: comment_ids.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        p.stage("\0ci:target", serde_json::to_vec(&vec!["thread"]).unwrap())
+            .unwrap();
+        for id in &comment_ids {
+            p.stage(
+                &format!("\0cc:{id}"),
+                serde_json::to_vec(&Comment {
+                    id: id.clone(),
+                    thread_id: "thread".into(),
+                    author: AuthorRef::System,
+                    text: String::new(),
+                    created_at: 0,
+                    edited_at: None,
+                    deleted: false,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        p.commit_block().await.unwrap();
+
+        p.apply(
+            PageMsg::RemoveBlock {
+                block_id: "target".into(),
+            },
+            &Origin::System,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(p.load_block("target").await.unwrap().is_none());
+        assert!(p.load_thread("thread").await.unwrap().is_none());
+        assert!(p.load_comment(&comment_ids[0]).await.unwrap().is_none());
+        assert!(p.load_index().await.unwrap().is_empty());
+    });
+}
+
+#[test]
 fn as_agent_refines_a_module_origin_into_an_agent_author() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
@@ -261,7 +354,10 @@ fn as_agent_refines_a_module_origin_into_an_agent_author() {
             agent_id: "bot".into(),
         };
         assert_eq!(view.thread.opener, agent, "the opener is the agent");
-        assert_eq!(view.comments[0].author, agent, "the comment author too");
+        assert_eq!(
+            view.comments[0].author, agent,
+            "the comment author too"
+        );
     });
 }
 
@@ -281,6 +377,18 @@ fn as_agent_requires_a_module_origin_and_a_non_empty_id() {
             &add_as_agent("t1", "m1", "b1", ""),
             sdk::Origin::Module("runs".into()),
             "empty as_agent",
+        )
+        .await;
+        apply_err_as(
+            &mut p,
+            &add_as_agent(
+                "t1",
+                "m1",
+                "b1",
+                &"a".repeat(MAX_COMMENT_AGENT_ID_BYTES + 1),
+            ),
+            sdk::Origin::Module("runs".into()),
+            "as_agent is too large",
         )
         .await;
     });
@@ -310,7 +418,7 @@ fn get_comment_serves_the_record_tombstones_included() {
 }
 
 #[test]
-fn comment_add_opens_then_appends_and_batches_by_target() {
+fn comment_add_opens_then_appends_and_counts_per_target() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "first"), user("alice")).await;
@@ -318,10 +426,7 @@ fn comment_add_opens_then_appends_and_batches_by_target() {
         apply_commit_as(&mut p, &add("t2", "m3", "b1", "other"), user("alice")).await;
         apply_commit_as(&mut p, &add("t3", "m4", "b2", "elsewhere"), user("alice")).await;
 
-        let groups = query_threads(&p, &["b1", "b2"]).await;
-        let b1 = groups.iter().find(|g| g.target == "b1").unwrap();
-        assert_eq!(b1.threads.len(), 2);
-        let t1 = b1.threads.iter().find(|v| v.thread.id == "t1").unwrap();
+        let t1 = query_thread(&p, "t1").await.unwrap();
         assert_eq!(
             t1.comments
                 .iter()
@@ -331,15 +436,11 @@ fn comment_add_opens_then_appends_and_batches_by_target() {
         );
         assert_eq!(t1.thread.opener, AuthorRef::User(b"alice".to_vec()));
         assert_eq!(t1.comments[1].author, AuthorRef::User(b"bob".to_vec()));
-        assert_eq!(
-            groups
-                .iter()
-                .find(|g| g.target == "b2")
-                .unwrap()
-                .threads
-                .len(),
-            1
-        );
+        // the per-target index counts THREADS, not comments (per-target
+        // thread ENUMERATION is `index::tests`' now).
+        assert_eq!(target_thread_count(&p, "b1").await, 2);
+        assert_eq!(target_thread_count(&p, "b2").await, 1);
+        assert_eq!(target_thread_count(&p, "ghost").await, 0);
     });
 }
 
@@ -444,7 +545,7 @@ fn comment_deleting_last_live_removes_the_thread() {
         )
         .await;
         assert!(query_thread(&p, "t1").await.is_none());
-        assert!(query_threads(&p, &["b1"]).await[0].threads.is_empty());
+        assert_eq!(target_thread_count(&p, "b1").await, 0);
     });
 }
 
@@ -512,13 +613,8 @@ fn comment_caps_and_reserved_ids_reject() {
             "reserved block id",
         )
         .await;
-        // over-cap query rejected.
-        let targets: Vec<String> = (0..=MAX_QUERY_TARGETS).map(|i| format!("t{i}")).collect();
-        assert!(
-            p.query(&encode_query(&PageQuery::ThreadsForTargets { targets }))
-                .await
-                .is_err()
-        );
+        // the MAX_QUERY_TARGETS cap guards the index tier's grouped read now
+        // (`index::tests::threads_for_targets_rejects_over_cap_target_lists`).
     });
 }
 
@@ -537,7 +633,7 @@ fn comments_and_blocks_coexist_and_move_the_root() {
             ids(&get_page(&p, "p1").await.unwrap()),
             ["p1", "b1", "b2", "b3"]
         );
-        assert_eq!(query_threads(&p, &["b1"]).await[0].threads.len(), 1);
+        assert_eq!(target_thread_count(&p, "b1").await, 1);
     });
 }
 
@@ -550,7 +646,7 @@ fn deleting_a_block_purges_its_comment_threads() {
         seed_page(&mut p, "p1").await; // p1 + b1,b2,b3
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "on b1"), user("alice")).await;
         apply_commit_as(&mut p, &add("t2", "m2", "p1", "on the page"), user("alice")).await;
-        assert_eq!(query_threads(&p, &["b1"]).await[0].threads.len(), 1);
+        assert_eq!(target_thread_count(&p, "b1").await, 1);
 
         // remove b1 → its thread t1 (+ comment m1 + target index) is gone.
         apply_commit(
@@ -560,7 +656,7 @@ fn deleting_a_block_purges_its_comment_threads() {
             },
         )
         .await;
-        assert!(query_threads(&p, &["b1"]).await[0].threads.is_empty());
+        assert_eq!(target_thread_count(&p, "b1").await, 0);
         assert!(query_thread(&p, "t1").await.is_none());
 
         // delete the page → the page-anchored thread t2 is purged too.
@@ -569,18 +665,91 @@ fn deleting_a_block_purges_its_comment_threads() {
             &PageMsg::CreatePage {
                 page_id: "p2".into(),
                 title: "keep".into(),
-                parent: None,
             },
         )
         .await;
         apply_commit(
             &mut p,
-            &PageMsg::DeletePage {
-                page_id: "p1".into(),
+            &PageMsg::RemoveBlock {
+                block_id: "p1".into(),
             },
         )
         .await;
         assert!(query_thread(&p, "t2").await.is_none());
-        assert!(query_threads(&p, &["p1"]).await[0].threads.is_empty());
+        assert_eq!(target_thread_count(&p, "p1").await, 0);
+    });
+}
+
+// re-homing a thread is the opener's call — the same stored-author rule
+// `EditComment`/`DeleteComment` already enforce. It is also what bounds the
+// comment purge: without it, a stranger aims `RemoveBlock` at comments they
+// may not delete by first moving the thread onto a block of their own.
+#[test]
+fn a_thread_moves_only_by_its_opener() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await; // p1 + b1,b2,b3
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "on b1"), user("alice")).await;
+
+        let move_to_b2 = PageMsg::MoveCommentThread {
+            thread_id: "t1".into(),
+            target: "b2".into(),
+            anchor: None,
+        };
+        // a stranger, a module and the system are all refused: the opener is a
+        // stored author, not an origin KIND, so nothing outranks it here.
+        for origin in [
+            user("mallory"),
+            sdk::Origin::Module("runs".into()),
+            sdk::Origin::System,
+        ] {
+            apply_err_as(&mut p, &move_to_b2, origin, "not the comment author").await;
+        }
+        // and the pre-consensus empty origin never passes as a real user,
+        // exactly as on `AddComment`/`EditComment`/`DeleteComment`.
+        apply_err_as(
+            &mut p,
+            &move_to_b2,
+            sdk::Origin::External(Vec::new()),
+            "empty origin",
+        )
+        .await;
+        assert_eq!(target_thread_count(&p, "b1").await, 1);
+        assert_eq!(target_thread_count(&p, "b2").await, 0);
+
+        // so mallory removing her OWN block takes nothing of alice's with it:
+        // the purge reaches exactly what was anchored to the removed subtree.
+        apply_commit(
+            &mut p,
+            &PageMsg::RemoveBlock {
+                block_id: "b2".into(),
+            },
+        )
+        .await;
+        assert!(query_comment(&p, "m1").await.is_some());
+        assert_eq!(query_thread(&p, "t1").await.unwrap().thread.target, "b1");
+
+        // the opener re-homes it herself, and then the purge does reach it —
+        // that is the block op's authority, and it is unchanged.
+        apply_commit_as(
+            &mut p,
+            &PageMsg::MoveCommentThread {
+                thread_id: "t1".into(),
+                target: "b3".into(),
+                anchor: None,
+            },
+            user("alice"),
+        )
+        .await;
+        assert_eq!(target_thread_count(&p, "b3").await, 1);
+        apply_commit(
+            &mut p,
+            &PageMsg::RemoveBlock {
+                block_id: "b3".into(),
+            },
+        )
+        .await;
+        assert!(query_thread(&p, "t1").await.is_none());
+        assert!(query_comment(&p, "m1").await.is_none());
     });
 }

@@ -11,12 +11,10 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 COPY --from=build /src/target/release/coordinator /usr/local/bin/ducktape-coordinator
 ENV MALLOC_ARENA_MAX=1
 USER nonroot:nonroot
-# STUN/rendezvous control port — the process's only socket. Publish with:
+# STUN/rendezvous control port. Publish with:
 # -p 3478:3478/udp
 EXPOSE 3478/udp
 ENTRYPOINT ["/usr/local/bin/ducktape-coordinator"]
-# This image is the STUN + rendezvous coordinator (rendezvous only; it never
-# carries peer traffic). Run it hardened, published as a single UDP port (NOT
-# --network host): docker run --cap-drop=ALL --security-opt no-new-privileges
-# --read-only --restart unless-stopped -p 3478:3478/udp ducktape-coordinator.
-CMD ["--listen", "0.0.0.0:3478", "--workers", "4"]
+# The default image exposes UDP rendezvous only. Opt into the sealed-intro TCP
+# fallback explicitly, mapping host 443 to an unprivileged container port.
+CMD ["--listen", "0.0.0.0:3478", "--relay-listen", "none", "--workers", "4"]

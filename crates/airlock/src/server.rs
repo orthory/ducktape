@@ -1,0 +1,1002 @@
+//! The gateway (credential-side) HTTP service, behind the `server` feature. The
+//! `airlock-gateway` binary is a thin wrapper over [`build`]/[`serve`]; tests
+//! drive the same router in-process. Enclave keys are minted per process and
+//! never leave memory; the operator cannot read the sealed credential back out.
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{bail, Context, Result};
+use axum::body::{Body, Bytes};
+use axum::extract::{OriginalUri, State};
+use axum::http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{any, get, post};
+use axum::Json;
+pub use axum::Router;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use rand_core::OsRng;
+
+use crate::attest;
+use crate::bodyseal;
+use crate::handshake;
+use crate::seal::{self, SealKeypair};
+use crate::token::{self, Claims};
+use crate::wire::{
+    AttestationResponse, CredentialKind, CredentialPayload, CredentialUpload, SessionRequest,
+    SessionResponse, WorkRef,
+};
+
+/// How the gateway proves its seal key to the broker.
+#[derive(Clone)]
+pub enum AttestMode {
+    /// configfs-tsm hardware attestation. Carries the operator's requested
+    /// vendor: `tdx` | `snp` | `auto` (auto probes the silicon).
+    Tsm(String),
+    /// No TEE. There is no quote; the trust anchor is the seal_pk published on
+    /// consensus, which the broker pins. The gateway serves an empty quote under
+    /// vendor `self-host`.
+    SelfHost,
+}
+
+/// Everything the gateway needs to serve. Keys are minted inside [`build`]
+/// unless `seal_keypair` injects one (the self-host path pins the on-chain key).
+pub struct GatewayConfig {
+    pub attest: AttestMode,
+    /// The enclave seal keypair. `None` mints a fresh one — the TEE path binds it
+    /// into the quote. Self-host injects the on-chain-published keypair so the
+    /// broker's pinned seal_pk matches what this gateway seals under.
+    pub seal_keypair: Option<SealKeypair>,
+    /// Upstream base for `CredentialKind::Claude` credentials.
+    pub anthropic_base: String,
+    /// Upstream base for `CredentialKind::Codex` credentials.
+    pub openai_base: String,
+    pub oauth_token_url: String,
+    pub oauth_client_id: String,
+    pub session_ttl_secs: u64,
+    pub max_requests: u32,
+}
+
+struct Config {
+    anthropic_base: String,
+    openai_base: String,
+    oauth_token_url: String,
+    oauth_client_id: String,
+    session_ttl_secs: u64,
+    max_requests: u32,
+}
+
+struct Oauth {
+    access_token: String,
+    refresh_token: String,
+    expires_at: u64,
+}
+
+/// One named credential: its vendor, its (refreshable) token state, and a
+/// single-flight gate so two concurrent proxied calls never double-spend one
+/// rotating refresh token.
+struct CredEntry {
+    kind: CredentialKind,
+    oauth: Mutex<Oauth>,
+    refresh_gate: tokio::sync::Mutex<()>,
+}
+
+struct AppState {
+    seal_kp: SealKeypair,
+    sess_sk: SigningKey,
+    sess_pk: VerifyingKey,
+    quote: Vec<u8>,
+    /// "tdx" | "snp" | "self-host" — advertised so the client picks the right
+    /// verifier (or, for self-host, pins the on-chain seal_pk instead).
+    vendor: String,
+    http: reqwest::Client,
+    cfg: Config,
+    /// The named credential store, keyed by credential name (== session `sub`).
+    /// Seeded at build and/or filled by sealed `/credential` uploads.
+    creds: Mutex<HashMap<String, Arc<CredEntry>>>,
+    /// Remaining request budget per session `sub` (credential NAME), refilled by
+    /// every `/session` open. Deliberately named for what it is: a per-credential
+    /// throttle shared by all of that credential's borrowers, NOT a per-session
+    /// cap and NOT an authorization boundary — reopening a session refills it.
+    /// The boundary is [`AppState::grant_check`], which decides who may open a
+    /// session at all.
+    budgets: Mutex<HashMap<String, u32>>,
+    /// Per-name sealed-request nonces already served — replay dedupe. Bounded
+    /// by the request budget per name; dies with the process like every key.
+    seen_nonces: Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
+    /// The co-hosted-lending grant gate (see [`GrantCheck`]). `None` on gateways
+    /// that never lend, where every known credential opens without a grant check.
+    grant_check: Option<GrantCheck>,
+    /// Lazy store loader (see [`ReloadCredential`]): consulted on a session name
+    /// miss so a credential `cred add` wrote after boot is served without a
+    /// restart. `None` on gateways with no backing store (TEE, tests).
+    reload: Option<ReloadCredential>,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// Quote generation, injected. Production uses configfs-tsm; the testkit
+/// injects a minted-chain quoter. A process that injects a quoter already
+/// controls the process — clients only trust what verifies against pinned
+/// vendor roots, so this seam grants no forgery power.
+pub type Quoter = Box<dyn Fn(&[u8; attest::REPORT_DATA_LEN]) -> Result<Vec<u8>> + Send + Sync>;
+
+/// What the injected grant gate answered. THREE states, not two: a `bool` has
+/// no room for "I could not ask", and folding that into a refusal is the
+/// expensive mistake — it tells the borrower's operator to go add a grant that
+/// already exists, which is the one thing provably not wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantAnswer {
+    /// the authority answered, and its committed record admits this account.
+    Granted,
+    /// the authority answered, and it does not admit this account — no such
+    /// record, or an account that is neither the owner nor a grantee.
+    Refused,
+    /// the authority could not be ASKED: a node link that timed out, a refused
+    /// connection, a resident that is not serving, a reply that would not
+    /// decode. Nothing at all is known about the grant.
+    Undetermined,
+}
+
+/// Everything the injected gate is given about one session-open. A struct, not a
+/// positional list: `credential` and `caller` are both opaque identifiers, and a
+/// security gate whose two arguments can be silently transposed is a defect
+/// waiting to happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantQuestion {
+    /// the credential NAME the session names (`SessionRequest::sub`).
+    pub credential: String,
+    /// the account the TRANSPORT vouched for — see [`CALLER_ACCOUNT_HEADER`].
+    /// The only identity input, and the request contributes nothing to it.
+    pub caller: Vec<u8>,
+    /// WHICH WORK the session draws for. A pointer into the lender's own
+    /// committed state, never a claim — see [`WorkRef`].
+    pub work: WorkRef,
+}
+
+/// The co-hosted-lending grant gate, injected by the node. Given a
+/// [`GrantQuestion`] it answers whether that session may open — the node
+/// resolves it against its own COMMITTED state (the gateway-module credential
+/// record, and for a delegated pointer the saga module and the identity module
+/// too).
+///
+/// The account handed here is ALWAYS the one the node's proxy vouched for in
+/// [`CALLER_ACCOUNT_HEADER`]. There is no other source, and there must not be
+/// one: the record's `owner_account` is a public field of the very record a
+/// borrower must read to learn `seal_pk`, so a gate keyed on anything the
+/// request could carry admits everyone who can read the chain. See
+/// [`session_gate`].
+///
+/// The `work` pointer is different in kind and that difference is the whole of
+/// the delegation design: it is an ID, and every fact derived from it is READ
+/// FROM CONSENSUS by the answering node. A caller that names a saga still
+/// cannot say who submitted it, who holds its lease, or whether that submitter
+/// is granted.
+///
+/// `None` on gateways that never lend (owner-local, TEE): there is no subject to
+/// check. See [`GrantAnswer`] for what each answer costs the borrower.
+pub type GrantCheck =
+    Arc<dyn Fn(GrantQuestion) -> Pin<Box<dyn Future<Output = GrantAnswer> + Send>> + Send + Sync>;
+
+/// Lazy store loader: given a credential name, return its payload from the
+/// on-disk store, or `None` if absent. Lets a running gateway pick up a
+/// credential `cred add` wrote AFTER boot without a node restart — the session
+/// handler calls it on a name miss. `None` on gateways with no backing store.
+pub type ReloadCredential =
+    Arc<dyn Fn(&str) -> Option<(CredentialKind, CredentialPayload)> + Send + Sync>;
+
+/// Whether this gateway serves `POST /credential`.
+///
+/// ONE discriminant, decided at build time by which build path ran, because the
+/// two answers come from genuinely different topologies:
+///
+/// - [`Self::Accepted`] — the ATTESTED build. An enclave has no other way to
+///   receive a credential: there is a real host-vs-enclave boundary and the
+///   upload is the only thing that crosses it. Its listener is the CVM's own,
+///   not something a network member is routed to.
+/// - [`Self::Refused`] — the SELF-HOST lender. Its credentials come from the
+///   operator's own disk store (`ducktape user cred add`), which the lazy
+///   [`ReloadCredential`] picks up without a restart, so nothing legitimate ever
+///   posts here. Its router, by contrast, IS reachable by any admitted network
+///   member through the owner's signed `airlock` gateway route — and sealing is
+///   not authentication, since the seal public key is on chain and served at
+///   `/attestation`. An open upload endpoint there is a way for any member to
+///   overwrite a lender's credential with an attacker-chosen bearer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialUploads {
+    Accepted,
+    Refused,
+}
+
+/// The unforgeable half of a session request.
+///
+/// The node's gateway proxy mints `x-duck-caller-account` from the mesh-verified
+/// WireGuard peer identity (`bin/node/src/gateway_plane.rs`), and the proxy's own
+/// decode REFUSES a caller-supplied `x-duck-*`, so a borrower cannot write it.
+/// Everything else on a [`SessionRequest`] is chosen by whoever composed the
+/// JSON.
+pub const CALLER_ACCOUNT_HEADER: &str = "x-duck-caller-account";
+
+/// Build the gateway router and report the vendor ("tdx"/"snp"/"self-host").
+pub fn build(cfg: GatewayConfig) -> Result<(Router, String)> {
+    build_seeded(cfg, Vec::new())
+}
+
+/// Self-host build with a lazy store loader: seeds the gateway with whatever the
+/// store holds now AND lets it load credentials added later (see
+/// [`ReloadCredential`]). The credential-lending node embed calls this so
+/// `cred add` takes effect without a restart.
+pub fn build_self_host_reloadable(
+    cfg: GatewayConfig,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+    grant_check: Option<GrantCheck>,
+    reload: ReloadCredential,
+) -> Result<(Router, String)> {
+    build_self_host(cfg, seeds, grant_check, Some(reload))
+}
+
+/// Like [`build_seeded`], but with the co-hosted-lending grant gate wired: the
+/// node's own committed-state grant lookup. Only the credential-lending node
+/// embed calls this; every other build path leaves the gate off.
+pub fn build_seeded_gated(
+    cfg: GatewayConfig,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+    grant_check: Option<GrantCheck>,
+) -> Result<(Router, String)> {
+    match cfg.attest.clone() {
+        AttestMode::Tsm(spec) => {
+            let mode = if spec == "auto" {
+                tsm_probe_provider()?
+            } else {
+                spec.parse::<attest::AttestMode>()?
+            };
+            build_with_quoter_gated(cfg, mode.as_str(), tsm_quoter(mode), seeds, grant_check)
+        }
+        AttestMode::SelfHost => build_self_host(cfg, seeds, grant_check, None),
+    }
+}
+
+/// Like [`build`], but seed the store with named credentials directly instead of
+/// waiting for sealed `/credential` uploads. Used when the credential provider IS
+/// the gateway process (the node embed): there is no host-vs-enclave boundary to
+/// seal across, so credentials are handed in-process. A `Bearer` is static (no
+/// rotation); a claude `Refresh` is refreshed lazily; a codex `Refresh` is
+/// refused (bearer-only lane).
+pub fn build_seeded(
+    cfg: GatewayConfig,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+) -> Result<(Router, String)> {
+    build_seeded_gated(cfg, seeds, None)
+}
+
+fn tsm_quoter(expected: attest::AttestMode) -> Quoter {
+    Box::new(move |rd| tsm_gen_quote(Some(expected), rd).map(|(_, quote)| quote))
+}
+
+/// Build the gateway with an injected quote generator (see [`build_seeded`]).
+/// Mints/takes the enclave seal key, mints the session key, and calls `quoter`
+/// once on the freshly bound REPORTDATA.
+pub fn build_with_quoter(
+    cfg: GatewayConfig,
+    vendor: &str,
+    quoter: Quoter,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+) -> Result<(Router, String)> {
+    build_with_quoter_gated(cfg, vendor, quoter, seeds, None)
+}
+
+fn build_with_quoter_gated(
+    mut cfg: GatewayConfig,
+    vendor: &str,
+    quoter: Quoter,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+    grant_check: Option<GrantCheck>,
+) -> Result<(Router, String)> {
+    let seal_kp = cfg.seal_keypair.take().unwrap_or_else(SealKeypair::generate);
+    let sess_sk = SigningKey::generate(&mut OsRng);
+    let sess_pk = sess_sk.verifying_key();
+
+    let report_data = attest::make_report_data(&seal_kp.public_bytes(), &sess_pk.to_bytes());
+    let quote = quoter(&report_data)?;
+    assemble(Assembly {
+        cfg,
+        vendor: vendor.to_string(),
+        quote,
+        seal_kp,
+        sess_sk,
+        sess_pk,
+        seeds,
+        grant_check,
+        reload: None,
+        uploads: CredentialUploads::Accepted,
+    })
+}
+
+/// Non-TEE build: no quote, vendor "self-host". The broker pins the seal_pk from
+/// consensus, so there is nothing to attest here.
+fn build_self_host(
+    mut cfg: GatewayConfig,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+    grant_check: Option<GrantCheck>,
+    reload: Option<ReloadCredential>,
+) -> Result<(Router, String)> {
+    let seal_kp = cfg.seal_keypair.take().unwrap_or_else(SealKeypair::generate);
+    let sess_sk = SigningKey::generate(&mut OsRng);
+    let sess_pk = sess_sk.verifying_key();
+    assemble(Assembly {
+        cfg,
+        vendor: "self-host".to_string(),
+        quote: Vec::new(),
+        seal_kp,
+        sess_sk,
+        sess_pk,
+        seeds,
+        grant_check,
+        reload,
+        uploads: CredentialUploads::Refused,
+    })
+}
+
+/// Everything [`assemble`] needs, already resolved by whichever build path ran.
+struct Assembly {
+    cfg: GatewayConfig,
+    vendor: String,
+    quote: Vec<u8>,
+    seal_kp: SealKeypair,
+    sess_sk: SigningKey,
+    sess_pk: VerifyingKey,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+    grant_check: Option<GrantCheck>,
+    reload: Option<ReloadCredential>,
+    uploads: CredentialUploads,
+}
+
+/// Shared assembly: build the named store from the seeds, wire the state and the
+/// router. The two build paths differ only in vendor/quote/keys and whether they
+/// serve `/credential`, all resolved before this point.
+fn assemble(assembly: Assembly) -> Result<(Router, String)> {
+    let Assembly {
+        cfg,
+        vendor,
+        quote,
+        seal_kp,
+        sess_sk,
+        sess_pk,
+        seeds,
+        grant_check,
+        reload,
+        uploads,
+    } = assembly;
+    let mut creds = HashMap::new();
+    for (name, kind, payload) in seeds {
+        creds.insert(name, Arc::new(cred_entry(kind, payload)?));
+    }
+
+    let state = Arc::new(AppState {
+        seal_kp,
+        sess_sk,
+        sess_pk,
+        quote,
+        vendor: vendor.clone(),
+        http: reqwest::Client::new(),
+        cfg: Config {
+            anthropic_base: cfg.anthropic_base,
+            openai_base: cfg.openai_base,
+            oauth_token_url: cfg.oauth_token_url,
+            oauth_client_id: cfg.oauth_client_id,
+            session_ttl_secs: cfg.session_ttl_secs,
+            max_requests: cfg.max_requests,
+        },
+        creds: Mutex::new(creds),
+        budgets: Mutex::new(HashMap::new()),
+        seen_nonces: Mutex::new(HashMap::new()),
+        grant_check,
+        reload,
+    });
+
+    let app = Router::new()
+        .route("/attestation", get(attestation))
+        .route("/session", post(session))
+        // Proxy the whole /v1/* surface (Claude Code calls /v1/messages and
+        // /v1/messages/count_tokens, not just messages).
+        .route("/v1/{*rest}", any(proxy));
+    // NOT mounted-then-guarded: a route that exists and refuses is one bad
+    // refactor away from a route that exists and accepts. See
+    // [`CredentialUploads`] for why only the attested build has one.
+    let app = match uploads {
+        CredentialUploads::Accepted => app.route("/credential", post(credential)),
+        CredentialUploads::Refused => app,
+    };
+    Ok((app.with_state(state), vendor))
+}
+
+/// Turn a seed/upload payload into a [`CredEntry`]. A `Bearer` is static
+/// (`expires_at = MAX`, never refreshed); a claude `Refresh` starts empty and is
+/// exchanged lazily; a codex `Refresh` is rejected — codex is bearer-only in v1.
+fn cred_entry(kind: CredentialKind, payload: CredentialPayload) -> Result<CredEntry> {
+    let oauth = match (kind, payload) {
+        (_, CredentialPayload::Bearer { access_token }) => Oauth {
+            access_token,
+            refresh_token: String::new(),
+            expires_at: u64::MAX,
+        },
+        (
+            CredentialKind::Claude,
+            CredentialPayload::Refresh { refresh_token, access_token, expires_at },
+        ) => Oauth {
+            access_token,
+            refresh_token,
+            expires_at,
+        },
+        (CredentialKind::Codex, CredentialPayload::Refresh { .. }) => {
+            bail!("codex credentials must be a static bearer token; oauth refresh is not supported")
+        }
+    };
+    Ok(CredEntry { kind, oauth: Mutex::new(oauth), refresh_gate: tokio::sync::Mutex::new(()) })
+}
+
+/// Serve an already-built gateway router. The node embed BUILDS (and thus
+/// attests) at boot — before registering its route or claiming to listen —
+/// and only serves here; a box that cannot attest never reaches this point.
+pub async fn serve_router(listener: tokio::net::TcpListener, app: Router) -> Result<()> {
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Generate a real confidential-VM quote via `configfs-tsm` (kernel >= 6.7,
+/// only inside a CVM guest). Vendor-generic: Intel TDX and AMD SEV-SNP both write
+/// REPORTDATA to `inblob` and read the raw report/quote from `outblob`; the
+/// `provider` attribute names the vendor. `expected` is the operator's requested
+/// vendor (`None` = auto); a mismatch errors. Untested off-hardware.
+fn tsm_gen_quote(
+    expected: Option<attest::AttestMode>,
+    report_data: &[u8; attest::REPORT_DATA_LEN],
+) -> Result<(attest::AttestMode, Vec<u8>)> {
+    use std::fs;
+    let dir = format!("/sys/kernel/config/tsm/report/airlock-{}", std::process::id());
+    fs::create_dir(&dir)
+        .with_context(|| format!("create {dir} (are we inside a TDX/SEV-SNP guest?)"))?;
+    let result = (|| -> Result<(attest::AttestMode, Vec<u8>)> {
+        let provider =
+            fs::read_to_string(format!("{dir}/provider")).context("read configfs-tsm provider")?;
+        let detected = provider_to_mode(provider.trim())?;
+        if let Some(want) = expected
+            && want != detected
+        {
+            bail!(
+                "attest={} but the guest reports {} ({provider:?})",
+                want.as_str(),
+                detected.as_str()
+            );
+        }
+        fs::write(format!("{dir}/inblob"), report_data).context("write inblob")?;
+        let quote = fs::read(format!("{dir}/outblob")).context("read outblob")?;
+        Ok((detected, quote))
+    })();
+    let _ = fs::remove_dir(&dir);
+    result
+}
+
+fn provider_to_mode(provider: &str) -> Result<attest::AttestMode> {
+    match provider {
+        "tdx_guest" => Ok(attest::AttestMode::Tdx),
+        "sev_guest" => Ok(attest::AttestMode::Snp),
+        other => bail!("unsupported configfs-tsm provider {other:?} (want tdx_guest/sev_guest)"),
+    }
+}
+
+/// Probe the configfs-tsm provider to learn the hardware vendor without
+/// generating a quote (the `auto` mode).
+fn tsm_probe_provider() -> Result<attest::AttestMode> {
+    use std::fs;
+    let dir = format!("/sys/kernel/config/tsm/report/airlock-probe-{}", std::process::id());
+    fs::create_dir(&dir)
+        .with_context(|| format!("create {dir} (are we inside a TDX/SEV-SNP guest?)"))?;
+    let provider = fs::read_to_string(format!("{dir}/provider"));
+    let _ = fs::remove_dir(&dir);
+    provider_to_mode(provider.context("read configfs-tsm provider")?.trim())
+}
+
+// -------- handlers --------
+
+struct AppErr(StatusCode, String);
+impl IntoResponse for AppErr {
+    fn into_response(self) -> Response {
+        (self.0, self.1).into_response()
+    }
+}
+
+async fn attestation(State(st): State<Arc<AppState>>) -> Json<AttestationResponse> {
+    Json(AttestationResponse {
+        quote_b64: BASE64.encode(&st.quote),
+        vendor: st.vendor.clone(),
+    })
+}
+
+async fn credential(
+    State(st): State<Arc<AppState>>,
+    Json(up): Json<CredentialUpload>,
+) -> Result<StatusCode, AppErr> {
+    let blob = BASE64
+        .decode(up.sealed_b64)
+        .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("bad base64: {e}")))?;
+    let pt = seal::unseal(&st.seal_kp, &blob)
+        .map_err(|e| AppErr(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let payload: CredentialPayload = serde_json::from_slice(&pt)
+        .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("bad payload: {e}")))?;
+
+    let entry = Arc::new(
+        cred_entry(up.kind, payload).map_err(|e| AppErr(StatusCode::BAD_REQUEST, e.to_string()))?,
+    );
+    // A claude refresh credential starts with no access token — prove it works
+    // now, so a later /v1/messages isn't the first time we learn it's broken. A
+    // static bearer already holds its token; nothing to probe.
+    let needs_probe = entry.oauth.lock().unwrap().access_token.is_empty();
+    if needs_probe {
+        refresh_now(&st.cfg, &st.http, &entry).await.map_err(|e| {
+            AppErr(StatusCode::BAD_GATEWAY, format!("initial refresh failed: {e}"))
+        })?;
+    }
+    st.creds.lock().unwrap().insert(up.name, entry);
+    Ok(StatusCode::OK)
+}
+
+/// The account the TRANSPORT vouched for, or `None` when nothing did.
+///
+/// This is the whole of the identity input, and a session request contributes
+/// nothing to it: the node's gateway proxy mints [`CALLER_ACCOUNT_HEADER`] from
+/// the mesh-verified WireGuard peer and refuses a caller-supplied copy at its own
+/// decode, so it is the one field on the request that its sender cannot choose.
+fn vouched_caller(headers: &HeaderMap) -> Option<Vec<u8>> {
+    headers
+        .get(CALLER_ACCOUNT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|encoded| hex::decode(encoded).ok())
+}
+
+/// What a `/session` request is answered with. FOUR outcomes: the grant answer
+/// is only reachable once the transport has vouched for a caller, and "nobody
+/// vouched for you" is a refusal an operator acts on differently from a missing
+/// grant. Every one is a stable snake_case token, and none echoes back the value
+/// that would have been accepted.
+enum SessionGate {
+    Open,
+    CallerUnverified,
+    NotGranted,
+    AuthorityUnavailable,
+}
+
+/// Decide whether one session may open. Pure decision: it reads state and the
+/// injected authority, and writes nothing.
+///
+/// Co-hosted lending: when a grant gate is wired, the caller must be one the
+/// node's proxy VOUCHED for, and that account must be the owner or a grantee of
+/// the on-chain record. Both before any handshake work — a session for an
+/// ungranted account never opens.
+///
+/// The caller is the account of the node that made the hop, which is the node
+/// running the sandbox — and the ONE identity this flow can establish, since the
+/// session token the sandbox ends up holding names a credential and nothing
+/// about who is acting.
+///
+/// The request's [`WorkRef`] rides along so the authority can ALSO admit a
+/// session on the grant held by whoever the committed work says submitted it.
+/// That is not a second identity input: it is an id, and the authority derives
+/// every fact from it out of its own state.
+///
+/// With no gate wired (owner-local, TEE) this gateway lends to nobody across
+/// accounts, so there is no subject to check.
+async fn session_gate(
+    grant_check: &Option<GrantCheck>,
+    headers: &HeaderMap,
+    req: &SessionRequest,
+) -> SessionGate {
+    let Some(check) = grant_check else {
+        return SessionGate::Open;
+    };
+    let Some(caller) = vouched_caller(headers) else {
+        return SessionGate::CallerUnverified;
+    };
+    let question = GrantQuestion {
+        credential: req.sub.clone(),
+        caller,
+        work: req.work.clone(),
+    };
+    match check(question).await {
+        GrantAnswer::Granted => SessionGate::Open,
+        GrantAnswer::Refused => SessionGate::NotGranted,
+        GrantAnswer::Undetermined => SessionGate::AuthorityUnavailable,
+    }
+}
+
+/// Consult the lazy store loader for `name` and adopt whatever it hands back.
+///
+/// The loader is the one that decides there is anything to do: it answers
+/// `Some` for a credential the live store has never held AND for one whose
+/// backing artifact has changed since it was last read. So this runs on every
+/// session rather than only on a store miss — otherwise a re-login that rotated
+/// a credential in place would be served as the dead token until restart.
+///
+/// A no-op when no loader is wired (an enclave has no backing store) or the
+/// loader has nothing new.
+fn refresh_credential(st: &AppState, name: &str) {
+    let Some(reload) = &st.reload else {
+        return;
+    };
+    let Some((kind, payload)) = reload(name) else {
+        return;
+    };
+    let Ok(entry) = cred_entry(kind, payload) else {
+        return;
+    };
+    st.creds.lock().unwrap().insert(name.to_string(), Arc::new(entry));
+}
+
+async fn session(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<SessionRequest>,
+) -> Result<Json<SessionResponse>, AppErr> {
+    // A session names the credential it draws on. The store loader gets first
+    // refusal on every session, so both restart-free cases are covered: a
+    // credential `cred add` wrote after boot, and one a re-login rotated in
+    // place. A name that is still absent afterwards is a race or a stale record
+    // and 404s.
+    refresh_credential(&st, &req.sub);
+    let known_credential = st.creds.lock().unwrap().contains_key(&req.sub);
+    if !known_credential {
+        return Err(AppErr(StatusCode::NOT_FOUND, "credential_not_found".into()));
+    }
+    // The one visible dispatch for "may this session open at all". Five answers,
+    // and each names its OWN closed door: a 403 sends the borrower's operator to
+    // go get a grant, so neither an authority we could not REACH nor a caller the
+    // transport never vouched for may wear that one.
+    match session_gate(&st.grant_check, &headers, &req).await {
+        SessionGate::Open => {}
+        SessionGate::CallerUnverified => {
+            return Err(AppErr(StatusCode::FORBIDDEN, "caller_account_unverified".into()));
+        }
+        SessionGate::NotGranted => {
+            return Err(AppErr(StatusCode::FORBIDDEN, "credential_not_granted".into()));
+        }
+        SessionGate::AuthorityUnavailable => {
+            return Err(AppErr(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "grant_authority_unavailable".into(),
+            ));
+        }
+    }
+    // Enclave side of the handshake: derive the shared key from the client's
+    // ephemeral key and our static seal secret, then seal the token under it — so
+    // only the client that ECDH'd against the *attested* seal_pk can open it.
+    let eph = BASE64
+        .decode(&req.client_eph_pk_b64)
+        .ok()
+        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+        .ok_or_else(|| AppErr(StatusCode::BAD_REQUEST, "bad client_eph_pk".into()))?;
+    let keys = handshake::enclave_session_keys(&st.seal_kp, &eph);
+
+    let now = now_secs();
+    let claims = Claims {
+        sub: req.sub.clone(),
+        iat: now,
+        exp: now + st.cfg.session_ttl_secs,
+        eph: req.client_eph_pk_b64.clone(),
+        seal: req.body_seal,
+    };
+    st.budgets.lock().unwrap().insert(req.sub, st.cfg.max_requests);
+    let token = token::issue(&st.sess_sk, &claims);
+    let sealed = handshake::seal_token(&keys.session, token.as_bytes());
+    Ok(Json(SessionResponse { sealed_token_b64: BASE64.encode(sealed) }))
+}
+
+async fn proxy(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match proxy_inner(&st, method, &uri, &headers, body).await {
+        Ok(r) => r,
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Map the caller's request path onto the vendor upstream. Anthropic serves the
+/// `/v1/...` shape the caller sends, so it passes through. The ChatGPT Codex
+/// backend serves `/responses` under `/backend-api/codex` (no `/v1`), but codex
+/// posts to its `.../v1` broker base so the path arrives as `/v1/responses` —
+/// stripping the `/v1` prefix lands it on `.../codex/responses` instead of a
+/// 404'd `.../codex/v1/responses`.
+fn upstream_path(kind: CredentialKind, caller_path: &str) -> &str {
+    match kind {
+        CredentialKind::Claude => caller_path,
+        CredentialKind::Codex => caller_path.strip_prefix("/v1").unwrap_or(caller_path),
+    }
+}
+
+async fn proxy_inner(
+    st: &AppState,
+    method: Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppErr> {
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
+
+    let bearer = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or_else(|| AppErr(StatusCode::UNAUTHORIZED, "missing bearer token".into()))?;
+
+    let claims = token::verify(&st.sess_pk, bearer)
+        .map_err(|e| AppErr(StatusCode::UNAUTHORIZED, format!("bad session token: {e}")))?;
+
+    let now = now_secs();
+    if claims.exp < now {
+        return Err(AppErr(StatusCode::UNAUTHORIZED, "session token expired".into()));
+    }
+    // The session's `sub` names the credential it draws on; resolve it now — its
+    // kind selects the upstream and its own token state is what we refresh/spend.
+    let entry = st
+        .creds
+        .lock()
+        .unwrap()
+        .get(&claims.sub)
+        .cloned()
+        .ok_or_else(|| AppErr(StatusCode::NOT_FOUND, "credential_not_found".into()))?;
+    // Sealed-body session: re-derive the handshake keys statelessly from the
+    // claims' ephemeral pk, unseal the request, and REFUSE plaintext — a
+    // stolen bearer alone (visible to path hosts) cannot produce a sealable
+    // body. A plaintext session must not send the seal header. The raw blob's
+    // nonce becomes (a) the per-sub replay-dedup key and (b) the binding the
+    // response stream key is derived under, so an authentic response cannot
+    // be replayed as the answer to a different request.
+    let seal_keys = if claims.seal {
+        let eph = BASE64
+            .decode(&claims.eph)
+            .ok()
+            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+            .ok_or_else(|| AppErr(StatusCode::UNAUTHORIZED, "bad eph in claims".into()))?;
+        Some(handshake::enclave_session_keys(&st.seal_kp, &eph))
+    } else {
+        None
+    };
+    let sealed_request = headers
+        .get(bodyseal::SEAL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some(bodyseal::SEAL_V1);
+    let binding = bodyseal::request_binding(&body);
+    let body = match (&seal_keys, sealed_request) {
+        (Some(keys), true) => {
+            let replayed = !st
+                .seen_nonces
+                .lock()
+                .unwrap()
+                .entry(claims.sub.clone())
+                .or_default()
+                .insert(binding.clone());
+            if replayed {
+                return Err(AppErr(
+                    StatusCode::BAD_REQUEST,
+                    "airlock: replayed sealed request".into(),
+                ));
+            }
+            Bytes::from(
+                bodyseal::open_request(keys, &body)
+                    .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
+            )
+        }
+        (Some(_), false) if !body.is_empty() => {
+            return Err(AppErr(
+                StatusCode::BAD_REQUEST,
+                "airlock: sealed session requires a sealed body".into(),
+            ));
+        }
+        (Some(_), false) => body,
+        (None, true) => {
+            return Err(AppErr(
+                StatusCode::BAD_REQUEST,
+                "airlock: session was not opened for sealed bodies".into(),
+            ));
+        }
+        (None, false) => body,
+    };
+
+    // Budget spends only AFTER the sealed body validated — a path host feeding
+    // garbage blobs must not burn the session's requests (review finding).
+    {
+        let mut b = st.budgets.lock().unwrap();
+        let rem = b
+            .get_mut(&claims.sub)
+            .ok_or_else(|| AppErr(StatusCode::FORBIDDEN, "no budget for sub".into()))?;
+        // A spent budget ENDS the session, exactly as its TTL lapsing does, and
+        // the remedy is identical: open a new one. So it answers 401 like the
+        // expiry above, not 429.
+        //
+        // 429 said "back off and retry later", which is false — waiting never
+        // refills this session, the budget is per-session and only a new
+        // handshake resets it. Worse, the caller cannot tell that 429 from the
+        // VENDOR's rate-limit 429, which is relayed from upstream and MUST pass
+        // through untouched. So the broker's re-handshake-on-401 never fired
+        // here and a borrowed credential simply died at `max_requests`, with the
+        // sandbox seeing a rate limit that would never clear.
+        if *rem == 0 {
+            return Err(AppErr(
+                StatusCode::UNAUTHORIZED,
+                "session budget spent".into(),
+            ));
+        }
+        *rem -= 1;
+    }
+
+    // Ensure a fresh access token, then swap session token -> real credential.
+    let stale = {
+        let o = entry.oauth.lock().unwrap();
+        o.access_token.is_empty() || o.expires_at <= now
+    };
+    if stale {
+        refresh_now(&st.cfg, &st.http, &entry)
+            .await
+            .map_err(|e| AppErr(StatusCode::BAD_GATEWAY, format!("refresh: {e}")))?;
+    }
+    let access = {
+        let o = entry.oauth.lock().unwrap();
+        if o.access_token.is_empty() {
+            return Err(AppErr(StatusCode::BAD_GATEWAY, "no credential loaded".into()));
+        }
+        o.access_token.clone()
+    };
+
+    // Upstream base is the credential's vendor endpoint; the caller's path maps
+    // onto it per vendor (see `upstream_path`).
+    let upstream_base = match entry.kind {
+        CredentialKind::Claude => &st.cfg.anthropic_base,
+        CredentialKind::Codex => &st.cfg.openai_base,
+    };
+    let url = format!(
+        "{}{}",
+        upstream_base.trim_end_matches('/'),
+        upstream_path(entry.kind, path_and_query)
+    );
+    let mut rb = st.http.request(method, &url).body(body.to_vec());
+    // Forward the caller's headers verbatim, minus ones we own or that would
+    // break the relay. bearer_auth then plants the real credential.
+    for (name, value) in headers.iter() {
+        if matches!(
+            name.as_str(),
+            "authorization" | "host" | "content-length" | "accept-encoding" | "x-airlock-body-seal"
+        ) {
+            continue;
+        }
+        rb = rb.header(name, value);
+    }
+    let resp = rb
+        .bearer_auth(&access)
+        .send()
+        .await
+        .map_err(|e| AppErr(StatusCode::BAD_GATEWAY, format!("upstream: {e}")))?;
+
+    let status = resp.status();
+    let ct = resp.headers().get("content-type").cloned();
+    let Some(keys) = seal_keys else {
+        // Plaintext session: passthrough, streamed.
+        let mut builder = Response::builder().status(status.as_u16());
+        if let Some(v) = ct {
+            builder = builder.header("content-type", v);
+        }
+        return builder
+            .body(Body::from_stream(resp.bytes_stream()))
+            .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")));
+    };
+
+    // Sealed session: re-seal the upstream stream chunk by chunk. The inner
+    // content-type rides the sealed head chunk; the outer body is opaque. An
+    // upstream error mid-stream ends WITHOUT the final marker — the broker
+    // sees authenticated truncation, never a silent clean EOF.
+    let inner_ct = ct
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let (mut sealer, salt) = bodyseal::StreamSealer::new(&keys, &binding);
+    let head_chunk = sealer.seal_head(&inner_ct);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        use futures_util::StreamExt as _;
+        let mut opening = salt;
+        opening.extend(head_chunk);
+        if tx.send(Ok(Bytes::from(opening))).await.is_err() {
+            return;
+        }
+        let mut upstream = resp.bytes_stream();
+        while let Some(chunk) = upstream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    if tx.send(Ok(Bytes::from(sealer.seal_chunk(&chunk)))).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return, // no Final marker -> authenticated truncation
+            }
+        }
+        let _ = tx.send(Ok(Bytes::from(sealer.seal_final()))).await;
+    });
+    Response::builder()
+        .status(status.as_u16())
+        .header("content-type", "application/octet-stream")
+        .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")))
+}
+
+/// Exchange one credential's refresh token for a fresh access token (and rotated
+/// refresh token), single-flighted per credential so concurrent callers never
+/// double-spend it.
+async fn refresh_now(cfg: &Config, http: &reqwest::Client, entry: &CredEntry) -> Result<()> {
+    let _gate = entry.refresh_gate.lock().await;
+    // Re-check under the gate — a caller we queued behind may have just done it.
+    let refresh = {
+        let o = entry.oauth.lock().unwrap();
+        if !o.access_token.is_empty() && o.expires_at > now_secs() {
+            return Ok(());
+        }
+        o.refresh_token.clone()
+    };
+
+    let resp = http
+        .post(&cfg.oauth_token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh.as_str()),
+            ("client_id", cfg.oauth_client_id.as_str()),
+        ])
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        bail!("oauth token endpoint {status}: {text}");
+    }
+    let j: serde_json::Value = serde_json::from_str(&text).context("oauth response json")?;
+    let access = j["access_token"].as_str().context("no access_token")?.to_string();
+    let new_refresh = j["refresh_token"].as_str().map(|s| s.to_string());
+    let expires_in = j["expires_in"].as_u64().unwrap_or(3600);
+
+    let now = now_secs();
+    let mut o = entry.oauth.lock().unwrap();
+    o.access_token = access;
+    if let Some(r) = new_refresh {
+        o.refresh_token = r; // memory-only; lost on restart, re-seal to recover
+    }
+    o.expires_at = now + expires_in.saturating_sub(60);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_upstream_path_strips_v1_but_claude_passes_through() {
+        // Codex: `.../backend-api/codex` + this path must be `/responses`, not
+        // `/v1/responses` (the 404 the ChatGPT backend returns otherwise).
+        assert_eq!(upstream_path(CredentialKind::Codex, "/v1/responses"), "/responses");
+        assert_eq!(
+            upstream_path(CredentialKind::Codex, "/v1/responses?stream=true"),
+            "/responses?stream=true"
+        );
+        // Claude: `api.anthropic.com` + `/v1/messages` is correct — pass through.
+        assert_eq!(upstream_path(CredentialKind::Claude, "/v1/messages"), "/v1/messages");
+        // A codex path already without `/v1` is left alone.
+        assert_eq!(upstream_path(CredentialKind::Codex, "/responses"), "/responses");
+    }
+}

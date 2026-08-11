@@ -12,14 +12,14 @@
 //!
 //! two tests:
 //!  * `relay_path_converges_including_qmdb_root` — the honest baseline: prove the
-//!    relay path CONVERGES here (byte-identical app-hash + order-dependent qmdb
+//!    relay path CONVERGES here (byte-identical root-hash + order-dependent qmdb
 //!    root), so a peer resolves a finalized digest solely via the relay into its
 //!    own store. a broken relay hangs every peer to the deadline.
 //!  * `byzantine_payload_flood_is_inert` — ONE validator (v4) is byzantine: it
 //!    still votes/relays honestly, but ALSO floods the payload channel with
 //!    (a) random attacker-chosen bytes AND (b) a WELL-FORMED node frame it never
 //!    proposed to consensus. assert the honest nodes still converge on the
-//!    byte-identical CORRECT app-hash incl. the qmdb root, applying EXACTLY the
+//!    byte-identical CORRECT root-hash incl. the qmdb root, applying EXACTLY the
 //!    finalized ops and nothing flooded, and hold every flooded blob in their
 //!    stores under its OWN sha256 (content-addressed -> can never match a
 //!    finalized digest, so `store.get(finalized_digest)` never resolves it).
@@ -113,7 +113,7 @@ fn sentinel_garbage() -> Vec<u8> {
 ///   stores it under `digest_of(frame)`, which is never finalized (never proposed),
 ///   so it is never delivered — isolating the defense from mere frame-validity.
 fn unproposed_valid_frame() -> Vec<u8> {
-    encode_frame(&op_signer(200), 0, &kv_set(b"zzz", b"999"), None)
+    encode_frame(&op_signer(200), 0, &kv_set(b"zzz", b"999"))
 }
 
 /// the N=5 relay convergence scenario. `flood`: when true, validator `BYZ` spawns
@@ -241,12 +241,12 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
         nodes.push(OrderedNode::new(host, orderer));
     }
 
-    let genesis = nodes[0].app_hash();
+    let genesis = nodes[0].root_hash();
     for n in &nodes {
         assert_eq!(
-            n.app_hash(),
+            n.root_hash(),
             genesis,
-            "identical genesis -> identical app-hash"
+            "identical genesis -> identical root-hash"
         );
     }
     let genesis_kv = nodes[0].host().module_root("kv").unwrap();
@@ -268,9 +268,9 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
     }
     for n in &nodes {
         assert_eq!(
-            n.app_hash(),
+            n.root_hash(),
             genesis,
-            "no optimistic echo: submit does not advance app-hash"
+            "no optimistic echo: submit does not advance root-hash"
         );
     }
 
@@ -284,9 +284,9 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
             // store-only) reaches `decode_frame` here: random bytes Err out (this
             // `.expect` panics) and the well-formed frame would inflate `applied`
             // past `target` (asserted below). store-only is enforced, not assumed.
-            // the production drain flushes the batch window every BLOCK_TIME tick
-            // (bin/node main); enqueue-only submits never propose without it — the
-            // sim mirrors that cadence (a no-op when nothing is pending).
+            // the production run loop flushes pending ops event-driven (bin/node
+            // `pump_eager_flush`); enqueue-only submits never propose without a flush —
+            // the sim drives that flush on its own tick (a no-op when nothing is pending).
             n.flush_batch().await.expect("flush");
             applied[i] += n.drain_delivered().await.expect("drain");
         }
@@ -296,11 +296,11 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
     }
 
     // ---- convergence: identical CORRECT state on every validator ----
-    let converged = nodes[0].app_hash();
+    let converged = nodes[0].root_hash();
     let converged_kv = nodes[0].host().module_root("kv").unwrap();
     assert_ne!(
         converged, genesis,
-        "the finalized ops moved the app-hash off genesis"
+        "the finalized ops moved the root-hash off genesis"
     );
     assert_ne!(converged_kv, genesis_kv, "the qmdb root moved off genesis");
     for (i, n) in nodes.iter().enumerate() {
@@ -309,9 +309,9 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
             "validator {i} applied EXACTLY the finalized ops (nothing flooded entered delivery)"
         );
         assert_eq!(
-            n.app_hash(),
+            n.root_hash(),
             converged,
-            "validator {i} converges on the identical app-hash"
+            "validator {i} converges on the identical root-hash"
         );
         assert_eq!(
             n.host().module_root("kv").unwrap(),
@@ -319,7 +319,7 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
             "validator {i} converges on the identical qmdb (order-DEPENDENT) root"
         );
         // order-INDEPENDENT anchor: the directory reflects EXACTLY the 2 legit dir
-        // writes — rules out "agreed but wrong" (cross-node app_hash equality alone
+        // writes — rules out "agreed but wrong" (cross-node root_hash equality alone
         // cannot: all nodes could agree on a poisoned root).
         assert_eq!(
             n.host().module_root("directory").unwrap(),
@@ -365,7 +365,7 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
             "validator {i}: random garbage keyed by digest_of(garbage), inert"
         );
         // the WELL-FORMED frame: present + would decode/apply cleanly, yet it is
-        // NOT in committed state (converged app-hash is correct, `applied == target`
+        // NOT in committed state (converged root-hash is correct, `applied == target`
         // above). the ONLY reason it never applied is that its digest was never
         // FINALIZED — content-addressing + finalization-gating, not frame-validity.
         assert_eq!(

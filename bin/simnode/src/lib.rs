@@ -27,7 +27,7 @@
 //! block time is a LOGICAL clock (`SIM_EPOCH_MS + height * SIM_BLOCK_MS`) —
 //! the one wall-clock read in noded's block path (`consensus_time`) is what
 //! made replays non-reproducible, so the same op script always produces the
-//! same app-hash here. reads (query/status) always serve committed state:
+//! same root-hash here. reads (query/status) always serve committed state:
 //! held ops are invisible until stepped, which is consensus semantics.
 //!
 //! the sim actor IS an [`OrderedNode`]`<`[`StepOrderer`]`, `[`NullSink`]`>` —
@@ -42,16 +42,16 @@
 //! durable block index (`BlockOps.record` via the shared `project_block`), so
 //! `GET /v1/blocks` and `/v1/index/*` serve just like noded. personas shape
 //! the one wire difference left between the two real nodes — the receipt:
-//!   - `local`: submit receipts carry `opHash` (the embedded daemon's shape).
+//!   - `local`: submit receipts carry `op_hash` (the embedded daemon's shape).
 //!   - `networked`: receipts are height-only — a response layer strips
-//!     `opHash`, the validator's shape until its ordered-node convergence.
+//!     `op_hash`, the validator's shape until its ordered-node convergence.
 //!
 //! `POST /sim/peer-block` commits a block owned by no held submit — the
 //! "concurrent writer" for optimistic-projection race scenarios. it takes
 //! EITHER the single-op `{target, payload, origin?}` shape OR a multi-op
 //! `{ops: [{target, payload, origin?}, …]}` shape: the ops array commits ONE
 //! block with N members through the host's `submit_block` batch engine (per-op
-//! isolation, one shared app-hash), and the reply carries a per-member
+//! isolation, one shared root-hash), and the reply carries a per-member
 //! applied/rejected verdict so a test can pin the host's abort-all-and-replay
 //! member isolation.
 //!
@@ -144,6 +144,7 @@ use identity::Identity;
 use inbox::Inbox;
 use indexer::IndexStore;
 use kv::Kv;
+use lifecycle::Lifecycle;
 use node::{ConsensusTimePolicy, DrainedFrame, NullSink, OrderedNode, StepHandle, StepOrderer};
 use noded::{
     BlockDisposition, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle,
@@ -153,9 +154,8 @@ use pages::Pages;
 use saga::SagaModule;
 use sdk::{Event, Module, Msg, Origin};
 use serde::{Deserialize, Serialize};
-use tasks::Tasks;
 use statesync::qmdb::QmdbStore;
-use lifecycle::Lifecycle;
+use tasks::Tasks;
 use valset::Valset;
 
 // the sim's genesis sets are the `sim_base` (+ `sim_valset`) selections of the
@@ -172,7 +172,7 @@ const PEER_ORIGIN: &[u8] = b"peer";
 const SIM_EPOCH_MS: u64 = 1_750_000_000_000;
 const SIM_BLOCK_MS: u64 = 1_000;
 
-/// cap when buffering a /v1/submit response body to strip `opHash` — receipts
+/// cap when buffering a /v1/submit response body to strip `op_hash` — receipts
 /// are ~200 bytes; anything past this is not a receipt.
 const RECEIPT_BODY_CAP: usize = 64 * 1024;
 
@@ -186,7 +186,6 @@ pub enum Persona {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SimSnapshot {
     height: u64,
     held: usize,
@@ -196,10 +195,9 @@ struct SimSnapshot {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct CommittedInfo {
     height: u64,
-    app_hash: String,
+    root_hash: String,
     op_hash: String,
     target: String,
     /// `held` (a client submit released by this step), `oracle` (a worker
@@ -208,7 +206,6 @@ struct CommittedInfo {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct StepReport {
     /// `null` when the step found both queues empty, or when the stepped op
     /// was rejected (its submitter got the rejection as its reply).
@@ -252,7 +249,6 @@ enum PeerBlockRequest {
 
 /// one member's verdict in a `/sim/peer-block` batch reply (input order).
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct MemberInfo {
     target: String,
     /// this member's authored origin, hex or the printable convention — the
@@ -268,10 +264,9 @@ struct MemberInfo {
 /// the multi-op `/sim/peer-block` reply: ONE committed block carrying N members,
 /// each with its own applied/rejected verdict.
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct BatchInfo {
     height: u64,
-    app_hash: String,
+    root_hash: String,
     /// one entry per input op, in input order.
     members: Vec<MemberInfo>,
 }
@@ -394,23 +389,9 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     let forge_repo = storage.join("forge-git");
 
     // the durable block index: /v1/blocks and /v1/index/* read it, the sim
-    // actor feeds it block-by-block — same wiring as the real daemons.
-    let index_dir = storage.join("index");
-    let index = IndexStore::open(&index_dir, &module_ids)
-        .map(|store| {
-            Arc::new(
-                store
-                    .with_indexer(Box::new(chat::index::ChatIndex::new("chat")))
-                    .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
-                    .with_indexer(Box::new(pages::index::PagesIndex::new("pages"))),
-            )
-        })
-        .map_err(|err| {
-            format!(
-                "open module index at {}: {err} (derived tier — delete the directory to rebuild)",
-                index_dir.display()
-            )
-        })?;
+    // actor feeds it block-by-block — noded's construction site verbatim, so
+    // the sim runs the SAME bundled wasm index guests as the real daemons.
+    let index = noded::open_index_store(&storage, &module_ids)?;
 
     // the log ring is a process-GLOBAL subscriber (and stacks a panic hook per
     // call), so wire it ONLY under `install_log` — the binary does; an embedder
@@ -423,14 +404,39 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     } else {
         NodeHandle::channel()
     };
+    // the sim serves noded's router VERBATIM, admin namespace included, so it
+    // needs the same operator credential the real daemons mint — without one
+    // `admit_operator` refuses every request with `operator_token_unavailable`
+    // and the binary has no HTTP stop path at all (`sim_router` has no shutdown
+    // of its own; `SimHandle::wait` waits on exactly `/v1/admin/shutdown`).
+    // Minted into `storage`, so a driver reads it back with
+    // `noded::admin::read_operator_token(storage)`. `DUCKTAPE_ADMIN=off` still
+    // removes the surface entirely; a mint failure refuses every admin request
+    // rather than falling back to loopback trust.
     let handle = handle
         .with_forge_repo(forge_repo.clone())
-        .with_index_store(index.clone());
+        .with_index_store(index.clone())
+        .with_admin(noded::AdminConfig::minted(
+            noded::AdminExposure::from_env(),
+            &storage,
+        ));
 
     let (control_tx, control_rx) = mpsc::channel::<SimCommand>(16);
     let persona = Arc::new(Mutex::new(persona));
     let fatal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let public_key = node_key.unwrap_or_default();
+
+    // the readiness event: the actor publishes its FIRST status snapshot
+    // (genesis or the resumed height) and signals; the http listener is not
+    // bound until then. `/v1/status` answering 200 is what every client uses as
+    // "this sim is up" — the harness, the CLI, an embedder — so serving before
+    // the actor's boot publish hands them a snapshot claiming version "",
+    // root_hash "", no modules, height 0 and an empty public_key even when
+    // `--node-key` seeded one. On a restart over existing storage that height
+    // is an outright lie about committed state. noded's `booted` signal exists
+    // for exactly this; the sim serves noded's router, so it owes the same
+    // contract.
+    let (booted_tx, booted_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
     // the actor: owns the non-Send host on its own commonware runner thread,
     // answering the node command lane + the /sim control lane. it holds a node
@@ -460,9 +466,16 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
                 stream_hub,
                 actor_node,
                 actor_fatal,
+                booted_tx,
             )
         })
         .map_err(|err| format!("spawn sim-actor thread: {err}"))?;
+
+    // a dropped sender means the actor thread died inside genesis — report that
+    // instead of binding a listener that would serve the empty default forever.
+    booted_rx
+        .recv()
+        .map_err(|_| "sim actor died during genesis — see the error above".to_string())?;
 
     // the serve loop on a private 2-worker tokio runtime, so an embedder needs
     // no runtime of its own. it binds, reports the REAL bound addr back over a
@@ -642,6 +655,17 @@ impl SimHandle {
     pub fn shutdown(mut self) {
         self.node.request_shutdown();
         self.join_threads();
+        // once both sim threads have exited, this handle's StatusCell
+        // exposition closure owns the LAST commonware-executor ref, and
+        // dropping the tokio runtime inside it panics on an async embedder
+        // thread (the app's current_thread tests) — hand the final drop to a
+        // scratch thread and wait for it.
+        let reaper = std::thread::Builder::new()
+            .name("sim-drop".into())
+            .spawn(move || drop(self));
+        if let Ok(reaper) = reaper {
+            let _ = reaper.join();
+        }
     }
 
     /// send one control command and block for its reply. a torn-down actor is
@@ -761,6 +785,9 @@ fn run_sim(
     stream_hub: StreamHub,
     handle: NodeHandle,
     fatal: Arc<Mutex<Option<String>>>,
+    // fired once, right after the boot snapshot is published — `boot` binds
+    // the listener only then, so `/v1/status` never serves the empty default.
+    booted: std::sync::mpsc::SyncSender<()>,
 ) {
     let duckfs_dir = storage.join("duckfs");
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
@@ -772,13 +799,41 @@ fn run_sim(
         // a real daemon's.
         let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
             .with_tagging("tagging");
-        let saga = SagaModule::new("saga");
-        let dispatch = DispatchModule::new("dispatch", "saga");
-        let tagging = TaggingModule::new("tagging").with_direct_owner("runs");
-        let tasks = Tasks::new("tasks");
-        let inbox = Inbox::new("inbox");
-        let automations = Automations::new("automations", "chat", "tasks", "inbox");
-        let agent = AgentModule::new("agent", "saga", Some("runs".into()));
+        let saga = SagaModule::new(
+            "saga",
+            Box::new(QmdbStore::init(context.child("saga"), "saga").await),
+        );
+        let dispatch = DispatchModule::new(
+            "dispatch",
+            "saga",
+            Box::new(QmdbStore::init(context.child("dispatch"), "dispatch").await),
+        );
+        let tagging = TaggingModule::new(
+            "tagging",
+            Box::new(QmdbStore::init(context.child("tagging"), "tagging").await),
+        )
+        .with_direct_owner("runs");
+        let tasks = Tasks::new(
+            "tasks",
+            Box::new(QmdbStore::init(context.child("tasks"), "tasks").await),
+        );
+        let inbox = Inbox::new(
+            "inbox",
+            Box::new(QmdbStore::init(context.child("inbox"), "inbox").await),
+        );
+        let automations = Automations::new(
+            "automations",
+            Box::new(QmdbStore::init(context.child("automations"), "automations").await),
+            "chat",
+            "tasks",
+            "inbox",
+        );
+        let agent = AgentModule::new(
+            "agent",
+            Box::new(QmdbStore::init(context.child("agent"), "agent").await),
+            "saga",
+            Some("runs".into()),
+        );
         let runs = RunsModule::new(
             "runs",
             "chat",
@@ -789,8 +844,7 @@ fn run_sim(
             Some("tasks".into()),
             Some("tasks".into()),
         )
-        // the duckfs/files module the portable (v3) composer pins its source
-        // head from (W2) — mandatory for envelope composition.
+        // The portable composer pins its source head from duckfs/files.
         .with_files_module("files")
         // the pages module the composer renders [[page:<id>]] refs from and
         // the pages effects lane writes to; unwired, both degrade.
@@ -803,9 +857,21 @@ fn run_sim(
         let files = Files::open("files", duckfs_dir).expect("duckfs open");
         // the deterministic user->nodes binding registry — no valset, no chain
         // (the simulator has neither), matching noded's daemon wiring. It is
-        // also the canonical account display-name registry.
-        let identity = Identity::new("identity", None, String::new());
-        let gateway = Gateway::new("gateway", "identity", None, "local");
+        // also the canonical account display-name registry. store-backed like
+        // chat/pages.
+        let identity = Identity::new(
+            "identity",
+            Box::new(QmdbStore::init(context.child("identity"), "identity").await),
+            None,
+            String::new(),
+        );
+        let gateway = Gateway::new(
+            "gateway",
+            Box::new(QmdbStore::init(context.child("gateway"), "gateway").await),
+            "identity",
+            None,
+            "local",
+        );
         let mut modules: Vec<Box<dyn Module>> = vec![
             Box::new(chat),
             Box::new(saga),
@@ -833,16 +899,31 @@ fn run_sim(
         // valset_keys => the default set, byte-identical.
         if !valset_keys.is_empty() {
             let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
-            let mut valset = Valset::new("valset");
+            let mut valset = Valset::new(
+                "valset",
+                Box::new(QmdbStore::init(context.child("valset"), "valset").await),
+            );
             for key in &valset_keys {
-                valset.insert(key.clone());
+                valset.seed(key.clone()).await.expect("seed sim valset");
             }
+            valset.finish_seed().await.expect("seed sim valset");
             // a redeemed role=Client invite records a key in identity's client
             // ACL (governance emits an `IdentityMsg::GrantClient` follow-up);
-            // identity is already in the default module set above.
-            let governance = Governance::new("governance", "valset", "identity")
-                .with_invite_binding(invite_binding);
-            let lifecycle = Lifecycle::new("lifecycle", "valset");
+            // identity is already in the default module set above. store-backed
+            // like bin/node; the sim wires the binding through the native
+            // builder (no wasm guest here, so no `__config` seeding).
+            let governance = Governance::new(
+                "governance",
+                Box::new(QmdbStore::init(context.child("governance"), "governance").await),
+                "valset",
+                "identity",
+            )
+            .with_invite_binding(invite_binding);
+            let lifecycle = Lifecycle::new(
+                "lifecycle",
+                Box::new(QmdbStore::init(context.child("lifecycle"), "lifecycle").await),
+                "valset",
+            );
             modules.push(Box::new(kv));
             modules.push(Box::new(valset));
             modules.push(Box::new(governance));
@@ -856,7 +937,7 @@ fn run_sim(
         // reads this line off stdout; readiness is `/v1/status`.
         tracing::info!(
             target: "ducktape::consensus",
-            app_hash = %hex_root(&host.app_hash()),
+            root_hash = %hex_root(&host.root_hash()),
             "genesis"
         );
 
@@ -864,7 +945,7 @@ fn run_sim(
         // fresh dir this is 0; on a (discouraged) reused dir it keeps op-log
         // heights monotonic instead of silently skipping every new block.
         let resume_height = index.resume_height().expect("read index watermarks");
-        stream_hub.prime(resume_height, hex_root(&host.app_hash()));
+        stream_hub.prime(resume_height, hex_root(&host.root_hash()));
 
         // wrap the host on the ordered lane, over the scripted FIFO orderer.
         // `view_base = resume_height + 1` bases the first drained block (engine
@@ -903,6 +984,21 @@ fn run_sim(
             fatal,
         };
 
+        // the boot snapshot: /v1/status answers from the cell before the
+        // first command, exactly like the real daemons. the exposition source
+        // feeds /metrics + /v1/peers off-lane (no mesh: the sample parses
+        // honestly empty, roles stay absent). `Context` has no Clone; a child
+        // shares the SAME registry, so its encode() serves the identical
+        // exposition.
+        let exposition_context = context.child("exposition");
+        sim.handle
+            .status_cell()
+            .wire_exposition(move || exposition_context.encode());
+        sim.publish_status();
+        // the snapshot is live: `boot` may bind the listener now. sending after
+        // the publish is what makes "/v1/status never answers the empty
+        // default" true — the whole point of the signal.
+        let _ = booted.send(());
         loop {
             select! {
                 cmd = control.next() => match cmd {
@@ -938,16 +1034,7 @@ fn run_sim(
                     // already refused it, and this decode is the second wall.
                     Some(NodeCommand::SubmitFrame { frame, reply }) => {
                         match node::decode_frame(&frame) {
-                            // the sim's single-op lane has no batch path to
-                            // release a continuation on — refuse loudly rather
-                            // than silently strip it off a signed frame.
-                            Ok((_origin, _msg, Some(_cont))) => {
-                                let _ = reply.send(Err(
-                                    "continuation envelopes are not supported on the sim frame lane"
-                                        .to_string(),
-                                ));
-                            }
-                            Ok((origin, msg, None)) => {
+                            Ok((origin, msg)) => {
                                 sim.handle_submit(origin, msg, reply).await;
                             }
                             Err(err) => {
@@ -962,25 +1049,6 @@ fn run_sim(
                         let result =
                             sim.node.host().query(&target, &req).await.map_err(|err| err.to_string());
                         let _ = reply.send(result);
-                    }
-                    Some(NodeCommand::Status { reply }) => {
-                        let _ = reply.send(sim.status());
-                    }
-                    Some(NodeCommand::Peers { reply }) => {
-                        // the sim has no mesh: its exposition carries no peer
-                        // families, so this parses to the honest empty sample
-                        // (same shape as the embedded daemon).
-                        let sampled_at_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        let _ = reply.send(noded::peers::peers_from_exposition(
-                            &context.encode(),
-                            sampled_at_ms,
-                        ));
-                    }
-                    Some(NodeCommand::Metrics { reply }) => {
-                        let _ = reply.send(context.encode());
                     }
                     None => break,
                 },
@@ -1138,7 +1206,7 @@ impl Sim {
 
     /// commit N ops as ONE block, returning per-member verdicts. the batch twin
     /// of [`Self::commit_peer`]: `submit_decoded` each, flush into ONE batch (one
-    /// block, one app-hash, per-op isolation), and read each member's
+    /// block, one root-hash, per-op isolation), and read each member's
     /// applied/rejected disposition from the drain — the shared `project_block`
     /// already wrote the block's one row (all members, each with its disposition)
     /// and the per-module index feed. an empty `ops` produces no ordered frame
@@ -1147,7 +1215,7 @@ impl Sim {
         let (drained, events) = self.commit_block(ops).await?;
         self.settle(&drained, events).await;
         // the batch is ONE block: every member frame shares its height and the
-        // one post-batch app-hash the drain sealed.
+        // one post-batch root-hash the drain sealed.
         let members = drained
             .iter()
             .filter_map(|d| {
@@ -1162,7 +1230,7 @@ impl Sim {
             .collect();
         Ok(BatchInfo {
             height: self.height(),
-            app_hash: hex_root(&self.node.app_hash()),
+            root_hash: hex_root(&self.node.root_hash()),
             members,
         })
     }
@@ -1185,7 +1253,6 @@ impl Sim {
             self.node.submit_decoded(BlockOp {
                 origin,
                 msg,
-                continuation: None,
                 frame: [0u8; 32],
             });
         }
@@ -1222,11 +1289,35 @@ impl Sim {
                 projection.record,
                 &projection.dispatches,
             );
-            if let Some(app_hash) = projection.sealed_hash {
-                self.stream_hub
-                    .publish_block(projection.height, hex_root(&app_hash));
+            if let Some(root_hash) = projection.sealed_hash {
+                self.stream_hub.publish_block(
+                    projection.height,
+                    hex_root(&root_hash),
+                    noded::BlockWake::from_dispatches(&projection.dispatches),
+                );
             }
         }
+        // the deterministic lane's read barrier: fold triggers drain on a
+        // background runner, and a sim commit must imply the derived views
+        // answer the block (a client read — or the ws `changed` event that
+        // prompts one — must never race the fold). production daemons stay
+        // async by design; their clients re-read on the next event.
+        if let Err(err) = self.index.wait_folds_drained() {
+            tracing::error!(
+                target: "ducktape::consensus",
+                event = "node_index_poisoned",
+                error = %err,
+                "module index fold failed — the sim's views are now STALE"
+            );
+        }
+        // the status snapshot is part of committing, for the same reason the
+        // fold barrier above is: a commit must imply every read surface already
+        // answers the block. this used to fire once per pump turn instead —
+        // AFTER the arm had already sent its reply — so a caller that read
+        // /v1/status the instant its receipt for height N arrived could still be
+        // told N-1. publishing here makes that unobservable by construction,
+        // rather than by winning a race.
+        self.publish_status();
         Ok((drained, self.node.take_events()))
     }
 
@@ -1321,7 +1412,7 @@ impl Sim {
         };
         let block = BlockSummary {
             height: frame.height,
-            app_hash: hex_root(&frame.app_hash),
+            root_hash: hex_root(&frame.root_hash),
         };
         match frame.disposition {
             node::Disposition::Applied => Ok(block),
@@ -1332,7 +1423,11 @@ impl Sim {
     /// the `CommittedInfo` for an APPLIED one-op commit; `None` if the op was
     /// rejected (the step/peer reply reports no commit, the submitter got the
     /// rejection). `op_hash` re-stages the payload (idempotent, content-address).
-    fn committed_info(&self, drained: &[DrainedFrame], kind: &'static str) -> Option<CommittedInfo> {
+    fn committed_info(
+        &self,
+        drained: &[DrainedFrame],
+        kind: &'static str,
+    ) -> Option<CommittedInfo> {
         let frame = drained.iter().find(|d| d.op.is_some())?;
         if frame.disposition != node::Disposition::Applied {
             return None;
@@ -1340,11 +1435,23 @@ impl Sim {
         let op = frame.op.as_ref()?;
         Some(CommittedInfo {
             height: frame.height,
-            app_hash: hex_root(&frame.app_hash),
+            root_hash: hex_root(&frame.root_hash),
             op_hash: hex_bytes(&self.blobs.put_chunk(op.payload.clone())),
             target: op.target.clone(),
             kind,
         })
+    }
+
+    /// publish the current committed snapshot into the shared `/v1/status`
+    /// cell — the http route reads the cell, never the command lane. the
+    /// peers standing rides along (no mesh: height only, no roles or epoch).
+    fn publish_status(&self) {
+        let cell = self.handle.status_cell();
+        cell.publish(self.status());
+        cell.publish_peers(noded::PeersStanding {
+            height: self.height(),
+            ..Default::default()
+        });
     }
 
     fn status(&self) -> NodeStatus {
@@ -1363,7 +1470,7 @@ impl Sim {
             .collect();
         NodeStatus {
             version: env!("CARGO_PKG_VERSION").into(),
-            app_hash: hex_root(&host.app_hash()),
+            root_hash: hex_root(&host.root_hash()),
             height: self.height(),
             modules,
             // empty unless `--node-key` fabricated one: clients treat an empty
@@ -1554,7 +1661,10 @@ async fn sim_auto(State(handle): State<ControlState>, Json(req): Json<AutoReques
     }
 }
 
-async fn sim_persona(State(handle): State<ControlState>, Json(req): Json<PersonaRequest>) -> Response {
+async fn sim_persona(
+    State(handle): State<ControlState>,
+    Json(req): Json<PersonaRequest>,
+) -> Response {
     match control(handle, |reply| SimCommand::SetPersona {
         persona: req.persona,
         reply,
@@ -1636,7 +1746,7 @@ async fn sim_state(State(handle): State<ControlState>) -> Response {
 
 // ── Networked-persona receipt shaping ───────────────────
 
-/// the networked validator's submit reply is height-only — `opHash` is a
+/// the networked validator's submit reply is height-only — `op_hash` is a
 /// local-daemon receipt field. noded's shared submit handler always adds it,
 /// so the networked persona strips it at the response layer instead of
 /// forking the handler.
@@ -1661,7 +1771,7 @@ async fn strip_receipt_op_hash(
     let stripped = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|mut value| {
-            value.as_object_mut()?.remove("opHash");
+            value.as_object_mut()?.remove("op_hash");
             serde_json::to_vec(&value).ok()
         });
     // the buffered body replaces the streamed one, so the recorded length is
@@ -1677,6 +1787,49 @@ async fn strip_receipt_op_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WHERE the status snapshot is published is load-bearing, and the bug it
+    /// replaced was a race — so this pins the SHAPE, which is deterministic,
+    /// instead of trying to lose the race on purpose.
+    ///
+    /// The contract: a caller who reads `/v1/status` the instant its receipt for
+    /// height N arrives must be told N, never N-1. That holds only while the
+    /// publish happens INSIDE `commit_block` — before the committing arm sends
+    /// its reply. It used to fire once per pump turn, i.e. AFTER the reply had
+    /// already gone out; the symptom was a ~1-in-15 red in
+    /// `governance_scenarios.rs` asserting the tip equals its own receipt, which
+    /// is far too rare to be the guard for this.
+    ///
+    /// So: exactly two call sites, both named. Boot (the snapshot the listener
+    /// waits on) and the commit funnel. A third — especially one back in the
+    /// pump loop — means the ordering regressed.
+    #[test]
+    fn the_status_snapshot_is_published_from_boot_and_the_commit_funnel_alone() {
+        // the production half only — below `#[cfg(test)]` this very test quotes
+        // the call it is looking for, and would count itself.
+        let (source, _) = include_str!("lib.rs")
+            .split_once("#[cfg(test)]")
+            .expect("the test module marks the end of the production source");
+        assert_eq!(
+            source.matches("self.publish_status();").count(),
+            1,
+            "expected exactly ONE `self.publish_status()` — the commit funnel's. \
+             A second (notably one per pump turn) lands AFTER the committing arm \
+             already replied, which is the race this shape exists to make \
+             unobservable."
+        );
+        // and it must be the commit funnel's: the statement immediately
+        // preceding `commit_block`'s return.
+        let (before_return, _) = source
+            .split_once("        Ok((drained, self.node.take_events()))")
+            .expect("commit_block's return is the anchor for this check");
+        assert!(
+            before_return.trim_end().ends_with("self.publish_status();"),
+            "`commit_block` must publish the snapshot as its last act before \
+             returning — that is what makes the publish precede every caller's \
+             reply."
+        );
+    }
 
     /// once a fatal reason is recorded, the embedded control surface fails
     /// closed — every method routes through `call`, so one guard covers all.

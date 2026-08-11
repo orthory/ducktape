@@ -436,7 +436,7 @@ fn kv_round_trips_and_a_set_empty_is_not_a_delete() {
     );
 }
 
-/// the whole app-hash is deterministic under the valset preset: the same
+/// the whole root-hash is deterministic under the valset preset: the same
 /// kv-touching script on two fresh dirs walks to a byte-identical tip hash
 /// (the standing guard against nondeterminism in the preset modules).
 #[test]
@@ -450,9 +450,9 @@ fn a_kv_script_is_deterministic_across_fresh_dirs() {
                 Some("writer"),
             );
         }
-        sim.status()["appHash"]
+        sim.status()["root_hash"]
             .as_str()
-            .expect("app hash")
+            .expect("root hash")
             .to_string()
     };
     let d1 = tempfile::tempdir().expect("dir");

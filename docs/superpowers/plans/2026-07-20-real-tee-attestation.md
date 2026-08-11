@@ -20,8 +20,8 @@
 - Standalone bins (`airlock-cli`, `airlock-broker`, `airlock-gateway`) use `println!`/`eprintln!` (coordinator precedent); anything reachable from the node uses `tracing`.
 - No `--attest` / `DUCKTAPE_AIRLOCK_ATTEST` value may default; after Task 7 the accepted values are `tdx | snp` (server config also accepts `auto`).
 - Commit trailer: `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
-- Worktree: `/home/eddy/dev/ducktape/.worktree/real-tee-attest`, branch `feat-airlock-real-attest`, PR against `dev`.
-- Crate API references live in the scratchpad: `sev-8.0.0/` and `dcap-qvl-0.3.12/` under `/tmp/claude-1000/-home-eddy-dev-ducktape/eeec504e-b8d1-429b-8895-935b2bf3362d/scratchpad/` — consult before guessing any sev/dcap API.
+- Worktree: `<repo>/.worktree/real-tee-attest`, branch `feat-airlock-real-attest`, PR against `dev`.
+- Crate API references live in the scratchpad: `sev-8.0.0/` and `dcap-qvl-0.3.12/` under `<your scratchpad dir>/` — consult before guessing any sev/dcap API.
 
 ---
 
@@ -130,7 +130,7 @@ async fn garbage_quote_is_rejected() {
 
 - [ ] **Step 3: Run to verify it fails**
 
-Run: `cd /home/eddy/dev/ducktape/.worktree/real-tee-attest && CARGO_INCREMENTAL=0 cargo test -p airlock --features testkit --test verify_snp 2>&1 | tail -5`
+Run: `cd <repo>/.worktree/real-tee-attest && CARGO_INCREMENTAL=0 cargo test -p airlock --features testkit --test verify_snp 2>&1 | tail -5`
 Expected: compile FAIL — `verify`/`testkit` modules do not exist yet.
 
 - [ ] **Step 4: Implement `src/verify.rs`**
@@ -543,7 +543,7 @@ git commit -m "feat(airlock): real SEV-SNP chain verification + minted-chain tes
 
 ```bash
 mkdir -p crates/system/airlock/tests/fixtures
-SCRATCH=/tmp/claude-1000/-home-eddy-dev-ducktape/eeec504e-b8d1-429b-8895-935b2bf3362d/scratchpad
+SCRATCH=<your scratchpad dir>
 cp $SCRATCH/dcap-qvl-0.3.12/sample/tdx_quote crates/system/airlock/tests/fixtures/
 cp $SCRATCH/dcap-qvl-0.3.12/sample/tdx_quote_collateral.json crates/system/airlock/tests/fixtures/
 ```

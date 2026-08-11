@@ -101,7 +101,10 @@ impl IndexDisk for MemDisk {
     }
 
     fn remove_dir_all(&self, dir: &Path) -> io::Result<()> {
-        self.files.lock().unwrap().retain(|k, _| !k.starts_with(dir));
+        self.files
+            .lock()
+            .unwrap()
+            .retain(|k, _| !k.starts_with(dir));
         Ok(())
     }
 
@@ -110,6 +113,10 @@ impl IndexDisk for MemDisk {
     }
 
     fn exists(&self, path: &Path) -> bool {
-        self.files.lock().unwrap().keys().any(|k| k.starts_with(path))
+        self.files
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|k| k.starts_with(path))
     }
 }

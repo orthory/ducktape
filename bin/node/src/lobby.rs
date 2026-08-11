@@ -4,7 +4,7 @@
 //!
 //! transport: the joiner's SEALED first-contact intro ([`IntroRequest`]) IS
 //! the gate request — it rides the WireGuard-tunnel doorbell, never the mesh
-//! (the pre-v2 `lobby_identity` + `CHANNEL_LOBBY` lane is gone). every claim
+//! (the retired `lobby_identity` + `CHANNEL_LOBBY` lane is gone). every claim
 //! in an intro is verified against the INVITE TOKEN it carries (issuer
 //! signature over the genesis namespace) and the joiner's proof-of-
 //! possession. the gate stays synchronous: a member runs the V1–V9 checklist,
@@ -61,7 +61,7 @@ pub enum GateMsg {
     /// joiner → member. "this key asks to join, invited by `issuer`" — the
     /// token's fields plus the joiner key and its proof-of-possession, all raw
     /// bytes. `role` and `expires_unix_secs` are the token's covered fields.
-    /// Every invite is bearer (기명 dropped in v2): there is no target, the
+    /// Every invite is bearer: there is no target, the
     /// proof binds the announcing key and single-use bounds it.
     Request {
         issuer: Vec<u8>,
@@ -80,11 +80,7 @@ pub enum GateMsg {
 /// [`intro_request`]; the tests keep this to exercise [`verify_join_request`]
 /// without re-deriving the proof signing by hand.
 #[cfg(test)]
-pub fn gate_request(
-    joiner: &ed25519::PrivateKey,
-    binding: &[u8],
-    token: &InviteToken,
-) -> GateMsg {
+pub fn gate_request(joiner: &ed25519::PrivateKey, binding: &[u8], token: &InviteToken) -> GateMsg {
     use commonware_codec::Encode as _;
     use commonware_cryptography::Signer as _;
     let proof = crate::config::sign_join_proof(joiner, binding, token);
@@ -99,27 +95,9 @@ pub fn gate_request(
     }
 }
 
-/// map a [`verify_join_request`] error to its ADR §3.1 reject code (V1–V3/V5).
-/// every crypto/decode failure is TERMINAL; the caller sets the bit.
-///
-/// no production call site remains this generation — the doorbell's pre-verify
-/// `Refused` carries prose only — but the checklist-code mapping is part of
-/// the reject-code wire contract (ADR §4), test-pinned, and KEPT deliberately
-/// (item-4 blueprint).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn verify_reject_code(err: &str) -> RejectCode {
-    if err.contains("does not verify for this network") {
-        RejectCode::BadToken
-    } else if err.contains("proof-of-possession") {
-        RejectCode::BadProof
-    } else {
-        RejectCode::BadEncoding // malformed key/nonce/role/signature bytes
-    }
-}
-
 /// map a governance `Redeem` consensus-reject reason (ADR §3.2) to a gate
 /// reject code + terminal bit. these fire only on a race that slips past the
-/// member's V1–V8 pre-filter (chiefly a nonce another joiner redeemed first).
+/// member's verification filter (chiefly a nonce another joiner redeemed first).
 /// an unrecognized reason is a transient `Busy` (non-terminal) rather than a
 /// permanent kill — the joiner retries and re-runs the checklist.
 pub fn redeem_reject_outcome(reason: Option<&str>) -> (RejectCode, bool) {
@@ -168,10 +146,10 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
         role,
         expires_unix_secs,
     } = msg;
-    let issuer = ed25519::PublicKey::decode(issuer.as_slice())
-        .map_err(|e| format!("issuer key: {e}"))?;
-    let joiner = ed25519::PublicKey::decode(joiner.as_slice())
-        .map_err(|e| format!("joiner key: {e}"))?;
+    let issuer =
+        ed25519::PublicKey::decode(issuer.as_slice()).map_err(|e| format!("issuer key: {e}"))?;
+    let joiner =
+        ed25519::PublicKey::decode(joiner.as_slice()).map_err(|e| format!("joiner key: {e}"))?;
     let role = InviteRole::from_u8(*role)?;
     if nonce.len() != INVITE_NONCE_LEN {
         return Err(format!("nonce must be {INVITE_NONCE_LEN} bytes"));
@@ -180,8 +158,8 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
     nonce_arr.copy_from_slice(nonce);
     let sig = ed25519::Signature::decode(token_sig.as_slice())
         .map_err(|e| format!("token signature: {e}"))?;
-    let proof = ed25519::Signature::decode(proof.as_slice())
-        .map_err(|e| format!("join proof: {e}"))?;
+    let proof =
+        ed25519::Signature::decode(proof.as_slice()).map_err(|e| format!("join proof: {e}"))?;
 
     let token = InviteToken {
         issuer: issuer.clone(),
@@ -377,10 +355,7 @@ pub fn verify_intro(msg: &IntroRequest, binding: &[u8]) -> Result<VerifiedIntro,
     let wg_sig = ed25519::Signature::decode(msg.wg_sig.as_slice())
         .map_err(|e| format!("wireguard key signature: {e}"))?;
     let wg_msg = [binding, verified.nonce.as_slice(), &wg_public_key].concat();
-    if !verified
-        .joiner
-        .verify(INTRO_WG_NAMESPACE, &wg_msg, &wg_sig)
-    {
+    if !verified.joiner.verify(INTRO_WG_NAMESPACE, &wg_msg, &wg_sig) {
         return Err("wireguard key binding does not verify".into());
     }
     Ok(VerifiedIntro {
@@ -456,11 +431,8 @@ mod tests {
             expires_unix_secs,
             ..
         } = msg;
-        let bad_proof = crate::config::sign_join_proof(
-            &ed25519::PrivateKey::from_seed(3),
-            BINDING,
-            &token,
-        );
+        let bad_proof =
+            crate::config::sign_join_proof(&ed25519::PrivateKey::from_seed(3), BINDING, &token);
         use commonware_codec::Encode as _;
         let forged = GateMsg::Request {
             issuer: i,
@@ -604,19 +576,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_errors_map_to_the_checklist_codes() {
-        assert_eq!(
-            verify_reject_code("invite token signature does not verify for this network"),
-            RejectCode::BadToken
-        );
-        assert_eq!(
-            verify_reject_code("joiner proof-of-possession does not verify"),
-            RejectCode::BadProof
-        );
-        assert_eq!(verify_reject_code("issuer key: bad length"), RejectCode::BadEncoding);
-    }
-
-    #[test]
     fn redeem_reasons_map_to_codes_and_terminal_bits() {
         // the classic race the gate must not mis-report: a spent nonce is a
         // permanent Spent, not a transient Busy.
@@ -625,7 +584,9 @@ mod tests {
             (RejectCode::Spent, true)
         );
         assert_eq!(
-            redeem_reject_outcome(Some("the inviting member is no longer part of this network")),
+            redeem_reject_outcome(Some(
+                "the inviting member is no longer part of this network"
+            )),
             (RejectCode::IssuerUnknown, false)
         );
         // an unrecognized / already-standing reason retries rather than kills.
@@ -637,11 +598,8 @@ mod tests {
     }
 
     #[test]
-    fn the_retired_gate_reply_wire_no_longer_decodes_as_an_ack() {
-        // NO backward compat (ADR §7): the pre-v2 mesh `GateMsg` replies are a
-        // dead shape — a member/joiner speaking them does not interop with the
-        // doorbell's intro-ack lane.
-        let old_wire = br#"{"admitted":{"height":42,"cap":null}}"#;
-        assert!(decode_intro_ack(old_wire).is_err());
+    fn an_unrecognized_gate_reply_does_not_decode_as_an_ack() {
+        let unexpected = br#"{"admitted":{"height":42,"cap":null}}"#;
+        assert!(decode_intro_ack(unexpected).is_err());
     }
 }

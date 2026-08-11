@@ -2,7 +2,7 @@
 //! running host purely through the statesync wire protocol — one manifest at
 //! one finalized boundary, chunked snapshot fetches for the snapshot-lane
 //! modules, live proof-carrying qmdb op-range fetches for the resolver-lane
-//! modules — and composes the source's exact app-hash.
+//! modules — and composes the source's exact root-hash.
 //!
 //! NOTHING crosses the boundary except protocol bytes. the transport is an
 //! in-process channel; the bytes, frames, and client code are identical to
@@ -74,7 +74,9 @@ impl SyncClient for ChannelClient {
     }
 }
 
-fn validator_key(seed_byte: u8) -> Vec<u8> {
+/// a deterministic ed25519 public key — a validator key for valset, a member
+/// id for an authenticated external origin.
+fn seeded_pubkey(seed_byte: u8) -> Vec<u8> {
     let seed = [seed_byte; 32];
     PrivateKey::decode(&seed[..])
         .expect("any 32 bytes is a valid ed25519 seed")
@@ -91,7 +93,7 @@ fn tmp_repo(tag: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
+fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
     let source_repo = tmp_repo("source");
     let joiner_repo = tmp_repo("joiner");
     let (source_dir, joiner_dir) = (source_repo.clone(), joiner_repo.clone());
@@ -100,109 +102,150 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
         // ---- SOURCE: the full module set behind one Host, real op path ------
         let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("source_kv"), "kv").await));
         let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("source_chat"), "chat").await));
+        let valset = Valset::new(
+            "valset",
+            Box::new(QmdbStore::init(context.child("source_valset"), "valset").await),
+        );
         let forge = Forge::init("forge", source_dir.clone()).expect("forge init");
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(chat),
             Box::new(forge),
             Box::new(Directory::new("directory")),
-            Box::new(Valset::new("valset")),
-            Box::new(SagaModule::new("saga")),
+            Box::new(valset),
+            Box::new(SagaModule::new(
+                "saga",
+                Box::new(QmdbStore::init(context.child("source_saga"), "saga").await),
+            )),
             Box::new(Greeter::new("greeter")),
         ])
         .expect("genesis");
 
+        // authorship is derived from the dispatch origin across the tree, and
+        // the lanes are NOT interchangeable, so every source op carries its
+        // own. SYSTEM is the trusted orchestration lane: valset membership is
+        // governance-gated, and the saga id below is namespaced to the origin
+        // that triggers it. forge refuses a SYSTEM tracker author (nothing
+        // reaches it on that lane), so this issue — a member action here —
+        // rides an authenticated external origin instead.
+        let system = sdk::Origin::System;
+        let member = sdk::Origin::External(seeded_pubkey(5));
+
         // content through every module, including overwrites (op-log order).
-        let ops: Vec<Msg> = vec![
-            Msg {
-                target: "kv".into(),
-                payload: kv_encode(&KvMsg::Set {
-                    key: b"motd".to_vec(),
-                    value: b"draft".to_vec(),
-                }),
-            },
-            Msg {
-                target: "kv".into(),
-                payload: kv_encode(&KvMsg::Set {
-                    key: b"motd".to_vec(),
-                    value: b"final".to_vec(),
-                }),
-            },
-            Msg {
-                target: "chat".into(),
-                payload: chat_encode_msg(&ChatMsg::CreateChannel {
-                    channel_id: "general".into(),
-                    name: "General".into(),
-                    post_policy: PostPolicy::Open,
-                }),
-            },
-            Msg {
-                target: "chat".into(),
-                payload: chat_encode_msg(&ChatMsg::PostMessage {
-                    channel_id: "general".into(),
-                    message_id: "u1".into(),
-                    blocks: vec![ChatBlock::paragraph("hello")],
-                    thread: None,
-                    as_agent: None,
-                }),
-            },
-            Msg {
-                target: "chat".into(),
-                payload: chat_encode_msg(&ChatMsg::PostMessage {
-                    channel_id: "general".into(),
-                    message_id: "a1".into(),
-                    blocks: vec![ChatBlock::paragraph("synced over the wire")],
-                    thread: None,
-                    as_agent: None,
-                }),
-            },
-            Msg {
-                target: "forge".into(),
-                payload: forge::encode_msg(&forge::ForgeMsg::OpenIssue {
-                    repo: "demo".into(),
-                    title: "State-sync the Forge tracker".into(),
-                    body: "Git objects use the separate PushRefs data plane".into(),
-                }),
-            },
-            Msg {
-                target: "directory".into(),
-                payload: dir_encode_msg(&DirMsg::Set {
-                    key: "name".into(),
-                    value: "world".into(),
-                }),
-            },
-            Msg {
-                target: "valset".into(),
-                payload: valset_encode_msg(&ValsetMsg::Join {
-                    key: validator_key(7),
-                }),
-            },
-            Msg {
-                target: "saga".into(),
-                payload: saga_encode_msg(&SagaMsg::Trigger {
-                    pinned_assignee: None,
-                    saga_id: "greet".into(),
-                    spec: b"reverse hello".to_vec(),
-                    reply_to: None,
-                    reply_payload: Vec::new(),
-                    deadline: None,
-                    max_attempts: 1,
-                    lease_views: None,
-                    capability: None,
-                    demands: Default::default(),
-                }),
-            },
+        let ops: Vec<(sdk::Origin, Msg)> = vec![
+            (
+                system.clone(),
+                Msg {
+                    target: "kv".into(),
+                    payload: kv_encode(&KvMsg::Set {
+                        key: b"motd".to_vec(),
+                        value: b"draft".to_vec(),
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "kv".into(),
+                    payload: kv_encode(&KvMsg::Set {
+                        key: b"motd".to_vec(),
+                        value: b"final".to_vec(),
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "chat".into(),
+                    payload: chat_encode_msg(&ChatMsg::CreateChannel {
+                        channel_id: "general".into(),
+                        name: "General".into(),
+                        post_policy: PostPolicy::Open,
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "chat".into(),
+                    payload: chat_encode_msg(&ChatMsg::PostMessage {
+                        channel_id: "general".into(),
+                        message_id: "u1".into(),
+                        blocks: vec![ChatBlock::paragraph("hello")],
+                        thread: None,
+                        as_agent: None,
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "chat".into(),
+                    payload: chat_encode_msg(&ChatMsg::PostMessage {
+                        channel_id: "general".into(),
+                        message_id: "a1".into(),
+                        blocks: vec![ChatBlock::paragraph("synced over the wire")],
+                        thread: None,
+                        as_agent: None,
+                    }),
+                },
+            ),
+            (
+                member,
+                Msg {
+                    target: "forge".into(),
+                    payload: forge::encode_msg(&forge::ForgeMsg::OpenIssue {
+                        repo: "demo".into(),
+                        title: "State-sync the Forge tracker".into(),
+                        body: "Git objects use the separate PushRefs data plane".into(),
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "directory".into(),
+                    payload: dir_encode_msg(&DirMsg::Set {
+                        key: "name".into(),
+                        value: "world".into(),
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "valset".into(),
+                    payload: valset_encode_msg(&ValsetMsg::Join {
+                        key: seeded_pubkey(7),
+                    }),
+                },
+            ),
+            (
+                system.clone(),
+                Msg {
+                    target: "saga".into(),
+                    payload: saga_encode_msg(&SagaMsg::Trigger {
+                        pinned_assignee: None,
+                        saga_id: saga::namespaced_id(&system, "greet"),
+                        spec: b"reverse hello".to_vec(),
+                        reply_to: None,
+                        reply_payload: Vec::new(),
+                        deadline: None,
+                        max_attempts: 1,
+                        lease_views: None,
+                        capability: None,
+                        demands: Default::default(),
+                    }),
+                },
+            ),
         ];
         let mut height = 0u64;
-        for op in ops {
-            // membership ops are governance-gated: drive every source op on the
-            // SYSTEM origin lane (trusted test orchestration), which valset and
-            // every product module accept alike.
+        for (origin, op) in ops {
             host.submit_at(
                 host::BlockContext {
                     height: height + 1,
                     consensus_time: height + 1,
-                    origin: sdk::Origin::System,
+                    origin,
                 },
                 op,
             )
@@ -212,7 +255,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
         }
         let finalized = FinalizedBlock {
             height,
-            app_hash: host.app_hash(),
+            root_hash: host.root_hash(),
         };
 
         // ---- the wire ---------------------------------------------------------
@@ -225,7 +268,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
         let join_side = async move {
             let client = client_for_join;
             let manifest = fetch_manifest(&client).await.expect("manifest");
-            assert_eq!(manifest.app_hash, finalized.app_hash);
+            assert_eq!(manifest.root_hash, finalized.root_hash);
             assert_eq!(
                 manifest.entries.len(),
                 7,
@@ -282,7 +325,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             );
             assert_eq!(join_chat.root(), chat_root);
 
-            // --- snapshot lane: directory, valset, saga, forge ----------------
+            // --- snapshot lane: directory, saga, forge ------------------------
             let entry = manifest.entry("directory").unwrap();
             assert_eq!(entry.kind, PayloadKind::Snapshot);
             let bytes = fetch_snapshot(&client, boundary, "directory")
@@ -293,21 +336,48 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 .install(&bytes, entry.root)
                 .expect("directory install");
 
-            let entry = manifest.entry("valset").unwrap();
-            let bytes = fetch_snapshot(&client, boundary, "valset")
-                .await
-                .expect("valset snapshot");
-            let mut join_valset = Valset::new("valset");
-            join_valset
-                .install(&bytes, entry.root)
-                .expect("valset install");
+            // valset rides the resolver lane like kv/chat (store-backed).
+            let valset_entry = manifest.entry("valset").unwrap();
+            let valset_root = valset_entry.root;
+            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "valset");
+            let target = pinned_target(valset_entry);
+            assert_eq!(StateRoot(target.root.0), valset_root);
+            let join_valset = Valset::new(
+                "valset",
+                Box::new(
+                    QmdbStore::sync_from(
+                        joiner_ctx.child("joiner_valset"),
+                        "valset-rebuilt",
+                        target,
+                        resolver,
+                    )
+                    .await
+                    .expect("sync_from"),
+                ),
+            );
+            assert_eq!(join_valset.root(), valset_root);
 
-            let entry = manifest.entry("saga").unwrap();
-            let bytes = fetch_snapshot(&client, boundary, "saga")
-                .await
-                .expect("saga snapshot");
-            let mut join_saga = SagaModule::new("saga");
-            join_saga.install(&bytes, entry.root).expect("saga install");
+            // saga rides the resolver lane too (store-backed since the qmdb
+            // port): no byte snapshot, the store's proven op range.
+            let saga_entry = manifest.entry("saga").unwrap();
+            let saga_root = saga_entry.root;
+            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "saga");
+            let target = pinned_target(saga_entry);
+            assert_eq!(StateRoot(target.root.0), saga_root);
+            let join_saga = SagaModule::new(
+                "saga",
+                Box::new(
+                    QmdbStore::sync_from(
+                        joiner_ctx.child("joiner_saga"),
+                        "saga-rebuilt",
+                        target,
+                        resolver,
+                    )
+                    .await
+                    .expect("sync_from"),
+                ),
+            );
+            assert_eq!(join_saga.root(), saga_root);
 
             let entry = manifest.entry("forge").unwrap();
             let bytes = fetch_snapshot(&client, boundary, "forge")
@@ -326,7 +396,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             );
             let join_greeter = Greeter::new("greeter");
 
-            // --- THE property: the composed app-hash equals the manifest's ----
+            // --- THE property: the composed root-hash equals the manifest's ----
             // the rebuilt qmdb stores live under distinct storage ids inside this
             // ONE deterministic runner (a real joiner has its own disk); compose
             // under the canonical module ids exactly as `global_root` would see
@@ -370,8 +440,8 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             ];
             assert_eq!(
                 global_root(&mods),
-                manifest.app_hash,
-                "the joiner lands on the exact app-hash the source finalized"
+                manifest.root_hash,
+                "the joiner lands on the exact root-hash the source finalized"
             );
         };
 

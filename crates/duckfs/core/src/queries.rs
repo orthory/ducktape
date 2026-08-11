@@ -80,7 +80,7 @@ pub(crate) fn query<S: ObjectStore>(fs: &Fs<S>, q: FilesQuery) -> Result<FilesRe
 /// join/rejoin history), so a `true` sourced from raw odb presence would tell
 /// the client to skip staging a chunk that other nodes lack, and the commit
 /// referencing it would then be accepted on some validators and rejected on
-/// others — a split app-hash (finding #1). the answer is advisory: staging can
+/// others — a split root-hash (finding #1). the answer is advisory: staging can
 /// expire, so the commit re-validates — a stale `true` costs one clean
 /// rejection, a stale `false` one redundant (but consensus-safe) stage.
 ///
@@ -186,6 +186,15 @@ fn ls<S: ObjectStore>(
         (root_tree, String::new())
     } else {
         match entry_at(&store, root_tree, &segs)? {
+            // a STRUCTURAL namespace root (`/home`, `/shared`) that nothing has
+            // been written under yet: it exists in the authority rule and not in
+            // the tree, so listing it answers empty exactly as `/` does. saying
+            // `path not found` here told a caller to create a directory
+            // `check_authority` forbids it from creating — and it is what put an
+            // error banner on the Files pane of every fresh workspace.
+            None if crate::paths::is_namespace_root(&segs) => {
+                (None, format!("/{}", segs.join("/")))
+            }
             None => return Err("files: path not found".into()),
             Some(entry) => match entry.kind {
                 EntryKind::Dir => (Some(entry.id), format!("/{}", segs.join("/"))),

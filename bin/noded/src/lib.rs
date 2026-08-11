@@ -29,8 +29,8 @@ pub mod blobs;
 pub mod log;
 pub mod stream;
 pub use stream::{
-    ClientMsg, LogRing, RunOutputEvent, RunOutputRegistry, RunStream, ServerFrame, StreamErrorCode,
-    StreamHub, StreamOpRow, StreamOrigin, StreamOriginKind, TailItem,
+    BlockWake, ClientMsg, LogRing, RunOutputEvent, RunOutputRegistry, RunStream, ServerFrame,
+    StreamErrorCode, StreamHub, StreamOpRow, StreamOrigin, StreamOriginKind, TailItem,
 };
 // the duckfs product surface lives in its own module; re-exported flat so the
 // router keeps its bare handler names and the public param structs stay at
@@ -60,23 +60,35 @@ mod gateway_http;
 pub mod gateway_ws_token;
 pub mod origin_guard;
 pub use gateway_http::{
-    GatewayFailure, GatewayJob, GatewayLane, GatewayProxyReply, GatewayProxyRequest,
-    GatewayBody, GatewayResponse, GatewayWsMsg, collect_body, gateway_browser_router,
-    serve_browser_gateway,
+    GatewayBody, GatewayFailure, GatewayJob, GatewayLane, GatewayProxyReply, GatewayProxyRequest,
+    GatewayResponse, GatewayWsMsg, collect_body, gateway_browser_router, serve_browser_gateway,
 };
 // git smart-HTTP: forge as a full push+fetch remote over /forge/{repo}/….
 mod git_http;
 pub use git_http::InfoRefsParams;
 // the node-actor command lane and the router's shared state handle.
 mod handle;
-pub use handle::{NodeCommand, NodeHandle};
+pub use handle::{NodeCommand, NodeHandle, PeersStanding, StatusCell};
 
 mod module_code;
 pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest};
 // the node-local, off-chain interactive terminal-session plane. public so
 // `main.rs` can build the manager and wire it onto the handle.
 pub mod term;
-pub use term::{TermChunkEvent, TermCommandEvent, TermCommandRing, TermRing, TerminalSessions};
+pub use term::{
+    CreatedSession, PeerAttach, TermChunkEvent, TermCommandEvent, TermCommandRing, TermError,
+    TermRing, TerminalSessions,
+};
+
+pub mod term_remote;
+
+/// the volatile catalog of service daemons signaling presence to this node.
+pub mod services;
+
+/// A service daemon's handle on the node it serves: the `/v1` twin of the
+/// in-process `NodeCommand` actor lane. See [`node_link::NodeLink`].
+pub mod node_link;
+pub use term_remote::{RemoteSessions, SessionInputWire, SessionJob, SessionLane};
 // PR2 consensus command source: the chat<->pty bridge (channel scheme + the
 // off-loop projector that drives committed chat commands into a session's pty).
 mod term_consensus;
@@ -85,11 +97,12 @@ mod term_consensus;
 // does: `command_blocks(line)` -> a `PostMessage` body, `command_text(blocks)`
 // -> the line, `session_channel(id)` -> the carrier channel.
 pub use term_consensus::{command_blocks, command_text, session_channel};
-// the derived-index tier: store construction, rebuilds, /v1/index/* + /v1/blocks.
+// the derived-index tier: store construction, boundary stamps, /v1/index/* +
+// /v1/blocks.
 mod index;
 pub use index::{
     BlocksParams, IndexScanParams, index_block_ops, index_origin, open_index_store,
-    rebuild_stale_modules,
+    stamp_stale_modules,
 };
 // the ducktape_* Prometheus series + GET /metrics.
 mod metrics;
@@ -131,10 +144,9 @@ use crate::metrics::metrics;
 
 /// one finalized block, as reported to clients (http response + ws frame).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BlockSummary {
     pub height: u64,
-    pub app_hash: String,
+    pub root_hash: String,
 }
 
 /// the `/v1/submit` reply: the block that INCLUDED the caller's op, plus the
@@ -143,16 +155,14 @@ pub struct BlockSummary {
 /// `GET /v1/files/blob/{op_hash}` serves them back: the hash is addressable,
 /// not just informational.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SubmitReceipt {
     pub height: u64,
-    pub app_hash: String,
+    pub root_hash: String,
     pub op_hash: String,
 }
 
 /// one dispatch in a block's drain — the wire twin of `host::DispatchRecord`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DispatchInfo {
     /// the module dispatched this step.
     pub module: String,
@@ -183,7 +193,6 @@ pub enum BlockDisposition {
 /// fans out over. a block now AGGREGATES the txs from its window, so it carries
 /// a vector of these in agreed (applied) order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RootOp {
     /// hex of this op's authenticated author origin (the frame's VERIFIED
     /// signer), or `"system"` / `"module:<id>"` for a non-external origin. on
@@ -207,19 +216,18 @@ pub struct RootOp {
 }
 
 /// one non-empty finalized block, as the explorer reads it: the block's
-/// consensus coordinates (height, frame content hash, post-block app-hash) and
+/// consensus coordinates (height, frame content hash, post-block root-hash) and
 /// the member ops it AGGREGATED, each with its deterministic dispatch trace.
 /// stored as the block's row in the index store's blocks database
 /// ([`indexer::BlockOps::record`]) and served by `GET /v1/blocks`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BlockRecord {
     pub height: u64,
     /// hex of the block's content address — the block's hash on this surface.
     /// empty on the embedded daemon's lane: nothing is framed or signed there,
     /// so the field stays honest rather than carrying a fabricated digest.
     pub hash: String,
-    /// hex of the composed app-hash after this block settled — the commit.
+    /// hex of the composed root-hash after this block settled — the commit.
     pub commit_hash: String,
     /// the member ops this block aggregated, in agreed (applied) order. empty
     /// for an idle/nop block (nothing but the heartbeat filler).
@@ -263,24 +271,23 @@ pub fn block_row(record: &BlockRecord) -> Vec<u8> {
     serde_json::to_vec(record).expect("a plain record struct serializes")
 }
 
-/// the status projection: daemon build version, global app-hash, and each
-/// registered module's root.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// the status projection: daemon build version, global root-hash, and each
+/// registered module's root. `Default` is the pre-first-publish snapshot in
+/// [`StatusCell`] — zeroed boundary facts are the honest answer before any
+/// boundary is served.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeStatus {
     pub version: String,
-    pub app_hash: String,
+    pub root_hash: String,
     pub height: u64,
     pub modules: Vec<ModuleStatus>,
     /// this node's mesh identity (hex ed25519 key) — what a client stamps
     /// into ops that route peer traffic to it (chat's `JoinHuddle.node`).
     /// empty on daemons with no mesh identity (the embedded local daemon).
-    #[serde(default)]
     pub public_key: String,
     /// Node-owned operational state. This is the stable, role-aware facade for
     /// operators; dependency-specific consensus and transport metrics remain
     /// available on `/metrics` for deeper diagnosis.
-    #[serde(default)]
     pub operations: OperationalStatus,
 }
 
@@ -345,7 +352,6 @@ impl NodePhase {
 /// `ducktape_*` metrics. Optional sections are absent when they do not apply to
 /// the selected role, rather than being filled with misleading zeroes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OperationalStatus {
     pub role: NodeRole,
     pub phase: NodePhase,
@@ -361,7 +367,6 @@ pub struct OperationalStatus {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ConsensusOperationalStatus {
     pub epoch: u64,
     pub view: u64,
@@ -374,7 +379,6 @@ pub struct ConsensusOperationalStatus {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SyncOperationalStatus {
     /// Source identity is useful in status and logs but intentionally not a
     /// metric label (peer identities are unbounded cardinality).
@@ -391,7 +395,6 @@ pub struct SyncOperationalStatus {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct StorageOperationalStatus {
     pub checkpoint_height: u64,
     pub index_poisoned: bool,
@@ -399,14 +402,12 @@ pub struct StorageOperationalStatus {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct IndexOperationalStatus {
     pub module: String,
     pub applied_height: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModuleStatus {
     pub id: String,
     pub root: String,
@@ -416,7 +417,7 @@ pub struct ModuleStatus {
 /// A module's presentation category — how the app's Modules view groups the
 /// registered set. This is catalog metadata the status projection attaches by
 /// id; it is not part of a module's consensus identity (that stays `id` +
-/// `root`) and never enters the app-hash.
+/// `root`) and never enters the root-hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModuleCategory {
@@ -442,7 +443,6 @@ impl ModuleCategory {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SubmitRequest {
     pub target: String,
     /// the module's `*Msg` enum as a json value — encoded verbatim into `Msg.payload`.
@@ -458,7 +458,6 @@ pub struct SubmitRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct QueryRequest {
     pub target: String,
     /// the module's `*Query` enum as a json value.
@@ -606,14 +605,17 @@ pub fn router(handle: NodeHandle) -> Router {
         // managed checkouts under the injected root: create, commit (409 on a
         // structured conflict), delete. `None` root → 503.
         // ---- interactive terminal sessions (node-local, off-chain) ----
-        // create returns {sessionId, topic}; output rides the ws `term:<id>`
+        // create returns {session_id, topic}; output rides the ws `term:<id>`
         // topic. same trusted-local gate as the other mutating /v1 routes (see
         // term.rs). close is idempotent.
         .route("/v1/term/sessions", post(term::create_session))
-        .route(
-            "/v1/term/sessions/{id}/close",
-            post(term::close_session),
-        )
+        .route("/v1/term/sessions/{id}/close", post(term::close_session))
+        // ---- service signaling (node-local, off-chain, volatile) ----
+        // a local service daemon says hello; the entry ages out on its own
+        // TTL. Presence only — enablement lives in the workspace's
+        // services.toml and is never inferred from a hello (see services.rs).
+        .route("/v1/services/hello", post(services::hello))
+        .route("/v1/services", get(services::list))
         .route("/v1/fs/workspaces", post(workspaces::create_workspace))
         .route(
             "/v1/fs/workspaces/{id}/commit",
@@ -637,8 +639,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route(
             "/forge/{repo}/git-upload-pack",
             post(git_upload_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
-        )
-        ;
+        );
     // the owner-gated `/v1/admin/*` namespace — merged only when exposure is
     // enabled, so `Disabled` leaves the control surface simply ABSENT (a 404),
     // not a gated-but-present route. its own PoP middleware is baked in.
@@ -701,7 +702,7 @@ async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>
             let op_hash = hex_bytes(&handle.blobs.put_chunk(payload));
             Json(SubmitReceipt {
                 height: block.height,
-                app_hash: block.app_hash,
+                root_hash: block.root_hash,
                 op_hash,
             })
             .into_response()
@@ -740,7 +741,7 @@ async fn submit_frame(
         // the origin is DELIBERATELY dropped here: the http layer never tells an
         // actor who signed — the actor re-derives that from the bytes (or, on
         // the validator, `submit_frame` does). one authority on authorship.
-        Ok((_origin, msg, _cont)) => msg.payload,
+        Ok((_origin, msg)) => msg.payload,
         Err(err) => return error_response(StatusCode::BAD_REQUEST, &err.to_string()),
     };
     let (reply, rx) = oneshot::channel();
@@ -761,7 +762,7 @@ async fn submit_frame(
             let op_hash = hex_bytes(&handle.blobs.put_chunk(payload));
             Json(SubmitReceipt {
                 height: block.height,
-                app_hash: block.app_hash,
+                root_hash: block.root_hash,
                 op_hash,
             })
             .into_response()
@@ -797,29 +798,37 @@ async fn query(State(handle): State<NodeHandle>, Json(req): Json<QueryRequest>) 
     }
 }
 
+/// GET /v1/status — the last boundary snapshot the owning actor published,
+/// with live operations overlaid, straight off the handle's [`StatusCell`].
+/// deliberately NEVER crosses the command lane: a sync/catch-up stage keeps
+/// the pump busy for whole stages, and status must answer through that.
 async fn status(State(handle): State<NodeHandle>) -> Response {
-    let (reply, rx) = oneshot::channel();
-    if let Err(resp) = handle.send(NodeCommand::Status { reply }).await {
-        return resp;
-    }
-    match rx.await {
-        Ok(status) => Json(status).into_response(),
-        Err(_) => actor_gone(),
-    }
+    Json(handle.status_cell().current()).into_response()
 }
 
 /// GET /v1/peers — the direct-peer sample (see [`peers::PeersView`]): who the
 /// mesh holds open right now, cumulative per-peer traffic counters, and each
-/// peer's statesync progression where one exists.
+/// peer's statesync progression where one exists. composed OFF the command
+/// lane like status: the connection/traffic counters parse from the live
+/// exposition source, the committed facts (roles, height, epoch) come from
+/// the standing the owning actor last published.
 async fn peers(State(handle): State<NodeHandle>) -> Response {
-    let (reply, rx) = oneshot::channel();
-    if let Err(resp) = handle.send(NodeCommand::Peers { reply }).await {
-        return resp;
-    }
-    match rx.await {
-        Ok(view) => Json(view).into_response(),
-        Err(_) => actor_gone(),
-    }
+    let cell = handle.status_cell();
+    let Some(exposition) = cell.exposition() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no metrics exposition is wired on this daemon",
+        );
+    };
+    let standing = cell.peers_standing();
+    let view = peers::peers_from_exposition(
+        &exposition,
+        stream::unix_millis(),
+        standing.height,
+        standing.epoch,
+    )
+    .with_roles(&standing.validators, &standing.residents);
+    Json(view).into_response()
 }
 
 /// POST /v1/admin/shutdown — ask the process to exit gracefully. lives on the
@@ -918,20 +927,6 @@ async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Resp
 mod tests {
     use super::*;
 
-    #[test]
-    fn status_from_an_older_node_defaults_operational_state() {
-        let status: NodeStatus = serde_json::from_value(serde_json::json!({
-            "version": "0.1.0",
-            "appHash": "",
-            "height": 0,
-            "modules": []
-        }))
-        .expect("the additive status field stays backward-compatible");
-
-        assert_eq!(status.operations.role, NodeRole::Unknown);
-        assert_eq!(status.operations.phase, NodePhase::Starting);
-    }
-
     #[tokio::test]
     async fn shutdown_wakes_every_surface_and_remains_sticky() {
         let (handle, _commands, _hub) = NodeHandle::channel();
@@ -992,10 +987,10 @@ mod tests {
         assert_eq!(back.ops.len(), 2, "the block aggregated two member ops");
         assert_eq!(back.ops[0].proposer, "bb".repeat(32));
         assert_eq!(back.ops[1].op_hash, "ff".repeat(32));
-        // the wire keys stay camelCase — the app reads these fields verbatim.
+        // the wire keys are snake_case — clients read these fields verbatim.
         let json: serde_json::Value = serde_json::from_slice(&row).unwrap();
-        assert!(json.get("commitHash").is_some());
-        assert!(json["ops"][0].get("opHash").is_some());
+        assert!(json.get("commit_hash").is_some());
+        assert!(json["ops"][0].get("op_hash").is_some());
     }
 
     #[test]

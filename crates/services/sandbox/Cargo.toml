@@ -1,0 +1,35 @@
+[package]
+name = "sandbox-host"
+edition.workspace = true
+version.workspace = true
+
+# the shared sandbox muscle: HOW a node-local child is spawned in isolation.
+# the SandboxBackend seam + its boot probe, the Tart (macOS) guest plan, and the
+# node-private rootless podman it drives over the libpod REST socket (never the
+# `podman` CLI) plus the egress nft firewall each run's netns gets. carved out of
+# capability-host, which remains the only in-tree caller of the run path.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# "net" pulls tokio::net::UnixStream — the libpod socket transport; "process"
+# drives the podman/tart host binaries; "io-util" the attach-stream framing.
+tokio = { workspace = true, features = ["process", "io-util", "net"] }
+# the pull path's lifecycle events: a once-per-image-per-store acquisition that
+# can block a run for minutes says so, on the node's stderr and in the app's log
+# ring. This crate had no logging because nothing in it could stall; the pull can.
+tracing = { workspace = true }
+# TWO calls: the `flock` that makes a service root single-owner, and the SIGTERM
+# a successor sends the podman child a dead owner left behind. Already a direct
+# dep of provider-host and bin/node.
+libc = "0.2"
+
+[dev-dependencies]
+# the service-root singleton test claims a real directory twice.
+tempfile = "3"
+
+[features]
+# the test-harness `SandboxBackend::Bare` spawn. a `cfg(test)` gate cannot cross
+# a crate boundary, so the variant capability-host's unit tests construct hangs
+# off this feature instead — off in every shipped build, so a released binary
+# still cannot express a bare spawn.
+testkit = []

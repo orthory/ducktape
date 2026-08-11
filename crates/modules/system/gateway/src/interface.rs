@@ -1,9 +1,19 @@
+use std::collections::BTreeSet;
+
 use duckdns::{DuckDnsName, HandleRegistration, ResolvedAccount};
 use sdk::codec::{push_bytes, push_opt_str};
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 /// Commonware signing namespace for every gateway route mutation.
 pub const GATEWAY_ROUTE_NS: &[u8] = b"ducktape-gateway-route-v1";
+/// Commonware signing namespace for every credential-record mutation. A leading
+/// operation tag in each preimage keeps a set/remove/grant/revoke signature from
+/// being replayed as another operation.
+pub const GATEWAY_CREDENTIAL_NS: &[u8] = b"ducktape-gateway-credential-v1";
+pub const MAX_CREDENTIAL_NAME_BYTES: usize = 64;
+pub const MAX_CREDENTIAL_GRANTS: usize = 64;
+pub const SEAL_PK_BYTES: usize = 32;
 pub const MAX_CHAIN_ID_BYTES: usize = 256;
 pub const MAX_ACCOUNT_ID_BYTES: usize = 128;
 pub const NODE_KEY_BYTES: usize = 32;
@@ -23,7 +33,7 @@ pub const SHA256_HEX_BYTES: usize = 64;
 
 /// The account apex (`None`) or one DNS-shaped label below it. The account is
 /// carried separately so a route name can never cross authority boundaries.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(deny_unknown_fields)]
 pub struct RouteName {
     pub label: Option<String>,
@@ -53,7 +63,7 @@ impl RouteName {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteMethod {
     Get,
@@ -84,7 +94,7 @@ impl RouteMethod {
 /// A globally signed audience. Transport peers still have to be admitted by
 /// the current network set; this policy then resolves their authenticated node
 /// key through Identity before a request reaches the local upstream.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteAudience {
     /// Only a node currently bound to the owning account.
@@ -95,7 +105,7 @@ pub enum RouteAudience {
     Accounts { account_ids: Vec<Vec<u8>> },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutePolicy {
     pub audience: RouteAudience,
@@ -115,7 +125,7 @@ pub struct RoutePolicy {
     pub allow_upgrade: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteTarget {
     /// Static content: the signed SHA-256 of the off-consensus manifest
@@ -136,7 +146,7 @@ impl RouteTarget {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteDefinition {
     pub target: RouteTarget,
@@ -145,7 +155,7 @@ pub struct RouteDefinition {
 
 /// `route = None` is an authenticated tombstone and still advances the
 /// independent per-name revision, preventing replay.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteStatement {
     /// Signed into the preimage; publishers stamp `1` today.
@@ -158,14 +168,14 @@ pub struct RouteStatement {
     pub route: Option<RouteDefinition>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MemberAuthorization {
     pub signer: Vec<u8>,
     pub signature: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteRecord {
     pub statement: RouteStatement,
@@ -184,6 +194,163 @@ pub struct RouteSummary {
     pub target: String,
 }
 
+/// A named API credential the owner co-hosts through their airlock gateway. The
+/// registry stores routing metadata and the gateway's seal PUBLIC key ONLY —
+/// never secret material. Grants are managed exclusively through the
+/// owner-signed [`GatewayMsg::GrantCredential`]/[`GatewayMsg::RevokeCredential`]
+/// ops, so they are never carried unsigned on [`GatewayMsg::SetCredential`].
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    Claude,
+    Codex,
+}
+
+impl CredentialKind {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Claude => 1,
+            Self::Codex => 2,
+        }
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialRecord {
+    pub name: String,
+    pub owner_account: Vec<u8>,
+    pub publisher_node: Vec<u8>,
+    pub kind: CredentialKind,
+    pub seal_pk: [u8; 32],
+    pub grants: BTreeSet<Vec<u8>>,
+}
+
+/// The owner-signed registration statement. `record.grants` MUST be empty — the
+/// signed preimage does not cover grants, so registration only carries metadata.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SetCredentialStatement {
+    pub chain_id: String,
+    pub record: CredentialRecord,
+}
+
+/// The owner-signed tombstone statement for [`GatewayMsg::RemoveCredential`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveCredentialStatement {
+    pub chain_id: String,
+    pub owner_account: Vec<u8>,
+    pub name: String,
+}
+
+/// The owner-signed grant/revoke statement — one target account per op. Grant
+/// and revoke share this shape but sign distinct preimages (op tag `3`/`4`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialGrantStatement {
+    pub chain_id: String,
+    pub owner_account: Vec<u8>,
+    pub name: String,
+    pub account: Vec<u8>,
+}
+
+/// True when `account` is the owner or a granted account of `record`.
+pub fn credential_use_allowed(record: &CredentialRecord, account: &[u8]) -> bool {
+    let is_owner = record.owner_account == account;
+    let is_grantee = record.grants.contains(account);
+    is_owner || is_grantee
+}
+
+pub fn validate_credential_name(name: &str) -> Result<(), String> {
+    let len_ok = (1..=MAX_CREDENTIAL_NAME_BYTES).contains(&name.len());
+    let charset_ok = name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !(len_ok && charset_ok) {
+        return Err(format!(
+            "gateway: credential name must be 1-{MAX_CREDENTIAL_NAME_BYTES} chars of [a-z0-9-]"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_chain_id(chain_id: &str) -> Result<(), String> {
+    if chain_id.is_empty() || chain_id.len() > MAX_CHAIN_ID_BYTES {
+        return Err(format!(
+            "gateway: chain id must be 1..={MAX_CHAIN_ID_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_set_credential_statement(statement: &SetCredentialStatement) -> Result<(), String> {
+    validate_chain_id(&statement.chain_id)?;
+    let record = &statement.record;
+    validate_credential_name(&record.name)?;
+    validate_account_id(&record.owner_account)?;
+    if record.publisher_node.len() != NODE_KEY_BYTES {
+        return Err(format!(
+            "gateway: publisher node must be {NODE_KEY_BYTES} bytes"
+        ));
+    }
+    if !record.grants.is_empty() {
+        return Err("gateway: credential registration carries no grants".into());
+    }
+    Ok(())
+}
+
+/// Signed under [`GATEWAY_CREDENTIAL_NS`], op tag `1`.
+pub fn set_credential_preimage(statement: &SetCredentialStatement) -> Result<Vec<u8>, String> {
+    validate_set_credential_statement(statement)?;
+    let record = &statement.record;
+    let mut out = vec![1u8];
+    push_bytes(&mut out, statement.chain_id.as_bytes());
+    push_bytes(&mut out, &record.owner_account);
+    push_bytes(&mut out, record.name.as_bytes());
+    out.push(record.kind.tag());
+    out.extend_from_slice(&record.seal_pk);
+    push_bytes(&mut out, &record.publisher_node);
+    Ok(out)
+}
+
+/// Signed under [`GATEWAY_CREDENTIAL_NS`], op tag `2`.
+pub fn remove_credential_preimage(
+    statement: &RemoveCredentialStatement,
+) -> Result<Vec<u8>, String> {
+    validate_chain_id(&statement.chain_id)?;
+    validate_credential_name(&statement.name)?;
+    validate_account_id(&statement.owner_account)?;
+    let mut out = vec![2u8];
+    push_bytes(&mut out, statement.chain_id.as_bytes());
+    push_bytes(&mut out, &statement.owner_account);
+    push_bytes(&mut out, statement.name.as_bytes());
+    Ok(out)
+}
+
+/// Signed under [`GATEWAY_CREDENTIAL_NS`], op tag `3`.
+pub fn grant_credential_preimage(statement: &CredentialGrantStatement) -> Result<Vec<u8>, String> {
+    grant_op_preimage(3, statement)
+}
+
+/// Signed under [`GATEWAY_CREDENTIAL_NS`], op tag `4`.
+pub fn revoke_credential_preimage(statement: &CredentialGrantStatement) -> Result<Vec<u8>, String> {
+    grant_op_preimage(4, statement)
+}
+
+fn grant_op_preimage(op: u8, statement: &CredentialGrantStatement) -> Result<Vec<u8>, String> {
+    validate_chain_id(&statement.chain_id)?;
+    validate_credential_name(&statement.name)?;
+    validate_account_id(&statement.owner_account)?;
+    validate_account_id(&statement.account)?;
+    let mut out = vec![op];
+    push_bytes(&mut out, statement.chain_id.as_bytes());
+    push_bytes(&mut out, &statement.owner_account);
+    push_bytes(&mut out, statement.name.as_bytes());
+    push_bytes(&mut out, &statement.account);
+    Ok(out)
+}
+
 /// The single message surface of the merged gateway module: the `.duck` handle
 /// plane (`SetHandle`, the human-name → AccountId facet absorbed from duckdns)
 /// and the route plane (`SetRoute`) are ops on ONE consensus module.
@@ -199,6 +366,25 @@ pub enum GatewayMsg {
     SetHandle { handle: Option<String> },
     SetRoute {
         statement: RouteStatement,
+        authorization: MemberAuthorization,
+    },
+    /// Register a named credential record (owner-signed). First registration in
+    /// consensus order wins the name; a same-owner re-registration replaces the
+    /// metadata and clears grants (grants are re-added with `GrantCredential`).
+    SetCredential {
+        statement: SetCredentialStatement,
+        authorization: MemberAuthorization,
+    },
+    RemoveCredential {
+        statement: RemoveCredentialStatement,
+        authorization: MemberAuthorization,
+    },
+    GrantCredential {
+        statement: CredentialGrantStatement,
+        authorization: MemberAuthorization,
+    },
+    RevokeCredential {
+        statement: CredentialGrantStatement,
         authorization: MemberAuthorization,
     },
 }
@@ -220,6 +406,10 @@ pub enum GatewayQuery {
     /// publisher can continue the revision stream, but are not management
     /// surface entries.
     List { account_id: Vec<u8> },
+    /// Resolve one credential name to its record, or `None`.
+    Credential { name: String },
+    /// Every registered credential record, in canonical name order.
+    Credentials {},
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -232,6 +422,8 @@ pub enum GatewayReply {
     /// list variant; `Box` is transparent in the JSON wire representation.
     Route(Box<Option<RouteRecord>>),
     Routes(Vec<RouteSummary>),
+    Credential(Option<CredentialRecord>),
+    Credentials(Vec<CredentialRecord>),
 }
 
 pub fn encode_msg(message: &GatewayMsg) -> Vec<u8> {

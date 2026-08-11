@@ -1,4 +1,4 @@
-//! validator governance with optional account-share voting.
+//! qmdb-backed validator governance with optional account-share voting.
 //!
 //! the module that closes the private network's membership loop: a CURRENT
 //! valset member proposes (`AddValidator` / `RemoveValidator` / `Signal`),
@@ -23,10 +23,56 @@
 //! freezes its electorate and rule, so later mode/membership/share changes
 //! cannot move its decision boundary or count the same shares twice.
 //!
-//! state model mirrors the tasks module: execute STAGES into a pending
-//! overlay, `commit_block` publishes, `abort_block` discards; `root()` is
-//! sha256 over the canonical encoding of COMMITTED proposals, and
-//! `snapshot`/`install` ship exactly that root preimage (verify-then-adopt).
+//! ## State model
+//!
+//! pure logic over a host-injected [`sdk::MerkleStore`]: the HOST constructs
+//! the concrete store (qmdb today — `statesync::qmdb::QmdbStore`) and hands it
+//! to [`Governance::new`], so this crate never names a storage crate. one
+//! logical record per proposal (`prop\0{id}`) and per settled invite
+//! redemption (`red\0{nonce}`), plus three aggregate records:
+//!
+//! - the proposal ROSTER (the sorted proposal-id list, bounded by
+//!   [`MAX_PROPOSALS`]) — the ONE enumeration read. it stays canonical
+//!   because governance's read model CANNOT move to the derived index tier:
+//!   a proposal's frozen electorate, every ballot's principal resolution,
+//!   and the settlement tally all read the valset/identity SIBLINGS at
+//!   execute time, so an index fold over governance's own applied ops could
+//!   only reproduce proposal state by re-implementing the consensus tally
+//!   over other modules' state — a second consensus implementation, which is
+//!   worse than a bounded canonical id list. the operator ceremonies (the
+//!   CLI's adopt-an-open-proposal flow) consume this listing;
+//! - the SHARE REGISTRY (bounded by [`MAX_SHARE_ACCOUNTS`]) — consensus
+//!   consumes it whenever a proposal freezes an account electorate;
+//! - the share-MODE flag — consensus consumes it on every `Propose`.
+//!
+//! redemptions have NO enumeration: the exactly-once gate and the node's
+//! join-lobby pre-check (V6) are both point reads by nonce, so the set lives
+//! as point records alone and grows without an aggregate to poison.
+//!
+//! writes are staged during a block and flushed to the store in one batch at
+//! `commit_block`; the module root IS the store's merkle root. sync belongs
+//! to the store, not this module: a joiner rebuilds the concrete store from a
+//! peer (`QmdbStore::sync_from`) and wraps a fresh `Governance` around it.
+//!
+//! oversized values never reach the store (the poison-value lesson — the qmdb
+//! wire codec bounds a value at decode, so an over-cap committed value would
+//! wedge every syncing peer): a NEW proposal record is byte-gated at half of
+//! [`MAX_PROPOSAL_RECORD_BYTES`] (accumulated ballots can at most double the
+//! frozen-electorate section, so a settled record stays under the full cap),
+//! the roster is byte-gated at [`MAX_ROSTER_RECORD_BYTES`] on top of its
+//! id-length and count caps, and a redemption record is fixed-size by
+//! construction (32-byte keys, 16-byte nonce).
+//!
+//! ## Genesis config (the invite binding)
+//!
+//! the per-network invite binding reaches the NATIVE module through
+//! [`Governance::with_invite_binding`]. the wasm tenant is fixed bytes, so
+//! there the binding rides GENESIS CONFIG: the host seeds the reserved
+//! `__config` entry ([`sdk::genesis_config`]) into this module's store at
+//! genesis construction — under [`sdk::store_key`], the same logical→store
+//! mapping every record here uses — and the guest decodes it per dispatch.
+//! the config is consensus state in the store's merkle root from genesis and
+//! rides state-sync like any other record. this module never writes that key.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -37,16 +83,18 @@ pub mod invite;
 
 use std::collections::BTreeMap;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use identity::{
     IdentityMsg, IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
     encode_msg as identity_encode_msg, encode_query as identity_encode_query,
 };
-use sdk::codec::{Cursor, push_bytes};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
-use sha2::{Digest, Sha256};
 use lifecycle::{LifecycleMsg, encode_msg as lifecycle_encode_msg};
+use sdk::{
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
+    StateRoot, StateSyncHandle,
+};
 use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_msg as valset_encode_msg, encode_query as valset_encode_query,
@@ -59,17 +107,64 @@ const MAX_VOTING_PERIOD: u64 = 1_000_000_000;
 
 /// Keep every share value and total exact in the JavaScript operator client.
 const MAX_SAFE_SHARES: u64 = 9_007_199_254_740_991;
-/// The v1 snapshot copies the complete electorate into each proposal. This is
-/// intentionally the small-network implementation; checkpointed power history
-/// replaces it if real deployments outgrow this bound.
+/// The frozen electorate copies the complete allocation into each proposal.
+/// This is intentionally the small-network implementation; checkpointed power
+/// history replaces it if real deployments outgrow this bound.
 const MAX_SHARE_ACCOUNTS: usize = 256;
-/// Optional state extension marker. The initial/empty state (no frozen
-/// electorate, no adopted share registry) and redemptions-only states omit it
-/// and retain their bytes/root; the first frozen electorate or adopted share
-/// registry appends this section.
-const SHARES_EXT_MAGIC: &[u8; 8] = b"DGOVSHR1";
+/// `proposal_id` byte bound — roster arithmetic and record keys need ids that
+/// cannot balloon.
+pub const MAX_PROPOSAL_ID_BYTES: usize = 256;
+/// proposals retained over the network's life (settled proposals keep their
+/// ids forever). proposing past this is refused loudly at execute.
+pub const MAX_PROPOSALS: usize = 1024;
+/// serialized roster-record byte bound, enforced at propose — the backstop
+/// on top of the id-length and count caps that keeps the committed record
+/// far under the qmdb value-decode ceiling (the poison-value lesson: a
+/// committed over-cap value would wedge every syncing peer). generous: borsh
+/// renders the worst-case roster (1024 ids of 256 bytes) in ~260 KiB.
+pub const MAX_ROSTER_RECORD_BYTES: usize = 512 * 1024;
+/// serialized proposal-record ceiling. a NEW proposal is gated at HALF this
+/// value: ballots accrue only from principals inside the frozen electorate
+/// and a ballot entry is no larger than its electorate entry, so a fully
+/// voted record is at most twice its at-propose size — the settled record
+/// can never cross the full cap (which itself sits under the qmdb 1 MiB
+/// value-decode ceiling).
+pub const MAX_PROPOSAL_RECORD_BYTES: usize = 512 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// per-proposal record key: prefix + 0 + id (the single-component shape chat
+/// uses). safe because every key literal below is fixed and none is another
+/// followed by a 0 byte.
+fn prop_key(proposal_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + 1 + proposal_id.len());
+    key.extend_from_slice(b"prop");
+    key.push(0);
+    key.extend_from_slice(proposal_id.as_bytes());
+    key
+}
+
+/// per-redemption record key: prefix + 0 + nonce (16 raw bytes).
+fn red_key(nonce: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(3 + 1 + nonce.len());
+    key.extend_from_slice(b"red");
+    key.push(0);
+    key.extend_from_slice(nonce);
+    key
+}
+
+/// the proposal roster's whole key. collides with no `prop\0...`/`red\0...`
+/// key (nor the host-seeded `__config` genesis-config record).
+const PROPOSAL_ROSTER_KEY: &[u8] = b"proposals";
+
+/// the share registry's whole key. present = shares were configured.
+const SHARES_KEY: &[u8] = b"shares";
+
+/// the share-mode flag's whole key. absent = validator ballots (the default).
+const SHARE_MODE_KEY: &[u8] = b"mode";
+
+/// one proposal, stored verbatim — borsh writes the ballot and electorate
+/// `BTreeMap`s length-prefixed in key order, so one proposal state has
+/// exactly one encoding.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct Proposal {
     action: GovAction,
     proposer: Vec<u8>,
@@ -82,7 +177,7 @@ struct Proposal {
     electorate: Electorate,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct Electorate {
     voter_kind: VoterKind,
     powers: BTreeMap<Vec<u8>, u64>,
@@ -123,8 +218,8 @@ impl Actor {
 }
 
 /// one settled invite redemption — the single-use record plus the audit
-/// trail (who invited whom, when).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// trail (who invited whom, when). the nonce is the record KEY, not a field.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct Redemption {
     joiner: Vec<u8>,
     issuer: Vec<u8>,
@@ -151,29 +246,17 @@ pub struct Governance {
     /// (a shape without a descriptor) refuses every `Redeem` with a clear
     /// error, deterministically.
     invite_binding: Option<Vec<u8>>,
-    /// committed proposals — what `root()` commits to.
-    proposals: BTreeMap<String, Proposal>,
-    /// this block's staged writes (whole-proposal overwrite granularity),
-    /// read ahead of committed state, merged at `commit_block`.
-    pending: BTreeMap<String, Proposal>,
-    /// committed invite redemptions by token nonce — the exactly-once set.
-    /// folded into `root()`/`snapshot()` after the proposal section.
-    redeemed: BTreeMap<Vec<u8>, Redemption>,
-    /// this block's staged redemptions, same discipline as `pending`.
-    pending_redeemed: BTreeMap<Vec<u8>, Redemption>,
-    /// `None` until the one-time AdoptShares action passes.
-    shares: Option<BTreeMap<Vec<u8>, u64>>,
-    /// this block's replacement share map, if a share action executed.
-    pending_shares: Option<BTreeMap<Vec<u8>, u64>>,
-    /// false by default: one validator node, one ballot.
-    share_mode: bool,
-    /// this block's mode switch, if one executed.
-    pending_share_mode: Option<bool>,
+    /// the host-injected authenticated store plus this block's staging overlay
+    /// (read-your-writes, folded into `root()` at `commit_block`). store key
+    /// is `sha256(logical_key)`, owned by [`StagedStore`].
+    staged: StagedStore,
 }
 
 impl Governance {
+    /// wrap the host-constructed store under module identity `id`.
     pub fn new(
         id: impl Into<ModuleId>,
+        store: Box<dyn MerkleStore>,
         valset_id: impl Into<ModuleId>,
         identity_id: impl Into<ModuleId>,
     ) -> Self {
@@ -183,14 +266,7 @@ impl Governance {
             code_registry_id: None,
             identity_id: identity_id.into(),
             invite_binding: None,
-            proposals: BTreeMap::new(),
-            pending: BTreeMap::new(),
-            redeemed: BTreeMap::new(),
-            pending_redeemed: BTreeMap::new(),
-            shares: None,
-            pending_shares: None,
-            share_mode: false,
-            pending_share_mode: None,
+            staged: StagedStore::new(store),
         }
     }
 
@@ -211,9 +287,109 @@ impl Governance {
         self
     }
 
-    fn get(&self, id: &str) -> Option<&Proposal> {
-        self.pending.get(id).or_else(|| self.proposals.get(id))
+    // ---- staged-over-committed reads ----------------------------------------
+
+    async fn load<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
+    where
+        T: BorshDeserialize,
+    {
+        match self.staged.get(key).await? {
+            Some(bytes) => Ok(Some(
+                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
     }
+
+    /// stage a value whose serialized size is bounded by construction (a
+    /// redemption record, the share registry, the mode flag) — see the module
+    /// doc's poison-value paragraph. proposals and the roster go through
+    /// [`Self::store_bounded`].
+    fn store<T>(&mut self, key: Vec<u8>, value: &T)
+    where
+        T: BorshSerialize,
+    {
+        self.staged.stage(
+            key,
+            borsh::to_vec(value).expect("governance value is serializable"),
+        );
+    }
+
+    /// stage a value only if its serialized size fits `cap` — the write-time
+    /// guard against poison values (the qmdb codec cap is decode-only).
+    fn store_bounded<T>(
+        &mut self,
+        key: Vec<u8>,
+        value: &T,
+        cap: usize,
+        what: &str,
+    ) -> Result<(), Error>
+    where
+        T: BorshSerialize,
+    {
+        let bytes = borsh::to_vec(value).expect("governance value is serializable");
+        if bytes.len() > cap {
+            return Err(Error::Module(format!(
+                "{what} record too large: {} > {cap} bytes",
+                bytes.len()
+            )));
+        }
+        self.staged.stage(key, bytes);
+        Ok(())
+    }
+
+    async fn proposal(&self, proposal_id: &str) -> Result<Option<Proposal>, Error> {
+        self.load(&prop_key(proposal_id)).await
+    }
+
+    /// stage a settled/updated proposal record under the FULL byte cap — see
+    /// [`MAX_PROPOSAL_RECORD_BYTES`] for why accrued ballots cannot cross it.
+    fn store_proposal(&mut self, proposal_id: &str, proposal: &Proposal) -> Result<(), Error> {
+        self.store_bounded(
+            prop_key(proposal_id),
+            proposal,
+            MAX_PROPOSAL_RECORD_BYTES,
+            "proposal",
+        )
+    }
+
+    /// the proposal roster — every proposal id, sorted. record and roster are
+    /// staged (and commit or abort) together, so membership in one is
+    /// membership in both; the roster is the ONE existence authority at
+    /// propose and the ONE enumeration read (module doc: why it is canonical).
+    async fn roster(&self) -> Result<Vec<String>, Error> {
+        Ok(self.load(PROPOSAL_ROSTER_KEY).await?.unwrap_or_default())
+    }
+
+    async fn shares(&self) -> Result<Option<BTreeMap<Vec<u8>, u64>>, Error> {
+        Ok(self
+            .load::<Vec<ShareAllocation>>(SHARES_KEY)
+            .await?
+            .map(|allocations| {
+                allocations
+                    .into_iter()
+                    .map(|a| (a.account_id, a.shares))
+                    .collect()
+            }))
+    }
+
+    fn stage_shares(&mut self, shares: &BTreeMap<Vec<u8>, u64>) {
+        let allocations: Vec<ShareAllocation> = shares
+            .iter()
+            .map(|(account_id, shares)| ShareAllocation {
+                account_id: account_id.clone(),
+                shares: *shares,
+            })
+            .collect();
+        // bounded by construction: at most MAX_SHARE_ACCOUNTS allocations.
+        self.store(SHARES_KEY.to_vec(), &allocations);
+    }
+
+    async fn share_mode(&self) -> Result<bool, Error> {
+        Ok(self.load(SHARE_MODE_KEY).await?.unwrap_or(false))
+    }
+
+    // ---- sibling reads ------------------------------------------------------
 
     /// the AUTHENTICATED submitter key, or an error for module/system origins —
     /// proposals and ballots are member actions, never emitted by modules.
@@ -231,9 +407,8 @@ impl Governance {
     /// account acts for that account — its ballots are the account's bound
     /// nodes. an origin that is no account member acts as ITSELF (a node key):
     /// a validator node remains a first-class governance actor (its own
-    /// automation, upgrade tooling, self-serving ops), so this arm is the
-    /// model, not a compat alias — the deleted thing is the node-local
-    /// re-signing TRANSPORT, not node principals.
+    /// automation, upgrade tooling, self-serving ops), so node principals are
+    /// part of the current actor model.
     async fn resolve_actor(&self, ctx: &dyn Ctx, origin: &[u8]) -> Result<Actor, Error> {
         // an origin that is no account member — including a network with no
         // identity module at all (an identity query error means the module is
@@ -272,14 +447,6 @@ impl Governance {
     /// projection, via the shared `valset::members` read.
     async fn members(&self, ctx: &dyn Ctx) -> Result<Vec<Vec<u8>>, Error> {
         valset::members(ctx, &self.valset_id).await
-    }
-
-    fn effective_shares(&self) -> Option<&BTreeMap<Vec<u8>, u64>> {
-        self.pending_shares.as_ref().or(self.shares.as_ref())
-    }
-
-    fn effective_share_mode(&self) -> bool {
-        self.pending_share_mode.unwrap_or(self.share_mode)
     }
 
     async fn identity_account(
@@ -365,8 +532,8 @@ impl Governance {
         submitter: &[u8],
         action: &GovAction,
     ) -> Result<(Vec<u8>, Electorate), Error> {
-        if self.effective_share_mode() {
-            let shares = self.effective_shares().ok_or_else(|| {
+        if self.share_mode().await? {
+            let shares = self.shares().await?.ok_or_else(|| {
                 Error::Module("account-share mode has no configured registry".into())
             })?;
             let account_id = self.account_principal(ctx, submitter).await?;
@@ -375,19 +542,18 @@ impl Governance {
                     "submitter account holds no governance shares".into(),
                 ));
             }
-            let powers = shares.clone();
-            let total = Self::total_power(&powers)?;
+            let total = Self::total_power(&shares)?;
             return Ok((
                 account_id,
                 Electorate {
                     voter_kind: VoterKind::Account,
                     rule: Self::threshold_rule(total, action, true),
-                    powers,
+                    powers: shares,
                 },
             ));
         }
 
-        // validator mode (the v1 default): ballots stay NODE-keyed — N
+        // validator mode (the default): ballots stay NODE-keyed — N
         // validators = N votes. the module-side ACL (A1): the submitter must
         // hold member standing. a submitter that is DIRECTLY a member node acts
         // as itself with NO identity read (a validator's own key, and any host
@@ -400,8 +566,7 @@ impl Governance {
             let actor = self.resolve_actor(ctx, submitter).await?;
             if !actor.nodes().iter().any(|node| members.contains(node)) {
                 return Err(Error::Module(
-                    "submitter holds no validator-set standing (no member node bound to it)"
-                        .into(),
+                    "submitter holds no validator-set standing (no member node bound to it)".into(),
                 ));
             }
             actor.principal().to_vec()
@@ -469,21 +634,25 @@ impl Governance {
             status: p.status,
             votes: p.votes.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             voter_kind: electorate.voter_kind,
-            electorate: electorate.powers.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            electorate: electorate
+                .powers
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             voting_rule: electorate.rule,
         }
     }
 
-    fn shares_view(&self) -> SharesView {
-        let Some(shares) = self.effective_shares() else {
-            return SharesView {
+    async fn shares_view(&self) -> Result<SharesView, Error> {
+        let Some(shares) = self.shares().await? else {
+            return Ok(SharesView {
                 active: false,
                 allocations: Vec::new(),
                 total: 0,
-            };
+            });
         };
-        SharesView {
-            active: self.effective_share_mode(),
+        Ok(SharesView {
+            active: self.share_mode().await?,
             allocations: shares
                 .iter()
                 .map(|(account_id, shares)| ShareAllocation {
@@ -492,201 +661,7 @@ impl Governance {
                 })
                 .collect(),
             total: shares.values().sum(),
-        }
-    }
-
-    // ---- canonical state bytes (root preimage + snapshot format) -----------
-
-    fn encode_state(
-        proposals: &BTreeMap<String, Proposal>,
-        redeemed: &BTreeMap<Vec<u8>, Redemption>,
-        shares: Option<&BTreeMap<Vec<u8>, u64>>,
-        share_mode: bool,
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&(proposals.len() as u64).to_le_bytes());
-        for (id, p) in proposals {
-            push_bytes(&mut out, id.as_bytes());
-            match &p.action {
-                GovAction::AddValidator { key } => {
-                    out.push(0);
-                    push_bytes(&mut out, key);
-                }
-                GovAction::RemoveValidator { key } => {
-                    out.push(1);
-                    push_bytes(&mut out, key);
-                }
-                GovAction::Signal { text } => {
-                    out.push(2);
-                    push_bytes(&mut out, text.as_bytes());
-                }
-                GovAction::AddResident { key } => {
-                    out.push(3);
-                    push_bytes(&mut out, key);
-                }
-                GovAction::RemoveResident { key } => {
-                    out.push(4);
-                    push_bytes(&mut out, key);
-                }
-                GovAction::AdoptShares { allocations } => {
-                    out.push(5);
-                    out.extend_from_slice(&(allocations.len() as u64).to_le_bytes());
-                    for allocation in allocations {
-                        push_bytes(&mut out, &allocation.account_id);
-                        out.extend_from_slice(&allocation.shares.to_le_bytes());
-                    }
-                }
-                GovAction::SetShares { account_id, shares } => {
-                    out.push(6);
-                    push_bytes(&mut out, account_id);
-                    out.extend_from_slice(&shares.to_le_bytes());
-                }
-                GovAction::SetShareMode { enabled } => {
-                    out.push(7);
-                    out.push(u8::from(*enabled));
-                }
-                GovAction::UpdateModule {
-                    name,
-                    module_id,
-                    activation_height,
-                    code_hash,
-                } => {
-                    out.push(8);
-                    push_bytes(&mut out, name.as_bytes());
-                    push_bytes(&mut out, module_id.as_bytes());
-                    out.extend_from_slice(&activation_height.to_le_bytes());
-                    push_bytes(&mut out, code_hash);
-                }
-                GovAction::CancelModuleUpdate { name, module_id } => {
-                    out.push(9);
-                    push_bytes(&mut out, name.as_bytes());
-                    push_bytes(&mut out, module_id.as_bytes());
-                }
-                GovAction::RegisterModule {
-                    name,
-                    module_id,
-                    activation_height,
-                    code_hash,
-                } => {
-                    out.push(10);
-                    push_bytes(&mut out, name.as_bytes());
-                    push_bytes(&mut out, module_id.as_bytes());
-                    out.extend_from_slice(&activation_height.to_le_bytes());
-                    push_bytes(&mut out, code_hash);
-                }
-            }
-            push_bytes(&mut out, &p.proposer);
-            out.extend_from_slice(&p.created_at.to_le_bytes());
-            out.extend_from_slice(&p.deadline.to_le_bytes());
-            out.push(match p.status {
-                ProposalStatus::Open => 0,
-                ProposalStatus::Passed => 1,
-                ProposalStatus::Rejected => 2,
-            });
-            out.extend_from_slice(&(p.votes.len() as u64).to_le_bytes());
-            for (voter, approve) in &p.votes {
-                push_bytes(&mut out, voter);
-                out.push(u8::from(*approve));
-            }
-        }
-        // the redemption section: count, then per sorted nonce its record.
-        out.extend_from_slice(&(redeemed.len() as u64).to_le_bytes());
-        for (nonce, r) in redeemed {
-            push_bytes(&mut out, nonce);
-            push_bytes(&mut out, &r.joiner);
-            push_bytes(&mut out, &r.issuer);
-            out.extend_from_slice(&r.height.to_le_bytes());
-        }
-        // every proposal freezes its electorate, so the extension carries one
-        // record per proposal. it rides whenever there is anything to persist:
-        // a proposal (hence its electorate), a share registry, or a mode flag.
-        if shares.is_some() || !proposals.is_empty() || share_mode {
-            out.extend_from_slice(SHARES_EXT_MAGIC);
-            out.push(1); // extension version
-            match shares {
-                Some(shares) => {
-                    out.push(1);
-                    out.extend_from_slice(&(shares.len() as u64).to_le_bytes());
-                    for (account_id, power) in shares {
-                        push_bytes(&mut out, account_id);
-                        out.extend_from_slice(&power.to_le_bytes());
-                    }
-                }
-                None => out.push(0),
-            }
-            out.extend_from_slice(&(proposals.len() as u64).to_le_bytes());
-            for (id, proposal) in proposals {
-                let electorate = &proposal.electorate;
-                push_bytes(&mut out, id.as_bytes());
-                out.push(match electorate.voter_kind {
-                    VoterKind::ValidatorNode => 0,
-                    VoterKind::Account => 1,
-                });
-                match electorate.rule {
-                    VotingRule::Threshold { required_yes } => {
-                        out.push(1);
-                        out.extend_from_slice(&required_yes.to_le_bytes());
-                    }
-                    VotingRule::ParticipatingMajority { quorum } => {
-                        out.push(2);
-                        out.extend_from_slice(&quorum.to_le_bytes());
-                    }
-                }
-                out.extend_from_slice(&(electorate.powers.len() as u64).to_le_bytes());
-                for (principal, power) in &electorate.powers {
-                    push_bytes(&mut out, principal);
-                    out.extend_from_slice(&power.to_le_bytes());
-                }
-            }
-            // The original extension implied share mode from registry
-            // presence. Preserve those exact bytes/roots; append one override
-            // byte only after governance switches a configured registry off.
-            if share_mode != shares.is_some() {
-                out.push(u8::from(share_mode));
-            }
-        }
-        out
-    }
-
-    fn root_of(
-        proposals: &BTreeMap<String, Proposal>,
-        redeemed: &BTreeMap<Vec<u8>, Redemption>,
-        shares: Option<&BTreeMap<Vec<u8>, u64>>,
-        share_mode: bool,
-    ) -> StateRoot {
-        if proposals.is_empty() && redeemed.is_empty() && shares.is_none() && !share_mode {
-            return StateRoot::ZERO;
-        }
-        let mut h = Sha256::new();
-        h.update(Self::encode_state(proposals, redeemed, shares, share_mode));
-        StateRoot(h.finalize().into())
-    }
-
-    /// canonical bytes of COMMITTED state — the exact preimage of `root()`.
-    pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode_state(
-            &self.proposals,
-            &self.redeemed,
-            self.shares.as_ref(),
-            self.share_mode,
-        )
-    }
-
-    /// verify-then-adopt a peer snapshot: decode into a temporary, recompute
-    /// the root, refuse on mismatch — committed state and stage untouched on
-    /// any error. success drops the stage (it belonged to the replaced state).
-    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (proposals, redeemed, shares, share_mode) = decode_state(bytes)?;
-        sdk::verify_snapshot_root(Self::root_of(&proposals, &redeemed, shares.as_ref(), share_mode), expected)?;
-        self.proposals = proposals;
-        self.redeemed = redeemed;
-        self.shares = shares;
-        self.share_mode = share_mode;
-        self.pending.clear();
-        self.pending_redeemed.clear();
-        self.pending_shares = None;
-        self.pending_share_mode = None;
-        Ok(())
+        })
     }
 
     async fn normalize_share_action(
@@ -696,7 +671,7 @@ impl Governance {
     ) -> Result<GovAction, Error> {
         match &mut action {
             GovAction::AdoptShares { allocations } => {
-                if self.effective_shares().is_some() {
+                if self.shares().await?.is_some() {
                     return Err(Error::Module(
                         "governance shares are already configured".into(),
                     ));
@@ -730,7 +705,7 @@ impl Governance {
                     .collect();
             }
             GovAction::SetShares { account_id, shares } => {
-                let current = self.effective_shares().ok_or_else(|| {
+                let current = self.shares().await?.ok_or_else(|| {
                     Error::Module("adopt governance shares before changing them".into())
                 })?;
                 if *shares > MAX_SAFE_SHARES {
@@ -753,12 +728,12 @@ impl Governance {
                 Self::total_power(&after)?;
             }
             GovAction::SetShareMode { enabled } => {
-                if *enabled && self.effective_shares().is_none() {
+                if *enabled && self.shares().await?.is_none() {
                     return Err(Error::Module(
                         "configure governance shares before enabling share mode".into(),
                     ));
                 }
-                if *enabled == self.effective_share_mode() {
+                if *enabled == self.share_mode().await? {
                     return Err(Error::Module(
                         "governance is already using the requested voting mode".into(),
                     ));
@@ -780,6 +755,12 @@ impl Governance {
     ) -> Result<(), Error> {
         if proposal_id.is_empty() {
             return Err(Error::Module("proposal_id must not be empty".into()));
+        }
+        if proposal_id.len() > MAX_PROPOSAL_ID_BYTES {
+            return Err(Error::Module(format!(
+                "proposal_id exceeds {MAX_PROPOSAL_ID_BYTES} bytes ({} given)",
+                proposal_id.len()
+            )));
         }
         if voting_period == 0 || voting_period > MAX_VOTING_PERIOD {
             return Err(Error::Module(format!(
@@ -805,8 +786,12 @@ impl Governance {
         // the lifecycle module is their sole authority at ingest. a net without a
         // wired code registry deterministically rejects these (genesis wiring is
         // identical on every node).
-        if let GovAction::UpdateModule { name, module_id, .. }
-        | GovAction::RegisterModule { name, module_id, .. }
+        if let GovAction::UpdateModule {
+            name, module_id, ..
+        }
+        | GovAction::RegisterModule {
+            name, module_id, ..
+        }
         | GovAction::CancelModuleUpdate { name, module_id } = &action
         {
             if self.code_registry_id.is_none() {
@@ -831,9 +816,18 @@ impl Governance {
                 lifecycle::CODE_HASH_LEN
             )));
         }
-        if self.get(&proposal_id).is_some() {
+        let mut roster = self.roster().await?;
+        let position = match roster.binary_search(&proposal_id) {
+            Ok(_) => {
+                return Err(Error::Module(format!(
+                    "proposal already exists: {proposal_id}"
+                )));
+            }
+            Err(position) => position,
+        };
+        if roster.len() >= MAX_PROPOSALS {
             return Err(Error::Module(format!(
-                "proposal already exists: {proposal_id}"
+                "proposal cap reached ({MAX_PROPOSALS})"
             )));
         }
         let submitter = Self::external_origin(ctx)?;
@@ -846,18 +840,32 @@ impl Governance {
         let deadline = now
             .checked_add(voting_period)
             .ok_or_else(|| Error::Module("voting deadline overflows consensus time".into()))?;
-        self.pending.insert(
-            proposal_id,
-            Proposal {
-                action,
-                proposer,
-                created_at: now,
-                deadline,
-                status: ProposalStatus::Open,
-                votes: BTreeMap::new(),
-                electorate,
-            },
-        );
+        let proposal = Proposal {
+            action,
+            proposer,
+            created_at: now,
+            deadline,
+            status: ProposalStatus::Open,
+            votes: BTreeMap::new(),
+            electorate,
+        };
+        // both byte gates first: a refusal must stage NOTHING. a NEW proposal
+        // is gated at HALF the record cap so accrued ballots (at most one per
+        // electorate entry, each no larger than its entry) can never push the
+        // settled record past the full cap.
+        self.store_bounded(
+            prop_key(&proposal_id),
+            &proposal,
+            MAX_PROPOSAL_RECORD_BYTES / 2,
+            "proposal",
+        )?;
+        roster.insert(position, proposal_id);
+        self.store_bounded(
+            PROPOSAL_ROSTER_KEY.to_vec(),
+            &roster,
+            MAX_ROSTER_RECORD_BYTES,
+            "proposal roster",
+        )?;
         Ok(())
     }
 
@@ -868,8 +876,8 @@ impl Governance {
         approve: bool,
     ) -> Result<(), Error> {
         let mut proposal = self
-            .get(&proposal_id)
-            .cloned()
+            .proposal(&proposal_id)
+            .await?
             .ok_or_else(|| Error::Module(format!("no such proposal: {proposal_id}")))?;
         if proposal.status != ProposalStatus::Open {
             return Err(Error::Module("proposal is settled".into()));
@@ -887,7 +895,9 @@ impl Governance {
             // account held when each node voted for itself.
             VoterKind::ValidatorNode => {
                 let voters = self
-                    .node_ballots(ctx, &submitter, &|node| electorate.powers.contains_key(node))
+                    .node_ballots(ctx, &submitter, &|node| {
+                        electorate.powers.contains_key(node)
+                    })
                     .await?;
                 if voters.is_empty() {
                     return Err(Error::Module(
@@ -912,8 +922,7 @@ impl Governance {
         for voter in voters {
             proposal.votes.insert(voter, approve);
         }
-        self.pending.insert(proposal_id, proposal);
-        Ok(())
+        self.store_proposal(&proposal_id, &proposal)
     }
 
     async fn handle_execute(
@@ -922,8 +931,8 @@ impl Governance {
         proposal_id: String,
     ) -> Result<(), Error> {
         let mut proposal = self
-            .get(&proposal_id)
-            .cloned()
+            .proposal(&proposal_id)
+            .await?
             .ok_or_else(|| Error::Module(format!("no such proposal: {proposal_id}")))?;
         if proposal.status != ProposalStatus::Open {
             return Err(Error::Module("proposal is settled".into()));
@@ -993,8 +1002,9 @@ impl Governance {
                 // code registry owns the min-lead / at-most-one / no-op gates,
                 // and the swap arms purely on height. Propose door-checks the
                 // wiring, so an unwired registry here means the proposal was
-                // adopted from a peer snapshot minted under DIFFERENT genesis
-                // wiring — reject it cleanly rather than emit into the void.
+                // adopted from a peer's synced store minted under DIFFERENT
+                // genesis wiring — reject it cleanly rather than emit into the
+                // void.
                 GovAction::UpdateModule {
                     name,
                     module_id,
@@ -1053,7 +1063,7 @@ impl Governance {
                     payload: valset_encode_msg(&ValsetMsg::Revoke { key: key.clone() }),
                 }),
                 GovAction::AdoptShares { allocations } => {
-                    if self.effective_shares().is_some() {
+                    if self.shares().await?.is_some() {
                         // A competing adoption may have won since this proposal
                         // opened. Settle cleanly; initialization is one-time.
                         proposal.status = ProposalStatus::Rejected;
@@ -1065,16 +1075,15 @@ impl Governance {
                         if Self::total_power(&shares).is_err() {
                             proposal.status = ProposalStatus::Rejected;
                         } else {
-                            self.pending_shares = Some(shares);
-                            self.pending_share_mode = Some(true);
+                            self.stage_shares(&shares);
+                            self.store(SHARE_MODE_KEY.to_vec(), &true);
                         }
                     }
                 }
                 GovAction::SetShares { account_id, shares } => {
-                    let Some(mut after) = self.effective_shares().cloned() else {
+                    let Some(mut after) = self.shares().await? else {
                         proposal.status = ProposalStatus::Rejected;
-                        self.pending.insert(proposal_id, proposal);
-                        return Ok(());
+                        return self.store_proposal(&proposal_id, &proposal);
                     };
                     if *shares == 0 {
                         after.remove(account_id);
@@ -1084,14 +1093,14 @@ impl Governance {
                     if after.len() > MAX_SHARE_ACCOUNTS || Self::total_power(&after).is_err() {
                         proposal.status = ProposalStatus::Rejected;
                     } else {
-                        self.pending_shares = Some(after);
+                        self.stage_shares(&after);
                     }
                 }
                 GovAction::SetShareMode { enabled } => {
-                    if *enabled && self.effective_shares().is_none() {
+                    if *enabled && self.shares().await?.is_none() {
                         proposal.status = ProposalStatus::Rejected;
                     } else {
-                        self.pending_share_mode = Some(*enabled);
+                        self.store(SHARE_MODE_KEY.to_vec(), enabled);
                     }
                 }
                 GovAction::Signal { .. } => {}
@@ -1099,8 +1108,7 @@ impl Governance {
         } else {
             proposal.status = ProposalStatus::Rejected;
         }
-        self.pending.insert(proposal_id, proposal);
-        Ok(())
+        self.store_proposal(&proposal_id, &proposal)
     }
 
     /// redeem an invite — no ballot, the mint WAS the admission decision.
@@ -1147,7 +1155,7 @@ impl Governance {
         let proof_sig = ed25519::Signature::decode(proof.as_slice())
             .map_err(|e| Error::Module(format!("join proof: {e}")))?;
         let role = invite::InviteRole::from_u8(role).map_err(Error::Module)?;
-        // EVERY invite is bearer (기명 dropped — see the join ADR): there is
+        // EVERY invite is bearer (the targeted form was dropped — see the join ADR): there is
         // no target lock. The join proof below binds the redemption to
         // whichever key presents it, and the nonce set makes that
         // exactly-once — that is the whole containment story.
@@ -1226,16 +1234,16 @@ impl Governance {
             }
         };
         // exactly-once: the nonce is the single-use key, SHARED across roles
-        // (pending-over-committed read, so two redemptions in one block settle
-        // first-wins too). a Client and a Resident invite carry different
-        // nonces, but the set is shared so neither token can be replayed as the
-        // other's.
-        if self.pending_redeemed.contains_key(&nonce) || self.redeemed.contains_key(&nonce) {
+        // (the staged-over-committed read collapses two redemptions in one
+        // block to first-wins too). a Client and a Resident invite carry
+        // different nonces, but the keyspace is shared so neither token can be
+        // replayed as the other's.
+        if self.load::<Redemption>(&red_key(&nonce)).await?.is_some() {
             return Err(Error::Module("invite already redeemed".into()));
         }
-        self.pending_redeemed.insert(
-            nonce,
-            Redemption {
+        self.store(
+            red_key(&nonce),
+            &Redemption {
                 joiner,
                 issuer,
                 height: ctx.env().height,
@@ -1252,20 +1260,25 @@ impl Module for Governance {
         self.id.clone()
     }
 
-    /// sha256 over the canonical encoding of COMMITTED proposals and
-    /// redemptions; `ZERO` when none exist (the sdk's uninitialized-module
-    /// sentinel).
+    /// the store's merkle root over all committed records, verbatim — the
+    /// staged overlay is invisible here until `commit_block`.
     fn root(&self) -> StateRoot {
-        Self::root_of(
-            &self.proposals,
-            &self.redeemed,
-            self.shares.as_ref(),
-            self.share_mode,
-        )
+        self.staged.root()
     }
 
-    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
-        Some(self.snapshot())
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        self.staged.state_sync_handle()
+    }
+
+    /// the network state-sync serve lane: answers the shared qmdb wire requests
+    /// (historical proof-carrying op ranges) from committed state. read-only;
+    /// the joiner's sync engine merkle-verifies every batch.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.staged.serve_sync(req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        self.staged.sync_target().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -1292,507 +1305,76 @@ impl Module for Governance {
                 role,
                 expires_unix_secs,
             } => {
-                self.handle_redeem(ctx, issuer, nonce, token_sig, joiner, proof, role, expires_unix_secs)
+                self.handle_redeem(
+                    ctx,
+                    issuer,
+                    nonce,
+                    token_sig,
+                    joiner,
+                    proof,
+                    role,
+                    expires_unix_secs,
+                )
                     .await
             }
         }
     }
 
-    /// read projection — committed plus this block's staged changes.
+    /// read projection — committed plus this block's staged changes (the
+    /// staged-over-committed store view).
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             GovQuery::Proposals => {
-                let mut merged = self.proposals.clone();
-                for (id, p) in &self.pending {
-                    merged.insert(id.clone(), p.clone());
+                // walk the roster by derived key (≤ MAX_PROPOSALS point
+                // reads). a rostered id without a record is a store bug —
+                // loud, never skipped.
+                let mut views = Vec::new();
+                for proposal_id in self.roster().await? {
+                    let Some(proposal) = self.proposal(&proposal_id).await? else {
+                        return Err(Error::Module(format!(
+                            "missing proposal record: {proposal_id}"
+                        )));
+                    };
+                    views.push(Self::view_of(&proposal_id, &proposal));
                 }
-                let views = merged.iter().map(|(id, p)| Self::view_of(id, p)).collect();
                 Ok(encode_reply(&GovReply::Proposals(views)))
             }
             GovQuery::Proposal { proposal_id } => Ok(encode_reply(&GovReply::Proposal(
-                self.get(&proposal_id)
-                    .map(|p| Self::view_of(&proposal_id, p)),
+                self.proposal(&proposal_id)
+                    .await?
+                    .map(|p| Self::view_of(&proposal_id, &p)),
             ))),
-            GovQuery::Redemptions => {
-                let mut merged = self.redeemed.clone();
-                for (nonce, r) in &self.pending_redeemed {
-                    merged.insert(nonce.clone(), r.clone());
-                }
-                let views = merged
-                    .iter()
-                    .map(|(nonce, r)| RedemptionView {
+            GovQuery::Redemption { nonce } => {
+                let view = self
+                    .load::<Redemption>(&red_key(&nonce))
+                    .await?
+                    .map(|r| RedemptionView {
                         nonce: nonce.clone(),
-                        joiner: r.joiner.clone(),
-                        issuer: r.issuer.clone(),
+                        joiner: r.joiner,
+                        issuer: r.issuer,
                         height: r.height,
-                    })
-                    .collect();
-                Ok(encode_reply(&GovReply::Redemptions(views)))
+                    });
+                Ok(encode_reply(&GovReply::Redemption(view)))
             }
-            GovQuery::Shares => Ok(encode_reply(&GovReply::Shares(self.shares_view()))),
+            GovQuery::Shares => Ok(encode_reply(&GovReply::Shares(self.shares_view().await?))),
         }
     }
 
+    /// publish the block's staged writes in ONE store batch. no-op (and no
+    /// root movement) if nothing was staged.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        for (id, p) in std::mem::take(&mut self.pending) {
-            self.proposals.insert(id, p);
-        }
-        for (nonce, r) in std::mem::take(&mut self.pending_redeemed) {
-            self.redeemed.insert(nonce, r);
-        }
-        if let Some(shares) = self.pending_shares.take() {
-            self.shares = Some(shares);
-        }
-        if let Some(share_mode) = self.pending_share_mode.take() {
-            self.share_mode = share_mode;
-        }
-        Ok(())
+        self.staged.commit().await
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending.clear();
-        self.pending_redeemed.clear();
-        self.pending_shares = None;
-        self.pending_share_mode = None;
+        self.staged.abort();
         Ok(())
     }
 }
 
-// ---- strict snapshot decode (untrusted bytes) -------------------------------
-
-type DecodedState = (
-    BTreeMap<String, Proposal>,
-    BTreeMap<Vec<u8>, Redemption>,
-    Option<BTreeMap<Vec<u8>, u64>>,
-    bool,
-);
-
-/// a proposal decoded from the snapshot's proposal section — everything but the
-/// frozen electorate, which rides the later share-extension section. every
-/// proposal must be paired with exactly one electorate before it becomes a
-/// `Proposal`; one the extension does not name is refused (no network freezes a
-/// proposal without an electorate).
-struct PendingProposal {
-    action: GovAction,
-    proposer: Vec<u8>,
-    created_at: u64,
-    deadline: u64,
-    status: ProposalStatus,
-    votes: BTreeMap<Vec<u8>, bool>,
-}
-
-fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
-    let mut cur = Cursor::new(bytes);
-    let count = cur.u64("snapshot proposal count")?;
-    // every proposal costs at least its id length prefix — a forged count can
-    // never drive allocation past the buffer.
-    cur.bound(count, 8, "snapshot proposal")?;
-    // phase 1: the proposal section, sans electorate (see `PendingProposal`).
-    let mut pending: BTreeMap<String, PendingProposal> = BTreeMap::new();
-    let mut prev_id: Option<String> = None;
-    for _ in 0..count {
-        let id = cur.string("snapshot proposal id")?;
-        // strictly increasing ids: one state has exactly one encoding.
-        if prev_id.as_deref().is_some_and(|p| p >= id.as_str()) {
-            return Err(Error::Module(
-                "snapshot proposal ids must be strictly increasing".into(),
-            ));
-        }
-        let action = match cur.byte("snapshot action tag")? {
-            0 => GovAction::AddValidator {
-                key: cur.bytes("snapshot key")?.to_vec(),
-            },
-            1 => GovAction::RemoveValidator {
-                key: cur.bytes("snapshot key")?.to_vec(),
-            },
-            2 => GovAction::Signal {
-                text: cur.string("snapshot signal text")?,
-            },
-            3 => GovAction::AddResident {
-                key: cur.bytes("snapshot key")?.to_vec(),
-            },
-            4 => GovAction::RemoveResident {
-                key: cur.bytes("snapshot key")?.to_vec(),
-            },
-            5 => {
-                let allocation_count = cur.u64("snapshot allocation count")?;
-                if allocation_count == 0 || allocation_count > MAX_SHARE_ACCOUNTS as u64 {
-                    return Err(Error::Module(
-                        "snapshot initial shares have an invalid account count".into(),
-                    ));
-                }
-                let mut allocations = Vec::with_capacity(allocation_count as usize);
-                let mut powers = BTreeMap::new();
-                for _ in 0..allocation_count {
-                    let account_id = cur.bytes("snapshot allocation account")?.to_vec();
-                    let shares = cur.u64("snapshot allocation shares")?;
-                    if shares == 0 || powers.insert(account_id.clone(), shares).is_some() {
-                        return Err(Error::Module(
-                            "snapshot initial shares are zero or duplicated".into(),
-                        ));
-                    }
-                    allocations.push(ShareAllocation { account_id, shares });
-                }
-                if allocations
-                    .windows(2)
-                    .any(|pair| pair[0].account_id >= pair[1].account_id)
-                {
-                    return Err(Error::Module(
-                        "snapshot initial shares must be strictly increasing".into(),
-                    ));
-                }
-                Governance::total_power(&powers)?;
-                GovAction::AdoptShares { allocations }
-            }
-            6 => GovAction::SetShares {
-                account_id: cur.bytes("snapshot account id")?.to_vec(),
-                shares: cur.u64("snapshot shares")?,
-            },
-            7 => GovAction::SetShareMode {
-                enabled: cur.bool("snapshot share-mode action")?,
-            },
-            8 => GovAction::UpdateModule {
-                name: cur.string("snapshot module update name")?,
-                module_id: cur.string("snapshot module id")?,
-                activation_height: cur.u64("snapshot activation height")?,
-                code_hash: cur.bytes("snapshot code hash")?.to_vec(),
-            },
-            9 => GovAction::CancelModuleUpdate {
-                name: cur.string("snapshot module update name")?,
-                module_id: cur.string("snapshot module id")?,
-            },
-            10 => GovAction::RegisterModule {
-                name: cur.string("snapshot module update name")?,
-                module_id: cur.string("snapshot module id")?,
-                activation_height: cur.u64("snapshot activation height")?,
-                code_hash: cur.bytes("snapshot code hash")?.to_vec(),
-            },
-            other => return Err(Error::Module(format!("snapshot: bad action tag {other}"))),
-        };
-        let proposer = cur.bytes("snapshot proposer")?.to_vec();
-        let created_at = cur.u64("snapshot created_at")?;
-        let deadline = cur.u64("snapshot deadline")?;
-        let status = match cur.byte("snapshot status tag")? {
-            0 => ProposalStatus::Open,
-            1 => ProposalStatus::Passed,
-            2 => ProposalStatus::Rejected,
-            other => return Err(Error::Module(format!("snapshot: bad status tag {other}"))),
-        };
-        let vote_count = cur.u64("snapshot vote count")?;
-        cur.bound(vote_count, 9, "snapshot vote")?;
-        let mut votes = BTreeMap::new();
-        let mut prev_voter: Option<Vec<u8>> = None;
-        for _ in 0..vote_count {
-            let voter = cur.bytes("snapshot voter")?.to_vec();
-            if prev_voter.as_deref().is_some_and(|p| p >= voter.as_slice()) {
-                return Err(Error::Module(
-                    "snapshot voters must be strictly increasing".into(),
-                ));
-            }
-            let approve = cur.bool("snapshot ballot")?;
-            prev_voter = Some(voter.clone());
-            votes.insert(voter, approve);
-        }
-        prev_id = Some(id.clone());
-        pending.insert(
-            id,
-            PendingProposal {
-                action,
-                proposer,
-                created_at,
-                deadline,
-                status,
-                votes,
-            },
-        );
-    }
-    // the redemption section always rides, then the optional share extension.
-    let rcount = cur.u64("snapshot redemption count")?;
-    cur.bound(rcount, 8, "snapshot redemption")?;
-    let mut redeemed = BTreeMap::new();
-    let mut prev_nonce: Option<Vec<u8>> = None;
-    for _ in 0..rcount {
-        let nonce = cur.bytes("snapshot redemption nonce")?.to_vec();
-        if prev_nonce.as_deref().is_some_and(|p| p >= nonce.as_slice()) {
-            return Err(Error::Module(
-                "snapshot redemption nonces must be strictly increasing".into(),
-            ));
-        }
-        let joiner = cur.bytes("snapshot redemption joiner")?.to_vec();
-        let issuer = cur.bytes("snapshot redemption issuer")?.to_vec();
-        let height = cur.u64("snapshot redemption height")?;
-        prev_nonce = Some(nonce.clone());
-        redeemed.insert(
-            nonce,
-            Redemption {
-                joiner,
-                issuer,
-                height,
-            },
-        );
-    }
-
-    // phase 2: the share extension carries the registry, the mode flag, and
-    // EVERY proposal's frozen electorate. an absent extension is legal only
-    // when there is nothing to carry (no proposals, no shares, no share mode).
-    let mut electorates: BTreeMap<String, Electorate> = BTreeMap::new();
-    let (shares, share_mode) = if cur.remaining() == 0 {
-        (None, false)
-    } else {
-        if cur.array::<8>("snapshot share-extension magic")? != *SHARES_EXT_MAGIC {
-            return Err(Error::Module("snapshot carries trailing bytes".into()));
-        }
-        if cur.byte("snapshot share-extension version")? != 1 {
-            return Err(Error::Module(
-                "snapshot has an unsupported governance-share extension".into(),
-            ));
-        }
-        let shares = match cur.byte("snapshot share-active flag")? {
-            0 => None,
-            1 => {
-                let share_count = cur.u64("snapshot share count")?;
-                if share_count == 0 || share_count > MAX_SHARE_ACCOUNTS as u64 {
-                    return Err(Error::Module(
-                        "snapshot share registry has an invalid account count".into(),
-                    ));
-                }
-                let mut map = BTreeMap::new();
-                let mut previous: Option<Vec<u8>> = None;
-                for _ in 0..share_count {
-                    let account_id = cur.bytes("snapshot share account")?.to_vec();
-                    if previous
-                        .as_deref()
-                        .is_some_and(|prev| prev >= account_id.as_slice())
-                    {
-                        return Err(Error::Module(
-                            "snapshot share accounts must be strictly increasing".into(),
-                        ));
-                    }
-                    let power = cur.u64("snapshot share power")?;
-                    if power == 0 {
-                        return Err(Error::Module(
-                            "snapshot share power must be positive".into(),
-                        ));
-                    }
-                    previous = Some(account_id.clone());
-                    map.insert(account_id, power);
-                }
-                Governance::total_power(&map)?;
-                Some(map)
-            }
-            other => {
-                return Err(Error::Module(format!(
-                    "snapshot share-active flag must be 0 or 1, got {other}"
-                )));
-            }
-        };
-
-        let meta_count = cur.u64("snapshot electorate count")?;
-        if meta_count > pending.len() as u64 {
-            return Err(Error::Module(
-                "snapshot has more electorates than proposals".into(),
-            ));
-        }
-        let mut previous_id: Option<String> = None;
-        for _ in 0..meta_count {
-            let id = cur.string("snapshot electorate id")?;
-            if previous_id
-                .as_deref()
-                .is_some_and(|prev| prev >= id.as_str())
-            {
-                return Err(Error::Module(
-                    "snapshot electorate ids must be strictly increasing".into(),
-                ));
-            }
-            let voter_kind = match cur.byte("snapshot voter-kind tag")? {
-                0 => VoterKind::ValidatorNode,
-                1 => VoterKind::Account,
-                other => {
-                    return Err(Error::Module(format!(
-                        "snapshot has bad voter-kind tag {other}"
-                    )));
-                }
-            };
-            // tag 0 is retired with the dynamic-validator rule: it no longer
-            // names a rule, so it is refused here like any other bad tag.
-            let rule = match cur.byte("snapshot voting-rule tag")? {
-                1 => VotingRule::Threshold {
-                    required_yes: cur.u64("snapshot required_yes")?,
-                },
-                2 => VotingRule::ParticipatingMajority {
-                    quorum: cur.u64("snapshot quorum")?,
-                },
-                other => {
-                    return Err(Error::Module(format!(
-                        "snapshot has bad voting-rule tag {other}"
-                    )));
-                }
-            };
-            let power_count = cur.u64("snapshot electorate power count")?;
-            if power_count == 0 {
-                return Err(Error::Module(
-                    "snapshot electorate count exceeds buffer".into(),
-                ));
-            }
-            cur.bound(power_count, 16, "snapshot electorate power")?;
-            let mut powers = BTreeMap::new();
-            let mut previous_principal: Option<Vec<u8>> = None;
-            for _ in 0..power_count {
-                let principal = cur.bytes("snapshot electorate principal")?.to_vec();
-                if previous_principal
-                    .as_deref()
-                    .is_some_and(|prev| prev >= principal.as_slice())
-                {
-                    return Err(Error::Module(
-                        "snapshot electorate must be strictly increasing".into(),
-                    ));
-                }
-                let power = cur.u64("snapshot electorate power")?;
-                if power == 0 {
-                    return Err(Error::Module(
-                        "snapshot electorate power must be positive".into(),
-                    ));
-                }
-                previous_principal = Some(principal.clone());
-                powers.insert(principal, power);
-            }
-            let total = Governance::total_power(&powers)?;
-            match rule {
-                VotingRule::Threshold { required_yes }
-                    if required_yes == 0 || required_yes > total =>
-                {
-                    return Err(Error::Module(
-                        "snapshot threshold is outside electorate power".into(),
-                    ));
-                }
-                VotingRule::ParticipatingMajority { quorum } if quorum == 0 || quorum > total => {
-                    return Err(Error::Module(
-                        "snapshot quorum is outside electorate power".into(),
-                    ));
-                }
-                _ => {}
-            }
-            let proposal = pending
-                .get(&id)
-                .ok_or_else(|| Error::Module("snapshot electorate names no proposal".into()))?;
-            if proposal
-                .votes
-                .keys()
-                .any(|principal| !powers.contains_key(principal))
-            {
-                return Err(Error::Module(
-                    "snapshot ballot is outside its frozen electorate".into(),
-                ));
-            }
-            electorates.insert(
-                id.clone(),
-                Electorate {
-                    voter_kind,
-                    powers,
-                    rule,
-                },
-            );
-            previous_id = Some(id);
-        }
-        let share_mode = if cur.remaining() == 0 {
-            // Compatibility with the original extension: registry presence
-            // implied that account shares governed future proposals.
-            shares.is_some()
-        } else {
-            cur.bool("snapshot share-mode override")?
-        };
-        if share_mode && shares.is_none() {
-            return Err(Error::Module(
-                "snapshot enables share mode without a registry".into(),
-            ));
-        }
-        (shares, share_mode)
-    };
-    cur.finish("snapshot")?;
-    // assemble: pair every proposal with its frozen electorate. there is no
-    // dynamic-electorate fallback — a proposal the extension did not name is
-    // refused here (the retired `electorate: None` shape).
-    let mut proposals = BTreeMap::new();
-    for (id, p) in pending {
-        let electorate = electorates
-            .remove(&id)
-            .ok_or_else(|| Error::Module("snapshot proposal has no frozen electorate".into()))?;
-        proposals.insert(
-            id,
-            Proposal {
-                action: p.action,
-                proposer: p.proposer,
-                created_at: p.created_at,
-                deadline: p.deadline,
-                status: p.status,
-                votes: p.votes,
-                electorate,
-            },
-        );
-    }
-    Ok((proposals, redeemed, shares, share_mode))
-}
-
-#[cfg(test)]
-mod dead_electorate_refusal {
-    //! the retired dynamic-validator path — `electorate: None` /
-    //! `VotingRule::DynamicValidatorMajority` — must be UNREACHABLE. these craft
-    //! the two shapes the old decoder tolerated and prove the new one refuses
-    //! both, so no snapshot can resurrect the dynamic electorate.
-    use super::*;
-
-    /// the proposal section without the share extension that carries frozen
-    /// electorates: the pre-share shape that used to decode to `electorate:
-    /// None`. it must be refused now — every proposal freezes an electorate.
-    fn one_proposal_no_extension() -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // one proposal
-        push_bytes(&mut bytes, b"p"); // proposal id
-        bytes.push(2); // Signal action tag
-        push_bytes(&mut bytes, b"x"); // signal text
-        push_bytes(&mut bytes, &[0u8; 32]); // proposer
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // created_at
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // deadline
-        bytes.push(0); // status Open
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // vote count
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // redemption count
-        bytes
-    }
-
-    #[test]
-    fn a_proposal_without_a_frozen_electorate_is_refused() {
-        let err = decode_state(&one_proposal_no_extension())
-            .expect_err("a proposal with no frozen electorate must not decode");
-        assert!(
-            matches!(&err, Error::Module(m) if m.contains("no frozen electorate")),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn the_retired_dynamic_voting_rule_tag_is_refused() {
-        // the same proposal, this time WITH an extension that tags its frozen
-        // electorate with the retired dynamic rule (tag 0). the tag no longer
-        // names a rule, so decode refuses it before reading powers.
-        let mut bytes = one_proposal_no_extension();
-        bytes.extend_from_slice(SHARES_EXT_MAGIC); // extension magic
-        bytes.push(1); // extension version
-        bytes.push(0); // share-active flag: no registry
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // one electorate record
-        push_bytes(&mut bytes, b"p"); // names the proposal
-        bytes.push(0); // voter_kind ValidatorNode
-        bytes.push(0); // voting-rule tag 0 — the retired dynamic rule
-        let err = decode_state(&bytes)
-            .expect_err("the retired dynamic voting-rule tag must not decode");
-        assert!(
-            matches!(&err, Error::Module(m) if m.contains("bad voting-rule tag")),
-            "unexpected error: {err:?}"
-        );
-    }
-}
-
-// the wasm-guest port: the dispatch shell that adapts this module to the
-// ducktape:module world. compiled only by the guest-builder's synthesized
-// wasm32 cdylib workspace (feature `guest`), never by the native build.
+// the wasm-guest port: the store-backed dispatch shell that adapts this module
+// to the ducktape:module world. compiled only by the guest-builder's
+// synthesized wasm32 cdylib workspace (feature `guest`), never by the native
+// build.
 #[cfg(feature = "guest")]
 mod guest;

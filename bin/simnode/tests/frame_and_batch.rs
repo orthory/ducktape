@@ -64,14 +64,13 @@ fn a_signed_frame_commits_under_its_verified_signer() {
         &signer,
         1,
         &chat_frame_op(create_channel("general", "General")),
-        None,
     );
     let (code, receipt) = sim.submit_frame(&frame);
     assert_eq!(code, 200, "a valid frame commits: {receipt}");
     assert_eq!(receipt["height"], 1, "the frame's op landed in block 1");
     // the receipt addresses the op PAYLOAD, exactly as the frameless lane does.
     assert_eq!(
-        receipt["opHash"].as_str().map(str::len),
+        receipt["op_hash"].as_str().map(str::len),
         Some(64),
         "the frame lane returns the same receipt shape: {receipt}"
     );
@@ -105,7 +104,6 @@ fn a_tampered_frame_is_refused_with_no_block() {
         &signer,
         1,
         &chat_frame_op(create_channel("general", "General")),
-        None,
     );
     // flip one PAYLOAD byte: the trailing bytes are cont_flag (1) + signature
     // (64), so the payload's last byte sits at len - 66. the signature binds
@@ -140,7 +138,7 @@ fn a_files_commit_over_a_frame_is_authored_by_the_verified_key() {
 
     // a user-signed commit: the signer key authors it.
     let signer = Ed::from_seed(11);
-    let frame = node::encode_frame(&signer, 1, &files_mkdir_commit("/shared/proj", "signed"), None);
+    let frame = node::encode_frame(&signer, 1, &files_mkdir_commit("/shared/proj", "signed"));
     let (code, receipt) = sim.submit_frame(&frame);
     assert_eq!(code, 200, "the files frame commits: {receipt}");
 
@@ -193,7 +191,7 @@ fn a_byte_identical_frame_resubmit_is_stopped_by_the_files_cas_not_a_consensus_s
     let sim = Sim::spawn(storage.path(), &["--auto"]);
 
     let signer = Ed::from_seed(13);
-    let frame = node::encode_frame(&signer, 1, &files_mkdir_commit("/shared/proj", "once"), None);
+    let frame = node::encode_frame(&signer, 1, &files_mkdir_commit("/shared/proj", "once"));
 
     let (code, receipt) = sim.submit_frame(&frame);
     assert_eq!(code, 200, "the first commit lands: {receipt}");
@@ -298,33 +296,25 @@ fn a_rejected_batch_member_is_isolated_and_the_rest_commit() {
     assert_eq!(reply["height"], 1, "the batch is a single block: {reply}");
     assert_eq!(sim.status()["height"], 1);
 
-    // member 2 left NO trace: exactly alpha + beta committed (alpha once).
-    let channels = sim.query("chat", serde_json::json!("channels"));
-    let ids: Vec<&str> = channels["channels"]
-        .as_array()
-        .expect("channels array")
-        .iter()
-        .map(|c| c["id"].as_str().expect("channel id"))
-        .collect();
+    // member 2 left NO trace. the point read says this more sharply than the
+    // old count did: alpha's committed record still carries member 1's name, so
+    // the rejected duplicate neither added a channel NOR overwrote one.
+    let alpha = sim.channel("alpha").expect("member 1's alpha committed");
     assert_eq!(
-        ids.len(),
-        2,
-        "member 2's duplicate left no trace: {channels}"
+        alpha["name"], "Alpha",
+        "member 2's 'Alpha again' left no trace on alpha: {alpha}"
     );
-    assert!(
-        ids.contains(&"alpha") && ids.contains(&"beta"),
-        "{channels}"
-    );
+    assert!(sim.channel("beta").is_some(), "member 3's beta committed");
 }
 
 /// DETERMINISM: the same N ops as ONE batch block vs as N single blocks reach an
 /// identical LOGICAL state (every key resolves to the same value) but a DIFFERENT
-/// authenticated root and app-hash. this is the reality worth pinning: kv's
+/// authenticated root and root-hash. this is the reality worth pinning: kv's
 /// substrate is a commonware qmdb with a SEQUENTIAL merkle strategy, so the root
 /// commits to the commit-BOUNDARY structure (one commit vs three), not just the
 /// key→value map — folding N writes into one block is NOT root-equivalent to N
 /// single blocks even for the identical writes. so batching is observable in the
-/// app-hash: a joiner must agree on block structure, not merely on final values.
+/// root-hash: a joiner must agree on block structure, not merely on final values.
 #[test]
 fn one_batch_and_n_single_blocks_reach_the_same_values_but_different_roots() {
     // identical genesis on both sims: same valset seed, same module set. kv is
@@ -373,10 +363,10 @@ fn one_batch_and_n_single_blocks_reach_the_same_values_but_different_roots() {
         );
     }
 
-    // but the authenticated ROOT and app-hash DIFFER: the qmdb sequential merkle
+    // but the authenticated ROOT and root-hash DIFFER: the qmdb sequential merkle
     // commits to the commit-boundary structure, so one block ≠ three blocks even
     // for identical writes. (all OTHER module roots stay genesis-identical, so
-    // the app-hash gap is entirely the kv root gap — a clean isolation of the
+    // the root-hash gap is entirely the kv root gap — a clean isolation of the
     // effect.)
     assert_ne!(
         kv_root(&a),
@@ -384,8 +374,8 @@ fn one_batch_and_n_single_blocks_reach_the_same_values_but_different_roots() {
         "kv roots must differ: block structure is authenticated:\nA {a}\nB {b}"
     );
     assert_ne!(
-        a["appHash"], b["appHash"],
-        "the app-hash reflects the kv root gap"
+        a["root_hash"], b["root_hash"],
+        "the root-hash reflects the kv root gap"
     );
 }
 
@@ -409,7 +399,7 @@ fn kv_root(status: &serde_json::Value) -> String {
 
 // ── E4 — node-key seeding ───────────────────────────────
 
-/// `--node-key` fabricates a mesh identity `status().publicKey` serves back —
+/// `--node-key` fabricates a mesh identity `status().public_key` serves back —
 /// what a consensus op naming a node key (huddle membership) references. no mesh
 /// routes behind it.
 #[test]
@@ -418,7 +408,7 @@ fn node_key_seeds_status_public_key() {
     let key = "ab".repeat(32); // 64 hex, 32 bytes
     let sim = Sim::spawn(storage.path(), &["--node-key", &key]);
     assert_eq!(
-        sim.status()["publicKey"],
+        sim.status()["public_key"],
         key,
         "the seeded key is served verbatim"
     );
@@ -430,7 +420,7 @@ fn node_key_seeds_status_public_key() {
 fn without_node_key_public_key_stays_empty() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &[]);
-    assert_eq!(sim.status()["publicKey"], "", "no key seeded → empty");
+    assert_eq!(sim.status()["public_key"], "", "no key seeded → empty");
 }
 
 /// a malformed `--node-key` fails LOUD at startup rather than seeding junk a
@@ -537,7 +527,7 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
         ),
         (
             "gateway",
-            serde_json::json!({ "set_handle": { "handle": "eddy" } }),
+            serde_json::json!({ "set_handle": { "handle": "bob" } }),
             node.clone(),
         ),
         ("kv", kv_set(b"k1", b"v1"), "peer".into()),
@@ -546,8 +536,8 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
         ("pages", create_page("p2"), "peer".into()),
         ("tasks", create_task("t1"), "peer".into()),
         ("tasks", create_task("t2"), "peer".into()),
-        ("inbox", deliver("eddy", "hi"), "courier".into()),
-        ("inbox", deliver("eddy", "yo"), "courier".into()),
+        ("inbox", deliver("bob", "hi"), "courier".into()),
+        ("inbox", deliver("bob", "yo"), "courier".into()),
     ];
     let n = script.len() as u64;
 
@@ -579,8 +569,8 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
     assert_eq!(a["height"], 1, "the batch is one block");
     assert_eq!(b["height"], n, "the singles are {n} blocks");
     assert_ne!(
-        a["appHash"], b["appHash"],
-        "the app-hash reflects the diverging roots"
+        a["root_hash"], b["root_hash"],
+        "the root-hash reflects the diverging roots"
     );
 
     // qmdb-backed modules authenticate the commit boundary → roots DIFFER.
@@ -621,11 +611,17 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
             "kv value for {k:?} converges"
         );
     }
-    assert_eq!(
-        sim_a.query("pages", serde_json::json!("list_pages"))["page_list"],
-        sim_b.query("pages", serde_json::json!("list_pages"))["page_list"],
-        "the page list converges"
-    );
+    // pages answers point reads only since the read-model cutover (ListPages
+    // moved to the index guest), so convergence is asserted per page the script
+    // created — which names them instead of trusting a list's ordering.
+    for page_id in ["p1", "p2"] {
+        let query = serde_json::json!({ "get_page": { "page_id": page_id, "after": null, "limit": 0 } });
+        assert_eq!(
+            sim_a.query("pages", query.clone()),
+            sim_b.query("pages", query),
+            "page {page_id} converges"
+        );
+    }
 
     // the timestamp-stamping modules converge once the block-dependent stamp is
     // stripped: the SAME entities exist in both runs, only their created_at differs.
@@ -641,15 +637,9 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
         tasks_a, tasks_b,
         "the same tasks exist in both runs (only the stamped time differs)"
     );
-    let inbox_query =
-        serde_json::json!({ "list": { "member": "eddy", "from_seq": 0, "limit": 100 } });
-    let inbox_a = strip(
-        &sim_a.query("inbox", inbox_query.clone())["items"],
-        &["created_at"],
-    );
-    let inbox_b = strip(&sim_b.query("inbox", inbox_query)["items"], &["created_at"]);
-    assert_eq!(
-        inbox_a, inbox_b,
-        "the same inbox items exist in both runs (only the stamped time differs)"
-    );
+    // inbox is deliberately absent from this logical sweep: the read-model
+    // cutover made it WRITE-ONLY in canonical state (its member feeds and
+    // unread counters live in the index guest), so there is no canonical value
+    // to converge. its contribution to this test is the root assertion above —
+    // that it stamps consensus_time — which is the property this file owns.
 }

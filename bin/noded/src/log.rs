@@ -28,7 +28,15 @@ use tracing_subscriber::{EnvFilter, Layer as _, reload};
 /// if commonware's `info` proves chatty, pin it here — it is just a directive
 /// string ("info,commonware_p2p=warn"). don't guess: the ring's dropped-lines
 /// marker (`stream.rs::catch_up_logs`) tells you whether it actually evicts.
-const DEFAULT_FILTER: &str = "info";
+///
+/// defguard_boringtun is pinned off: its rekey timers WARN every ~5 s per
+/// unreachable peer — with no peer field, so the lines diagnose nothing while
+/// evicting the ring. the replacement is peer-labeled and edge-triggered on
+/// `ducktape::overlay` (overlay-net's `device.rs` logs expiry/recovery from
+/// `ConnectionExpired` return values, where the peer IS known). RUST_LOG
+/// appends after this, so `RUST_LOG=defguard_boringtun=warn` re-arms the raw
+/// crate lines.
+const DEFAULT_FILTER: &str = "info,defguard_boringtun=off";
 
 /// parse a directive list STRICTLY.
 ///
@@ -89,6 +97,11 @@ pub fn set_filter(directives: &str) -> Result<(), String> {
 /// makes the node its OWN tee: the desktop spawner that used to pipe stderr
 /// into daemon.log is gone, so without this a hand-run `ducktape node run`
 /// leaves no durable record at all — the log "looks off by default".
+///
+/// A `service run <kind>` daemon tees the same way, to `<workspace>/<kind>.log`,
+/// and for the same reason: nothing supervises it either, and the airlock
+/// lender's `info` record of who drew on the operator's credential is only a
+/// record if it outlives the terminal that launched the daemon.
 pub fn init(ring: Option<crate::LogRing>, log_file: Option<std::path::PathBuf>) {
     let (boot, bad_env) = boot_filter();
     let (filter_layer, handle) = reload::Layer::new(boot);
@@ -143,7 +156,9 @@ pub fn init(ring: Option<crate::LogRing>, log_file: Option<std::path::PathBuf>) 
         tracing::warn!(
             target: "ducktape::node",
             error = %err,
-            "daemon.log unavailable — logging to stderr and the ring only"
+            // named by `error` above: `node run` tees daemon.log, a
+            // `service run <kind>` daemon tees <kind>.log.
+            "log file unavailable — logging to stderr and the ring only"
         );
     }
 
@@ -172,8 +187,8 @@ fn install_panic_hook() {
         tracing::error!(
             target: "ducktape::node",
             thread = std::thread::current().name().unwrap_or("?"),
-            // the "panicked at" text is a marker the desktop shell greps for
-            // (app/src-iced/src/backend/workspace_service.rs) — keep it in the message.
+            // the "panicked at" text is a marker `daemon.log` readers grep for —
+            // keep it in the message.
             "panicked at: {info}"
         );
         default(info);

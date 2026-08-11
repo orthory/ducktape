@@ -1,6 +1,6 @@
 //! the runs module — the collaboration loop's actor.
 //!
-//! a pure state-machine module (in the app-hash) holding channel watches and
+//! a pure state-machine module (in the root-hash) holding channel watches and
 //! the correlation entries for still-pending dispatches. the agents it runs
 //! are NOT its state: the agent registry (`crates/modules/apps/agent`) is the record
 //! book, and this module reads it by query — staged same-block registrations
@@ -101,7 +101,7 @@
 //! first in consensus order wins and the rest fall through silently.
 //!
 //! `root()` folds in every field of both maps, so any transition moves the
-//! app-hash. a joiner rebuilds this module from a peer via
+//! root-hash. a joiner rebuilds this module from a peer via
 //! [`RunsModule::snapshot`] / [`RunsModule::install`]: the snapshot ships the
 //! committed maps in the exact canonical encoding `root()` hashes, and
 //! install re-derives the root from the decoded temporaries before adopting
@@ -114,11 +114,12 @@ pub use interface::*;
 // dispatch payload composition: the structured run envelope.
 mod envelope;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use agent::{
-    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentEvent, AgentQuery,
-    AgentRecord, AgentReply, AgentResponse, AgentStatus, DelegationRequest, MAX_ACTIONS_BYTES,
+    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentEvent, AgentQuery, AgentRecord,
+    AgentReply, AgentResponse, AgentStatus, DelegationRequest, MAX_ACTIONS_BYTES,
     MAX_ACTIONS_PER_RUN, MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES,
     MAX_DELEGATIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
     ResourceCaps, SkillRef, decode_event as agent_decode_event, decode_reply as agent_decode_reply,
@@ -139,11 +140,6 @@ use files::{
     decode_reply as files_decode_reply, encode_msg as files_encode_msg,
     encode_query as files_encode_query,
 };
-use tasks::{
-    JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_job_event as jobs_decode_event,
-    decode_job_reply as jobs_decode_reply, encode_job_msg as jobs_encode_msg,
-    encode_job_query as jobs_encode_query,
-};
 use saga::SagaOrigin;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use serde::{Deserialize, Serialize};
@@ -151,6 +147,11 @@ use sha2::{Digest, Sha256};
 use tagging::{
     EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
     encode_msg as tagging_encode_msg,
+};
+use tasks::{
+    JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_job_event as jobs_decode_event,
+    decode_job_reply as jobs_decode_reply, encode_job_msg as jobs_encode_msg,
+    encode_job_query as jobs_encode_query,
 };
 use tasks::{
     TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_task_reply as tasks_decode_reply,
@@ -192,6 +193,44 @@ const RUN_HISTORY_CAP: usize = 100;
 /// reserved delimiter separating run-key fields — the registry rejects agent
 /// ids carrying it ([`RESERVED_ID_SEPARATOR`]), so run keys stay unambiguous.
 const RUN_KEY_SEPARATOR: char = RESERVED_ID_SEPARATOR;
+
+/// The wasm host's per-dispatch bound on distinct sibling reads. Runs mirrors
+/// it at the module boundary so reference injection degrades before the host
+/// rejects the whole dispatch.
+pub(crate) const MAX_SIBLING_QUERY_READS: usize = 64;
+
+#[derive(Ord, PartialOrd, Eq, PartialEq)]
+enum SiblingRead {
+    Root(ModuleId),
+    Query(ModuleId, Vec<u8>),
+}
+
+#[derive(Default)]
+struct SiblingReadBudget {
+    reads: RefCell<BTreeSet<SiblingRead>>,
+}
+
+impl SiblingReadBudget {
+    fn reserve(&self, read: SiblingRead) -> bool {
+        let mut reads = self.reads.borrow_mut();
+        if reads.contains(&read) {
+            return true;
+        }
+        if reads.len() >= MAX_SIBLING_QUERY_READS {
+            return false;
+        }
+        reads.insert(read);
+        true
+    }
+
+    fn reserve_root(&self, target: &str) -> bool {
+        self.reserve(SiblingRead::Root(target.into()))
+    }
+
+    fn reserve_query(&self, target: &str, req: &[u8]) -> bool {
+        self.reserve(SiblingRead::Query(target.into(), req.to_vec()))
+    }
+}
 
 /// the turn-claim key: first creation in consensus order wins.
 pub fn run_id_for(channel_id: &str, anchor_seq: u64, agent_id: &str) -> String {
@@ -471,7 +510,7 @@ pub struct RunsModule {
     /// envelope pins as `source_snapshot` (W2). genesis config, NOT committed
     /// state (never in `root()`), so it adds no consensus surface. every
     /// production composer wires it; unwired (dev tools/tests) the envelope
-    /// still composes v3, with a null pin.
+    /// still composes v1, with a null pin.
     files: Option<ModuleId>,
     /// the pages module id — queried for `[[page:<id>]]` refs so a run's
     /// context can carry referenced page subtrees (M2). genesis config, NOT
@@ -479,7 +518,7 @@ pub struct RunsModule {
     /// pages; page refs then compose no page section (a silent skip, never
     /// a failure).
     pages: Option<ModuleId>,
-    /// committed state — what `root()` and the app-hash commit to.
+    /// committed state — what `root()` and the root-hash commit to.
     watches: BTreeMap<String, TurnPolicy>,
     /// in-flight correlation entries keyed by dispatch id — pruned on
     /// delivery; the dispatch module owns lifecycle and history.
@@ -756,7 +795,10 @@ impl RunsModule {
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let (watches, pending, sessions, delegations) =
             decode_committed(bytes).map_err(Error::Module)?;
-        sdk::verify_snapshot_root(committed_root(&watches, &pending, &sessions, &delegations), expected)?;
+        sdk::verify_snapshot_root(
+            committed_root(&watches, &pending, &sessions, &delegations),
+            expected,
+        )?;
         self.watches = watches;
         self.pending = pending;
         self.sessions = sessions;

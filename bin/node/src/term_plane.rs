@@ -32,7 +32,15 @@ use data_plane::{
     Service, SocketFactory, StreamPacing, StreamPlaneSpec, StreamPolicy, StreamService,
     bind_stream_plane,
 };
-use noded::{TermChunkEvent, TermCommandEvent, TermCommandRing, TermRing};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use provider_host::ResolvedCredential;
+use futures::SinkExt as _;
+use futures::channel::{mpsc as fmpsc, oneshot};
+use noded::{
+    CreatedSession, NodeCommand, PeerAttach, SessionInputWire, SessionJob, TermChunkEvent,
+    TermCommandEvent, TermCommandRing, TermError, TerminalSessions, TermRing,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -42,20 +50,60 @@ use crate::voice_plane::MediaPeers;
 /// the raw-output feed rides intent 1, the ordered command log intent 2.
 const CHUNK_INTENT: u8 = 1;
 const COMMAND_INTENT: u8 = 2;
+/// guest→host directed create/close, one request → one reply (mirrors gateway
+/// PROXY_INTENT). NOT deduped per-peer — each create/close is its own short stream.
+const CONTROL_INTENT: u8 = 3;
+/// guest→host forwarded keystrokes/resizes, one persistent stream per peer,
+/// creator-gated host-side.
+const INPUT_INTENT: u8 = 4;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
+
+/// guest→host directed create/close request, one request → one reply. Carries
+/// NO creator field — the host derives the creator from the mesh-authenticated
+/// requesting peer node (identity `OfNode`), never from client-supplied bytes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SessionControlRequest {
+    Create {
+        provider: String,
+        cred: String,
+        cpu: Option<u64>,
+        mem_gb: Option<u64>,
+    },
+    Close {
+        session: String,
+    },
+}
+
+/// the host's reply to a [`SessionControlRequest`]. Refusal `reason`s are stable
+/// snake_case tokens, in two families. **Whose work this host runs**:
+/// `work_not_admitted`, `work_caller_unbound`, `work_policy_unreadable`,
+/// `work_authority_unavailable` (see [`crate::work_admission`]). **What this
+/// host can do with it**: `no_sandbox`, `unknown_credential`,
+/// `provider_kind_mismatch`, `limits_exceed_host_ceiling`, `at_capacity`,
+/// `unknown_provider`, `spawn_failed`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum SessionControlReply {
+    Created { session: String, topic: String },
+    Closed,
+    Refused { reason: String, detail: String },
+}
+
+/// guest→host forwarded input event on the persistent INPUT stream. `data_b64`
+/// is base64 of the raw keystroke bytes — never logged.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionInputEvent {
+    Input { session: String, data_b64: String },
+    Resize { session: String, cols: u16, rows: u16 },
+}
 const RETRY: Duration = Duration::from_secs(3);
 
 fn term_flow() -> FlowId {
     FlowId::derive(b"ducktape:term-session:v1")
 }
 
-/// a session id is 16 lowercase hex (see `term::spawn`'s `format!("{:016x}",
-/// …)`). The agent plane's twin guard checks a 64-hex run id; ours accepts the
-/// shorter session id and rejects anything else, so a malformed grain never
-/// reaches a ring.
-fn valid_session(session: &str) -> bool {
-    session.len() == 16 && session.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
 
 struct TermBook {
     peers: Arc<MediaPeers>,
@@ -90,6 +138,31 @@ impl AdmissionPolicy for TermBook {
 /// Bind the service in the background. Each peer gets one persistent outbound
 /// stream per feed; inbound events enter the same node-local rings the existing
 /// `term:<id>` / `term-cmd:<id>` websocket topics already tail.
+/// the host-side control state shared by every accepted CONTROL/INPUT stream and
+/// the guest-side client half: the session manager (`None` on a sync-only /
+/// joiner node → creates refuse `no_sandbox`), the actor command lane the
+/// admission queries ride, the host's own browser-gateway base URL (the `via`
+/// for a resolved credential), and this node's key (loopback short-circuit).
+struct ControlState {
+    sessions: Option<TerminalSessions>,
+    commands: fmpsc::Sender<NodeCommand>,
+    local_gateway_via: String,
+    me: [u8; 32],
+    /// where this node's `work-admit.toml` lives. Re-read on every create, so
+    /// `ducktape node work admit` takes effect without a restart — and takes
+    /// effect at the same instant on the compute lane, which reads the same
+    /// file the same way.
+    workspace: std::path::PathBuf,
+}
+
+/// the node actor's query lane, behind the one method the admission needs.
+#[async_trait::async_trait]
+impl crate::work_admission::CommittedReader for fmpsc::Sender<NodeCommand> {
+    async fn read(&self, target: &str, request: Vec<u8>) -> Result<Vec<u8>, String> {
+        query(self, target, request).await
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     label: String,
@@ -100,6 +173,11 @@ pub(crate) fn spawn(
     planes: data_plane::PlaneMonitor,
     terminals: TermRing,
     term_commands: TermCommandRing,
+    sessions: Option<TerminalSessions>,
+    commands: fmpsc::Sender<NodeCommand>,
+    local_gateway_via: String,
+    workspace: std::path::PathBuf,
+    jobs: tokio::sync::mpsc::Receiver<SessionJob>,
 ) {
     tokio::spawn(async move {
         let own = peers.own_ip(&me);
@@ -128,10 +206,28 @@ pub(crate) fn spawn(
         };
         tracing::info!(target: "ducktape::term", node = %label, %own, "term_session_plane_bound");
         planes.register("term", Service::TermSession, plane.watch());
-        run_bound(plane, service, peers, PeerId(me), terminals, term_commands).await;
+        let control = Arc::new(ControlState {
+            sessions,
+            commands,
+            local_gateway_via,
+            me,
+            workspace,
+        });
+        run_bound(
+            plane,
+            service,
+            peers,
+            PeerId(me),
+            terminals,
+            term_commands,
+            control,
+            jobs,
+        )
+        .await;
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_bound<T: DataPlaneTransport>(
     plane: DataPlane<T>,
     service: Arc<StreamService<T>>,
@@ -139,6 +235,8 @@ async fn run_bound<T: DataPlaneTransport>(
     me: PeerId,
     terminals: TermRing,
     term_commands: TermCommandRing,
+    control: Arc<ControlState>,
+    jobs: tokio::sync::mpsc::Receiver<SessionJob>,
 ) {
     let _plane = plane;
     tokio::select! {
@@ -147,8 +245,10 @@ async fn run_bound<T: DataPlaneTransport>(
             Arc::clone(&peers),
             terminals.clone(),
             term_commands.clone(),
+            Arc::clone(&control),
         ) => {}
-        _ = fanout_loop(service, peers, me, terminals, term_commands) => {}
+        _ = fanout_loop(Arc::clone(&service), Arc::clone(&peers), me, terminals, term_commands) => {}
+        _ = client_loop(service, control, jobs) => {}
     }
 }
 
@@ -157,29 +257,43 @@ async fn accept_loop<T: DataPlaneTransport>(
     peers: Arc<MediaPeers>,
     terminals: TermRing,
     term_commands: TermCommandRing,
+    control: Arc<ControlState>,
 ) {
-    // one live inbound stream per (peer, feed): a peer opens two streams (chunk
-    // + command), so the dedupe key carries the intent, not just the peer.
+    // one live inbound stream per (peer, feed): the long-lived feeds (chunk /
+    // command / input) hold one stream per (peer, intent), so the dedupe key
+    // carries the intent. CONTROL is a short one-shot stream per create/close and
+    // is deliberately NOT deduped.
     let active = Arc::new(std::sync::Mutex::new(HashSet::new()));
     while let Some((peer, hello, stream)) = service.accept().await {
         let intent = hello.intent;
-        if !hello.meta.is_empty() || !matches!(intent, CHUNK_INTENT | COMMAND_INTENT) {
+        let routed = matches!(
+            intent,
+            CHUNK_INTENT | COMMAND_INTENT | CONTROL_INTENT | INPUT_INTENT
+        );
+        if !hello.meta.is_empty() || !routed {
             continue;
         }
+        let deduped = intent != CONTROL_INTENT;
         let key = (peer, intent);
-        if !active.lock().expect("term streams lock").insert(key) {
+        if deduped && !active.lock().expect("term streams lock").insert(key) {
             continue;
         }
         let peers = Arc::clone(&peers);
         let terminals = terminals.clone();
         let term_commands = term_commands.clone();
+        let control = Arc::clone(&control);
         let active = Arc::clone(&active);
         tokio::spawn(async move {
             let _ = match intent {
                 CHUNK_INTENT => receive_chunks(stream, peer, peers, terminals).await,
-                _ => receive_commands(stream, peer, peers, term_commands).await,
+                COMMAND_INTENT => receive_commands(stream, peer, peers, term_commands).await,
+                INPUT_INTENT => receive_input(stream, peer, peers, control).await,
+                CONTROL_INTENT => serve_control(stream, peer, control).await,
+                _ => Ok(()),
             };
-            active.lock().expect("term streams lock").remove(&key);
+            if deduped {
+                active.lock().expect("term streams lock").remove(&key);
+            }
         });
     }
 }
@@ -199,7 +313,7 @@ async fn receive_chunks<S: AsyncRead + Unpin>(
         }
         // a peer sending a malformed session id is a bug, not consensus — skip
         // the grain and keep the stream (best-effort, observational).
-        if valid_session(&event.session) {
+        if agent_service::wire::valid_session(&event.session) {
             ring.append_remote(event);
         }
     }
@@ -219,7 +333,7 @@ async fn receive_commands<S: AsyncRead + Unpin>(
         if !peers.contains(peer) {
             return Ok(());
         }
-        if valid_session(&event.session) {
+        if agent_service::wire::valid_session(&event.session) {
             // append_remote replays the origin's seq verbatim — the peer shows
             // the same total order and never re-stamps it.
             ring.append_remote(event);
@@ -296,7 +410,7 @@ async fn send_peer<T: DataPlaneTransport>(
             tokio::select! {
                 event = chunks.recv() => match event {
                     Ok(event) => {
-                        if valid_session(&event.session)
+                        if agent_service::wire::valid_session(&event.session)
                             && write_frame(&mut chunk_stream, &event).await.is_err()
                         {
                             break;
@@ -307,7 +421,7 @@ async fn send_peer<T: DataPlaneTransport>(
                 },
                 event = commands.recv() => match event {
                     Ok(event) => {
-                        if valid_session(&event.session)
+                        if agent_service::wire::valid_session(&event.session)
                             && write_frame(&mut cmd_stream, &event).await.is_err()
                         {
                             break;
@@ -328,7 +442,7 @@ async fn send_peer<T: DataPlaneTransport>(
 
 /// length-prefixed JSON, one event per frame. Generic over the event type: the
 /// two feeds share the identical codec, differing only in their payload struct.
-async fn write_frame<S: AsyncWrite + Unpin, E: Serialize>(
+async fn write_frame<S: AsyncWrite + Unpin + ?Sized, E: Serialize>(
     stream: &mut S,
     event: &E,
 ) -> io::Result<()> {
@@ -368,17 +482,656 @@ async fn read_frame<S: AsyncRead + Unpin, E: DeserializeOwned>(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+// ---------------------------------------------------------------------------
+// host side: control handler (create/close admission) + creator-gated input
+// ---------------------------------------------------------------------------
+
+/// serve ONE guest→host control exchange: read the request, dispatch on its
+/// variant (one delegation each), write the single reply. No loop — CONTROL is a
+/// short stream per create/close.
+async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    peer: PeerId,
+    control: Arc<ControlState>,
+) -> io::Result<()> {
+    let Some(request) = read_frame::<_, SessionControlRequest>(&mut stream).await? else {
+        return Ok(());
+    };
+    let reply = match request {
+        SessionControlRequest::Create {
+            provider,
+            cred,
+            cpu,
+            mem_gb,
+        } => serve_create(&control, peer, &provider, &cred, cpu, mem_gb).await,
+        SessionControlRequest::Close { session } => serve_close(&control, &session).await,
+    };
+    write_frame(&mut stream, &reply).await
+}
+
+/// the host's create path: resolve the named credential from committed gateway
+/// state, decide what THIS HOST admits (sandbox present, credential registered,
+/// provider/kind agreement, size ceiling), then spawn a peer-attached session
+/// drawing on the guest's self-host gateway. Every refusal carries a stable
+/// snake_case `reason`.
+///
+/// It deliberately does NOT resolve the creator's account *to ship to the
+/// lender*. Whether the credential may be drawn on is the LENDER's decision,
+/// made against the account its own node stamps when this session's traffic
+/// makes the gateway hop — which is this host, not the peer.
+///
+/// It DOES ask its own [`crate::work_admission`] policy whether it runs this
+/// peer's work at all. That is the opposite direction and a different question:
+/// not a claim about who a session acts for, but this host's own answer about
+/// whose workload it hosts. Without it, "a grant lends to that account's node,
+/// for whatever workload it runs" means any mesh peer naming any registered
+/// credential gets a container here, on this node's grants.
+///
+/// `peer` is also still used for the one thing it settles locally: binding the
+/// session's input frames to the node that created it.
+async fn serve_create(
+    control: &ControlState,
+    peer: PeerId,
+    provider: &str,
+    cred: &str,
+    cpu: Option<u64>,
+    mem_gb: Option<u64>,
+) -> SessionControlReply {
+    // Whose work does this host run? Asked FIRST, because it depends on nothing
+    // about the credential and refusing later would mean reading committed
+    // state on a stranger's behalf. `peer.0` is mesh-authenticated (the plane's
+    // `permits` gate ran before this stream was accepted) or, on the own-node
+    // loopback, this node's own key — derived either way, never asserted.
+    match crate::work_admission::admit(
+        &control.commands,
+        &control.workspace,
+        &control.me,
+        crate::work_admission::WorkSource::Peer(&peer.0),
+    )
+    .await
+    {
+        crate::work_admission::WorkVerdict::Admitted => {}
+        crate::work_admission::WorkVerdict::Refused(refusal) => {
+            // the peer's NODE key, never its account: a node key is public
+            // routing metadata already logged at boot, and without it the
+            // operator is told "someone was refused" with no way to find out
+            // whom to admit.
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = refusal.reason(),
+                node = %crate::config::hex_bytes(&peer.0[..4]),
+                "peer session create refused"
+            );
+            return refused(refusal.reason(), refusal.detail());
+        }
+        // not a refusal: nothing is known about the policy's subject, so the
+        // caller is told to retry rather than sent to fix an admission that may
+        // already exist.
+        crate::work_admission::WorkVerdict::AuthorityUnavailable => {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "work_authority_unavailable",
+                node = %crate::config::hex_bytes(&peer.0[..4]),
+                "peer session create not decided"
+            );
+            return refused(
+                "work_authority_unavailable",
+                "this node could not read committed identity to decide whose work it runs",
+            );
+        }
+    }
+    let Some(sessions) = control.sessions.clone() else {
+        tracing::warn!(target: "ducktape::term", reason = "no_sandbox", "peer session create refused");
+        return refused("no_sandbox", "this node hosts no terminal sessions");
+    };
+    let sandbox_present = sessions.has_sandbox();
+    // The creator's ACCOUNT is deliberately not looked up. It used to be, and it
+    // used to be shipped to the lender as the grant subject — but the lender
+    // authorizes the account ITS node vouched for on the gateway hop, which is
+    // THIS host, the one running the sandbox. A creator account resolved here
+    // could only ever be a second, uncheckable answer to a question the lender
+    // has already answered. `peer.0` still binds the session's input frames to
+    // its creator; that is a node-key gate, not an identity claim.
+    let record = match credential_record(&control.commands, cred).await {
+        Ok(record) => record,
+        Err(detail) => return refused("unknown_credential", &detail),
+    };
+    let admit = match admit_create(provider, record.as_ref(), cpu, mem_gb, sandbox_present) {
+        Ok(admit) => admit,
+        Err((reason, detail)) => {
+            tracing::warn!(target: "ducktape::term", reason, "peer session create refused");
+            return refused(reason, &detail);
+        }
+    };
+    let authority = match owner_airlock_authority(&control.commands, &admit.owner_account).await {
+        Ok(authority) => authority,
+        Err(detail) => return refused("unknown_credential", &detail),
+    };
+    // bin/node owns the record → ResolvedCredential mapping (capability-host must
+    // not depend on the gateway crate): the seal_pk is the on-chain anchor, the
+    // via is the host's own browser-gateway, the authority is the owner's airlock
+    // route.
+    let resolved = ResolvedCredential {
+        name: admit.name,
+        kind: admit.kind,
+        authority,
+        via: control.local_gateway_via.clone(),
+        seal_pk: admit.seal_pk,
+    };
+    // the record travels to the agent daemon, which pins it as its broker's
+    // self-host airlock upstream. Nothing secret crosses, and no identity either:
+    // a name, an authority handle, this node's own gateway `via`, and a PUBLIC
+    // seal key.
+    let attach = PeerAttach {
+        creator_node: peer.0,
+        credential: agent_service::credential_wire(&resolved),
+        limits: admit.limits,
+    };
+    match sessions.create_for_peer(provider, attach).await {
+        Ok(created) => SessionControlReply::Created {
+            session: created.session_id,
+            topic: created.topic,
+        },
+        Err(err) => refused_from_term_error(err),
+    }
+}
+
+/// close on the host: idempotent teardown. The host owns lifecycle; a close from
+/// a non-creator names a random id it would have to already know, and the
+/// wall-clock + kill-on-drop backstops hold — creator-binding close is a named
+/// follow-up.
+async fn serve_close(control: &ControlState, session: &str) -> SessionControlReply {
+    if let Some(sessions) = &control.sessions {
+        sessions.close(session).await;
+    }
+    SessionControlReply::Closed
+}
+
+fn refused(reason: &str, detail: &str) -> SessionControlReply {
+    SessionControlReply::Refused {
+        reason: reason.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+/// map the manager's spawn-path error to the matching refusal reason.
+fn refused_from_term_error(err: TermError) -> SessionControlReply {
+    let (reason, detail) = match err {
+        TermError::NoSandbox => (
+            "no_sandbox",
+            // the same fact the HTTP path reports, worded the same way: this
+            // host CAN sandbox, it just has no agent service attached.
+            "this node has no agent service attached".to_string(),
+        ),
+        TermError::AtCapacity => (
+            "at_capacity",
+            "the host terminal-session cap is reached".to_string(),
+        ),
+        TermError::Resolve(detail) => ("unknown_provider", detail),
+        TermError::Spawn(detail) => ("spawn_failed", detail),
+    };
+    refused(reason, &detail)
+}
+
+/// the host's create decision, given committed state already fetched. Pure so it
+/// is unit-testable without a pty. `Ok` carries the resolved credential pieces +
+/// container limits; `Err` is a `(reason, detail)`.
+#[derive(Debug)]
+struct AdmitOk {
+    name: String,
+    kind: provider_host::CredentialKind,
+    seal_pk: [u8; 32],
+    owner_account: Vec<u8>,
+    limits: std::collections::BTreeMap<String, u64>,
+}
+
+/// What survives is what this HOST knows about itself and the record: can it
+/// sandbox, does the name exist, does the requested provider contradict the
+/// credential's vendor, what limits apply. The grant check that used to sit here
+/// does not: it decided, against a creator account this node resolved, a question
+/// the lender decides against the account it vouches for — and the two are
+/// different parties the moment the creator is not the host.
+fn admit_create(
+    provider: &str,
+    record: Option<&gateway::CredentialRecord>,
+    cpu: Option<u64>,
+    mem_gb: Option<u64>,
+    sandbox_present: bool,
+) -> Result<AdmitOk, (&'static str, String)> {
+    if !sandbox_present {
+        // `sandbox_present` is `has_sandbox()` = "is an agent service attached",
+        // NOT "is a sandbox image configured" — word it as the fact it tested
+        // (and as `refused_from_term_error` already does). The old "no
+        // configured sandbox image" text sent an operator with a perfectly
+        // good `[sandbox]` table hunting the wrong config.
+        return Err((
+            "no_sandbox",
+            "this node has no agent service attached".into(),
+        ));
+    }
+    let Some(record) = record else {
+        return Err((
+            "unknown_credential",
+            "no credential by that name is registered".into(),
+        ));
+    };
+    let over_ceiling = cpu.is_some_and(|cores| cores > MAX_SESSION_CORES)
+        || mem_gb.is_some_and(|mem| mem > MAX_SESSION_MEM_GB);
+    if over_ceiling {
+        return Err((
+            "limits_exceed_host_ceiling",
+            format!(
+                "this host caps a session at {MAX_SESSION_CORES} cores / \
+                 {MAX_SESSION_MEM_GB} GB"
+            ),
+        ));
+    }
+    let contradicts = provider_contradicts_kind(provider, record.kind);
+    if contradicts {
+        return Err((
+            "provider_kind_mismatch",
+            format!("provider {provider} contradicts the credential kind"),
+        ));
+    }
+    Ok(AdmitOk {
+        name: record.name.clone(),
+        kind: map_kind(record.kind),
+        seal_pk: record.seal_pk,
+        owner_account: record.owner_account.clone(),
+        limits: build_limits(cpu, mem_gb),
+    })
+}
+
+/// gateway kind → capability-host kind (the two are deliberately separate types;
+/// capability-host must not depend on the gateway crate).
+fn map_kind(kind: gateway::CredentialKind) -> provider_host::CredentialKind {
+    match kind {
+        gateway::CredentialKind::Claude => provider_host::CredentialKind::Claude,
+        gateway::CredentialKind::Codex => provider_host::CredentialKind::Codex,
+    }
+}
+
+/// true when an EXPLICIT vendor provider tag contradicts the credential's kind.
+/// An unknown tag (a test provider) is not a contradiction — the manager's
+/// provider resolution decides it (→ `unknown_provider`).
+fn provider_contradicts_kind(provider: &str, kind: gateway::CredentialKind) -> bool {
+    match provider {
+        "claude" => kind != gateway::CredentialKind::Claude,
+        "codex" => kind != gateway::CredentialKind::Codex,
+        _ => false,
+    }
+}
+
+/// Per-session ceiling on what a REMOTE creator may ask this host to allocate.
+///
+/// `cpu`/`mem_gb` arrive from a mesh peer and go straight to the sandbox
+/// backend. Before the credential gate moved to the lender, a stranger could not
+/// reach [`build_limits`] at all on a node they held no grant on; now any
+/// admitted member naming any registered credential can, so the size of the
+/// container they get is a number they choose. `TermError::AtCapacity` bounds
+/// the session COUNT, not the size of one.
+///
+/// Refused rather than silently clamped: quietly handing back a tenth of what
+/// was asked for is the fail-quiet this repo's refusal doctrine exists to
+/// prevent, and the reason token tells the caller what actually happened.
+///
+/// ponytail: a constant, not the host's real capacity. The compute plane already
+/// models that (`compute_service::ResourceLedger`); wiring one into the term
+/// plane is the upgrade when a host wants to sell its actual size.
+const MAX_SESSION_CORES: u64 = 8;
+const MAX_SESSION_MEM_GB: u64 = 32;
+
+/// `--cpu`/`--mem` → the container limit keys the sandbox backend enforces.
+fn build_limits(cpu: Option<u64>, mem_gb: Option<u64>) -> std::collections::BTreeMap<String, u64> {
+    let mut limits = std::collections::BTreeMap::new();
+    if let Some(cores) = cpu {
+        limits.insert("cores".to_string(), cores);
+    }
+    if let Some(mem) = mem_gb {
+        limits.insert("mem_gb".to_string(), mem);
+    }
+    limits
+}
+
+/// the creator gate: a forwarded input frame is written only when it arrives from
+/// the exact node that created the session. `None` (a local session, or an
+/// unknown id) is refused — it is not a peer-attached session.
+fn input_permitted(creator: Option<[u8; 32]>, peer: PeerId) -> bool {
+    creator == Some(peer.0)
+}
+
+/// the host's forwarded-input stream: read events until EOF, gate each on the
+/// creator, and write the permitted ones to the pty. Never logs the bytes.
+async fn receive_input<S: AsyncRead + Unpin>(
+    mut stream: S,
+    peer: PeerId,
+    peers: Arc<MediaPeers>,
+    control: Arc<ControlState>,
+) -> io::Result<()> {
+    let Some(sessions) = control.sessions.clone() else {
+        return Ok(());
+    };
+    while peers.contains(peer) {
+        let Some(event) = read_frame::<_, SessionInputEvent>(&mut stream).await? else {
+            return Ok(());
+        };
+        if !peers.contains(peer) {
+            return Ok(());
+        }
+        deliver_input(&sessions, peer, event).await;
+    }
+    Ok(())
+}
+
+/// gate one input event on the creator, then apply it to the pty (write or
+/// resize). Shared by the remote input stream and the loopback client path.
+async fn deliver_input(sessions: &TerminalSessions, peer: PeerId, event: SessionInputEvent) {
+    let session = input_session(&event).to_string();
+    // an unknown (or already-ended) session and a peer that does not own a live
+    // one are different diagnoses, and `creator_node` returns `None` for both —
+    // so establish existence first, or every stale id would be counted as an
+    // authorization failure.
+    if sessions.mode(&session).is_none() {
+        tracing::warn!(target: "ducktape::term", reason = "unknown_session", "forwarded input dropped");
+        return;
+    }
+    let permitted = input_permitted(sessions.creator_node(&session), peer);
+    if !permitted {
+        tracing::warn!(target: "ducktape::term", reason = "input_not_creator", "forwarded input dropped");
+        return;
+    }
+    match event {
+        SessionInputEvent::Input { data_b64, .. } => {
+            // decoded only to refuse a malformed frame at this boundary; the
+            // daemon takes the base64 as-is, so the bytes never round-trip.
+            if STANDARD.decode(&data_b64).is_err() {
+                tracing::warn!(target: "ducktape::term", reason = "bad_base64", "forwarded input dropped");
+                return;
+            }
+            sessions.input(&session, &data_b64).await;
+        }
+        SessionInputEvent::Resize { cols, rows, .. } => {
+            sessions.resize(&session, cols, rows).await;
+        }
+    }
+}
+
+fn input_session(event: &SessionInputEvent) -> &str {
+    match event {
+        SessionInputEvent::Input { session, .. } => session,
+        SessionInputEvent::Resize { session, .. } => session,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// guest side: the client half draining the SessionJob lane
+// ---------------------------------------------------------------------------
+
+/// drain the guest's remote-session lane: a `Create`/`Close` is one CONTROL
+/// round-trip, an `Input` rides a persistent per-host INPUT stream. When the
+/// host is THIS node it short-circuits over a local duplex / straight to the
+/// manager, so a single node still exercises the real frame path.
+async fn client_loop<T: DataPlaneTransport>(
+    service: Arc<StreamService<T>>,
+    control: Arc<ControlState>,
+    mut jobs: tokio::sync::mpsc::Receiver<SessionJob>,
+) {
+    let mut input_streams: HashMap<[u8; 32], Box<dyn AsyncWrite + Unpin + Send>> = HashMap::new();
+    while let Some(job) = jobs.recv().await {
+        match job {
+            SessionJob::Create {
+                host,
+                provider,
+                cred,
+                cpu,
+                mem_gb,
+                reply,
+            } => {
+                let result =
+                    client_create(&service, &control, host, provider, cred, cpu, mem_gb).await;
+                let _ = reply.send(result);
+            }
+            SessionJob::Close { host, session } => {
+                input_streams.remove(&host);
+                client_close(&service, &control, host, session).await;
+            }
+            SessionJob::Input { host, event } => {
+                client_input(&service, &control, &mut input_streams, host, event).await;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn client_create<T: DataPlaneTransport>(
+    service: &Arc<StreamService<T>>,
+    control: &Arc<ControlState>,
+    host: [u8; 32],
+    provider: String,
+    cred: String,
+    cpu: Option<u64>,
+    mem_gb: Option<u64>,
+) -> Result<CreatedSession, String> {
+    let request = SessionControlRequest::Create {
+        provider,
+        cred,
+        cpu,
+        mem_gb,
+    };
+    match client_control(service, control, host, request).await? {
+        SessionControlReply::Created { session, topic } => Ok(CreatedSession {
+            session_id: session,
+            topic,
+        }),
+        SessionControlReply::Refused { reason, detail } => Err(format!("{reason}: {detail}")),
+        SessionControlReply::Closed => Err("host replied Closed to a create request".into()),
+    }
+}
+
+async fn client_close<T: DataPlaneTransport>(
+    service: &Arc<StreamService<T>>,
+    control: &Arc<ControlState>,
+    host: [u8; 32],
+    session: String,
+) {
+    // best-effort: the host owns lifecycle backstops if the close never lands.
+    let _ = client_control(
+        service,
+        control,
+        host,
+        SessionControlRequest::Close { session },
+    )
+    .await;
+}
+
+/// one CONTROL round-trip: loopback over a local duplex when the host is this
+/// node (the creator is us), else open a CONTROL stream to the host peer.
+async fn client_control<T: DataPlaneTransport>(
+    service: &Arc<StreamService<T>>,
+    control: &Arc<ControlState>,
+    host: [u8; 32],
+    request: SessionControlRequest,
+) -> Result<SessionControlReply, String> {
+    if host == control.me {
+        let (server_end, mut caller_end) = tokio::io::duplex(64 * 1024);
+        let control = Arc::clone(control);
+        tokio::spawn(async move {
+            let _ = serve_control(server_end, PeerId(control.me), control).await;
+        });
+        write_frame(&mut caller_end, &request)
+            .await
+            .map_err(|error| error.to_string())?;
+        read_frame::<_, SessionControlReply>(&mut caller_end)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "loopback control stream closed without a reply".to_string())
+    } else {
+        let mut stream = service
+            .open(PeerId(host), term_flow(), CONTROL_INTENT, Vec::new())
+            .await
+            .map_err(|error| error.to_string())?;
+        write_frame(&mut stream, &request)
+            .await
+            .map_err(|error| error.to_string())?;
+        read_frame::<_, SessionControlReply>(&mut stream)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "host closed the control stream without a reply".to_string())
+    }
+}
+
+/// forward one input event to the host: loopback straight to the local manager
+/// (same creator gate), else write it on the persistent per-host INPUT stream,
+/// reopening on error.
+async fn client_input<T: DataPlaneTransport>(
+    service: &Arc<StreamService<T>>,
+    control: &Arc<ControlState>,
+    input_streams: &mut HashMap<[u8; 32], Box<dyn AsyncWrite + Unpin + Send>>,
+    host: [u8; 32],
+    event: SessionInputWire,
+) {
+    let event = wire_to_event(event);
+    if host == control.me {
+        if let Some(sessions) = &control.sessions {
+            deliver_input(sessions, PeerId(control.me), event).await;
+        }
+        return;
+    }
+    // open lazily on the first frame for this host; the entry API can't span the
+    // async open, so this is a plain get-or-open, not a `contains_key`+`insert`.
+    if input_streams.get(&host).is_none() {
+        let opened = service
+            .open(PeerId(host), term_flow(), INPUT_INTENT, Vec::new())
+            .await;
+        match opened {
+            Ok(stream) => {
+                input_streams.insert(host, Box::new(stream));
+            }
+            Err(err) => {
+                tracing::warn!(target: "ducktape::term", reason = "input_open_failed", error = %err, "forwarded input dropped");
+                return;
+            }
+        }
+    }
+    let stream = input_streams
+        .get_mut(&host)
+        .expect("input stream just inserted");
+    if let Err(err) = write_frame(stream.as_mut(), &event).await {
+        tracing::warn!(target: "ducktape::term", reason = "input_write_failed", error = %err, "forwarded input dropped; reopening");
+        input_streams.remove(&host);
+    }
+}
+
+fn wire_to_event(event: SessionInputWire) -> SessionInputEvent {
+    match event {
+        SessionInputWire::Input { session, data_b64 } => {
+            SessionInputEvent::Input { session, data_b64 }
+        }
+        SessionInputWire::Resize {
+            session,
+            cols,
+            rows,
+        } => SessionInputEvent::Resize {
+            session,
+            cols,
+            rows,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// committed-state queries over the node actor lane (copied from gateway_plane)
+// ---------------------------------------------------------------------------
+
+async fn query(
+    commands: &fmpsc::Sender<NodeCommand>,
+    target: &str,
+    req: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let (reply, rx) = oneshot::channel();
+    let mut commands = commands.clone();
+    commands
+        .send(NodeCommand::Query {
+            target: target.into(),
+            req,
+            reply,
+        })
+        .await
+        .map_err(|_| "node actor is gone".to_string())?;
+    rx.await
+        .map_err(|_| "node actor dropped the query".to_string())?
+}
+
+/// the committed credential record for `name`, or `None` when unregistered.
+async fn credential_record(
+    commands: &fmpsc::Sender<NodeCommand>,
+    name: &str,
+) -> Result<Option<gateway::CredentialRecord>, String> {
+    let reply = query(
+        commands,
+        "gateway",
+        gateway::encode_query(&gateway::GatewayQuery::Credential {
+            name: name.to_string(),
+        }),
+    )
+    .await?;
+    match gateway::decode_reply(&reply)? {
+        gateway::GatewayReply::Credential(record) => Ok(record),
+        _ => Err("unexpected gateway credential reply".into()),
+    }
+}
+
+/// the `airlock.<handle>.duck` authority for the credential owner's co-hosted
+/// gateway, resolved from the owner account's `.duck` handle registration.
+async fn owner_airlock_authority(
+    commands: &fmpsc::Sender<NodeCommand>,
+    owner_account: &[u8],
+) -> Result<String, String> {
+    // the registrations query is paginated and the module HARD-CAPS a page at
+    // MAX_QUERY_LIMIT (a larger `limit` is rejected outright), so page through in
+    // MAX_QUERY_LIMIT chunks until the owner's handle is found or a short page
+    // marks the end of the listing.
+    let mut from = 0u64;
+    loop {
+        let reply = query(
+            commands,
+            "gateway",
+            gateway::encode_query(&gateway::GatewayQuery::Registrations {
+                from,
+                limit: gateway::MAX_QUERY_LIMIT,
+            }),
+        )
+        .await?;
+        let page = match gateway::decode_reply(&reply)? {
+            gateway::GatewayReply::Registrations(registrations) => registrations,
+            _ => return Err("unexpected gateway registrations reply".into()),
+        };
+        let owned = page
+            .iter()
+            .find(|registration| registration.account_id.as_slice() == owner_account);
+        if let Some(registration) = owned {
+            return Ok(format!("airlock.{}.duck", registration.handle));
+        }
+        let page_len = page.len() as u64;
+        let listing_exhausted = page_len < gateway::MAX_QUERY_LIMIT;
+        if listing_exhausted {
+            return Err("credential owner has no registered duck handle".into());
+        }
+        from += page_len;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn valid_session_accepts_16_hex_and_rejects_the_rest() {
-        assert!(valid_session("00000000deadbeef"));
-        assert!(!valid_session("deadbeef"), "too short");
-        assert!(!valid_session("00000000deadbeef0"), "too long");
-        assert!(!valid_session("00000000deadbeeg"), "non-hex digit");
-        assert!(!valid_session(""), "empty");
+        assert!(agent_service::wire::valid_session("00000000deadbeef"));
+        assert!(!agent_service::wire::valid_session("deadbeef"), "too short");
+        assert!(!agent_service::wire::valid_session("00000000deadbeef0"), "too long");
+        assert!(!agent_service::wire::valid_session("00000000deadbeeg"), "non-hex digit");
+        assert!(!agent_service::wire::valid_session(""), "empty");
     }
 
     #[tokio::test]
@@ -401,6 +1154,328 @@ mod tests {
         write_frame(&mut a, &cmd).await.unwrap();
         let got: TermCommandEvent = read_frame(&mut b).await.unwrap().unwrap();
         assert_eq!(got, cmd);
+    }
+
+    #[tokio::test]
+    async fn control_and_input_frames_round_trip() {
+        let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+        let req = SessionControlRequest::Create {
+            provider: "claude".into(),
+            cred: "jess-fable-1".into(),
+            cpu: Some(1),
+            mem_gb: Some(2),
+        };
+        write_frame(&mut a, &req).await.unwrap();
+        let got: SessionControlRequest = read_frame(&mut b).await.unwrap().unwrap();
+        assert_eq!(got, req);
+
+        let reply = SessionControlReply::Refused {
+            reason: "credential_not_granted".into(),
+            detail: "stranger".into(),
+        };
+        write_frame(&mut a, &reply).await.unwrap();
+        let got: SessionControlReply = read_frame(&mut b).await.unwrap().unwrap();
+        assert_eq!(got, reply);
+
+        let ev = SessionInputEvent::Resize {
+            session: "00000000deadbeef".into(),
+            cols: 120,
+            rows: 40,
+        };
+        write_frame(&mut a, &ev).await.unwrap();
+        let got: SessionInputEvent = read_frame(&mut b).await.unwrap().unwrap();
+        assert_eq!(got, ev);
+    }
+
+    fn rec(
+        name: &str,
+        owner: &[u8],
+        grants: &[&[u8]],
+        kind: gateway::CredentialKind,
+    ) -> gateway::CredentialRecord {
+        gateway::CredentialRecord {
+            name: name.into(),
+            owner_account: owner.to_vec(),
+            publisher_node: vec![9u8; 32],
+            kind,
+            seal_pk: [1u8; 32],
+            grants: grants.iter().map(|g| g.to_vec()).collect(),
+        }
+    }
+
+    /// What the HOST decides, and the boundary of it. Every case here is a fact
+    /// about this host or about the record; none is a fact about who is asking.
+    ///
+    /// The grant is deliberately absent, including for an account the record does
+    /// NOT name: a record granting somebody else still admits here, because the
+    /// account this host would have checked is not the account the lender checks.
+    /// The lender authorizes the account its own node stamps on the gateway hop —
+    /// this host's — and it refuses at `/session`, before the sandbox spawns.
+    #[test]
+    fn admit_gates_on_sandbox_credential_and_kind_but_never_on_who_is_asking() {
+        let owner = b"owner-acct".to_vec();
+        let claude = rec("c1", &owner, &[b"someone-else"], gateway::CredentialKind::Claude);
+
+        // no sandbox → refused before any credential decision.
+        assert_eq!(
+            admit_create("claude", Some(&claude), None, None, false).unwrap_err().0,
+            "no_sandbox"
+        );
+        // unknown credential.
+        assert_eq!(
+            admit_create("claude", None, None, None, true).unwrap_err().0,
+            "unknown_credential"
+        );
+        // a record this host is on nobody's grant list for still admits: routing
+        // is not authorization, and the lender has not been asked yet.
+        assert!(admit_create("claude", Some(&claude), None, None, true).is_ok());
+        // an explicit provider contradicting the cred's kind is refused.
+        assert_eq!(
+            admit_create("codex", Some(&claude), None, None, true).unwrap_err().0,
+            "provider_kind_mismatch"
+        );
+        // an unknown provider tag is not a contradiction (the manager resolves it).
+        assert!(admit_create("echo", Some(&claude), Some(1), Some(2), true).is_ok());
+    }
+
+    /// The size of the container is a number a REMOTE creator picks, and since
+    /// the credential gate moved to the lender any admitted member can reach it.
+    /// The ceiling is what stops "give me 1024 cores" from being a sentence a
+    /// stranger can say to this host.
+    #[test]
+    fn a_remote_creator_cannot_ask_this_host_for_any_size_it_likes() {
+        let owner = b"owner-acct".to_vec();
+        let claude = rec("c1", &owner, &[], gateway::CredentialKind::Claude);
+
+        // at the ceiling is fine; a step past it is refused, per knob.
+        assert!(
+            admit_create(
+                "claude",
+                Some(&claude),
+                Some(MAX_SESSION_CORES),
+                Some(MAX_SESSION_MEM_GB),
+                true
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            admit_create("claude", Some(&claude), Some(MAX_SESSION_CORES + 1), None, true)
+                .unwrap_err()
+                .0,
+            "limits_exceed_host_ceiling"
+        );
+        assert_eq!(
+            admit_create("claude", Some(&claude), None, Some(MAX_SESSION_MEM_GB + 1), true)
+                .unwrap_err()
+                .0,
+            "limits_exceed_host_ceiling"
+        );
+        // and an unset knob is not a request for infinity.
+        assert!(admit_create("claude", Some(&claude), None, None, true).is_ok());
+    }
+
+    #[test]
+    fn admit_maps_limits_and_kind() {
+        let owner = b"owner".to_vec();
+        let codex = rec("x", &owner, &[], gateway::CredentialKind::Codex);
+        let ok = admit_create("codex", Some(&codex), Some(3), Some(8), true).unwrap();
+        assert_eq!(ok.limits.get("cores"), Some(&3));
+        assert_eq!(ok.limits.get("mem_gb"), Some(&8));
+        assert!(matches!(ok.kind, provider_host::CredentialKind::Codex));
+    }
+
+    #[test]
+    fn input_frame_is_accepted_only_from_the_creator_node() {
+        assert!(input_permitted(Some([7u8; 32]), PeerId([7u8; 32])));
+        assert!(!input_permitted(Some([7u8; 32]), PeerId([9u8; 32])));
+        // not an attached session (local, or unknown id) → refused.
+        assert!(!input_permitted(None, PeerId([7u8; 32])));
+    }
+
+    /// a fake identity module: answers `OfNode` by mapping a node key to an
+    /// account id derived from it, so two different nodes are two different
+    /// accounts. Runs until the command channel closes.
+    async fn answer_identity(mut rx: fmpsc::Receiver<NodeCommand>) {
+        use futures::StreamExt as _;
+        while let Some(command) = rx.next().await {
+            let NodeCommand::Query { req, reply, .. } = command else {
+                continue;
+            };
+            let identity::IdentityQuery::OfNode { node_key } =
+                identity::decode_query(&req).expect("an identity query")
+            else {
+                continue;
+            };
+            let view = identity::AccountView {
+                account_id: node_key.iter().map(|b| b ^ 0xaa).collect(),
+                display_name: None,
+                avatar: None,
+                bio: None,
+                nonce: 0,
+                member_keys: Vec::new(),
+                nodes: Vec::new(),
+                updated_at: 0,
+            };
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(view)),
+            )));
+        }
+    }
+
+    /// **The work-admission call site, behaviourally.**
+    ///
+    /// A mesh peer whose account this node does not admit is refused at the
+    /// door — before the credential record is read, before any host capability
+    /// is disclosed. This is the hole #833 left open: without it, "a grant lends
+    /// to that account's node for whatever workload it runs" means any admitted
+    /// member naming any registered credential gets a container here.
+    #[tokio::test]
+    async fn a_peer_this_node_does_not_admit_is_refused_before_any_credential_read() {
+        let workspace = std::env::temp_dir().join(format!(
+            "ducktape-term-admit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).expect("scratch workspace");
+
+        let (commands, rx) = fmpsc::channel(4);
+        let identity = tokio::spawn(answer_identity(rx));
+        let control = Arc::new(ControlState {
+            // a live manager would still never be reached: the refusal is
+            // upstream of every host-capability question.
+            sessions: None,
+            commands,
+            local_gateway_via: String::new(),
+            me: [1u8; 32],
+            workspace: workspace.clone(),
+        });
+
+        let (server, mut caller) = tokio::io::duplex(64 * 1024);
+        let serving = Arc::clone(&control);
+        tokio::spawn(async move {
+            let _ = serve_control(server, PeerId([9u8; 32]), serving).await;
+        });
+        write_frame(
+            &mut caller,
+            &SessionControlRequest::Create {
+                provider: "claude".into(),
+                cred: "c".into(),
+                cpu: None,
+                mem_gb: None,
+            },
+        )
+        .await
+        .unwrap();
+        let reply: SessionControlReply = read_frame(&mut caller).await.unwrap().unwrap();
+        let SessionControlReply::Refused { reason, detail } = reply else {
+            panic!("an unadmitted peer must be refused");
+        };
+        assert_eq!(reason, "work_not_admitted");
+        assert!(
+            !detail.contains("account") || detail.contains("<account>"),
+            "a refusal never echoes the account that would have been accepted: {detail:?}"
+        );
+
+        // and the SAME peer is served once its account is admitted — the policy
+        // is re-read per create, so no restart is involved.
+        let admitted: Vec<u8> = [9u8; 32].iter().map(|b| b ^ 0xaa).collect();
+        crate::work_admission::admit_account_fixture(&workspace, &admitted).expect("save policy");
+        let (server, mut caller) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = serve_control(server, PeerId([9u8; 32]), control).await;
+        });
+        write_frame(
+            &mut caller,
+            &SessionControlRequest::Create {
+                provider: "claude".into(),
+                cred: "c".into(),
+                cpu: None,
+                mem_gb: None,
+            },
+        )
+        .await
+        .unwrap();
+        let reply: SessionControlReply = read_frame(&mut caller).await.unwrap().unwrap();
+        assert_eq!(
+            reply,
+            SessionControlReply::Refused {
+                reason: "no_sandbox".into(),
+                detail: "this node hosts no terminal sessions".into(),
+            },
+            "an admitted peer passes the door and is refused only on this host's own capability"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+        identity.abort();
+    }
+
+    #[tokio::test]
+    async fn serve_control_refuses_create_without_a_sandbox_and_acks_close() {
+        // no session manager (a sync-only / Direct node) → a create is refused
+        // `no_sandbox` and a close is still a clean idempotent ack, both over the
+        // real CONTROL frame codec. Exercises serve_control without a live pty.
+        let (commands, _rx) = fmpsc::channel(1);
+        let control = Arc::new(ControlState {
+            sessions: None,
+            commands,
+            local_gateway_via: String::new(),
+            // the peer IS this node (the own-node loopback), so the work
+            // admission takes its zero-query `ThisNode` path and this test stays
+            // about `no_sandbox`. The refusing case is the test below.
+            me: [7u8; 32],
+            workspace: std::path::PathBuf::from("/nonexistent-work-admission-workspace"),
+        });
+
+        let (server, mut caller) = tokio::io::duplex(64 * 1024);
+        let control_create = Arc::clone(&control);
+        tokio::spawn(async move {
+            let _ = serve_control(server, PeerId([7u8; 32]), control_create).await;
+        });
+        write_frame(
+            &mut caller,
+            &SessionControlRequest::Create {
+                provider: "claude".into(),
+                cred: "c".into(),
+                cpu: None,
+                mem_gb: None,
+            },
+        )
+        .await
+        .unwrap();
+        let reply: SessionControlReply = read_frame(&mut caller).await.unwrap().unwrap();
+        assert_eq!(
+            reply,
+            SessionControlReply::Refused {
+                reason: "no_sandbox".into(),
+                detail: "this node hosts no terminal sessions".into(),
+            }
+        );
+
+        let (server, mut caller) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = serve_control(server, PeerId([7u8; 32]), control).await;
+        });
+        write_frame(
+            &mut caller,
+            &SessionControlRequest::Close {
+                session: "00000000deadbeef".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let reply: SessionControlReply = read_frame(&mut caller).await.unwrap().unwrap();
+        assert_eq!(reply, SessionControlReply::Closed);
+    }
+
+    #[test]
+    fn intents_do_not_collide() {
+        let intents = [CHUNK_INTENT, COMMAND_INTENT, CONTROL_INTENT, INPUT_INTENT];
+        for i in intents {
+            assert_eq!(
+                intents.iter().filter(|x| **x == i).count(),
+                1,
+                "intent {i} is unique"
+            );
+        }
     }
 
     #[tokio::test]

@@ -25,6 +25,9 @@ use sha2::{Digest as _, Sha256};
 struct Daemon {
     child: Child,
     port: u16,
+    /// the operator credential the daemon minted 0600 into its storage root.
+    /// `/v1/admin/*` requires it: loopback presence is not authority.
+    admin_token: String,
 }
 
 impl Drop for Daemon {
@@ -40,14 +43,14 @@ impl Daemon {
     /// a leaked dir plus a recycled pid would reopen stale qmdb state and
     /// fail this suite spuriously.
     fn spawn(storage: &Path) -> Self {
-        Self::spawn_inner(storage, false, &[])
+        Self::spawn_inner(storage, false)
     }
 
     fn spawn_with_echo_oracle(storage: &Path) -> Self {
-        Self::spawn_inner(storage, true, &[])
+        Self::spawn_inner(storage, true)
     }
 
-    fn spawn_inner(storage: &Path, echo_oracle: bool, env: &[(String, String)]) -> Self {
+    fn spawn_inner(storage: &Path, echo_oracle: bool) -> Self {
         let port = free_port();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-noded"));
         cmd.arg("--listen")
@@ -62,25 +65,54 @@ impl Daemon {
         if echo_oracle {
             cmd.env("DUCKTAPE_NODED_ECHO_ORACLE", "1");
         }
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
         let child = cmd.spawn().expect("spawn ducktape-noded");
-        let mut daemon = Self { child, port };
-        // readiness = a status answer, never the listen println: the daemon
-        // prints before binding, and status only answers once genesis is done.
+        let mut daemon = Self {
+            child,
+            port,
+            admin_token: String::new(),
+        };
+        // readiness = a status answer, never the listen line: the daemon binds
+        // its listener only AFTER the node actor publishes its boot snapshot,
+        // so the first answer is genesis (or the resumed height) — never the
+        // empty default.
         daemon.await_status();
+        // the credential is written before the listener binds, so a daemon that
+        // answers /v1/status has already minted it.
+        daemon.admin_token =
+            noded::admin::read_operator_token(storage).expect("daemon minted an operator token");
         daemon
+    }
+
+    /// POST the graceful-exit route with this daemon's operator credential —
+    /// the ONLY thing that may drive it.
+    fn admin_shutdown(&self) -> Option<u16> {
+        nettest::http_status_with(
+            self.port,
+            "POST",
+            "/v1/admin/shutdown",
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &self.admin_token)],
+        )
     }
 
     fn await_status(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
+            // liveness BEFORE the probe, never after. If our child lost a race
+            // for the port and exited, something else is listening on it — and
+            // a probe-first loop would take that stranger's 200 as our own
+            // readiness and silently drive ANOTHER test's daemon for the whole
+            // test. That failure surfaces far downstream as an impossible
+            // assertion (a height that moved on a daemon we never submitted
+            // to), which is exactly the kind of ghost that costs a day.
+            if let Some(status) = self.child.try_wait().expect("poll daemon") {
+                panic!(
+                    "daemon for port {} exited during startup ({status}) — see stderr above. \
+                     If something still answers that port, it is NOT ours.",
+                    self.port
+                );
+            }
             if let Ok((200, _)) = self.try_request("GET", "/v1/status", None) {
                 return;
-            }
-            if let Some(status) = self.child.try_wait().expect("poll daemon") {
-                panic!("daemon exited during startup ({status}) — see stderr above");
             }
             assert!(
                 Instant::now() < deadline,
@@ -326,7 +358,10 @@ fn call_ws_without_a_hub_refuses_with_a_reason() {
 
     let (status, raw) = daemon.ws_upgrade_refusal("/v1/presence/ws?page=page-1");
     assert_eq!(status, 503, "no realtime hub → presence refused: {raw}");
-    assert!(raw.contains("no mesh realtime hub"), "refusal says WHY: {raw}");
+    assert!(
+        raw.contains("no mesh realtime hub"),
+        "refusal says WHY: {raw}"
+    );
 
     let (status, _raw) = daemon.ws_upgrade_refusal("/v1/voice/ws?channel=general");
     assert_eq!(status, 404, "the old voice route is unrouted, not refused");
@@ -357,7 +392,6 @@ fn full_surface_blocks_authorship_and_ws() {
             "tasks",
             "inbox",
             "automations",
-            "jobs",
             "agent",
             "runs",
             "pages",
@@ -367,14 +401,14 @@ fn full_surface_blocks_authorship_and_ws() {
             "gateway"
         ]
     );
-    let genesis_hash = status["appHash"].as_str().expect("appHash").to_string();
+    let genesis_hash = status["root_hash"].as_str().expect("root_hash").to_string();
 
     // connect before submitting: the stream heartbeats without a subscription,
     // then module events catch up from the subscribed cursor.
     let mut ws = daemon.ws_connect();
     let heartbeat = Daemon::ws_read_type(&mut ws, "heartbeat");
     assert_eq!(heartbeat["height"], 0);
-    assert_eq!(heartbeat["intervalMs"], 3_000);
+    assert_eq!(heartbeat["interval_ms"], 3_000);
 
     Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["module:chat"]}"#);
     let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
@@ -383,7 +417,7 @@ fn full_surface_blocks_authorship_and_ws() {
         "op/0000000000000000/ffff"
     );
 
-    // one msg = one block; the summary echoes the new height + app-hash.
+    // one msg = one block; the summary echoes the new height + root-hash.
     let (code, block) = daemon.submit(
         "chat",
         serde_json::json!({
@@ -393,12 +427,12 @@ fn full_surface_blocks_authorship_and_ws() {
     );
     assert_eq!(code, 200, "create channel failed: {block}");
     assert_eq!(block["height"], 1);
-    assert_ne!(block["appHash"].as_str(), Some(genesis_hash.as_str()));
+    assert_ne!(block["root_hash"].as_str(), Some(genesis_hash.as_str()));
 
     let (code, block) = daemon.submit(
         "chat",
         post_message("general", "m1", "hello from e2e"),
-        Some("eddy"),
+        Some("alice"),
     );
     assert_eq!(code, 200, "post failed: {block}");
     assert_eq!(block["height"], 2);
@@ -446,7 +480,7 @@ fn full_surface_blocks_authorship_and_ws() {
     // committed state reads back; authorship derived from the submit origin.
     let reply = daemon.query(
         "chat",
-        serde_json::json!({ "messages_latest": { "channel_id": "general", "limit": 16 } }),
+        serde_json::json!({ "messages_range": { "channel_id": "general", "from_seq": 1, "limit": 16 } }),
     );
     let messages = reply["messages"].as_array().expect("Messages reply");
     assert_eq!(messages.len(), 1);
@@ -460,7 +494,7 @@ fn full_surface_blocks_authorship_and_ws() {
         .map(|v| v.as_u64().expect("byte") as u8)
         .collect();
     assert_eq!(
-        author_bytes, b"eddy",
+        author_bytes, b"alice",
         "authorship must come from the submit origin"
     );
 
@@ -570,7 +604,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     let (code, block) = daemon.submit(
         "chat",
         post_mention("general", "m1", "quackbot"),
-        Some("eddy"),
+        Some("alice"),
     );
     assert_eq!(code, 200, "mention post failed: {block}");
     // the receipt reports the block that INCLUDED the post, not the drain tail…
@@ -613,7 +647,7 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
 
     let reply = daemon.query(
         "chat",
-        serde_json::json!({ "messages_latest": { "channel_id": "general", "limit": 16 } }),
+        serde_json::json!({ "messages_range": { "channel_id": "general", "from_seq": 1, "limit": 16 } }),
     );
     let messages = reply["messages"].as_array().expect("Messages reply");
     assert_eq!(messages.len(), 2, "user post plus agent reply should exist");
@@ -650,14 +684,13 @@ fn state_persists_across_restart() {
         let (code, _) = daemon.submit(
             "chat",
             post_message("durable", "m1", "written before restart"),
-            Some("eddy"),
+            Some("alice"),
         );
         assert_eq!(code, 200);
 
         // graceful retirement THROUGH the wire — the port is the daemon's
         // identity; a client that spawned it has no pid to signal.
-        let (code, _) = daemon.request("POST", "/v1/admin/shutdown", None);
-        assert_eq!(code, 200);
+        assert_eq!(daemon.admin_shutdown(), Some(200));
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut daemon = daemon;
         loop {
@@ -667,7 +700,10 @@ fn state_persists_across_restart() {
                     break;
                 }
                 None => {
-                    assert!(Instant::now() < deadline, "daemon ignored /v1/admin/shutdown");
+                    assert!(
+                        Instant::now() < deadline,
+                        "daemon ignored /v1/admin/shutdown"
+                    );
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
@@ -682,7 +718,7 @@ fn state_persists_across_restart() {
     assert_eq!(daemon.status()["height"], 2);
     let reply = daemon.query(
         "chat",
-        serde_json::json!({ "messages_latest": { "channel_id": "durable", "limit": 16 } }),
+        serde_json::json!({ "messages_range": { "channel_id": "durable", "from_seq": 1, "limit": 16 } }),
     );
     let messages = reply["messages"].as_array().expect("Messages reply");
     assert_eq!(messages.len(), 1, "chat state must survive a restart");
@@ -706,14 +742,43 @@ fn state_persists_across_restart() {
     assert_eq!(op["target"], "chat");
     assert_eq!(op["disposition"], "applied");
     // this lane frames and signs nothing: the block hash is honestly empty, and
-    // the op's proposer is the SUBMITTER's origin bytes as hex ("eddy").
+    // the op's proposer is the SUBMITTER's origin bytes as hex ("alice").
     assert_eq!(post["hash"], "");
-    assert_eq!(op["proposer"], "65646479");
+    assert_eq!(op["proposer"], "616c696365");
     assert!(
         op["operations"]
             .as_array()
             .is_some_and(|ops| !ops.is_empty()),
         "the dispatch trace rides the op: {post}"
+    );
+}
+
+/// block until `module`'s materialized view has caught up with everything the
+/// op feed already carries.
+///
+/// the derived tier is asynchronous ON PURPOSE — the block loop writes the op
+/// rows and the guest folds them into the views behind a background trigger, so
+/// an index failure degrades the read models and never a block. that makes a
+/// view read immediately after a submit a genuine race, and the daemon publishes
+/// the backlog on `/v1/index/status` (`fold.<module>.pending`) precisely so a
+/// reader can tell "caught up" from "still folding". this waits on THAT signal —
+/// the daemon's own report that the fold drained — never on a duration.
+fn await_view_folded(daemon: &Daemon, module: &str) {
+    nettest::poll_until(
+        &format!("{module}'s view fold to drain"),
+        Duration::from_secs(30),
+        || {
+            let (code, status) = daemon.request("GET", "/v1/index/status", None);
+            assert_eq!(code, 200, "index status failed: {status}");
+            let fold = &status["fold"][module];
+            // a module with no folding guest reports nothing — nothing to await.
+            let drained = fold.is_null() || fold["pending"].as_u64() == Some(0);
+            assert!(
+                fold["lastError"].is_null(),
+                "the {module} fold FAILED — its views can never catch up: {status}"
+            );
+            drained.then_some(())
+        },
     );
 }
 
@@ -738,15 +803,19 @@ fn per_module_index_serves_ops_and_views() {
         let (code, _) = daemon.submit(
             "chat",
             post_message("eng", "m1", "fluent index demo"),
-            Some("eddy"),
+            Some("alice"),
         );
         assert_eq!(code, 200);
-        let (code, _) = daemon.submit(
+        // tasks owns TWO boards behind one module: the write wire is the
+        // `WorkMsg` envelope that routes to the task board or the job board.
+        let (code, task) = daemon.submit(
             "tasks",
-            serde_json::json!({ "create_task": { "task_id": "t1", "title": "wire the indexer" } }),
+            serde_json::json!({
+                "task": { "create_task": { "task_id": "t1", "title": "wire the indexer" } }
+            }),
             None,
         );
-        assert_eq!(code, 200);
+        assert_eq!(code, 200, "create task failed: {task}");
 
         // the raw op log: every applied chat op, oldest-first, json envelopes.
         let (code, ops) = daemon.request("GET", "/v1/index/chat/ops?limit=10", None);
@@ -760,6 +829,7 @@ fn per_module_index_serves_ops_and_views() {
         assert_eq!(rows[1]["height"], 2);
 
         // chat's OWN endpoint: the materialized search view.
+        await_view_folded(&daemon, "chat");
         let (code, reply) = daemon.request(
             "POST",
             "/v1/index/chat/view",
@@ -768,14 +838,15 @@ fn per_module_index_serves_ops_and_views() {
         assert_eq!(code, 200, "chat view failed: {reply}");
         let hits = hits_of(&reply);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0]["messageId"], "m1");
-        assert_eq!(hits[0]["author"], "user:eddy");
+        assert_eq!(hits[0]["message_id"], "m1");
+        assert_eq!(hits[0]["author"], "user:alice");
 
         // tasks' endpoint: the by-status partition.
+        await_view_folded(&daemon, "tasks");
         let (code, reply) = daemon.request(
             "POST",
             "/v1/index/tasks/view",
-            Some(&serde_json::json!({ "byStatus": { "status": "open" } })),
+            Some(&serde_json::json!({ "by_status": { "status": "open" } })),
         );
         assert_eq!(code, 200, "tasks view failed: {reply}");
         let tasks = reply["tasks"]["tasks"].as_array().expect("tasks array");
@@ -803,12 +874,14 @@ fn per_module_index_serves_ops_and_views() {
 
         pre_restart_height = daemon.status()["height"].as_u64().expect("height");
 
-        let (code, _) = daemon.request("POST", "/v1/admin/shutdown", None);
-        assert_eq!(code, 200);
+        assert_eq!(daemon.admin_shutdown(), Some(200));
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut daemon = daemon;
         while daemon.child.try_wait().expect("poll daemon").is_none() {
-            assert!(Instant::now() < deadline, "daemon ignored /v1/admin/shutdown");
+            assert!(
+                Instant::now() < deadline,
+                "daemon ignored /v1/admin/shutdown"
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -831,9 +904,10 @@ fn per_module_index_serves_ops_and_views() {
     let (code, _) = daemon.submit(
         "chat",
         post_message("eng", "m2", "fresh after restart"),
-        Some("eddy"),
+        Some("alice"),
     );
     assert_eq!(code, 200);
+    await_view_folded(&daemon, "chat");
     let (code, reply) = daemon.request(
         "POST",
         "/v1/index/chat/view",
@@ -842,16 +916,16 @@ fn per_module_index_serves_ops_and_views() {
     assert_eq!(code, 200);
     let hits = hits_of(&reply);
     assert_eq!(hits.len(), 1, "post-restart blocks keep indexing");
-    assert_eq!(hits[0]["messageId"], "m2");
+    assert_eq!(hits[0]["message_id"], "m2");
 }
 
 #[test]
 fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
-    let genesis_hash = daemon.status()["appHash"]
+    let genesis_hash = daemon.status()["root_hash"]
         .as_str()
-        .expect("appHash")
+        .expect("root_hash")
         .to_string();
 
     // sha256 as 64-char lowercase hex — the digest rendering the lane returns.
@@ -912,13 +986,24 @@ fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
         "413 uses the error envelope: {err}"
     );
 
-    // the whole blob lane is off-consensus: no blocks, no app-hash movement.
+    // the whole blob lane is off-consensus: no blocks, no root-hash movement.
+    //
+    // a non-zero height here means SOMETHING committed a block, and this test
+    // submits no op at all — so the interesting evidence is what that block
+    // holds, not the number. `/v1/blocks` names the op, which is what tells a
+    // real "the blob lane started committing" regression apart from this
+    // daemon not being ours at all.
     let status = daemon.status();
-    assert_eq!(status["height"], 0, "blob puts must not commit blocks");
+    let (_, blocks) = daemon.request("GET", "/v1/blocks", None);
     assert_eq!(
-        status["appHash"].as_str(),
+        status["height"], 0,
+        "blob puts must not commit blocks — height moved to {}, blocks: {}",
+        status["height"], blocks["blocks"]
+    );
+    assert_eq!(
+        status["root_hash"].as_str(),
         Some(genesis_hash.as_str()),
-        "blob puts must not move the app hash"
+        "blob puts must not move the root hash"
     );
 }
 
@@ -935,9 +1020,9 @@ fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
 fn duckfs_surface_stage_commit_and_reads_round_trip() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
-    let genesis_hash = daemon.status()["appHash"]
+    let genesis_hash = daemon.status()["root_hash"]
         .as_str()
-        .expect("appHash")
+        .expect("root_hash")
         .to_string();
 
     // refs on a fresh module: no head (the empty filesystem) and an empty window,
@@ -1005,7 +1090,7 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
     let after_stage = daemon.status();
     assert_eq!(after_stage["height"], 2, "two stages committed two blocks");
     assert_ne!(
-        after_stage["appHash"].as_str(),
+        after_stage["root_hash"].as_str(),
         Some(genesis_hash.as_str()),
         "staging moves the module root"
     );
@@ -1017,11 +1102,11 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
         "base_snapshot": null,
         "message": "seed duckfs",
         "changes": [
-            { "put": { "path": "/shared/a.bin", "exec": false,
+            { "put": { "path": "/shared/a.bin", "exec": false, "meta": {},
                 "content": { "chunks": { "size": chunk_a.len() as u64, "chunks": [digest_a] } } } },
-            { "put": { "path": "/shared/b.bin", "exec": false,
+            { "put": { "path": "/shared/b.bin", "exec": false, "meta": {},
                 "content": { "chunks": { "size": chunk_b.len() as u64, "chunks": [digest_b] } } } },
-            { "put": { "path": "/shared/hello.txt", "exec": false,
+            { "put": { "path": "/shared/hello.txt", "exec": false, "meta": {},
                 "content": { "inline": { "b64": STANDARD.encode(inline_bytes) } } } },
         ],
     });
@@ -1135,7 +1220,7 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
         "base_snapshot": seed_snapshot,
         "message": "edit hello",
         "changes": [
-            { "put": { "path": "/shared/hello.txt", "exec": false,
+            { "put": { "path": "/shared/hello.txt", "exec": false, "meta": {},
                 "content": { "inline": { "b64": STANDARD.encode(b"HELLO AGAIN") } } } },
         ],
     });
@@ -1166,7 +1251,7 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
         "base_snapshot": null,
         "message": "dangling chunk",
         "changes": [
-            { "put": { "path": "/shared/dangling.bin", "exec": false,
+            { "put": { "path": "/shared/dangling.bin", "exec": false, "meta": {},
                 "content": { "chunks": { "size": 10, "chunks": [bogus] } } } },
         ],
     });
@@ -1195,6 +1280,66 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
 
     // the daemon is still alive and answering after the rejections.
     daemon.status();
+}
+
+/// A SUBSCRIBED SESSION IS SENT BACK TO THE STORE ONCE PER FED BLOCK — AND ONLY
+/// THEN.
+///
+/// The block wake is gated on the block having appended index rows, and until
+/// this series existed nothing could observe whether that gate was wired at
+/// all: inverting the one `sweep &&` that connects the decision to `catch_up`
+/// left the whole suite green, because the 30s backstop delivered late and no
+/// assertion measured promptness. This measures the sweep itself, so the gate
+/// is pinned rather than inferred from a frame arriving eventually.
+///
+/// The counter is read BEFORE and AFTER, because `subscribe` runs its own
+/// `Wake::All` catch-up that is not a block wake and must not be counted.
+#[test]
+fn a_fed_block_sweeps_a_subscribed_session_exactly_once() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    // BY CAUSE, because the total cannot tell the gate from its floor: the 30s
+    // backstop sweeps too, and a test that waited for the total to move would
+    // pass on a broken wake after half a minute. This asks whether the BLOCK
+    // woke it.
+    fn block_sweeps(text: &str) -> u64 {
+        text.lines()
+            .find_map(|line| {
+                line.strip_prefix("ducktape_stream_index_sweeps_total{cause=\"block\"} ")
+            })
+            .map(|count| count.trim().parse().expect("counter is a number"))
+            // absent until the first one — a family emits no series for a
+            // label it has never seen.
+            .unwrap_or(0)
+    }
+
+    let mut ws = daemon.ws_connect();
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["module:chat"]}"#);
+    let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+    assert!(subscribed["topics"]["module:chat"].is_string());
+    let before = block_sweeps(&daemon.metrics());
+
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
+        }),
+        None,
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+
+    // wait on the session's OWN delivery, never a clock: the event frame for
+    // this block cannot arrive before the sweep that produced it.
+    let event = Daemon::ws_read_type(&mut ws, "event");
+    assert_eq!(event["topic"], "module:chat");
+
+    assert_eq!(
+        block_sweeps(&daemon.metrics()),
+        before + 1,
+        "one fed block, one sweep — not zero (the gate never fires) and not \
+         several (something else is waking the index topics)"
+    );
 }
 
 #[test]
@@ -1263,7 +1408,10 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
     let mut ws = daemon.ws_connect();
     Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["metrics"]}"#);
     let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
-    assert_eq!(subscribed["topics"]["metrics"], "0", "fresh snapshot cursor");
+    assert_eq!(
+        subscribed["topics"]["metrics"], "0",
+        "fresh snapshot cursor"
+    );
 
     // the subscribe replay pushes the first sample immediately — no wait for
     // the next heartbeat tick — carrying the SAME exposition GET /metrics
@@ -1275,341 +1423,219 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
         text.contains("ducktape_blocks_total"),
         "stream sample carries the block series: {text}"
     );
-    assert!(text.trim_end().ends_with("# EOF"), "whole scrape body rides");
-    let time_ms = tail["item"]["timeMs"].as_u64().expect("sample instant");
+    assert!(
+        text.trim_end().ends_with("# EOF"),
+        "whole scrape body rides"
+    );
+    let time_ms = tail["item"]["time_ms"].as_u64().expect("sample instant");
     assert_eq!(tail["cursor"], time_ms.to_string());
 
     // the next sample arrives on the heartbeat tick without any block moving.
     let tail2 = Daemon::ws_read_type(&mut ws, "tail");
     assert_eq!(tail2["topic"], "metrics");
     assert!(
-        tail2["item"]["timeMs"].as_u64().expect("second instant") >= time_ms,
+        tail2["item"]["time_ms"].as_u64().expect("second instant") >= time_ms,
         "tick samples advance monotonically"
     );
 }
 
-// ============================================================================
-// off-loop oracle execution: REAL script-backed providers through the full
-// capability-host path, proving the daemon's command loop no longer awaits
-// provider execution — the fix for the status heartbeat starving (and the
-// desktop "reconnecting" banner) during long agent runs.
-// ============================================================================
-
-/// stage one script-backed capability provider for a spawned daemon: an
-/// operator spec dir with a single `text`-format spec whose `detect.env`
-/// points at `body`'s script. returns the daemon env that provides the tag —
-/// including detect overrides that HIDE the embedded executor specs, so a dev
-/// box with a real `claude`/`codex` on PATH runs these tests identically to CI.
-fn stage_script_provider(root: &Path, tag: &str, body: &str) -> Vec<(String, String)> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let spec_dir = root.join("specs");
-    std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-    let script = root.join(format!("{tag}.sh"));
-    std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("write provider script");
-    let mut perms = std::fs::metadata(&script)
-        .expect("script metadata")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&script, perms).expect("chmod provider script");
-
-    let env_var = format!(
-        "DUCKTAPE_TEST_{}_BIN",
-        tag.replace(['-', '.'], "_").to_uppercase()
-    );
-    std::fs::write(
-        spec_dir.join(format!("{tag}.toml")),
-        format!(
-            "spec = 1\n\
-             [capability]\n\
-             tag = \"{tag}\"\n\
-             description = \"daemon e2e script executor\"\n\
-             [detect]\n\
-             bin = \"{tag}-nonexistent-cli\"\n\
-             env = \"{env_var}\"\n\
-             [invoke]\n\
-             args = []\n\
-             prompt = \"stdin\"\n\
-             timeout_secs = 60\n\
-             [output]\n\
-             format = \"text\"\n"
-        ),
-    )
-    .expect("write provider spec");
-
-    let missing = root.join("missing-executor");
-    vec![
-        (
-            "DUCKTAPE_CAPABILITY_DIR".into(),
-            spec_dir.display().to_string(),
-        ),
-        (env_var, script.display().to_string()),
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
-    ]
-}
-
-/// channel + registered agent + mention watch: the client-side trigger stack
-/// for one agent run in `channel`. no prompt blob — an agent is its curated
-/// skills, and one that curates none still runs (it simply has no persona).
-fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
-    let (code, block) = daemon.submit(
-        "chat",
-        serde_json::json!({
-            "create_channel": { "channel_id": channel, "name": channel, "post_policy": "open" }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "create channel failed: {block}");
-    let (code, block) = daemon.submit(
-        "agent",
-        serde_json::json!({
-            "register_agent": {
-                "agent_id": agent_id,
-                "display_name": agent_id,
-                "capability": tag,
-                "allowed_actions": ["chat.post"]
-            }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "register agent failed: {block}");
-    let (code, block) = daemon.submit(
-        "runs",
-        serde_json::json!({
-            "watch_channel": { "channel_id": channel, "policy": "mention" }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "watch channel failed: {block}");
-}
-
-/// the plain texts of `channel`'s agent-authored replies.
-fn agent_replies(daemon: &Daemon, channel: &str) -> Vec<String> {
-    let reply = daemon.query(
-        "chat",
-        serde_json::json!({ "messages_latest": { "channel_id": channel, "limit": 32 } }),
-    );
-    reply["messages"]
-        .as_array()
-        .expect("Messages reply")
-        .iter()
-        .filter(|m| m["head"]["author"].get("agent").is_some())
-        .map(|m| {
-            m["head"]["blocks"][0]["paragraph"][0]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()
-        })
-        .collect()
-}
-
-fn pending_run_count(daemon: &Daemon) -> usize {
-    let pending = daemon.query("runs", serde_json::json!("pending_runs"));
-    pending["pending_runs"]
-        .as_array()
-        .map(Vec::len)
-        .unwrap_or(0)
-}
-
-use nettest::poll_until;
-
-/// THE HEADLINE FIX, asserted directly: submit a run whose provider sleeps,
-/// then Status and Query answer BEFORE the run completes. on the pre-fix
-/// inline path the mention's submit itself blocked through provider
-/// execution AND delivery, so "submit returned, reply not posted yet" was
-/// unreachable — this test is red there without any wall-clock assertion.
+/// A SUBSCRIBE COSTS ONE SAMPLE PER TOPIC, NOT TWO.
+///
+/// `peers` composes its sample by encoding the whole metrics registry, so the
+/// heartbeat's immediate first tick landing on the heels of the subscribe
+/// replay meant every subscribe paid that twice — the second carrying nothing
+/// the first did not. The scrape sits inside the ~3 s before the next real
+/// beat, so the margin here is a whole heartbeat, not a hair.
+///
+/// ALL THREE SNAPSHOT TOPICS, because the guard is written at three call
+/// sites. Asserting `peers` alone leaves deleting the other two copies green,
+/// which is the same forget-a-topic failure `catch_up`'s exhaustive dispatch
+/// was written to prevent.
 #[test]
-fn status_answers_while_a_slow_run_is_in_flight() {
+fn a_subscribe_composes_one_snapshot_per_topic_and_not_the_tick_behind_it() {
     let storage = tempfile::TempDir::new().expect("storage dir");
-    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
-    let env = stage_script_provider(
-        fixtures.path(),
-        "slow-quack",
-        "cat > /dev/null\nsleep 6\nprintf 'slow answer\\n'",
-    );
-    let daemon = Daemon::spawn_inner(storage.path(), false, &env);
-    arm_agent(&daemon, "general", "sloth", "slow-quack");
+    let daemon = Daemon::spawn(storage.path());
 
-    let (code, block) = daemon.submit("chat", post_mention("general", "m1", "sloth"), Some("eddy"));
-    assert_eq!(code, 200, "mention post failed: {block}");
-
-    // the provider is asleep for ~6s. the daemon answers NOW:
-    let status = daemon.status();
-    assert!(
-        status["height"].as_u64().is_some(),
-        "status is live: {status}"
+    let mut ws = daemon.ws_connect();
+    Daemon::ws_send_text(
+        &mut ws,
+        r#"{"op":"subscribe","topics":["peers","status","metrics"]}"#,
     );
-    assert_eq!(
-        pending_run_count(&daemon),
-        1,
-        "the run is in flight while status answered"
-    );
-    assert!(
-        agent_replies(&daemon, "general").is_empty(),
-        "status/query answered BEFORE the run completed"
-    );
-
-    // ... and the run still lands: the result re-enters as a submit, the
-    // mailbox delivers next block, the reply posts, the pending entry prunes.
-    poll_until(
-        "the slow run's reply to post",
-        Duration::from_secs(30),
-        || {
-            let replies = agent_replies(&daemon, "general");
-            (!replies.is_empty()).then_some(replies)
-        },
-    );
-    assert_eq!(agent_replies(&daemon, "general"), ["slow answer"]);
-    poll_until(
-        "the pending entry to prune",
-        Duration::from_secs(30),
-        || (pending_run_count(&daemon) == 0).then_some(()),
-    );
-}
-
-/// two slow runs execute CONCURRENTLY: the second child starts while the
-/// first is still asleep — the in-flight log carries start,start before any
-/// end. on the pre-fix path the second mention's submit queued behind the
-/// first run, so the log serialized (start,end,start,end).
-#[test]
-fn two_slow_runs_overlap() {
-    let storage = tempfile::TempDir::new().expect("storage dir");
-    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
-    let log = fixtures.path().join("exec.log");
-    let env = stage_script_provider(
-        fixtures.path(),
-        "slow-pair",
-        &format!(
-            "cat > /dev/null\n\
-             echo start >> {log}\n\
-             sleep 3\n\
-             echo end >> {log}\n\
-             printf 'done\\n'",
-            log = log.display()
-        ),
-    );
-    let daemon = Daemon::spawn_inner(storage.path(), false, &env);
-    // two channels, one agent each: two independent runs.
-    arm_agent(&daemon, "left", "pair-a", "slow-pair");
-    arm_agent(&daemon, "right", "pair-b", "slow-pair");
-
-    let (code, block) = daemon.submit("chat", post_mention("left", "m1", "pair-a"), Some("eddy"));
-    assert_eq!(code, 200, "first mention failed: {block}");
-    let (code, block) = daemon.submit("chat", post_mention("right", "m2", "pair-b"), Some("eddy"));
-    assert_eq!(code, 200, "second mention failed: {block}");
-
-    for channel in ["left", "right"] {
-        poll_until("both slow runs to reply", Duration::from_secs(30), || {
-            let replies = agent_replies(&daemon, channel);
-            (!replies.is_empty()).then_some(())
-        });
+    let _ = Daemon::ws_read_type(&mut ws, "subscribed");
+    for _ in 0..3 {
+        let _ = Daemon::ws_read_type(&mut ws, "tail");
     }
-    let lines: Vec<String> = std::fs::read_to_string(&log)
-        .expect("exec log written")
-        .lines()
-        .map(str::to_string)
-        .collect();
-    assert_eq!(
-        lines[..2],
-        ["start", "start"],
-        "both children started before either finished — the runs overlapped: {lines:?}"
-    );
-    assert_eq!(lines.len(), 4, "two complete executions: {lines:?}");
+
+    let exposition = daemon.metrics();
+    for topic in ["peers", "status", "metrics"] {
+        assert_eq!(
+            snapshot_samples(&exposition, topic),
+            1,
+            "{topic}: the subscribe replay composed the document; the immediate \
+             heartbeat tick behind it must fold away rather than compose again"
+        );
+    }
 }
 
-/// the failure path is loud, not silent: a provider that exits non-zero
-/// still produces the failure OracleResult, the saga burns its attempts,
-/// and the terminal failure prunes the pending entry — but the agent posts
-/// exactly one ⚠ failure reply into the channel (authored as the agent,
-/// carrying the provider's stderr excerpt) instead of dying silently. and
-/// the daemon answers throughout.
+/// DROPPING THE SOCKET MUST STOP THE SAMPLING — the whole cost argument for
+/// gating the console's overview subscription rests on it, and until now
+/// nothing observed it.
+///
+/// `peers` re-composes its sample by encoding the node's ENTIRE metrics
+/// registry, per session, per heartbeat, for as long as a session holds the
+/// topic. "Leaving the tab stops that at the source" is a claim about session
+/// teardown that no test could see: a session that outlived its socket would
+/// keep paying that cost forever with every existing test green.
+///
+/// THE SECOND SESSION IS THE CLOCK. Its frames mark heartbeat ticks, so the
+/// test waits on the system's own events and never on a duration — a sleep
+/// here would be a timeout wearing a disguise. If the closed session were
+/// still sampling, the counter would advance by two per tick instead of one.
 #[test]
-fn a_failing_provider_still_fails_the_run_cleanly() {
+fn a_closed_session_stops_costing_the_node_a_snapshot_sample() {
     let storage = tempfile::TempDir::new().expect("storage dir");
-    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
-    let log = fixtures.path().join("exec.log");
-    let env = stage_script_provider(
-        fixtures.path(),
-        "kaboom",
-        &format!(
-            "cat > /dev/null\n\
-             echo ran >> {log}\n\
-             echo 'provider exploded' >&2\n\
-             exit 3",
-            log = log.display()
-        ),
-    );
-    let daemon = Daemon::spawn_inner(storage.path(), false, &env);
-    arm_agent(&daemon, "general", "boomer", "kaboom");
+    let daemon = Daemon::spawn(storage.path());
 
-    let (code, block) = daemon.submit(
-        "chat",
-        post_mention("general", "m1", "boomer"),
-        Some("eddy"),
-    );
-    assert_eq!(code, 200, "mention post failed: {block}");
+    let mut leaving = daemon.ws_connect();
+    Daemon::ws_send_text(&mut leaving, r#"{"op":"subscribe","topics":["peers"]}"#);
+    let _ = Daemon::ws_read_type(&mut leaving, "subscribed");
+    let _ = Daemon::ws_read_type(&mut leaving, "tail");
 
-    // the terminal failure delivers (that is what prunes the entry) — the
-    // saga's retry cycle ran through the pool to completion.
-    poll_until("the failed run to prune", Duration::from_secs(30), || {
-        (pending_run_count(&daemon) == 0).then_some(())
-    });
+    let mut clock = daemon.ws_connect();
+    Daemon::ws_send_text(&mut clock, r#"{"op":"subscribe","topics":["peers"]}"#);
+    let _ = Daemon::ws_read_type(&mut clock, "subscribed");
+    let _ = Daemon::ws_read_type(&mut clock, "tail");
 
-    // the deliberate failure surface: exactly one ⚠ reply, authored as the
-    // agent, one-reply-per-run message id, provider stderr in the excerpt.
-    // (the anchor is a top-level post here, so the reply joins the channel
-    // with `thread: null` — the runs crate's unit tests cover the reply
-    // joining a threaded anchor's thread.)
-    let reply = daemon.query(
-        "chat",
-        serde_json::json!({ "messages_latest": { "channel_id": "general", "limit": 16 } }),
+    // the leaver goes away. Nothing else changes.
+    drop(leaving);
+
+    // ONE TICK OF SLACK so the close is observed before the window we measure.
+    //
+    // This read blocks for a real heartbeat beat now. It did not always: a
+    // subscribe used to be sampled twice within milliseconds — the `Wake::All`
+    // replay and the heartbeat's immediate first tick — and this read returned
+    // instantly with that second, already-counted frame, ordering nothing.
+    // `SNAPSHOT_MIN_INTERVAL_MS` folded the pair into one, which is what makes
+    // the wait real and this comment true.
+    let _ = Daemon::ws_read_type(&mut clock, "tail");
+    let before = peers_samples(&daemon.metrics());
+
+    // THREE ticks, counted by the surviving session's own frames.
+    const TICKS: u64 = 3;
+    for _ in 0..TICKS {
+        let _ = Daemon::ws_read_type(&mut clock, "tail");
+    }
+    let observed = peers_samples(&daemon.metrics()) - before;
+
+    // A RANGE, NOT AN EQUALITY, and the slack is exactly one tick.
+    //
+    // Upper bound: at most one further tick can fire between the last frame and
+    // the scrape, so demanding equality would flake on it.
+    //
+    // Lower bound: the counter is incremented before its frame is sent, so
+    // reading N frames proves at least N samples — but ONLY because the drain
+    // above leaves no counted-but-unread frame behind at the `before` scrape.
+    // The two steps buy that invariant together; neither alone is enough, and
+    // the bottom of this range has no margin beyond it.
+    //
+    // The separation is what matters: ONE subscriber gives 3..=4, and a leaked
+    // session gives 6 — which no slack of one tick can reach.
+    assert!(
+        (TICKS..=TICKS + 1).contains(&observed),
+        "expected {TICKS}..={} samples for the ONE session still subscribed, got \
+         {observed}. At roughly double, the closed session is still being \
+         sampled and the console's subscription gate buys the node nothing; at \
+         zero, the surviving session stopped sampling and the topic is dead.",
+        TICKS + 1
     );
-    let agent_msgs: Vec<&serde_json::Value> = reply["messages"]
-        .as_array()
-        .expect("Messages reply")
-        .iter()
-        .filter(|m| m["head"]["author"].get("agent").is_some())
-        .collect();
+}
+
+/// one arm of `ducktape_stream_snapshot_samples`, off a scrape.
+fn snapshot_samples(exposition: &str, topic: &str) -> u64 {
+    let series = format!("ducktape_stream_snapshot_samples_total{{topic=\"{topic}\"}}");
+    exposition
+        .lines()
+        .find(|line| line.starts_with(&series))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(|value| value as u64)
+        .unwrap_or_else(|| panic!("no {topic} sample counter in exposition"))
+}
+
+fn peers_samples(exposition: &str) -> u64 {
+    snapshot_samples(exposition, "peers")
+}
+
+/// THE OVERVIEW TOPICS MUST DELIVER, OVER A REAL SOCKET, IN THE SHAPE THE
+/// CONSOLE DECODES.
+///
+/// `files:watch` subscribed cleanly for months and never delivered a frame,
+/// because every test stopped at the `subscribed` ack. So this reads the
+/// items: `item.peers` must be the same document `GET /v1/peers` serves and
+/// `item.status` the same one `GET /v1/status` serves, because
+/// `ducktape_rpc::node_snapshots` routes on exactly those two keys and the
+/// console then parses them with the readers it already had for the HTTP
+/// routes. A rename on either side breaks this test rather than the console.
+#[test]
+fn overview_snapshot_topics_push_peers_and_status_over_ws() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    let mut ws = daemon.ws_connect();
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["peers","status"]}"#);
+    let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+    assert_eq!(subscribed["topics"]["peers"], "0", "fresh snapshot cursor");
+    assert_eq!(subscribed["topics"]["status"], "0", "fresh snapshot cursor");
+
+    // BOTH arrive on the subscribe replay — no wait for a heartbeat tick, and
+    // no block has to move: these planes have no op behind them, which is the
+    // whole reason they needed a snapshot topic instead of a module stream.
+    let mut peers = serde_json::Value::Null;
+    let mut status = serde_json::Value::Null;
+    for _ in 0..2 {
+        let tail = Daemon::ws_read_type(&mut ws, "tail");
+        let time_ms = tail["item"]["time_ms"].as_u64().expect("sample instant");
+        assert_eq!(tail["cursor"], time_ms.to_string());
+        match tail["topic"].as_str().expect("topic") {
+            "peers" => peers = tail["item"]["peers"].clone(),
+            "status" => status = tail["item"]["status"].clone(),
+            other => panic!("unexpected topic {other}"),
+        }
+    }
+
+    // the peers sample is the `/v1/peers` document: the envelope's own chain
+    // coordinates plus the peer array. A solo daemon meshes with nobody, so an
+    // EMPTY array is the correct answer — and an absent one is not.
+    assert!(
+        peers["peers"].is_array(),
+        "peers sample carries the peer array: {peers}"
+    );
+    assert!(
+        peers["sampled_at_ms"].as_u64().is_some(),
+        "peers sample carries its own instant: {peers}"
+    );
+
+    // the status sample is the `/v1/status` document, read field-for-field by
+    // the console's `load_node_facts`.
+    assert!(
+        status["version"].as_str().is_some(),
+        "status sample carries the build: {status}"
+    );
+    assert!(
+        status["root_hash"].as_str().is_some(),
+        "status sample carries the app hash: {status}"
+    );
+    assert!(
+        status["operations"].is_object(),
+        "status sample carries the operations projection the overview reads: {status}"
+    );
+
+    // and it agrees with the HTTP route it mirrors — one node, one answer.
+    let http = daemon.status();
     assert_eq!(
-        agent_msgs.len(),
-        1,
-        "a failed run posts exactly one ⚠ failure reply: {reply}"
+        status["version"], http["version"],
+        "the pushed status must not be a second, drifting projection"
     );
-    let head = &agent_msgs[0]["head"];
-    assert_eq!(
-        head["author"],
-        serde_json::json!({ "agent": { "module": "runs", "agent_id": "boomer" } }),
-        "the failure reply is authored as the agent"
-    );
-    let run_id = "chat\u{1f}general\u{1f}1\u{1f}boomer";
-    assert_eq!(
-        head["message_id"],
-        format!("agent/{run_id}"),
-        "one reply per run, failure included"
-    );
-    assert!(
-        head["thread"].is_null(),
-        "a top-level anchor's failure reply is not threaded: {head}"
-    );
-    let text = head["blocks"][0]["paragraph"][0]["text"]
-        .as_str()
-        .expect("reply text");
-    assert!(
-        text.starts_with("⚠ boomer failed: "),
-        "the ⚠ failure reply names the agent: {text}"
-    );
-    assert!(
-        text.contains("provider exploded"),
-        "the provider's stderr surfaces in the failure excerpt: {text}"
-    );
-    let executions = std::fs::read_to_string(&log)
-        .map(|s| s.lines().count())
-        .unwrap_or(0);
-    assert!(
-        executions >= 1,
-        "the provider actually ran (got {executions} executions)"
-    );
-    daemon.status(); // still alive, still answering.
 }
 
 // ============================================================================
@@ -1622,15 +1648,17 @@ fn a_failing_provider_still_fails_the_run_cleanly() {
 // stash, and the consensus `Push` CAS.
 // ============================================================================
 
-/// whether a `git` binary is on PATH (the bridge test needs a real client).
-fn have_git() -> bool {
-    Command::new("git")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// `Some(())` = no real `git` client here, so `test` cannot run and the caller
+/// must return.
+///
+/// The whole forge-over-http protocol suite is five tests behind this, and a
+/// bare early-return made every one of them report green on a host without git
+/// — five protocol proofs covering nothing, indistinguishable in CI output from
+/// five that ran. Printing "skipping" does not fix that: libtest captures
+/// stderr too, so the line never reaches the log. [`nettest::skip_without`]
+/// FAILS instead, unless `DUCKTAPE_ALLOW_MISSING_TOOLS=1` asks for the skip.
+fn skip_without_git(test: &str) -> Option<()> {
+    nettest::skip_without(test, nettest::missing_tool("git"))
 }
 
 /// a `git` invocation in `dir` with a hermetic config: no host global/system
@@ -1704,8 +1732,7 @@ fn forge_head(daemon: &Daemon, repo: &str) -> Option<String> {
 
 #[test]
 fn git_push_over_http_lands_in_forge_head() {
-    if !have_git() {
-        eprintln!("skipping git_push_over_http_lands_in_forge_head: no `git` on PATH");
+    if skip_without_git("git_push_over_http_lands_in_forge_head").is_some() {
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -1794,8 +1821,7 @@ fn log_oids(dir: &Path) -> Vec<u8> {
 
 #[test]
 fn git_clone_over_http_round_trips_full_history() {
-    if !have_git() {
-        eprintln!("skipping git_clone_over_http_round_trips_full_history: no `git` on PATH");
+    if skip_without_git("git_clone_over_http_round_trips_full_history").is_some() {
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -1879,10 +1905,8 @@ fn git_clone_over_http_round_trips_full_history() {
 /// PACK bytes are legal only in the final response.
 #[test]
 fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
-    if !have_git() {
-        eprintln!(
-            "skipping git_fetch_and_pull_into_nonempty_checkout_complete_negotiation: no `git` on PATH"
-        );
+    if skip_without_git("git_fetch_and_pull_into_nonempty_checkout_complete_negotiation").is_some()
+    {
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -1907,7 +1931,11 @@ fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
     let checkout = checkout_root.path().join("checkout");
     git_ok(
         checkout_root.path(),
-        &["clone", &url, checkout.to_str().expect("utf-8 checkout path")],
+        &[
+            "clone",
+            &url,
+            checkout.to_str().expect("utf-8 checkout path"),
+        ],
     );
 
     // A fetch from a non-empty repo has a common first commit. This exercises
@@ -1951,8 +1979,7 @@ fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
 /// exact client the app's `forge_sync_remote` runs, so this pins that interop.
 #[test]
 fn libgit2_mirror_fetch_completes_incremental_sync() {
-    if !have_git() {
-        eprintln!("skipping libgit2_mirror_fetch_completes_incremental_sync: no `git` on PATH");
+    if skip_without_git("libgit2_mirror_fetch_completes_incremental_sync").is_some() {
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -1979,7 +2006,10 @@ fn libgit2_mirror_fetch_completes_incremental_sync() {
 
     fetch(&mirror);
     let first_oid = git2::Oid::from_str(&first_head).expect("head oid");
-    assert!(mirror.find_commit(first_oid).is_ok(), "fresh sync lands the head");
+    assert!(
+        mirror.find_commit(first_oid).is_ok(),
+        "fresh sync lands the head"
+    );
 
     // origin advances; the re-sync's haves earn an ACK + delta pack, and the
     // mirror must still complete the new head's closure from it.
@@ -1988,7 +2018,9 @@ fn libgit2_mirror_fetch_completes_incremental_sync() {
     let second_head = rev_parse_head(src);
     fetch(&mirror);
     let second_oid = git2::Oid::from_str(&second_head).expect("head oid");
-    let landed = mirror.find_commit(second_oid).expect("incremental sync lands the head");
+    let landed = mirror
+        .find_commit(second_oid)
+        .expect("incremental sync lands the head");
     assert_eq!(
         landed
             .tree()
@@ -2014,10 +2046,7 @@ fn libgit2_mirror_fetch_completes_incremental_sync() {
 /// `http.postBuffer=1` makes git take the probe path for even a one-commit push.
 #[test]
 fn git_push_larger_than_post_buffer_uses_the_probe_path() {
-    if !have_git() {
-        eprintln!(
-            "skipping git_push_larger_than_post_buffer_uses_the_probe_path: no `git` on PATH"
-        );
+    if skip_without_git("git_push_larger_than_post_buffer_uses_the_probe_path").is_some() {
         return;
     }
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -2177,16 +2206,27 @@ fn duckfs_workspace_rpc_lifecycle_and_conflict() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
 
-    // ---- create: an empty checkout under /shared/job1 ----
+    // ---- create: an empty checkout. `/workspace` is the ONLY vocabulary this
+    // RPC accepts; it maps to an id-scoped managed prefix the caller reads back
+    // off the reply, so a job never has to know the module's writable roots ----
     let (code, ws) = daemon.request(
         "POST",
         "/v1/fs/workspaces",
-        Some(&serde_json::json!({ "prefix": "/shared/job1" })),
+        Some(&serde_json::json!({ "prefix": "/workspace" })),
     );
     assert_eq!(code, 200, "create workspace failed: {ws}");
     let id = ws["id"].as_str().expect("workspace id").to_string();
     let path = ws["path"].as_str().expect("workspace path").to_string();
+    let prefix = ws["prefix"].as_str().expect("managed prefix").to_string();
     assert!(ws["snapshot"].is_null(), "empty checkout has no base: {ws}");
+    // a duckfs path outside that vocabulary is a clean 400, not a commit that
+    // fails later inside the module's authority check.
+    let (code, refused) = daemon.request(
+        "POST",
+        "/v1/fs/workspaces",
+        Some(&serde_json::json!({ "prefix": "/shared/job1" })),
+    );
+    assert_eq!(code, 400, "a non-/workspace prefix is refused: {refused}");
     // the managed checkout wrote its .duckfs index to disk at `path`.
     let index_json = std::path::Path::new(&path).join(".duckfs/index.json");
     assert!(
@@ -2214,7 +2254,11 @@ fn duckfs_workspace_rpc_lifecycle_and_conflict() {
     assert_eq!(done["rebased"], false, "a first commit never rebases");
 
     // ---- read the committed file back over the files surface ----
-    let (code, read) = daemon.request("GET", "/v1/files/read?path=/shared/job1/hello.txt", None);
+    let (code, read) = daemon.request(
+        "GET",
+        &format!("/v1/files/read?path={prefix}/hello.txt"),
+        None,
+    );
     assert_eq!(code, 200, "read the committed file: {read}");
     let bytes = STANDARD
         .decode(read["b64"].as_str().expect("b64").as_bytes())
@@ -2230,19 +2274,20 @@ fn duckfs_workspace_rpc_lifecycle_and_conflict() {
         "the workspace dir is removed on delete"
     );
 
-    // ---- conflict: two workspaces off the same base, same-path edits ----
-    let make_ws = || {
-        let (c, v) = daemon.request(
-            "POST",
-            "/v1/fs/workspaces",
-            Some(&serde_json::json!({ "prefix": "/shared/wsconflict" })),
-        );
-        assert_eq!(c, 200, "create conflict workspace: {v}");
-        (
-            v["id"].as_str().unwrap().to_string(),
-            v["path"].as_str().unwrap().to_string(),
-        )
-    };
+    // ---- conflict: a workspace loses a race on its OWN path. every managed
+    // checkout owns an id-scoped prefix, so no two workspaces can collide; the
+    // competing writer is whoever else commits into duckfs — here a direct
+    // /v1/files/commit that lands between this workspace's checkout and its
+    // commit. same 409 lane, reachable the way production reaches it ----
+    let (code, ws2) = daemon.request(
+        "POST",
+        "/v1/fs/workspaces",
+        Some(&serde_json::json!({ "prefix": "/workspace" })),
+    );
+    assert_eq!(code, 200, "create conflict workspace: {ws2}");
+    let id2 = ws2["id"].as_str().expect("workspace id").to_string();
+    let path2 = ws2["path"].as_str().expect("workspace path").to_string();
+    let prefix2 = ws2["prefix"].as_str().expect("managed prefix").to_string();
     let commit_ws = |id: &str, msg: &str| -> (u16, serde_json::Value) {
         daemon.request(
             "POST",
@@ -2251,26 +2296,43 @@ fn duckfs_workspace_rpc_lifecycle_and_conflict() {
         )
     };
 
-    let (id1, path1) = make_ws();
-    std::fs::write(std::path::Path::new(&path1).join("f.txt"), b"v1").unwrap();
-    let (c, _) = commit_ws(&id1, "seed");
-    assert_eq!(c, 200, "seed commit lands");
+    std::fs::write(std::path::Path::new(&path2).join("f.txt"), b"v1").unwrap();
+    let (code, seeded) = commit_ws(&id2, "seed");
+    assert_eq!(code, 200, "seed commit lands: {seeded}");
 
-    // ws2 checks out the seeded head (its base is snapshot1).
-    let (id2, path2) = make_ws();
+    // a direct commit advances the SAME path off the seeded head — the
+    // workspace's base snapshot is now stale.
+    let (code, refs) = daemon.request("GET", "/v1/files/refs", None);
+    assert_eq!(code, 200, "refs failed: {refs}");
+    let head = refs["head"].as_str().expect("seeded head").to_string();
+    let (code, advanced) = daemon.request(
+        "POST",
+        "/v1/files/commit",
+        Some(&serde_json::json!({
+            "base_snapshot": head,
+            "message": "a competing writer takes the path",
+            "changes": [
+                { "put": { "path": format!("{prefix2}/f.txt"), "exec": false, "meta": {},
+                    "content": { "inline": { "b64": STANDARD.encode(b"from the other writer") } } } },
+            ],
+        })),
+    );
+    assert_eq!(code, 200, "the competing commit lands: {advanced}");
 
-    // ws1 advances the shared path...
-    std::fs::write(std::path::Path::new(&path1).join("f.txt"), b"from1").unwrap();
-    let (c, _) = commit_ws(&id1, "advance");
-    assert_eq!(c, 200, "ws1 advances the shared path");
-
-    // ...so ws2's same-path commit conflicts: a 409 with the clashing path.
-    std::fs::write(std::path::Path::new(&path2).join("f.txt"), b"from2").unwrap();
-    let (c, report) = commit_ws(&id2, "loses");
-    assert_eq!(c, 409, "an overlapping workspace commit is a 409: {report}");
+    // ...so the workspace's same-path commit conflicts: a 409 naming the path.
+    std::fs::write(
+        std::path::Path::new(&path2).join("f.txt"),
+        b"from the workspace",
+    )
+    .unwrap();
+    let (code, report) = commit_ws(&id2, "loses");
+    assert_eq!(
+        code, 409,
+        "an overlapping workspace commit is a 409: {report}"
+    );
     let clashing = report["clashing"].as_array().expect("clashing array");
     assert!(
-        clashing.iter().any(|p| p == "/shared/wsconflict/f.txt"),
+        clashing.iter().any(|p| p == &format!("{prefix2}/f.txt")),
         "the conflict report names the clashing path: {report}"
     );
 }

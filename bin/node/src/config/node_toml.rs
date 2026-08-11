@@ -23,20 +23,41 @@ use super::resolve::{DEFAULT_CHECKPOINT_BLOCKS, DEFAULT_PODMAN_IMAGE};
 /// with every surface up. Loopback for the operator surfaces (HTTP app
 /// API, browser gateway, admin RPC), dual-stack for the mesh, and the
 /// conventional WireGuard port for the tunnel plane.
-pub const DEFAULT_MESH_LISTEN: &str = "[::]:52200";
+///
+/// EVERY eagerly-bound TCP default sits BELOW [`EPHEMERAL_FLOOR`], and that is
+/// a correctness property rather than tidiness — see
+/// [`no_tcp_default_sits_in_the_ephemeral_range`]. The mesh listener was at
+/// `52200`, inside the range, where any outbound connection on the box can take
+/// the port first; commonware's discovery listener `expect`s its bind, so
+/// losing that race is an unwinding panic ten seconds into boot. It now sits
+/// beside the two operator surfaces, which were never at risk.
+pub const DEFAULT_MESH_LISTEN: &str = "[::]:8846";
 pub const DEFAULT_HTTP_LISTEN: &str = "127.0.0.1:8844";
 pub const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:8845";
 /// port 0 on purpose: the browser gateway prints its bound port and its
 /// consumers re-read it per session; a fixed port would only collide.
 pub const DEFAULT_GATEWAY_LISTEN: &str = "127.0.0.1:0";
+/// UDP, and deliberately still the CONVENTIONAL WireGuard port even though it
+/// is inside the ephemeral range: a firewall rule, a NAT forward and an
+/// operator's muscle memory all key on 51820, and the tunnel plane answers a
+/// bind failure with a logged retry rather than a panic — so the trade the mesh
+/// port made does not apply here.
 pub const DEFAULT_WIREGUARD_LISTEN: &str = "0.0.0.0:51820";
+
+/// The bottom of Linux's default `ip_local_port_range` (32768–60999). A
+/// listener whose default port sits above this is racing every outbound
+/// connection on the host for it.
+#[cfg(test)]
+pub const EPHEMERAL_FLOOR: u16 = 32768;
 
 /// the operator node.toml — the network shape, every key required.
 ///
 /// Where "unset" is a meaningful state it is an EXPLICIT value, never a
 /// missing key: `"none"` (primary_coordinator, coordinator_relay),
-/// `"auto"` (wireguard_advertised), `0` = probe (sandbox_cores,
-/// sandbox_mem_gb).
+/// `"auto"` (wireguard_advertised), `0` = probe ([sandbox] cores/mem_gb).
+/// the ONE table-level exception is `[sandbox]`: its PRESENCE is the
+/// compute-plane switch (see [`SandboxToml`]), so a consensus-only node
+/// simply has no such table.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeToml {
@@ -73,20 +94,32 @@ pub struct NodeToml {
     pub coordinator_relay: String,
     /// sealed blocks between recovery checkpoints.
     pub checkpoint_blocks: u64,
-    /// opt-in UNVERIFIABLE shipped-index warm start on join.
+    /// shipped-index warm start on join (default ON — the read model arrives
+    /// warm from the sync source, unverified by design). `false` opts this
+    /// node down to consensus-only: verified state, derived views empty at
+    /// the boundary.
     pub sync_index: bool,
-    /// whether this node publishes its provider set into the capability
-    /// registry; `false` = accept-lane-only provider.
-    pub announce_capabilities: bool,
-    /// provider run isolation: `"direct"`, `"podman"`, or `"tart"`.
-    pub sandbox: String,
-    /// the provider environment image (used by podman/tart; ignored for
-    /// direct).
-    pub sandbox_image: String,
-    /// announced sandbox capacity; `0` = probe the host.
-    pub sandbox_cores: u64,
-    /// announced sandbox capacity in GiB; `0` = probe the host.
-    pub sandbox_mem_gb: u64,
+    /// the compute plane: PRESENT = provider runs execute in this sandbox;
+    /// ABSENT = consensus-only node (no provider discovery, no announce, no
+    /// terminal plane).
+    pub sandbox: Option<SandboxToml>,
+}
+
+/// the `[sandbox]` compute-plane table. its PRESENCE is what makes a node a
+/// compute node; inside it every key is required. there is deliberately no
+/// bare/"direct" runtime — a provider run never executes directly on the
+/// host, so the only selectable adapters are the audited in-tree ones.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxToml {
+    /// the isolation adapter: `"podman"` or `"tart"`.
+    pub runtime: String,
+    /// the provider environment image the adapter boots.
+    pub image: String,
+    /// announced capacity; `0` = probe the host.
+    pub cores: u64,
+    /// announced capacity in GiB; `0` = probe the host.
+    pub mem_gb: u64,
 }
 
 impl NodeToml {
@@ -127,11 +160,7 @@ pub struct DevSeedToml {
     pub primary_coordinator: Option<String>,
     pub coordinator_relay: Option<String>,
     pub sync_index: Option<bool>,
-    pub announce_capabilities: Option<bool>,
-    pub sandbox: Option<String>,
-    pub sandbox_image: Option<String>,
-    pub sandbox_cores: Option<u64>,
-    pub sandbox_mem_gb: Option<u64>,
+    pub sandbox: Option<SandboxToml>,
 }
 
 /// both file shapes, discriminated by the `network` key: PRESENT means the
@@ -200,11 +229,7 @@ pub struct Plumbing {
     pub coordinator_relay: String,
     pub checkpoint_blocks: u64,
     pub sync_index: bool,
-    pub announce_capabilities: bool,
-    pub sandbox: String,
-    pub sandbox_image: String,
-    pub sandbox_cores: u64,
-    pub sandbox_mem_gb: u64,
+    pub sandbox: Option<SandboxToml>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -286,16 +311,8 @@ pub fn merged_plumbing(
         checkpoint_blocks: e
             .map(|r| r.checkpoint_blocks)
             .unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
-        sync_index: e.map(|r| r.sync_index).unwrap_or(false),
-        announce_capabilities: e.map(|r| r.announce_capabilities).unwrap_or(false),
-        sandbox: e
-            .map(|r| r.sandbox.clone())
-            .unwrap_or_else(|| "direct".into()),
-        sandbox_image: e
-            .map(|r| r.sandbox_image.clone())
-            .unwrap_or_else(|| DEFAULT_PODMAN_IMAGE.into()),
-        sandbox_cores: e.map(|r| r.sandbox_cores).unwrap_or(0),
-        sandbox_mem_gb: e.map(|r| r.sandbox_mem_gb).unwrap_or(0),
+        sync_index: e.map(|r| r.sync_index).unwrap_or(true),
+        sandbox: e.and_then(|r| r.sandbox.clone()),
         wireguard_listen,
         primary_coordinator,
     })
@@ -373,17 +390,39 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     keyline(&mut s, "checkpoint_blocks", format_args!("{}", p.checkpoint_blocks),
         "sealed blocks between recovery checkpoints");
     keyline(&mut s, "sync_index", format_args!("{}", p.sync_index),
-        "true: UNVERIFIABLE shipped-index warm start on join");
-    keyline(&mut s, "announce_capabilities", format_args!("{}", p.announce_capabilities),
-        "true: publish this node's provider set");
-    keyline(&mut s, "sandbox", format_args!("\"{}\"", p.sandbox),
-        "provider run isolation: \"direct\" | \"podman\" | \"tart\"");
-    keyline(&mut s, "sandbox_image", format_args!("\"{}\"", p.sandbox_image),
-        "provider image (podman/tart; unused for direct)");
-    keyline(&mut s, "sandbox_cores", format_args!("{}", p.sandbox_cores),
-        "announced capacity; 0 = probe the host");
-    keyline(&mut s, "sandbox_mem_gb", format_args!("{}", p.sandbox_mem_gb),
-        "announced capacity (GiB); 0 = probe the host");
+        "false: consensus-only (skip the unverified index warm start on join)");
+    // the [sandbox] table LAST — everything after a toml table header belongs
+    // to the table, so no top-level key may follow it.
+    match &p.sandbox {
+        Some(sb) => {
+            let _ = writeln!(
+                s,
+                "\n# compute plane: provider runs execute inside this sandbox and the node\n\
+                 # can announce capabilities. delete the whole table for a consensus-only node.\n\
+                 [sandbox]"
+            );
+            keyline(&mut s, "runtime", format_args!("\"{}\"", sb.runtime),
+                "isolation adapter: \"podman\" | \"tart\" (runs never execute bare on the host)");
+            keyline(&mut s, "image", format_args!("\"{}\"", sb.image),
+                "the provider environment image");
+            keyline(&mut s, "cores", format_args!("{}", sb.cores),
+                "announced capacity; 0 = probe the host");
+            keyline(&mut s, "mem_gb", format_args!("{}", sb.mem_gb),
+                "announced capacity (GiB); 0 = probe the host");
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "\n# compute plane (off): uncomment [sandbox] to run providers on this node.\n\
+                 # runtime: \"podman\" | \"tart\" — runs never execute bare on the host.\n\
+                 #[sandbox]\n\
+                 #runtime = \"podman\"\n\
+                 #image = \"{DEFAULT_PODMAN_IMAGE}\"\n\
+                 #cores = 0\n\
+                 #mem_gb = 0"
+            );
+        }
+    }
     let path = dir.join("node.toml");
     std::fs::write(&path, s).map_err(|e| format!("write {path:?}: {e}"))?;
     Ok(path)
@@ -409,6 +448,41 @@ mod tests {
     }
 
     /// the generated file round-trips through the strict parser and its
+    /// No TCP listener a node binds EAGERLY may default into the ephemeral
+    /// range, because the kernel hands those ports out to outbound connections
+    /// and the loser of that race is a node that will not start.
+    ///
+    /// The mesh listener is the one that bit: it sat at `52200`, and
+    /// commonware's discovery listener `expect`s its bind inside the runtime,
+    /// so losing the race was `thread 'tokio-rt-worker' panicked … BindFailed`
+    /// ten seconds into an otherwise healthy boot.
+    ///
+    /// Scoped to TCP on purpose. `wireguard_listen` is UDP, is the conventional
+    /// 51820 that firewalls and NAT forwards are written against, and answers a
+    /// failed bind with a logged retry rather than a panic — so it is named
+    /// here as a deliberate exclusion instead of quietly not being checked.
+    #[test]
+    fn no_tcp_default_sits_in_the_ephemeral_range() {
+        for (key, value) in [
+            ("listen", DEFAULT_MESH_LISTEN),
+            ("http_listen", DEFAULT_HTTP_LISTEN),
+            ("rpc_listen", DEFAULT_RPC_LISTEN),
+        ] {
+            let port = value
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok())
+                .unwrap_or_else(|| panic!("{key} default {value:?} names a port"));
+            assert!(
+                port < EPHEMERAL_FLOOR,
+                "{key} defaults to {port}, inside the kernel's ephemeral range \
+                 ({EPHEMERAL_FLOOR}+) — it will lose bind races to outbound sockets"
+            );
+        }
+        // the gateway is the one exception and it is the SAFE direction: port 0
+        // asks the kernel for a free port instead of racing for a fixed one.
+        assert!(DEFAULT_GATEWAY_LISTEN.ends_with(":0"));
+    }
+
     /// flagless defaults are a WORKING node: every surface up, every
     /// derivation materialized concretely.
     #[test]
@@ -431,12 +505,10 @@ mod tests {
             derive_coordinator_relay(DEFAULT_PRIMARY_COORDINATOR)
         );
         assert_eq!(raw.checkpoint_blocks, DEFAULT_CHECKPOINT_BLOCKS);
-        assert!(!raw.sync_index);
-        assert!(!raw.announce_capabilities);
-        assert_eq!(raw.sandbox, "direct");
-        assert_eq!(raw.sandbox_image, DEFAULT_PODMAN_IMAGE);
-        assert_eq!(raw.sandbox_cores, 0);
-        assert_eq!(raw.sandbox_mem_gb, 0);
+        assert!(raw.sync_index);
+        // no [sandbox] table by default: a fresh node is consensus-only, and
+        // the commented example in the file must not parse as a live table.
+        assert_eq!(raw.sandbox, None);
     }
 
     /// nothing optional: a file missing ANY key refuses to parse, and the
@@ -514,16 +586,16 @@ mod tests {
         let edited = std::fs::read_to_string(dir.join("node.toml"))
             .expect("read")
             .replace("checkpoint_blocks = 32", "checkpoint_blocks = 7")
-            .replace("sandbox = \"direct\"", "sandbox = \"podman\"")
-            .replace("sandbox_cores = 0", "sandbox_cores = 4");
+            + "\n[sandbox]\nruntime = \"podman\"\nimage = \"img\"\ncores = 4\nmem_gb = 0\n";
         std::fs::write(dir.join("node.toml"), edited).expect("write");
         let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None)
             .expect("merge");
         write_node_toml(&dir, &p).expect("rewrite");
         let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload");
         assert_eq!(raw.checkpoint_blocks, 7);
-        assert_eq!(raw.sandbox, "podman");
-        assert_eq!(raw.sandbox_cores, 4);
+        let sandbox = raw.sandbox.expect("hand-added [sandbox] survives rewrite");
+        assert_eq!(sandbox.runtime, "podman");
+        assert_eq!(sandbox.cores, 4);
     }
 
     /// the dev-seed shape parses through the same loader, discriminated by

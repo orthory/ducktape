@@ -42,7 +42,7 @@ pub use governance::invite::{
 /// mint a BEARER invite token binding an invite to `binding` (the genesis
 /// namespace), with `role` and `expires_unix_secs`: fresh OS randomness for the
 /// nonce, signed by this member's identity. minting IS the admission decision —
-/// there is no target (기명 dropped — see the join ADR); whoever presents a
+/// there is no target (the targeted form was dropped — see the join ADR); whoever presents a
 /// valid join proof for the nonce first redeems it, single-use.
 pub fn mint_invite_token(
     signer: &ed25519::PrivateKey,
@@ -119,7 +119,9 @@ pub fn save_invite_token(dir: &Path, token: &InviteToken) -> Result<(), String> 
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(0o600);
     }
-    let mut f = opts.open(&path).map_err(|e| format!("create {path:?}: {e}"))?;
+    let mut f = opts
+        .open(&path)
+        .map_err(|e| format!("create {path:?}: {e}"))?;
     f.write_all(format!("{}\n", hex_bytes(&pack_invite_token(token))).as_bytes())
         .map_err(|e| format!("write {path:?}: {e}"))
 }
@@ -253,7 +255,8 @@ pub fn save_invite_fronts(dir: &Path, fronts: &[Front]) -> Result<(), String> {
             endpoint: f.endpoint.clone(),
         })
         .collect();
-    let text = serde_json::to_string_pretty(&stored).map_err(|e| format!("encode {path:?}: {e}"))?;
+    let text =
+        serde_json::to_string_pretty(&stored).map_err(|e| format!("encode {path:?}: {e}"))?;
     std::fs::write(&path, text).map_err(|e| format!("write {path:?}: {e}"))
 }
 
@@ -396,8 +399,7 @@ pub fn fronts_from_adverts(
 pub struct Invite {
     pub descriptor: NetworkDescriptor,
     pub token: InviteToken,
-    /// The inviter's WireGuard bootstrap — MANDATORY in v2 (the WG/overlay
-    /// plane is required; data planes ride the overlay only). The `endpoint`
+    /// The inviter's mandatory WireGuard bootstrap. The `endpoint`
     /// inside stays reachability-dependent (a fully-NAT'd inviter has none and
     /// is reached by identity via the coordinator), but the key material is
     /// always present so the joiner can seal its first-contact intro.
@@ -445,10 +447,7 @@ pub fn decode_invite(blob: &str) -> Result<Invite, String> {
 pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String> {
     use base64::Engine as _;
     use commonware_cryptography::Verifier as _;
-    let body = blob
-        .trim()
-        .strip_prefix(INVITE_PREFIX)
-        .ok_or_else(|| {
+    let body = blob.trim().strip_prefix(INVITE_PREFIX).ok_or_else(|| {
             format!("not a ducktape invite (expected {INVITE_PREFIX}...) — ask for a fresh invite")
         })?;
     let bytes = INVITE_B64
@@ -459,7 +458,8 @@ pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String
         return Err("invite payload truncated".into());
     };
     let (signed, sig_bytes) = bytes.split_at(signed_len);
-    let sig = ed25519::Signature::decode(sig_bytes).map_err(|e| format!("envelope signature: {e}"))?;
+    let sig =
+        ed25519::Signature::decode(sig_bytes).map_err(|e| format!("envelope signature: {e}"))?;
     let invite = unpack_invite(signed, now_unix_secs)?;
     if !invite
         .token
@@ -493,17 +493,23 @@ fn pack_invite(
     let mut out = Vec::new();
 
     let cid = d.chain_id.as_bytes();
-    out.push(u8::try_from(cid.len()).map_err(|_| format!("chain_id too long ({} bytes)", cid.len()))?);
+    out.push(
+        u8::try_from(cid.len()).map_err(|_| format!("chain_id too long ({} bytes)", cid.len()))?,
+    );
     out.extend_from_slice(cid);
 
     let vkeys = d.validator_keys()?; // hex -> raw, deduped, rejects malformed here
-    out.push(u8::try_from(vkeys.len()).map_err(|_| format!("too many validators ({})", vkeys.len()))?);
+    out.push(
+        u8::try_from(vkeys.len()).map_err(|_| format!("too many validators ({})", vkeys.len()))?,
+    );
     for k in &vkeys {
         out.extend_from_slice(k.as_ref());
     }
 
     let hints = d.reach_hints()?;
-    out.push(u8::try_from(hints.len()).map_err(|_| format!("too many reach hints ({})", hints.len()))?);
+    out.push(
+        u8::try_from(hints.len()).map_err(|_| format!("too many reach hints ({})", hints.len()))?,
+    );
     for h in &hints {
         out.extend_from_slice(h.expected_key.as_ref());
         match &h.reach {
@@ -523,7 +529,7 @@ fn pack_invite(
         }
     }
 
-    // the WireGuard bootstrap is MANDATORY in v2. flag 1 = a direct underlay
+    // the WireGuard bootstrap is mandatory. flag 1 = a direct underlay
     // endpoint (+ intro), flag 2 = coordinated (key material only, reached by
     // identity via the coordinator). there is no flag-0 "no wireguard" shape.
     match (&wireguard.endpoint, &wireguard.intro) {
@@ -559,13 +565,12 @@ fn pack_invite(
     out.push(u8::try_from(tok.len()).expect("a packed token fits u8"));
     out.extend_from_slice(&tok);
 
-    // the fronts block rides AFTER the fixed-length token, inside the signed
-    // envelope, but is NEVER fed to `genesis_namespace` (advisory reachability,
-    // not validator identity). Absent when empty, so an invite with no fronts
-    // stays BYTE-IDENTICAL to a pre-feature blob and old blobs still decode
-    // (the reader treats "nothing after the token" as `fronts: []`).
-    if !fronts.is_empty() {
-        out.push(u8::try_from(fronts.len()).map_err(|_| format!("too many fronts ({})", fronts.len()))?);
+    // the fronts block rides after the token inside the signed envelope, but is
+    // never fed to `genesis_namespace` (advisory reachability, not validator
+    // identity). The count is always present, including zero.
+    out.push(
+        u8::try_from(fronts.len()).map_err(|_| format!("too many fronts ({})", fronts.len()))?,
+    );
         for f in fronts {
             out.extend_from_slice(&f.member_key);
             out.extend_from_slice(&f.wireguard_public_key);
@@ -578,14 +583,15 @@ fn pack_invite(
                 None => out.push(0),
             }
         }
-    }
     Ok(out)
 }
 
 /// length-prefix (u8) a short utf-8 string into the packed buffer.
 fn put_str_u8(out: &mut Vec<u8>, s: &str) -> Result<(), String> {
     let b = s.as_bytes();
-    out.push(u8::try_from(b.len()).map_err(|_| format!("string too long ({} bytes): {s:?}", b.len()))?);
+    out.push(
+        u8::try_from(b.len()).map_err(|_| format!("string too long ({} bytes): {s:?}", b.len()))?,
+    );
     out.extend_from_slice(b);
     Ok(())
 }
@@ -599,7 +605,8 @@ fn put_str_u8(out: &mut Vec<u8>, s: &str) -> Result<(), String> {
 fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
     let mut r = InviteReader::new(bytes);
     let cid_len = r.u8()? as usize;
-    let chain_id = String::from_utf8(r.take(cid_len)?.to_vec()).map_err(|e| format!("chain_id: {e}"))?;
+    let chain_id =
+        String::from_utf8(r.take(cid_len)?.to_vec()).map_err(|e| format!("chain_id: {e}"))?;
 
     let vcount = r.u8()? as usize;
     let mut validators = Vec::with_capacity(vcount);
@@ -618,16 +625,24 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
             2 => {
                 let coord_addr = r.take_str_u8()?;
                 let coord_key = r.take_key()?;
-                Reach::Coordinated(CoordRef { coord_addr, coord_key })
+                Reach::Coordinated(CoordRef {
+                    coord_addr,
+                    coord_key,
+                })
             }
             other => return Err(format!("unknown reach tag {other} in invite")),
         };
-        reach.push(ReachHint { expected_key, reach: reach_val }.to_canonical());
+        reach.push(
+            ReachHint {
+                expected_key,
+                reach: reach_val,
+            }
+            .to_canonical(),
+        );
     }
     reach.sort();
 
-    // the WireGuard bootstrap is MANDATORY (v2): flag 0 ("no wireguard") no
-    // longer decodes — an old WG-less blob fails loudly at the reader.
+    // the WireGuard bootstrap is mandatory; flag 0 is invalid.
     let wireguard = match r.u8()? {
         1 => {
             let mut public_key = [0u8; 32];
@@ -655,8 +670,7 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         }
         0 => {
             return Err(
-                "this invite carries no WireGuard bootstrap — v2 requires the reachability \
-                 plane; ask for a fresh invite from a plane-enabled member"
+                "this invite carries no WireGuard bootstrap — the reachability plane is required"
                     .into(),
             );
         }
@@ -680,12 +694,6 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         return Err("this invite has expired — ask for a fresh one".into());
     }
 
-    // the optional fronts block. A pre-feature blob has nothing after the
-    // token (`r.done()`), decoding to an empty set; a feature blob carries a
-    // u8 count then each front. Fail-closed on a malformed entry.
-    let fronts = if r.done() {
-        Vec::new()
-    } else {
         let fcount = r.u8()? as usize;
         let mut fronts = Vec::with_capacity(fcount);
         for _ in 0..fcount {
@@ -706,8 +714,6 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
                 endpoint,
             });
         }
-        fronts
-    };
     if !r.done() {
         return Err("invite payload has trailing bytes".into());
     }
@@ -810,14 +816,11 @@ mod tests {
             .expect("coordinator hint");
         let invite = decode_invite(&encode_test_invite(&d, &issuer, None)).expect("decode");
 
-        assert!(
-            invite_requires_reachability_defaults(&invite),
-            "a coordinated invite must start the joiner's reachability plane even without a direct tunnel bootstrap"
-        );
+        assert_eq!(invite.wireguard.endpoint, None);
     }
 
     /// a minimal coordinated (endpoint-less) WireGuard bootstrap — the default a
-    /// test invite carries when it does not specify one (v2: WG is mandatory).
+    /// test invite carries when it does not specify one.
     fn coordinated_test_wg() -> InviteWireGuard {
         InviteWireGuard {
             public_key: [0u8; 32],
@@ -829,14 +832,18 @@ mod tests {
 
     /// mint + encode with the test defaults: issuer-signed, bearer Resident,
     /// far-future expiry. A caller that passes no WireGuard gets the minimal
-    /// coordinated default, since v2 invites always carry a bootstrap.
+    /// coordinated default, since invites always carry a bootstrap.
     fn encode_test_invite(
         d: &NetworkDescriptor,
         issuer: &ed25519::PrivateKey,
         wireguard: Option<&InviteWireGuard>,
     ) -> String {
-        let token =
-            mint_invite_token(issuer, d.genesis_namespace().as_bytes(), InviteRole::Resident, u64::MAX);
+        let token = mint_invite_token(
+            issuer,
+            d.genesis_namespace().as_bytes(),
+            InviteRole::Resident,
+            u64::MAX,
+        );
         let default_wg = coordinated_test_wg();
         let wg = wireguard.unwrap_or(&default_wg);
         encode_invite(d, &token, wg, &[], issuer).expect("encode")
@@ -918,7 +925,10 @@ mod tests {
         // packed-token codec: fixed width, exact roundtrip.
         let packed = pack_invite_token(&token);
         assert_eq!(packed.len(), INVITE_TOKEN_LEN);
-        assert_eq!(unpack_invite_token(&packed).expect("token roundtrip"), token);
+        assert_eq!(
+            unpack_invite_token(&packed).expect("token roundtrip"),
+            token
+        );
 
         // token FILE roundtrip (the joining side persists it 0600).
         let dir = tmp("bearer-token-file");
@@ -950,7 +960,7 @@ mod tests {
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
-            // a token invite now packs v4, which echoes the coordination mode;
+            // the invite echoes the coordination mode;
             // a `None` source resolves to Private, so it decodes as an EXPLICIT
             // "private" (semantically identical — see `coordination()`).
             coordination: Some("private".into()),
@@ -967,8 +977,30 @@ mod tests {
         assert!(invite.fronts.is_empty());
     }
 
+    #[test]
+    fn invite_without_the_front_count_is_rejected() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: Some("private".into()),
+        };
+        let token = mint_invite_token(
+            &issuer,
+            d.genesis_namespace().as_bytes(),
+            InviteRole::Resident,
+            u64::MAX,
+        );
+        let mut bytes = pack_invite(&d, &token, &coordinated_test_wg(), &[]).unwrap();
+        bytes.pop();
+        assert!(unpack_invite(&bytes, 0).is_err());
+    }
+
     /// mint + encode with the test defaults, carrying a set of fronts. A caller
-    /// that passes no WireGuard gets the minimal coordinated default (v2).
+    /// that passes no WireGuard gets the minimal coordinated default.
     fn encode_test_invite_with_fronts(
         d: &NetworkDescriptor,
         issuer: &ed25519::PrivateKey,
@@ -1021,32 +1053,6 @@ mod tests {
         assert_eq!(invite.fronts, fronts);
     }
 
-    #[test]
-    fn pre_feature_invite_decodes_to_empty_fronts() {
-        use base64::Engine as _;
-        // an invite minted WITHOUT fronts carries NO fronts block — its signed
-        // payload ends at the fixed-length token, byte-for-byte like a
-        // pre-feature blob — so an old blob (nothing after the token) decodes
-        // to an empty set. Token nonces are random, so we compare the ENCODED
-        // LENGTH (identical when the fronts block is absent), not the bytes.
-        let issuer = ed25519::PrivateKey::from_seed(7);
-        let d = front_descriptor(&issuer);
-        let empty = encode_test_invite_with_fronts(&d, &issuer, None, &[]);
-        let baseline = encode_test_invite(&d, &issuer, None);
-        let len = |blob: &str| {
-            INVITE_B64
-                .decode(blob.strip_prefix(INVITE_PREFIX).unwrap())
-                .unwrap()
-                .len()
-        };
-        assert_eq!(
-            len(&empty),
-            len(&baseline),
-            "an empty-fronts invite adds no bytes over a pre-feature blob"
-        );
-        assert!(decode_invite(&empty).expect("decode").fronts.is_empty());
-    }
-
     fn sample_advert(
         seed: u64,
         octet: u8,
@@ -1060,7 +1066,12 @@ mod tests {
         let policy = PortPolicy::production();
         let signer = ed25519::PrivateKey::from_seed(seed);
         let endpoint = |port: u16, transport| {
-            Endpoint::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, octet)), port, transport, &policy)
+            Endpoint::new(
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, octet)),
+                port,
+                transport,
+                &policy,
+            )
                 .unwrap()
         };
         let record = EndpointRecord {
@@ -1084,7 +1095,11 @@ mod tests {
         let me = ed25519::PrivateKey::from_seed(1);
         let host_capable = sample_advert(2, 20, Some(51820));
         let punchable = sample_advert(3, 30, None);
-        let adverts = vec![sample_advert(1, 10, Some(51820)), host_capable.clone(), punchable.clone()];
+        let adverts = vec![
+            sample_advert(1, 10, Some(51820)),
+            host_capable.clone(),
+            punchable.clone(),
+        ];
 
         let own: [u8; 32] = me.public_key().as_ref().try_into().unwrap();
         let fronts = fronts_from_adverts(&adverts, &own);
@@ -1141,9 +1156,9 @@ mod tests {
             "encoding/decoding fronts must not change the source fingerprint"
         );
         let mut with_extra_validator = front_descriptor(&issuer);
-        with_extra_validator
-            .validators
-            .push(hex_bytes(ed25519::PrivateKey::from_seed(8).public_key().as_ref()));
+        with_extra_validator.validators.push(hex_bytes(
+            ed25519::PrivateKey::from_seed(8).public_key().as_ref(),
+        ));
         assert_ne!(
             d.genesis_namespace(),
             with_extra_validator.genesis_namespace(),
@@ -1211,12 +1226,13 @@ mod tests {
             reach: vec![],
             coordination: None,
         };
-        for (mode, expect) in [("public", Coordination::Public), ("private", Coordination::Private)]
-        {
+        for (mode, expect) in [
+            ("public", Coordination::Public),
+            ("private", Coordination::Private),
+        ] {
             let mut d = base.clone();
             d.coordination = Some(mode.to_string());
-            let invite =
-                decode_invite(&encode_test_invite(&d, &issuer, None)).expect("roundtrip");
+            let invite = decode_invite(&encode_test_invite(&d, &issuer, None)).expect("roundtrip");
             assert_eq!(
                 invite.descriptor.coordination(),
                 expect,
@@ -1226,8 +1242,7 @@ mod tests {
         }
         // an unset source resolves to Private, the safe default, and decodes
         // as the EXPLICIT "private" (semantically identical).
-        let invite =
-            decode_invite(&encode_test_invite(&base, &issuer, None)).expect("roundtrip");
+        let invite = decode_invite(&encode_test_invite(&base, &issuer, None)).expect("roundtrip");
         assert_eq!(invite.descriptor.coordination.as_deref(), Some("private"));
     }
 
@@ -1270,48 +1285,12 @@ mod tests {
                 endpoint: None,
             },
         ];
-        let blob = encode_invite(&d, &token, &coordinated_test_wg(), &fronts, &issuer).expect("encode");
+        let blob =
+            encode_invite(&d, &token, &coordinated_test_wg(), &fronts, &issuer).expect("encode");
         let invite = decode_invite(&blob).expect("decode");
-        assert_eq!(invite.fronts, fronts, "fronts roundtrip through the envelope");
-    }
-
-    #[test]
-    fn a_pre_feature_blob_decodes_to_empty_fronts() {
-        // (b) the fronts block is OMITTED when empty, so a zero-fronts encode is
-        // byte-identical to a blob minted BEFORE this feature (which ended at
-        // the token). such a blob must decode to `fronts: vec![]`, never error
-        // on a "missing" block.
-        let issuer = ed25519::PrivateKey::from_seed(7);
-        let d = front_test_descriptor(&issuer);
-        let token = mint_invite_token(
-            &issuer,
-            d.genesis_namespace().as_bytes(),
-            InviteRole::Resident,
-            u64::MAX,
-        );
-
-        let empty_blob = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer).expect("encode");
-        let invite = decode_invite(&empty_blob).expect("decode pre-feature-shaped blob");
-        assert!(invite.fronts.is_empty(), "no fronts block => empty fronts");
-
-        // and the omission is real: adding a front lengthens the blob, proving
-        // the empty case appended nothing (i.e. matches the old wire).
-        let with_front = encode_invite(
-            &d,
-            &token,
-            &coordinated_test_wg(),
-            &[Front {
-                member_key: [1u8; 32],
-                wireguard_public_key: [2u8; 32],
-                mesh_port: 1,
-                endpoint: None,
-            }],
-            &issuer,
-        )
-        .expect("encode");
-        assert!(
-            with_front.len() > empty_blob.len(),
-            "a front appends bytes the empty blob lacks"
+        assert_eq!(
+            invite.fronts, fronts,
+            "fronts roundtrip through the envelope"
         );
     }
 

@@ -87,21 +87,27 @@ pub(crate) fn joiner_epoch_mesh(
         .expect("a btree-set union has no duplicates")
 }
 
-/// read the governance module's committed invite redemptions — the
-/// exactly-once nonce set (committed+staged projection, between drains). an
-/// unreadable reply degrades to empty: the lobby then simply cannot pre-empt
+/// read ONE committed invite redemption by token nonce — the exactly-once
+/// set's point read (committed+staged projection, between drains). an
+/// unreadable reply degrades to `None`: the lobby then simply cannot pre-empt
 /// a spent invite, and the in-consensus exactly-once check still holds.
-pub(crate) async fn read_redemptions_from_host(host: &Host) -> Vec<governance::RedemptionView> {
+pub(crate) async fn read_redemption_from_host(
+    host: &Host,
+    nonce: &[u8],
+) -> Option<governance::RedemptionView> {
     use governance::{GovQuery, GovReply, decode_reply, encode_query};
-    let Ok(reply) = host
-        .query("governance", &encode_query(&GovQuery::Redemptions))
+    let reply = host
+        .query(
+            "governance",
+            &encode_query(&GovQuery::Redemption {
+                nonce: nonce.to_vec(),
+            }),
+        )
         .await
-    else {
-        return Vec::new();
-    };
+        .ok()?;
     match decode_reply(&reply) {
-        Ok(GovReply::Redemptions(v)) => v,
-        Ok(_) | Err(_) => Vec::new(),
+        Ok(GovReply::Redemption(view)) => view,
+        Ok(_) | Err(_) => None,
     }
 }
 

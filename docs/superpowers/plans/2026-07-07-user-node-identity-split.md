@@ -14,13 +14,13 @@
 
 - Signing namespaces exactly: `IDENTITY_BIND_NS = b"ducktape-identity-bind-v1"`, `IDENTITY_UNBIND_NS = b"ducktape-identity-unbind-v1"`.
 - Display-name limit 64 bytes (profiles' `MAX_NAME_LEN`); query page cap 256 (`MAX_QUERY_LIMIT`).
-- The module id is `"identity"`; it joins every host composition (`bin/node` genesis/restore/joiner, `bin/noded`, `bin/simnode`, `bin/demo`) or app-hash parity breaks.
+- The module id is `"identity"`; it joins every host composition (`bin/node` genesis/restore/joiner, `bin/noded`, `bin/simnode`, `bin/demo`) or root-hash parity breaks.
 - Adding the module is a module-set change: existing networks need a genesis rebuild; this is accepted (dev-stage networks, same class as the video-calls engine-bank change).
 - `Frame`, valset, governance, mesh, NAT, WireGuard code paths must NOT change.
 - Determinism: no wall clock, no randomness inside the module; ed25519 verify in `execute` is allowed (pure).
 - Rust style: match the repo's lowercase doc-comment voice; JSON wire via serde `snake_case` enums like profiles.
 - Run Rust tests with `cargo test -p <crate>`; app tests with `cd app && bun run test -- --run <file>` (vitest); clippy gate only on touched crates (`cargo clippy -p identity` must be clean; node-bin baseline-diff only).
-- Commit after every task with the shown message; all work in worktree `/home/eddy/dev/ducktape/.claude/worktrees/feat+identity-split` on branch `feat/identity-split`.
+- Commit after every task with the shown message; all work in worktree `<repo>/.claude/worktrees/feat+identity-split` on branch `feat/identity-split`.
 
 ---
 
@@ -209,7 +209,7 @@ mod tests {
         for m in [
             IdentityMsg::BindNode { user_key: vec![7; 32], user_sig: vec![9; 64] },
             IdentityMsg::UnbindNode { node_key: vec![1; 32], user_sig: vec![2; 64] },
-            IdentityMsg::SetUserName { display_name: "eddy".into() },
+            IdentityMsg::SetUserName { display_name: "alice".into() },
         ] {
             assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);
         }
@@ -417,7 +417,7 @@ Expected hits: `bin/node/src/main.rs` ×3 (genesis/restore/joiner), `bin/noded/s
 Run: `cargo build -p node-bin -p noded -p simnode -p demo 2>&1 | tail -5` (package names per each `Cargo.toml`; verify with `grep '^name' bin/*/Cargo.toml`)
 Expected: clean build.
 Run: `cargo test -p noded module_category` (the category enumeration test) and `cargo test -p demo`
-Expected: PASS — `joiner_rebuilds_global_app_hash` in demo proves the new module composes into app-hash parity.
+Expected: PASS — `joiner_rebuilds_global_root_hash` in demo proves the new module composes into root-hash parity.
 
 - [ ] **Step 3: Run the node's own test suite (slow, but the joiner/cluster proofs live here)**
 
@@ -639,7 +639,7 @@ git commit -m "feat(app): user-grouped members roster + linked-devices settings 
 **Interfaces:**
 - Consumes: the cluster harness's submit + query plumbing; `identity::{encode_msg, encode_query, decode_reply}`; `config::mint_bind_cert`.
 
-- [ ] **Step 1: Write the test:** spin the harness's standard 2-validator network (chain id from the harness); create one user key (`from_seed(42)`); node A submits `BindNode` (cert nonce 0), await finalization; node B submits its own `BindNode` (cert nonce 1); query `UserOf(A)` and `UserOf(B)` on BOTH nodes → same `user_key`, `nodes` len 2, and both nodes' app-hash / identity module root agree. Then `UnbindNode(A)` signed nonce 2 submitted FROM node B → `UserOf(A)` → null on both.
+- [ ] **Step 1: Write the test:** spin the harness's standard 2-validator network (chain id from the harness); create one user key (`from_seed(42)`); node A submits `BindNode` (cert nonce 0), await finalization; node B submits its own `BindNode` (cert nonce 1); query `UserOf(A)` and `UserOf(B)` on BOTH nodes → same `user_key`, `nodes` len 2, and both nodes' root-hash / identity module root agree. Then `UnbindNode(A)` signed nonce 2 submitted FROM node B → `UserOf(A)` → null on both.
 - [ ] **Step 2: Run it** — `cargo test -p node-bin identity_two_nodes_one_user -- --nocapture 2>&1 | tail -15`
 Expected: PASS.
 - [ ] **Step 3: Commit**
@@ -655,8 +655,8 @@ git commit -m "test(identity): two nodes bind to one user across a live cluster"
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-07-07-user-node-identity-split-design.md` — as-built amendment note at top: chain id + nonce reach the app from the workspace registry (`workspace.chainId`, Tauri) and the `Get` query; `/v1/status` was NOT extended (registry already carries `chainId`); user-key ops ride `ducktape-node` CLI verbs, not an in-shell crypto dep.
-- Modify: `docs/src/content/docs/en/human/modules/product-modules.mdx` — an `identity` section (what it stores, bind/unbind/setname semantics, the nonce, chain scoping); mirror a matching section into `docs/src/content/docs/ko/human/modules/product-modules.mdx` (follow the file's existing ko voice).
-- Modify: `docs/src/content/docs/en/human/network/network-and-membership.mdx` — one paragraph: membership stays per-node; the identity module maps nodes to users above it. Mirror to `docs/src/content/docs/ko/...` counterpart.
+- Modify: `docs/src/content/docs/en/human/modules/product-modules.mdx` — an `identity` section (what it stores, bind/unbind/setname semantics, the nonce, chain scoping).
+- Modify: `docs/src/content/docs/en/human/network/network-and-membership.mdx` — one paragraph: membership stays per-node; the identity module maps nodes to users above it.
 - Modify: `bin/node/src/config.rs:75` doc comment — "(and for now the user's)" is no longer true; reword to point at the identity module for user identity.
 
 - [ ] **Step 1: Write all four doc edits.**

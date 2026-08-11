@@ -4,28 +4,32 @@
 //! is single-sourced (a behavior change in the native crate IS the wasm
 //! change).
 //!
-//! ## the whole-state dispatch model, and why it is equivalent
+//! ## the STORE-BACKED dispatch model
 //!
-//! the guest is re-instantiated per dispatch, so the native module inside it
-//! must FULLY apply per dispatch. each `execute`:
+//! saga is pure logic over a host-injected [`sdk::MerkleStore`] — so the port
+//! injects [`WitStore`], the adapter's `MerkleStore` over the wit `state-*`
+//! imports, and the REAL qmdb store stays host-side
+//! (`WasmModule::with_store`). there is NO per-dispatch snapshot: the store IS
+//! the state and the wasm root is the store's Merkle root, so this port is
+//! ROOT-CONTINUOUS with the native module (pinned block-by-block by
+//! `wasm_saga_parity`).
 //!
-//! 1. loads the persisted snapshot through the host's staged-overlay reads
-//!    (`__state`/`__root`, verify-then-adopt via the native `install`),
-//! 2. runs the native `execute` over a [`WitCtx`] — INCLUDING the assignment
-//!    pool reads (the valset membership for untagged sagas, the capability
-//!    registry's announced providers for tagged ones), both host-routed
-//!    `query-module` reads the runtime resolves through memoized replay,
-//! 3. on success calls the INNER module's `commit_block` — publishing the
-//!    ledger's per-op `pending` overlay into its committed map — and
-//! 4. saves the new canonical snapshot back as STAGED host writes.
+//! * the guest rebuilds the module FRESH per dispatch over the production
+//!   constructor; its inner staging overlay is per-dispatch, and cross-dispatch
+//!   read-your-writes comes from the host's outer staged overlay via
+//!   `WitStore::get` (staged-over-committed). the fold is safe for saga
+//!   SPECIFICALLY because every decision in its execute paths reads
+//!   staged-over-committed — there is no frozen-committed read anywhere in its
+//!   handle paths (contrast upgrade's `Advance`, which stays native for exactly
+//!   that reason).
+//! * each successful `execute` flushes the inner staging with the inner
+//!   `commit_block` — `state-set`/`state-delete` OUTER staging the host
+//!   publishes into the real store in ONE `commit_batch` at the true block
+//!   boundary. the accepted no-ops (a duplicate trigger, a stale result, a
+//!   crank that finds nothing expired) stage NOTHING on either side, so the op
+//!   log — and the root — stays byte-identical there too.
 //!
-//! the fold is safe for saga SPECIFICALLY because every decision in its
-//! execute paths reads staged-over-committed (`SagaModule::get` shadows the
-//! committed map with this block's `pending`, `visible_ids` unions both), so
-//! a reloaded module that sees earlier same-block writes as committed decides
-//! byte-identically — there is no frozen-committed read anywhere in its
-//! handle paths (contrast upgrade's `Advance`, which stays native for exactly
-//! that reason). the ordering-contract surfaces cross the seam unchanged:
+//! the ordering-contract surfaces cross the seam unchanged:
 //!
 //! * P6 callbacks: `emit_msg` follow-ups leave through the wit `emit-msg`
 //!   import and the runtime republishes them on a clean execute — the
@@ -36,14 +40,13 @@
 //!   worker seam decodes the identical [`saga::WorkerRequest`] bytes from
 //!   `BlockOutcome::events` on both runtimes (pinned by
 //!   `wasm_saga_parity.rs`), so the reactor feeds workers identically.
-//! * abort/rejection: nothing was saved (step 4 never ran), the runtime
-//!   restores the pre-dispatch overlay, and the host discards the outer
-//!   staging on a block abort — exactly the native `abort_block` story.
-//!
-//! the persisted encoding is the native module's canonical snapshot stored as
-//! ONE host-KV value, so the wasm root is the host-KV encoding over the two
-//! reserved keys — a STATE-SCHEMA BREAK versus the native root (revision 2 in
-//! `MODULE_STATE_SCHEMAS`; beta networks re-genesis, no back-compat shim).
+//! * SIBLING READS: the assignment pool (the valset membership for untagged
+//!   sagas, the capability registry's announced providers for tagged ones) is
+//!   a host-routed `query-module` read the runtime resolves through memoized
+//!   replay.
+//! * abort/rejection: nothing was flushed, the runtime restores the
+//!   pre-dispatch overlay, and the host discards the outer staging on a block
+//!   abort — exactly the native `abort_block` story.
 
 use crate::{LeasePolicy, SagaModule};
 
@@ -57,10 +60,18 @@ const MODULE_ID: &str = "saga";
 const VALSET_ID: &str = "valset";
 const CAPABILITY_ID: &str = "capability";
 
-// whole-state port: the shell loads/saves the canonical snapshot and runs the
-// native module per dispatch (see `guest_adapter::snapshot_guest!`).
-guest_adapter::snapshot_guest! {
+use guest_adapter::WitStore;
+
+// store-backed port: no snapshot — the host owns the real qmdb store and the
+// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+guest_adapter::store_guest! {
     id: MODULE_ID,
     module: SagaModule,
-    new: SagaModule::with_assignment(MODULE_ID, VALSET_ID, CAPABILITY_ID, LeasePolicy::Strict),
+    new: SagaModule::with_assignment(
+        MODULE_ID,
+        Box::new(WitStore),
+        VALSET_ID,
+        CAPABILITY_ID,
+        LeasePolicy::Strict,
+    ),
 }

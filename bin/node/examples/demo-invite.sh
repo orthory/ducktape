@@ -11,10 +11,10 @@
 #   friend:  ducktape node join <refreshed blob>     -> now a member
 #   both:    ducktape node run --config .../node.toml    -> one network
 #
-# the assertion: both identities boot the SAME genesis app-hash (identical
+# the assertion: both identities boot the SAME genesis root-hash (identical
 # descriptor -> identical genesis), an op submitted on the founder's node is
 # readable on the friend's (2-validator quorum crossed real TCP), and both
-# status app-hashes agree afterward.
+# status root-hashes agree afterward.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 command -v bun >/dev/null || { echo "bun is required" >&2; exit 1; }
@@ -66,11 +66,11 @@ rpc() { # rpc <port> <json>
 }
 hexenc() { printf '%s' "$1" | od -An -tx1 -v | tr -d ' \n'; }
 
-# identical descriptor -> identical genesis app-hash on both.
+# identical descriptor -> identical genesis root-hash on both.
 genesis_ok=""
 for _ in $(seq 1 60); do
-  ga=$(grep -m1 -oE 'genesis app_hash=[0-9a-f]+' "$loga" | cut -d= -f2 || true)
-  gb=$(grep -m1 -oE 'genesis app_hash=[0-9a-f]+' "$logb" | cut -d= -f2 || true)
+  ga=$(grep -m1 -oE 'genesis root_hash=[0-9a-f]+' "$loga" | cut -d= -f2 || true)
+  gb=$(grep -m1 -oE 'genesis root_hash=[0-9a-f]+' "$logb" | cut -d= -f2 || true)
   if [ -n "$ga" ] && [ -n "$gb" ]; then
     [ "$ga" = "$gb" ] && genesis_ok="yes"
     break
@@ -108,9 +108,9 @@ if [ -z "$converge_ok" ]; then
   exit 1
 fi
 
-# both status app-hashes agree at the settled boundary.
+# both status root-hashes agree at the settled boundary.
 hash_of() { # hash_of <port>
-  rpc "$1" '{"cmd":"status"}' | bun -e 'console.log((await Bun.stdin.json()).status.app_hash)'
+  rpc "$1" '{"cmd":"status"}' | bun -e 'console.log((await Bun.stdin.json()).status.root_hash)'
 }
 final_ok=""
 for _ in $(seq 1 20); do
@@ -120,10 +120,10 @@ for _ in $(seq 1 20); do
   sleep 0.5
 done
 if [ -z "$final_ok" ]; then
-  echo "FAIL: status app-hashes diverged (founder=$ha friend=$hb)"
+  echo "FAIL: status root-hashes diverged (founder=$ha friend=$hb)"
   exit 1
 fi
 
 echo
 echo "PASS: $chain_id founded, a friend joined by invite + pre-genesis admit,"
-echo "      both converged on app_hash=$ha over real TCP with keygen'd identities"
+echo "      both converged on root_hash=$ha over real TCP with keygen'd identities"

@@ -48,10 +48,6 @@ fn a_job_submit_claims_and_dispatches_with_the_spec_payload() {
         envelope.get("prompt_hash").is_none(),
         "the prompt pin retired — the job run's agent is its curated skills too"
     );
-    assert!(
-        envelope["thread_key"].is_null(),
-        "job runs have no channel, so no thread key"
-    );
     let conversation = envelope["conversation"].as_str().unwrap();
     assert!(
         conversation.contains("summarize this work item"),

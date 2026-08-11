@@ -173,7 +173,7 @@ connection-layer swap when it wakes — no door closes.
   surfaced (mnemonic reveal/restore exists).
 - Decisions (question-bomb): labels are **on-chain** — an identity-module
   label op, so a device's label is visible from the user's other devices
-  (consensus module change; genesis app-hash moves, re-seed accepted).
+  (consensus module change; genesis root-hash moves, re-seed accepted).
   Aggregation renders **cached last-known state** per network, refreshed on
   switch (single-active). Unbind is **per-network**; no bulk
   "remove everywhere" button.

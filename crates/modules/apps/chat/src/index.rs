@@ -1,17 +1,33 @@
-//! chat's materialized view: full-text message search.
+//! chat's read model: the FULL human-facing surface — channel lists, message
+//! pages, threads, revisions, reactions, members, huddles, full-text search,
+//! and tags — folded from the applied-op feed into chat's per-module index
+//! database.
 //!
-//! canonical chat state serves by-sequence pages and point lookups; it cannot
-//! scan or search (any::unordered qmdb — hashed keys). this mapper folds every
-//! applied [`ChatMsg`] into a token index and serves `search` as chat's own
-//! endpoint on the derived tier.
+//! canonical chat state is hash-addressable qmdb serving DISPATCH point
+//! reads only; everything a human lists, scrolls, or searches is served
+//! here, where the engine iterates natively. consensus never reads this
+//! tier; this tier never feeds consensus.
 //!
 //! key spaces (inside chat's per-module index database):
-//! - `seq/{channel}`                    — mirror of the channel's head_seq.
-//!   faithful BY CONSTRUCTION: a failed op aborts its whole block and never
-//!   reaches the index, so every applied `PostMessage` assigned exactly the
-//!   next sequence, in drain order.
-//! - `msg/{channel}/{seq:016x}`         — the current head text of one message
-//!   ([`MsgRow`]); edits rewrite it, deletes tombstone it.
+//! - `seq/{channel}`                    — mirror of the channel's head_seq,
+//!   written from each applied `PostMessage`'s assigned stamp
+//!   ([`crate::ChatAssigned::Posted`] on the feed row) — the module's exact
+//!   in-state assignment, never a counted derivation, so the mirror cannot
+//!   desync across a boundary stamp.
+//! - `channel/{id}`                     — one [`ChannelRow`]: metadata, post
+//!   policy, owner, archive flag, hooks, and the live huddle roster.
+//!   enumeration IS the keyspace — the channel list is a prefix scan.
+//! - `msg/{channel}/{seq:016x}`         — the renderable head of one message
+//!   ([`MsgRow`]): structured blocks, flattened search text, authorship,
+//!   edit/thread summaries, and reaction state. edits rewrite it, deletes
+//!   tombstone it, reactions update it in place.
+//! - `msgid/{message_id}`               — global id → (channel, seq) pointer.
+//! - `rev/{channel}/{seq:016x}/{rev:08x}` — the immutable prior head a
+//!   revision replaced, ascending by revision.
+//! - `thread/{channel}/{root:016x}/{reply:016x}` — one marker per reply;
+//!   thread pages are a prefix scan in post order.
+//! - `member/{channel}/{handle}`        — one [`MemberRow`] per channel
+//!   member, keyed by the rendered user handle.
 //! - `tok/{token}/{channel}/{seq:016x}` — one posting per (token, message),
 //!   value = [`TokRef`]. postings of a tombstoned/retokenized head are
 //!   deleted in the same fold, so search never surfaces stale text.
@@ -19,29 +35,25 @@
 //!   hashtag postings and per-channel tag catalog (see [`tags`]), maintained
 //!   by the same fold with the same tombstone/re-fold discipline.
 //!
-//! caveat (shared by every mapper): the view reflects ops applied SINCE the
-//! index existed. enabling an index against storage with prior chat history
-//! leaves that history unsearchable — and the seq mirror offset — until the
-//! index is re-derived, either by replaying the chain from genesis or via the
-//! from-state rebuild below.
+//! caveat (shared by every mapper): the view reflects ops folded SINCE the
+//! index existed. a boundary-stamped or freshly-enabled index has no rows
+//! below its floor until a shipped index (`sync_index`, the default join
+//! path) or a chain replay establishes them; pages honestly skip absent rows
+//! rather than erroring. sequences are exact even across a boundary: every
+//! feed row carries the module-assigned stamp, so numbering never restarts.
 //!
-//! from-state rebuild: canonical `Channels`/`MessagesRange` enumerate every
-//! sequence gap-free (tombstones and replies included), so the seq mirrors,
-//! rows, and postings all re-derive with an exact hit set. this mapper is the
-//! spec's NAMED degradation case: canonical heads keep no block height, so
-//! `height` collapses to the boundary — but `created_at` survives, so `time`
-//! (and with it search ranking) stays exact.
+//! this file is the DECISION core — pure functions over [`StateRead`],
+//! compiled natively and unit-tested against a plain map. the wasm shell
+//! (`src/index_guest.rs`, feature `index-guest`) wires it into the engine.
+//! within one op a read never sees that op's own writes (they apply after
+//! the decision); across ops in one feed batch it sees everything earlier —
+//! identical in the engine transaction and the native test harness.
 
-use crate::{
-    AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, DEFAULT_CHAT_TARGET, MAX_QUERY_LIMIT, Span,
-    decode_msg, decode_reply, encode_query,
-};
-use indexer::search::{self, DEFAULT_POSTING_CAP};
-use indexer::{
-    ApplyCtx, Backfill, Derived, Error, ModuleIndexer, OpMeta, OriginKind, OriginTag, RebuildMeta,
-    Result, StateReader, ViewReader,
-};
+use index_guest::search::{self, DEFAULT_POSTING_CAP};
+use index_guest::{Fail, OpRow, OriginKind, OriginTag, StateRead, Writes, user_handle};
 use serde::{Deserialize, Serialize};
+
+use crate::{Block, ChatAssigned, ChatMsg, PostPolicy, Span, decode_assigned, decode_msg};
 
 mod tags;
 pub use tags::{MAX_TAG_CHARS, MAX_TAGS_PER_MESSAGE, TagRow};
@@ -49,10 +61,27 @@ pub use tags::{MAX_TAG_CHARS, MAX_TAGS_PER_MESSAGE, TagRow};
 /// default and max page size for search results.
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 100;
+/// default and max page size for list/page views (channels, messages,
+/// threads, members). the max mirrors the retired canonical page bound.
+const DEFAULT_PAGE_LIMIT: usize = 50;
+const MAX_PAGE_LIMIT: usize = 256;
 
-/// the stored head row of one message, as search results return it.
+/// [`Fail`] code: an applied op's payload did not decode — the interface
+/// crates drifted, which only a refold can honestly repair. fail loudly (the
+/// feed holds), never guess.
+const FAIL_OP_DECODE: i32 = 2;
+/// [`Fail`] code: a stored row did not decode — a damaged read model.
+const FAIL_ROW_DECODE: i32 = 3;
+/// [`Fail`] code: a view request this mapper does not speak.
+const FAIL_BAD_REQUEST: i32 = 4;
+/// [`Fail`] code: an applied op that assigns (post, edit) carried a missing
+/// or undecodable assigned stamp — the same interface-drift class as
+/// [`FAIL_OP_DECODE`]: the feed holds until a fixed guest ships.
+const FAIL_ASSIGNED_DECODE: i32 = 5;
+
+/// the stored head row of one message — the renderable read-model record
+/// every message view returns (pages, threads, search hits, point lookups).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct MsgRow {
     pub channel_id: String,
     pub seq: u64,
@@ -63,10 +92,28 @@ pub struct MsgRow {
     pub author: String,
     pub height: u64,
     pub time: u64,
+    /// the structured message body, verbatim from the applied op; a
+    /// tombstone's is empty.
+    pub blocks: Vec<Block>,
+    /// the flattened plain text the token index sees (and search returns).
     pub text: String,
     pub deleted: bool,
     pub edited: bool,
+    /// edit revision; 0 = original post. the replaced heads live under
+    /// `rev/…`, ascending.
+    pub rev: u32,
+    pub edited_at: Option<u64>,
+    /// the revision the last edit CLAIMED to be based on, verbatim from the
+    /// op — a stale base is recorded, never rejected, exactly as canonical
+    /// chat stores it.
+    pub base_rev: Option<u32>,
+    /// `Some(root_seq)` marks this message as a thread reply.
     pub thread: Option<u64>,
+    /// reply summary maintained on a thread ROOT as replies fold.
+    pub reply_count: u64,
+    pub last_reply_seq: Option<u64>,
+    /// live reaction state, emoji-sorted; a tombstone carries none.
+    pub reactions: Vec<ReactionRow>,
     /// the head's normalized tag labels (appearance order, ≤ 16) — stored so
     /// an edit/delete can diff/clear exactly what this head indexed (the flat
     /// `text` can't re-derive them: it folds code blocks in). tombstones
@@ -74,9 +121,62 @@ pub struct MsgRow {
     pub tags: Vec<String>,
 }
 
+/// one emoji's reactors on a message, rendered handles, both levels sorted
+/// for a deterministic row byte image.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReactionRow {
+    pub emoji: String,
+    pub reactors: Vec<String>,
+}
+
+/// the stored row of one channel: metadata, policy, and the live huddle
+/// roster. the head sequence lives in the `seq/` mirror (one write per post
+/// instead of one row rewrite per post); channel views join the two.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelRow {
+    pub id: String,
+    pub name: String,
+    pub created_at: u64,
+    /// `"open"` posting or members-only, rendered from the op.
+    pub post_policy: PostPolicy,
+    /// the rendered creator handle for user-created channels; `None` for
+    /// module/system-minted ones.
+    pub owner: Option<String>,
+    pub archived: bool,
+    /// module ids notified on every post.
+    pub hooks: Vec<String>,
+    /// the live huddle roster, join order.
+    pub huddle: Vec<HuddleEntry>,
+}
+
+/// one huddle participant: rendered user handle plus the hex node key peers
+/// route media to.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HuddleEntry {
+    pub user: String,
+    pub node: String,
+    pub joined_at: u64,
+}
+
+/// one channel member, keyed by rendered handle.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemberRow {
+    pub user: String,
+    pub height: u64,
+    pub time: u64,
+}
+
+/// a channel row joined with its head-sequence mirror — what channel views
+/// return.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelInfo {
+    #[serde(flatten)]
+    pub channel: ChannelRow,
+    pub head_seq: u64,
+}
+
 /// a token posting's value: enough to rank (time) and fetch the row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TokRef {
     channel_id: String,
     seq: u64,
@@ -85,11 +185,66 @@ struct TokRef {
 }
 
 /// chat's view requests. externally tagged json, matching the module wire
-/// style: `{"search": {"text": "...", "channelId": "...", "limit": 20}}`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// style: `{"search": {"text": "...", "channel_id": "...", "limit": 20}}`.
+/// `Serialize` too: typed clients (the app's `RpcClient::view`) build
+/// requests from this same enum, so the wire has one definition site.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChatViewQuery {
-    #[serde(rename_all = "camelCase")]
+    /// the channel list, ascending by id, cursor-paged.
+    Channels {
+        #[serde(default)]
+        after: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// one channel joined with its head-seq mirror.
+    Channel { channel_id: String },
+    /// the newest `limit` messages, ascending by sequence — computed off the
+    /// `seq/` mirror, tombstones included, so pagination stays gap-free.
+    MessagesLatest {
+        channel_id: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// `limit` messages starting at `from_seq`, ascending.
+    MessagesRange {
+        channel_id: String,
+        from_seq: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// the window of `limit` messages CENTERED on `seq` — the jump-to-message
+    /// read for a search/tag hit older than the newest page.
+    MessagesAround {
+        channel_id: String,
+        seq: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// global message-id lookup.
+    Message { message_id: String },
+    /// the immutable edit history of one message, ascending by revision.
+    Revisions { channel_id: String, seq: u64 },
+    /// the thread root plus one cursor-paged run of replies, post order.
+    Thread {
+        channel_id: String,
+        root_seq: u64,
+        #[serde(default)]
+        after: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// one message's live reaction state.
+    Reactions { channel_id: String, seq: u64 },
+    /// the channel member roster, ascending by handle, cursor-paged.
+    Members {
+        channel_id: String,
+        #[serde(default)]
+        after: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     Search {
         text: String,
         #[serde(default)]
@@ -97,9 +252,8 @@ pub enum ChatViewQuery {
         #[serde(default)]
         limit: Option<usize>,
     },
-    /// the tag catalog: `{"tags": {"channelId": "...", "limit": 20}}`. no
+    /// the tag catalog: `{"tags": {"channel_id": "...", "limit": 20}}`. no
     /// channel aggregates every channel per label.
-    #[serde(rename_all = "camelCase")]
     Tags {
         #[serde(default)]
         channel_id: Option<String>,
@@ -107,8 +261,7 @@ pub enum ChatViewQuery {
         limit: Option<usize>,
     },
     /// live messages carrying one exact tag, newest first:
-    /// `{"tagSearch": {"tag": "rust", "channelId": "...", "limit": 20}}`.
-    #[serde(rename_all = "camelCase")]
+    /// `{"tag_search": {"tag": "rust", "channel_id": "...", "limit": 20}}`.
     TagSearch {
         tag: String,
         #[serde(default)]
@@ -118,40 +271,72 @@ pub enum ChatViewQuery {
     },
 }
 
-/// chat's view replies: `{"hits": [<MsgRow>…]}` newest first, or
-/// `{"tags": [<TagRow>…]}` count-ordered.
+/// chat's view replies, externally tagged like the requests.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum ChatViewReply {
+    /// one cursor page of channels, ascending by id.
+    Channels {
+        channels: Vec<ChannelInfo>,
+        has_more: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_after: Option<String>,
+    },
+    Channel(Option<ChannelInfo>),
+    /// message rows ascending by sequence (pages) — absent rows below a
+    /// backfill floor are skipped, never errored.
+    Messages(Vec<MsgRow>),
+    Message(Option<MsgRow>),
+    /// prior heads ascending by revision.
+    Revisions(Vec<MsgRow>),
+    /// a thread root plus one cursor page of replies, post order. `root` is
+    /// `None` when the sequence names no indexed message or names a reply.
+    Thread {
+        root: Option<MsgRow>,
+        replies: Vec<MsgRow>,
+        has_more: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_after: Option<String>,
+    },
+    Reactions(Vec<ReactionRow>),
+    /// one cursor page of the member roster.
+    Members {
+        members: Vec<MemberRow>,
+        has_more: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_after: Option<String>,
+    },
+    /// search/tag hits, newest first.
     Hits(Vec<MsgRow>),
     Tags(Vec<TagRow>),
-}
-
-/// the chat mapper. register with the module's genesis id.
-pub struct ChatIndex {
-    module: String,
-}
-
-impl ChatIndex {
-    pub fn new(module: impl Into<String>) -> Self {
-        Self {
-            module: module.into(),
-        }
-    }
-}
-
-impl Default for ChatIndex {
-    fn default() -> Self {
-        Self::new(DEFAULT_CHAT_TARGET)
-    }
 }
 
 fn seq_key(channel: &str) -> String {
     format!("seq/{channel}")
 }
 
+fn channel_row_key(channel: &str) -> String {
+    format!("channel/{channel}")
+}
+
 fn msg_key(channel: &str, seq: u64) -> String {
     format!("msg/{channel}/{seq:016x}")
+}
+
+fn msgid_key(message_id: &str) -> String {
+    format!("msgid/{message_id}")
+}
+
+fn rev_row_key(channel: &str, seq: u64, rev: u32) -> String {
+    format!("rev/{channel}/{seq:016x}/{rev:08x}")
+}
+
+fn thread_marker_key(channel: &str, root_seq: u64, reply_seq: u64) -> String {
+    format!("thread/{channel}/{root_seq:016x}/{reply_seq:016x}")
+}
+
+fn member_row_key(channel: &str, handle: &str) -> String {
+    format!("member/{channel}/{handle}")
 }
 
 fn tok_key(token: &str, channel: &str, seq: u64) -> String {
@@ -185,8 +370,10 @@ fn plain_text(blocks: &[Block]) -> String {
 }
 
 /// render the author the way chat derives it: origin decides, `as_agent`
-/// refines a module origin into an agent author.
-fn author(origin: &OriginTag, as_agent: Option<&str>) -> String {
+/// refines a module origin into an agent author. pub: feed followers outside
+/// the fold (the desktop app folding the same op stream) must render
+/// authorship identically or rows drift between hydration and deltas.
+pub fn author(origin: &OriginTag, as_agent: Option<&str>) -> String {
     let id = origin.id.as_deref().unwrap_or_default();
     match (origin.kind, as_agent) {
         (OriginKind::Module, Some(agent)) => format!("agent:{id}/{agent}"),
@@ -196,329 +383,659 @@ fn author(origin: &OriginTag, as_agent: Option<&str>) -> String {
     }
 }
 
-/// render a canonical [`AuthorRef`] to the SAME string [`author`] renders the
-/// dispatch origin to — rebuilt rows must read identically to folded ones.
-/// user keys go through [`indexer::user_handle`], the same rendering the node
-/// layer applies when it flattens an external origin into an [`OriginTag`]
-/// (`noded::index_origin`): printable names pass through, raw pubkeys become
-/// hex — never the lossy `�` boxes a plain utf-8 decode would leave.
-fn author_from_ref(author: &AuthorRef) -> String {
-    match author {
-        AuthorRef::User(key) => format!("user:{}", indexer::user_handle(key)),
-        AuthorRef::Agent { module, agent_id } => format!("agent:{module}/{agent_id}"),
-        AuthorRef::Module(id) => format!("module:{id}"),
-        AuthorRef::System => "system".to_string(),
-    }
-}
-
-fn read_u64(ctx: &ApplyCtx, key: &str) -> Result<u64> {
-    Ok(ctx
-        .get(key.as_bytes())?
+fn read_u64(read: &impl StateRead, key: &str) -> u64 {
+    read.get(key.as_bytes())
         .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
         .map(u64::from_be_bytes)
-        .unwrap_or(0))
+        .unwrap_or(0)
 }
 
-fn read_row(ctx: &ApplyCtx, key: &str) -> Result<Option<MsgRow>> {
-    match ctx.get(key.as_bytes())? {
-        Some(bytes) => Ok(Some(
-            serde_json::from_slice(&bytes).map_err(|e| Error::Mapper(e.to_string()))?,
-        )),
-        None => Ok(None),
-    }
+fn read_row(read: &impl StateRead, key: &str) -> Result<Option<MsgRow>, Fail> {
+    let Some(bytes) = read.get(key.as_bytes()) else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))
 }
 
-/// every entry one head state materializes to — the row plus one posting per
-/// token and per tag label (a tombstone's empty text and tag set yield none).
-/// fold and rebuild both write THROUGH this, so the two paths produce
-/// byte-identical rows.
-fn row_entries(row: &MsgRow) -> Result<Vec<(String, Vec<u8>)>> {
-    let mut entries = vec![(
+fn read_channel(read: &impl StateRead, channel: &str) -> Result<Option<ChannelRow>, Fail> {
+    let Some(bytes) = read.get(channel_row_key(channel).as_bytes()) else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))
+}
+
+fn encode_json<T: Serialize>(value: &T) -> Result<Vec<u8>, Fail> {
+    serde_json::to_vec(value).map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))
+}
+
+/// stage ONLY the message row — for folds that change no text or tags
+/// (reaction updates, thread summaries on a root), so token and tag postings
+/// stay untouched.
+fn put_row(out: &mut Writes, row: &MsgRow) -> Result<(), Fail> {
+    index_guest::put(out, msg_key(&row.channel_id, row.seq), encode_json(row)?);
+    Ok(())
+}
+
+fn put_channel(out: &mut Writes, row: &ChannelRow) -> Result<(), Fail> {
+    index_guest::put(out, channel_row_key(&row.id), encode_json(row)?);
+    Ok(())
+}
+
+/// page-view limit: absent → default, always within [1, max]. read-model
+/// clamping only — nothing here is a consensus bound.
+fn clamp_page(limit: Option<usize>) -> usize {
+    limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT)
+}
+
+/// stage every entry one head state materializes to — the row plus one
+/// posting per token and per tag label (a tombstone's empty text and tag set
+/// yield none) — so every write path produces byte-identical rows.
+fn put_row_and_toks(out: &mut Writes, row: &MsgRow) -> Result<(), Fail> {
+    index_guest::put(
+        out,
         msg_key(&row.channel_id, row.seq),
-        serde_json::to_vec(row).map_err(|e| Error::Mapper(e.to_string()))?,
-    )];
+        serde_json::to_vec(row).map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?,
+    );
     let tok_ref = serde_json::to_vec(&TokRef {
         channel_id: row.channel_id.clone(),
         seq: row.seq,
         message_id: row.message_id.clone(),
         time: row.time,
     })
-    .map_err(|e| Error::Mapper(e.to_string()))?;
+    .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
     for token in search::tokens(&row.text) {
-        entries.push((tok_key(&token, &row.channel_id, row.seq), tok_ref.clone()));
+        index_guest::put(
+            out,
+            tok_key(&token, &row.channel_id, row.seq),
+            tok_ref.clone(),
+        );
     }
     for label in &row.tags {
-        entries.push((
+        index_guest::put(
+            out,
             tags::tag_key(label, &row.channel_id, row.seq),
             tok_ref.clone(),
-        ));
-    }
-    Ok(entries)
-}
-
-fn put_row_and_toks(out: &mut Derived, row: &MsgRow) -> Result<()> {
-    for (key, value) in row_entries(row)? {
-        out.put(key, value);
+        );
     }
     Ok(())
 }
 
-fn delete_toks(out: &mut Derived, row: &MsgRow) {
+fn delete_toks(out: &mut Writes, row: &MsgRow) {
     for token in search::tokens(&row.text) {
-        out.delete(tok_key(&token, &row.channel_id, row.seq));
+        index_guest::delete(out, tok_key(&token, &row.channel_id, row.seq));
     }
 }
 
-#[async_trait::async_trait(?Send)]
-impl ModuleIndexer for ChatIndex {
-    fn module(&self) -> &str {
-        &self.module
-    }
+/// decode the module-assigned stamp an applied assigning op carries on its
+/// feed row. every applied post/edit stamps ([`crate::Module::execute`] sets
+/// it unconditionally), so an empty or undecodable stamp is interface drift —
+/// the [`FAIL_OP_DECODE`] class: fail loudly, the feed holds.
+fn decode_stamp(op: &OpRow) -> Result<ChatAssigned, Fail> {
+    decode_assigned(&op.assigned).map_err(|e| Fail::new(FAIL_ASSIGNED_DECODE, e))
+}
 
-    fn index_op(
-        &self,
-        ctx: &ApplyCtx,
-        meta: &OpMeta,
-        payload: &[u8],
-        out: &mut Derived,
-    ) -> Result<()> {
-        // an applied op decoded fine in the module; failing HERE means the
-        // interface crates drifted — poison loudly, never guess.
-        let msg = decode_msg(payload).map_err(Error::Mapper)?;
-        match msg {
-            ChatMsg::PostMessage {
-                channel_id,
-                message_id,
-                blocks,
-                thread,
-                as_agent,
-            } => {
-                let seq = read_u64(ctx, &seq_key(&channel_id))? + 1;
-                out.put(seq_key(&channel_id), seq.to_be_bytes().to_vec());
-                let row = MsgRow {
-                    seq,
-                    message_id,
-                    author: author(meta.origin, as_agent.as_deref()),
-                    height: meta.height,
-                    time: meta.time,
-                    text: plain_text(&blocks),
-                    deleted: false,
-                    edited: false,
-                    thread,
-                    tags: tags::labels(&blocks),
-                    channel_id,
-                };
-                tags::fold_catalog(ctx, out, &row.channel_id, &[], &row.tags)?;
-                put_row_and_toks(out, &row)
-            }
-            ChatMsg::EditMessage {
-                channel_id,
-                seq,
-                blocks,
-                ..
-            } => {
-                // absent row == the message predates this index; nothing to
-                // retokenize (see the module doc's pre-index caveat).
-                let Some(mut row) = read_row(ctx, &msg_key(&channel_id, seq))? else {
-                    return Ok(());
-                };
-                if row.deleted {
-                    return Ok(());
-                }
-                // delete BEFORE re-putting: tokens/tags shared by the old and
-                // new text stage a delete then a put, and the last action
-                // wins. the catalog moves by the old/new tag-set DIFF.
-                delete_toks(out, &row);
-                tags::delete_postings(out, &row);
-                let new_tags = tags::labels(&blocks);
-                tags::fold_catalog(ctx, out, &row.channel_id, &row.tags, &new_tags)?;
-                row.text = plain_text(&blocks);
-                row.tags = new_tags;
-                row.edited = true;
-                put_row_and_toks(out, &row)
-            }
-            ChatMsg::DeleteMessage { channel_id, seq } => {
-                let Some(mut row) = read_row(ctx, &msg_key(&channel_id, seq))? else {
-                    return Ok(());
-                };
-                delete_toks(out, &row);
-                tags::delete_postings(out, &row);
-                tags::fold_catalog(ctx, out, &row.channel_id, &row.tags, &[])?;
-                row.deleted = true;
-                row.text = String::new();
-                row.tags = Vec::new();
-                put_row_and_toks(out, &row)
-            }
-            // channel records (create/rename/archive), reactions, hooks,
-            // membership, and huddle rosters don't change any searchable text —
-            // no view impact.
-            ChatMsg::CreateChannel { .. }
-            | ChatMsg::RenameChannel { .. }
-            | ChatMsg::SetChannelArchived { .. }
-            | ChatMsg::AddReaction { .. }
-            | ChatMsg::RemoveReaction { .. }
-            | ChatMsg::RegisterHook { .. }
-            | ChatMsg::UnregisterHook { .. }
-            | ChatMsg::SetMembership { .. }
-            | ChatMsg::JoinHuddle { .. }
-            | ChatMsg::LeaveHuddle { .. }
-            | ChatMsg::SweepHuddle { .. } => Ok(()),
-        }
-    }
-
-    fn serve_view(&self, reader: &ViewReader, req: &[u8]) -> Result<Vec<u8>> {
-        let query: ChatViewQuery =
-            serde_json::from_slice(req).map_err(|e| Error::View(e.to_string()))?;
-        match query {
-            ChatViewQuery::Search {
-                text,
-                channel_id,
-                limit,
-            } => {
-                let tokens: Vec<String> = search::tokens(&text).into_iter().collect();
-                if tokens.is_empty() {
-                    return Err(Error::View("search text has no tokens".into()));
-                }
-                // each token matches as a prefix; the channel scope filters the
-                // intersected refs by their stored channel (postings can't embed
-                // it after a partial token).
-                let mut refs: Vec<TokRef> =
-                    search::intersect_prefix(reader, "tok/", &tokens, DEFAULT_POSTING_CAP)?
-                        .into_iter()
-                        .filter_map(|hit| serde_json::from_slice(&hit.value).ok())
-                        .filter(|r: &TokRef| channel_id.as_ref().is_none_or(|c| &r.channel_id == c))
-                        .collect();
-                // newest first; (channel, seq) tiebreak for a stable order.
-                refs.sort_by(|a, b| {
-                    (b.time, &b.channel_id, b.seq).cmp(&(a.time, &a.channel_id, a.seq))
-                });
-                let limit = limit
-                    .unwrap_or(DEFAULT_SEARCH_LIMIT)
-                    .clamp(1, MAX_SEARCH_LIMIT);
-                let mut hits = Vec::new();
-                for r in refs.into_iter().take(limit) {
-                    if let Some(bytes) = reader.get(msg_key(&r.channel_id, r.seq).as_bytes())? {
-                        let row: MsgRow = serde_json::from_slice(&bytes)
-                            .map_err(|e| Error::Mapper(e.to_string()))?;
-                        hits.push(row);
-                    }
-                }
-                serde_json::to_vec(&ChatViewReply::Hits(hits))
-                    .map_err(|e| Error::View(e.to_string()))
-            }
-            ChatViewQuery::Tags { channel_id, limit } => {
-                let rows = tags::serve_tags(reader, channel_id, limit)?;
-                serde_json::to_vec(&ChatViewReply::Tags(rows))
-                    .map_err(|e| Error::View(e.to_string()))
-            }
-            ChatViewQuery::TagSearch {
-                tag,
-                channel_id,
-                limit,
-            } => {
-                let hits = tags::serve_tag_search(reader, &tag, channel_id, limit)?;
-                serde_json::to_vec(&ChatViewReply::Hits(hits))
-                    .map_err(|e| Error::View(e.to_string()))
-            }
-        }
-    }
-
-    fn supports_rebuild(&self) -> bool {
-        true
-    }
-
-    /// re-derive the seq mirrors, rows, and postings from canonical
-    /// `Channels`/`MessagesRange`. the per-channel sequence space is gap-free
-    /// (tombstones and replies included), so every head re-derives. the
-    /// spec's named degradation: heads keep no block height, so `height`
-    /// collapses to the boundary — `time` survives via `created_at`, so
-    /// ranking stays exact.
-    async fn rebuild_from_state(
-        &self,
-        state: &dyn StateReader,
-        meta: &RebuildMeta,
-        out: &mut Backfill<'_>,
-    ) -> Result<()> {
-        let reply = state.query(&encode_query(&ChatQuery::Channels)).await?;
-        let channels = match decode_reply(&reply).map_err(Error::State)? {
-            ChatReply::Channels(channels) => channels,
-            other => return Err(Error::State(format!("Channels answered {other:?}"))),
-        };
-        for channel in channels {
-            out.put(
-                seq_key(&channel.id),
-                channel.head_seq.to_be_bytes().to_vec(),
+/// fold one applied op into derived writes. an applied op decoded fine in the
+/// module; failing HERE means the interface crates drifted — fail loudly (the
+/// feed holds and surfaces it), never guess. an applied op also PASSED every
+/// canonical validation (a failed op aborts its block and never reaches the
+/// feed), so arms mirror state transitions without re-judging them; an
+/// absent row/channel means the record predates this index (the module doc's
+/// pre-index caveat) and folds to a deterministic skip.
+pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
+    let msg = decode_msg(&op.payload).map_err(|e| Fail::new(FAIL_OP_DECODE, e))?;
+    let mut out = Writes::new();
+    match msg {
+        ChatMsg::CreateChannel {
+            channel_id,
+            name,
+            post_policy,
+        } => {
+            let is_user = matches!(op.origin.kind, OriginKind::External);
+            let owner = is_user.then(|| op.origin.id.clone().unwrap_or_default());
+            put_channel(
+                &mut out,
+                &ChannelRow {
+                    id: channel_id,
+                    name,
+                    created_at: op.time,
+                    post_policy,
+                    owner,
+                    archived: false,
+                    hooks: Vec::new(),
+                    huddle: Vec::new(),
+                },
             )?;
-            // the channel's tag catalog re-accumulates from the live heads —
-            // count-only, exactly what the fold maintains incrementally.
-            let mut tag_counts: std::collections::BTreeMap<String, u64> =
-                std::collections::BTreeMap::new();
-            let mut from_seq = 1u64;
-            while from_seq <= channel.head_seq {
-                let reply = state
-                    .query(&encode_query(&ChatQuery::MessagesRange {
-                        channel_id: channel.id.clone(),
-                        from_seq,
-                        limit: MAX_QUERY_LIMIT,
-                    }))
-                    .await?;
-                let views = match decode_reply(&reply).map_err(Error::State)? {
-                    ChatReply::Messages(views) => views,
-                    other => {
-                        return Err(Error::State(format!("MessagesRange answered {other:?}")));
-                    }
-                };
-                // the sequence space is gap-free through head_seq, so an
-                // empty page below the head is drift, not the end.
-                let Some(last) = views.last() else {
-                    return Err(Error::State(format!(
-                        "channel {} empty at seq {from_seq}, head {}",
-                        channel.id, channel.head_seq
-                    )));
-                };
-                from_seq = last.seq + 1;
-                for view in views {
-                    let head = view.head;
-                    let row = MsgRow {
-                        channel_id: view.channel_id,
-                        seq: view.seq,
-                        message_id: head.message_id,
-                        author: author_from_ref(&head.author),
-                        height: meta.height,
-                        time: head.created_at,
-                        // mirror the fold's tombstone exactly: empty text and
-                        // tag set (so no postings), whatever skeleton the
-                        // head kept.
-                        text: if head.deleted {
-                            String::new()
-                        } else {
-                            plain_text(&head.blocks)
-                        },
-                        deleted: head.deleted,
-                        edited: head.rev > 0,
-                        thread: head.thread,
-                        tags: if head.deleted {
-                            Vec::new()
-                        } else {
-                            tags::labels(&head.blocks)
-                        },
-                    };
-                    for label in &row.tags {
-                        *tag_counts.entry(label.clone()).or_insert(0) += 1;
-                    }
-                    for (key, value) in row_entries(&row)? {
-                        out.put(key, value)?;
-                    }
+        }
+        ChatMsg::RenameChannel { channel_id, name } => {
+            let Some(mut row) = read_channel(read, &channel_id)? else {
+                return Ok(out);
+            };
+            row.name = name;
+            put_channel(&mut out, &row)?;
+        }
+        ChatMsg::SetChannelArchived {
+            channel_id,
+            archived,
+        } => {
+            let Some(mut row) = read_channel(read, &channel_id)? else {
+                return Ok(out);
+            };
+            row.archived = archived;
+            put_channel(&mut out, &row)?;
+        }
+        ChatMsg::PostMessage {
+            channel_id,
+            message_id,
+            blocks,
+            thread,
+            as_agent,
+        } => {
+            let ChatAssigned::Posted { seq } = decode_stamp(op)? else {
+                return Err(Fail::new(
+                    FAIL_ASSIGNED_DECODE,
+                    "applied PostMessage carried a non-Posted stamp",
+                ));
+            };
+            index_guest::put(&mut out, seq_key(&channel_id), seq.to_be_bytes().to_vec());
+            index_guest::put(
+                &mut out,
+                msgid_key(&message_id),
+                encode_json(&(channel_id.clone(), seq))?,
+            );
+            if let Some(root_seq) = thread {
+                index_guest::put(
+                    &mut out,
+                    thread_marker_key(&channel_id, root_seq, seq),
+                    seq.to_be_bytes().to_vec(),
+                );
+                // the root carries the reply summary; a pre-index root skips
+                // it (its marker still lands, so the page stays complete).
+                if let Some(mut root) = read_row(read, &msg_key(&channel_id, root_seq))? {
+                    root.reply_count += 1;
+                    root.last_reply_seq = Some(seq);
+                    put_row(&mut out, &root)?;
                 }
             }
-            for (label, count) in tag_counts {
-                out.put(
-                    tags::catalog_key(&channel.id, &label),
-                    tags::encode_catalog(count)?,
-                )?;
+            let text = plain_text(&blocks);
+            let tag_labels = tags::labels(&blocks);
+            let row = MsgRow {
+                seq,
+                message_id,
+                author: author(&op.origin, as_agent.as_deref()),
+                height: op.height,
+                time: op.time,
+                text,
+                blocks,
+                deleted: false,
+                edited: false,
+                rev: 0,
+                edited_at: None,
+                base_rev: None,
+                thread,
+                reply_count: 0,
+                last_reply_seq: None,
+                reactions: Vec::new(),
+                tags: tag_labels,
+                channel_id,
+            };
+            tags::fold_catalog(read, &mut out, &row.channel_id, &[], &row.tags)?;
+            put_row_and_toks(&mut out, &row)?;
+        }
+        ChatMsg::EditMessage {
+            channel_id,
+            seq,
+            blocks,
+            base_rev,
+        } => {
+            let ChatAssigned::Edited { rev } = decode_stamp(op)? else {
+                return Err(Fail::new(
+                    FAIL_ASSIGNED_DECODE,
+                    "applied EditMessage carried a non-Edited stamp",
+                ));
+            };
+            // absent row == the message predates this index; nothing to
+            // retokenize (see the module doc's pre-index caveat).
+            let Some(mut row) = read_row(read, &msg_key(&channel_id, seq))? else {
+                return Ok(out);
+            };
+            if row.deleted {
+                return Ok(out);
+            }
+            // the replaced head becomes an immutable revision record,
+            // exactly like canonical chat's `rev/…` history.
+            index_guest::put(
+                &mut out,
+                rev_row_key(&channel_id, seq, row.rev),
+                encode_json(&row)?,
+            );
+            // delete BEFORE re-putting: tokens/tags shared by the old and
+            // new text stage a delete then a put, and the last command
+            // wins. the catalog moves by the old/new tag-set DIFF.
+            delete_toks(&mut out, &row);
+            tags::delete_postings(&mut out, &row);
+            let new_tags = tags::labels(&blocks);
+            tags::fold_catalog(read, &mut out, &row.channel_id, &row.tags, &new_tags)?;
+            row.text = plain_text(&blocks);
+            row.blocks = blocks;
+            row.tags = new_tags;
+            row.edited = true;
+            row.rev = rev;
+            row.edited_at = Some(op.time);
+            row.base_rev = base_rev;
+            put_row_and_toks(&mut out, &row)?;
+        }
+        ChatMsg::DeleteMessage { channel_id, seq } => {
+            let Some(mut row) = read_row(read, &msg_key(&channel_id, seq))? else {
+                return Ok(out);
+            };
+            delete_toks(&mut out, &row);
+            tags::delete_postings(&mut out, &row);
+            tags::fold_catalog(read, &mut out, &row.channel_id, &row.tags, &[])?;
+            // tombstone: content and reactions cleared, skeleton (thread
+            // linkage, reply summary, revision count) kept — the canonical
+            // tombstone shape.
+            row.deleted = true;
+            row.text = String::new();
+            row.blocks = Vec::new();
+            row.reactions = Vec::new();
+            row.tags = Vec::new();
+            put_row_and_toks(&mut out, &row)?;
+        }
+        ChatMsg::AddReaction {
+            channel_id,
+            seq,
+            emoji,
+        } => {
+            let Some(mut row) = read_row(read, &msg_key(&channel_id, seq))? else {
+                return Ok(out);
+            };
+            let reactor = author(&op.origin, None);
+            let entry = row.reactions.iter_mut().find(|r| r.emoji == emoji);
+            match entry {
+                Some(entry) => {
+                    if entry.reactors.contains(&reactor) {
+                        // idempotent: a duplicate add stages nothing.
+                        return Ok(out);
+                    }
+                    entry.reactors.push(reactor);
+                    entry.reactors.sort();
+                }
+                None => {
+                    row.reactions.push(ReactionRow {
+                        emoji,
+                        reactors: vec![reactor],
+                    });
+                    row.reactions.sort_by(|a, b| a.emoji.cmp(&b.emoji));
+                }
+            }
+            put_row(&mut out, &row)?;
+        }
+        ChatMsg::RemoveReaction {
+            channel_id,
+            seq,
+            emoji,
+        } => {
+            let Some(mut row) = read_row(read, &msg_key(&channel_id, seq))? else {
+                return Ok(out);
+            };
+            let reactor = author(&op.origin, None);
+            let Some(entry) = row.reactions.iter_mut().find(|r| r.emoji == emoji) else {
+                return Ok(out);
+            };
+            let before = entry.reactors.len();
+            entry.reactors.retain(|r| r != &reactor);
+            if entry.reactors.len() == before {
+                // exact remove: an absent (emoji, author) is a no-op.
+                return Ok(out);
+            }
+            row.reactions.retain(|r| !r.reactors.is_empty());
+            put_row(&mut out, &row)?;
+        }
+        ChatMsg::RegisterHook {
+            channel_id,
+            module_id,
+        } => {
+            let Some(mut row) = read_channel(read, &channel_id)? else {
+                return Ok(out);
+            };
+            if row.hooks.contains(&module_id) {
+                return Ok(out);
+            }
+            row.hooks.push(module_id);
+            put_channel(&mut out, &row)?;
+        }
+        ChatMsg::UnregisterHook {
+            channel_id,
+            module_id,
+        } => {
+            let Some(mut row) = read_channel(read, &channel_id)? else {
+                return Ok(out);
+            };
+            row.hooks.retain(|hook| hook != &module_id);
+            put_channel(&mut out, &row)?;
+        }
+        ChatMsg::SetMembership {
+            channel_id,
+            user,
+            member,
+        } => {
+            let handle = user_handle(&user);
+            let key = member_row_key(&channel_id, &handle);
+            if member {
+                index_guest::put(
+                    &mut out,
+                    key,
+                    encode_json(&MemberRow {
+                        user: handle,
+                        height: op.height,
+                        time: op.time,
+                    })?,
+                );
+            } else {
+                index_guest::delete(&mut out, key);
             }
         }
-        Ok(())
+        ChatMsg::JoinHuddle { channel_id, node } => {
+            let Some(mut row) = read_channel(read, &channel_id)? else {
+                return Ok(out);
+            };
+            let user = op.origin.id.clone().unwrap_or_default();
+            let node = hex_lower(&node);
+            match row.huddle.iter_mut().find(|m| m.user == user) {
+                Some(existing) => {
+                    if existing.node == node {
+                        return Ok(out);
+                    }
+                    // a re-join moves the member's node; join order and
+                    // joined_at stay, mirroring canonical.
+                    existing.node = node;
+                }
+                None => row.huddle.push(HuddleEntry {
+                    user,
+                    node,
+                    joined_at: op.time,
+                }),
+            }
+            put_channel(&mut out, &row)?;
+        }
+        ChatMsg::LeaveHuddle { channel_id } => {
+            let Some(mut row) = read_channel(read, &channel_id)? else {
+                return Ok(out);
+            };
+            let user = op.origin.id.clone().unwrap_or_default();
+            row.huddle.retain(|m| m.user != user);
+            put_channel(&mut out, &row)?;
+        }
+        ChatMsg::SweepHuddle { channel_id, user } => {
+            let Some(mut row) = read_channel(read, &channel_id)? else {
+                return Ok(out);
+            };
+            let target = user_handle(&user);
+            row.huddle.retain(|m| m.user != target);
+            put_channel(&mut out, &row)?;
+        }
+    }
+    Ok(out)
+}
+
+/// lowercase hex, the node-key rendering the media plane's routing UI reads.
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// one ascending run of message rows for computed sequences. rows absent
+/// below a backfill floor are skipped — pages are honest about where the
+/// index begins, never an error.
+fn messages_run(
+    read: &impl StateRead,
+    channel_id: &str,
+    from: u64,
+    to: u64,
+) -> Result<Vec<MsgRow>, Fail> {
+    let mut rows = Vec::new();
+    for seq in from..=to {
+        if let Some(row) = read_row(read, &msg_key(channel_id, seq))? {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+fn reply_messages(rows: Vec<MsgRow>) -> Result<Vec<u8>, Fail> {
+    serde_json::to_vec(&ChatViewReply::Messages(rows))
+        .map_err(|e| Fail::new(FAIL_BAD_REQUEST, e.to_string()))
+}
+
+fn reply_json(reply: &ChatViewReply) -> Result<Vec<u8>, Fail> {
+    serde_json::to_vec(reply).map_err(|e| Fail::new(FAIL_BAD_REQUEST, e.to_string()))
+}
+
+/// join one channel row with its head-seq mirror.
+fn channel_info(read: &impl StateRead, row: ChannelRow) -> ChannelInfo {
+    let head_seq = read_u64(read, &seq_key(&row.id));
+    ChannelInfo {
+        channel: row,
+        head_seq,
+    }
+}
+
+/// serve one materialized-view request.
+pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
+    let query: ChatViewQuery =
+        serde_json::from_slice(req).map_err(|e| Fail::new(FAIL_BAD_REQUEST, e.to_string()))?;
+    match query {
+        ChatViewQuery::Channels { after, limit } => {
+            let page = read.scan_page(
+                b"channel/",
+                after.as_deref().map(str::as_bytes),
+                clamp_page(limit),
+            );
+            let mut channels = Vec::with_capacity(page.entries.len());
+            for (_key, value) in &page.entries {
+                let row: ChannelRow = serde_json::from_slice(value)
+                    .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
+                channels.push(channel_info(read, row));
+            }
+            reply_json(&ChatViewReply::Channels {
+                channels,
+                has_more: page.has_more,
+                next_after: page.next_after,
+            })
+        }
+        ChatViewQuery::Channel { channel_id } => {
+            let info = read_channel(read, &channel_id)?.map(|row| channel_info(read, row));
+            reply_json(&ChatViewReply::Channel(info))
+        }
+        ChatViewQuery::MessagesLatest { channel_id, limit } => {
+            let head = read_u64(read, &seq_key(&channel_id));
+            if head == 0 {
+                return reply_messages(Vec::new());
+            }
+            let limit = clamp_page(limit) as u64;
+            let from = head.saturating_sub(limit - 1).max(1);
+            reply_messages(messages_run(read, &channel_id, from, head)?)
+        }
+        ChatViewQuery::MessagesRange {
+            channel_id,
+            from_seq,
+            limit,
+        } => {
+            let head = read_u64(read, &seq_key(&channel_id));
+            let from = from_seq.max(1);
+            if from > head {
+                return reply_messages(Vec::new());
+            }
+            let limit = clamp_page(limit) as u64;
+            let to = head.min(from.saturating_add(limit - 1));
+            reply_messages(messages_run(read, &channel_id, from, to)?)
+        }
+        ChatViewQuery::MessagesAround {
+            channel_id,
+            seq,
+            limit,
+        } => {
+            let head = read_u64(read, &seq_key(&channel_id));
+            if head == 0 {
+                return reply_messages(Vec::new());
+            }
+            let limit = clamp_page(limit) as u64;
+            // a seq of 0 or one past the head names no message: window the
+            // nearest real one instead of answering an empty page.
+            let seq = seq.clamp(1, head);
+            let from = seq.saturating_sub(limit / 2).max(1);
+            let to = head.min(from.saturating_add(limit - 1));
+            reply_messages(messages_run(read, &channel_id, from, to)?)
+        }
+        ChatViewQuery::Message { message_id } => {
+            let row = match read.get(msgid_key(&message_id).as_bytes()) {
+                Some(bytes) => {
+                    let (channel_id, seq): (String, u64) = serde_json::from_slice(&bytes)
+                        .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
+                    read_row(read, &msg_key(&channel_id, seq))?
+                }
+                None => None,
+            };
+            reply_json(&ChatViewReply::Message(row))
+        }
+        ChatViewQuery::Revisions { channel_id, seq } => {
+            // MAX_REVISIONS (256) fits one scan page, so no cursor.
+            let prefix = format!("rev/{channel_id}/{seq:016x}/");
+            let page = read.scan_page(prefix.as_bytes(), None, MAX_PAGE_LIMIT);
+            let mut rows = Vec::with_capacity(page.entries.len());
+            for (_key, value) in &page.entries {
+                rows.push(
+                    serde_json::from_slice(value)
+                        .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?,
+                );
+            }
+            reply_json(&ChatViewReply::Revisions(rows))
+        }
+        ChatViewQuery::Thread {
+            channel_id,
+            root_seq,
+            after,
+            limit,
+        } => {
+            let is_root = |row: &MsgRow| row.thread.is_none();
+            let root = read_row(read, &msg_key(&channel_id, root_seq))?.filter(is_root);
+            if root.is_none() {
+                return reply_json(&ChatViewReply::Thread {
+                    root: None,
+                    replies: Vec::new(),
+                    has_more: false,
+                    next_after: None,
+                });
+            }
+            let prefix = format!("thread/{channel_id}/{root_seq:016x}/");
+            let page = read.scan_page(
+                prefix.as_bytes(),
+                after.as_deref().map(str::as_bytes),
+                clamp_page(limit),
+            );
+            let mut replies = Vec::with_capacity(page.entries.len());
+            for (_key, value) in &page.entries {
+                let reply_seq = <[u8; 8]>::try_from(value.as_slice())
+                    .map(u64::from_be_bytes)
+                    .map_err(|_| Fail::new(FAIL_ROW_DECODE, "thread marker is not a u64"))?;
+                if let Some(row) = read_row(read, &msg_key(&channel_id, reply_seq))? {
+                    replies.push(row);
+                }
+            }
+            reply_json(&ChatViewReply::Thread {
+                root,
+                replies,
+                has_more: page.has_more,
+                next_after: page.next_after,
+            })
+        }
+        ChatViewQuery::Reactions { channel_id, seq } => {
+            let reactions = read_row(read, &msg_key(&channel_id, seq))?
+                .map(|row| row.reactions)
+                .unwrap_or_default();
+            reply_json(&ChatViewReply::Reactions(reactions))
+        }
+        ChatViewQuery::Members {
+            channel_id,
+            after,
+            limit,
+        } => {
+            let prefix = format!("member/{channel_id}/");
+            let page = read.scan_page(
+                prefix.as_bytes(),
+                after.as_deref().map(str::as_bytes),
+                clamp_page(limit),
+            );
+            let mut members = Vec::with_capacity(page.entries.len());
+            for (_key, value) in &page.entries {
+                members.push(
+                    serde_json::from_slice(value)
+                        .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?,
+                );
+            }
+            reply_json(&ChatViewReply::Members {
+                members,
+                has_more: page.has_more,
+                next_after: page.next_after,
+            })
+        }
+        ChatViewQuery::Search {
+            text,
+            channel_id,
+            limit,
+        } => {
+            let tokens: Vec<String> = search::tokens(&text).into_iter().collect();
+            if tokens.is_empty() {
+                return Err(Fail::new(FAIL_BAD_REQUEST, "search text has no tokens"));
+            }
+            // each token matches as a prefix; the channel scope filters the
+            // intersected refs by their stored channel (postings can't embed
+            // it after a partial token).
+            let mut refs: Vec<TokRef> =
+                search::intersect_prefix(read, "tok/", &tokens, DEFAULT_POSTING_CAP)
+                    .into_iter()
+                    .filter_map(|hit| serde_json::from_slice(&hit.value).ok())
+                    .filter(|r: &TokRef| channel_id.as_ref().is_none_or(|c| &r.channel_id == c))
+                    .collect();
+            // newest first; (channel, seq) tiebreak for a stable order.
+            refs.sort_by(|a, b| {
+                (b.time, &b.channel_id, b.seq).cmp(&(a.time, &a.channel_id, a.seq))
+            });
+            let limit = limit
+                .unwrap_or(DEFAULT_SEARCH_LIMIT)
+                .clamp(1, MAX_SEARCH_LIMIT);
+            let mut hits = Vec::new();
+            for r in refs.into_iter().take(limit) {
+                if let Some(bytes) = read.get(msg_key(&r.channel_id, r.seq).as_bytes()) {
+                    let row: MsgRow = serde_json::from_slice(&bytes)
+                        .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
+                    hits.push(row);
+                }
+            }
+            serde_json::to_vec(&ChatViewReply::Hits(hits))
+                .map_err(|e| Fail::new(FAIL_BAD_REQUEST, e.to_string()))
+        }
+        ChatViewQuery::Tags { channel_id, limit } => {
+            let rows = tags::serve_tags(read, channel_id, limit)?;
+            serde_json::to_vec(&ChatViewReply::Tags(rows))
+                .map_err(|e| Fail::new(FAIL_BAD_REQUEST, e.to_string()))
+        }
+        ChatViewQuery::TagSearch {
+            tag,
+            channel_id,
+            limit,
+        } => {
+            let hits = tags::serve_tag_search(read, &tag, channel_id, limit)?;
+            serde_json::to_vec(&ChatViewReply::Hits(hits))
+                .map_err(|e| Fail::new(FAIL_BAD_REQUEST, e.to_string()))
+        }
     }
 }
 
@@ -528,48 +1045,63 @@ mod tag_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode_msg;
-    use indexer::{AppliedOp, BlockOps, IndexStore};
+    use crate::{encode_assigned, encode_msg};
+    use index_guest::apply_to_map;
+    use std::collections::BTreeMap;
 
-    fn store(dir: &std::path::Path) -> IndexStore {
-        IndexStore::open(dir, &["chat"])
-            .expect("open store")
-            .with_indexer(Box::new(ChatIndex::default()))
-    }
+    type Map = BTreeMap<Vec<u8>, Vec<u8>>;
 
-    fn op(msg: &ChatMsg) -> AppliedOp {
-        AppliedOp {
-            module: "chat".into(),
-            origin: OriginTag::external("jess"),
-            payload: encode_msg(msg),
+    /// the test twin of the module's in-state assignment (`stage_message` /
+    /// `stage_edit`): posts take the channel's next sequence, edits the row's
+    /// next revision, everything else assigns nothing. boundary tests pass an
+    /// explicit stamp through [`op_with`] instead.
+    fn assigned_for(map: &Map, msg: &ChatMsg) -> Vec<u8> {
+        match msg {
+            ChatMsg::PostMessage { channel_id, .. } => {
+                encode_assigned(&ChatAssigned::Posted {
+                    seq: read_u64(map, &seq_key(channel_id)) + 1,
+                })
+            }
+            ChatMsg::EditMessage {
+                channel_id, seq, ..
+            } => {
+                let row = read_row(map, &msg_key(channel_id, *seq))
+                    .expect("row reads")
+                    .expect("edited row exists");
+                encode_assigned(&ChatAssigned::Edited { rev: row.rev + 1 })
+            }
+            _ => Vec::new(),
         }
     }
 
-    fn post(channel: &str, id: &str, text: &str) -> AppliedOp {
-        op(&ChatMsg::PostMessage {
+    fn op_with(height: u64, msg: &ChatMsg, assigned: Vec<u8>) -> OpRow {
+        OpRow {
+            height,
+            seq: 0,
+            time: 1_000 + height,
+            origin: OriginTag::external("jess"),
+            payload: encode_msg(msg),
+            assigned,
+        }
+    }
+
+    fn post(channel: &str, id: &str, text: &str) -> ChatMsg {
+        ChatMsg::PostMessage {
             channel_id: channel.into(),
             message_id: id.into(),
             blocks: vec![Block::paragraph(text)],
             thread: None,
             as_agent: None,
-        })
+        }
     }
 
-    fn apply(store: &IndexStore, height: u64, ops: Vec<AppliedOp>) {
-        store
-            .apply_block(&BlockOps {
-                height,
-                time: 1_000 + height,
-                ops,
-                record: None,
-            })
-            .expect("apply");
+    fn fold(map: &mut Map, height: u64, msg: &ChatMsg) {
+        let writes = fold_op(&op_with(height, msg, assigned_for(map, msg)), map).expect("fold");
+        apply_to_map(map, writes);
     }
 
-    fn search(store: &IndexStore, req: serde_json::Value) -> Vec<MsgRow> {
-        let bytes = store
-            .view("chat", &serde_json::to_vec(&req).unwrap())
-            .expect("view");
+    fn search(map: &Map, req: serde_json::Value) -> Vec<MsgRow> {
+        let bytes = serve_view(map, &serde_json::to_vec(&req).unwrap()).expect("view");
         match serde_json::from_slice(&bytes).expect("reply decodes") {
             ChatViewReply::Hits(hits) => hits,
             other => panic!("expected hits, got {other:?}"),
@@ -578,400 +1110,507 @@ mod tests {
 
     #[test]
     fn posts_are_searchable_and_seq_mirrors() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        apply(&store, 1, vec![post("general", "m1", "hello fluent world")]);
-        apply(&store, 2, vec![post("general", "m2", "unrelated words")]);
-        apply(&store, 3, vec![post("random", "m3", "fluent chatter")]);
+        let mut map = Map::new();
+        fold(&mut map, 1, &post("general", "m1", "hello fluent world"));
+        fold(&mut map, 2, &post("general", "m2", "unrelated words"));
 
-        let hits = search(&store, serde_json::json!({"search": {"text": "fluent"}}));
-        assert_eq!(hits.len(), 2);
-        // newest first.
-        assert_eq!(hits[0].message_id, "m3");
-        assert_eq!(hits[1].message_id, "m1");
-        // per-channel sequences assigned in order.
-        assert_eq!(hits[1].seq, 1);
+        let hits = search(&map, serde_json::json!({"search": {"text": "fluent"}}));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, "m1");
         assert_eq!(hits[0].seq, 1);
-        assert_eq!(hits[1].author, "user:jess");
-
-        let hits = search(
-            &store,
-            serde_json::json!({"search": {"text": "fluent", "channelId": "general"}}),
-        );
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].message_id, "m1");
-    }
-
-    #[test]
-    fn multi_token_search_is_an_and() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        apply(&store, 1, vec![post("g", "m1", "alpha beta gamma")]);
-        apply(&store, 2, vec![post("g", "m2", "alpha delta")]);
-
-        let hits = search(
-            &store,
-            serde_json::json!({"search": {"text": "alpha beta"}}),
-        );
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].message_id, "m1");
-    }
-
-    #[test]
-    fn partial_tokens_match_as_a_prefix() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        apply(&store, 1, vec![post("general", "m1", "testing the waters")]);
-
-        // typing a partial word surfaces the message before the full word is
-        // typed — the command-palette search-as-you-type contract.
-        for q in ["te", "tes", "test", "testing"] {
-            let hits = search(&store, serde_json::json!({"search": {"text": q}}));
-            assert_eq!(hits.len(), 1, "query {q:?} should match `testing`");
-            assert_eq!(hits[0].message_id, "m1");
-        }
-        // a prefix that matches no word still finds nothing.
-        assert!(search(&store, serde_json::json!({"search": {"text": "xyz"}})).is_empty());
-    }
-
-    #[test]
-    fn prefix_search_is_still_an_and_across_tokens() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        apply(&store, 1, vec![post("g", "m1", "alpha beta gamma")]);
-        apply(&store, 2, vec![post("g", "m2", "alpha delta")]);
-
-        // each token is a prefix; ALL must match some word in the message.
-        let hits = search(&store, serde_json::json!({"search": {"text": "alp bet"}}));
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].message_id, "m1");
-    }
-
-    #[test]
-    fn prefix_match_dedups_multiple_words_per_message() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        // three distinct words all share the prefix — one message, one hit.
-        apply(&store, 1, vec![post("g", "m1", "test tester testing")]);
-        let hits = search(&store, serde_json::json!({"search": {"text": "test"}}));
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].message_id, "m1");
-    }
-
-    #[test]
-    fn prefix_search_honors_channel_scope() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        apply(&store, 1, vec![post("general", "m1", "testing here")]);
-        apply(&store, 2, vec![post("random", "m2", "testing there")]);
-
-        let hits = search(
-            &store,
-            serde_json::json!({"search": {"text": "test", "channelId": "general"}}),
-        );
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].message_id, "m1");
-    }
-
-    #[test]
-    fn user_author_renders_binary_key_as_hex_not_garbage() {
-        // a raw ed25519-style key: 32 bytes that are NOT printable utf-8.
-        let key: Vec<u8> = (0u8..32)
-            .map(|i| i.wrapping_mul(37).wrapping_add(0x80))
-            .collect();
-        let rendered = author_from_ref(&AuthorRef::User(key.clone()));
-        let handle = rendered.strip_prefix("user:").expect("user-tagged");
-        assert!(
-            !handle.contains('\u{FFFD}'),
-            "no lossy replacement chars: {handle:?}"
-        );
-        assert!(
-            handle.chars().all(|c| !c.is_control()),
-            "no control chars: {handle:?}"
-        );
-        // it is the hex of the key bytes.
-        assert_eq!(handle, indexer::user_handle(&key));
-        // a printable claimed name (embedded daemon) still passes through.
+        assert_eq!(hits[0].author, "user:jess");
         assert_eq!(
-            author_from_ref(&AuthorRef::User(b"jess".to_vec())),
-            "user:jess"
+            map.get(b"seq/general".as_slice()),
+            Some(&2u64.to_be_bytes().to_vec()),
+            "the seq mirror tracks the channel head"
         );
     }
 
     #[test]
-    fn edit_retokenizes_and_delete_tombstones() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        apply(&store, 1, vec![post("g", "m1", "original wording")]);
-        apply(
-            &store,
+    fn stamped_sequences_survive_a_boundary_stamp() {
+        // a boundary-stamped index starts EMPTY mid-life: no rows, no seq
+        // mirror. the first folded post carries the module's true assignment
+        // (here 42) — the fold must honor the stamp, never restart from 1.
+        let mut map = Map::new();
+        let msg = post("general", "m42", "first post after the boundary");
+        let writes = fold_op(
+            &op_with(9, &msg, encode_assigned(&ChatAssigned::Posted { seq: 42 })),
+            &map,
+        )
+        .expect("fold");
+        apply_to_map(&mut map, writes);
+
+        let hits = search(&map, serde_json::json!({"search": {"text": "boundary"}}));
+        assert_eq!(hits[0].seq, 42);
+        assert_eq!(
+            map.get(b"seq/general".as_slice()),
+            Some(&42u64.to_be_bytes().to_vec()),
+            "the mirror resumes at the stamped head, not at 1"
+        );
+    }
+
+    #[test]
+    fn a_post_without_a_stamp_fails_the_fold() {
+        // an applied assigning op with no stamp is interface drift — the fold
+        // holds loudly instead of guessing a sequence.
+        let map = Map::new();
+        let msg = post("general", "m1", "unstamped");
+        let fail = fold_op(&op_with(1, &msg, Vec::new()), &map).expect_err("must fail");
+        assert_eq!(fail.code, FAIL_ASSIGNED_DECODE);
+    }
+
+    #[test]
+    fn edits_retokenize_and_deletes_tombstone() {
+        let mut map = Map::new();
+        fold(&mut map, 1, &post("g", "m1", "original wording"));
+        fold(
+            &mut map,
             2,
-            vec![op(&ChatMsg::EditMessage {
+            &ChatMsg::EditMessage {
                 channel_id: "g".into(),
                 seq: 1,
                 blocks: vec![Block::paragraph("revised phrasing")],
                 base_rev: None,
-            })],
+            },
         );
 
-        assert!(search(&store, serde_json::json!({"search": {"text": "original"}})).is_empty());
-        let hits = search(&store, serde_json::json!({"search": {"text": "revised"}}));
+        assert!(search(&map, serde_json::json!({"search": {"text": "original"}})).is_empty());
+        let hits = search(&map, serde_json::json!({"search": {"text": "revised"}}));
         assert_eq!(hits.len(), 1);
         assert!(hits[0].edited);
 
-        apply(
-            &store,
+        fold(
+            &mut map,
             3,
-            vec![op(&ChatMsg::DeleteMessage {
+            &ChatMsg::DeleteMessage {
                 channel_id: "g".into(),
                 seq: 1,
-            })],
+            },
         );
-        assert!(search(&store, serde_json::json!({"search": {"text": "revised"}})).is_empty());
+        assert!(search(&map, serde_json::json!({"search": {"text": "revised"}})).is_empty());
+        let row: MsgRow =
+            serde_json::from_slice(map.get(msg_key("g", 1).as_bytes()).expect("tombstone"))
+                .unwrap();
+        assert!(row.deleted);
+        assert!(row.text.is_empty());
     }
 
     #[test]
-    fn same_block_post_then_edit_folds_correctly() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        // one block: post assigns seq 1, edit of seq 1 lands right after —
-        // the overlay must make the post's staged row visible to the edit.
-        apply(
-            &store,
-            1,
-            vec![
-                post("g", "m1", "first draft"),
-                op(&ChatMsg::EditMessage {
-                    channel_id: "g".into(),
-                    seq: 1,
-                    blocks: vec![Block::paragraph("final text")],
-                    base_rev: None,
-                }),
-            ],
+    fn channel_scope_and_multi_token_intersection() {
+        let mut map = Map::new();
+        fold(&mut map, 1, &post("general", "m1", "deploy pipeline green"));
+        fold(&mut map, 2, &post("random", "m2", "deploy thoughts"));
+
+        // multi-token AND: only m1 carries both.
+        let hits = search(
+            &map,
+            serde_json::json!({"search": {"text": "deploy green"}}),
         );
-        assert!(search(&store, serde_json::json!({"search": {"text": "draft"}})).is_empty());
-        assert_eq!(
-            search(&store, serde_json::json!({"search": {"text": "final"}})).len(),
-            1
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, "m1");
+
+        // channel scope filters by the stored ref's channel.
+        let hits = search(
+            &map,
+            serde_json::json!({"search": {"text": "deploy", "channel_id": "random"}}),
         );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, "m2");
+    }
+
+    #[test]
+    fn prefix_match_and_ranking_newest_first() {
+        let mut map = Map::new();
+        fold(&mut map, 1, &post("g", "m1", "testing the indexer"));
+        fold(&mut map, 2, &post("g", "m2", "tested and shipped"));
+
+        // `test` prefix-matches both `testing` and `tested`; newest first.
+        let hits = search(&map, serde_json::json!({"search": {"text": "test"}}));
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].message_id, "m2");
+    }
+
+    #[test]
+    fn prefix_match_dedups_multiple_words_per_message() {
+        let mut map = Map::new();
+        fold(&mut map, 1, &post("g", "m1", "test tested testing"));
+        let hits = search(&map, serde_json::json!({"search": {"text": "tes"}}));
+        assert_eq!(hits.len(), 1, "three matching words collapse to one hit");
+        assert_eq!(hits[0].message_id, "m1");
     }
 
     #[test]
     fn agent_author_is_rendered() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let mut agent_post = post("g", "m1", "from an agent");
-        agent_post.origin = OriginTag::module("agent");
-        agent_post.payload = encode_msg(&ChatMsg::PostMessage {
-            channel_id: "g".into(),
-            message_id: "m1".into(),
-            blocks: vec![Block::paragraph("from an agent")],
-            thread: None,
-            as_agent: Some("helper".into()),
-        });
-        apply(&store, 1, vec![agent_post]);
-        let hits = search(&store, serde_json::json!({"search": {"text": "agent"}}));
-        assert_eq!(hits[0].author, "agent:agent/helper");
-    }
-
-    /// canonical chat state standing in for the module's query surface. pages
-    /// `MessagesRange` TWO views at a time regardless of the asked limit, so
-    /// the rebuild's pagination loop is exercised, not just its first lap.
-    struct CanonicalChat {
-        channels: Vec<crate::Channel>,
-        views: Vec<crate::MessageView>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl indexer::StateReader for CanonicalChat {
-        async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
-            let reply = match crate::decode_query(req).map_err(Error::State)? {
-                ChatQuery::Channels => ChatReply::Channels(self.channels.clone()),
-                ChatQuery::MessagesRange {
-                    channel_id,
-                    from_seq,
-                    ..
-                } => ChatReply::Messages(
-                    self.views
-                        .iter()
-                        .filter(|v| v.channel_id == channel_id && v.seq >= from_seq)
-                        .take(2)
-                        .cloned()
-                        .collect(),
-                ),
-                other => return Err(Error::State(format!("unexpected query {other:?}"))),
-            };
-            Ok(crate::encode_reply(&reply))
-        }
-    }
-
-    fn canonical_channel(id: &str, head_seq: u64) -> crate::Channel {
-        crate::Channel {
-            id: id.into(),
-            name: id.into(),
-            created_at: 900,
-            head_seq,
-            post_policy: crate::PostPolicy::Open,
-            hooks: Vec::new(),
-            pinned: Vec::new(),
-            huddle: Vec::new(),
-            owner: None,
-            archived: false,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn canonical_view(
-        channel: &str,
-        seq: u64,
-        head_seq: u64,
-        message_id: &str,
-        author: AuthorRef,
-        text: &str,
-        created_at: u64,
-        rev: u32,
-        deleted: bool,
-    ) -> crate::MessageView {
-        crate::MessageView {
-            channel_id: channel.into(),
-            seq,
-            head: crate::MessageHead {
-                message_id: message_id.into(),
-                author,
-                blocks: vec![Block::paragraph(text)],
-                created_at,
-                rev,
-                edited_at: (rev > 0).then_some(created_at + 1),
-                base_rev: None,
-                deleted,
-                thread: None,
-                reply_count: 0,
-                last_reply_seq: None,
+        let mut map = Map::new();
+        let writes = fold_op(
+            &OpRow {
+                height: 1,
+                seq: 0,
+                time: 1_001,
+                origin: OriginTag::module("agent"),
+                payload: encode_msg(&ChatMsg::PostMessage {
+                    channel_id: "g".into(),
+                    message_id: "m1".into(),
+                    blocks: vec![Block::paragraph("from the helper")],
+                    thread: None,
+                    as_agent: Some("helper".into()),
+                }),
+                assigned: encode_assigned(&ChatAssigned::Posted { seq: 1 }),
             },
-            reactions: Vec::new(),
-            channel_head_seq: head_seq,
+            &map,
+        )
+        .expect("fold");
+        apply_to_map(&mut map, writes);
+
+        let hits = search(&map, serde_json::json!({"search": {"text": "helper"}}));
+        assert_eq!(hits[0].author, "agent:agent/helper");
+    }
+
+    #[test]
+    fn bad_view_requests_fail_cleanly() {
+        let map = Map::new();
+        assert!(serve_view(&map, b"not json").is_err());
+        assert!(
+            serve_view(&map, br#"{"search": {"text": "!!!"}}"#).is_err(),
+            "no tokens is a view error"
+        );
+    }
+
+    // ---- the read model --------------------------------------------------
+
+    fn view(map: &Map, req: serde_json::Value) -> ChatViewReply {
+        let bytes = serve_view(map, &serde_json::to_vec(&req).unwrap()).expect("view");
+        serde_json::from_slice(&bytes).expect("reply decodes")
+    }
+
+    fn create(channel: &str, name: &str) -> ChatMsg {
+        ChatMsg::CreateChannel {
+            channel_id: channel.into(),
+            name: name.into(),
+            post_policy: PostPolicy::Open,
         }
     }
 
-    #[tokio::test]
-    async fn rebuild_rederives_channels_pagination_and_tombstones() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        // folded rows the rebuild must throw away.
-        apply(&store, 1, vec![post("stale", "m0", "vanishing text")]);
+    #[test]
+    fn channels_list_joins_head_seq_and_tracks_renames() {
+        let mut map = Map::new();
+        fold(&mut map, 1, &create("general", "General"));
+        fold(&mut map, 2, &create("random", "Random"));
+        fold(&mut map, 3, &post("general", "m1", "hello"));
 
-        // channel g: 3 live sequences (pages of 2 exercise the loop), one
-        // edited; channel q: one tombstone.
-        let state = CanonicalChat {
-            channels: vec![canonical_channel("g", 3), canonical_channel("q", 1)],
-            views: vec![
-                canonical_view(
-                    "g",
-                    1,
-                    3,
-                    "m1",
-                    AuthorRef::User(b"jess".to_vec()),
-                    "hello fluent world",
-                    1_001,
-                    0,
-                    false,
-                ),
-                canonical_view(
-                    "g",
-                    2,
-                    3,
-                    "m2",
-                    AuthorRef::Agent {
-                        module: "agent".into(),
-                        agent_id: "helper".into(),
-                    },
-                    "fluent chatter",
-                    1_002,
-                    0,
-                    false,
-                ),
-                canonical_view(
-                    "g",
-                    3,
-                    3,
-                    "m3",
-                    AuthorRef::User(b"eddy".to_vec()),
-                    "revised phrasing",
-                    1_003,
-                    2,
-                    false,
-                ),
-                canonical_view(
-                    "q",
-                    1,
-                    1,
-                    "m4",
-                    AuthorRef::User(b"jess".to_vec()),
-                    "was deleted",
-                    1_004,
-                    0,
-                    true,
-                ),
-            ],
+        let ChatViewReply::Channels { channels, has_more, .. } =
+            view(&map, serde_json::json!({"channels": {}}))
+        else {
+            panic!("wrong reply shape")
         };
-        store
-            .rebuild_module(
-                "chat",
-                &state,
-                indexer::RebuildMeta {
-                    height: 50,
-                    time: 0,
-                },
-            )
-            .await
-            .expect("rebuild");
+        assert!(!has_more);
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].channel.id, "general");
+        assert_eq!(channels[0].head_seq, 1, "head_seq joins from the mirror");
+        assert_eq!(channels[0].channel.owner.as_deref(), Some("jess"));
+        assert_eq!(channels[1].head_seq, 0);
 
-        assert!(
-            search(&store, serde_json::json!({"search": {"text": "vanishing"}})).is_empty(),
-            "pre-rebuild rows do not survive"
+        fold(
+            &mut map,
+            4,
+            &ChatMsg::RenameChannel {
+                channel_id: "random".into(),
+                name: "Water Cooler".into(),
+            },
         );
-
-        let hits = search(&store, serde_json::json!({"search": {"text": "fluent"}}));
-        assert_eq!(hits.len(), 2);
-        // ranking survives the rebuild: created_at is canonical.
-        assert_eq!(hits[0].message_id, "m2");
-        assert_eq!(hits[0].author, "agent:agent/helper");
-        assert_eq!(hits[1].author, "user:jess");
-        assert_eq!(hits[1].time, 1_001, "time survives via created_at");
-        assert_eq!(hits[1].height, 50, "height collapses to the boundary");
-
-        let hits = search(&store, serde_json::json!({"search": {"text": "revised"}}));
-        assert_eq!(hits.len(), 1);
-        assert!(hits[0].edited, "rev > 0 rebuilds as edited");
-
-        assert!(
-            search(&store, serde_json::json!({"search": {"text": "deleted"}})).is_empty(),
-            "tombstones rebuild without postings"
+        fold(
+            &mut map,
+            5,
+            &ChatMsg::SetChannelArchived {
+                channel_id: "random".into(),
+                archived: true,
+            },
         );
+        let ChatViewReply::Channel(Some(info)) =
+            view(&map, serde_json::json!({"channel": {"channel_id": "random"}}))
+        else {
+            panic!("random exists")
+        };
+        assert_eq!(info.channel.name, "Water Cooler");
+        assert!(info.channel.archived);
+    }
 
-        assert_eq!(store.applied_height("chat").unwrap(), 50);
-        assert_eq!(store.backfill_height("chat").unwrap(), Some(50));
+    #[test]
+    fn message_pages_range_latest_around() {
+        let mut map = Map::new();
+        for i in 1..=7 {
+            fold(&mut map, i, &post("g", &format!("m{i}"), &format!("msg {i}")));
+        }
 
-        // the rebuilt seq mirror carries the fold forward: the next post in g
-        // is assigned seq 4, and an edit of a rebuilt row retokenizes.
-        apply(&store, 51, vec![post("g", "m5", "post rebuild message")]);
-        let hits = search(&store, serde_json::json!({"search": {"text": "rebuild"}}));
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].seq, 4, "seq mirror rebuilt from head_seq");
-        apply(
-            &store,
-            52,
-            vec![op(&ChatMsg::EditMessage {
-                channel_id: "g".into(),
-                seq: 3,
-                blocks: vec![Block::paragraph("polished phrasing")],
-                base_rev: None,
-            })],
-        );
-        assert!(search(&store, serde_json::json!({"search": {"text": "revised"}})).is_empty());
+        let ChatViewReply::Messages(rows) = view(
+            &map,
+            serde_json::json!({"messages_latest": {"channel_id": "g", "limit": 3}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
         assert_eq!(
-            search(&store, serde_json::json!({"search": {"text": "polished"}})).len(),
-            1
+            rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![5, 6, 7]
         );
+        assert_eq!(rows[0].blocks, vec![Block::paragraph("msg 5")]);
+
+        let ChatViewReply::Messages(rows) = view(
+            &map,
+            serde_json::json!({"messages_range": {"channel_id": "g", "from_seq": 2, "limit": 2}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
+        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![2, 3]);
+
+        let ChatViewReply::Messages(rows) = view(
+            &map,
+            serde_json::json!({"messages_around": {"channel_id": "g", "seq": 4, "limit": 3}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
+        assert_eq!(
+            rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+
+        // an empty channel pages empty, never errors.
+        let ChatViewReply::Messages(rows) = view(
+            &map,
+            serde_json::json!({"messages_latest": {"channel_id": "nope"}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn message_id_lookup_resolves_globally() {
+        let mut map = Map::new();
+        fold(&mut map, 1, &post("g", "m1", "first"));
+        fold(&mut map, 2, &post("g", "m2", "second"));
+
+        let ChatViewReply::Message(Some(row)) =
+            view(&map, serde_json::json!({"message": {"message_id": "m2"}}))
+        else {
+            panic!("m2 resolves")
+        };
+        assert_eq!((row.channel_id.as_str(), row.seq), ("g", 2));
+
+        let ChatViewReply::Message(None) =
+            view(&map, serde_json::json!({"message": {"message_id": "nope"}}))
+        else {
+            panic!("unknown id is None")
+        };
+    }
+
+    #[test]
+    fn edits_keep_revision_history() {
+        let mut map = Map::new();
+        fold(&mut map, 1, &post("g", "m1", "draft one"));
+        fold(
+            &mut map,
+            2,
+            &ChatMsg::EditMessage {
+                channel_id: "g".into(),
+                seq: 1,
+                blocks: vec![Block::paragraph("draft two")],
+                base_rev: Some(0),
+            },
+        );
+        fold(
+            &mut map,
+            3,
+            &ChatMsg::EditMessage {
+                channel_id: "g".into(),
+                seq: 1,
+                blocks: vec![Block::paragraph("final")],
+                base_rev: Some(1),
+            },
+        );
+
+        let ChatViewReply::Revisions(revs) = view(
+            &map,
+            serde_json::json!({"revisions": {"channel_id": "g", "seq": 1}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
+        assert_eq!(revs.len(), 2, "two replaced heads");
+        assert_eq!(revs[0].text, "draft one");
+        assert_eq!(revs[0].rev, 0);
+        assert_eq!(revs[1].text, "draft two");
+        assert_eq!(revs[1].rev, 1);
+
+        let ChatViewReply::Message(Some(head)) =
+            view(&map, serde_json::json!({"message": {"message_id": "m1"}}))
+        else {
+            panic!("head resolves")
+        };
+        assert_eq!(head.rev, 2);
+        assert_eq!(head.base_rev, Some(1));
+        assert!(head.edited_at.is_some());
+    }
+
+    #[test]
+    fn threads_page_in_post_order_and_roots_carry_summaries() {
+        let mut map = Map::new();
+        fold(&mut map, 1, &post("g", "root", "thread root"));
+        fold(&mut map, 2, &post("g", "noise", "unrelated"));
+        for i in 0..3 {
+            fold(
+                &mut map,
+                3 + i,
+                &ChatMsg::PostMessage {
+                    channel_id: "g".into(),
+                    message_id: format!("r{i}"),
+                    blocks: vec![Block::paragraph(format!("reply {i}"))],
+                    thread: Some(1),
+                    as_agent: None,
+                },
+            );
+        }
+
+        let ChatViewReply::Thread { root, replies, has_more, next_after } = view(
+            &map,
+            serde_json::json!({"thread": {"channel_id": "g", "root_seq": 1, "limit": 2}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
+        let root = root.expect("root indexed");
+        assert_eq!(root.reply_count, 3);
+        assert_eq!(root.last_reply_seq, Some(5));
+        assert_eq!(replies.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 4]);
+        assert!(has_more);
+
+        let ChatViewReply::Thread { replies, has_more, .. } = view(
+            &map,
+            serde_json::json!({"thread": {"channel_id": "g", "root_seq": 1,
+                "after": next_after.unwrap(), "limit": 2}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
+        assert_eq!(replies.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![5]);
+        assert!(!has_more);
+
+        // a reply is not a thread root.
+        let ChatViewReply::Thread { root, .. } = view(
+            &map,
+            serde_json::json!({"thread": {"channel_id": "g", "root_seq": 3}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
+        assert!(root.is_none());
+    }
+
+    #[test]
+    fn reactions_mirror_set_semantics_and_clear_on_tombstone() {
+        let mut map = Map::new();
+        fold(&mut map, 1, &post("g", "m1", "react to me"));
+        let react = |emoji: &str| ChatMsg::AddReaction {
+            channel_id: "g".into(),
+            seq: 1,
+            emoji: emoji.into(),
+        };
+        fold(&mut map, 2, &react("🎉"));
+        fold(&mut map, 3, &react("🎉")); // idempotent duplicate
+        fold(&mut map, 4, &react("🚀"));
+
+        let ChatViewReply::Reactions(rows) = view(
+            &map,
+            serde_json::json!({"reactions": {"channel_id": "g", "seq": 1}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().map(|r| r.emoji.as_str()).collect::<Vec<_>>(),
+            vec!["🎉", "🚀"], "emoji-sorted");
+        assert_eq!(rows[0].reactors, vec!["user:jess"], "duplicate add collapsed");
+
+        fold(
+            &mut map,
+            5,
+            &ChatMsg::RemoveReaction {
+                channel_id: "g".into(),
+                seq: 1,
+                emoji: "🎉".into(),
+            },
+        );
+        let ChatViewReply::Reactions(rows) = view(
+            &map,
+            serde_json::json!({"reactions": {"channel_id": "g", "seq": 1}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
+        assert_eq!(rows.len(), 1, "empty emoji entries drop");
+
+        fold(
+            &mut map,
+            6,
+            &ChatMsg::DeleteMessage {
+                channel_id: "g".into(),
+                seq: 1,
+            },
+        );
+        let ChatViewReply::Reactions(rows) = view(
+            &map,
+            serde_json::json!({"reactions": {"channel_id": "g", "seq": 1}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
+        assert!(rows.is_empty(), "a tombstone carries no reactions");
+    }
+
+    #[test]
+    fn members_and_huddles_track_rosters() {
+        let mut map = Map::new();
+        fold(&mut map, 1, &create("g", "General"));
+        let membership = |user: &str, member: bool| ChatMsg::SetMembership {
+            channel_id: "g".into(),
+            user: user.as_bytes().to_vec(),
+            member,
+        };
+        fold(&mut map, 2, &membership("alice", true));
+        fold(&mut map, 3, &membership("bob", true));
+        fold(&mut map, 4, &membership("alice", false));
+
+        let ChatViewReply::Members { members, .. } = view(
+            &map,
+            serde_json::json!({"members": {"channel_id": "g"}}),
+        ) else {
+            panic!("wrong reply shape")
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].user, "bob");
+
+        fold(
+            &mut map,
+            5,
+            &ChatMsg::JoinHuddle {
+                channel_id: "g".into(),
+                node: vec![0xab; 32],
+            },
+        );
+        let ChatViewReply::Channel(Some(info)) =
+            view(&map, serde_json::json!({"channel": {"channel_id": "g"}}))
+        else {
+            panic!("g exists")
+        };
+        assert_eq!(info.channel.huddle.len(), 1);
+        assert_eq!(info.channel.huddle[0].user, "jess");
+        assert_eq!(info.channel.huddle[0].node, "ab".repeat(32));
+
+        fold(
+            &mut map,
+            6,
+            &ChatMsg::SweepHuddle {
+                channel_id: "g".into(),
+                user: b"jess".to_vec(),
+            },
+        );
+        let ChatViewReply::Channel(Some(info)) =
+            view(&map, serde_json::json!({"channel": {"channel_id": "g"}}))
+        else {
+            panic!("g exists")
+        };
+        assert!(info.channel.huddle.is_empty(), "sweep clears by handle");
     }
 }

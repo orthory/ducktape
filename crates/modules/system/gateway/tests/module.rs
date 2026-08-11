@@ -1,12 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use commonware_cryptography::{Signer as _, ed25519};
 use futures::executor::block_on;
 use gateway::{
-    DuckDnsName, GATEWAY_ROUTE_NS, Gateway, GatewayMsg, GatewayQuery, GatewayReply,
-    MemberAuthorization, ResolvedAccount, RouteAudience, RouteDefinition, RouteMethod, RouteName,
-    RoutePolicy, RouteStatement, RouteTarget, decode_reply, encode_msg, encode_query,
-    route_signing_preimage,
+    CredentialGrantStatement, CredentialKind, CredentialRecord, DuckDnsName, GATEWAY_CREDENTIAL_NS,
+    GATEWAY_ROUTE_NS, Gateway, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization,
+    RemoveCredentialStatement, ResolvedAccount, RouteAudience, RouteDefinition, RouteMethod,
+    RouteName, RoutePolicy, RouteStatement, RouteTarget, SetCredentialStatement,
+    credential_use_allowed, decode_msg, decode_reply, encode_msg, encode_query,
+    grant_credential_preimage, remove_credential_preimage, revoke_credential_preimage,
+    route_signing_preimage, set_credential_preimage, validate_credential_name,
 };
 use identity::{AccountView, IdentityQuery, IdentityReply, KeyKind, MemberKeyView, NodeView};
 use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
@@ -140,6 +143,7 @@ fn fixture(seed: u64) -> (Vec<u8>, ed25519::PrivateKey, AccountView, TestCtx, Ga
     };
     let module = Gateway::new(
         "gateway",
+        Box::new(sdk_testkit::MemStore::new()),
         "identity",
         Some("valset".into()),
         "test#12345678",
@@ -334,4 +338,263 @@ fn route_revision_and_chain_prevent_replay() {
             .to_string()
             .contains("another chain")
     );
+}
+
+const CHAIN_ID: &str = "test#12345678";
+
+fn credential(name: &str, owner_account: Vec<u8>, publisher_node: Vec<u8>) -> CredentialRecord {
+    CredentialRecord {
+        name: name.into(),
+        owner_account,
+        publisher_node,
+        kind: CredentialKind::Claude,
+        seal_pk: [9; 32],
+        grants: BTreeSet::new(),
+    }
+}
+
+fn signed_set_credential(signer: &ed25519::PrivateKey, record: CredentialRecord) -> GatewayMsg {
+    let statement = SetCredentialStatement {
+        chain_id: CHAIN_ID.into(),
+        record,
+    };
+    let preimage = set_credential_preimage(&statement).unwrap();
+    let signature = signer
+        .sign(GATEWAY_CREDENTIAL_NS, &preimage)
+        .as_ref()
+        .to_vec();
+    GatewayMsg::SetCredential {
+        statement,
+        authorization: MemberAuthorization {
+            signer: signer.public_key().as_ref().to_vec(),
+            signature,
+        },
+    }
+}
+
+fn signed_remove(signer: &ed25519::PrivateKey, owner_account: Vec<u8>, name: &str) -> GatewayMsg {
+    let statement = RemoveCredentialStatement {
+        chain_id: CHAIN_ID.into(),
+        owner_account,
+        name: name.into(),
+    };
+    let preimage = remove_credential_preimage(&statement).unwrap();
+    let signature = signer
+        .sign(GATEWAY_CREDENTIAL_NS, &preimage)
+        .as_ref()
+        .to_vec();
+    GatewayMsg::RemoveCredential {
+        statement,
+        authorization: MemberAuthorization {
+            signer: signer.public_key().as_ref().to_vec(),
+            signature,
+        },
+    }
+}
+
+fn grant_statement(
+    owner_account: Vec<u8>,
+    name: &str,
+    account: Vec<u8>,
+) -> CredentialGrantStatement {
+    CredentialGrantStatement {
+        chain_id: CHAIN_ID.into(),
+        owner_account,
+        name: name.into(),
+        account,
+    }
+}
+
+fn signed_grant(
+    signer: &ed25519::PrivateKey,
+    owner_account: Vec<u8>,
+    name: &str,
+    account: Vec<u8>,
+) -> GatewayMsg {
+    let statement = grant_statement(owner_account, name, account);
+    let preimage = grant_credential_preimage(&statement).unwrap();
+    let signature = signer
+        .sign(GATEWAY_CREDENTIAL_NS, &preimage)
+        .as_ref()
+        .to_vec();
+    GatewayMsg::GrantCredential {
+        statement,
+        authorization: MemberAuthorization {
+            signer: signer.public_key().as_ref().to_vec(),
+            signature,
+        },
+    }
+}
+
+fn signed_revoke(
+    signer: &ed25519::PrivateKey,
+    owner_account: Vec<u8>,
+    name: &str,
+    account: Vec<u8>,
+) -> GatewayMsg {
+    let statement = grant_statement(owner_account, name, account);
+    let preimage = revoke_credential_preimage(&statement).unwrap();
+    let signature = signer
+        .sign(GATEWAY_CREDENTIAL_NS, &preimage)
+        .as_ref()
+        .to_vec();
+    GatewayMsg::RevokeCredential {
+        statement,
+        authorization: MemberAuthorization {
+            signer: signer.public_key().as_ref().to_vec(),
+            signature,
+        },
+    }
+}
+
+fn query_credential(module: &Gateway, name: &str) -> Option<CredentialRecord> {
+    let reply = block_on(module.query(&encode_query(&GatewayQuery::Credential {
+        name: name.into(),
+    })))
+    .unwrap();
+    match decode_reply(&reply).unwrap() {
+        GatewayReply::Credential(record) => record,
+        other => panic!("expected a credential reply, got {other:?}"),
+    }
+}
+
+#[test]
+fn credential_wire_round_trips() {
+    let signer = ed25519::PrivateKey::from_seed(31);
+    let record = credential("alice-claude-1", vec![5; 32], vec![1; 32]);
+    let msg = signed_set_credential(&signer, record);
+    let decoded = decode_msg(&encode_msg(&msg)).expect("decode");
+    assert_eq!(msg, decoded);
+}
+
+#[test]
+fn credential_names_are_validated() {
+    let too_long = "x".repeat(65);
+    for bad in ["", "UPPER", "has space", too_long.as_str()] {
+        assert!(
+            validate_credential_name(bad).is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+    assert!(validate_credential_name("alice-claude-1").is_ok());
+}
+
+#[test]
+fn first_registration_wins_and_owner_gates_mutations() {
+    let node_a = vec![1; 32];
+    let node_b = vec![2; 32];
+    let signer_a = ed25519::PrivateKey::from_seed(100);
+    let signer_b = ed25519::PrivateKey::from_seed(200);
+    let account_a = account(&node_a, &signer_a);
+    let account_b = account(&node_b, &signer_b);
+    let mut context = TestCtx {
+        env: Env {
+            height: 1,
+            consensus_time: 1,
+            origin: Origin::External(node_a.clone()),
+            me: "gateway".into(),
+        },
+        validators: vec![node_a.clone(), node_b.clone()],
+        residents: vec![],
+        accounts: BTreeMap::from([
+            (node_a.clone(), account_a.clone()),
+            (node_b.clone(), account_b.clone()),
+        ]),
+    };
+    let mut module = Gateway::new(
+        "gateway",
+        Box::new(sdk_testkit::MemStore::new()),
+        "identity",
+        Some("valset".into()),
+        CHAIN_ID,
+    );
+
+    let as_a = |context: &mut TestCtx| context.env.origin = Origin::External(node_a.clone());
+    let as_b = |context: &mut TestCtx| context.env.origin = Origin::External(node_b.clone());
+
+    // owner A registers "a".
+    as_a(&mut context);
+    execute(
+        &mut module,
+        &mut context,
+        signed_set_credential(
+            &signer_a,
+            credential("a", account_a.account_id.clone(), node_a.clone()),
+        ),
+    )
+    .unwrap();
+    block_on(module.commit_block()).unwrap();
+
+    // account B cannot squat the same name.
+    as_b(&mut context);
+    assert!(
+        execute(
+            &mut module,
+            &mut context,
+            signed_set_credential(
+                &signer_b,
+                credential("a", account_b.account_id.clone(), node_b.clone())
+            ),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("already registered")
+    );
+
+    // a non-owner grant is refused; an owner grant commits.
+    assert!(
+        execute(
+            &mut module,
+            &mut context,
+            signed_grant(
+                &signer_b,
+                account_b.account_id.clone(),
+                "a",
+                account_b.account_id.clone(),
+            ),
+        )
+        .is_err()
+    );
+    as_a(&mut context);
+    execute(
+        &mut module,
+        &mut context,
+        signed_grant(
+            &signer_a,
+            account_a.account_id.clone(),
+            "a",
+            account_b.account_id.clone(),
+        ),
+    )
+    .unwrap();
+    block_on(module.commit_block()).unwrap();
+    let record = query_credential(&module, "a").expect("record");
+    assert!(credential_use_allowed(&record, &account_b.account_id));
+
+    // owner revokes, then removes.
+    execute(
+        &mut module,
+        &mut context,
+        signed_revoke(
+            &signer_a,
+            account_a.account_id.clone(),
+            "a",
+            account_b.account_id.clone(),
+        ),
+    )
+    .unwrap();
+    block_on(module.commit_block()).unwrap();
+    assert!(!credential_use_allowed(
+        &query_credential(&module, "a").unwrap(),
+        &account_b.account_id
+    ));
+
+    execute(
+        &mut module,
+        &mut context,
+        signed_remove(&signer_a, account_a.account_id.clone(), "a"),
+    )
+    .unwrap();
+    block_on(module.commit_block()).unwrap();
+    assert!(query_credential(&module, "a").is_none());
 }

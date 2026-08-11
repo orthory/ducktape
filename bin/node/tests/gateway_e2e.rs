@@ -221,8 +221,13 @@ fn proxy_request(
                 "path_and_query": path,
                 "headers": headers,
                 "body_len": body.len(),
+                // `ProxyRequestHead` is `deny_unknown_fields` AND has no
+                // `serde(default)` on `upgrade`, so omitting it is not a
+                // permissive miss — the whole head fails to deserialize and the
+                // handler answers 422 with an empty body.
+                "upgrade": false,
             },
-            "bodyB64": base64::engine::general_purpose::STANDARD.encode(body),
+            "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
         })),
     )
 }
@@ -263,7 +268,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     }
     for index in 0..2 {
         cluster.wait_marker(index, "rpc listening on", READY);
-        cluster.wait_marker(index, "converged app_hash=", READY);
+        cluster.wait_marker(index, "converged root_hash=", READY);
         cluster.wait_marker(index, "peer handshake COMPLETE", READY);
         cluster.wait_marker(index, "gateway plane: overlay stream bound", READY);
     }
@@ -349,11 +354,11 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     assert_eq!(response["head"]["status"], 201);
     assert_eq!(
         base64::engine::general_purpose::STANDARD
-            .decode(response["bodyB64"].as_str().unwrap())
+            .decode(response["body_b64"].as_str().unwrap())
             .unwrap(),
         br#"{"ok":true}"#
     );
-    // v2 forwards Set-Cookie end to end (v1 stripped it).
+    // Set-Cookie is forwarded end to end.
     assert!(
         response["head"]["headers"]
             .as_array()
@@ -406,7 +411,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
 
     for (method, path, headers, expected) in [
         ("delete", "/items", serde_json::json!([]), 403),
-        // (v2: Cookie is no longer rejected at the proxy; it flows to upstream.)
+        // Cookie flows to the upstream.
         (
             "get",
             "/items",

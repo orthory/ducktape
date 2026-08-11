@@ -8,11 +8,20 @@
 CARGO ?= cargo
 BIN_DEST ?= $(HOME)/.cargo/bin
 
-.PHONY: all demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-node install-coordinator test clean wasm-modules wasm-modules-check labs-gate
+.PHONY: all dev demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-repro-check labs-gate
 
 ## build every workspace crate (the default target)
 all:
 	$(CARGO) build --workspace
+
+## the app dev loop: seed the "demo" localnet if it does not exist yet
+## (DEV_RESEED=1 forces a fresh seed), start its node when it is not already
+## serving, sync ducktape's own repo into that node's forge (dogfood-forge —
+## non-fatal when origin is unreachable), then run the desktop app against it
+## in the foreground. Ctrl-C quits the app and leaves the node running;
+## `make demo-clear` tears down.
+dev:
+	@bash ops/dev.sh
 
 ## seed a local "demo" network preloaded with sample data — chat channels +
 ## messages, a tasks board, pages, a registered agent (with a live @mention run),
@@ -79,10 +88,48 @@ install-coordinator:
 ## TCP, bin/noded drives a real spawned daemon over http/ws), the consensus
 ## sim-feature suite, and a build of the noded + simnode binaries the test
 ## harnesses stage.
+# WHERE THE E2E SUITES PUT NODE STORAGE — pinned to disk, on purpose.
+#
+# Every spawned cluster writes `storage=$TMPDIR/.tmpXXXX/storage-N`, and a test
+# that panics (or a node killed with it) leaves the whole tree behind. On a host
+# where /tmp is tmpfs — the default on this dev box — those leaks are RAM. One
+# session left 11 dirs totalling 22 GB, two of them 7.2 GB each, and since
+# tmpfs has no swap the box lost that memory for good: each gate run started
+# with less than the last, until rustc and ld began dying mid-compile. The runs
+# measuring the box were degrading it.
+#
+# Pinning TMPDIR under target/ makes a leak cost disk instead of memory, and the
+# rm -rf reclaims the previous run's leftovers before each pass. The leak itself
+# is still a bug worth fixing in the harnesses — see #887.
+TEST_TMPDIR := $(CURDIR)/target/test-tmp
+
 test: wasm-modules-check
-	$(CARGO) test --workspace
-	$(CARGO) test -p consensus --features sim
-	$(CARGO) build -p noded -p simnode
+# TWO passes, and the second is not optional.
+#
+# A run that reached the compute plane leaves podman rootless overlay dirs owned
+# by a SUBUID, which this user cannot remove: plain `rm -rf` prints a wall of
+# `Permission denied` and — with `&&` — aborted the whole gate before a single
+# test ran. `podman unshare` re-enters the user namespace where those uids map
+# to root, which is the only way to reclaim them without privileges.
+#
+# Neither pass may fail the gate: a first run has nothing to clean, and a host
+# without podman has no second pass to make.
+	-rm -rf "$(TEST_TMPDIR)" 2>/dev/null
+	-command -v podman >/dev/null 2>&1 && podman unshare rm -rf "$(TEST_TMPDIR)" 2>/dev/null
+	mkdir -p "$(TEST_TMPDIR)"
+	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test --workspace
+# the #[ignore]d tests are ignored ONLY because they must not share a process
+# with the parallel suite — they still have to run. `absolute_configs_resolve_
+# after_launch_cwd_is_deleted` re-execs the test binary, and doing that under 32
+# live libtest threads made unrelated tests fail ~4 runs in 11 with integrity
+# errors. Serial + its own invocation is the isolation. See #887.
+	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test -p node-bin --bin ducktape -- --ignored --test-threads=1
+	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test -p consensus --features sim
+# ducktape-app rides this line for a reason: `cargo test` builds the TEST
+# target, which links dev-dependencies, so a product path reaching for a
+# dev-only crate compiles under every test lane and breaks only the BINARY.
+# That is not hypothetical — it shipped and sat on dev for 81 commits.
+	$(CARGO) build -p noded -p simnode -p ducktape-app
 
 ## rebuild every wasm guest module into its componentized artifact and refresh
 ## EVERY committed copy in one sweep (the canonical node-embedded artifact +
@@ -91,12 +138,14 @@ test: wasm-modules-check
 ## and wasm-tools (cargo install wasm-tools). component bytes are toolchain-
 ## dependent: a rebuild on a different rustc may legitimately differ from the
 ## committed bytes — commit the refreshed set TOGETHER; `wasm-modules-check`
-## guards mutual consistency, not reproducibility.
+## guards mutual consistency. bytes no longer depend on WHERE the checkout
+## lives (guest-builder remaps the path prefixes away), so the same toolchain
+## on any box reproduces them — `wasm-repro-check` is that pin.
 #
 # Every product/example module carries its own guest port (src/guest.rs behind
 # the `guest` feature); guest-builder synthesizes the packaging workspace and
 # writes the canonical component.wasm into the module directory itself. The
-# four kernel-fixture test guests (hello, hello-v2, sibling, object) keep
+# four kernel-fixture test guests (hello, hello-replacement, sibling, object) keep
 # their standalone crates/guests workspaces below.
 BUILDER_MODULES := \
   crates/examples/directory \
@@ -108,6 +157,16 @@ BUILDER_MODULES := \
   crates/modules/system/gateway crates/modules/system/governance \
   crates/modules/system/saga
 
+# Modules that additionally ship an INDEX guest (src/index_guest.rs behind the
+# `index-guest` feature): guest-builder --index writes the canonical
+# index.wasm (core wasm, no componentize) into the module directory, which
+# noded embeds via include_bytes!. The reference testmap mapper is the
+# indexer crate's test fixture and rides the same sweep.
+INDEX_MODULES := \
+  crates/modules/apps/chat crates/modules/apps/tasks crates/modules/apps/pages \
+  crates/modules/apps/inbox crates/modules/system/saga \
+  crates/kernel/index-guest/testmap
+
 wasm-modules:
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
@@ -115,9 +174,13 @@ wasm-modules:
 	  cp $$m/component.wasm \
 	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
 	done
+	@for m in $(INDEX_MODULES); do \
+	  $(CARGO) run -q -p guest-builder -- --index $$m || exit 1; \
+	done
 	# hello mirrors its component into BOTH fixture homes; sibling/object write
-	# straight to the wasm-host fixture with no guest copy; hello-v2 builds the v2
-	# crate directly into the host fixture. Each shape is unique — kept explicit.
+	# straight to the wasm-host fixture with no guest copy; hello-replacement
+	# builds the replacement crate directly into the host fixture. Each shape is
+	# unique — kept explicit.
 	cd crates/guests/hello-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/hello-wasm/target/wasm32-unknown-unknown/release/hello_wasm.wasm \
@@ -126,10 +189,10 @@ wasm-modules:
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
 	cp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
-	cd crates/guests/hello-wasm-v2 && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/hello-wasm-replacement && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/guests/hello-wasm-v2/target/wasm32-unknown-unknown/release/hello_wasm_v2.wasm \
-	  -o crates/kernel/host/tests/fixtures/hello-v2.component.wasm
+	  crates/guests/hello-wasm-replacement/target/wasm32-unknown-unknown/release/hello_wasm_replacement.wasm \
+	  -o crates/kernel/host/tests/fixtures/hello-replacement.component.wasm
 	cd crates/guests/sibling-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
@@ -153,7 +216,25 @@ wasm-modules-check:
 	  cmp $$m/component.wasm \
 	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
 	done
+	@for m in $(INDEX_MODULES); do \
+	  test -f $$m/index.wasm || { echo "missing $$m/index.wasm (make wasm-modules)"; exit 1; }; \
+	done
+# and no committed artifact may carry a builder-local absolute path. guest-builder
+# remaps the checkout, CARGO_HOME and RUSTUP_HOME prefixes to stable tokens (see
+# `remap_flags`), so a `/home/...` or `/Users/...` in the bytes means an artifact
+# built without that remap — the state where every box disagrees on every module.
+	@leaks=$$(git ls-files -z '*.wasm' | xargs -0 grep -laE '/home/|/Users/' || true); \
+	  test -z "$$leaks" || { \
+	    echo "builder host paths embedded in: $$leaks"; \
+	    echo "rebuild with make wasm-modules (guest-builder --remap-path-prefix)"; exit 1; }
 	@echo "wasm module artifacts are mutually consistent"
+
+## the reproducibility gate: one guest built from TWO different checkout paths
+## must be byte-identical, and carry no host path. Needs the wasm32 target and
+## wasm-tools (which `wasm-modules-check` deliberately does not), so it stands
+## apart from the pre-push `test` gate. See ops/wasm-repro-check.sh.
+wasm-repro-check:
+	@bash ops/wasm-repro-check.sh
 
 clean:
 	$(CARGO) clean

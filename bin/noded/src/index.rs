@@ -1,5 +1,6 @@
-//! the derived-index tier: shared store construction, from-state rebuilds,
-//! and the `/v1/index/*` + `/v1/blocks` snapshot read lane.
+//! the derived-index tier: shared store construction (bundled wasm index
+//! guests installed per module), boundary stamping, and the `/v1/index/*` +
+//! `/v1/blocks` snapshot read lane.
 
 use std::sync::Arc;
 
@@ -16,30 +17,54 @@ use crate::{NodeHandle, error_response, hex_bytes};
 const BLOCKS_DEFAULT_LIMIT: usize = 256;
 
 // ---------------------------------------------------------------------------
-// the derived-index tier: shared construction + from-state rebuild triggers.
-// noded and the consensus validator (bin/node) both reuse this router, so
-// they share the store setup too — one construction site, identical
-// /v1/index/* behavior, each binary passing its own genesis module list.
+// the derived-index tier: shared construction. noded and the consensus
+// validator (bin/node) both reuse this router, so they share the store setup
+// too — one construction site, identical /v1/index/* behavior, each binary
+// passing its own genesis module list.
 // ---------------------------------------------------------------------------
 
-/// open the per-module index store under `<storage>/index` with every view
-/// mapper registered. an open failure is fatal-with-remedy for the caller:
-/// the tier is rebuildable, so the fix is always "delete the directory".
+// the bundled index-guest artifacts: each module's fluentabi mapper, built by
+// `guest-builder --index` and committed beside its crate (`make wasm-modules`
+// refreshes the set, `wasm-modules-check` guards it). installed into the
+// module's index database at open — code travels WITH the data from there on
+// (the shipping lane carries it to joiners inside the archive).
+const CHAT_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/chat/index.wasm");
+const TASKS_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/tasks/index.wasm");
+const PAGES_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/pages/index.wasm");
+const INBOX_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/inbox/index.wasm");
+const SAGA_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/system/saga/index.wasm");
+
+/// the bundled mapper for one module id — `None` for modules that ship no
+/// index guest (their databases still hold the op feed and serve scans).
+fn index_guest_wasm(id: &str) -> Option<&'static [u8]> {
+    match id {
+        "chat" => Some(CHAT_INDEX_WASM),
+        "tasks" => Some(TASKS_INDEX_WASM),
+        "pages" => Some(PAGES_INDEX_WASM),
+        "inbox" => Some(INBOX_INDEX_WASM),
+        "saga" => Some(SAGA_INDEX_WASM),
+        _ => None,
+    }
+}
+
+/// open the per-module index store under `<storage>/index`, converging every
+/// module's database onto its bundled index guest. an open failure is
+/// fatal-with-remedy for the caller: the tier is rebuildable, so the fix is
+/// always "delete the directory".
 pub fn open_index_store<S: AsRef<str>>(
     storage: &std::path::Path,
     module_ids: &[S],
 ) -> Result<Arc<indexer::IndexStore>, String> {
     let index_dir = storage.join("index");
-    indexer::IndexStore::open(&index_dir, module_ids)
-        .map(|store| {
-            Arc::new(
-                store
-                    .with_indexer(Box::new(chat::index::ChatIndex::new("chat")))
-                    .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
-                    .with_indexer(Box::new(pages::index::PagesIndex::new("pages")))
-                    .with_indexer(Box::new(saga::index::UsageIndex::new("saga"))),
-            )
+    let modules: Vec<indexer::IndexModule> = module_ids
+        .iter()
+        .map(|id| indexer::IndexModule {
+            id: id.as_ref(),
+            guest: index_guest_wasm(id.as_ref()),
         })
+        .collect();
+    indexer::IndexStore::open(&index_dir, &modules)
+        .map(Arc::new)
         .map_err(|err| {
             format!(
                 "open module index at {}: {err} (derived tier — delete the directory to rebuild)",
@@ -51,10 +76,9 @@ pub fn open_index_store<S: AsRef<str>>(
 /// flatten a dispatch origin into the index's plain origin tag: external
 /// submitter identities render via [`indexer::user_handle`] — printable claimed
 /// names pass through, raw ed25519 pubkeys become hex (never the lossy `�`
-/// boxes a plain utf-8 decode leaves). the same convention drives a mapper's
-/// from-state rebuild (see `chat::index` `author_from_ref`), so folded and
-/// rebuilt rows match byte-for-byte on BOTH lanes. hex-keyed identity belongs
-/// to the explorer row's `proposer`, not the index op rows.
+/// boxes a plain utf-8 decode leaves). the feed carries origins pre-rendered,
+/// so index guests never see raw key bytes. hex-keyed identity belongs to the
+/// explorer row's `proposer`, not the index op rows.
 pub fn index_origin(origin: &sdk::Origin) -> indexer::OriginTag {
     match origin {
         sdk::Origin::External(id) => indexer::OriginTag::external(indexer::user_handle(id)),
@@ -89,59 +113,34 @@ pub fn index_block_ops(
                 origin: index_origin(&d.origin),
                 module: d.module.clone(),
                 payload: d.payload.clone(),
+                assigned: d.assigned.clone(),
             })
             .collect(),
         record: None,
     }
 }
 
-/// one module's canonical state as the indexer's [`indexer::StateReader`]:
-/// [`host::Host::query`] adapted onto the bytes-in/bytes-out rebuild surface,
-/// module errors mapped into [`indexer::Error::State`].
-struct HostStateReader<'a> {
-    host: &'a host::Host,
-    module: &'a str,
-}
-
-#[async_trait::async_trait(?Send)]
-impl indexer::StateReader for HostStateReader<'_> {
-    async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
-        self.host
-            .query(self.module, req)
-            .await
-            .map_err(|err| indexer::Error::State(err.to_string()))
-    }
-}
-
-/// heal every module whose watermark trails `boundary` from VERIFIED
-/// canonical state: a mapper that declares a from-state rebuild re-derives
-/// its read model; a module without one is stamped backfilled, its content
-/// visibly beginning at the boundary. call wherever canonical state advanced
+/// stamp every module whose watermark trails `boundary` as backfilled: its
+/// feed and views honestly BEGIN at the boundary, visibly via the floor
+/// (`/v1/index/status` reports it). call wherever canonical state advanced
 /// without the op stream — after state-sync installs a boundary, after
 /// recovery skipped re-executing durable blocks, or over a wiped index
-/// directory. returns `(module, rows)` per re-derived view.
-pub async fn rebuild_stale_modules(
+/// directory. history below a boundary re-enters only by replaying blocks
+/// through the feed or adopting a shipped index. returns the stamped ids.
+pub fn stamp_stale_modules(
     index: &indexer::IndexStore,
-    host: &host::Host,
-    boundary: indexer::RebuildMeta,
-) -> Result<Vec<(String, u64)>, indexer::Error> {
+    boundary: u64,
+) -> Result<Vec<String>, indexer::Error> {
     let modules: Vec<String> = index.module_ids().map(str::to_string).collect();
-    let mut rebuilt = Vec::new();
+    let mut stamped = Vec::new();
     for module in modules {
-        if index.applied_height(&module)? >= boundary.height {
+        if index.applied_height(&module)? >= boundary {
             continue;
         }
-        let state = HostStateReader {
-            host,
-            module: &module,
-        };
-        match index.rebuild_module(&module, &state, boundary).await {
-            Ok(rows) => rebuilt.push((module, rows)),
-            Err(indexer::Error::RebuildUnsupported) => index.mark_backfilled(&module, boundary)?,
-            Err(err) => return Err(err),
-        }
+        index.mark_backfilled(&module, boundary)?;
+        stamped.push(module);
     }
-    Ok(rebuilt)
+    Ok(stamped)
 }
 
 // ---------------------------------------------------------------------------
@@ -152,11 +151,10 @@ pub async fn rebuild_stale_modules(
 
 /// query params for `GET /v1/index/{module}/scan` and `…/ops`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct IndexScanParams {
     /// key prefix to scan under. ignored by `…/ops` (pinned to the op log).
     pub prefix: Option<String>,
-    /// opaque page cursor: the `nextAfter` of the previous page.
+    /// opaque page cursor: the `next_after` of the previous page.
     pub after: Option<String>,
     /// page size; the store clamps oversized asks.
     pub limit: Option<usize>,
@@ -166,9 +164,8 @@ pub struct IndexScanParams {
 const INDEX_DEFAULT_LIMIT: usize = 100;
 
 /// one scanned entry. values written by this tier are json (`value`); a
-/// derived value that is not valid json ships as `valueHex` instead.
+/// derived value that is not valid json ships as `value_hex` instead.
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct IndexEntry {
     key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,7 +175,6 @@ struct IndexEntry {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct IndexScanResponse {
     entries: Vec<IndexEntry>,
     has_more: bool,
@@ -187,13 +183,39 @@ struct IndexScanResponse {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct IndexOpsResponse {
-    /// stored op-row envelopes, verbatim (height/seq/time/origin + payload).
-    ops: Vec<Box<serde_json::value::RawValue>>,
+    /// op rows projected to json (height/seq/time/origin + payload). the
+    /// stored envelope is borsh (the guest feed); this lane re-presents it
+    /// in the row shape the tier always served: a payload that is valid
+    /// json embeds verbatim as `payload`, anything else ships as
+    /// `payload_hex` — the codebase's hex-not-base64 convention.
+    ops: Vec<serde_json::Value>,
     has_more: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_after: Option<String>,
+}
+
+/// one borsh op row as this lane's json projection.
+fn op_row_json(row: &indexer::OpRow) -> serde_json::Value {
+    let mut out = serde_json::json!({
+        "height": row.height,
+        "seq": row.seq,
+        "time": row.time,
+        "origin": row.origin,
+    });
+    let payload_json: Option<serde_json::Value> = serde_json::from_slice(&row.payload).ok();
+    match payload_json {
+        Some(value) => out["payload"] = value,
+        None => out["payload_hex"] = serde_json::Value::String(hex_bytes(&row.payload)),
+    }
+    if !row.assigned.is_empty() {
+        let assigned_json: Option<serde_json::Value> = serde_json::from_slice(&row.assigned).ok();
+        match assigned_json {
+            Some(value) => out["assigned"] = value,
+            None => out["assigned_hex"] = serde_json::Value::String(hex_bytes(&row.assigned)),
+        }
+    }
+    out
 }
 
 fn index_store(handle: &NodeHandle) -> Option<&Arc<indexer::IndexStore>> {
@@ -213,18 +235,21 @@ fn index_error(err: indexer::Error) -> Response {
     error_response(status, &err.to_string())
 }
 
-/// GET /v1/index/status — each module's applied watermark plus the poison
-/// flag. a poisoned index keeps serving (stale but consistent) reads; the
-/// remedy is a rebuild, which this surface makes visible. modules re-derived
-/// from canonical state also report their backfill floor: content below it
-/// was never folded from ops (heights are boundary-stamped, the op log
-/// starts above it) — the gap stays visible instead of papered over.
+/// GET /v1/index/status — each module's applied watermark (the op FEED, not
+/// the derived view), the poison flag, backfill floors, and every fold
+/// trigger's health (`pending` backlog + last drain error): the watermark
+/// vouches for the feed, the fold trails it observably. a poisoned index
+/// keeps serving (stale but consistent) reads; the remedy is a rebuild,
+/// which this surface makes visible. boundary-stamped modules also report
+/// their backfill floor: content below it was never in the feed — the gap
+/// stays visible instead of papered over.
 pub(crate) async fn index_status(State(handle): State<NodeHandle>) -> Response {
     let Some(store) = index_store(&handle) else {
         return no_index_store_response();
     };
     let mut modules = serde_json::Map::new();
     let mut backfilled = serde_json::Map::new();
+    let mut fold = serde_json::Map::new();
     for id in store.module_ids() {
         match store.applied_height(id) {
             Ok(height) => {
@@ -239,18 +264,34 @@ pub(crate) async fn index_status(State(handle): State<NodeHandle>) -> Response {
             Ok(None) => {}
             Err(err) => return index_error(err),
         }
+        match store.fold_status(id) {
+            Ok(Some(status)) => match serde_json::to_value(&status) {
+                Ok(value) => {
+                    fold.insert(id.to_string(), value);
+                }
+                Err(_) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "fold status did not serialize",
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(err) => return index_error(err),
+        }
     }
     Json(serde_json::json!({
         "poisoned": store.is_poisoned(),
         "modules": modules,
         "backfilled": backfilled,
+        "fold": fold,
     }))
     .into_response()
 }
 
 /// GET /v1/index/{module}/ops?after=&limit= — one page of the module's op
 /// log, oldest-first. rows are the stored envelopes verbatim; page forward by
-/// echoing `nextAfter` as the next call's `after`.
+/// echoing `next_after` as the next call's `after`.
 pub(crate) async fn index_ops(
     State(handle): State<NodeHandle>,
     Path(module): Path<String>,
@@ -270,14 +311,14 @@ pub(crate) async fn index_ops(
     };
     let mut ops = Vec::with_capacity(page.entries.len());
     for (_key, value) in &page.entries {
-        match serde_json::from_slice(value) {
-            Ok(row) => ops.push(row),
-            // rows are written as json by construction; failing one means the
+        match borsh::from_slice::<indexer::OpRow>(value) {
+            Ok(row) => ops.push(op_row_json(&row)),
+            // rows are written as borsh by construction; failing one means the
             // store is damaged — say so instead of silently dropping it.
             Err(_) => {
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "stored op row was not json — rebuild the index",
+                    "stored op row was not a borsh envelope — rebuild the index",
                 );
             }
         }
@@ -356,20 +397,28 @@ pub(crate) async fn index_scan(
 
 /// query params for `GET /v1/blocks`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BlocksParams {
     /// cap the response to the most recent N blocks (default:
     /// [`BLOCKS_DEFAULT_LIMIT`]).
     pub limit: Option<usize>,
 }
 
-/// GET /v1/blocks — recent non-empty blocks, oldest-first: `{"blocks":[…]}`.
+/// GET /v1/blocks — the recent rows this node kept, oldest-first:
+/// `{"blocks":[…]}`.
 ///
 /// reads the index store's durable blocks database directly (no actor
 /// round-trip), the same discipline as the other `/v1/index/*` reads — so
 /// history survives a restart. heartbeat nops never get a row, so an empty
 /// reply means no real ops have finalized, not an idle chain. a handle with
 /// no index store configured serves the same "no blocks yet" shape.
+///
+/// NOT uniformly non-empty, and a reader that assumes so is wrong: the block
+/// writers drop an op-less block, but [`indexer::IndexStore::apply_block_record`]
+/// exists for a follower that observes BOUNDARIES rather than sealed frames,
+/// and `bin/node`'s `boundary_block_row` writes one such row (empty `hash`,
+/// empty `ops`) at each ascension tip. it is a truthful record of what that
+/// node saw; a consumer that presents these rows as blocks-with-content owes
+/// its own filter.
 pub(crate) async fn blocks(
     State(handle): State<NodeHandle>,
     Query(params): Query<BlocksParams>,

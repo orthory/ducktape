@@ -479,7 +479,6 @@ fn raw_commit_message_does_not_inflate_the_job_finalize_receipt() {
             task_id: "t1".into(),
             title: "todo".into(),
         }],
-        delegations: Vec::new(),
         commit_message: Some("x".repeat(JOB_FINALIZE_PAYLOAD_BYTES * 2)),
     });
     let response = String::from_utf8(response).unwrap();
@@ -1054,7 +1053,11 @@ fn saga_id_mirror_matches_the_dispatch_modules_derivation() {
     // pin the executing-node lookup's saga-id mirror against the REAL
     // dispatch module: register a recipe, dispatch, and read the saga id
     // off the emitted trigger — the mirror must derive the same id.
-    let mut d = dispatch::DispatchModule::new("dispatch", "saga");
+    let mut d = dispatch::DispatchModule::new(
+        "dispatch",
+        "saga",
+        Box::new(sdk_testkit::MemStore::new()),
+    );
     let mut ctx = CaptureCtx::new().with_origin(Origin::Module("runs".into()));
     block_on(d.execute(
         &mut ctx,

@@ -1,13 +1,7 @@
-# lifecycle — the network lifecycle module. ONE app-hashed commitment covering
-# both height-gated coordination classes that used to live in the mirror-image
-# `upgrade` and `modreg` crates:
-#   * the agreed node protocol version + at most one pending, readiness-gated
-#     ScheduledUpgrade (the R=n binary roll), and
-#   * per hot-swappable module, the ACTIVE code hash + at most one pending,
-#     readiness-gated ScheduledSwap (the height-gated wasm code swap).
-# One root, one wire surface, one system-injected `Advance` boundary tick that
-# arms both. Native module (no wasm guest). The code BYTES stay out-of-band
-# (content-addressed by hash); this module commits only to WHICH code is active.
+# lifecycle — the network module-code registry. It commits each hot-swappable
+# module's active code hash and at most one readiness-gated scheduled swap.
+# Native module (no wasm guest); component bytes remain content-addressed and
+# out-of-band.
 [package]
 name = "lifecycle"
 version.workspace = true
@@ -15,6 +9,8 @@ edition.workspace = true
 
 [dependencies]
 sdk = { workspace = true }
+# the store-record codec: compact, canonical, deterministic. wire stays sdk::wire.
+borsh = { workspace = true }
 valset = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,5 +18,8 @@ sha2 = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+# the sync round-trip proof drives a real qmdb source/joiner pair.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }
 futures = { workspace = true }
 sdk-testkit = { workspace = true }

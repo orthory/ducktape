@@ -92,14 +92,6 @@ fn a_threaded_anchor_threads_the_reply() {
     commit(&mut m);
     let run_id = run_id_for("general", 3, "bot");
     assert_eq!(get_pending(&m, &run_id).unwrap().thread_root, Some(1));
-    // the envelope keys thread continuity by the ROOT, not the anchor.
-    let dispatches = ctx.dispatch_msgs();
-    let DispatchMsg::Dispatch { payload, .. } = &dispatches[0] else {
-        panic!("expected a dispatch");
-    };
-    let envelope: serde_json::Value = serde_json::from_slice(payload).unwrap();
-    assert_eq!(envelope["thread_key"], "general#1");
-
     let mut ctx = CaptureCtx::new()
         .at(9)
         .with_dispatch_origin()

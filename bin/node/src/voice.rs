@@ -1237,6 +1237,10 @@ mod tests {
         session_a: &noded::CallSession,
         session_b: &mut noded::CallSession,
     ) {
+        // drain stale playout first: mixed_out fills to its cushion and then
+        // drops newest, so a barrier reused after an earlier loud phase would
+        // otherwise read that phase's tail and "prove" a gate it never tested.
+        while session_b.mixed_out.try_recv().is_ok() {}
         let loud = loud_frame();
         let heard = async {
             loop {
@@ -1330,7 +1334,9 @@ mod tests {
             .send(noded::PresenceControlIn::Cursor(cursor.clone()))
             .await
             .unwrap();
-        let received = tokio::time::timeout(Duration::from_secs(2), presence_b.control_out.recv())
+        // this cursor may race B's roster into admission and drop; the 1 Hz
+        // presence tick re-sends it, so a generous timeout absorbs the race.
+        let received = tokio::time::timeout(Duration::from_secs(10), presence_b.control_out.recv())
             .await
             .expect("cursor crosses before timeout")
             .expect("presence lane stays open");
@@ -1774,6 +1780,10 @@ mod tests {
         let mut session_b = open(req_b_tx.clone()).await;
         session_a.recipients.send(vec![key_b]).expect("session a alive");
         session_b.recipients.send(vec![key_a]).expect("session b alive");
+        // gate barrier: the keyframe below is one-shot, and a roster reaches
+        // BOTH admission gates (A's send side, B's receive side)
+        // asynchronously — audio crossing is the proof they are open.
+        wait_audio_crosses(&session_a, &mut session_b).await;
 
         // A's first stream: one keyframe crosses and B emits it, so B's
         // peer_lane for A now carries last_emitted = 0.
@@ -1807,6 +1817,12 @@ mod tests {
             .recipients
             .send(vec![key_b])
             .expect("session a2 alive");
+        // barrier again: A2 registered with a fresh EMPTY roster and B's
+        // restore is still in flight, so the rejoin keyframe is a one-shot
+        // across two unproven gates. Audio creates no peer lane on B (lanes
+        // are built only by video/ctl arrivals), so the eviction property
+        // under test is untouched.
+        wait_audio_crosses(&session_a2, &mut session_b).await;
 
         let rejoined: Vec<u8> = (0..5000).map(|i| ((i * 3 + 1) % 251) as u8).collect();
         session_a2
@@ -1854,7 +1870,7 @@ mod tests {
         // a lone hub whose voice-plane ingress we drive directly, as a peer
         // would over the overlay. hold the egress receivers so sends don't
         // fail closed.
-        let (voice_out, _voice_out_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+        let (voice_out, mut voice_out_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
         let (voice_in, voice_in_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
         let (video_out, _video_out_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
         let (_video_in, video_in_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
@@ -1863,6 +1879,16 @@ mod tests {
         let session = open(req_tx.clone()).await;
         session.recipients.send(vec![peer]).expect("session alive");
         let mut control_out = session.control_out;
+
+        // the roster reaches admission asynchronously (the session task's
+        // select loop pushes it), and an inject racing it is dropped at demux
+        // with no resend. The hub's 1 Hz beacon to `peer` rides the SAME
+        // (Service::Voice, ctl_flow) admission entry, so one outbound frame
+        // on the voice plane proves the gate the injects need is open.
+        tokio::time::timeout(Duration::from_secs(10), voice_out_rx.recv())
+            .await
+            .expect("a beacon must leave once the roster reaches admission")
+            .expect("voice plane alive");
 
         // hand-craft a control datagram on the session's ctl flow, exactly as a
         // hostile peer could inject over the overlay.
@@ -1952,7 +1978,7 @@ mod tests {
 /// the one thing unit-level transports cannot cover.
 #[cfg(test)]
 mod overlay_e2e {
-    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use commonware_cryptography::{Signer as _, ed25519};
     use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
@@ -2021,14 +2047,25 @@ mod overlay_e2e {
             node_key,
             raw_key,
             ula,
-            endpoint: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+            // a placeholder: the real value is the bound underlay address,
+            // copied WHOLE below. The two addresses on this struct belong to
+            // DIFFERENT layers and must not be confused — `ula` is the tunnel
+            // INTERIOR `/128` (v6, above), this is the UNDERLAY endpoint a peer
+            // dials. Writing a v6 literal here sends every handshake initiation
+            // into a socket that cannot carry it, and the tunnel never comes up
+            // (HANDSHAKE(REKEY_TIMEOUT), forever, surfacing only as a timeout).
+            endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         };
         node.effect.create_interface().expect("create interface");
         node.effect
             .apply(&config(&node, 0, Vec::new()))
             .expect("first apply binds the underlay");
-        let bound = node.effect.local_underlay_addr().expect("underlay bound");
-        node.endpoint.set_port(bound.port());
+        // take the whole bound address, not just its port: copying the port
+        // onto a hand-written literal is what let the family drift out of sync
+        // in the first place, and an assertion on the literal would still pass
+        // while the test timed out. Whatever the underlay actually bound IS the
+        // endpoint, by construction.
+        node.endpoint = node.effect.local_underlay_addr().expect("underlay bound");
         node
     }
 

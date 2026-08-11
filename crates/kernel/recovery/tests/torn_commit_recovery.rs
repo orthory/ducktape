@@ -330,7 +330,7 @@ fn a_torn_block_recovers_by_committing_only_the_in_memory_cohort() {
         node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         let tip = node.finalized().expect("boundary");
-        let tip_hash = node.app_hash();
+        let tip_hash = node.root_hash();
         assert_eq!(cell.borrow().counter, 1, "disk committed once");
 
         // graceful WAL barrier, then the "crash": drop everything in memory but
@@ -378,8 +378,8 @@ fn a_torn_block_recovers_by_committing_only_the_in_memory_cohort() {
 
         assert_eq!(recovered.height, Some(tip.height));
         assert_eq!(
-            recovered.app_hash, tip_hash,
-            "recomposed app-hash is byte-identical to the sealed tip"
+            recovered.root_hash, tip_hash,
+            "recomposed root-hash is byte-identical to the sealed tip"
         );
         assert_eq!(recovered.applied, 1, "the torn block was replayed");
         // the in-memory cohort rolled forward from the WAL.
@@ -415,7 +415,7 @@ fn a_torn_block_recovers_by_committing_only_the_in_memory_cohort() {
             .recover(&mut host2, &manifest)
             .await
             .expect("again");
-        assert_eq!(again.app_hash, recovered.app_hash, "idempotent app-hash");
+        assert_eq!(again.root_hash, recovered.root_hash, "idempotent root-hash");
         assert_eq!(cell.borrow().counter, 1, "still no extra disk commit");
 
         // sanity: the disposition of the replayed block was Applied.
@@ -506,7 +506,7 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
         node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 2);
         let tip = node.finalized().expect("boundary");
-        let tip_hash = node.app_hash();
+        let tip_hash = node.root_hash();
         assert_eq!(cell.borrow().counter, 3, "disk committed once per block");
         assert!(
             tip.height - checkpoint_height >= 2,
@@ -544,8 +544,8 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
 
         assert_eq!(recovered.height, Some(tip.height));
         assert_eq!(
-            recovered.app_hash, tip_hash,
-            "recomposed app-hash is byte-identical to the sealed tip"
+            recovered.root_hash, tip_hash,
+            "recomposed root-hash is byte-identical to the sealed tip"
         );
         assert_eq!(recovered.applied, 2, "both post-checkpoint blocks replayed");
         assert_eq!(recovered.skipped, 0);
@@ -609,7 +609,7 @@ fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
         node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 3);
         let tip = node.finalized().expect("boundary");
-        let tip_hash = node.app_hash();
+        let tip_hash = node.root_hash();
         assert_eq!(cell.borrow().counter, 3, "disk committed once per block");
 
         node.sink_mut().sync().await.expect("sync");
@@ -632,7 +632,7 @@ fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
             .expect("pure-disk blocks ahead of the checkpoint recover cleanly");
 
         assert_eq!(recovered.height, Some(tip.height));
-        assert_eq!(recovered.app_hash, tip_hash);
+        assert_eq!(recovered.root_hash, tip_hash);
         // nothing rolled back, so every ahead-disk block is SKIPPED, not replayed.
         assert_eq!(recovered.applied, 0, "no in-memory cohort to re-commit");
         assert_eq!(recovered.skipped, 3, "every ahead-disk block was skipped");

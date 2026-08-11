@@ -15,7 +15,7 @@ seal.
 
 | # | Rule | Enforced at |
 |---|------|-------------|
-| R1 | Every invite is BEARER (무기명). No `target` field exists; whoever presents a valid join proof for the nonce first redeems it, single-use. | §1 |
+| R1 | Every invite is BEARER. No `target` field exists; whoever presents a valid join proof for the nonce first redeems it, single-use. | §1 |
 | R2 | A bearer resident token IS the admission credential, so it never crosses a link in the clear: the first-contact intro is SEALED to the receiving member's WireGuard X25519 key. | §2 |
 | R3 | The WireGuard/overlay plane is mandatory — the invite blob always carries the inviter's WG key material; the WG-less (TCP-reachable) shape is deleted. | §3 |
 | R4 | The gate rides the doorbell; the lobby dies — one sealed request/response over the tunnel path, no `CHANNEL_LOBBY`, no `lobby_identity`. | §4 |

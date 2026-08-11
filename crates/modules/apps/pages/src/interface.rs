@@ -1,8 +1,8 @@
 //! the pages module's public wire surface — types plus thin `sdk::wire` codec
 //! delegates.
 //!
-//! a page is a TREE of [`Block`]s (notion's model, simplified): the page itself
-//! is the root block, every block carries an ordered `children` list, and every
+//! a page is a TREE of [`Block`]s (notion's model, simplified): a `Page` block
+//! starts a document, every block carries an ordered `children` list, and every
 //! block id is GLOBALLY UNIQUE within the module — not merely unique inside its
 //! page. that global uniqueness is the addressability contract: a block is
 //! resolvable by id alone ([`PageQuery::GetBlock`] takes no page context), so a
@@ -12,9 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// the kind of a block. `Page` is a kind like any other (a page IS a block),
-/// but only [`PageMsg::CreatePage`] may mint one — block ops that try to
-/// insert or convert to `Page` are rejected.
+/// the kind of a block. `Page` is a kind like any other (a page IS a block):
+/// [`PageMsg::CreatePage`] creates a top-level one and [`PageMsg::InsertBlock`]
+/// creates a subpage in the parent page's content flow.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockKind {
@@ -66,18 +66,18 @@ pub struct RelativeAnchor {
 
 /// one block of a page, as stored and as returned by queries.
 ///
-/// the tree shape lives here: `parent` points up (None only for a page root),
-/// `children` is the ordered list of ids below, and `page` names the root
-/// block of the page this block belongs to (a root names itself). `page` and
-/// `parent` are DERIVED by the module on insert/move — writers never supply
-/// them (see [`NewBlock`]).
+/// the tree shape lives here: `parent` points up (`None` only for a top-level
+/// page), `children` is the ordered list of ids below, and `page` names the
+/// `Page` block whose document owns this block (`Page` blocks name themselves).
+/// `page` and `parent` are DERIVED by the module on insert/move — writers never
+/// supply them (see [`NewBlock`]).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     /// globally unique within the module — the addressable handle.
     pub id: String,
-    /// the parent block id; `None` only for a page root.
+    /// the parent block id; `None` only for a top-level page.
     pub parent: Option<String>,
-    /// the page (root block id) this block belongs to; a root names itself.
+    /// the owning page block id; `Page` blocks name themselves.
     pub page: String,
     pub kind: BlockKind,
     /// the text payload — the page title for `Page`, empty for `Divider`.
@@ -111,27 +111,20 @@ pub struct NewBlock {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PageMsg {
-    /// create a page: a root block of kind `Page` whose text is `title`.
-    /// `parent`, when `Some`, nests this page under another page (a folder
-    /// relation stored only in the enumeration index — content blocks are
-    /// untouched). idempotent: re-creating an existing page is a benign no-op
-    /// that changes neither the title NOR the parent. `page_id` is a block id
-    /// and shares the global-uniqueness rule.
-    CreatePage {
-        page_id: String,
-        title: String,
-        parent: Option<String>,
-    },
+    /// create a top-level page block. Subpages use `InsertBlock` with kind
+    /// `Page`, so their position is part of the containing document tree.
+    /// Idempotent: re-creating an existing page is a benign no-op that does
+    /// not clobber its title or position.
+    CreatePage { page_id: String, title: String },
     /// insert `block` under `parent` after the given sibling anchor (see the
-    /// `after` rule). the parent may be the page root or any block — nesting
-    /// is what makes toggles/indent work. rejected when `block.kind` is
-    /// `Page` (pages come only from `CreatePage`).
+    /// `after` rule). the parent may be a page block or any content block — nesting
+    /// is what makes toggles, indentation, and inline subpages work.
     InsertBlock {
         parent: String,
         after: Option<String>,
         block: NewBlock,
     },
-    /// replace a block's text. on a page root this renames the page.
+    /// replace a block's text. On a `Page` block this renames the page.
     UpdateText {
         block_id: String,
         text: String,
@@ -151,31 +144,25 @@ pub enum PageMsg {
         active: bool,
     },
     /// convert a block to another kind (markdown-shortcut conversions). both
-    /// converting TO `Page` and converting a page root away are rejected.
+    /// converting TO `Page` and converting a `Page` block away are rejected.
     SetKind { block_id: String, kind: BlockKind },
     /// flip a `Todo` block's checked state. rejected on any other kind.
     SetChecked { block_id: String, checked: bool },
-    /// move a block under a (possibly new) parent within the SAME page (see
-    /// the `after` rule). rejected on page roots, across pages, and when the
-    /// new parent sits inside the moved block's own subtree.
+    /// move a block under a (possibly new) parent (see the `after` rule).
+    /// `None` promotes a `Page` block to the top level and is rejected for
+    /// every other kind. Non-page blocks stay within their page; page blocks
+    /// may move between pages when that does not form a cycle.
     MoveBlock {
         block_id: String,
-        parent: String,
+        parent: Option<String>,
         after: Option<String>,
     },
-    /// remove a block AND its whole subtree. rejected on page roots.
+    /// remove a block AND its whole subtree. Removing a `Page` also removes
+    /// every nested page from the enumeration index, and purges the comment
+    /// threads anchored to every block that goes — an implicit mutation on the
+    /// block op's own authority, which like every block op here is any origin
+    /// (see `purge_comments_for_target`).
     RemoveBlock { block_id: String },
-    /// re-nest a page under a (possibly new) parent page, or to top level with
-    /// `None`. rejected when the target is not a page root, the parent is not a
-    /// page, or the move would form a cycle in the folder forest.
-    SetPageParent {
-        page_id: String,
-        parent: Option<String>,
-    },
-    /// delete a page: remove its root and whole block subtree, and PROMOTE its
-    /// direct child pages to the deleted page's parent (no cascade). rejected
-    /// when the id is not a page root.
-    DeletePage { page_id: String },
 
     // ── comments ──
     // a comment thread anchors to a `target` (a block id or a page id in THIS
@@ -208,6 +195,11 @@ pub enum PageMsg {
     },
     /// Move a thread with text that crossed a block boundary during split or
     /// merge. The replacement anchor is validated against the new target.
+    /// Stored-author authority, the same rule as `EditComment`/`DeleteComment`:
+    /// only the thread's `opener` may re-home it. An ungated move was also how
+    /// a stranger aimed `RemoveBlock`'s comment purge at someone else's
+    /// comments — re-home the thread onto a throwaway block, remove it, and
+    /// the author check on `DeleteComment` is bypassed.
     MoveCommentThread {
         thread_id: String,
         target: String,
@@ -232,10 +224,21 @@ pub enum PageMsg {
 
 // write-time caps for comments (consensus constants) — enforced before staging.
 pub const MAX_COMMENT_TEXT_BYTES: usize = 64 * 1024;
-pub const MAX_COMMENTS_PER_THREAD: usize = 4096;
+// One target index read + one thread read leave this many comment records
+// inside the subtree-removal work budget. An otherwise-empty target with one
+// full thread stays directly removable; larger targets can first shed the
+// thread because its last-live delete also stays below the wasm read ceiling.
+pub const MAX_COMMENTS_PER_THREAD: usize = 3_498;
 pub const MAX_THREADS_PER_TARGET: usize = 1024;
+/// per-request target cap on the index tier's grouped thread read.
 pub const MAX_QUERY_TARGETS: usize = 512;
 pub const MAX_SPAN_MARKS_PER_BLOCK: usize = 4096;
+pub const MAX_COMMENT_AGENT_ID_BYTES: usize = 512;
+/// Hard count bound for both page-index and page-block query pages.
+pub const MAX_PAGE_QUERY_LIMIT: u16 = 256;
+/// Encoded item budget for a page query reply. The remaining 2 MiB covers the
+/// response envelope and a worst-case cursor below the RPC client's 8 MiB cap.
+pub const MAX_PAGE_QUERY_BYTES: usize = 6 * 1024 * 1024;
 
 // client-minted id length caps (consensus constants). the shared DERIVED
 // blocks — the per-target thread index (a `Vec<thread_id>`, up to
@@ -245,11 +248,15 @@ pub const MAX_SPAN_MARKS_PER_BLOCK: usize = 4096;
 // long ids until one more append trips `MAX_BLOCK_LEN` at stage time and
 // ABORTS the block (a permanent-re-abort R4 wedge). these caps keep those
 // derived blocks safely under `MAX_BLOCK_LEN` (768 KiB) at full count (JSON
-// overhead ≈ 3 B/entry): 1024 × (512+3) ≈ 515 KiB and 4096 × (128+3) ≈ 524
-// KiB, both a comfortable ~250 KiB clear.
+// overhead ≈ 3 B/entry): 1024 × (512+3) ≈ 515 KiB and 3498 × (128+3) ≈ 448
+// KiB, both comfortably below the stored-value ceiling.
 pub const MAX_THREAD_ID_BYTES: usize = 512;
 pub const MAX_COMMENT_ID_BYTES: usize = 128;
 pub const MAX_COMMENT_TARGET_BYTES: usize = 512;
+/// Maximum bytes retained from an external or module origin in a comment
+/// author. Together with the page item limits, this bounds every comment query
+/// reply even when consensus receives a nonstandard origin.
+pub const MAX_COMMENT_AUTHOR_BYTES: usize = 512;
 
 /// whether a client-minted id serializes 1:1 (byte-for-byte) under
 /// `serde_json` — i.e. carries no escaping char. `serde_json` escapes `"`→
@@ -261,7 +268,8 @@ pub const MAX_COMMENT_TARGET_BYTES: usize = 512;
 /// exactly and the count × length caps hold. legit ids (uuids, path/hex
 /// forms) never contain these chars.
 pub fn id_is_index_safe(s: &str) -> bool {
-    !s.chars().any(|c| c == '"' || c == '\\' || (c as u32) < 0x20)
+    !s.chars()
+        .any(|c| c == '"' || c == '\\' || (c as u32) < 0x20)
 }
 
 /// who authored a comment — derived from `Env.origin`, never a payload. own
@@ -312,13 +320,6 @@ pub struct ThreadView {
     pub comments: Vec<Comment>,
 }
 
-/// the threads anchored to one target.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct TargetThreads {
-    pub target: String,
-    pub threads: Vec<ThreadView>,
-}
-
 pub fn encode_msg(m: &PageMsg) -> Vec<u8> {
     sdk::wire::encode(m)
 }
@@ -326,25 +327,28 @@ pub fn decode_msg(b: &[u8]) -> Result<PageMsg, String> {
     sdk::wire::decode(b)
 }
 
-/// read requests the pages module serves via `Module::query`.
+/// the DISPATCH read surface — the point reads other modules' `execute()`
+/// paths resolve through `Ctx::query` (runs' block/comment probes and page
+/// context assembly). UI-shaped enumeration (the page list, per-target
+/// thread panels, search) is served by pages' index guest on the derived
+/// tier instead.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PageQuery {
-    /// the whole page as its blocks in PREORDER (root first, each block's
-    /// subtree before its next sibling). `None` == no page at that id.
-    GetPage { page_id: String },
+    /// One bounded page of blocks in PREORDER (root first, each block's
+    /// subtree before its next sibling). `after` is the exclusive id of the
+    /// last block returned; `limit == 0` selects [`MAX_PAGE_QUERY_LIMIT`]. An
+    /// adversarially deep traversal fails before the wasm store-read ceiling.
+    GetPage {
+        page_id: String,
+        after: Option<String>,
+        limit: u16,
+    },
     /// a single block by id ALONE — no page context needed. this is the
     /// cross-module resolution surface; the returned block carries its `page`
     /// and `parent`, so a resolver learns where the block lives, not just
     /// what it says.
     GetBlock { block_id: String },
-    /// enumerate every page, served from the module's reserved index entry
-    /// (sorted by id), with titles read from the live roots.
-    ListPages,
-    /// every thread anchored to any of `targets` (block or page ids), grouped
-    /// by target. a page render calls this once with all visible block ids +
-    /// the page id. `targets` beyond [`MAX_QUERY_TARGETS`] are rejected.
-    ThreadsForTargets { targets: Vec<String> },
     /// one thread with its live comments.
     CommentThread { thread_id: String },
     /// one comment by id, tombstones included — the existence probe a module
@@ -352,27 +356,29 @@ pub enum PageQuery {
     /// so a squatted id would otherwise reject the follow-up and abort its
     /// block). `None` == no comment record at that id.
     GetComment { comment_id: String },
+    /// how many threads anchor to one target — the [`MAX_THREADS_PER_TARGET`]
+    /// cap probe a module staging `AddComment` follow-ups runs. a count off
+    /// the target's thread-index record, deliberately NOT the thread views
+    /// (those are the index guest's `threads_for_targets`).
+    TargetThreadCount { target: String },
 }
 
-/// one entry of [`PageReply::PageList`]: a page id and its current title.
+/// One bounded slice of a page's preorder block traversal.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct PageMeta {
-    pub id: String,
-    pub title: String,
-    /// the containing page id (folder parent), or `None` for a top-level page.
-    pub parent: Option<String>,
+pub struct PageBlockPage {
+    pub blocks: Vec<Block>,
+    pub next_after: Option<String>,
 }
 
 /// replies to a [`PageQuery`]. `Option` mirrors absence.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PageReply {
-    Page(Option<Vec<Block>>),
+    Page(Option<PageBlockPage>),
     Block(Option<Block>),
-    PageList(Vec<PageMeta>),
-    CommentThreads(Vec<TargetThreads>),
     CommentThread(Option<ThreadView>),
     Comment(Option<Comment>),
+    TargetThreadCount(u64),
 }
 
 pub fn encode_query(q: &PageQuery) -> Vec<u8> {
@@ -393,39 +399,45 @@ mod interface_tests {
     use super::*;
 
     #[test]
-    fn create_page_carries_optional_parent() {
+    fn page_blocks_use_block_tree_wire() {
         let m = PageMsg::CreatePage {
-            page_id: "p2".into(),
-            title: "child".into(),
-            parent: Some("p1".into()),
+            page_id: "p1".into(),
+            title: "root".into(),
         };
         let round: PageMsg = decode_msg(&encode_msg(&m)).unwrap();
         assert_eq!(round, m);
-        // top-level create serializes parent as null.
-        let top = PageMsg::CreatePage {
-            page_id: "p1".into(),
-            title: "root".into(),
-            parent: None,
+        let nested = PageMsg::InsertBlock {
+            parent: "p1".into(),
+            after: None,
+            block: NewBlock {
+                id: "p2".into(),
+                kind: BlockKind::Page,
+                text: "child".into(),
+                marks: Vec::new(),
+            },
         };
-        assert!(String::from_utf8(encode_msg(&top)).unwrap().contains("\"parent\":null"));
+        assert_eq!(decode_msg(&encode_msg(&nested)).unwrap(), nested);
     }
 
     #[test]
-    fn set_parent_and_delete_round_trip() {
-        for m in [
-            PageMsg::SetPageParent { page_id: "p2".into(), parent: None },
-            PageMsg::DeletePage { page_id: "p2".into() },
-        ] {
-            assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);
-        }
+    fn target_thread_count_round_trips() {
+        // the cap-probe read a module staging AddComment follow-ups runs.
+        let q = PageQuery::TargetThreadCount { target: "b1".into() };
+        assert_eq!(decode_query(&encode_query(&q)).unwrap(), q);
+        let r = PageReply::TargetThreadCount(7);
+        assert_eq!(decode_reply(&encode_reply(&r)).unwrap(), r);
     }
 
     #[test]
-    fn page_meta_carries_parent() {
-        let meta = PageMeta { id: "p2".into(), title: "t".into(), parent: Some("p1".into()) };
-        let bytes = serde_json::to_vec(&meta).unwrap();
-        let back: PageMeta = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back, meta);
+    fn page_queries_require_the_bounded_cursor_wire() {
+        let page = PageQuery::GetPage {
+            page_id: "p2".into(),
+            after: Some("b7".into()),
+            limit: 4,
+        };
+        assert_eq!(decode_query(&encode_query(&page)).unwrap(), page);
+        assert!(decode_query(br#""list_pages""#).is_err());
+        assert!(decode_query(br#"{"get_page":{"page_id":"p2"}}"#).is_err());
     }
 
     #[test]
@@ -464,8 +476,14 @@ mod interface_tests {
         );
 
         // a reply / block-level comment (the runs agent emits exactly this).
-        let wire = br#"{"add_comment":{"thread_id":"t1","comment_id":"c1","target":"b1","text":"note"}}"#;
-        let PageMsg::AddComment { anchor, mentions, as_agent, .. } = decode_msg(wire).unwrap()
+        let wire =
+            br#"{"add_comment":{"thread_id":"t1","comment_id":"c1","target":"b1","text":"note"}}"#;
+        let PageMsg::AddComment {
+            anchor,
+            mentions,
+            as_agent,
+            ..
+        } = decode_msg(wire).unwrap()
         else {
             panic!("expected AddComment")
         };

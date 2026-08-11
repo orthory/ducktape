@@ -1,22 +1,14 @@
 //! a runnable super-app demo: twenty registered modules — including QMDB-backed
 //! KV and EVM state, Git/DuckFS substrates, collaboration apps, and system
 //! routing modules — dispatched over ONE host, showing
-//! the app-hash evolve as typed cross-module ops flow, ending on the
+//! the root-hash evolve as typed cross-module ops flow, ending on the
 //! agent-collaboration beat: a mention becomes a run and a pending saga in one
 //! block.
 //!
 //! run: `cargo run -p demo`
 
-use statesync::qmdb::QmdbStore;
 use agent::AgentModule;
-use agent::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, encode_msg as agent_encode_msg,
-};
-use runs::{RunsModule, run_id_for};
-use runs::{
-    RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
-    encode_msg as runs_encode_msg, encode_query as runs_encode_query,
-};
+use agent::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, encode_msg as agent_encode_msg};
 use automations::Automations;
 use chat::Chat;
 use chat::{
@@ -29,20 +21,22 @@ use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
 use directory::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
-use gateway::Gateway;
 use files::Files;
 use forge::Forge;
 use forge::{
     ForgeMsg, ForgeQuery, ForgeReply, decode_reply as forge_decode_reply,
     encode_msg as forge_encode_msg, encode_query as forge_encode_query,
 };
+use gateway::Gateway;
 use greeter::Greeter;
 use host::{BlockContext, Host};
 use identity::Identity;
 use inbox::Inbox;
-use inbox::{
-    InboxMsg, InboxQuery, InboxReply, decode_reply as inbox_decode_reply,
-    encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
+use inbox::{InboxMsg, encode_msg as inbox_encode_msg};
+use runs::{RunsModule, run_id_for};
+use runs::{
+    RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
+    encode_msg as runs_encode_msg, encode_query as runs_encode_query,
 };
 use saga::SagaModule;
 use saga::{
@@ -50,6 +44,7 @@ use saga::{
     encode_query as saga_encode_query,
 };
 use sdk::{Msg, Origin};
+use statesync::qmdb::QmdbStore;
 use tasks::Tasks;
 use valset::Valset;
 use valset::{
@@ -78,7 +73,7 @@ fn main() {
             host::topology::DEMO.len()
         );
         println!("forge repo       : {}", forge_repo.display());
-        println!("genesis app-hash : {:?}", host.app_hash());
+        println!("genesis root-hash : {:?}", host.root_hash());
         println!(
             "genesis forge root (unborn git repo): {:?}",
             host.module_root("forge").unwrap()
@@ -104,7 +99,7 @@ fn main() {
             .await
             .expect("submit block 1");
         println!("\n[block 1] directory <- Set(name = world)");
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
 
         // block 2: trigger greeter. it QUERIES directory (typed, cross-module),
         // then emits typed follow-up writes to directory + kv — all in one block.
@@ -116,24 +111,46 @@ fn main() {
             .await
             .expect("submit block 2");
         println!("\n[block 2] greeter(name): query directory -> write greeting to directory + kv");
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
+
+        // forge, chat and the app modules below derive authorship from the
+        // dispatch origin (no author field in any payload) and each refuses an
+        // unauthenticated one, so the demo submits with an explicit external
+        // origin — a seed-derived ed25519 pubkey standing in for a real
+        // submitter id. the default empty external origin would be rejected.
+        let demo_user = PrivateKey::decode(&[5u8; 32][..])
+            .expect("32-byte seed is a valid ed25519 private key")
+            .public_key()
+            .as_ref()
+            .to_vec();
+        let as_demo_user = || BlockContext {
+            height: 0,
+            consensus_time: 0,
+            origin: Origin::External(demo_user.clone()),
+        };
 
         // block 3: tracker state is consensus-owned; Git objects are built by
         // clients and enter through the node's PushRefs data-plane lane, which
-        // this in-process Host demo deliberately does not emulate.
+        // this in-process Host demo deliberately does not emulate. a tracker
+        // item needs an authenticated author, so it rides the demo user's
+        // origin (the default `submit` context is the EMPTY external origin,
+        // which forge refuses).
         let out = host
-            .submit(Msg {
-                target: "forge".into(),
-                payload: forge_encode_msg(&ForgeMsg::OpenIssue {
-                    repo: "demo".into(),
-                    title: "Ship the first pushed commit".into(),
-                    body: "Git objects travel through the data plane".into(),
-                }),
-            })
+            .submit_at(
+                as_demo_user(),
+                Msg {
+                    target: "forge".into(),
+                    payload: forge_encode_msg(&ForgeMsg::OpenIssue {
+                        repo: "demo".into(),
+                        title: "Ship the first pushed commit".into(),
+                        body: "Git objects travel through the data plane".into(),
+                    }),
+                },
+            )
             .await
             .expect("submit block 3");
         println!("\n[block 3] forge <- OpenIssue — consensus-owned tracker state");
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
         println!(
             "  forge root     : {:?}",
             host.module_root("forge").unwrap()
@@ -184,21 +201,8 @@ fn main() {
             );
         }
 
-        // block 4: create a chat channel. chat derives authorship from the
-        // dispatch origin (no author field in any payload), so the demo submits
-        // with an explicit external origin — a seed-derived ed25519 pubkey
-        // standing in for a real submitter id. the default empty external
-        // origin would be rejected.
-        let demo_user = PrivateKey::decode(&[5u8; 32][..])
-            .expect("32-byte seed is a valid ed25519 private key")
-            .public_key()
-            .as_ref()
-            .to_vec();
-        let as_demo_user = || BlockContext {
-            height: 0,
-            consensus_time: 0,
-            origin: Origin::External(demo_user.clone()),
-        };
+        // block 4: create a chat channel — same origin-derived authorship as
+        // the forge item above, so the same demo user submits it.
         let out = host
             .submit_at(
                 as_demo_user(),
@@ -215,7 +219,7 @@ fn main() {
             .expect("submit block 4");
         println!("\n[block 4] chat <- CreateChannel(general) — authorship from origin");
         println!("  chat root      : {:?}", host.module_root("chat").unwrap());
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
 
         // block 5: a root message, a thread reply, and a reaction — three ops,
         // three blocks; sequences come from the channel's head_seq counter.
@@ -265,11 +269,16 @@ fn main() {
             )
             .await
             .expect("submit block 5 reaction");
+        // the dispatch read surface: `MessagesRange` over the gap-free seq
+        // space. reaction STATE is read-model territory (the index tier's
+        // `reactions` view on a full node); here the committed root moving
+        // is the reaction's receipt.
         let reply = host
             .query(
                 "chat",
-                &chat_encode_query(&ChatQuery::MessagesLatest {
+                &chat_encode_query(&ChatQuery::MessagesRange {
                     channel_id: "general".into(),
+                    from_seq: 1,
                     limit: 16,
                 }),
             )
@@ -282,22 +291,14 @@ fn main() {
                 "  m1 replies     : {} (last reply seq: {:?})",
                 messages[0].head.reply_count, messages[0].head.last_reply_seq
             );
-            println!(
-                "  m2 reactions   : {:?}",
-                messages[1]
-                    .reactions
-                    .iter()
-                    .map(|r| (r.emoji.as_str(), r.reactors.len()))
-                    .collect::<Vec<_>>()
-            );
             println!("  chat root      : {:?}", host.module_root("chat").unwrap());
-            println!("  app-hash       : {:?}", out.app_hash);
+            println!("  root-hash       : {:?}", out.root_hash);
         }
 
         // block 6: a NEW validator JOINs the permissionless ed25519 valset. derive
         // the key deterministically from a fixed seed (any 32 bytes is a valid
         // ed25519 seed) so the demo is reproducible. the valset root moves off
-        // ZERO and folds another module's commitment into the app-hash.
+        // ZERO and folds another module's commitment into the root-hash.
         let seed = [7u8; 32];
         let new_validator = PrivateKey::decode(&seed[..])
             .expect("32-byte seed is a valid ed25519 private key")
@@ -336,10 +337,10 @@ fn main() {
             "  valset root    : {:?}",
             host.module_root("valset").unwrap()
         );
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
 
         // block 7: the agent-collaboration loop (design §3). register an agent
-        // (which model+prompt it runs is committed into the app-hash), watch
+        // (which model+prompt it runs is committed into the root-hash), watch
         // the chat channel under a Mention policy — the watch and chat's hook
         // registration commit atomically — enable the runs module as the
         // jobs-board worker by admin op (not genesis config), then post a message MENTIONING the
@@ -479,7 +480,7 @@ fn main() {
         println!(
             "  (post + tag + engagement + run + dispatch + trigger: ONE block — the P2 cascade)"
         );
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
 
         // block 8: the INBOX notification queue. modules deliver to a member as
         // a follow-up so the notification commits atomically with its cause; here
@@ -506,35 +507,20 @@ fn main() {
             )
             .await
             .expect("submit block 8");
+        // inbox serves NO canonical reads (its whole read surface is the
+        // index guest's paged views on a full node) — the moved root IS the
+        // delivery receipt here.
         println!("\n[block 8] inbox <- Deliver(quackbot) — a notification as consensus state");
-        let reply = host
-            .query(
-                "inbox",
-                &inbox_encode_query(&InboxQuery::List {
-                    member: "quackbot".into(),
-                    from_seq: 0,
-                    limit: 16,
-                }),
-            )
-            .await
-            .expect("query inbox");
-        if let InboxReply::Items(items) = inbox_decode_reply(&reply).unwrap() {
-            for note in &items {
-                println!(
-                    "  note           : seq {} [{}] from {:?} — {}",
-                    note.seq, note.kind, note.source, note.body
-                );
-            }
-        }
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  inbox root     : {:?}", host.module_root("inbox").unwrap());
+        println!("  root-hash       : {:?}", out.root_hash);
 
         // every registered module, straight from the registry — the same set
-        // (and sorted-id order) the app-hash composes over.
+        // (and sorted-id order) the root-hash composes over.
         println!("\nmodule roots:");
         for (id, root) in host.module_roots() {
             println!("  {id:>11} : {root:?}");
         }
-        println!("\nfinal app-hash   : {:?}", host.app_hash());
+        println!("\nfinal root-hash   : {:?}", host.root_hash());
     });
 }
 
@@ -547,26 +533,69 @@ async fn demo_genesis(
     forge_repo: &std::path::Path,
     duckfs_dir: &std::path::Path,
 ) -> Host {
-    let kv = kv::Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
+    let kv = kv::Kv::new(
+        "kv",
+        Box::new(QmdbStore::init(context.child("kv"), "kv").await),
+    );
     let directory = Directory::new("directory");
     let greeter = Greeter::new("greeter");
     let forge = Forge::init("forge", forge_repo.to_path_buf())
         .expect("forge init")
         .with_chat("chat");
-    let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
-        .with_tagging("tagging");
-    let valset = Valset::new("valset");
-    let saga = SagaModule::new("saga");
-    let dispatch = dispatch::DispatchModule::new("dispatch", "saga");
-    let tagging = tagging::TaggingModule::new("tagging").with_direct_owner("runs");
-    let tasks = Tasks::new("tasks");
+    let chat = Chat::new(
+        "chat",
+        Box::new(QmdbStore::init(context.child("chat"), "chat").await),
+    )
+    .with_tagging("tagging");
+    let valset = Valset::new(
+        "valset",
+        Box::new(QmdbStore::init(context.child("valset"), "valset").await),
+    );
+    let saga = SagaModule::new(
+        "saga",
+        Box::new(QmdbStore::init(context.child("saga"), "saga").await),
+    );
+    let dispatch = dispatch::DispatchModule::new(
+        "dispatch",
+        "saga",
+        Box::new(QmdbStore::init(context.child("dispatch"), "dispatch").await),
+    );
+    let tagging = tagging::TaggingModule::new(
+        "tagging",
+        Box::new(QmdbStore::init(context.child("tagging"), "tagging").await),
+    )
+    .with_direct_owner("runs");
+    let tasks = Tasks::new(
+        "tasks",
+        Box::new(QmdbStore::init(context.child("tasks"), "tasks").await),
+    );
     // the deterministic user->nodes binding registry: no valset gating and
     // a fixed demo chain id (the demo has no real network descriptor).
-    let identity = Identity::new("identity", None, "demo".into());
-    let gateway = Gateway::new("gateway", "identity", None, "demo");
-    let inbox = Inbox::new("inbox");
+    // store-backed like chat/pages.
+    let identity = Identity::new(
+        "identity",
+        Box::new(QmdbStore::init(context.child("identity"), "identity").await),
+        None,
+        "demo".into(),
+    );
+    let gateway = Gateway::new(
+        "gateway",
+        Box::new(QmdbStore::init(context.child("gateway"), "gateway").await),
+        "identity",
+        None,
+        "demo",
+    );
+    let inbox = Inbox::new(
+        "inbox",
+        Box::new(QmdbStore::init(context.child("inbox"), "inbox").await),
+    );
     let files = Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open");
-    let agent = AgentModule::new("agent", "saga", Some("runs".into()));
+    let agent = AgentModule::new(
+        "agent",
+        Box::new(QmdbStore::init(context.child("agent"), "agent").await),
+        "saga",
+        Some("runs".into()),
+    );
     let runs = RunsModule::new(
         "runs",
         "chat",
@@ -577,10 +606,16 @@ async fn demo_genesis(
         Some("tasks".into()),
         Some("tasks".into()),
     )
-    // the duckfs/files module the portable (v3) composer pins its source
+    // the duckfs/files module the portable composer pins its source
     // head from (W2) — mandatory for envelope composition.
     .with_files_module("files");
-    let automations = Automations::new("automations", "chat", "tasks", "inbox");
+    let automations = Automations::new(
+        "automations",
+        Box::new(QmdbStore::init(context.child("automations"), "automations").await),
+        "chat",
+        "tasks",
+        "inbox",
+    );
     Host::genesis(vec![
         Box::new(kv),
         Box::new(directory),
@@ -623,7 +658,10 @@ mod tests {
             let mut want: Vec<String> =
                 host::topology::DEMO.iter().map(|s| s.to_string()).collect();
             want.sort_unstable();
-            assert_eq!(got, want, "demo genesis set must equal host::topology::DEMO");
+            assert_eq!(
+                got, want,
+                "demo genesis set must equal host::topology::DEMO"
+            );
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

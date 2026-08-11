@@ -61,7 +61,7 @@ pub(crate) fn choose_promotion_boundary<'a>(
     if !latest.participants.iter().any(|key| key == self_public_key) {
         return PromotionBoundary::Retry;
     }
-    if latest.app_hash == synced_host_hash {
+    if latest.root_hash == synced_host_hash {
         return if latest_boundary_has_floor(latest) {
             PromotionBoundary::Promote {
                 boundary: latest,

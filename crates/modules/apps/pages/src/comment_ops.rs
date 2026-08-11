@@ -1,5 +1,6 @@
 use super::{
-    AuthorRef, Comment, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
+    AuthorRef, Comment, MAX_COMMENT_AGENT_ID_BYTES, MAX_COMMENT_AUTHOR_BYTES,
+    MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
     MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET, Origin, PageError,
     PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
 };
@@ -28,7 +29,11 @@ fn target_index_key(target: &str) -> String {
 fn author_from_origin(origin: &Origin) -> Result<AuthorRef, PageError> {
     match origin {
         Origin::External(bytes) if bytes.is_empty() => Err(PageError::EmptyOrigin),
+        Origin::External(bytes) if bytes.len() > MAX_COMMENT_AUTHOR_BYTES => {
+            Err(PageError::AuthorTooLarge)
+        }
         Origin::External(bytes) => Ok(AuthorRef::User(bytes.clone())),
+        Origin::Module(id) if id.len() > MAX_COMMENT_AUTHOR_BYTES => Err(PageError::AuthorTooLarge),
         Origin::Module(id) => Ok(AuthorRef::Module(id.to_string())),
         Origin::System => Ok(AuthorRef::System),
     }
@@ -112,6 +117,18 @@ impl Pages {
     /// remove every comment thread (its comments + the target index) anchored
     /// to `target` — called when the target block/page is deleted so comment
     /// records never dangle in the reserved keyspace with no reachable target.
+    ///
+    /// deliberately NOT author-gated, and that is the module's rule rather
+    /// than an omission: this is an IMPLICIT mutation, a consequence of
+    /// removing the block, and it rides that block op's own authority. A page
+    /// tree here has no owning principal — every block op admits any origin —
+    /// so a per-comment check would only make a block undeletable once anyone
+    /// else commented on it, while adding no authority the module has
+    /// anywhere. What bounds the purge is aim, not permission: it reaches
+    /// exactly the threads anchored to the subtree being removed, which is why
+    /// [`Pages::apply_comment_op`]'s `MoveCommentThread` must stay
+    /// opener-gated — that op is the only way to aim it at a thread that was
+    /// never on your block. Same rule as [`Self::rebase_comment_anchors`].
     pub(super) async fn purge_comments_for_target(
         &mut self,
         target: &str,
@@ -132,9 +149,12 @@ impl Pages {
         Ok(())
     }
 
-    /// Keep selection anchors attached while a block's text shifts. This is
-    /// linear in threads on one target (hard-capped at 1024); shard the target
-    /// index only if real documents make that hotspot measurable.
+    /// Keep selection anchors attached while a block's text shifts. Implicit
+    /// like the purge above, so ungated for the same reason: it is a
+    /// consequence of an edit to the block and rides that block op's
+    /// authority. This is linear in threads on one target (hard-capped at
+    /// 1024); shard the target index only if real documents make that hotspot
+    /// measurable.
     pub(super) async fn rebase_comment_anchors(
         &mut self,
         target: &str,
@@ -200,6 +220,9 @@ impl Pages {
                     Some(agent_id) => {
                         if agent_id.is_empty() {
                             return Err(PageError::EmptyAgent);
+                        }
+                        if agent_id.len() > MAX_COMMENT_AGENT_ID_BYTES {
+                            return Err(PageError::AgentIdTooLarge);
                         }
                         match author_from_origin(origin)? {
                             AuthorRef::Module(module) => AuthorRef::Agent { module, agent_id },
@@ -280,6 +303,23 @@ impl Pages {
                 target,
                 anchor,
             } => {
+                // WHO first, then WHAT: an explicit re-home rewrites the
+                // anchor its OPENER placed, so it carries the same
+                // stored-author rule as `EditComment`/`DeleteComment` — and
+                // `author_from_origin` refuses the empty (pre-consensus)
+                // origin here exactly as it does on its four siblings.
+                // Ungated, this was also the aiming device for the comment
+                // purge: re-home a stranger's thread onto a throwaway block,
+                // `RemoveBlock` it, and their comments are hard-deleted past
+                // the very author check `DeleteComment` enforces.
+                let author = author_from_origin(origin)?;
+                let mut thread = self
+                    .load_thread(&thread_id)
+                    .await?
+                    .ok_or(PageError::ThreadNotFound)?;
+                if thread.opener != author {
+                    return Err(PageError::NotAuthor);
+                }
                 if target.len() > MAX_COMMENT_TARGET_BYTES || !id_is_index_safe(&target) {
                     return Err(PageError::IdTooLarge);
                 }
@@ -293,10 +333,6 @@ impl Pages {
                 {
                     return Err(PageError::InvalidTextRange);
                 }
-                let mut thread = self
-                    .load_thread(&thread_id)
-                    .await?
-                    .ok_or(PageError::ThreadNotFound)?;
                 if thread.target != target {
                     let mut next = self.load_target_index(&target).await?;
                     if !next.contains(&thread_id) && next.len() >= MAX_THREADS_PER_TARGET {

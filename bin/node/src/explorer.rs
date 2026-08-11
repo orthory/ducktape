@@ -1,4 +1,3 @@
-use host::Host;
 use noded::projection::project_root_op;
 use sdk::StateRoot;
 
@@ -51,18 +50,6 @@ pub(crate) fn sealed_frame_block_row(
             &[],
             disposition,
         ));
-        // an envelope's released continuation is its own op row, right after
-        // its parent — the live drain's row order (`noded::projection`).
-        if let Some(cont) = op.continuation {
-            ops.push(project_root_op(
-                blobs,
-                &sdk::Origin::Module(op.msg.target),
-                &cont.target,
-                &cont.payload,
-                &[],
-                disposition,
-            ));
-        }
     }
     if ops.is_empty() {
         // a pure nop/idle block — the explorer hides it (same rule as live).
@@ -71,22 +58,22 @@ pub(crate) fn sealed_frame_block_row(
     Some(noded::block_row(&noded::BlockRecord {
         height: block.height,
         hash: noded::hex_bytes(&node::frame_id(block.frame)),
-        commit_hash: hex(&block.app_hash),
+        commit_hash: hex(&block.root_hash),
         ops,
     }))
 }
 
 /// the resident's explorer row: a followed BOUNDARY, not a sealed frame. the
 /// populated fields are verified truth — the boundary height and the
-/// app-hash the manifest check passed — and every frame-derived field stays
+/// root-hash the manifest check passed — and every frame-derived field stays
 /// honestly empty, because a resident never sees the frames between
 /// boundaries (the same degradation rule that keeps the frameless daemon
 /// lane's `hash` empty rather than fabricated).
-pub(crate) fn boundary_block_row(height: u64, app_hash: &StateRoot) -> Vec<u8> {
+pub(crate) fn boundary_block_row(height: u64, root_hash: &StateRoot) -> Vec<u8> {
     noded::block_row(&noded::BlockRecord {
         height,
         hash: String::new(),
-        commit_hash: hex(app_hash),
+        commit_hash: hex(root_hash),
         // a resident follows boundaries, not frames: no member ops to show.
         ops: Vec::new(),
     })
@@ -170,26 +157,20 @@ impl recovery::ReplaySink for IndexFold<'_> {
     }
 }
 
-/// re-derive every index module whose watermark trails `boundary` from the
-/// host's VERIFIED canonical state (checkpoint-restored, state-synced, or
-/// replay-verified — every boot caller sits after a root/app-hash check).
-/// failures poison the store and log; the node boots regardless.
-pub(crate) async fn heal_index(index: &indexer::IndexStore, host: &Host, boundary: u64, label: &str) {
-    let meta = indexer::RebuildMeta {
-        height: boundary,
-        // the validator's consensus time IS the height.
-        time: boundary,
-    };
-    match noded::rebuild_stale_modules(index, host, meta).await {
-        Ok(rebuilt) => {
-            for (module, rows) in rebuilt {
+/// stamp every index module whose watermark trails `boundary` as backfilled
+/// (every boot caller sits after a root/root-hash check; history below the
+/// boundary re-enters only by replaying blocks through the feed). failures
+/// poison the store and log; the node boots regardless.
+pub(crate) fn heal_index(index: &indexer::IndexStore, boundary: u64, label: &str) {
+    match noded::stamp_stale_modules(index, boundary) {
+        Ok(stamped) => {
+            for module in stamped {
                 tracing::info!(
                     target: "ducktape::modules",
                     node = %label,
                     module,
                     height = boundary,
-                    rows,
-                    "index for {module} re-derived from state at height {boundary} ({rows} rows)"
+                    "index for {module} stamped backfilled at height {boundary}"
                 );
             }
         }
@@ -243,6 +224,11 @@ pub(crate) fn ship_index_blobs(
 /// short of a staged-and-committed install converges on the same fallback:
 /// the boot heal re-derives whatever the watermarks say is missing, so
 /// failures here log and fall through, never abort the promotion.
+// ORPHANED by the in-process promotion seat (nothing exec-reboots, so
+// nothing adopts a staged index anymore); kept only until the shipped-index
+// lane (serve side, IndexStore adoption, `sync_index` key) is swept as one
+// follow-up removal.
+#[allow(dead_code)]
 pub(crate) async fn stage_shipped_index<C: statesync::SyncClient>(
     client: &C,
     boundary: statesync::BoundaryId,

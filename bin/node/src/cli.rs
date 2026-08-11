@@ -10,9 +10,10 @@ use commonware_cryptography::{Signer as _, ed25519};
 
 use crate::cli_args::{
     AdmitArgs, InitArgs, InviteArgs, JoinCmd, JoinQuery, KeyArgs, MemberCmd, OpCmd, PubkeyArgs,
-    ResidentCmd, SelectorArgs, StatusArgs,
+    ResidentCmd, Selector, SelectorArgs, StatusArgs, WorkCmd, WorkTargetArgs,
 };
 use crate::config;
+use crate::work_admission::{self, AdmitTarget, WorkAdmission};
 use config::{hex_bytes, unhex};
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
@@ -32,7 +33,108 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::Peers(args) => cmd_node_peers(args),
         OpCmd::Resident(cmd) => dispatch_resident(cmd),
         OpCmd::Member(cmd) => dispatch_member(cmd),
+        OpCmd::Work(cmd) => dispatch_work(cmd),
     }
+}
+
+fn dispatch_work(cmd: WorkCmd) -> CommandResult {
+    match cmd {
+        WorkCmd::List(args) => cmd_work_list(args),
+        WorkCmd::Admit(args) => cmd_work_admit(args),
+        WorkCmd::Revoke(args) => cmd_work_revoke(args),
+    }
+}
+
+/// the workspace directory a `node work` verb reads and writes. The policy sits
+/// beside `node.toml`, and both the node and the compute daemon read it there.
+fn work_workspace(selector: &Selector) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cfg_path = selector.config_path()?;
+    Ok(cfg_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf())
+}
+
+/// `anyone` is the literal, everything else is an account (hex id or display
+/// name — the same resolution `user cred grant` takes). A hex id resolves
+/// offline; a display name needs the node to answer.
+fn resolve_work_target(
+    workspace: &std::path::Path,
+    input: &str,
+) -> Result<AdmitTarget, Box<dyn std::error::Error>> {
+    if input == work_admission::ANYONE {
+        return Ok(AdmitTarget::Anyone);
+    }
+    let base = config::http_base_in(workspace)?;
+    Ok(AdmitTarget::Account(crate::cred_cli::resolve_account(
+        &base, input,
+    )?))
+}
+
+fn cmd_work_list(args: SelectorArgs) -> CommandResult {
+    let workspace = work_workspace(&args.selector)?;
+    match work_admission::load(&workspace)? {
+        WorkAdmission::Owner => {
+            println!("owner only — this node runs its owner's work and its own submissions")
+        }
+        WorkAdmission::Anyone => {
+            println!("anyone — every network member may run a workload on this node")
+        }
+        WorkAdmission::Accounts(accounts) => {
+            println!("owner, plus {} admitted account(s):", accounts.len());
+            for account in &accounts {
+                println!("  {}", hex_bytes(account));
+            }
+        }
+    }
+    println!(
+        "policy: {}",
+        work_admission::policy_path(&workspace).display()
+    );
+    Ok(())
+}
+
+fn cmd_work_admit(args: WorkTargetArgs) -> CommandResult {
+    let workspace = work_workspace(&args.selector)?;
+    let target = resolve_work_target(&workspace, &args.target)?;
+    let policy = work_admission::load(&workspace)?.with(target.clone());
+    work_admission::save(&workspace, &policy)?;
+    match target {
+        AdmitTarget::Anyone => {
+            // the `service enable` consent-screen precedent: the widening that
+            // re-opens the hole says so on the way in, on stderr so stdout stays
+            // scriptable.
+            eprintln!(
+                "consent: every network member may now run a workload on this node, and any \
+                 workload here may draw on every credential this node has been granted. \
+                 Narrow it with `ducktape node work revoke anyone`."
+            );
+            println!("admitted: anyone");
+        }
+        AdmitTarget::Account(account) => println!("admitted: {}", hex_bytes(&account)),
+    }
+    Ok(())
+}
+
+fn cmd_work_revoke(args: WorkTargetArgs) -> CommandResult {
+    let workspace = work_workspace(&args.selector)?;
+    let target = resolve_work_target(&workspace, &args.target)?;
+    let current = work_admission::load(&workspace)?;
+    // revoking ONE account while the policy admits everyone would write a file
+    // that changes nothing and print success: refuse instead of fail-quiet.
+    let narrowing_one_from_anyone =
+        current == WorkAdmission::Anyone && !matches!(target, AdmitTarget::Anyone);
+    if narrowing_one_from_anyone {
+        return Err("this node admits anyone, so revoking one account changes nothing — \
+                    run `ducktape node work revoke anyone` first"
+            .into());
+    }
+    work_admission::save(&workspace, &current.without(target.clone()))?;
+    match target {
+        AdmitTarget::Anyone => println!("revoked: anyone"),
+        AdmitTarget::Account(account) => println!("revoked: {}", hex_bytes(&account)),
+    }
+    Ok(())
 }
 
 fn dispatch_resident(cmd: ResidentCmd) -> CommandResult {
@@ -84,11 +186,11 @@ fn cmd_list() -> CommandResult {
 /// stdout:
 ///
 /// ```text
-/// height=<h> app_hash=<hex>
+/// height=<h> root_hash=<hex>
 /// ```
 ///
 /// `height=none` means no block has finalized yet. `--json` emits the rpc's
-/// full status object (height, app_hash, every module root). requires the
+/// full status object (height, root_hash, every module root). requires the
 /// node to be up — the same local rpc lane as `member status`.
 fn cmd_node_status(args: StatusArgs) -> CommandResult {
     let cfg_path = args.selector.config_path()?;
@@ -110,9 +212,50 @@ fn cmd_node_status(args: StatusArgs) -> CommandResult {
         Some(h) => h.to_string(),
         None => "none".into(),
     };
-    let app_hash = status["app_hash"].as_str().unwrap_or("");
-    println!("height={height} app_hash={app_hash}");
+    let root_hash = status["root_hash"].as_str().unwrap_or("");
+    println!("height={height} root_hash={root_hash}");
+    // WHOSE node this is — the fact `user cred grant <account>`, `node work
+    // admit <account>` and `agent sched --host-node` all stand on, and the one
+    // an operator otherwise had to hand-write a `/v1/query` `OfNode` for.
+    // Prose only: `--json` is the rpc's status document verbatim and stays a
+    // byte-for-byte contract.
+    println!(
+        "{}",
+        account_line(&rpc_addr, resolved.signer.public_key().as_ref())
+    );
     Ok(())
+}
+
+/// The `account=` line under `node status`: this node's own account, named.
+///
+/// Best-effort, and quiet about its own failures on purpose: the node's tip is
+/// the answer `status` promises, and a chain that cannot serve an identity read
+/// must not turn a working status into an error. An UNBOUND node is not a
+/// failure at all — it is the ordinary state between `node run` and
+/// `user account-init`, and the only state with a next step worth printing.
+///
+/// `node_key` comes from the workspace this verb already resolved, NOT from the
+/// rpc status document — which carries height, root hash and module roots and
+/// has never named the node. Asking the running process would be the stricter
+/// source, but this verb opened `identity.key` two lines up to find the rpc
+/// address at all, so there is no new exposure to buy with the round trip.
+fn account_line(rpc_addr: &str, node_key: &[u8]) -> String {
+    let query = identity::encode_query(&identity::IdentityQuery::OfNode {
+        node_key: node_key.to_vec(),
+    });
+    let Ok(view) = rpc_query(rpc_addr, "identity", &query)
+        .and_then(|bytes| identity::decode_reply(&bytes).map_err(|e| e.to_string()))
+    else {
+        return "account=unknown (the identity module did not answer)".into();
+    };
+    let identity::IdentityReply::Account(Some(account)) = view else {
+        return "account=none — claim one with: ducktape user account-init --name <you>".into();
+    };
+    let id = hex_bytes(&account.account_id);
+    match account.display_name {
+        Some(name) => format!("account={name} ({})", id.get(..16).unwrap_or(&id)),
+        None => format!("account={id}"),
+    }
 }
 
 /// `peers [--config <path> | -n <chain-id>] [--json]` — the RUNNING node's
@@ -183,8 +326,7 @@ fn peer_line(
         " msgs_tx={} msgs_rx={}",
         peer.msgs_sent, peer.msgs_received
     ));
-    let dt_secs =
-        (second.sampled_at_ms.saturating_sub(first.sampled_at_ms)).max(1) as f64 / 1000.0;
+    let dt_secs = (second.sampled_at_ms.saturating_sub(first.sampled_at_ms)).max(1) as f64 / 1000.0;
     if let Some(base) = baseline {
         let tx_rate = (peer.msgs_sent.saturating_sub(base.msgs_sent)) as f64 / dt_secs;
         let rx_rate = (peer.msgs_received.saturating_sub(base.msgs_received)) as f64 / dt_secs;
@@ -251,6 +393,55 @@ fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// the platform's compute adapter — podman on Linux, tart on macOS — as the
+/// `[sandbox]` table generation writes (`0` = probe the host at boot) plus
+/// the probeable backend, so generation and detection share one choice.
+fn platform_sandbox() -> (config::SandboxToml, provider_host::SandboxBackend) {
+    let (runtime, image, backend) = if cfg!(target_os = "macos") {
+        ("tart", config::DEFAULT_TART_IMAGE, provider_host::SandboxBackend::Tart {
+            image: config::DEFAULT_TART_IMAGE.into(),
+        })
+    } else {
+        // the socket is left empty here: `platform_sandbox` only writes the
+        // default [sandbox] TOML at `node init`; the real socket is named by
+        // `resolve_sandbox` from the workspace when the node actually boots.
+        ("podman", config::DEFAULT_PODMAN_IMAGE, provider_host::SandboxBackend::Podman {
+            image: config::DEFAULT_PODMAN_IMAGE.into(),
+            socket: std::path::PathBuf::new(),
+        })
+    };
+    let table = config::SandboxToml {
+        runtime: runtime.into(),
+        image: image.into(),
+        cores: 0,
+        mem_gb: 0,
+    };
+    (table, backend)
+}
+
+/// fresh-workspace compute detection (`init`, `join`): the platform adapter's
+/// runtime binary on PATH ⇒ a live `[sandbox]` table, with a stderr note;
+/// absent ⇒ `None` (today's commented example).
+///
+/// The table says only HOW runs would be isolated on this host — it grants
+/// nothing. Whether this node runs a compute service at all is the user's
+/// `ducktape service enable compute`, so detection can stay eager: it makes
+/// the interactive terminal plane work out of the box and leaves the compute
+/// plane dark until someone consents to it.
+fn detect_platform_sandbox() -> Option<config::SandboxToml> {
+    let (table, backend) = platform_sandbox();
+    let Ok(runtime_path) = backend.probe() else {
+        return None;
+    };
+    eprintln!(
+        "compute plane: {} found at {} — writing a live [sandbox] table \
+         (announce stays off; delete the table for a consensus-only node)",
+        table.runtime,
+        runtime_path.display()
+    );
+    Some(table)
+}
+
 /// `init --name <human name> [--dir <dir>] [--listen a] [--advertised a] [--http a]
 /// [--rpc a] [--primary-coordinator host:port|none]
 /// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]`
@@ -306,7 +497,8 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     // coordinator default `apply_primary_coordinator` bakes into the
     // descriptor, so the two never silently disagree (see `docs`:
     // coordinator is ambient, node-local).
-    let plumbing = config::merged_plumbing(
+    let fresh_workspace = !dir.join("node.toml").exists();
+    let mut plumbing = config::merged_plumbing(
         &dir,
         net.listen.as_deref(),
         net.advertised.as_deref(),
@@ -318,6 +510,14 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         net.primary_coordinator.as_deref(),
         net.wireguard_advertised.as_deref(),
     )?;
+    // a FRESH workspace detects the platform runtime and writes the table (it
+    // describes HOW runs are isolated, and grants nothing); an existing
+    // node.toml keeps whatever the operator chose — a deleted table is never
+    // resurrected. Turning the compute plane ON is `ducktape service enable
+    // compute`, never an init flag.
+    if fresh_workspace {
+        plumbing.sandbox = detect_platform_sandbox();
+    }
 
     let me = key.public_key();
     let mut descriptor = config::NetworkDescriptor {
@@ -369,7 +569,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// invite — single-use, 1-day default TTL, first valid redeemer wins. the
 /// resident role always requires a target.
 fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // every invite is BEARER (기명 dropped — see the join ADR): `--role`
+    // every invite is BEARER (the targeted form was dropped — see the join ADR): `--role`
     // (default resident) selects the standing plane, and there is no `--target`
     // — whoever redeems the single-use token first wins. A resident invite is
     // the admission credential itself, kept off the wire by the sealed
@@ -401,7 +601,7 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
     // the WireGuard bootstrap: endpoints are minted from the advertised host
     // (the listen IP is usually unspecified) + the plane's UDP ports; the
     // mesh port is where the joiner dials this member's overlay ULA once the
-    // tunnel routes. the bootstrap is MANDATORY in v2 (the overlay plane
+    // tunnel routes. the bootstrap is mandatory (the overlay plane
     // carries the data planes and the sealed first-contact intro) — and the
     // network shape always runs the plane (`wireguard_listen` is required).
     let wg_listen: std::net::SocketAddr = raw
@@ -527,13 +727,7 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
         role,
         expires,
     );
-    let blob_string = config::encode_invite(
-        &invite_descriptor,
-        &token,
-        &wireguard,
-        &fronts,
-        &key,
-    )?;
+    let blob_string = config::encode_invite(&invite_descriptor, &token, &wireguard, &fronts, &key)?;
     if role == config::InviteRole::Client {
         eprintln!(
             "[invite] bearer CLIENT invite (single-use, expires in {ttl_days} day(s)) — \
@@ -579,8 +773,12 @@ fn cmd_admit(args: AdmitArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// one blocking json-lines rpc round-trip against the LOCAL node.
 fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json::Value, String> {
     use std::io::{BufRead as _, BufReader, Write as _};
-    let conn = std::net::TcpStream::connect(addr)
-        .map_err(|e| format!("connect rpc {addr}: {e} (is the node running?)"))?;
+    // the same calm sentence the http lane gives, for the same condition: an
+    // `os error 111` with a port in it is a diagnosis nobody asked for.
+    let conn = std::net::TcpStream::connect(addr).map_err(|error| match error.kind() {
+        std::io::ErrorKind::ConnectionRefused => crate::node_http::NODE_NOT_RUNNING.to_string(),
+        _ => format!("cannot reach this node's operator rpc on {addr}: {error}"),
+    })?;
     conn.set_read_timeout(Some(std::time::Duration::from_secs(15)))
         .map_err(|e| format!("rpc timeout: {e}"))?;
     let mut writer = conn.try_clone().map_err(|e| format!("rpc clone: {e}"))?;
@@ -1026,9 +1224,11 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
-                "admitted {pubkey_hex} as STANDBY: the joiner's parked node will verify a \
-                 state sync, announce itself online, and join the consensus quorum at the \
-                 activation cutover — no quorum slot is spent until the node is actually up"
+                "admitted {pubkey_hex}: the next epoch cutover seats it in the consensus \
+                 quorum, and the chain PAUSES at that cutover until its node seats itself \
+                 and votes. a warm (pre-synced) resident seats in-process from its own \
+                 folded state within moments; a cold node first syncs the frozen boundary. \
+                 watch its log for `promoted: validator at epoch …; seating in-process`"
             );
             Ok(())
         }
@@ -1217,8 +1417,8 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
 /// this node's own pubkey.
 ///
 /// honesty: leaving is NOT unilateral when this account lacks the proposal's
-/// required power. this casts only its account ballot (or the legacy node
-/// ballot), and member remove prints the remaining threshold plus the command
+/// required power. This casts only its account ballot, and member remove
+/// prints the remaining threshold plus the command
 /// other voters run (`member remove <this key>`).
 fn cmd_member_leave(args: SelectorArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cfg_path = args.selector.config_path()?;
@@ -1296,10 +1496,12 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     // would gate-fail terminally at the lobby; fail at paste time with the
     // right pointer instead.
     if invite.token.role == config::InviteRole::Client {
-        return Err("this is a CLIENT invite — it grants submit access, not a node. \
+        return Err(
+            "this is a CLIENT invite — it grants submit access, not a node. \
                     redeem it with `ducktape user redeem-invite <blob> --node \
                     <member-http-url> --key <user.key>`"
-            .into());
+                .into(),
+        );
     }
     let mut descriptor = invite.descriptor.clone();
     let explicit_dir = args.dir.is_some();
@@ -1313,7 +1515,7 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     };
     std::fs::create_dir_all(&dir)?;
     // mint (or reuse) this workspace dir's identity. Every invite is bearer
-    // (기명 dropped in v2): there is no target to match, so any freshly minted
+    // (invites are bearer credentials): there is no target to match, so any freshly minted
     // key may redeem — the OOB "hand the inviter your join code first" step is
     // gone. The redeeming key is bound by the join proof and the token is
     // single-use, so a paste simply admits whoever runs it.
@@ -1324,9 +1526,10 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     // (network shape only — a dev-seed or incomplete file aborts) survive,
     // working defaults fill the rest. computed BEFORE anything lands on disk
     // so a corrupt existing node.toml aborts the join without leaving a
-    // half-migrated dir.
+    // partially written dir.
     let net = &args.plumbing;
-    let plumbing = config::merged_plumbing(
+    let fresh_workspace = !dir.join("node.toml").exists();
+    let mut plumbing = config::merged_plumbing(
         &dir,
         net.listen.as_deref(),
         net.advertised.as_deref(),
@@ -1338,6 +1541,13 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         net.primary_coordinator.as_deref(),
         net.wireguard_advertised.as_deref(),
     )?;
+    // a FRESH joining workspace gets the same compute detection as init: the
+    // platform runtime on PATH ⇒ a live [sandbox] table (announce stays off),
+    // so agent runs and the terminal plane work without a config edit. a
+    // re-join over an existing node.toml keeps the operator's choice.
+    if fresh_workspace {
+        plumbing.sandbox = detect_platform_sandbox();
+    }
     if config::invite_requires_reachability_defaults(&invite) {
         // a WireGuard or Coordinated invite makes the reachability plane the
         // dial path: fold the inviter's (and every offered front's) overlay
@@ -1355,10 +1565,6 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
                 reach: config::Reach::Direct(format!("[{inviter_ula}]:{}", wg.mesh_port)),
             });
         }
-        // every offered front gets the same overlay-ULA Direct hint the inviter
-        // does: once ANY candidate's tunnel comes up, the mesh dialer can reach
-        // that member's overlay ULA and ride the mesh from there. A hint whose
-        // tunnel never comes up simply fails to dial — harmless.
         for front in &invite.fronts {
             let Ok(member) = ed25519::PublicKey::decode(&front.member_key[..]) else {
                 continue;
@@ -1384,7 +1590,7 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     config::save_invite_fronts(&dir, &invite.fronts)?;
     {
         // the tunnel bootstrap the joining node dials BEFORE any p2p (always
-        // present in v2); kept beside the token so `run_node` brings the
+        // present); kept beside the token so `run_node` brings the
         // interface up first.
         config::save_invite_wireguard(&dir, &invite.token.issuer, &invite.wireguard)?;
         // mint the WireGuard identity NOW so the run's plane and intro
@@ -1449,14 +1655,31 @@ mod tests {
         (bash, zsh)
     }
 
+    /// the completion declarations belonging to ONE family: every line naming a
+    /// `<family>_*` variable.
+    ///
+    /// Scoping is what makes the guard real. A whole-file `contains` passes for
+    /// `service run` purely because `run` already appears under `node`, so a
+    /// family that borrows a verb name from a sibling would never be caught.
+    /// (Every family's declarations are kept on ONE line each so this filter is
+    /// a plain line match.)
+    fn family_scope(text: &str, family: &str) -> String {
+        let needle = format!("{family}_");
+        text.lines()
+            .filter(|line| line.contains(&needle))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// the drift guard: every verb token and every non-hidden long flag in the
-    /// CLAP TREE (the grammar itself, not a parallel table) — across EVERY
-    /// family — must appear in BOTH completion files. renaming a verb or
-    /// adding a flag without updating the hand-written completions fails here.
+    /// CLAP TREE (the grammar itself, not a parallel table) must appear in BOTH
+    /// completion files, WITHIN ITS OWN FAMILY's declarations. renaming a verb
+    /// or adding a flag without updating the hand-written completions fails
+    /// here, and so does adding one whose name a sibling family already uses.
     #[test]
-    fn completion_files_cover_the_verb_table() {
+    fn completion_files_cover_the_verb_table_per_family() {
         let (bash, zsh) = completions();
-        fn walk(cmd: &clap::Command, bash: &str, zsh: &str) {
+        fn walk(cmd: &clap::Command, scope: &str, file: &str, family: &str) {
             for sub in cmd.get_subcommands() {
                 if sub.is_hide_set() {
                     continue;
@@ -1465,8 +1688,10 @@ mod tests {
                 if token == "help" {
                     continue;
                 }
-                assert!(bash.contains(token), "ducktape.bash missing token {token:?}");
-                assert!(zsh.contains(token), "ducktape.zsh missing token {token:?}");
+                assert!(
+                    scope.contains(token),
+                    "{file}: family {family:?} is missing verb {token:?}"
+                );
                 for arg in sub.get_arguments() {
                     if arg.is_hide_set() {
                         continue;
@@ -1476,13 +1701,74 @@ mod tests {
                         continue;
                     }
                     let flag = format!("--{long}");
-                    assert!(bash.contains(&flag), "ducktape.bash missing flag {flag}");
-                    assert!(zsh.contains(&flag), "ducktape.zsh missing flag {flag}");
+                    assert!(
+                        scope.contains(&flag),
+                        "{file}: family {family:?} is missing flag {flag}"
+                    );
                 }
-                walk(sub, bash, zsh);
+                walk(sub, scope, file, family);
             }
         }
-        walk(&<crate::Cli as clap::CommandFactory>::command(), &bash, &zsh);
+
+        let cli = <crate::Cli as clap::CommandFactory>::command();
+        for family in cli.get_subcommands() {
+            if family.is_hide_set() {
+                continue;
+            }
+            let name = family.get_name();
+            if name == "help" {
+                continue;
+            }
+            for (file, text) in [("ducktape.bash", &bash), ("ducktape.zsh", &zsh)] {
+                // the family token itself is offered at the top level.
+                assert!(text.contains(name), "{file}: missing family {name:?}");
+                let has_grammar = family.get_subcommands().next().is_some()
+                    || family
+                        .get_arguments()
+                        .any(|arg| !arg.is_hide_set() && arg.get_long().is_some_and(|l| l != "help"));
+                if !has_grammar {
+                    continue; // a bare family (`mcp`) declares no verbs to scope.
+                }
+                let scope = family_scope(text, name);
+                assert!(
+                    !scope.is_empty(),
+                    "{file}: family {name:?} has verbs but no {name}_* declarations"
+                );
+                walk(family, &scope, file, name);
+                for arg in family.get_arguments() {
+                    if arg.is_hide_set() {
+                        continue;
+                    }
+                    let Some(long) = arg.get_long() else { continue };
+                    if long == "help" {
+                        continue;
+                    }
+                    let flag = format!("--{long}");
+                    assert!(
+                        scope.contains(&flag),
+                        "{file}: family {name:?} is missing flag {flag}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// the guard must actually bite: a verb a sibling family happens to use is
+    /// NOT coverage. This is the hole the whole-file match had.
+    #[test]
+    fn the_family_scope_does_not_borrow_a_siblings_verb() {
+        let (bash, _zsh) = completions();
+        let service = family_scope(&bash, "service");
+        assert!(service.contains("run"), "service declares its own run verb");
+        // `promote` lives under `node member`; it must not read as covered here.
+        assert!(
+            !service.contains("promote"),
+            "the service scope must not see node's verbs"
+        );
+        assert!(
+            family_scope(&bash, "gateway").contains("bind"),
+            "a family scope still finds its own verbs"
+        );
     }
 
     /// the grammar's own consistency check (conflicting ids, broken flatten,
@@ -1517,10 +1803,14 @@ mod tests {
         };
         let first = noded::peers::PeersView {
             sampled_at_ms: 10_000,
+            height: 5,
+            epoch: Some(1),
             peers: vec![sample(100, 1_000)],
         };
         let second = noded::peers::PeersView {
             sampled_at_ms: 12_000,
+            height: 6,
+            epoch: Some(1),
             peers: vec![sample(150, 3_000)],
         };
 
@@ -1537,7 +1827,10 @@ mod tests {
 
         let without_baseline = peer_line(&second.peers[0], None, &first, &second);
         assert!(!without_baseline.contains("tx/s="), "{without_baseline}");
-        assert!(!without_baseline.contains("sync_B/s="), "{without_baseline}");
+        assert!(
+            !without_baseline.contains("sync_B/s="),
+            "{without_baseline}"
+        );
     }
 
     #[test]

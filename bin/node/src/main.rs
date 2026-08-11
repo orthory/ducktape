@@ -36,35 +36,41 @@
 //! `--sync-only` and the process joins the mesh WITHOUT a consensus engine,
 //! pulls a manifest + every module from the bootstrapper over that channel,
 //! rebuilds them against their consensus-committed roots, prints its composed
-//! `synced app_hash=`, and exits 0 — the network-backed joiner path over real
+//! `synced root_hash=`, and exits 0 — the network-backed joiner path over real
 //! sockets. membership note: `peer_seeds` is the AUTHORIZED MESH (everyone,
 //! including sync-only joiners); `validator_seeds` (default: peer_seeds) is the
 //! CONSENSUS participant set — the split that lets a non-validator sync.
 //!
-//! each validator prints its GENESIS app-hash at startup and its CONVERGED
-//! app-hash once it has applied ALL validator ops. the demo script asserts every
+//! each validator prints its GENESIS root-hash at startup and its CONVERGED
+//! root-hash once it has applied ALL validator ops. the demo script asserts every
 //! process's genesis line agrees, every converged line agrees, and the sync-only
 //! joiner's synced line equals the converged line.
 
-
 use commonware_cryptography::Signer;
-use commonware_runtime::{Runner, Supervisor};
+use commonware_runtime::{Metrics as _, Runner, Supervisor};
 
+mod agent_cli;
 mod agent_plane;
+mod airlock;
+mod announce;
 mod blob_fetch;
 mod boot;
-mod code_plane;
-mod term_plane;
 mod cli;
 mod cli_args;
+mod code_plane;
 mod config;
 mod constants;
+mod cred_cli;
+mod cred_seal;
+mod node_http;
+mod tty;
+mod agent;
+mod compute;
 mod drain_actions;
 mod explorer;
 mod first_contact_join;
 mod fs_cli;
 mod gateway_plane;
-mod airlock_serve;
 mod gateway_routes;
 mod host_reads;
 mod host_resources;
@@ -75,7 +81,6 @@ mod lobby;
 #[cfg(test)]
 mod main_tests;
 mod mcp;
-mod oracle_pool;
 mod overlay_book;
 mod plane_metrics;
 mod reachability_plane;
@@ -84,42 +89,44 @@ mod reachability_plane_tests;
 mod relay;
 mod relay_runtime;
 mod replica;
-mod resident_announce;
-mod resident_dispatch;
 mod resource_limits;
 mod rpc;
+mod services;
 mod sync;
+mod term_plane;
 mod userkey;
 mod userkey_cli;
 mod util;
 mod validator;
 mod voice;
 mod voice_plane;
+mod work_admission;
+use crate::util::fatal;
 use config::Resolved;
+#[cfg(test)]
+use directory::{DirQuery, DirReply, decode_reply, encode_query};
+use duckfs_disk::SyncScratch;
 #[cfg(test)]
 use explorer::sealed_frame_block_row;
 #[cfg(test)]
 use noded::projection::project_root_op;
+use recovery::Recovery;
 #[cfg(test)]
 use replica::promotion::{
     PromotionBoundary, PromotionBoundarySource, choose_promotion_boundary,
     joiner_manifest_fetch_retry,
 };
 #[cfg(test)]
+use sdk::{Msg, StateRoot};
+#[cfg(test)]
 use sync::catchup::{apply_post_reboot_catchup_frames, apply_verified_suffix_frame};
 #[cfg(test)]
 use sync::serve::assert_floor_binds_view;
 #[cfg(test)]
 use util::hex;
-#[cfg(test)]
-use directory::{DirQuery, DirReply, decode_reply, encode_query};
-use crate::util::fatal;
-use duckfs_disk::SyncScratch;
-use recovery::Recovery;
-#[cfg(test)]
-use sdk::{Msg, StateRoot};
 
 fn main() {
+    resource_limits::cap_malloc_arenas();
     resource_limits::raise_open_file_limit();
     #[cfg(target_os = "macos")]
     hold_macos_activity();
@@ -156,6 +163,32 @@ fn hold_macos_activity() {
     std::mem::forget(token);
 }
 
+/// The bare-`ducktape` screen: from nothing to a working node, in the order a
+/// person actually types it. Every line here is a command that runs as written
+/// on a machine with one network on it — no placeholders except the two that
+/// are genuinely yours to choose.
+///
+/// Deliberately NOT the full verb tree (`--help` on any family is that), and
+/// deliberately stops at "it is running": what comes after depends on what you
+/// want the node FOR, and each of those verbs points at its own next step.
+const GETTING_STARTED: &str = "\
+Getting started:
+  ducktape node init --name mynet     found your own network here
+  ducktape node join <invite>         ...or join someone else's
+  ducktape node run                   start it (^C checkpoints and exits)
+  ducktape user account-init --name <you>
+                                      claim an account on it (mints your key)
+  ducktape node status                height + root hash of the running node
+
+Then, to run agents on it:
+  ducktape service run compute        offer this host's sandbox, and enable it
+  ducktape user cred add claude       log a provider in, on this node
+  ducktape agent pty claude           attach a terminal to a sandboxed agent
+
+Each verb's own --help carries the rest. `ducktape node list` shows every
+network this machine is registered on; -n <chain-id> picks one when there is
+more than one.";
+
 // clap owns parsing, help, usage errors (exit 2) and `-V/--version`; the
 // `FATAL:` wrapper in `main` stays for runtime death.
 #[derive(clap::Parser)]
@@ -165,7 +198,11 @@ fn hold_macos_activity() {
     // clap prints "<name> <version>", so the version string must NOT repeat
     // the binary name the way `version_line()` (the `version` verb) does.
     version = env!("CARGO_PKG_VERSION"),
-    arg_required_else_help = true
+    arg_required_else_help = true,
+    // `arg_required_else_help` means a bare `ducktape` lands HERE, so this is
+    // the one screen every new operator sees. A list of eight families does
+    // not tell anyone what to type first; the shortest real path does.
+    after_help = GETTING_STARTED,
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -190,8 +227,18 @@ enum Family {
     /// the duckfs working-copy CLI
     #[command(subcommand)]
     Fs(fs_cli::FsCmd),
+    /// offchain service daemons: what is signaling, and what you have enabled
+    #[command(subcommand)]
+    Service(services::ServiceCmd),
+    /// remote/interactive sandboxed provider sessions (pty attach, sched runs)
+    Agent(agent_cli::AgentArgs),
     /// the stdio MCP server an agent runner spawns
     Mcp,
+    /// internal: the OCI createRuntime hook that installs a sandbox run's egress
+    /// firewall. podman invokes it (via the node's --hooks-dir) with the OCI
+    /// container state on stdin; never run by hand. Hidden from help.
+    #[command(name = "__egress-hook", hide = true)]
+    EgressHook,
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -210,8 +257,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             mcp::serve();
             Ok(())
         }
+        // podman pipes the OCI state on stdin; a non-zero exit aborts the
+        // container (fail-closed), so map a hook error to a real process error.
+        Family::EgressHook => provider_host::run_egress_hook().map_err(Into::into),
         Family::User(cmd) => userkey_cli::run(cmd),
+        Family::Agent(args) => agent_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),
+        Family::Service(cmd) => services::run(cmd),
         Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
         Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),
     }
@@ -261,10 +313,7 @@ fn gateway_can_start(
              loopback address"
         );
     }
-    !sync_only
-        && gateway_listen.is_some()
-        && api_is_loopback
-        && wireguard_listen.is_some()
+    !sync_only && gateway_listen.is_some() && api_is_loopback && wireguard_listen.is_some()
 }
 
 fn run_node(
@@ -304,13 +353,69 @@ fn run_node(
         mesh_state_file,
         checkpoint_blocks,
         dev_demo,
-        sync_index,
-        announce_capabilities,
+        // the shipped-index warm start's staging client rode the retired
+        // promotion exec-reboot; the serve side and the config key await
+        // the follow-up sweep.
+        sync_index: _,
         sandbox,
+        compute_backend,
         sandbox_capacity,
         promoted,
-        joiner,
     } = boot::env::derive(resolved, sync_only);
+
+    // A node whose config says it can isolate runs, booting with no compute
+    // plane, is the shape EVERY workspace predating the grant has — and the
+    // one an operator lands in without asking. Silence here is how an upgrade
+    // looks like a hang, so the NODE BOOT that takes the compute-less branch
+    // says it plainly and names the fix. Deliberately not in `config::resolve`:
+    // that runs for every verb reading a workspace, including `service run`,
+    // which is not booting a node and offers to fix this on its next line.
+    let configured_but_ungranted = sandbox.is_some() && compute_backend.is_none();
+    if configured_but_ungranted {
+        tracing::warn!(
+            target: "ducktape::service",
+            node = %label,
+            reason = "compute_not_granted",
+            "sandbox configured but the compute service is not enabled; this node will run no \
+             provider work and announce no capabilities — enable it with `ducktape service \
+             run compute`"
+        );
+    }
+
+    // The LENDER twin of the same silence. An operator whose credentials are
+    // registered and granted on chain lends exactly nothing without an airlock
+    // daemon, and every other diagnostic still reads healthy: `user cred list`
+    // shows the records, `gateway list` shows the route, and `service
+    // list`/`status` render no airlock row at all (they fold signaling ∪
+    // grants, and an ungranted, unstarted service is in neither). This line is
+    // the only place that says so.
+    if let Some(credentials) = crate::airlock::lending_without_a_grant(&storage, &workspace) {
+        tracing::warn!(
+            target: "ducktape::service",
+            node = %label,
+            credentials,
+            reason = "airlock_not_granted",
+            "credentials are registered but the airlock service is not enabled; nothing will \
+             lend them and a borrower's session will not connect — enable it with `ducktape \
+             service run airlock`"
+        );
+    }
+
+    // There is NO sandbox probe here any more, and its absence is the point:
+    // this process runs nothing in a sandbox. Both planes that did — compute's
+    // headless runs and agent's interactive ptys — are separate daemons that
+    // probe the runtime themselves before they signal, and start their own
+    // podman service before they serve. Probing here would have made a missing
+    // podman a fatal BOOT error on a node that never needed one.
+
+    // THE MESH LISTENER, taken for a moment while a bind failure can still be
+    // a sentence. Everything below this line runs inside commonware's runtime,
+    // where the same failure is an unwinding panic in a worker thread.
+    // Skipped — not assumed — for an overlay-only node, which opens no OS
+    // socket for the mesh at all.
+    if boot::mesh::binds_an_os_mesh_socket(&namespace, &advertised, wireguard_listen.is_some()) {
+        boot::mesh::preflight_mesh_listen(listen)?;
+    }
 
     let gateway_enabled = gateway_can_start(
         sync_only,
@@ -319,24 +424,30 @@ fn run_node(
         wireguard_listen,
     );
 
+    // the announce's own base, kept before `http_listen` moves into the bind.
+    let announce_base = http_listen.as_deref().map(config::http_base_of);
+
     let boot::surfaces::Surfaces {
         rpc_listener,
         http_cmds,
+        status,
         stream_hub,
         index,
         voice_requests,
         code_stage_requests,
         blobs,
-        agent_provisioner,
+        services,
         gateway_requests,
         gateway_commands,
+        terminals,
+        session_requests,
+        local_gateway_via,
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
         sync_only,
-        joiner,
         label: &label,
         storage: &storage,
         // the config dir where gateway-routes.json lives (= storage in the dev
-        // shape); an embedded airlock gateway registers its port here.
+        // shape); a service daemon registers its loopback port there.
         workspace: &workspace,
         rpc_listen,
         http_listen,
@@ -346,31 +457,33 @@ fn run_node(
         // the forge worktree lane's committer identity (agent-dogfood M1):
         // every run commit is authored by this node's signer (D2 — the author
         // is the agent).
-        forge_committer: config::hex_bytes(signer.public_key().as_ref()),
         // the owner-gated admin namespace resolves ownership against this node's
         // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice (ADR A2/A4).
         node_key: signer.public_key().as_ref().to_vec(),
         admin_exposure: noded::AdminExposure::from_env(),
-        // the resolved node.toml sandbox backend: the interactive terminal plane
-        // uses the SAME backend + identity as this node's real agent runs, so a
-        // Direct node has no terminal plane and Podman reaping stays consistent.
-        // cloned — the validator/resident arms below consume the original.
-        sandbox: sandbox.clone(),
     })?;
+
+    // THE LIVENESS HALF of the capability announce. Consent is submitted by the
+    // verb that changes it (`service enable`/`disable`); this watches the other
+    // input — whether each granted kind's daemon is still signaling — and
+    // submits the corrected set when that changes. It runs on its own OS thread
+    // and talks to this node over its own `/v1`, because it must BLOCK on a
+    // settling submit and the host must never leave the runner thread.
+    //
+    // No http surface means no `/v1` to submit through and no daemon that could
+    // have signaled in the first place, so there is nothing to watch.
+    if let Some(base) = announce_base {
+        announce::spawn(announce::Watch {
+            base,
+            node_key: signer.public_key().as_ref().to_vec(),
+            workspace: workspace.clone(),
+            services: services.clone(),
+            capacity: sandbox_capacity.clone(),
+        })?;
+    }
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
     let storage_for_sync = storage.clone();
-    // per-agent host state, rooted OUTSIDE <storage> (D7 isolation floor): the
-    // persistent executor workspaces + session files must NOT be descendants of
-    // the key/consensus/blob tree, so a `..` from a run's cwd can't reach
-    // user.key/node keys/qmdb/blobstore. `DUCKTAPE_AGENT_WORKSPACES` / _SESSIONS
-    // override — see capability-host. host-local only, never consensus.
-    // non-portable (v2/persistent) agent workspaces stay under <storage>, exactly
-    // as today — relocating them would be a live (non-dormant) durability change.
-    // D7 relocation applies to the PORTABLE provisioner mount (agent_runs_root),
-    // which is out of <storage>; the pre-existing non-portable D7 gap is a
-    // separate, migration-aware hardening (tracked as a follow-up).
-    let agent_dirs = capability_host::AgentDirs::under(&storage);
     // 15s instead of commonware's 60s default: this read/write deadline is
     // the mesh's only half-open detector — see `constants::MESH_IO_TIMEOUT`.
     let rt_cfg = commonware_runtime::tokio::Config::default()
@@ -414,6 +527,23 @@ fn run_node(
             wireguard_listen.is_some(),
             overlay_slot.clone(),
         );
+        // the observability cell: operations overlay live from the metrics
+        // the moment they exist; boundary facts stay zeroed (honest —
+        // nothing is served yet) until a role loop publishes its first
+        // boundary. the boot snapshot stamps the process constants so a
+        // pre-boundary read still carries version + mesh identity, and the
+        // exposition source feeds /metrics + /v1/peers off the command lane
+        // (`Context` has no Clone; a child shares the SAME registry, so its
+        // encode() serves the identical exposition).
+        status.wire_metrics(&metrics);
+        stream_hub.wire_metrics(&metrics);
+        let exposition_context = context.child("exposition");
+        status.wire_exposition(move || exposition_context.encode());
+        status.publish(noded::NodeStatus {
+            version: env!("CARGO_PKG_VERSION").into(),
+            public_key: status_public_key.clone(),
+            ..Default::default()
+        });
         // One process-wide bulk budget: the per-use planes retain separate
         // protocols, queues, sockets, and admission but cannot independently
         // saturate the same WireGuard link.
@@ -437,7 +567,6 @@ fn run_node(
                 metrics.clone(),
                 storage_for_sync,
                 namespace,
-                identity_chain_id,
                 blobs,
                 voice_requests,
             )
@@ -502,7 +631,7 @@ fn run_node(
                 .any(|k| k.as_slice() == signer.public_key().as_ref())
         });
         if !checkpoint_seats_me && !validators.contains(&signer.public_key()) {
-            replica::run(
+            let baton = replica::run(
                 context,
                 network,
                 &mut oracle,
@@ -510,43 +639,40 @@ fn run_node(
                 &mesh_participants,
                 sync_sources,
                 sync_source,
-                advertised_reach,
-                status_public_key,
-                signer,
-                label,
-                namespace,
-                identity_chain_id,
-                peers,
-                validators,
+                advertised_reach.clone(),
+                status_public_key.clone(),
+                signer.clone(),
+                label.clone(),
+                namespace.clone(),
+                peers.clone(),
+                validators.clone(),
                 wireguard_listen,
-                wireguard_key_file,
-                primary_coordinator,
+                wireguard_key_file.clone(),
+                primary_coordinator.clone(),
                 coordinator_relay,
-                wireguard_advertised,
+                wireguard_advertised.clone(),
                 &invite_token,
                 &invite_wireguard,
                 invite_fronts,
                 &coord_cap,
-                workspace,
-                chain_id,
-                mesh_state_file,
+                workspace.clone(),
+                chain_id.clone(),
+                mesh_state_file.clone(),
                 checkpoint_blocks,
-                sync_index,
-                announce_capabilities,
-                sandbox,
-                sandbox_capacity,
                 rpc_listener,
                 http_cmds,
                 gateway_requests,
                 gateway_commands.clone(),
+                terminals,
+                session_requests,
+                local_gateway_via,
                 &stream_hub,
-                index,
+                index.clone(),
                 metrics.clone(),
+                status.clone(),
                 voice_requests,
-                blobs,
-                &agent_provisioner,
-                &agent_dirs,
-                overlay_slot,
+                blobs.clone(),
+                overlay_slot.clone(),
                 bulk_pacer.clone(),
                 plane_monitor.clone(),
                 storage_for_sync,
@@ -556,6 +682,44 @@ fn run_node(
                 duckfs_dir,
             )
             .await;
+            // THE PROMOTION SEAT: the park loop returned the baton — the
+            // validator role continues INSIDE this process, over the mesh
+            // and planes the parked role already runs.
+            validator::run_promoted(
+                baton,
+                oracle,
+                metrics,
+                status,
+                status_public_key,
+                signer,
+                label,
+                namespace,
+                peers,
+                validators,
+                coordinated,
+                wireguard_listen,
+                wireguard_key_file,
+                primary_coordinator,
+                wireguard_advertised,
+                invite_listen,
+                coordination,
+                coord_cap,
+                chain_id,
+                mesh_state_file,
+                advertised_reach,
+                checkpoint_blocks,
+                dev_demo,
+                stream_hub,
+                index,
+                code_stage_requests,
+                blobs,
+                overlay_slot,
+                bulk_pacer,
+                plane_monitor,
+                sync_monitor,
+            )
+            .await;
+            return;
         }
         validator::run_validator(
             context,
@@ -563,6 +727,7 @@ fn run_node(
             oracle,
             quota,
             metrics,
+            status,
             sync_source,
             advertised_reach,
             status_public_key,
@@ -585,20 +750,18 @@ fn run_node(
             checkpoint_blocks,
             promoted,
             dev_demo,
-            announce_capabilities,
-            sandbox,
-            sandbox_capacity,
             rpc_listener,
             http_cmds,
             gateway_requests,
             gateway_commands,
+            terminals,
+            session_requests,
+            local_gateway_via,
             stream_hub,
             index,
             voice_requests,
             code_stage_requests,
             blobs,
-            agent_provisioner,
-            agent_dirs,
             overlay_slot,
             bulk_pacer,
             plane_monitor,

@@ -1,10 +1,10 @@
-//! the REAL [`WorkspaceProvisioner`] for portable (v3) agent runs: one
+//! the REAL [`WorkspaceProvisioner`] for portable (v1) agent runs: one
 //! per-run workspace under a D7-validated root, materialized from whichever
 //! source the run's envelope pinned.
 //!
 //! two lanes, dispatched on [`WorkspaceSource`]:
 //! - **duckfs** ([`duckfs`]): checkout / commit a duckfs subtree over the
-//!   in-daemon actor lane — the original lane, moved verbatim.
+//!   node's `/v1` surface ([`crate::node_link::NodeLink`]).
 //! - **forge** ([`forge`]): a git WORKTREE of a node-local forge repo at the
 //!   run's pinned commit, committed with agent authorship and pushed back
 //!   through this node's own loopback smart-HTTP lane so the branch move
@@ -14,9 +14,11 @@
 //!   each forge attempt LOUDLY while duckfs runs are untouched.
 //!
 //! this lives in the noded LIB crate — the only place `duckfs-client` (the
-//! checkout/commit engine), the actor-lane `NodeApi`, and the node handle's
-//! forge repo base are all reachable, the reachability wall dispatch-oracle
-//! cannot cross.
+//! checkout/commit engine) and the node's `/v1` lane are both reachable, the
+//! reachability wall compute-service cannot cross. It runs in the COMPUTE
+//! DAEMON's process, not the node's: every consensus read and write below goes
+//! over `/v1`, so the provisioner has no in-process dependency on the node at
+//! all.
 //!
 //! whichever lane materializes it, every run is handed the same TOOL PLANE
 //! ([`run_env`] + [`tool_path_entries`]): the bin dir of the running binary on
@@ -35,18 +37,41 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use dispatch_oracle::{
+use compute_service::{
     ProvisionedWorkspace, RoMount, SkillDoc, WorkspaceProvisioner, WorkspaceSource, WorkspaceSpec,
     assemble_context_doc, parse_skill_md,
 };
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 
-use crate::NodeHandle;
-use crate::actor_api::ActorNodeApi;
+use crate::node_link::NodeLink;
 
 mod duckfs;
 mod forge;
 mod session;
+
+/// Serve `handle`'s own `/v1` router on loopback and return a [`NodeLink`] to
+/// it — the test seam for everything the provisioner does over http.
+///
+/// It is the REAL router over the test's own fake actor, not a stub: the
+/// provisioner's transport is exactly what a live daemon uses, while the tests
+/// keep asserting on the `NodeCommand`s that reach the actor. Nothing here is
+/// compiled into a shipping binary.
+#[cfg(test)]
+pub(crate) async fn test_link(handle: crate::NodeHandle) -> NodeLink {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind a loopback test surface");
+    let address = listener.local_addr().expect("read the test surface address");
+    let forge_repo = handle.forge_repo.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, crate::router(handle)).await;
+    });
+    let link = NodeLink::new(format!("http://{address}"));
+    match forge_repo {
+        Some(base) => link.with_forge_repo(base),
+        None => link,
+    }
+}
 
 pub use forge::forge_push_base;
 
@@ -63,20 +88,27 @@ mod session_boundary_tests;
 /// the D7 relocation lever: the root per-run agent workspaces are minted
 /// under. MUST be outside `<storage>` — VALIDATED here at boot, never trusted.
 /// `DUCKTAPE_AGENT_RUNS_ROOT` overrides the base (operators point it at an
-/// isolated volume); deliberately NOT `DUCKTAPE_AGENT_WORKSPACES`, which
-/// already means the legacy persistent per-agent root in `capability-host` —
-/// one knob must not govern two unrelated trees. the default is the system
-/// temp tree, the same safe scratch tree `CliProvider`'s fallback workdir
-/// already uses.
+/// isolated volume). the default is the system temp tree, the same safe
+/// scratch tree `CliProvider`'s fallback workdir already uses.
 ///
 /// the returned root is salted with a hash of THIS node's storage path, so
 /// co-located nodes (fleet tiles, multi-node test boxes) never share a
 /// run-dir tree — one node's W5 cleanup must never be able to delete a
 /// sibling process's in-flight checkout.
 pub fn agent_runs_root(storage: &Path) -> Result<PathBuf, String> {
+    // Default to a sibling of the storage dir (`<workspace>/agent-runs`): on the
+    // SAME real disk as storage — never a memory-backed `/tmp` that consumes RAM
+    // and that the codex CLI refuses to place its helper binaries under — while
+    // still OUTSIDE the storage tree the D7 guard forbids. The env override wins
+    // for hosts that want the run tree elsewhere.
     let base = std::env::var_os("DUCKTAPE_AGENT_RUNS_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("ducktape-agent-runs"));
+        .unwrap_or_else(|| {
+            storage
+                .parent()
+                .unwrap_or(storage)
+                .join("agent-runs")
+        });
     runs_root_under(base, storage)
 }
 
@@ -269,8 +301,8 @@ const SKILL_DOC: &str = "SKILL.md";
 ///
 /// the two jobs live together because this is the only place that has both
 /// halves: the committed curation (`mounts`: names, order, load modes) and the
-/// materialized bodies. dispatch-oracle owns the pure assembly
-/// ([`dispatch_oracle::assemble_context_doc`]) but cannot cross the reachability
+/// materialized bodies. compute-service owns the pure assembly
+/// ([`compute_service::assemble_context_doc`]) but cannot cross the reachability
 /// wall to read a duckfs checkout; the binary can read files but must not decide
 /// the document's shape. so: read here, assemble there.
 ///
@@ -291,12 +323,13 @@ const SKILL_DOC: &str = "SKILL.md";
 /// it already materialized. an over-budget soul (a blown context bound) fails on
 /// that same path: the mounts are already on disk when the assembler refuses.
 fn checkout_ro_mounts(
-    handle: &NodeHandle,
+    node: &NodeLink,
     ro_root: &Path,
     mounts: &[RoMount],
     library_readable: bool,
 ) -> Result<String, String> {
-    let api = ActorNodeApi::new(handle.clone());
+    // built HERE, inside the caller's blocking context — see `NodeLink::files`.
+    let api = node.files();
     mounts
         .iter()
         .map(|m| {
@@ -358,10 +391,10 @@ fn read_skill_doc(ro_root: &Path, mount: &RoMount) -> Result<SkillDoc, String> {
 }
 
 /// the real provisioner: mints per-run workspaces under `root`, driving the
-/// duckfs engine over `handle`'s actor lane and (when [`Self::with_forge`]
+/// duckfs engine over the node's `/v1` lane and (when [`Self::with_forge`]
 /// configured a usable lane) the forge worktree engine over host `git`.
 pub struct NodedProvisioner {
-    handle: NodeHandle,
+    node: NodeLink,
     root: PathBuf,
     /// the forge lane: `Ok` when this node can provision forge worktrees,
     /// `Err(reason)` — decided ONCE at construction, permanent and loud —
@@ -374,9 +407,9 @@ pub struct NodedProvisioner {
 }
 
 impl NodedProvisioner {
-    pub fn new(handle: NodeHandle, root: impl Into<PathBuf>) -> Self {
+    pub fn new(node: NodeLink, root: impl Into<PathBuf>) -> Self {
         Self {
-            handle,
+            node,
             root: root.into(),
             forge: Err("this provisioner was built without a forge lane \
                         (with_forge was never called)"
@@ -400,7 +433,7 @@ impl NodedProvisioner {
     /// http listen address; `None` = this node serves no http surface) and
     /// `committer_name` is this node's stable identity — the COMMITTER on
     /// every run commit (D2: author is the agent, committer is the node).
-    /// the repo base is read off the handle's forge repo (the same base the
+    /// the repo base is read off the link's forge repo (the same base the
     /// forge module materializes into). host `git` is probed ONCE here —
     /// a probe failure makes the lane permanently unavailable, loudly.
     pub fn with_forge(self, push_base: Option<String>, committer_name: impl Into<String>) -> Self {
@@ -416,7 +449,7 @@ impl NodedProvisioner {
         probe: impl FnOnce() -> Result<(), String>,
     ) -> Self {
         self.forge =
-            forge::ForgeLane::configure(&self.handle, push_base, committer_name.into(), probe);
+            forge::ForgeLane::configure(&self.node, push_base, committer_name.into(), probe);
         if let Err(reason) = &self.forge {
             tracing::warn!(
                 target: "ducktape::saga",
@@ -457,7 +490,7 @@ impl WorkspaceProvisioner for NodedProvisioner {
                 source_snapshot,
             } => {
                 duckfs::provision(
-                    self.handle.clone(),
+                    self.node.clone(),
                     run_dir,
                     ro_root,
                     source_prefix.clone(),
@@ -471,7 +504,7 @@ impl WorkspaceProvisioner for NodedProvisioner {
                 Ok(lane) => {
                     forge::provision(
                         lane,
-                        self.handle.clone(),
+                        self.node.clone(),
                         run_dir,
                         ro_root,
                         self.node_url.clone(),

@@ -18,3 +18,6 @@ ops/wg-smoke/node*/
 # superpowers SDD scratch
 .superpowers/
 package-lock.json
+
+# Session handoff notes — local working state, never committed.
+HANDOFF.md

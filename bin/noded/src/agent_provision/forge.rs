@@ -37,12 +37,11 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use dispatch_oracle::{
+use compute_service::{
     ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec, assemble_context_doc,
 };
-use sha2::{Digest as _, Sha256};
 
-use crate::NodeHandle;
+use crate::node_link::NodeLink;
 
 /// the synthetic domain for agent authorship and attribution. DELIBERATELY in
 /// the network's own `.duck` namespace (duckdns), not a registerable TLD: no
@@ -55,7 +54,6 @@ const AGENT_EMAIL_DOMAIN: &str = "agents.duck";
 /// a complete agent-authored commit message.
 const MAX_COMMIT_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_DISPLAY_NAME_BYTES: usize = 128;
-const MAX_AGENT_ID_BYTES: usize = 64;
 /// one node's configured forge lane: where the materialized repos live, where
 /// pushes rendezvous, and who the committer is. built by
 /// [`ForgeLane::configure`] exactly once, at provisioner construction.
@@ -73,20 +71,20 @@ pub(super) struct ForgeLane {
 }
 
 impl ForgeLane {
-    /// decide the lane ONCE: all three legs (repo base on the handle, a push
+    /// decide the lane ONCE: all three legs (repo base on the link, a push
     /// base, a worktree-capable host git) must hold, else the lane is
     /// `Err(reason)` — permanent for this provisioner's lifetime. the probe
     /// runs only when the config legs are present (no point probing git on a
     /// node that serves no http surface).
     pub(super) fn configure(
-        handle: &NodeHandle,
+        node: &NodeLink,
         push_base: Option<String>,
         committer_name: String,
         probe: impl FnOnce() -> Result<(), String>,
     ) -> Result<Self, String> {
-        let Some(repo_base) = handle.forge_repo.clone() else {
+        let Some(repo_base) = node.forge_repo().map(Path::to_path_buf) else {
             return Err(
-                "this node handle carries no forge repo base — the forge module's \
+                "this node link carries no forge repo base — the forge module's \
                  materialized repos are not reachable here"
                     .into(),
             );
@@ -304,12 +302,12 @@ fn validate_coords(repo: &str, commit: &str, branch: &str) -> Result<(), String>
 /// provision one forge run: verify the repo + pinned commit are materialized
 /// on THIS node, clone it without hardlinks under
 /// the (already D7-validated) run dir, then materialize the W6 skill mounts
-/// beside it. `handle` is the actor lane those mounts check out over (they are
+/// beside it. `node` is the `/v1` lane those mounts check out over (they are
 /// duckfs subtrees whatever the rw source is); `node_url` is this node's http
 /// base, handed to the run as `DUCKTAPE_NODE`.
 pub(super) async fn provision(
     lane: &ForgeLane,
-    handle: NodeHandle,
+    node: NodeLink,
     run_dir: PathBuf,
     ro_root: PathBuf,
     node_url: Option<String>,
@@ -356,15 +354,15 @@ pub(super) async fn provision(
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
         let run_dir = workspace_args.run_dir.clone();
-        // the handle outlives the mounts: the session bind below rides the same
+        // the link outlives the mounts: the session bind below rides the same
         // actor lane.
-        let mount_handle = handle.clone();
+        let mount_node = node.clone();
         // the committed library grant (consensus said it; the assembler obeys).
         let library_readable = spec.library_readable;
         // the same step assembles the run's SOUL from the mounts it just
         // materialized — the only place holding both the curation and the bodies.
         let context_doc = tokio::task::spawn_blocking(move || {
-            super::checkout_ro_mounts(&mount_handle, &checkout_ro, &mounts, library_readable)
+            super::checkout_ro_mounts(&mount_node, &checkout_ro, &mounts, library_readable)
                 .inspect_err(|_| {
                     // W5: a failed provision removes ALL its own debris. the mount
                     // helper dropped its partial ro tree; the clone goes here.
@@ -379,7 +377,7 @@ pub(super) async fn provision(
     // the clone EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an
     // op on a run that never starts.
-    let session = super::session::open(&handle, spec).await;
+    let session = super::session::open(&node, spec).await;
     let mut env = super::run_env(
         &workspace_args.run_dir,
         ro_dir.as_deref(),
@@ -694,70 +692,13 @@ fn sanitize_display_name(input: &str) -> String {
     }
 }
 
-fn readable_agent_slug(input: &str, max_bytes: usize) -> String {
-    let mut out = String::new();
-    let mut pending_dash = false;
-    for c in input.chars() {
-        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-            let add_dash = pending_dash && !out.is_empty() && !out.ends_with('-');
-            let dash_bytes = if add_dash { 1 } else { 0 };
-            if out.len() + dash_bytes + c.len_utf8() > max_bytes {
-                break;
-            }
-            if add_dash {
-                out.push('-');
-            }
-            pending_dash = false;
-            out.push(c);
-        } else {
-            pending_dash = true;
-        }
-    }
-    let trimmed = out.trim_matches(|c| matches!(c, '.' | '_' | '-'));
-    if trimmed.is_empty() {
-        "agent".into()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 /// The agent's address. Consensus admits only DNS-label agent ids
 /// (`agent::validate_agent_id`), and a label fits an RFC 5321 local part
 /// verbatim — so `quackbot` attributes to `quackbot@agents.duck` and the
 /// address round-trips back to the registry key.
-///
-/// LEGACY FALLBACK: agents registered before that rule may carry any id
-/// (spaces, `@`, `/`, 200 bytes). Those still need a valid, bounded, unique
-/// local part, so they keep the old derivation: a readable slug plus a suffix
-/// hashing the COMPLETE committed id, before any lossy normalization.
-///
-/// THE TWO BRANCHES MUST NOT COLLIDE, and a hash suffix alone does not buy that.
-/// The legacy derivation is lossy and its output lands back in the label
-/// alphabet: legacy id `"qa luna"` derives `qa-luna-<32 hex>`, which is itself a
-/// perfectly legal DNS label — so a NEW agent could register exactly that id and
-/// the verbatim branch would hand it the legacy agent's address. Both halves are
-/// public (the id is registry state, sha256 is sha256), so that is a cheap
-/// impersonation, not a birthday accident. The `.` separator makes the branches
-/// DISJOINT BY CONSTRUCTION instead of merely unlikely to meet: a dot is legal
-/// between the atoms of an RFC 5321 dot-string but can never occur in a DNS
-/// label, so no verbatim local part can ever equal a derived one.
-/// (`readable_agent_slug` trims `.`/`_`/`-` off both ends and falls back to
-/// `agent`, so the result never has a leading, trailing, or doubled dot.)
 fn attribution_email_local_part(input: &str) -> String {
-    const HASH_BYTES: usize = 16;
-    const HASH_HEX_BYTES: usize = HASH_BYTES * 2;
-    const SLUG_BYTES: usize = MAX_AGENT_ID_BYTES - HASH_HEX_BYTES - 1;
-
-    if agent::validate_agent_id(input).is_ok() {
-        return input.to_owned();
-    }
-    let slug = readable_agent_slug(input, SLUG_BYTES);
-    let digest = Sha256::digest(input.as_bytes());
-    let hash = digest[..HASH_BYTES]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("{slug}.{hash}")
+    debug_assert!(agent::validate_agent_id(input).is_ok());
+    input.to_owned()
 }
 
 fn commit_message(run_dir: &Path, oid: &str) -> Result<String, String> {
@@ -884,7 +825,7 @@ fn commit_blocking(
     // The provider's isolated HOME/auth/temp/target tree lives inside the
     // disk-backed run worktree but is runtime debris, not authored source.
     // Delete it before `git add -A` so credentials and caches cannot be pushed.
-    let _ = std::fs::remove_dir_all(run_dir.join(capability_host::RUN_RUNTIME_DIR));
+    let _ = std::fs::remove_dir_all(run_dir.join(provider_host::RUN_RUNTIME_DIR));
     sanitize_agent_git_control(run_dir)?;
     let head = run_git(run_dir, &["rev-parse", "HEAD"], &[])?;
     let safe_display_name = sanitize_display_name(&identity.agent_display_name);

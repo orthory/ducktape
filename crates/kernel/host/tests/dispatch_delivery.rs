@@ -23,6 +23,7 @@ use host::{BlockContext, Host};
 use saga::SagaModule;
 use saga::{SagaMsg, encode_msg as saga_encode_msg};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
+use sdk_testkit::MemStore;
 
 /// the stub dispatching module: `"go"` makes it dispatch one recipe run, and
 /// every `ResultEvent` the dispatch module delivers is recorded into a shared
@@ -106,8 +107,15 @@ fn results_deliver_exactly_once_and_never_in_their_own_block() {
     // an unassigned open-policy saga ledger: no valset, no capability
     // registry — nobody is assigned and any submitter's result is accepted,
     // which is all this delivery test needs.
-    host.register(Box::new(SagaModule::new("saga")));
-    host.register(Box::new(DispatchModule::new("dispatch", "saga")));
+    host.register(Box::new(SagaModule::new(
+        "saga",
+        Box::new(sdk_testkit::MemStore::new()),
+    )));
+    host.register(Box::new(DispatchModule::new(
+        "dispatch",
+        "saga",
+        Box::new(MemStore::new()),
+    )));
     host.register(Box::new(Caller {
         received: Rc::clone(&received),
     }));

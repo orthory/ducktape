@@ -60,7 +60,7 @@ fn synced_store_reconstructs_source_root() {
             .expect("sync_from");
         let synced = Kv::new("dst", Box::new(store));
 
-        // THE PROPERTY: identical qmdb root — the app-hash linkage a joiner needs
+        // THE PROPERTY: identical qmdb root — the root-hash linkage a joiner needs
         // to be accepted as a consensus participant at the boundary height.
         assert_eq!(
             synced.root(),

@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Worktree: `/home/eddy/dev/ducktape/.worktree/bearer-client-invites` (branch `feat/bearer-client-invites`, forked from origin/dev `538fa38e8b`). ALL commands below run from this directory.
+- Worktree: `<repo>/.worktree/bearer-client-invites` (branch `feat/bearer-client-invites`, forked from origin/dev `538fa38e8b`). ALL commands below run from this directory.
 - NO backward compatibility (standing mandate): the preimage changes in place — no dual-decode, no version tags; one format exists. All outstanding invites die; that is accepted.
 - Bearer ⇒ `role == Client`, enforced at mint (by construction), at redeem (consensus), and at node-join paste time. NEVER grant resident standing from a bearer token.
 - Single-use stays the law: one invite = one redemption (operator directive). No multi-use anywhere.

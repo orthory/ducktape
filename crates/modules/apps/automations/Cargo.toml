@@ -17,6 +17,9 @@ guest = ["dep:guest-adapter"]
 # crate, pulled only when the guest build compiles this crate for wasm32.
 guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 sdk = { workspace = true }
+# the store-record codec (and, for interface types, the stored-embedded
+# derive): compact, canonical, deterministic. wire stays sdk::wire.
+borsh = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # default-features = false on chat/tasks: only their consensus wire types
@@ -29,7 +32,6 @@ serde_json = { workspace = true }
 chat = { path = "../chat", default-features = false }
 tasks = { path = "../tasks", default-features = false }
 inbox = { workspace = true }
-sha2 = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]

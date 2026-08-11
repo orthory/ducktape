@@ -1,7 +1,7 @@
 //! the recovery loop end-to-end, minus networking: an ordered node journals
 //! through a real [`recovery::Recovery`] store (deterministic runtime), the
 //! process "crashes" (everything in memory is dropped), and boot rebuilds the
-//! host from the checkpoint + journal suffix to the byte-identical app-hash.
+//! host from the checkpoint + journal suffix to the byte-identical root-hash.
 //!
 //! directory is the module under test on purpose: it is one of the in-memory
 //! canonical-bytes modules that today vanish on restart — exactly the state
@@ -56,14 +56,14 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
             .await
             .expect("open recovery");
         let host = fresh_host();
-        let genesis_hash = host.app_hash();
+        let genesis_hash = host.root_hash();
         let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
 
         // genesis checkpoint: height 0 = nothing applied.
         let pos = node.sink_mut().oplog_pos().await;
         let manifest =
             Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1).expect("capture");
-        assert_eq!(manifest.app_hash, genesis_hash);
+        assert_eq!(manifest.root_hash, genesis_hash);
         node.sink_mut()
             .write_manifest(&manifest)
             .await
@@ -124,7 +124,7 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
         node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 3);
         let tip = node.finalized().expect("boundary");
-        let tip_hash = node.app_hash();
+        let tip_hash = node.root_hash();
 
         // ---- a graceful shutdown: the journal tail is made durable ---------
         node.sink_mut().sync().await.expect("shutdown sync");
@@ -161,8 +161,8 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
             .expect("recover");
         assert_eq!(recovered.height, Some(tip.height));
         assert_eq!(
-            recovered.app_hash, tip_hash,
-            "recomposed app-hash is byte-identical"
+            recovered.root_hash, tip_hash,
+            "recomposed root-hash is byte-identical"
         );
         assert_eq!(
             recovered.applied, 2,
@@ -197,7 +197,7 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
             recovery,
             Some(host::FinalizedBlock {
                 height: tip_height,
-                app_hash: recovered.app_hash,
+                root_hash: recovered.root_hash,
             }),
             recovered.view_base,
         );
@@ -239,7 +239,7 @@ fn a_crash_mid_apply_rolls_the_unsealed_block_forward() {
         // the torn write: pre_apply lands, the apply does not. the journaled
         // block record is a BATCH super-frame (single member here), exactly what
         // the live drain pins before it mutates state.
-        let frame = node::encode_batch(&[node::encode_frame(&signer, 1, &set("b", "2"), None)]);
+        let frame = node::encode_batch(&[node::encode_frame(&signer, 1, &set("b", "2"))]);
         {
             use node::BlockSink as _;
             node.sink_mut()
@@ -279,7 +279,7 @@ fn a_crash_mid_apply_rolls_the_unsealed_block_forward() {
             .expect("recover again");
         assert!(!again.rolled_forward);
         assert_eq!(again.height, recovered.height);
-        assert_eq!(again.app_hash, recovered.app_hash);
+        assert_eq!(again.root_hash, recovered.root_hash);
     });
 }
 
@@ -352,7 +352,7 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
 
         // each op is flushed as its OWN single-member batch, so the finalized
         // block bytes read back are the BATCH super-frame wrapping that member.
-        let frame2 = node::encode_batch(&[node::encode_frame(&signer, 2, &set("k2", "v2"), None)]);
+        let frame2 = node::encode_batch(&[node::encode_frame(&signer, 2, &set("k2", "v2"))]);
         let frame3 = node::encode_batch(&[node::encode_frame(
             &signer,
             3,
@@ -360,8 +360,7 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
                 target: "no-such-module".into(),
                 payload: vec![1],
             },
-        None,
-    )]);
+        )]);
         node.submit(&signer, 2, set("k2", "v2"))
             .await
             .expect("submit");
@@ -429,14 +428,14 @@ fn range_read_refuses_below_the_retained_floor() {
             .await
             .expect("open pruned-shape recovery");
         let signer = sk(9);
-        let frame = node::encode_batch(&[node::encode_frame(&signer, 9, &set("k9", "v9"), None)]);
+        let frame = node::encode_batch(&[node::encode_frame(&signer, 9, &set("k9", "v9"))]);
         pruned.pre_apply(2, &frame).await.expect("wal record");
         pruned
             .seal(&node::BlockSeal {
                 height: 2,
                 disposition: Disposition::Applied,
                 roots: vec![],
-                app_hash: sdk::StateRoot([0u8; 32]),
+                root_hash: sdk::StateRoot([0u8; 32]),
             })
             .await
             .expect("seal");

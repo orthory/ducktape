@@ -48,8 +48,25 @@ fn resident_rebootstraps_while_the_chain_stays_busy() {
     // tighten the cadence so the founder's drain loop periodically carries a
     // full manifest capture while serving.
     let founder_toml = cluster.config_file(0);
-    let mut cfg = std::fs::read_to_string(&founder_toml).expect("read founder node.toml");
-    cfg.push_str("\ncheckpoint_blocks = 4\n");
+    let cfg = std::fs::read_to_string(&founder_toml).expect("read founder node.toml");
+    // every node.toml key is required and emitted since the config overhaul, so
+    // REWRITE the generated line — appending would duplicate the key, and a
+    // duplicate TOML key is a founder boot FATAL.
+    assert!(
+        cfg.contains("checkpoint_blocks"),
+        "generated founder node.toml lost its checkpoint_blocks line"
+    );
+    let cfg = cfg
+        .lines()
+        .map(|line| {
+            if line.starts_with("checkpoint_blocks") {
+                "checkpoint_blocks = 4"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     std::fs::write(&founder_toml, cfg).expect("write founder node.toml");
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));

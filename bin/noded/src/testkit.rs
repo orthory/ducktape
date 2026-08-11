@@ -30,6 +30,10 @@ use crate::{
 /// thread serving the client surface, torn down cleanly on drop.
 pub struct InProcDaemon {
     port: u16,
+    /// this harness's admin credential. The harness OWNS the node in-process, so
+    /// it is the operator — there is no workspace to write the token into, and
+    /// nothing outside this struct ever learns it.
+    operator_token: String,
     server: Option<JoinHandle<()>>,
     actor: Option<JoinHandle<()>>,
 }
@@ -44,13 +48,74 @@ impl InProcDaemon {
         build_host: impl FnOnce() -> Host + Send + 'static,
         status_modules: Vec<String>,
     ) -> Self {
-        let port = nettest::free_port();
-        let (handle, cmd_rx, _events) = NodeHandle::channel();
+        Self::start_with_blob_root(build_host, status_modules, None)
+    }
 
+    /// [`Self::start`] with the node-local blob store rooted on disk.
+    ///
+    /// Needed whenever a test must put bytes where a MODULE will later look for
+    /// them. Forge materializes a pushed packfile OUT of the blob store, so a
+    /// test that pushes real git objects has to hand the module the same store
+    /// the http surface writes to — with the in-memory default they are two
+    /// disconnected stores and the objects are simply not there.
+    ///
+    /// `None` keeps the in-memory default.
+    pub fn start_with_blob_root(
+        build_host: impl FnOnce() -> Host + Send + 'static,
+        status_modules: Vec<String>,
+        blob_root: Option<std::path::PathBuf>,
+    ) -> Self {
+        // Bind FIRST, and hand the bound socket to the server thread.
+        //
+        // The harness used to reserve a port with `nettest::free_port()`, drop
+        // the probe, and bind minutes of genesis later — the classic gap. Worse,
+        // the bind then lived on the server thread where its `.expect` panicked
+        // into nothing, so the readiness loop below could not tell "my listener
+        // died" from "not up yet" and would happily settle for a STRANGER's 200
+        // on that port. Binding here closes both: there is no gap to lose the
+        // port in, a failure to bind panics in the caller's own thread, and the
+        // port we report is by construction the one WE hold.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind harness listener");
+        let port = listener.local_addr().expect("harness listen addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("harness listener is nonblocking for tokio");
+        let (handle, cmd_rx, _events) = NodeHandle::channel();
+        // chained right after `channel()`, before any `blob_handle()` clone is
+        // handed out — the ordering `with_blob_root` documents.
+        let handle = match blob_root {
+            Some(root) => handle.with_blob_root(root).expect("harness blob root"),
+            None => handle,
+        };
+        let status = handle.status_cell();
+        // the testkit has no mesh and no registry: an empty exposition
+        // parses to the honest empty peers sample and an empty scrape.
+        status.wire_exposition(String::new);
+        // the admin namespace is operator-gated, and this harness serves on a
+        // REAL loopback port — so it mints a real per-instance credential rather
+        // than a shared literal any other local process could guess.
+        let operator_token = crate::services::new_secret();
+        let handle = handle.with_admin(crate::AdminConfig {
+            operator_token: Some(operator_token.clone()),
+            ..Default::default()
+        });
+
+        // the readiness event, same contract as `bin/noded`'s daemon: genesis
+        // runs on the actor thread and publishes the boot snapshot, and only
+        // THEN does anything SERVE. The listener is bound above (that is a
+        // socket, not a service — an unaccepted connect just sits in the
+        // backlog), but `crate::serve` is not spawned until this channel has
+        // fired. Serving first would let `await_ready` — and any harness probing
+        // `/v1/status` for "up" — take a 200 carrying `NodeStatus::default()`
+        // (version "", no modules, height 0) as the node's real state while
+        // genesis is still running behind it.
+        let (booted_tx, booted_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let actor = std::thread::Builder::new()
             .name("inproc-actor".into())
-            .spawn(move || run_actor(build_host(), status_modules, cmd_rx))
+            .spawn(move || run_actor(build_host(), status_modules, cmd_rx, status, booted_tx))
             .expect("spawn actor");
+        // a dropped sender means genesis panicked; say that rather than block.
+        booted_rx.recv().expect("in-proc actor died during genesis");
 
         let server = std::thread::Builder::new()
             .name("inproc-server".into())
@@ -60,9 +125,8 @@ impl InProcDaemon {
                     .build()
                     .expect("server runtime");
                 rt.block_on(async move {
-                    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                        .await
-                        .expect("bind harness listener");
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .expect("adopt the pre-bound harness listener");
                     let _ = crate::serve(listener, handle).await;
                 });
             })
@@ -70,6 +134,7 @@ impl InProcDaemon {
 
         let daemon = Self {
             port,
+            operator_token,
             server: Some(server),
             actor: Some(actor),
         };
@@ -87,9 +152,32 @@ impl InProcDaemon {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// Block until the server thread's runtime is actually accepting.
+    ///
+    /// Liveness FIRST, then the probe — the same order `bin/simnode`'s harness
+    /// needed, and for the same reason. Binding in [`Self::start`] means a
+    /// stranger cannot answer *while we hold the socket*, but that is not
+    /// unconditional: if the server thread dies (its runtime fails to build, or
+    /// `serve` panics) the listener drops with it, the port frees, and this loop
+    /// would keep polling it for the remaining 30s — long enough for another
+    /// harness to bind it and answer 200, which this would report as our node
+    /// being ready. Asking `JoinHandle::is_finished()` first makes a dead server
+    /// a named failure instead.
+    ///
+    /// What remains a genuine wait is the runtime spinning up: a connect lands
+    /// in the backlog immediately, but no response comes back until `serve` is
+    /// polling.
     fn await_ready(&self) {
         let deadline = Instant::now() + Duration::from_secs(30);
+        let server = self.server.as_ref().expect("the server thread is running");
         loop {
+            assert!(
+                !server.is_finished(),
+                "the in-proc server thread exited before answering /v1/status on \
+                 port {}; its listener is gone, so anything answering that port \
+                 now belongs to someone else",
+                self.port
+            );
             if nettest::http_status(self.port, "GET", "/v1/status") == Some(200) {
                 return;
             }
@@ -111,7 +199,12 @@ impl Drop for InProcDaemon {
         // its sole handle drops → the command channel closes → both threads end,
         // so a caller's tempdir (dropped AFTER this) is removed only once the
         // host's qmdb handles are closed.
-        let _ = nettest::http_status(self.port, "POST", "/v1/admin/shutdown");
+        let _ = nettest::http_status_with(
+            self.port,
+            "POST",
+            "/v1/admin/shutdown",
+            &[(crate::admin::ADMIN_TOKEN_HEADER, &self.operator_token)],
+        );
         if let Some(server) = self.server.take() {
             let _ = server.join();
         }
@@ -128,9 +221,17 @@ pub fn run_actor(
     mut host: Host,
     status_modules: Vec<String>,
     mut cmd_rx: mpsc::Receiver<NodeCommand>,
+    status: crate::StatusCell,
+    booted: std::sync::mpsc::SyncSender<()>,
 ) {
     let mut height: u64 = 0;
     futures::executor::block_on(async move {
+        // the boot snapshot, then one publish per committed block — the SAME
+        // publish-into-the-cell contract the real daemons serve. the signal
+        // releases the caller to bind: the first status a client can reach is
+        // this one, never the cell's empty default.
+        publish_status(&status, &host, &status_modules, height);
+        let _ = booted.send(());
         while let Some(cmd) = cmd_rx.next().await {
             match cmd {
                 NodeCommand::Submit {
@@ -142,6 +243,7 @@ pub fn run_actor(
                     let result =
                         commit(&mut host, &mut height, Origin::External(origin), Msg { target, payload })
                             .await;
+                    publish_status(&status, &host, &status_modules, height);
                     let _ = reply.send(result);
                 }
                 // the signed-frame lane, FAITHFUL to the real daemon: the origin
@@ -149,45 +251,49 @@ pub fn run_actor(
                 // forged/tampered frame is a rejection, not a block.
                 NodeCommand::SubmitFrame { frame, reply } => {
                     let result = match node::decode_frame(&frame) {
-                        Ok((origin, msg, _cont)) => {
-                            commit(&mut host, &mut height, origin, msg).await
-                        }
+                        Ok((origin, msg)) => commit(&mut host, &mut height, origin, msg).await,
                         Err(err) => Err(err.to_string()),
                     };
+                    publish_status(&status, &host, &status_modules, height);
                     let _ = reply.send(result);
                 }
                 NodeCommand::Query { target, req, reply } => {
                     let result = host.query(&target, &req).await.map_err(|e| e.to_string());
                     let _ = reply.send(result);
                 }
-                NodeCommand::Status { reply } => {
-                    let modules = status_modules
-                        .iter()
-                        .map(|id| ModuleStatus {
-                            id: id.clone(),
-                            root: host.module_root(id).map(|r| hex_root(&r)).unwrap_or_default(),
-                            category: ModuleCategory::of(id),
-                        })
-                        .collect();
-                    let _ = reply.send(NodeStatus {
-                        version: env!("CARGO_PKG_VERSION").into(),
-                        app_hash: hex_root(&host.app_hash()),
-                        height,
-                        modules,
-                        public_key: String::new(),
-                        operations: Default::default(),
-                    });
-                }
-                NodeCommand::Peers { reply } => {
-                    // the testkit has no mesh and no registry: an empty
-                    // exposition parses to the honest empty sample.
-                    let _ = reply.send(crate::peers::peers_from_exposition("", 0));
-                }
-                NodeCommand::Metrics { reply } => {
-                    let _ = reply.send(String::new());
-                }
             }
         }
+    });
+}
+
+/// assemble + publish the harness's `/v1/status` snapshot (each module's root
+/// read straight from the host) into the shared cell.
+fn publish_status(
+    status: &crate::StatusCell,
+    host: &Host,
+    status_modules: &[String],
+    height: u64,
+) {
+    let modules = status_modules
+        .iter()
+        .map(|id| ModuleStatus {
+            id: id.clone(),
+            root: host.module_root(id).map(|r| hex_root(&r)).unwrap_or_default(),
+            category: ModuleCategory::of(id),
+        })
+        .collect();
+    status.publish(NodeStatus {
+        version: env!("CARGO_PKG_VERSION").into(),
+        root_hash: hex_root(&host.root_hash()),
+        height,
+        modules,
+        public_key: String::new(),
+        operations: Default::default(),
+    });
+    // no mesh: height only, no roles or epoch — same as the embedded daemon.
+    status.publish_peers(crate::PeersStanding {
+        height,
+        ..Default::default()
     });
 }
 
@@ -211,7 +317,7 @@ async fn commit(
             *height = next;
             Ok(BlockSummary {
                 height: *height,
-                app_hash: hex_root(&out.app_hash),
+                root_hash: hex_root(&out.root_hash),
             })
         }
         Err(err) => Err(err.to_string()),

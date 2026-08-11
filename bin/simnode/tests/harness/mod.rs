@@ -50,14 +50,24 @@ impl Sim {
         sim
     }
 
+    /// Block until this sim answers `/v1/status`.
+    ///
+    /// Liveness FIRST, and the order is the whole point: a child that lost its
+    /// listen port exits, and something else is then answering on that number.
+    /// Probing first would read the WINNER's 200 as this child's readiness, and
+    /// the test would drive a stranger's sim for its entire run — visible only
+    /// as an unrelated flake. Asking "is my child alive?" before "did someone
+    /// answer?" turns that into a named startup failure. (The same reorder
+    /// landed in `bin/noded/tests/daemon_e2e.rs`; this harness was the copy left
+    /// behind.)
     fn await_status(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if let Ok((200, _)) = try_request(self.port, "GET", "/v1/status", None) {
-                return;
-            }
             if let Some(status) = self.child.try_wait().expect("poll sim") {
                 panic!("sim exited during startup ({status}) — see stderr above");
+            }
+            if let Ok((200, _)) = try_request(self.port, "GET", "/v1/status", None) {
+                return;
             }
             assert!(
                 Instant::now() < deadline,
@@ -66,6 +76,21 @@ impl Sim {
             );
             std::thread::sleep(Duration::from_millis(150));
         }
+    }
+
+    /// this sim's http port — for the routes the helpers below do not wrap,
+    /// namely `/v1/admin/*`, which needs a credential header no json helper
+    /// carries.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// block until the child exits ON ITS OWN — the event a graceful
+    /// `/v1/admin/shutdown` produces. `Drop`'s kill is the backstop for a test
+    /// that never reaches here; this is what a shutdown assertion waits on, and
+    /// it waits on the process's own exit rather than on a duration.
+    pub fn wait_for_exit(&mut self) -> std::process::ExitStatus {
+        self.child.wait().expect("wait for sim exit")
     }
 
     pub fn request(
@@ -112,6 +137,26 @@ impl Sim {
         );
         assert_eq!(status, 200, "query {target} failed: {reply}");
         reply
+    }
+
+    /// the canonical chat point read: the channel's committed record, or `None`
+    /// when nothing is committed under that id.
+    ///
+    /// there is no list-all read to count any more, and that is the product's
+    /// position, not a gap: the read-model cutover moved every UI-shaped
+    /// iteration into the index guests (`POST /v1/index/chat/view`) and left
+    /// canonical state answering point reads ALONE. so a "did this commit?"
+    /// assertion has to name the channel it means — which is also the stronger
+    /// claim, since a count of 2 never said WHICH two.
+    pub fn channel(&self, channel_id: &str) -> Option<serde_json::Value> {
+        let reply = self.query(
+            "chat",
+            serde_json::json!({ "channel": { "channel_id": channel_id } }),
+        );
+        match reply["channel"] {
+            serde_json::Value::Null => None,
+            _ => Some(reply["channel"].clone()),
+        }
     }
 
     /// an inline submit — only sound in auto mode (or for an op the module

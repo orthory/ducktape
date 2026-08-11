@@ -258,7 +258,7 @@ temporary assembler—must own the promise.
 ## Terminology and Guarantee
 
 **Parent boundary** is the finalized tuple
-`(network_id, epoch, app_height, app_hash)` from which the next canonical
+`(network_id, epoch, app_height, root_hash)` from which the next canonical
 application block executes.
 
 **Assembler** is the validator Simplex elected to propose the active view. It
@@ -431,7 +431,7 @@ session_id = H(
   network_id,
   epoch,
   parent_height,
-  parent_app_hash,
+  parent_root_hash,
   assembler_view,
   assembler_identity
 )
@@ -693,7 +693,7 @@ struct ParentBoundaryV1 {
     network_id: [u8; 32],
     epoch: u64,
     app_height: u64,
-    app_hash: [u8; 32],
+    root_hash: [u8; 32],
 }
 
 struct ProposalCoreV1 {
@@ -1119,7 +1119,7 @@ the number of fastblocks, not violate a receipt.
 
 The final payload is the existing canonical batch encoding and enters the
 existing single execution path. Fastblocks introduce no alternate app-state
-transition, height, app hash, or commit order. Interactive priority affects
+transition, height, root hash, or commit order. Interactive priority affects
 which frames the elected assembler proposes, not how validators execute the
 agreed order.
 
@@ -1235,7 +1235,7 @@ projection functions for local intent and verified remote previews:
 | `pending` + `received` | node accepted custody of the stable FrameId | **Queued** |
 | `preconfirmed` | local node verified a portable receipt for this eligible frame | **Preconfirmed** |
 | remote interactive preview | verified receipt plus exact chat/pages operation | Render provisionally with a **Preconfirmed** marker |
-| `finalized.applied` | canonical block and app hash | **Finalized** |
+| `finalized.applied` | canonical block and root hash | **Finalized** |
 | `finalized.rejected` | canonical inclusion with deterministic rejection | **Finalized — rejected** |
 | `carried` | existing cutover custody remains unresolved | **Carried to next epoch** |
 | `preconfirmation_missed` | window ended without a receipt | stay **Queued**; optional fast-path detail |
@@ -1255,7 +1255,7 @@ The UI must never call the pre-custody optimistic projection “preconfirmed,”
 show an execution result from an inclusion receipt, or raise the existing
 finality / read-your-writes floor on preconfirmation. A preview must not send
 notifications, launch agents, start effects, or become queryable committed
-state. Finalized refresh and app-hash logic remain final-only.
+state. Finalized refresh and root-hash logic remain final-only.
 
 The node verifies receipts using the same epoch certificate suite and exposes
 only verified progress to the desktop. Portable SDK consumers may call the
@@ -1394,7 +1394,7 @@ upgrade/migration.
 - Golden tests prove the extracted `BatchBuilder` emits byte-identical batches
   to current `flush_batch`, including capacity boundaries and the single-frame
   exception.
-- With Fastblocks disabled, canonical digests, drained member order, app hashes,
+- With Fastblocks disabled, canonical digests, drained member order, root hashes,
   recovery replay, cutover carry, HTTP final receipts, and OpLedger transitions
   remain unchanged.
 - Every pre-existing module inherits `Ordinary`; Chat and Pages golden vectors

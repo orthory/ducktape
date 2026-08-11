@@ -68,9 +68,9 @@ auto-bind-on-connect pass). No background fan-out (single-active premise).
   (a duckfs path). App-side avatar image capped at `MAX_INLINE_COMMIT_BYTES`
   (256 KiB) so it rides one inline commit and stays localStorage-safe.
 
-## App-hash / re-seed impact
+## Root-hash / re-seed impact
 
-Adding fields + an op to the identity module **moves the genesis app-hash**
+Adding fields + an op to the identity module **moves the genesis root-hash**
 (accepted per ledger). Existing QA networks must be **re-seeded**.
 
 The `identity-wasm` component is a **single-sourced adapter** over the native

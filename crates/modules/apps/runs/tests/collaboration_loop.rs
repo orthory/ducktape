@@ -10,7 +10,7 @@
 //! AGENT) plus the task action commit in that delivery block (pruning the
 //! pending entry — the dispatch module keeps the history) → a second
 //! composition replaying the identical op sequence lands on the
-//! byte-identical app-hash — the oracle-as-op laundering that makes a
+//! byte-identical root-hash — the oracle-as-op laundering that makes a
 //! non-deterministic LLM consensus-safe (N2).
 //!
 //! the JOBS lane rides the same plane: a submitted `agent/{id}` job is
@@ -35,7 +35,7 @@ use chat::{
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };
-use commonware_runtime::{Runner as _, deterministic};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use dispatch::DispatchModule;
 use dispatch::{
     DispatchQuery, DispatchReply, DispatchStatus, decode_work_spec,
@@ -90,7 +90,6 @@ fn canned_response(run_id: &str) -> Vec<u8> {
             task_id: "task-1".into(),
             title: "follow up on the mention".into(),
         }],
-        delegations: Vec::new(),
         commit_message: None,
     })
 }
@@ -103,7 +102,6 @@ fn job_response(task_id: &str, title: &str) -> Vec<u8> {
             task_id: task_id.into(),
             title: title.into(),
         }],
-        delegations: Vec::new(),
         commit_message: None,
     })
 }
@@ -243,13 +241,30 @@ fn scripted_ops() -> Vec<(u64, Origin, Msg)> {
 }
 
 async fn genesis(context: deterministic::Context) -> Host {
-    let chat = Chat::new("chat", Box::new(QmdbStore::init(context, "chat").await)).with_tagging("tagging");
+    let chat = Chat::new(
+        "chat",
+        Box::new(QmdbStore::init(context.child("chat"), "chat").await),
+    )
+    .with_tagging("tagging");
+    let agent = AgentModule::new(
+        "agent",
+        Box::new(QmdbStore::init(context.child("agent"), "agent").await),
+        "saga",
+        Some("runs".into()),
+    );
     Host::genesis(vec![
         Box::new(chat),
-        Box::new(TaggingModule::new("tagging")),
-        Box::new(SagaModule::new("saga")),
-        Box::new(DispatchModule::new("dispatch", "saga")),
-        Box::new(AgentModule::new("agent", "saga", Some("runs".into()))),
+        Box::new(TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
+        Box::new(SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new()))),
+        Box::new(DispatchModule::new(
+            "dispatch",
+            "saga",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
+        Box::new(agent),
         Box::new(RunsModule::new(
             "runs",
             "chat",
@@ -260,7 +275,7 @@ async fn genesis(context: deterministic::Context) -> Host {
             Some("tasks".into()),
             Some("tasks".into()),
         )),
-        Box::new(Tasks::new("tasks")),
+        Box::new(Tasks::new("tasks", Box::new(sdk_testkit::MemStore::new()))),
     ])
     .expect("genesis")
 }
@@ -378,7 +393,6 @@ async fn job_view(host: &Host, job_id: &str) -> Option<Job> {
         .unwrap();
     match jobs_decode_reply(&reply).unwrap() {
         JobsReply::Job(job) => job,
-        other => panic!("unexpected reply: {other:?}"),
     }
 }
 
@@ -593,12 +607,12 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
         assert_eq!(record.status, AgentStatus::Active);
         assert_eq!(record.capability, "mock-llm-1");
 
-        (host.app_hash(), oracle_op)
+        (host.root_hash(), oracle_op)
     });
 
     // ---- instance two: replay the identical op sequence -------------------
     // a fresh composition applies the same six blocks and must land on the
-    // byte-identical app-hash: the LLM's non-determinism was laundered into
+    // byte-identical root-hash: the LLM's non-determinism was laundered into
     // an ordered op, so replay is pure state-machine (N2).
     let replayed_hash = deterministic::Runner::default().start(|context| async move {
         let mut host = genesis(context).await;
@@ -615,12 +629,12 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
             .await
             .expect("replayed delivery block");
         assert_eq!(pending_run(&host, &replay_run_id).await, None);
-        outcome.app_hash
+        outcome.root_hash
     });
 
     assert_eq!(
         settled_hash, replayed_hash,
-        "two instances, one op sequence -> byte-identical app-hash"
+        "two instances, one op sequence -> byte-identical root-hash"
     );
     assert_ne!(settled_hash, StateRoot::ZERO);
 }

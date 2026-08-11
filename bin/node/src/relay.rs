@@ -40,9 +40,9 @@ pub const RELAY_BLOB_CHUNK_BYTES: usize = 768 * 1024;
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RelayOutcome {
-    /// drained Applied at `height`; `app_hash` is the PER-BLOCK boundary
+    /// drained Applied at `height`; `root_hash` is the PER-BLOCK boundary
     /// hash the frame settled at (what a local app-surface hold reports).
-    Applied { height: u64, app_hash: String },
+    Applied { height: u64, root_hash: String },
     /// finalized but deterministically rejected by its module.
     Rejected { detail: String },
     /// refused at the door (bad frame / origin lacks resident standing) or
@@ -77,6 +77,14 @@ pub enum RelayMsg {
         digest: [u8; 32],
         error: Option<String>,
     },
+    /// a validator-to-validator LEADER NUDGE: the sender holds real parked
+    /// proposals and (by its local estimate) the receiver leads the CURRENT
+    /// view — close it now by beating the idle nop early, so leadership
+    /// rotation runs at network speed instead of the 1s idle beat. carries
+    /// nothing and grants nothing: the receiver acts only when quiet, only
+    /// ever by beating one deterministic nop, and only for a sender that is a
+    /// current validator — a stray, stale, or mis-aimed nudge is harmless.
+    Nudge,
     /// the validator's answer, keyed by the frame's content address.
     Reply {
         frame_id: [u8; 32],
@@ -98,7 +106,7 @@ pub fn decode_msg(b: &[u8]) -> Result<RelayMsg, String> {
 /// relay-specific policy decision.
 pub fn required_blob_digest(frame: &[u8]) -> Option<[u8; 32]> {
     // the door reads policy fields only.
-    let (_, msg, _cont) = node::decode_frame(frame).ok()?;
+    let (_, msg) = node::decode_frame(frame).ok()?;
     if msg.target != "forge" {
         return None;
     }
@@ -199,8 +207,7 @@ pub fn verify_relay_submit(
     residents: &[Vec<u8>],
     clients: &[Vec<u8>],
 ) -> Result<node::FrameId, String> {
-    let (origin, _msg, _cont) =
-        node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
+    let (origin, _msg) = node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
     let sdk::Origin::External(origin_bytes) = origin else {
         return Err("relayed frames carry an external origin".into());
     };
@@ -226,8 +233,7 @@ pub fn verify_blob_offer(
     members: &[Vec<u8>],
     residents: &[Vec<u8>],
 ) -> Result<node::FrameId, String> {
-    let (origin, _msg, _cont) =
-        node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
+    let (origin, _msg) = node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
     let sdk::Origin::External(origin_bytes) = origin else {
         return Err("blob offers carry an external origin".into());
     };
@@ -286,7 +292,7 @@ mod tests {
                 frame_id: [7; 32],
                 outcome: RelayOutcome::Applied {
                     height: 42,
-                    app_hash: "aa".into(),
+                    root_hash: "aa".into(),
                 },
             },
             RelayMsg::Reply {
@@ -302,7 +308,7 @@ mod tests {
     fn door_accepts_a_frame_from_a_standing_origin() {
         let author = sk(7);
         let me = author.public_key().as_ref().to_vec();
-        let frame = node::encode_frame(&author, 3, &msg(), None);
+        let frame = node::encode_frame(&author, 3, &msg());
         // the sending peer is never consulted — standing rides on the ORIGIN.
         let id = verify_relay_submit(&frame, std::slice::from_ref(&me), &[]).expect("accepted");
         assert_eq!(id, node::frame_id(&frame));
@@ -315,7 +321,7 @@ mod tests {
         // gate; standing rides on the ORIGIN, sourced from the clients module.
         let author = sk(7);
         let me = author.public_key().as_ref().to_vec();
-        let frame = node::encode_frame(&author, 3, &msg(), None);
+        let frame = node::encode_frame(&author, 3, &msg());
         let id = verify_relay_submit(&frame, &[], std::slice::from_ref(&me)).expect("accepted");
         assert_eq!(id, node::frame_id(&frame));
     }
@@ -323,7 +329,7 @@ mod tests {
     #[test]
     fn door_refuses_without_resident_or_client_standing() {
         let author = sk(7);
-        let frame = node::encode_frame(&author, 0, &msg(), None);
+        let frame = node::encode_frame(&author, 0, &msg());
         let err = verify_relay_submit(&frame, &[], &[]).unwrap_err();
         assert!(err.contains("standing"), "{err}");
     }
@@ -332,7 +338,7 @@ mod tests {
     fn door_refuses_a_signature_tampered_frame_that_still_parses() {
         let author = sk(7);
         let me = author.public_key().as_ref().to_vec();
-        let mut tampered = node::encode_frame(&author, 0, &msg(), None);
+        let mut tampered = node::encode_frame(&author, 0, &msg());
 
         // flip a bit INSIDE the trailing 64-byte ed25519 signature: the binary
         // envelope (the length-prefixed origin/seq/target/payload preimage) is
@@ -365,7 +371,7 @@ mod tests {
                 pack_digest: Some(digest.to_vec()),
             }),
         };
-        let frame = node::encode_frame(&author, 1, &msg, None);
+        let frame = node::encode_frame(&author, 1, &msg);
         assert!(verify_blob_offer(&frame, &digest, std::slice::from_ref(&me), &[]).is_ok());
         assert!(verify_blob_offer(&frame, &digest, &[], std::slice::from_ref(&me)).is_ok());
         assert!(verify_blob_offer(&frame, &digest, &[], &[]).is_err());
@@ -385,7 +391,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            required_blob_digest(&node::encode_frame(&author, 1, &push, None)),
+            required_blob_digest(&node::encode_frame(&author, 1, &push)),
             Some(digest)
         );
 
@@ -401,11 +407,11 @@ mod tests {
             }),
         };
         assert_eq!(
-            required_blob_digest(&node::encode_frame(&author, 2, &merge, None)),
+            required_blob_digest(&node::encode_frame(&author, 2, &merge)),
             Some(digest)
         );
         assert_eq!(
-            required_blob_digest(&node::encode_frame(&author, 3, &msg(), None)),
+            required_blob_digest(&node::encode_frame(&author, 3, &msg())),
             None
         );
     }

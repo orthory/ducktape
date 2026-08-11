@@ -4,7 +4,7 @@
 //!
 //! the load-bearing properties pinned here:
 //!
-//! - a FAILED join attempt (sync completed, but the composite app-hash gate
+//! - a FAILED join attempt (sync completed, but the composite root-hash gate
 //!   rejected — modeled by never calling `promote`) leaves the canonical dir
 //!   byte-untouched: a fresh joiner's canonical dir is not even created, and a
 //!   rejoining node's stale canonical state still opens to its OLD root.
@@ -173,7 +173,7 @@ fn failed_attempt_leaves_a_fresh_canonical_dir_untouched() {
     assert_eq!(synced.root(), source.root());
     drop(synced);
 
-    // the join then FAILS its composite app-hash gate: the scratch is simply
+    // the join then FAILS its composite root-hash gate: the scratch is simply
     // abandoned. the canonical dir was never created, let alone written.
     drop(scratch);
     assert!(
@@ -231,7 +231,7 @@ fn promotion_lands_the_synced_state_in_the_canonical_dir() {
     let expected = synced.root();
     drop(synced);
 
-    // the app-hash-verified join promotes: scratch -> canonical, then the
+    // the root-hash-verified join promotes: scratch -> canonical, then the
     // spent scratch is removed.
     scratch.promote(expected.0).expect("promote");
     assert!(!scratch.dir().exists(), "a promoted scratch is cleaned up");

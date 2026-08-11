@@ -1,0 +1,483 @@
+//! The composer surface: `ui_lang_runtime::RichTextEditor` behind the
+//! `crate::editor` externs. The stock Ice `editor` widget compiles to iced's
+//! plain `TextEditor`; this adapter is what carries the rich line layout and
+//! the IME hardening (preedit metrics, incremental relayout, grapheme deletes)
+//! that live only in the custom widget.
+//!
+//! The inline highlighter mirrors `chat::client::inline_spans` — the SAME
+//! marker grammar the message renderer parses, so what lights up while typing
+//! is exactly what the sent message will format. Marks do not nest; the first
+//! matching delimiter wins; there are no word-boundary rules. Mentions are the
+//! one renderer mark not previewed here: they need the member roster, and the
+//! composer is not worth a roster prop while the plain-ink fallback reads fine.
+
+use iced::advanced::text::{self, Highlighter};
+use iced::font::{Style as FontStyle, Weight};
+use iced::widget::text_editor::{self, Content};
+use iced::{Border, Color, Element, Font};
+use std::hash::{Hash as _, Hasher as _};
+use std::ops::Range;
+use ui_lang_runtime::rich_text_editor::{ContentVersion, Format, RichTextEditor};
+
+pub use ui_lang_runtime::rich_text_editor::Action as RichAction;
+
+const COMPOSER_SIZE: f32 = 13.5;
+const COMPOSER_LINE_HEIGHT: f32 = 1.3;
+
+// theme.ice mirrors: the adapter paints outside the Ice styling surface, so
+// these carry the palette values it cannot reach. Keep them in sync with the
+// palette block in `ui/theme.ice`.
+const fn rgb8(r: u8, g: u8, b: u8) -> Color {
+    Color {
+        r: r as f32 / 255.0,
+        g: g as f32 / 255.0,
+        b: b as f32 / 255.0,
+        a: 1.0,
+    }
+}
+/// The composer's ink set, one per palette reading of `theme.ice`.
+struct ComposerInk {
+    ink: Color,
+    muted: Color,
+    hint: Color,
+}
+
+const LIGHT_INK: ComposerInk = ComposerInk {
+    ink: rgb8(0x2c, 0x2b, 0x27),
+    muted: rgb8(0x6b, 0x69, 0x62),
+    hint: rgb8(0xb3, 0xb1, 0xa8),
+};
+
+const DARK_INK: ComposerInk = ComposerInk {
+    ink: rgb8(0xe8, 0xe6, 0xdf),
+    muted: rgb8(0xa8, 0xa6, 0x9c),
+    hint: rgb8(0x6b, 0x6a, 0x61),
+};
+
+fn composer_ink(theme: &iced::Theme) -> &'static ComposerInk {
+    if crate::backend::theme_is_dark(theme) {
+        &DARK_INK
+    } else {
+        &LIGHT_INK
+    }
+}
+
+// ponytail: the inline-mark formatter has no theme input (`format_key` is a
+// static 0), so the marker/link inks are single values chosen to read on both
+// palettes. Thread the appearance into the composer externs and bump
+// `format_key` per palette if these ever need per-theme tuning.
+const MARK_DIM: Color = rgb8(0x8a, 0x88, 0x7e);
+const MARK_LINK: Color = rgb8(0x6f, 0x8a, 0xab);
+
+/// One composer interaction, classified where the modifiers are still known.
+/// `Submit` is plain Enter (and the Send button, via
+/// [`composer_submit_event`]); everything else is an edit to apply.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ComposerEvent {
+    Submit,
+    Apply(RichAction),
+}
+
+pub fn composer_submit_event() -> ComposerEvent {
+    ComposerEvent::Submit
+}
+
+pub fn composer_submits(event: ComposerEvent) -> bool {
+    matches!(event, ComposerEvent::Submit)
+}
+
+pub fn apply_composer_event(mut document: Content, event: ComposerEvent) -> Content {
+    match event {
+        ComposerEvent::Apply(RichAction::Edit(action)) => document.perform(action),
+        ComposerEvent::Apply(RichAction::MoveTo(cursor)) => document.move_to(cursor),
+        ComposerEvent::Submit => {}
+    }
+    document
+}
+
+/// The composer toolbar's insertion: wrap the selection in `kind`'s markers,
+/// or insert an empty marker pair and park the cursor inside it. The markers
+/// are the SAME grammar `inline_marks` previews and the renderer parses, so
+/// the button and the typed fence produce identical messages.
+pub fn composer_toggle_mark(mut document: Content, kind: String) -> Content {
+    let (open, close) = match kind.as_str() {
+        "bold" => ("**", "**"),
+        "italic" => ("_", "_"),
+        "code" => ("```\n", "\n```"),
+        "quote" => ("> ", ""),
+        _ => return document,
+    };
+    let selected = document.selection().unwrap_or_default();
+    let marked = format!("{open}{selected}{close}");
+    document.perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+        std::sync::Arc::new(marked),
+    )));
+    if selected.is_empty() {
+        for _ in 0..close.chars().count() {
+            document.perform(text_editor::Action::Move(text_editor::Motion::Left));
+        }
+    }
+    document
+}
+
+/// The composer's formatting shortcuts, classified where the modifiers are
+/// known: Cmd/Ctrl+B bold, Cmd/Ctrl+I italic, Cmd/Ctrl+Shift+C code block,
+/// Cmd/Ctrl+Shift+9 quote — Slack's own table. The editor deliberately lets
+/// command-letter chords bubble (`command_shortcut_bubbles` in the widget), so
+/// this runs from the app's ONE keyboard subscription with the editor's focus
+/// untouched — the toolbar buttons cannot say the same, a click on them
+/// defocuses the editor. An empty verdict is `composer_toggle_mark`'s no-op.
+pub fn composer_mark_shortcut(
+    _logical: iced::keyboard::Key,
+    physical: iced::keyboard::key::Physical,
+    modifiers: iced::keyboard::Modifiers,
+    chat_ready: bool,
+) -> String {
+    use iced::keyboard::key::{Code, Physical};
+    if !chat_ready || !modifiers.command() {
+        return String::new();
+    }
+    let shifted = modifiers.shift();
+    let mark = match physical {
+        Physical::Code(Code::KeyB) if !shifted => "bold",
+        Physical::Code(Code::KeyI) if !shifted => "italic",
+        Physical::Code(Code::KeyC) if shifted => "code",
+        Physical::Code(Code::Digit9) if shifted => "quote",
+        _ => return String::new(),
+    };
+    mark.to_owned()
+}
+
+pub fn rich_composer(
+    document: &Content,
+    hint: String,
+    disabled: bool,
+    shift: bool,
+    min_h: f64,
+    max_h: f64,
+    pad: f64,
+) -> Element<'_, ComposerEvent> {
+    let editor = RichTextEditor::new(document, content_version(document))
+        .placeholder(hint)
+        .width(iced::Length::Fill)
+        .min_height(min_h as f32)
+        .max_height(max_h as f32)
+        .font(composer_font(Weight::Normal, FontStyle::Normal))
+        .size(COMPOSER_SIZE)
+        .line_height(COMPOSER_LINE_HEIGHT)
+        .wrapping(text::Wrapping::Word)
+        .padding(pad as f32)
+        // format_key 0: the format table is static — no theme or mode inputs.
+        .highlight_with::<InlineMarkdownHighlighter>((), 0, inline_format)
+        .style(composer_style);
+    if disabled {
+        return editor.into();
+    }
+    editor
+        .on_action(move |action| classify(action, shift))
+        .into()
+}
+
+/// The widget's change-detection key: equal versions promise equal text
+/// (cursor and selection moves keep the version, per the widget's contract).
+/// The Ice `editor` state is a bare `Content` with no revision counter, so
+/// the version is the text's own hash — the composer drafts are small, and
+/// the widget skips its internal resync whenever the text is unchanged.
+fn content_version(document: &Content) -> ContentVersion {
+    let mut hasher = std::hash::DefaultHasher::new();
+    document.text().hash(&mut hasher);
+    ContentVersion::new(0, hasher.finish())
+}
+
+fn classify(action: RichAction, shift: bool) -> ComposerEvent {
+    let plain_enter = matches!(
+        action,
+        RichAction::Edit(text_editor::Action::Edit(text_editor::Edit::Enter))
+    );
+    if plain_enter && !shift {
+        return ComposerEvent::Submit;
+    }
+    ComposerEvent::Apply(action)
+}
+
+fn composer_style(theme: &iced::Theme, status: text_editor::Status) -> text_editor::Style {
+    let ink = composer_ink(theme);
+    let disabled = matches!(status, text_editor::Status::Disabled);
+    text_editor::Style {
+        background: Color::TRANSPARENT.into(),
+        // NO focus ring of its own: the editor mounts inside a bordered plate
+        // (the r=12 composer card), and an inner rectangle on focus made the
+        // input read as a separate component floating in its card.
+        border: Border::default(),
+        placeholder: ink.hint,
+        value: if disabled { ink.muted } else { ink.ink },
+        selection: Color { a: 0.18, ..ink.ink },
+    }
+}
+
+// The generated app exposes the `default=true` font declaration, so the
+// adapter follows `theme.ice` instead of duplicating the family name.
+fn composer_font(weight: Weight, style: FontStyle) -> Font {
+    Font {
+        weight,
+        style,
+        ..crate::Ducktape::default_font()
+    }
+}
+
+/// A renderer-parity inline mark, plus the marker glyphs themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Inline {
+    Marker,
+    Bold,
+    Italic,
+    Link,
+}
+
+fn inline_format(kind: &Inline) -> Format {
+    match kind {
+        Inline::Marker => Format {
+            color: Some(MARK_DIM),
+            ..Format::default()
+        },
+        Inline::Bold => Format {
+            font: Some(composer_font(Weight::Bold, FontStyle::Normal)),
+            ..Format::default()
+        },
+        Inline::Italic => Format {
+            font: Some(composer_font(Weight::Normal, FontStyle::Italic)),
+            ..Format::default()
+        },
+        Inline::Link => Format {
+            color: Some(MARK_LINK),
+            ..Format::default()
+        },
+    }
+}
+
+struct InlineMarkdownHighlighter {
+    current_line: usize,
+}
+
+impl Highlighter for InlineMarkdownHighlighter {
+    type Settings = ();
+    type Highlight = Inline;
+    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, Inline)>;
+
+    fn new(_settings: &Self::Settings) -> Self {
+        Self { current_line: 0 }
+    }
+
+    fn update(&mut self, _settings: &Self::Settings) {
+        self.current_line = 0;
+    }
+
+    fn change_line(&mut self, line: usize) {
+        self.current_line = line;
+    }
+
+    fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
+        self.current_line += 1;
+        inline_marks(line).into_iter()
+    }
+
+    fn current_line(&self) -> usize {
+        self.current_line
+    }
+}
+
+/// Byte-ranged mirror of `chat::client::inline_spans`, minus mentions: bare
+/// `http(s)://` runs, then `**`/`__` bold, then `*`/`_` italic; unmatched or
+/// empty fences stay plain. Ranges land on char boundaries by construction —
+/// the scanner only advances through `char_indices`.
+pub fn inline_marks(line: &str) -> Vec<(Range<usize>, Inline)> {
+    let mut marks = Vec::new();
+    let mut at = 0;
+    while at < line.len() {
+        let rest = &line[at..];
+        if let Some(len) = url_len(rest) {
+            marks.push((at..at + len, Inline::Link));
+            at += len;
+            continue;
+        }
+        let fence = ["**", "__", "*", "_"]
+            .iter()
+            .find_map(|marker| fenced(rest, marker));
+        let Some((marker_len, inner_len)) = fence else {
+            at += rest.chars().next().map_or(1, char::len_utf8);
+            continue;
+        };
+        let bold = marker_len == 2;
+        let kind = if bold { Inline::Bold } else { Inline::Italic };
+        let body = at + marker_len..at + marker_len + inner_len;
+        marks.push((at..body.start, Inline::Marker));
+        marks.push((body.clone(), kind));
+        marks.push((body.end..body.end + marker_len, Inline::Marker));
+        at = body.end + marker_len;
+    }
+    marks
+}
+
+/// If `rest` opens with `marker` and a later closing `marker` encloses a
+/// non-empty body, `(marker byte length, body byte length)`.
+fn fenced(rest: &str, marker: &str) -> Option<(usize, usize)> {
+    let body = rest.strip_prefix(marker)?;
+    let close = body.find(marker)?;
+    if close == 0 {
+        return None;
+    }
+    Some((marker.len(), close))
+}
+
+/// If `rest` opens a bare link, its byte length: the renderer's rule — an
+/// `http(s)://` prefix, then everything up to whitespace.
+fn url_len(rest: &str) -> Option<usize> {
+    let starts_link = rest.starts_with("http://") || rest.starts_with("https://");
+    if !starts_link {
+        return None;
+    }
+    let len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    Some(len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mark_texts(line: &str) -> Vec<(&str, Inline)> {
+        inline_marks(line)
+            .into_iter()
+            .map(|(range, kind)| (&line[range], kind))
+            .collect()
+    }
+
+    #[test]
+    fn marks_mirror_the_renderer_grammar() {
+        assert_eq!(
+            mark_texts("say **hi** to _all_ at https://duck.example/x"),
+            vec![
+                ("**", Inline::Marker),
+                ("hi", Inline::Bold),
+                ("**", Inline::Marker),
+                ("_", Inline::Marker),
+                ("all", Inline::Italic),
+                ("_", Inline::Marker),
+                ("https://duck.example/x", Inline::Link),
+            ]
+        );
+    }
+
+    #[test]
+    fn intra_word_underscores_italicize_like_the_renderer() {
+        // `chat::client::fenced` has no word-boundary rule; the preview must
+        // agree with the renderer, surprising or not.
+        assert_eq!(
+            mark_texts("op_hash_receipts"),
+            vec![
+                ("_", Inline::Marker),
+                ("hash", Inline::Italic),
+                ("_", Inline::Marker),
+            ]
+        );
+    }
+
+    #[test]
+    fn unmatched_and_empty_fences_stay_plain() {
+        assert!(mark_texts("2 * 3 = six").is_empty());
+        assert!(mark_texts("****").is_empty());
+        assert!(mark_texts("*never closed").is_empty());
+    }
+
+    #[test]
+    fn multibyte_text_keeps_char_boundaries() {
+        assert_eq!(
+            mark_texts("한글 **굵게** 그리고 _기울임_"),
+            vec![
+                ("**", Inline::Marker),
+                ("굵게", Inline::Bold),
+                ("**", Inline::Marker),
+                ("_", Inline::Marker),
+                ("기울임", Inline::Italic),
+                ("_", Inline::Marker),
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_enter_submits_and_shift_enter_edits() {
+        let enter = RichAction::Edit(text_editor::Action::Edit(text_editor::Edit::Enter));
+        assert_eq!(classify(enter.clone(), false), ComposerEvent::Submit);
+        assert_eq!(classify(enter.clone(), true), ComposerEvent::Apply(enter));
+        let typed = RichAction::Edit(text_editor::Action::Edit(text_editor::Edit::Insert('x')));
+        assert_eq!(classify(typed.clone(), false), ComposerEvent::Apply(typed));
+    }
+
+    #[test]
+    fn toolbar_marks_wrap_the_selection_or_park_the_cursor_inside() {
+        // A selection is wrapped in place.
+        let mut document = Content::with_text("ship it");
+        document.perform(text_editor::Action::SelectAll);
+        let document = composer_toggle_mark(document, "bold".into());
+        assert_eq!(document.text().trim_end(), "**ship it**");
+
+        // No selection: an empty pair is inserted and the cursor parks inside
+        // it, so typing lands between the markers.
+        let mut document = composer_toggle_mark(Content::new(), "italic".into());
+        document.perform(text_editor::Action::Edit(text_editor::Edit::Insert('x')));
+        assert_eq!(document.text().trim_end(), "_x_");
+
+        // The block marks are the renderer's own fences.
+        let mut document = Content::with_text("let x = 1;");
+        document.perform(text_editor::Action::SelectAll);
+        let document = composer_toggle_mark(document, "code".into());
+        assert_eq!(document.text().trim_end(), "```\nlet x = 1;\n```");
+
+        // An unknown kind changes nothing.
+        let document = composer_toggle_mark(Content::with_text("keep"), "sparkle".into());
+        assert_eq!(document.text().trim_end(), "keep");
+    }
+
+    #[test]
+    fn mark_shortcuts_follow_slacks_table_and_respect_the_gate() {
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::{Key, Modifiers};
+        let chord = |code, modifiers| {
+            composer_mark_shortcut(Key::Unidentified, Physical::Code(code), modifiers, true)
+        };
+        assert_eq!(chord(Code::KeyB, Modifiers::COMMAND), "bold");
+        assert_eq!(chord(Code::KeyI, Modifiers::COMMAND), "italic");
+        assert_eq!(
+            chord(Code::KeyC, Modifiers::COMMAND | Modifiers::SHIFT),
+            "code"
+        );
+        assert_eq!(
+            chord(Code::Digit9, Modifiers::COMMAND | Modifiers::SHIFT),
+            "quote"
+        );
+        // Plain Cmd+C is copy, not code; plain typing marks nothing.
+        assert_eq!(chord(Code::KeyC, Modifiers::COMMAND), "");
+        assert_eq!(chord(Code::KeyB, Modifiers::default()), "");
+        // Off-chat (or palette-open) the gate swallows everything.
+        assert_eq!(
+            composer_mark_shortcut(
+                Key::Unidentified,
+                Physical::Code(Code::KeyB),
+                Modifiers::COMMAND,
+                false
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn apply_performs_edits_and_ignores_submit() {
+        let document = Content::with_text("draft");
+        let document = apply_composer_event(document, ComposerEvent::Submit);
+        assert_eq!(document.text().trim_end(), "draft");
+        let enter = ComposerEvent::Apply(RichAction::Edit(text_editor::Action::Edit(
+            text_editor::Edit::Enter,
+        )));
+        let document = apply_composer_event(document, enter);
+        assert_eq!(document.line_count(), 2);
+    }
+}

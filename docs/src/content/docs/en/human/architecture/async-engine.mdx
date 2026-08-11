@@ -18,7 +18,7 @@ remaining product depth.
 
 ## Saga
 
-The saga module stores continuation state under the app-hash. A trigger records
+The saga module stores continuation state under the root-hash. A trigger records
 that work is pending and emits a worker request as an effect. The pending state
 is deterministic and committed like any other module state.
 

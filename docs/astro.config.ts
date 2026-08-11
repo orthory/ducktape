@@ -79,19 +79,9 @@ const nimbusConfig = defineNimbusConfig({
         items: humanTrack("en/human", "Overview"),
       },
       {
-        label: "Human · 한국어",
-        segment: "/ko/human",
-        items: humanTrack("ko/human", "개요"),
-      },
-      {
         label: "Agent · English",
         segment: "/en/agent",
         items: agentTrack("en/agent", "Overview"),
-      },
-      {
-        label: "Agent · 한국어",
-        segment: "/ko/agent",
-        items: agentTrack("ko/agent", "개요"),
       },
     ],
   },

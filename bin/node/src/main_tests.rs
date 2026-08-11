@@ -17,24 +17,9 @@ fn gateway_requires_a_loopback_node_api_and_real_overlay() {
         wireguard,
     ));
     for allowed in [
-        gateway_can_start(
-            false,
-            Some("127.0.0.1:0"),
-            Some("0.0.0.0:8844"),
-            wireguard,
-        ),
-        gateway_can_start(
-            true,
-            Some("127.0.0.1:0"),
-            Some("127.0.0.1:8844"),
-            wireguard,
-        ),
-        gateway_can_start(
-            false,
-            Some("127.0.0.1:0"),
-            Some("127.0.0.1:8844"),
-            None,
-        ),
+        gateway_can_start(false, Some("127.0.0.1:0"), Some("0.0.0.0:8844"), wireguard),
+        gateway_can_start(true, Some("127.0.0.1:0"), Some("127.0.0.1:8844"), wireguard),
+        gateway_can_start(false, Some("127.0.0.1:0"), Some("127.0.0.1:8844"), None),
     ] {
         assert!(!allowed);
     }
@@ -50,43 +35,42 @@ fn test_me() -> Vec<u8> {
 
 fn test_manifest(
     height: u64,
-    app_hash: StateRoot,
+    root_hash: StateRoot,
     floor_cert: Option<Vec<u8>>,
 ) -> statesync::Manifest {
     statesync::Manifest {
         height,
-        app_hash,
+        root_hash,
         epoch: 0,
         view_base: 0,
         participants: vec![test_me()],
         residents: vec![],
         floor_cert,
-        state_schema: crate::constants::current_state_schema_fingerprint(),
         entries: vec![],
     }
 }
 
 fn test_manifest_with_participants(
     height: u64,
-    app_hash: StateRoot,
+    root_hash: StateRoot,
     floor_cert: Option<Vec<u8>>,
     participants: Vec<Vec<u8>>,
 ) -> statesync::Manifest {
     statesync::Manifest {
         participants,
-        ..test_manifest(height, app_hash, floor_cert)
+        ..test_manifest(height, root_hash, floor_cert)
     }
 }
 
 fn test_manifest_with_base(
     height: u64,
     view_base: u64,
-    app_hash: StateRoot,
+    root_hash: StateRoot,
     floor_cert: Option<Vec<u8>>,
 ) -> statesync::Manifest {
     statesync::Manifest {
         view_base,
-        ..test_manifest(height, app_hash, floor_cert)
+        ..test_manifest(height, root_hash, floor_cert)
     }
 }
 
@@ -321,8 +305,8 @@ async fn served_directory_frame(
     seq: u64,
     msg: Msg,
 ) -> statesync::FinalizedFrame {
-    let frame = node::encode_frame(signer, seq, &msg, None);
-    let (origin, msg, _cont) = node::decode_frame(&frame).expect("decode frame");
+    let frame = node::encode_frame(signer, seq, &msg);
+    let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
     // a block is a BATCH super-frame: apply the single member via the batch
     // API and serve the batch bytes, so the catch-up replay reproduces this.
     expected
@@ -341,7 +325,7 @@ async fn served_directory_frame(
         frame: node::encode_batch(&[frame]),
         disposition: statesync::FrameDisposition::Applied,
         roots: expected.module_roots(),
-        app_hash: expected.app_hash(),
+        root_hash: expected.root_hash(),
     }
 }
 
@@ -359,11 +343,10 @@ async fn served_mixed_frame(
             target: "disk".into(),
             payload: vec![value],
         },
-        None,
     );
-    let (origin, msg, _cont) = node::decode_frame(&frame).expect("decode frame");
+    let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
     // a block is a BATCH super-frame: apply the single member through the
-    // batch API so the served app-hash matches what recovery reproduces on
+    // batch API so the served root-hash matches what recovery reproduces on
     // replay (which decodes the frame as a batch), and serve the batch bytes.
     expected
         .submit_block(
@@ -381,7 +364,7 @@ async fn served_mixed_frame(
         frame: node::encode_batch(&[frame]),
         disposition: statesync::FrameDisposition::Applied,
         roots: expected.module_roots(),
-        app_hash: expected.app_hash(),
+        root_hash: expected.root_hash(),
     }
 }
 
@@ -482,11 +465,11 @@ fn suffix_installer_rejects_mismatched_served_seal() {
                 value: "v".into(),
             }),
         };
-        let frame = node::encode_frame(&signer, 0, &msg, None);
+        let frame = node::encode_frame(&signer, 0, &msg);
 
         let mut expected_host =
             Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
-        let (origin, msg, _cont) = node::decode_frame(&frame).expect("decode frame");
+        let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
         expected_host
             .submit_at(
                 host::BlockContext {
@@ -504,7 +487,7 @@ fn suffix_installer_rejects_mismatched_served_seal() {
             frame,
             disposition: statesync::FrameDisposition::Applied,
             roots: expected_host.module_roots(),
-            app_hash: StateRoot([0xA5; sdk::ROOT_LEN]),
+            root_hash: StateRoot([0xA5; sdk::ROOT_LEN]),
         };
         let mut host = Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
         let err = apply_verified_suffix_frame(&mut host, &served, &host::NoCodeSource)
@@ -538,7 +521,7 @@ fn post_reboot_catchup_applies_verifies_and_journals_served_suffix() {
                 .expect("catch up");
 
         assert_eq!(applied.applied, 2);
-        assert_eq!(host.app_hash(), expected.app_hash());
+        assert_eq!(host.root_hash(), expected.root_hash());
         assert_eq!(dir_value(&host, "a").await.as_deref(), Some("1"));
         assert_eq!(dir_value(&host, "b").await.as_deref(), Some("2"));
         let journaled = recovery
@@ -558,29 +541,20 @@ fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
         let signer = ed25519::PrivateKey::from_seed(81);
         let durable_store = TestDiskStore::default();
         let base_host = mixed_durability_host(durable_store.clone(), 0);
-        let base_manifest = Manifest::capture(
-            &base_host,
-            None,
-            0,
-            0,
-            vec![test_me()],
-            vec![],
-            None,
-            0,
-            1,)
+        let base_manifest =
+            Manifest::capture(&base_host, None, 0, 0, vec![test_me()], vec![], None, 0, 1)
         .expect("base manifest");
 
         let mut expected = mixed_durability_host(TestDiskStore::default(), 0);
         let served = served_mixed_frame(&mut expected, &signer, 1, 0, 7).await;
         let target = statesync::Manifest {
             height: 1,
-            app_hash: served.app_hash,
+            root_hash: served.root_hash,
             epoch: 0,
             view_base: 0,
             participants: vec![test_me()],
             residents: vec![],
             floor_cert: Some(vec![1, 2, 3]),
-            state_schema: crate::constants::current_state_schema_fingerprint(),
             entries: vec![],
         };
 
@@ -614,7 +588,7 @@ fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
             .await
             .expect("old base replay heals the torn sealed block selectively");
         assert_eq!(healed.height, Some(1));
-        assert_eq!(healed.app_hash, target.app_hash);
+        assert_eq!(healed.root_hash, target.root_hash);
         assert_eq!(healed.applied, 1, "the torn suffix frame was replayed");
         assert_eq!(
             durable_store.get(),
@@ -633,7 +607,7 @@ fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
         .await
         .expect("write catch-up checkpoint");
         assert_eq!(ckpt.height, Some(1));
-        assert_eq!(ckpt.app_hash, target.app_hash);
+        assert_eq!(ckpt.root_hash, target.root_hash);
         assert_eq!(ckpt.snapshot("mem"), Some([7u8].as_slice()));
 
         let mut restored = restore_mixed_durability_host(durable_store, &ckpt);
@@ -642,7 +616,7 @@ fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
             .await
             .expect("T checkpoint must recover without replaying the torn suffix");
         assert_eq!(recovered.height, Some(1));
-        assert_eq!(recovered.app_hash, target.app_hash);
+        assert_eq!(recovered.root_hash, target.root_hash);
         assert_eq!(recovered.applied, 0);
     });
 }
@@ -655,7 +629,7 @@ fn post_reboot_catchup_aborts_on_mismatched_served_seal() {
         let mut expected = fresh_directory_host();
         let mut served =
             served_directory_frame(&mut expected, &signer, 1, 0, dir_set("a", "1")).await;
-        served.app_hash = test_root(0xA5);
+        served.root_hash = test_root(0xA5);
 
         let mut host = fresh_directory_host();
         let mut recovery = Recovery::open(context.child("post_catchup_mismatch"))
@@ -678,7 +652,7 @@ fn post_reboot_catchup_is_noop_when_there_is_no_gap() {
     let executor = commonware_runtime::deterministic::Runner::default();
     executor.start(|context| async move {
         let mut host = fresh_directory_host();
-        let before = host.app_hash();
+        let before = host.root_hash();
         let mut recovery = Recovery::open(context.child("post_catchup_noop"))
             .await
             .expect("open recovery");
@@ -688,7 +662,7 @@ fn post_reboot_catchup_is_noop_when_there_is_no_gap() {
                 .expect("noop catch up");
 
         assert_eq!(applied.applied, 0);
-        assert_eq!(host.app_hash(), before);
+        assert_eq!(host.root_hash(), before);
         assert!(
             recovery
                 .read_finalized_frames(5, 5)
@@ -708,13 +682,14 @@ fn row_dispatches(payload: &[u8], origin: &sdk::Origin) -> Vec<host::DispatchRec
         payload: payload.to_vec(),
         emitted_msgs: 0,
         emitted_events: 0,
+        assigned: Vec::new(),
     }]
 }
 
 /// the boot fold rebuilds a block's per-op rows from its sealed BATCH frame,
 /// re-staging each op's payload so `GET /v1/files/blob/{op_hash}` answers
 /// again after a restart. the block coordinates and every op's identity
-/// (proposer/target/payload/opHash) match the drain's live row; the only
+/// (proposer/target/payload/op_hash) match the drain's live row; the only
 /// difference is the per-op dispatch TRACE — recovery folds the block-level
 /// aggregate, not per-member, so a replayed op carries an empty trace (a
 /// documented degradation visible only when the index is rebuilt).
@@ -726,17 +701,17 @@ fn boot_fold_rebuilds_a_batch_block_ops() {
         target: "directory".into(),
         payload: payload.clone(),
     };
-    let frame = node::encode_frame(&signer, 1, &msg, None);
-    let (origin, decoded, _cont) = node::decode_frame(&frame).expect("frame decodes");
+    let frame = node::encode_frame(&signer, 1, &msg);
+    let (origin, decoded) = node::decode_frame(&frame).expect("frame decodes");
     let dispatches = row_dispatches(&payload, &origin);
-    let app_hash = test_root(9);
+    let root_hash = test_root(9);
 
     // the drain's construction: one member op with its full dispatch trace.
     let drain_blobs = blobstore::BlobHandle::default();
     let drain_row = noded::block_row(&noded::BlockRecord {
         height: 7,
         hash: noded::hex_bytes(&node::frame_id(&frame)),
-        commit_hash: hex(&app_hash),
+        commit_hash: hex(&root_hash),
         ops: vec![project_root_op(
             &drain_blobs,
             &origin,
@@ -757,7 +732,7 @@ fn boot_fold_rebuilds_a_batch_block_ops() {
             height: 7,
             frame: &batch,
             disposition: node::Disposition::Applied,
-            app_hash,
+            root_hash,
             dispatches: &dispatches,
         },
     )
@@ -767,20 +742,20 @@ fn boot_fold_rebuilds_a_batch_block_ops() {
     // block coordinates match the drain.
     assert_eq!(row["height"], 7);
     assert_eq!(row["hash"], noded::hex_bytes(&node::frame_id(&batch)));
-    assert_eq!(row["commitHash"], hex(&app_hash));
+    assert_eq!(row["commit_hash"], hex(&root_hash));
     assert_eq!(row["ops"].as_array().unwrap().len(), 1);
     // the op's identity matches the drain byte-for-byte.
     assert_eq!(row["ops"][0]["proposer"], drain["ops"][0]["proposer"]);
     assert_eq!(row["ops"][0]["target"], "directory");
     assert_eq!(row["ops"][0]["payload"], drain["ops"][0]["payload"]);
-    assert_eq!(row["ops"][0]["opHash"], drain["ops"][0]["opHash"]);
+    assert_eq!(row["ops"][0]["op_hash"], drain["ops"][0]["op_hash"]);
     // the fold carries an empty per-op trace (recovery folds the aggregate).
     assert_eq!(row["ops"][0]["operations"].as_array().unwrap().len(), 0);
 
     // the rebuild re-staged the payload: op_hash is dereferencable again
     // from the FOLD's (fresh, post-restart) blob store.
     let op_digest = drain_blobs.put_chunk(payload.clone());
-    assert_eq!(row["ops"][0]["opHash"], noded::hex_bytes(&op_digest));
+    assert_eq!(row["ops"][0]["op_hash"], noded::hex_bytes(&op_digest));
     assert!(fold_blobs.has_chunk(&op_digest));
 }
 
@@ -798,7 +773,6 @@ fn boot_fold_skips_nop_and_undecodable_frames() {
             target: crate::constants::NOP_TARGET.into(),
             payload: Vec::new(),
         },
-        None,
     );
     for frame in [nop.as_slice(), b"not a frame".as_slice()] {
         assert!(
@@ -808,7 +782,7 @@ fn boot_fold_skips_nop_and_undecodable_frames() {
                     height: 3,
                     frame,
                     disposition: node::Disposition::Applied,
-                    app_hash: test_root(1),
+                    root_hash: test_root(1),
                     dispatches: &[],
                 },
             )
@@ -830,7 +804,6 @@ fn boot_fold_rebuilds_rejected_rows_with_empty_trace() {
             target: "directory".into(),
             payload: b"garbage-the-module-rejects".to_vec(),
         },
-        None,
     );
     let batch = node::encode_batch(&[frame]);
     let row = sealed_frame_block_row(
@@ -839,7 +812,7 @@ fn boot_fold_rebuilds_rejected_rows_with_empty_trace() {
             height: 5,
             frame: &batch,
             disposition: node::Disposition::Rejected,
-            app_hash: test_root(2),
+            root_hash: test_root(2),
             dispatches: &[],
         },
     )

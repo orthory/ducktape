@@ -580,7 +580,7 @@ mod tests {
         let metrics = nat_traversal::CoordinatorMetrics::default();
         let server = tokio::spawn(nat_traversal::run_coordinator_workers_with_metrics(
             socket,
-            nat_traversal::AuthPolicy::Open { require_pop: true },
+            nat_traversal::AuthPolicy::Public,
             4,
             metrics.clone(),
         ));

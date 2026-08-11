@@ -9,7 +9,7 @@ const DELIVERY_RECEIPT_VERSION: u32 = 1;
 /// response text: the model prose plus the host-assembled facets — message
 /// (`response_text`) / artifact (`workspace_receipt`) / sink / status.
 /// `deny_unknown_fields`: the assembled shape is this crate's own contract
-/// with dispatch-oracle, and an unrecognized key is drift, not forward compat
+/// with compute-service, and an unrecognized key is drift, not forward compat
 /// — the retired `data`/`effects` facets are now rejected here, not tolerated.
 /// `sink`/`status` keep `#[serde(default)]` because the oracle SKIP-SERIALIZES
 /// them when empty/default (the minimal
@@ -89,7 +89,7 @@ pub(crate) enum WireSink {
 
 impl WireSink {
     /// the composed `result_contract` omits the sink key entirely for `Chain`
-    /// — the serde skip mirroring dispatch-oracle's `is_chain`.
+    /// — the serde skip mirroring compute-service's `is_chain`.
     pub(crate) fn is_chain(&self) -> bool {
         matches!(self, WireSink::Chain)
     }

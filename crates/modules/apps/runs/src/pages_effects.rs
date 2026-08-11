@@ -320,15 +320,15 @@ impl RunsModule {
         let reply = ctx
             .query(
                 pages,
-                &pages_encode_query(&PageQuery::ThreadsForTargets {
-                    targets: vec![target.to_string()],
+                &pages_encode_query(&PageQuery::TargetThreadCount {
+                    target: target.to_string(),
                 }),
             )
             .await
             .map_err(|e| format!("pages target lookup failed: {e}"))?;
         match pages::decode_reply(&reply) {
-            Ok(PageReply::CommentThreads(groups)) => {
-                let taken = groups.first().map(|g| g.threads.len()).unwrap_or(0) + already_staged;
+            Ok(PageReply::TargetThreadCount(committed)) => {
+                let taken = committed as usize + already_staged;
                 if taken >= MAX_THREADS_PER_TARGET {
                     return Err(format!("target {target} already holds {taken} threads"));
                 }

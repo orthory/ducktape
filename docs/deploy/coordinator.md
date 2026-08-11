@@ -2,10 +2,11 @@
 
 How to run `bin/coordinator` as `p2p.ducktape.byeongsu.dev`: an **untrusted,
 non-validator reachability helper** that lets two NAT'd validators find each
-other and hole-punch a direct path. It is rendezvous-only: it never carries
-peer traffic (the DERP-style ciphertext relay was removed 2026-07-06). This
-runbook, the coordinator code, and the regression tests are the maintained
-source of record for the trust model and operating contract.
+other and hole-punch a direct path. Its optional TCP lane carries only sealed
+first-contact admission datagrams when UDP setup is exhausted; it never carries
+the established overlay or peer data. This runbook, the coordinator code, and
+the regression tests are the maintained source of record for the trust model
+and operating contract.
 
 > **Scope honesty.** Everything on this page **works today**: `bin/coordinator`
 > runs as-is and its `--listen` invocation is regression-proven by
@@ -13,7 +14,7 @@ source of record for the trust model and operating contract.
 > reachability plane is wired behind `wireguard_listen`: `bin/node` constructs a
 > `reachability::NatResolver` (reflexive discovery, `register`, hole-punch
 > against the configured coordinators) only when `wireguard_listen` is
-> configured. v3 `Coordinated` hints are now consumed as reachability routes;
+> configured. v1 `Coordinated` hints are consumed as reachability routes;
 > successful punching is still NAT-dependent because there is no relay fallback.
 > The cross-machine procedure is [the runbook](cross-machine-zero-exposure-runbook.md).
 
@@ -65,14 +66,20 @@ wrong.
 
 ## What it is
 
-`coordinator --listen <addr> --workers <1|4>` (defaults: `0.0.0.0:3478`, one
-worker). One **UDP** *control* socket — genuinely the only socket the process
-ever holds. Stateless. It provides two services on that one socket:
+`coordinator --listen <addr> --relay-listen <addr|none> --workers <1|4>`
+(defaults: UDP `0.0.0.0:3478`, TCP `0.0.0.0:443`, one worker). It is stateless.
+The UDP control socket provides two services:
 
 - **Rendezvous** — peers `register` their key and `lookup` each other; a
   `Lookup` fans a `PunchSync` to both sides so they simultaneous-open.
 - **STUN reflexive** — answers a `BindRequest` with the peer's observed
   public `ip:port` so it can learn its own NAT-mapped address.
+
+The optional TCP listener is a bounded fallback for the sealed first-contact
+intro only. It resolves a member through the same live advert book, forwards
+one opaque datagram, and returns the member's opaque reply. It is not a
+WireGuard-over-TCP or general peer-data relay. Pass `--relay-listen none` when
+that admission fallback is not deployed.
 
 Registrations have a lifetime: a `register`/`readvertise` mapping expires
 `REGISTRATION_TTL_SECS` (120 s) after the last accepted advert; an expired key
@@ -93,8 +100,9 @@ discards any reply that does not come from the exact address it dialed — so a
 coordinator answering from the "wrong" IP looks healthy while every client
 times out.
 
-No TCP listener. No disk. No secret. On bind it prints
-`coordinator listening on <addr>` to stderr, then serves.
+No disk. No secret. On bind it prints `coordinator listening on <addr>` and,
+when enabled, `coordinator relay listening on tcp/<addr>` to stderr, then
+serves.
 
 ## Auth modes
 
@@ -105,11 +113,10 @@ The coordinator is keyless in every mode:
 - **Private mode** — `--genesis-set <network.toml>`. The coordinator reads only
   the public `validators = [...]` keys from that descriptor and admits genesis
   validators or holder-presented caps rooted in that set.
-- **Legacy development mode** — `--allow-anonymous`. This disables proof of
-  possession and is for local smoke testing only.
 
-Malformed `--listen`, `--workers`, `--metrics-interval`, and malformed/value-less
-`--genesis-set` are hard errors, not silent fallbacks to a weaker policy.
+Malformed `--listen`, `--relay-listen`, `--workers`, `--metrics-interval`, and
+malformed/value-less `--genesis-set` are hard errors, not silent fallbacks to a
+weaker policy.
 
 ## Authentication workers
 
@@ -208,9 +215,9 @@ sudo install -D -m 0644 ops/coordinator/coordinator.env.example /etc/ducktape/co
 sudo cp ops/coordinator/ducktape-coordinator.service /etc/systemd/system/
 
 # Optional: edit /etc/ducktape/coordinator.env to choose a bind address and auth
-# mode. The supplied file selects four auth workers and default public
-# proof-of-possession. For private mode use:
-# COORDINATOR_ARGS=--workers 4 --metrics-interval 10 --genesis-set /etc/ducktape/network.toml
+# mode. The supplied file selects four auth workers, public proof-of-possession,
+# and no TCP fallback. For private mode use:
+# COORDINATOR_ARGS=--relay-listen none --workers 4 --metrics-interval 10 --genesis-set /etc/ducktape/network.toml
 
 # 4. Start it.
 sudo systemctl daemon-reload
@@ -226,25 +233,25 @@ no shell, nothing to compromise), with `CapabilityBoundingSet=` and
 `AmbientCapabilities=` **empty** (port 3478 > 1024 needs no privileged-port
 capability), `NoNewPrivileges=yes`, `ProtectSystem=strict` + `ReadOnlyPaths=/`
 (no writable path at all — the coordinator keeps no state), and
-`RestrictAddressFamilies=AF_INET AF_INET6` (UDP only; no unix/raw/packet
-sockets). This posture is deliberate: **there is no secret to steal and no state
-to corrupt**, so the box can be treated as disposable and replaced at will.
+`RestrictAddressFamilies=AF_INET AF_INET6` (Internet IP sockets only; no
+unix/raw/packet sockets). This posture is deliberate: **there is no secret to
+steal and no state to corrupt**, so the box can be treated as disposable and
+replaced at will.
 
 ## Deploy B — Docker / OCI
 
 ```sh
 docker build -f ops/coordinator/Dockerfile -t ducktape-coordinator .
 
-# 3478 is the only socket, so one published UDP port is enough. Harden the
-# container to match the systemd unit — this is untrusted-by-design infra, so
-# drop everything it does not need.
+# This deployment explicitly disables the TCP fallback, so one published UDP
+# port is enough. Harden the container to match the systemd unit.
 docker run \
   --cap-drop=ALL \
   --security-opt no-new-privileges \
   --read-only \
   --restart unless-stopped \
   -p 3478:3478/udp \
-  ducktape-coordinator
+  ducktape-coordinator --listen 0.0.0.0:3478 --relay-listen none --workers 4
 ```
 
 For private mode in Docker, append the auth args after the image name:
@@ -253,7 +260,7 @@ For private mode in Docker, append the auth args after the image name:
 docker run --cap-drop=ALL --security-opt no-new-privileges --read-only \
   -p 3478:3478/udp \
   -v /etc/ducktape/network.toml:/etc/ducktape/network.toml:ro \
-  ducktape-coordinator --listen 0.0.0.0:3478 --workers 4 \
+  ducktape-coordinator --listen 0.0.0.0:3478 --relay-listen none --workers 4 \
     --genesis-set /etc/ducktape/network.toml
 ```
 
@@ -277,20 +284,21 @@ equivalent of its empty capability set and read-only root:
 
 Keep these: the whole premise is that a compromised coordinator has nothing to
 steal and nowhere to write. Publishing **only** `-p 3478:3478/udp` (not
-`--network host`) is what keeps that true — with rendezvous-only there is no
-ephemeral-socket caveat, so bridge networking covers everything the process
-does.
+`--network host`) is sufficient for the explicit `--relay-listen none`
+deployment above. To enable the sealed-intro fallback, add
+`-p 443:8443/tcp` and `--relay-listen 0.0.0.0:8443`; the host mapping exposes
+the standard port without granting the container a privileged bind.
 
 ## DNS + firewall
 
 - Point an `A` record `p2p.ducktape.byeongsu.dev` → the VPS IP.
-- Open **inbound UDP 3478**. No TCP port is needed at all, and no other UDP
-  port either — the coordinator never binds a second socket.
+- Open **inbound UDP 3478**. When the sealed-intro fallback is enabled, also
+  open its externally mapped TCP port (normally 443).
 
 ## Redundancy — the coordinator is not load-bearing
 
-Run **multiple** coordinators. A v3 invite carries a `Vec` of reach hints and
-`NatClient::discover_reflexive_failover` walks them (Slice 3), so a single
+Run **multiple** coordinators. A v1 invite carries a `Vec` of reach hints and
+`NatClient::discover_reflexive_failover` walks them, so a single
 coordinator outage is not fatal to entry. A tunnel punched to a peer's **own**
 address (a direct signed endpoint, or a reflexive that stayed valid) survives a
 coordinator restart entirely — only *new* rendezvous depends on a live
@@ -308,7 +316,7 @@ survive; only new ones depend on it" framing holds.
 The coordinator deployed here is live and correct, and the node-side
 reachability plane (behind `wireguard_listen`) drives it: `bin/node`
 constructs a `NatResolver` that discovers its reflexive, `register`s, and
-hole-punches against the configured coordinators, and v3 `Coordinated` invite
+hole-punches against the configured coordinators, and v1 `Coordinated` invite
 hints route into that path instead of being dialed as mesh peers.
 
 What this page does **not** promise is universal zero-exposure connectivity:

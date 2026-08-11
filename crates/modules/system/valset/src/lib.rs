@@ -15,74 +15,113 @@
 //! the set; a [`ValsetMsg::Join`] on a current resident PROMOTES it (adds the
 //! validator, removes the resident, one block).
 //!
-//! ## root/snapshot encoding
+//! ## state model
 //!
-//! the root preimage and snapshot always carry both sections — validators,
-//! then residents — each a count-prefixed sorted key list, so a given state
-//! has exactly one encoding.
+//! pure logic over a host-injected [`sdk::MerkleStore`]: one tier record per
+//! membership class — `validators` and `residents`, each a borsh-encoded
+//! strictly-sorted key list, and an EMPTY tier is an ABSENT record, so a
+//! given membership has exactly one record-set encoding. writes are staged
+//! during a block (read-your-writes via [`sdk::StagedStore`]) and flushed in
+//! one batch at `commit_block`; `abort_block` drops the stage; the module
+//! root IS the store's committed merkle root, and sync belongs to the store.
 //!
-//! state model mirrors the directory module's host-lent staging seam:
-//! `execute` STAGES into a `pending` overlay (committed state untouched);
-//! `query` reads pending-over-committed (read-your-writes); `commit_block`
-//! merges pending into committed; `abort_block` drops pending; `root()`
-//! reflects COMMITTED state only — a state-based (sorted, length-prefixed)
-//! sha256 over the validator set, so it is order-independent and idempotent.
+//! the observation barrier and the epoch cutover key on this module's root
+//! MOVING, so an idempotent no-op — a re-join, a leave of an absent key, a
+//! re-grant, a revoke of a non-resident — must STAGE NOTHING: a
+//! byte-identical overwrite is still a committed qmdb op and would move the
+//! root, splitting a drain batch (and waking the orchestrator) over nothing.
 //!
 //! ## state-sync
 //!
-//! a joiner rebuilds this module from a peer via [`Valset::snapshot`] /
-//! [`Valset::install`]. the snapshot is the exact preimage of `root()`, so the
-//! joiner needs no trust in the serving peer: install recomputes the root of
-//! whatever bytes arrived and refuses to adopt them unless it matches the
-//! expected root consensus already agreed on.
+//! a joiner rebuilds this module through the store's qmdb resolver lane
+//! ([`sdk::StateSyncHandle::ResolverBacked`]): proof-carrying op ranges,
+//! merkle-verified against the root consensus agreed on — the root, not the
+//! serving peer, stays the trust anchor.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
-use sdk::codec;
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
-use sha2::{Digest, Sha256};
+use sdk::{
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, ResolverSyncTarget, StagedStore, StateRoot,
+    StateSyncHandle,
+};
 
 /// a 32-byte ed25519 public key encoding.
 const KEY_LEN: usize = 32;
-type SnapshotMembership = (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>);
+
+/// members retained per tier (the count cap). membership is genesis- and
+/// governance-authored, so this sits far above any real set; a join/grant
+/// past it refuses loudly at execute.
+pub const MAX_MEMBERS: usize = 1024;
+/// serialized tier-record byte bound — the uniform poison backstop on top of
+/// the count cap.
+const MAX_TIER_RECORD_BYTES: usize = 512 * 1024;
+
+/// the committed validator tier's record key: the strictly-sorted 32-byte
+/// member keys, borsh-encoded.
+const VALIDATORS_KEY: &[u8] = b"validators";
+/// the committed resident tier's record key, same shape.
+const RESIDENTS_KEY: &[u8] = b"residents";
 
 pub struct Valset {
     id: ModuleId,
-    /// committed membership — what `root()` and the app-hash commit to.
-    validators: BTreeSet<Vec<u8>>,
-    /// membership changes staged during the current block: `true` == staged add,
-    /// `false` == staged remove. read ahead of `validators` (read-your-writes),
-    /// merged into committed state (and `root()`) only on `commit_block`.
-    pending: BTreeMap<Vec<u8>, bool>,
-    /// committed RESIDENT standing (mesh + statesync, no quorum seat). folded
-    /// into `root()`/`snapshot()` as the second section.
-    residents: BTreeSet<Vec<u8>>,
-    /// resident changes staged during the current block, same discipline as
-    /// `pending`.
-    pending_residents: BTreeMap<Vec<u8>, bool>,
+    /// the host-injected authenticated store plus this block's staging overlay
+    /// (read-your-writes, folded into `root()` at `commit_block`). store key
+    /// is `sha256(logical_key)`, owned by [`StagedStore`].
+    staged: StagedStore,
 }
 
 impl Valset {
-    pub fn new(id: impl Into<ModuleId>) -> Self {
+    /// wrap the host-constructed store under module identity `id`.
+    pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {
         Self {
             id: id.into(),
-            validators: BTreeSet::new(),
-            pending: BTreeMap::new(),
-            residents: BTreeSet::new(),
-            pending_residents: BTreeMap::new(),
+            staged: StagedStore::new(store),
         }
     }
 
-    /// direct sync add (handy for genesis seeding / tests). does NOT validate —
-    /// callers seeding genesis are trusted; the `execute(Join)` path validates.
-    pub fn insert(&mut self, key: Vec<u8>) {
-        self.validators.insert(key);
+    /// GENESIS seeding: stage one founding validator BEFORE the host registers
+    /// this instance; [`Valset::finish_seed`] publishes the whole seed set in
+    /// one batch. deterministic and identical on every node (a different seed
+    /// set composes a different genesis root-hash and the network forks at
+    /// genesis). never valid after genesis: live changes go through the
+    /// governance-gated `Join`/`Leave`/`Grant`/`Revoke` ops.
+    ///
+    /// does NOT curve-validate — genesis callers are trusted (production
+    /// seeds from typed `ed25519::PublicKey`s); the `execute(Join)` path
+    /// validates. the length assert stays: a wrong-width key is a wiring
+    /// bug, never data.
+    pub async fn seed(&mut self, key: Vec<u8>) -> Result<(), Error> {
+        assert_eq!(
+            key.len(),
+            KEY_LEN,
+            "genesis validator key must be {KEY_LEN} bytes"
+        );
+        let mut validators = self.validators().await?;
+        let Err(position) = validators.binary_search(&key) else {
+            return Ok(()); // re-seeding a key already in the set is a no-op.
+        };
+        Self::require_capacity(&validators, "validator")?;
+        validators.insert(position, key);
+        self.store_tier(VALIDATORS_KEY, &validators)
+    }
+
+    /// publish the staged genesis seed in one batch — idempotent: a store
+    /// that already carries a validator tier (a reopened workspace
+    /// re-entering the genesis path) is left byte-untouched, exactly like
+    /// lifecycle's `finish_seed`.
+    pub async fn finish_seed(&mut self) -> Result<(), Error> {
+        let already_seeded = self.staged.get_committed(VALIDATORS_KEY).await?.is_some();
+        if already_seeded {
+            self.staged.abort();
+            return Ok(());
+        }
+        self.staged.commit().await
     }
 
     /// validate that `key` is a well-formed 32-byte ed25519 public key. the
@@ -101,140 +140,123 @@ impl Valset {
         Ok(())
     }
 
-    /// stage an add for this block (read-your-writes; committed on `commit_block`).
-    fn stage_add(&mut self, key: Vec<u8>) {
-        self.pending.insert(key, true);
-    }
-
-    /// stage a remove for this block.
-    fn stage_remove(&mut self, key: Vec<u8>) {
-        self.pending.insert(key, false);
-    }
-
-    /// the committed validator set with this block's staged changes applied —
-    /// read-your-writes, sorted (order-independent).
-    fn effective(&self) -> Vec<Vec<u8>> {
-        Self::overlay(&self.validators, &self.pending)
-    }
-
-    /// the COMMITTED membership pair — `(validators, residents)`, sorted.
-    /// the post-install/rebuild witness (both classes must survive a sync
-    /// byte-for-byte); reads inside a block use the staged projections.
-    pub fn membership(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-        (
-            self.validators.iter().cloned().collect(),
-            self.residents.iter().cloned().collect(),
-        )
-    }
-
-    /// the committed resident set with this block's staged changes applied.
-    fn effective_residents(&self) -> Vec<Vec<u8>> {
-        Self::overlay(&self.residents, &self.pending_residents)
-    }
-
-    /// committed-plus-staged projection shared by both sets.
-    fn overlay(committed: &BTreeSet<Vec<u8>>, staged: &BTreeMap<Vec<u8>, bool>) -> Vec<Vec<u8>> {
-        let mut set: BTreeSet<Vec<u8>> = committed.clone();
-        for (k, present) in staged {
-            if *present {
-                set.insert(k.clone());
-            } else {
-                set.remove(k);
-            }
+    /// the count cap shared by both tiers.
+    fn require_capacity(tier: &[Vec<u8>], what: &str) -> Result<(), Error> {
+        if tier.len() >= MAX_MEMBERS {
+            return Err(Error::Module(format!("{what} cap reached ({MAX_MEMBERS})")));
         }
-        set.into_iter().collect()
-    }
-
-    // ---- state-sync ---------------------------------------------------------
-    // ship the committed set as its root preimage; adopt a peer's bytes only
-    // after re-deriving the root consensus expects — the root, not the peer, is
-    // the trust anchor.
-
-    /// canonical bytes of the COMMITTED state — exactly the byte stream `root()`
-    /// hashes: the validator section (count u64-le, then per sorted key its len
-    /// u64-le + key bytes), then the resident section in the same shape. so for
-    /// non-empty state `sha256(snapshot()) == root()`; fully empty state
-    /// snapshots to two zero counts (root still `ZERO`, unhashed). pending is
-    /// deliberately excluded — a snapshot ships what consensus committed to,
-    /// and staged-but-uncommitted changes are not that.
-    pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode_membership(&self.validators, &self.residents)
-    }
-
-    /// the shared canonical encoding behind `snapshot` and `root_of`.
-    fn encode_membership(
-        validators: &BTreeSet<Vec<u8>>,
-        residents: &BTreeSet<Vec<u8>>,
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
-        for set in [validators, residents] {
-            out.extend_from_slice(&(set.len() as u64).to_le_bytes());
-            for k in set {
-                codec::push_bytes(&mut out, k);
-            }
-        }
-        out
-    }
-
-    /// replace committed state with a decoded snapshot, iff the decoded state's
-    /// recomputed root equals `expected`. decode and verification land in a
-    /// temporary: self is mutated only after both pass, so on any `Err` committed
-    /// state, pending, and `root()` are byte-identical to before the call.
-    /// success clears pending — staged changes belong to the state being
-    /// replaced, not the state being adopted.
-    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (validators, residents) = Self::decode_snapshot(bytes)?;
-        sdk::verify_snapshot_root(Self::root_of(&validators, &residents), expected)?;
-        self.validators = validators;
-        self.residents = residents;
-        self.pending.clear();
-        self.pending_residents.clear();
         Ok(())
     }
 
-    /// strict decode of UNTRUSTED snapshot bytes (a byzantine peer serves them):
-    /// the validator section, then the resident section. the count and every
-    /// key length are checked against the remaining buffer BEFORE any
-    /// allocation, truncation and trailing bytes both reject, and keys must
-    /// arrive strictly increasing per section — a peer cannot mint alternative
-    /// byte streams for one state.
-    fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotMembership, Error> {
-        fn take_section(cur: &mut codec::Cursor, what: &str) -> Result<BTreeSet<Vec<u8>>, Error> {
-            let count = cur.u64(what)?;
-            // each entry costs at least its 8-byte length prefix, so a count the
-            // remaining bytes cannot possibly hold is rejected up front — a forged
-            // count never drives allocation.
-            cur.bound(count, 8, what)?;
-            let mut set = BTreeSet::new();
-            let mut prev: Option<Vec<u8>> = None;
-            for _ in 0..count {
-                let key = cur.bytes(what)?;
-                if prev.as_deref().is_some_and(|p| p >= key) {
-                    return Err(Error::Module(
-                        "snapshot keys must be strictly increasing".into(),
-                    ));
-                }
-                prev = Some(key.to_vec());
-                set.insert(key.to_vec());
-            }
-            Ok(set)
-        }
+    // ---- staged-over-committed tier records ---------------------------------
 
-        let mut cur = codec::Cursor::new(bytes);
-        let validators = take_section(&mut cur, "snapshot validator")?;
-        let residents = take_section(&mut cur, "snapshot resident")?;
-        cur.finish("snapshot")?;
-        Ok((validators, residents))
+    /// one tier's staged-over-committed view: the strictly-sorted member list,
+    /// empty when the record is absent. a later op in the same block sees an
+    /// earlier op's staged write (read-your-writes).
+    async fn tier(&self, key: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        let Some(bytes) = self.staged.get(key).await? else {
+            return Ok(Vec::new());
+        };
+        borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))
     }
 
-    /// the state-based commitment: `ZERO` when both sets are empty, else sha256
-    /// over exactly the bytes `snapshot` emits. shared by `root()` (committed
-    /// state) and `install` (a decoded candidate), so the two can never drift.
-    fn root_of(validators: &BTreeSet<Vec<u8>>, residents: &BTreeSet<Vec<u8>>) -> StateRoot {
-        if validators.is_empty() && residents.is_empty() {
-            return StateRoot::ZERO;
+    async fn validators(&self) -> Result<Vec<Vec<u8>>, Error> {
+        self.tier(VALIDATORS_KEY).await
+    }
+
+    async fn residents(&self) -> Result<Vec<Vec<u8>>, Error> {
+        self.tier(RESIDENTS_KEY).await
+    }
+
+    /// stage one tier record. an EMPTY tier stages a DELETE — absence is the
+    /// single canonical encoding of "no members", so a fresh store and an
+    /// emptied tier answer reads identically.
+    fn store_tier(&mut self, key: &[u8], tier: &Vec<Vec<u8>>) -> Result<(), Error> {
+        if tier.is_empty() {
+            self.staged.delete(key.to_vec());
+            return Ok(());
         }
-        StateRoot(Sha256::digest(Self::encode_membership(validators, residents)).into())
+        let bytes = borsh::to_vec(tier).expect("a member list is serializable");
+        if bytes.len() > MAX_TIER_RECORD_BYTES {
+            return Err(Error::Module(format!(
+                "tier record too large: {} > {MAX_TIER_RECORD_BYTES} bytes",
+                bytes.len()
+            )));
+        }
+        self.staged.stage(key.to_vec(), bytes);
+        Ok(())
+    }
+
+    // ---- membership op handlers ---------------------------------------------
+
+    async fn handle_join(&mut self, key: Vec<u8>) -> Result<(), Error> {
+        Self::validate_key(&key)?;
+        // PROMOTION: a joining resident leaves the resident tier in the same
+        // block — one boundary carries the whole transition, and the
+        // transport union never double-counts the key.
+        let mut residents = self.residents().await?;
+        if let Ok(position) = residents.binary_search(&key) {
+            residents.remove(position);
+            self.store_tier(RESIDENTS_KEY, &residents)?;
+        }
+        let mut validators = self.validators().await?;
+        let Err(position) = validators.binary_search(&key) else {
+            return Ok(()); // an idempotent re-join stages nothing.
+        };
+        Self::require_capacity(&validators, "validator")?;
+        validators.insert(position, key);
+        self.store_tier(VALIDATORS_KEY, &validators)
+    }
+
+    async fn handle_leave(&mut self, key: Vec<u8>) -> Result<(), Error> {
+        let mut validators = self.validators().await?;
+        let Ok(position) = validators.binary_search(&key) else {
+            return Ok(()); // removing an absent key is a documented no-op.
+        };
+        // the validator set must NEVER go empty. a downstream orderer
+        // reconfigured to zero validators hits commonware `quorum(0)`, which
+        // panics ("n must not be zero") and halts the node. refuse a removal
+        // that would drop the LAST validator. authoritative here: every
+        // membership removal (a governance-passed RemoveValidator or genesis
+        // orchestration) funnels through this arm, so the invariant holds no
+        // matter who staged it — the set is closed under this rule regardless
+        // of the caller. the guard reads the staged-over-committed tier, so a
+        // second leave in the same block cannot slip past it.
+        if validators.len() == 1 {
+            return Err(Error::Module(
+                "refusing to remove the last validator: the set must never be empty".into(),
+            ));
+        }
+        validators.remove(position);
+        self.store_tier(VALIDATORS_KEY, &validators)
+    }
+
+    async fn handle_grant(&mut self, key: Vec<u8>) -> Result<(), Error> {
+        Self::validate_key(&key)?;
+        // a validator already holds every resident capability; a second
+        // standing would only smear the promote/demote edges.
+        let validators = self.validators().await?;
+        if validators.binary_search(&key).is_ok() {
+            return Err(Error::Module(
+                "key is a current validator — resident standing is the pre-promotion tier".into(),
+            ));
+        }
+        let mut residents = self.residents().await?;
+        let Err(position) = residents.binary_search(&key) else {
+            return Ok(()); // an idempotent re-grant stages nothing.
+        };
+        Self::require_capacity(&residents, "resident")?;
+        residents.insert(position, key);
+        self.store_tier(RESIDENTS_KEY, &residents)
+    }
+
+    async fn handle_revoke(&mut self, key: Vec<u8>) -> Result<(), Error> {
+        let mut residents = self.residents().await?;
+        let Ok(position) = residents.binary_search(&key) else {
+            return Ok(()); // revoking a non-resident is a documented no-op.
+        };
+        residents.remove(position);
+        self.store_tier(RESIDENTS_KEY, &residents)
     }
 }
 
@@ -297,17 +319,27 @@ impl Module for Valset {
         self.id.clone()
     }
 
-    /// state-based commitment over the COMMITTED state: a length-prefixed
-    /// sha256 over the sorted validators, then the sorted residents.
-    /// order-independent (BTreeSet) and idempotent. fully empty
-    /// state reports `ZERO` — an empty/uninitialized module (matching the sdk
-    /// `StateRoot::ZERO` doc and forge's unborn-repo root).
+    /// the store's committed merkle root over both tier records, verbatim —
+    /// the staged overlay is invisible here until `commit_block`. the
+    /// observation barrier compares this per drained block, so it moves
+    /// exactly when committed membership changes.
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.validators, &self.residents)
+        self.staged.root()
     }
 
-    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
-        Some(self.snapshot())
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        self.staged.state_sync_handle()
+    }
+
+    /// the network state-sync serve lane: answers the shared qmdb wire requests
+    /// (historical proof-carrying op ranges) from committed state. read-only;
+    /// the joiner's sync engine merkle-verifies every batch.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.staged.serve_sync(req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        self.staged.sync_target().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -326,88 +358,36 @@ impl Module for Valset {
             }
         }
         match decode_msg(&msg.payload).map_err(Error::Module)? {
-            ValsetMsg::Join { key } => {
-                Self::validate_key(&key)?;
-                // PROMOTION: a joining resident leaves the resident tier in
-                // the same block — one boundary carries the whole transition,
-                // and the transport union never double-counts the key.
-                if self.effective_residents().contains(&key) {
-                    self.pending_residents.insert(key.clone(), false);
-                }
-                self.stage_add(key);
-            }
-            ValsetMsg::Leave { key } => {
-                // the validator set must NEVER go empty. a downstream orderer
-                // reconfigured to zero validators hits commonware `quorum(0)`,
-                // which panics ("n must not be zero") and halts the node. refuse
-                // a removal that would drop the LAST validator. authoritative
-                // here: every membership removal (a governance-passed
-                // RemoveValidator or genesis orchestration) funnels through this
-                // arm, so the invariant holds no matter who staged it — the set
-                // is closed under this rule regardless of the caller.
-                let mut after: BTreeSet<Vec<u8>> = self.effective().into_iter().collect();
-                after.remove(&key);
-                if after.is_empty() {
-                    return Err(Error::Module(
-                        "refusing to remove the last validator: the set must never be empty".into(),
-                    ));
-                }
-                self.stage_remove(key);
-            }
-            ValsetMsg::Grant { key } => {
-                Self::validate_key(&key)?;
-                // a validator already holds every resident capability; a
-                // second standing would only smear the promote/demote edges.
-                if self.effective().contains(&key) {
-                    return Err(Error::Module(
-                        "key is a current validator — resident standing is the pre-promotion tier"
-                            .into(),
-                    ));
-                }
-                self.pending_residents.insert(key, true);
-            }
-            ValsetMsg::Revoke { key } => {
-                self.pending_residents.insert(key, false);
-            }
+            ValsetMsg::Join { key } => self.handle_join(key).await,
+            ValsetMsg::Leave { key } => self.handle_leave(key).await,
+            ValsetMsg::Grant { key } => self.handle_grant(key).await,
+            ValsetMsg::Revoke { key } => self.handle_revoke(key).await,
         }
-        Ok(())
     }
 
-    /// read projection — the committed sets plus this block's staged changes.
+    /// read projection — the committed tiers plus this block's staged changes.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            ValsetQuery::Validators => Ok(encode_reply(&ValsetReply::Validators(self.effective()))),
+            ValsetQuery::Validators => Ok(encode_reply(&ValsetReply::Validators(
+                self.validators().await?,
+            ))),
             ValsetQuery::Residents => Ok(encode_reply(&ValsetReply::Residents(
-                self.effective_residents(),
+                self.residents().await?,
             ))),
         }
     }
 
-    /// merge the block's staged membership changes into committed state —
-    /// `root()` now reflects them. no-op if nothing was staged.
+    /// publish the block's staged membership changes in ONE store batch —
+    /// `root()` now reflects them. no-op (and no root movement) if nothing
+    /// was staged.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        for (k, present) in std::mem::take(&mut self.pending) {
-            if present {
-                self.validators.insert(k);
-            } else {
-                self.validators.remove(&k);
-            }
-        }
-        for (k, present) in std::mem::take(&mut self.pending_residents) {
-            if present {
-                self.residents.insert(k);
-            } else {
-                self.residents.remove(&k);
-            }
-        }
-        Ok(())
+        self.staged.commit().await
     }
 
     /// discard the block's staged changes — committed state (and `root()`) is
     /// unchanged, so a failed block leaves no trace.
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending.clear();
-        self.pending_residents.clear();
+        self.staged.abort();
         Ok(())
     }
 }
@@ -429,10 +409,22 @@ mod tests {
 
     // a deterministic, VALID 32-byte ed25519 public key: any 32 bytes is a valid
     // ed25519 seed, and the derived public key is always a valid curve point.
-    fn valid_key(seed_byte: u8) -> Vec<u8> {
-        let seed = [seed_byte; 32];
-        let sk = PrivateKey::decode(&seed[..]).expect("any 32 bytes is a valid seed");
+    // u16 seeds so the cap test can mint more than 256 distinct keys.
+    fn valid_key(seed: u16) -> Vec<u8> {
+        let mut bytes = [0u8; 32];
+        bytes[..2].copy_from_slice(&seed.to_le_bytes());
+        let sk = PrivateKey::decode(&bytes[..]).expect("any 32 bytes is a valid seed");
         sk.public_key().as_ref().to_vec()
+    }
+
+    fn fresh() -> Valset {
+        Valset::new("valset", Box::new(sdk_testkit::MemStore::new()))
+    }
+
+    /// the root of a store that never committed anything — the store-backed
+    /// twin of the old ZERO sentinel.
+    fn empty_root() -> StateRoot {
+        fresh().root()
     }
 
     fn join(key: &[u8]) -> Msg {
@@ -446,6 +438,24 @@ mod tests {
             target: "valset".into(),
             payload: encode_msg(&ValsetMsg::Leave { key: key.to_vec() }),
         }
+    }
+    fn grant(key: &[u8]) -> Msg {
+        Msg {
+            target: "valset".into(),
+            payload: encode_msg(&ValsetMsg::Grant { key: key.to_vec() }),
+        }
+    }
+    fn revoke(key: &[u8]) -> Msg {
+        Msg {
+            target: "valset".into(),
+            payload: encode_msg(&ValsetMsg::Revoke { key: key.to_vec() }),
+        }
+    }
+    fn run(v: &mut Valset, ctx: &mut TestCtx, m: &Msg) -> Result<(), Error> {
+        futures::executor::block_on(v.execute(ctx, m))
+    }
+    fn commit(v: &mut Valset) {
+        futures::executor::block_on(v.commit_block()).unwrap();
     }
     fn validators(v: &Valset) -> Vec<Vec<u8>> {
         let reply =
@@ -463,40 +473,28 @@ mod tests {
             other => panic!("expected Residents, got {other:?}"),
         }
     }
-    fn grant(key: &[u8]) -> Msg {
-        Msg {
-            target: "valset".into(),
-            payload: encode_msg(&ValsetMsg::Grant { key: key.to_vec() }),
-        }
-    }
-    fn revoke(key: &[u8]) -> Msg {
-        Msg {
-            target: "valset".into(),
-            payload: encode_msg(&ValsetMsg::Revoke { key: key.to_vec() }),
-        }
-    }
 
     #[test]
-    fn join_adds_a_validator_and_moves_root_off_zero() {
-        let mut v = Valset::new("valset");
+    fn join_adds_a_validator_and_moves_root_off_empty() {
+        let mut v = fresh();
         let mut ctx = sys_ctx();
-        assert_eq!(v.root(), StateRoot::ZERO, "genesis set is empty -> ZERO");
+        assert_eq!(v.root(), empty_root(), "genesis set is empty -> empty root");
 
         let k = valid_key(1);
-        futures::executor::block_on(v.execute(&mut ctx, &join(&k))).unwrap();
-        // staged, not yet committed: root still ZERO, but read-your-writes sees it.
-        assert_eq!(v.root(), StateRoot::ZERO, "root reflects committed only");
+        run(&mut v, &mut ctx, &join(&k)).unwrap();
+        // staged, not yet committed: root unchanged, but read-your-writes sees it.
+        assert_eq!(v.root(), empty_root(), "root reflects committed only");
         assert_eq!(
             validators(&v),
             vec![k.clone()],
             "read-your-writes sees the stage"
         );
 
-        futures::executor::block_on(v.commit_block()).unwrap();
+        commit(&mut v);
         assert_ne!(
             v.root(),
-            StateRoot::ZERO,
-            "a committed join moves the root off ZERO"
+            empty_root(),
+            "a committed join moves the root off the empty root"
         );
         assert_eq!(validators(&v), vec![k]);
     }
@@ -506,19 +504,23 @@ mod tests {
         // remove ONE of two validators — the set stays non-empty, so the
         // last-validator guard never fires. (removing the last validator is a
         // refused no-op; see `leaving_the_last_validator_is_refused`.)
-        let mut v = Valset::new("valset");
+        let mut v = fresh();
         let mut ctx = sys_ctx();
         let (keep, drop) = (valid_key(2), valid_key(3));
-        futures::executor::block_on(v.execute(&mut ctx, &join(&keep))).unwrap();
-        futures::executor::block_on(v.execute(&mut ctx, &join(&drop))).unwrap();
-        futures::executor::block_on(v.commit_block()).unwrap();
+        run(&mut v, &mut ctx, &join(&keep)).unwrap();
+        run(&mut v, &mut ctx, &join(&drop)).unwrap();
+        commit(&mut v);
         let joined_root = v.root();
 
-        futures::executor::block_on(v.execute(&mut ctx, &leave(&drop))).unwrap();
-        futures::executor::block_on(v.commit_block()).unwrap();
+        run(&mut v, &mut ctx, &leave(&drop)).unwrap();
+        commit(&mut v);
         assert_eq!(validators(&v), vec![keep], "leave removes exactly that key");
         assert_ne!(v.root(), joined_root, "the committed root moved");
-        assert_ne!(v.root(), StateRoot::ZERO, "a non-empty set is not ZERO");
+        assert_ne!(
+            v.root(),
+            empty_root(),
+            "a non-empty set is not the empty root"
+        );
     }
 
     #[test]
@@ -526,39 +528,38 @@ mod tests {
         // the set must never go empty: an orderer reconfigured to zero
         // validators hits commonware `quorum(0)`, which panics. removing the
         // SOLE validator is refused deterministically, and the set is untouched.
-        let mut v = Valset::new("valset");
+        let mut v = fresh();
         let mut ctx = sys_ctx();
         let solo = valid_key(7);
-        futures::executor::block_on(v.execute(&mut ctx, &join(&solo))).unwrap();
-        futures::executor::block_on(v.commit_block()).unwrap();
+        run(&mut v, &mut ctx, &join(&solo)).unwrap();
+        commit(&mut v);
         let before = v.root();
 
-        let err = futures::executor::block_on(v.execute(&mut ctx, &leave(&solo))).unwrap_err();
+        let err = run(&mut v, &mut ctx, &leave(&solo)).unwrap_err();
         assert!(
             matches!(err, Error::Module(ref m) if m.contains("last validator")),
             "got {err:?}"
         );
         // read-your-writes: nothing was staged, so the sole validator remains.
         assert_eq!(validators(&v), vec![solo], "the last validator stays");
-        futures::executor::block_on(v.commit_block()).unwrap();
-        assert_eq!(v.root(), before, "committed set is byte-identical");
-        assert_ne!(v.root(), StateRoot::ZERO, "the set never went empty");
+        commit(&mut v);
+        assert_eq!(v.root(), before, "committed state is byte-identical");
     }
 
     #[test]
     fn leaving_the_last_of_a_shrinking_set_is_refused() {
         // stage two leaves in one block: the first (of two) is fine, the second
         // would empty the set within the same block's read-your-writes view and
-        // is refused — the guard reads the EFFECTIVE (staged-over-committed) set.
-        let mut v = Valset::new("valset");
+        // is refused — the guard reads the STAGED-over-committed tier.
+        let mut v = fresh();
         let mut ctx = sys_ctx();
         let (a, b) = (valid_key(4), valid_key(5));
-        futures::executor::block_on(v.execute(&mut ctx, &join(&a))).unwrap();
-        futures::executor::block_on(v.execute(&mut ctx, &join(&b))).unwrap();
-        futures::executor::block_on(v.commit_block()).unwrap();
+        run(&mut v, &mut ctx, &join(&a)).unwrap();
+        run(&mut v, &mut ctx, &join(&b)).unwrap();
+        commit(&mut v);
 
-        futures::executor::block_on(v.execute(&mut ctx, &leave(&a))).unwrap();
-        let err = futures::executor::block_on(v.execute(&mut ctx, &leave(&b))).unwrap_err();
+        run(&mut v, &mut ctx, &leave(&a)).unwrap();
+        let err = run(&mut v, &mut ctx, &leave(&b)).unwrap_err();
         assert!(
             matches!(err, Error::Module(ref m) if m.contains("last validator")),
             "got {err:?}"
@@ -567,31 +568,31 @@ mod tests {
 
     #[test]
     fn malformed_key_is_rejected() {
-        let mut v = Valset::new("valset");
+        let mut v = fresh();
         let mut ctx = sys_ctx();
         // wrong length is the deterministic malformed input: ~half of all 32-byte
         // strings are valid curve points (ZIP215 accepts non-canonical), so a
         // wrong-LENGTH key is the reliable reject path.
         let bad = vec![0u8; 16];
-        let err = futures::executor::block_on(v.execute(&mut ctx, &join(&bad))).unwrap_err();
+        let err = run(&mut v, &mut ctx, &join(&bad)).unwrap_err();
         assert!(
             matches!(err, Error::Module(_)),
             "malformed key errs with Module"
         );
-        futures::executor::block_on(v.commit_block()).unwrap();
+        commit(&mut v);
         assert!(validators(&v).is_empty(), "a rejected join adds nothing");
-        assert_eq!(v.root(), StateRoot::ZERO);
+        assert_eq!(v.root(), empty_root());
     }
 
     #[test]
     fn permissionless_any_valid_key_joins() {
-        let mut v = Valset::new("valset");
+        let mut v = fresh();
         let mut ctx = sys_ctx();
         // no authorization, no gating: three unrelated valid keys all join.
-        for b in [10u8, 20, 30] {
-            futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(b)))).unwrap();
+        for b in [10u16, 20, 30] {
+            run(&mut v, &mut ctx, &join(&valid_key(b))).unwrap();
         }
-        futures::executor::block_on(v.commit_block()).unwrap();
+        commit(&mut v);
         assert_eq!(
             validators(&v).len(),
             3,
@@ -600,36 +601,42 @@ mod tests {
     }
 
     #[test]
-    fn root_is_state_based_order_independent() {
+    fn intra_block_op_order_cannot_fork_the_root() {
+        // two validators joined in opposite orders WITHIN one block: the
+        // commit batch is key-sorted (BTreeMap iteration), so both instances
+        // publish the identical record set and the identical root — stage
+        // order inside a block can never fork per-node roots. (cross-block
+        // op-ORDER equality on the real path-dependent qmdb root is the
+        // replay-twin assertion in tests/sync_round_trip.rs.)
         let a = valid_key(3);
         let b = valid_key(4);
 
-        let mut v1 = Valset::new("valset");
+        let mut v1 = fresh();
         let mut c1 = sys_ctx();
-        futures::executor::block_on(v1.execute(&mut c1, &join(&a))).unwrap();
-        futures::executor::block_on(v1.execute(&mut c1, &join(&b))).unwrap();
-        futures::executor::block_on(v1.commit_block()).unwrap();
+        run(&mut v1, &mut c1, &join(&a)).unwrap();
+        run(&mut v1, &mut c1, &join(&b)).unwrap();
+        commit(&mut v1);
 
-        // same two validators, joined in the OPPOSITE order.
-        let mut v2 = Valset::new("valset");
+        let mut v2 = fresh();
         let mut c2 = sys_ctx();
-        futures::executor::block_on(v2.execute(&mut c2, &join(&b))).unwrap();
-        futures::executor::block_on(v2.execute(&mut c2, &join(&a))).unwrap();
-        futures::executor::block_on(v2.commit_block()).unwrap();
+        run(&mut v2, &mut c2, &join(&b)).unwrap();
+        run(&mut v2, &mut c2, &join(&a)).unwrap();
+        commit(&mut v2);
 
-        assert_eq!(v1.root(), v2.root(), "root is f(state), order-independent");
+        assert_eq!(v1.root(), v2.root(), "same block, same root");
+        assert_eq!(validators(&v1), validators(&v2), "same record set");
     }
 
     #[test]
     fn atomicity_a_failed_block_rolls_back_the_join() {
-        // reuse the host-lent staging seam directly: stage a join, then the block
+        // reuse the staging seam directly: stage a join, then the block
         // fails -> abort_block drops the stage. no validator is added, root is
         // byte-identical to its pre-block value.
-        let mut v = Valset::new("valset");
+        let mut v = fresh();
         let mut ctx = sys_ctx();
         let before = v.root();
 
-        futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(5)))).unwrap();
+        run(&mut v, &mut ctx, &join(&valid_key(5))).unwrap();
         // ... a later dispatch in the same block errors, so the host aborts:
         futures::executor::block_on(v.abort_block()).unwrap();
 
@@ -642,271 +649,175 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_install_round_trip_reconstructs_root_and_membership() {
-        // SOURCE: three validators through the real execute(Join)+commit_block
-        // path, so the snapshot ships state that consensus actually committed.
-        let mut src = Valset::new("valset");
+    fn idempotent_no_ops_stage_nothing_and_never_move_the_root() {
+        // THE barrier-noise property: the observation barrier ends a drain
+        // batch whenever this module's root moves, so a no-op re-join, an
+        // absent-key leave, a re-grant, and a non-resident revoke must all
+        // stage NOTHING — a byte-identical overwrite would still be a
+        // committed qmdb op and would move the root.
+        let mut v = fresh();
         let mut ctx = sys_ctx();
-        for b in [1u8, 2, 3] {
-            futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(b)))).unwrap();
-        }
-        futures::executor::block_on(src.commit_block()).unwrap();
-        let src_root = src.root();
-        assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
+        let (member, resident) = (valid_key(1), valid_key(2));
+        run(&mut v, &mut ctx, &join(&member)).unwrap();
+        run(&mut v, &mut ctx, &grant(&resident)).unwrap();
+        commit(&mut v);
+        let settled = v.root();
 
-        // the snapshot IS the root preimage: hashing it reproduces root(), so
-        // snapshot and root can never encode two different states.
-        let bytes = src.snapshot();
-        let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        assert_eq!(StateRoot(digest), src_root, "sha256(snapshot()) == root()");
+        run(&mut v, &mut ctx, &join(&member)).unwrap();
+        run(&mut v, &mut ctx, &leave(&valid_key(9))).unwrap();
+        run(&mut v, &mut ctx, &grant(&resident)).unwrap();
+        run(&mut v, &mut ctx, &revoke(&valid_key(9))).unwrap();
+        commit(&mut v);
 
-        // TARGET: a fresh set with an unrelated join STAGED — install must drop
-        // it, or the stale stage would leak into the post-install view.
-        let mut dst = Valset::new("valset");
-        let mut dctx = sys_ctx();
-        futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(9)))).unwrap();
-
-        dst.install(&bytes, src_root).unwrap();
-        assert_eq!(
-            dst.root(),
-            src_root,
-            "installed root equals the source root"
-        );
-        assert_eq!(
-            validators(&dst),
-            validators(&src),
-            "query parity after install"
-        );
+        assert_eq!(v.root(), settled, "no-ops committed nothing");
+        assert_eq!(validators(&v), vec![member], "membership unchanged");
+        assert_eq!(residents(&v), vec![resident], "residents unchanged");
     }
 
     #[test]
-    fn tampered_snapshot_is_rejected_and_the_target_is_untouched() {
-        let mut src = Valset::new("valset");
+    fn join_past_the_member_cap_is_refused() {
+        let mut v = fresh();
         let mut ctx = sys_ctx();
-        for b in [4u8, 5] {
-            futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(b)))).unwrap();
+        for seed in 0..MAX_MEMBERS as u16 {
+            run(&mut v, &mut ctx, &join(&valid_key(seed))).unwrap();
         }
-        futures::executor::block_on(src.commit_block()).unwrap();
-        let src_root = src.root();
-
-        // flip one bit inside the LAST key: count, lengths, and sort order all
-        // still hold, so structural decode alone cannot catch it — only the
-        // recomputed-root check can. exactly the byzantine-payload case.
-        let mut bytes = src.snapshot();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0x01;
-
-        // the TARGET already holds committed membership AND a staged join: a
-        // failed install must leave every layer untouched, not merely "still
-        // empty" — a cleared-on-err bug is invisible against an empty target.
-        let mut dst = Valset::new("valset");
-        let mut dctx = sys_ctx();
-        futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(8)))).unwrap();
-        futures::executor::block_on(dst.commit_block()).unwrap();
-        futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(9)))).unwrap();
-        let pre_root = dst.root();
-        let pre_view = validators(&dst);
-
-        let err = dst.install(&bytes, src_root).unwrap_err();
+        let err = run(&mut v, &mut ctx, &join(&valid_key(MAX_MEMBERS as u16))).unwrap_err();
         assert!(
-            matches!(err, Error::Module(_)),
-            "tampered snapshot errs with Module"
+            matches!(err, Error::Module(ref m) if m.contains("cap reached")),
+            "got {err:?}"
         );
+        commit(&mut v);
+        assert_eq!(validators(&v).len(), MAX_MEMBERS, "the cap held");
+    }
+
+    // ---- genesis seeding ----------------------------------------------------
+
+    #[test]
+    fn genesis_seed_publishes_once_and_reseeding_is_a_no_op() {
+        let mut v = fresh();
+        let (a, b) = (valid_key(1), valid_key(2));
+        futures::executor::block_on(async {
+            v.seed(a.clone()).await.unwrap();
+            v.seed(b.clone()).await.unwrap();
+            v.finish_seed().await.unwrap();
+        });
+        let seeded = v.root();
+        assert_ne!(seeded, empty_root(), "the seed set is committed state");
+        assert_eq!(validators(&v).len(), 2);
+
+        // a reopened workspace re-entering the genesis path re-seeds — the
+        // idempotence gate must leave the store byte-untouched.
+        futures::executor::block_on(async {
+            v.seed(valid_key(9)).await.unwrap();
+            v.finish_seed().await.unwrap();
+        });
         assert_eq!(
-            dst.root(),
-            pre_root,
-            "failed install leaves the committed root untouched"
+            v.root(),
+            seeded,
+            "re-seeding an initialized store is a no-op"
         );
+        let mut expected = vec![a, b];
+        expected.sort();
         assert_eq!(
-            validators(&dst),
-            pre_view,
-            "failed install leaves membership and stage untouched"
+            validators(&v),
+            expected,
+            "the original seed survived the re-entry"
         );
     }
 
     #[test]
-    fn truncated_or_trailing_bytes_are_rejected_and_leave_state_intact() {
-        let mut src = Valset::new("valset");
-        let mut ctx = sys_ctx();
-        for b in [6u8, 7] {
-            futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(b)))).unwrap();
-        }
-        futures::executor::block_on(src.commit_block()).unwrap();
-        let src_root = src.root();
-        let bytes = src.snapshot();
-
-        // the target has COMMITTED state of its own plus a STAGED join — every
-        // failed install must leave both exactly as they were, a stronger claim
-        // than "empty stays empty".
-        let mut dst = Valset::new("valset");
-        let mut dctx = sys_ctx();
-        futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(8)))).unwrap();
-        futures::executor::block_on(dst.commit_block()).unwrap();
-        futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(9)))).unwrap();
-        let before_root = dst.root();
-        let before_view = validators(&dst);
-
-        // truncation: the final key byte is missing.
-        assert!(dst.install(&bytes[..bytes.len() - 1], src_root).is_err());
-        // trailing garbage: one byte past a well-formed stream.
-        let mut trailing = bytes.clone();
-        trailing.push(0);
-        assert!(dst.install(&trailing, src_root).is_err());
-        // forged count: claims more entries than the buffer could possibly hold —
-        // rejected before any allocation.
-        let mut forged = bytes.clone();
-        forged[..8].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(dst.install(&forged, src_root).is_err());
-
-        assert_eq!(dst.root(), before_root, "a failed install moved the root");
-        assert_eq!(
-            validators(&dst),
-            before_view,
-            "a failed install changed membership or dropped the stage"
-        );
+    #[should_panic(expected = "genesis validator key must be 32 bytes")]
+    fn seeding_a_wrong_width_key_is_a_wiring_bug() {
+        // the seed seam trusts its caller (production seeds typed ed25519
+        // keys) but a wrong-WIDTH key can only be a wiring bug — loud panic,
+        // never staged state.
+        let mut v = fresh();
+        let _ = futures::executor::block_on(v.seed(vec![0u8; 16]));
     }
 
-    #[test]
-    fn empty_snapshot_installs_onto_an_empty_set() {
-        let src = Valset::new("valset");
-        assert_eq!(src.root(), StateRoot::ZERO);
-        let bytes = src.snapshot();
-        assert_eq!(
-            bytes,
-            [0u8; 16].to_vec(),
-            "an empty state is two zero section counts"
-        );
-
-        let mut dst = Valset::new("valset");
-        dst.install(&bytes, StateRoot::ZERO).unwrap();
-        assert_eq!(dst.root(), StateRoot::ZERO);
-        assert!(validators(&dst).is_empty());
-    }
-
-    // ---- residents (staged admission) --------------------------------------
+    // ---- residents (staged admission) ----------------------------------------
 
     #[test]
     fn resident_ops_apply_from_genesis() {
-        let mut v = Valset::new("valset");
+        let mut v = fresh();
         let mut ctx = sys_ctx();
-        futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
-        futures::executor::block_on(v.commit_block()).unwrap();
+        run(&mut v, &mut ctx, &join(&valid_key(1))).unwrap();
+        commit(&mut v);
 
         // grant confers resident standing on a freshly founded network.
         let obs = valid_key(2);
-        futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
-        futures::executor::block_on(v.commit_block()).unwrap();
+        run(&mut v, &mut ctx, &grant(&obs)).unwrap();
+        commit(&mut v);
         assert_eq!(residents(&v), vec![obs.clone()], "grant applied");
 
         // revoke clears it.
-        futures::executor::block_on(v.execute(&mut ctx, &revoke(&obs))).unwrap();
-        futures::executor::block_on(v.commit_block()).unwrap();
+        run(&mut v, &mut ctx, &revoke(&obs)).unwrap();
+        commit(&mut v);
         assert!(residents(&v).is_empty(), "revoke applied");
     }
 
     #[test]
-    fn grant_folds_the_root_only_while_residents_exist() {
-        // deterministic encoding end to end: granting moves the root; revoking
-        // the last resident returns it BYTE-IDENTICAL to the validators-only
-        // root and snapshot.
-        let mut v = Valset::new("valset");
+    fn grant_stages_then_commits_and_revoke_empties_the_tier() {
+        // the staged/committed split on the resident tier: a grant is visible
+        // to read-your-writes at once but moves the root only at commit;
+        // revoking the last resident returns the VIEW to empty (the record is
+        // deleted — absence is the one encoding of "no residents"). no
+        // root-restoration assertion: the qmdb op-log root never returns to a
+        // prior value after insert+delete.
+        let mut v = fresh();
         let mut ctx = sys_ctx();
-        futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
-        futures::executor::block_on(v.commit_block()).unwrap();
+        run(&mut v, &mut ctx, &join(&valid_key(1))).unwrap();
+        commit(&mut v);
         let validators_only = v.root();
-        let validators_only_snapshot = v.snapshot();
 
         let obs = valid_key(2);
-        futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
+        run(&mut v, &mut ctx, &grant(&obs)).unwrap();
         assert_eq!(v.root(), validators_only, "root reflects committed only");
         assert_eq!(residents(&v), vec![obs.clone()], "read-your-writes");
-        futures::executor::block_on(v.commit_block()).unwrap();
+        commit(&mut v);
         assert_ne!(
             v.root(),
             validators_only,
             "a committed grant moves the root"
         );
 
-        futures::executor::block_on(v.execute(&mut ctx, &revoke(&obs))).unwrap();
-        futures::executor::block_on(v.commit_block()).unwrap();
-        assert_eq!(
-            v.root(),
-            validators_only,
-            "revoking the last resident restores the exact validators-only root"
-        );
-        assert_eq!(
-            v.snapshot(),
-            validators_only_snapshot,
-            "and the exact validators-only snapshot bytes"
-        );
+        run(&mut v, &mut ctx, &revoke(&obs)).unwrap();
+        commit(&mut v);
+        assert!(residents(&v).is_empty(), "the resident tier emptied");
+        assert_eq!(validators(&v).len(), 1, "validators untouched");
     }
 
     #[test]
     fn join_promotes_a_resident_out_of_the_tier() {
-        let mut v = Valset::new("valset");
+        let mut v = fresh();
         let mut ctx = sys_ctx();
-        futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
+        run(&mut v, &mut ctx, &join(&valid_key(1))).unwrap();
         let obs = valid_key(2);
-        futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
-        futures::executor::block_on(v.commit_block()).unwrap();
+        run(&mut v, &mut ctx, &grant(&obs)).unwrap();
+        commit(&mut v);
         assert_eq!(residents(&v), vec![obs.clone()]);
 
         // the promotion: ONE Join both seats the validator and clears the
         // resident standing, in the same block.
-        futures::executor::block_on(v.execute(&mut ctx, &join(&obs))).unwrap();
-        futures::executor::block_on(v.commit_block()).unwrap();
+        run(&mut v, &mut ctx, &join(&obs)).unwrap();
+        commit(&mut v);
         assert!(validators(&v).contains(&obs), "promoted into the quorum");
         assert!(residents(&v).is_empty(), "and out of the resident tier");
     }
 
     #[test]
     fn granting_a_current_validator_is_refused() {
-        let mut v = Valset::new("valset");
+        let mut v = fresh();
         let mut ctx = sys_ctx();
         let k = valid_key(1);
-        futures::executor::block_on(v.execute(&mut ctx, &join(&k))).unwrap();
-        futures::executor::block_on(v.commit_block()).unwrap();
+        run(&mut v, &mut ctx, &join(&k)).unwrap();
+        commit(&mut v);
 
-        let err = futures::executor::block_on(v.execute(&mut ctx, &grant(&k))).unwrap_err();
+        let err = run(&mut v, &mut ctx, &grant(&k)).unwrap_err();
         assert!(
             matches!(err, Error::Module(ref m) if m.contains("current validator")),
             "got {err:?}"
         );
         assert!(residents(&v).is_empty());
-    }
-
-    #[test]
-    fn snapshot_with_residents_round_trips_and_rejects_forgeries() {
-        let mut src = Valset::new("valset");
-        let mut ctx = sys_ctx();
-        futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
-        futures::executor::block_on(src.execute(&mut ctx, &grant(&valid_key(2)))).unwrap();
-        futures::executor::block_on(src.commit_block()).unwrap();
-        let src_root = src.root();
-
-        // the snapshot stays the exact root preimage with residents present.
-        let bytes = src.snapshot();
-        let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        assert_eq!(StateRoot(digest), src_root, "sha256(snapshot()) == root()");
-
-        let mut dst = Valset::new("valset");
-        dst.install(&bytes, src_root).unwrap();
-        assert_eq!(dst.root(), src_root);
-        assert_eq!(validators(&dst), validators(&src));
-        assert_eq!(residents(&dst), residents(&src));
-
-        // bytes past the resident section are trailing garbage — reject them
-        // (single-encoding invariant).
-        let mut two_encodings = Valset::new("valset");
-        let mut c2 = sys_ctx();
-        futures::executor::block_on(two_encodings.execute(&mut c2, &join(&valid_key(3)))).unwrap();
-        futures::executor::block_on(two_encodings.commit_block()).unwrap();
-        let mut padded = two_encodings.snapshot();
-        padded.extend_from_slice(&0u64.to_le_bytes());
-        let err = dst.install(&padded, two_encodings.root()).unwrap_err();
-        assert!(
-            matches!(err, Error::Module(ref m) if m.contains("trailing bytes")),
-            "got {err:?}"
-        );
     }
 }

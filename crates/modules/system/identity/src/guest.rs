@@ -1,30 +1,43 @@
-//! the wasm port of this module, built the ADAPTER
-//! way: the NATIVE `identity` crate is compiled to wasm32 unmodified and
-//! adapted to the `ducktape:module` world through `guest-adapter`, so the
-//! module's logic is single-sourced (a behavior change in the native crate IS
-//! the wasm change).
+//! the wasm port of this module, built the ADAPTER way: the NATIVE `identity`
+//! crate is compiled to wasm32 unmodified and adapted to the
+//! `ducktape:module` world through `guest-adapter`, so the module's logic is
+//! single-sourced (a behavior change in the native crate IS the wasm change).
+//! the packaging cdylib around this port is synthesized by `guest-builder` —
+//! this module is the whole of the guest's hand-written surface.
 //!
-//! identity is the first ported module whose constructor takes a PER-NETWORK
-//! parameter: the chain id every signed certificate preimage folds in. a wasm
-//! component is fixed bytes, so the id cannot be compiled in — it arrives as
-//! GENESIS CONFIG: the host installs an `sdk::genesis_config`-encoded
-//! `__config` entry into this module's consensus store at genesis
-//! construction, and every dispatch decodes it and constructs the native
-//! module with it (see [`chain_id`]). the config is consensus state (identical
-//! on every node, in the root from genesis) and rides checkpoint snapshots
-//! like any other store key, so restore/state-sync need nothing special.
+//! ## the STORE-BACKED dispatch model, and why it is equivalent
 //!
-//! the whole-state dispatch model — load `__state`/`__root` through the host's
-//! staged-overlay reads, run the native `execute` (its valset member gate
-//! resolves through the runtime's memoized replay), commit the INNER module,
-//! save the canonical snapshot back as OUTER staged writes — is the `agent` guest port
-//! verbatim; see that crate for the equivalence argument
-//! spelled out. the persisted encoding is the native canonical snapshot as ONE
-//! host-KV value: a STATE-SCHEMA BREAK versus the native root (revision 2;
-//! beta networks re-genesis, no back-compat shim). the WebAuthn / P-256 member
-//! verifies run IN the guest — pure-Rust p256, deterministic on wasm32.
+//! identity is pure logic over a host-injected [`sdk::MerkleStore`] — so the
+//! port injects [`WitStore`], the adapter's `MerkleStore` over the wit
+//! `state-*` imports, and the REAL qmdb store stays host-side
+//! (`WasmModule::with_store`). there is NO per-dispatch snapshot: the store
+//! IS the state and the wasm root is the store's Merkle root. See the
+//! `pages` guest port for the staging-contract argument spelled out point by
+//! point — identity rides the identical seams: the guest rebuilds the module
+//! FRESH per dispatch over the exact production builder chain, cross-dispatch
+//! read-your-writes comes from the host's outer staged overlay via
+//! `WitStore::get`, and each successful `execute` flushes the inner staging
+//! with the inner `commit_block`. the `BindNode` member gate (valset
+//! validators ∪ residents) resolves through the runtime's memoized replay,
+//! and the WebAuthn / P-256 member verifies run IN the guest — pure-Rust p256,
+//! deterministic on wasm32.
+//!
+//! ## the genesis-config chain id
+//!
+//! identity's per-network parameter is the CHAIN ID every signed certificate
+//! preimage folds in. a wasm component is fixed bytes, so the id arrives as
+//! GENESIS CONFIG: the host seeds an `sdk::genesis_config`-encoded `__config`
+//! record into this module's qmdb store at genesis construction — under
+//! [`sdk::store_key`], the store-backed twin of the host-KV `__config` entry
+//! — and every dispatch reads it back through
+//! [`guest_adapter::store_genesis_chain_id`] and constructs the native module
+//! with it. the config is consensus state in the store's merkle root from
+//! genesis, and it rides state-sync like any other record. the valset sibling
+//! id is genesis-constant wiring (identical on every network), so it stays
+//! compiled in like every other port's sibling ids.
 
 use crate::Identity;
+use guest_adapter::WitStore;
 
 /// the genesis-constant id this module registers under (the native twin's id:
 /// `Env::me` and follow-up routing must read identically to ported logic).
@@ -34,11 +47,16 @@ const MODULE_ID: &str = "identity";
 /// residents union admits a bind origin.
 const VALSET_ID: &str = "valset";
 
-// whole-state port with a per-network chain id from genesis config (the
-// `genesis_chain_id` hook); the shell loads/saves the canonical snapshot and
-// runs the native module per dispatch (see `guest_adapter::snapshot_guest!`).
-guest_adapter::snapshot_guest! {
+// store-backed port: no snapshot — the host owns the real qmdb store and the
+// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+// the per-network chain id comes from the store-seeded genesis config.
+guest_adapter::store_guest! {
     id: MODULE_ID,
     module: Identity,
-    new: Identity::new(MODULE_ID, Some(VALSET_ID.into()), guest_adapter::genesis_chain_id("identity")?),
+    new: Identity::new(
+        MODULE_ID,
+        Box::new(WitStore),
+        Some(VALSET_ID.into()),
+        guest_adapter::store_genesis_chain_id("identity")?,
+    ),
 }

@@ -26,6 +26,10 @@ fn para(id: &str, text: &str) -> NewBlock {
     nb(id, BlockKind::Paragraph, text)
 }
 
+fn page(id: &str, title: &str) -> NewBlock {
+    nb(id, BlockKind::Page, title)
+}
+
 fn msg(m: &PageMsg) -> Msg {
     Msg {
         target: "pages".into(),
@@ -37,7 +41,9 @@ use sdk_testkit::TestCtx;
 
 // drive one op through execute + commit_block (one op per block-height).
 async fn apply_commit(p: &mut Pages, m: &PageMsg) {
-    p.execute(&mut TestCtx::at_height(0), &msg(m)).await.unwrap();
+    p.execute(&mut TestCtx::at_height(0), &msg(m))
+        .await
+        .unwrap();
     p.commit_block().await.unwrap();
 }
 
@@ -55,15 +61,27 @@ async fn apply_expect_err(p: &mut Pages, m: &PageMsg, needle: &str) {
 }
 
 async fn get_page(p: &Pages, page_id: &str) -> Option<Vec<Block>> {
-    let reply = p
-        .query(&encode_query(&PageQuery::GetPage {
-            page_id: page_id.into(),
-        }))
-        .await
-        .unwrap();
-    match decode_reply(&reply).unwrap() {
-        PageReply::Page(v) => v,
-        _ => panic!("expected Page"),
+    let mut blocks = Vec::new();
+    let mut after = None;
+    loop {
+        let reply = p
+            .query(&encode_query(&PageQuery::GetPage {
+                page_id: page_id.into(),
+                after: after.clone(),
+                limit: 0,
+            }))
+            .await
+            .unwrap();
+        let page = match decode_reply(&reply).unwrap() {
+            PageReply::Page(page) => page?,
+            _ => panic!("expected Page"),
+        };
+        blocks.extend(page.blocks);
+        let Some(next) = page.next_after else {
+            return Some(blocks);
+        };
+        assert_ne!(after.as_ref(), Some(&next), "page cursor must advance");
+        after = Some(next);
     }
 }
 
@@ -77,14 +95,6 @@ async fn get_block(p: &Pages, block_id: &str) -> Option<Block> {
     match decode_reply(&reply).unwrap() {
         PageReply::Block(b) => b,
         _ => panic!("expected Block"),
-    }
-}
-
-async fn list_pages(p: &Pages) -> Vec<PageMeta> {
-    let reply = p.query(&encode_query(&PageQuery::ListPages)).await.unwrap();
-    match decode_reply(&reply).unwrap() {
-        PageReply::PageList(l) => l,
-        _ => panic!("expected PageList"),
     }
 }
 
@@ -120,13 +130,15 @@ async fn apply_err_as(p: &mut Pages, m: &PageMsg, origin: sdk::Origin, needle: &
     );
     p.abort_block().await.unwrap();
 }
-async fn query_threads(p: &Pages, targets: &[&str]) -> Vec<TargetThreads> {
-    let q = PageQuery::ThreadsForTargets {
-        targets: targets.iter().map(|s| s.to_string()).collect(),
+/// the [`PageQuery::TargetThreadCount`] cap probe — the kept dispatch read
+/// over the per-target thread index (thread ENUMERATION is index-tier now).
+async fn target_thread_count(p: &Pages, target: &str) -> u64 {
+    let q = PageQuery::TargetThreadCount {
+        target: target.into(),
     };
     match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
-        PageReply::CommentThreads(v) => v,
-        _ => panic!("expected CommentThreads"),
+        PageReply::TargetThreadCount(n) => n,
+        _ => panic!("expected TargetThreadCount"),
     }
 }
 async fn query_thread(p: &Pages, thread_id: &str) -> Option<ThreadView> {
@@ -155,7 +167,6 @@ async fn seed_page(p: &mut Pages, page: &str) {
         &PageMsg::CreatePage {
             page_id: page.into(),
             title: format!("{page} title"),
-            parent: None,
         },
     )
     .await;

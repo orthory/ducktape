@@ -153,8 +153,6 @@ fn message_in(channel: &str, seq: u64, text: &str, thread: Option<u64>) -> Messa
             reply_count: 0,
             last_reply_seq: None,
         },
-        reactions: Vec::new(),
-        channel_head_seq: seq,
     }
 }
 
@@ -314,7 +312,7 @@ fn installed_snapshot_reconstructs_root_and_reads_across_both_keyspaces() {
 
     dst.install(&snap, src_root).unwrap();
 
-    // THE PROPERTY: identical root — the app-hash linkage a joiner needs.
+    // THE PROPERTY: identical root — the root-hash linkage a joiner needs.
     assert_eq!(dst.root(), src_root, "installed root must equal the source");
 
     // query parity across every surface.

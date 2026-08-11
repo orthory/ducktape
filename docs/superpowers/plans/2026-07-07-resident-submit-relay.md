@@ -227,7 +227,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Consumes: `node::{decode_frame, frame_id, FrameId}`, `sdk::Origin`.
 - Produces:
   - `pub enum RelayMsg { Submit { frame: Vec<u8> }, Reply { frame_id: [u8; 32], outcome: RelayOutcome } }`
-  - `pub enum RelayOutcome { Applied { height: u64, app_hash: String }, Rejected { detail: String }, Refused { detail: String } }`
+  - `pub enum RelayOutcome { Applied { height: u64, root_hash: String }, Rejected { detail: String }, Refused { detail: String } }`
   - `pub fn encode_msg(&RelayMsg) -> Vec<u8>`, `pub fn decode_msg(&[u8]) -> Result<RelayMsg, String>`
   - `pub fn verify_relay_submit(frame: &[u8], sender: &[u8], residents: &[Vec<u8>]) -> Result<node::FrameId, String>`
 
@@ -257,9 +257,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RelayOutcome {
-    /// drained Applied at `height`; `app_hash` is the PER-BLOCK boundary
+    /// drained Applied at `height`; `root_hash` is the PER-BLOCK boundary
     /// hash the frame settled at (what a local app-surface hold reports).
-    Applied { height: u64, app_hash: String },
+    Applied { height: u64, root_hash: String },
     /// finalized but deterministically rejected by its module.
     Rejected { detail: String },
     /// refused at the door (bad frame / origin mismatch / no standing) or
@@ -337,7 +337,7 @@ mod tests {
                 frame_id: [7; 32],
                 outcome: RelayOutcome::Applied {
                     height: 42,
-                    app_hash: "aa".into(),
+                    root_hash: "aa".into(),
                 },
             },
             RelayMsg::Reply {
@@ -536,7 +536,7 @@ if let Some((peer, _)) = pending_relays.remove(&d.id) {
     let outcome = match d.disposition {
         node::Disposition::Applied => relay::RelayOutcome::Applied {
             height: d.height,
-            app_hash: hex(&d.app_hash),
+            root_hash: hex(&d.root_hash),
         },
         node::Disposition::Rejected => relay::RelayOutcome::Rejected {
             detail: "op finalized but rejected (deterministic no-op)".into(),
@@ -774,8 +774,8 @@ answer = relay_rx.recv().fuse() => {
         | (RelayHold::Rpc(tx), relay::RelayOutcome::Refused { detail }) => {
             let _ = tx.send(RpcReply::err(detail));
         }
-        (RelayHold::Http(tx), relay::RelayOutcome::Applied { height, app_hash }) => {
-            let _ = tx.send(Ok(noded::BlockSummary { height, app_hash }));
+        (RelayHold::Http(tx), relay::RelayOutcome::Applied { height, root_hash }) => {
+            let _ = tx.send(Ok(noded::BlockSummary { height, root_hash }));
         }
         (RelayHold::Http(tx), relay::RelayOutcome::Rejected { detail })
         | (RelayHold::Http(tx), relay::RelayOutcome::Refused { detail }) => {

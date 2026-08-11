@@ -92,9 +92,11 @@ another node's rendezvous mapping at a wrong address.
 
 ## Running a coordinator
 
-The binary is `bin/coordinator`. It parses one required flag, `--listen`, plus
-the mode selector. It binds exactly one UDP socket, keeps no disk and no config
-file, and prints `coordinator listening on <addr>` on start.
+The binary is `bin/coordinator`. `--listen` selects the UDP rendezvous socket;
+`--relay-listen <addr|none>` selects the optional TCP sealed-intro fallback
+(default `0.0.0.0:443`). The fallback carries only first-contact admission
+datagrams, never the established overlay or peer data. The process keeps no disk
+and no config file.
 
 **Public (the default).** No mode flag needed; the coordinator accepts any
 proof-of-possession-signed request:
@@ -110,14 +112,6 @@ the caller is one of those keys or presents a capability one of them signed:
 
 ```sh
 coordinator --listen 203.0.113.10:3478 --genesis-set /etc/ducktape/network.toml
-```
-
-**Legacy fully-open (development only).** `--allow-anonymous` disables
-proof-of-possession and accepts unauthenticated requests, matching the pre-auth
-behavior. Use it only for local testing:
-
-```sh
-coordinator --listen 127.0.0.1:3478 --allow-anonymous
 ```
 
 A malformed or value-less `--genesis-set` is a **hard error**, never a silent

@@ -20,7 +20,7 @@ shows what is built and tested.
   origins, deterministic environment, `StateRoot`, and the shared snapshot
   codec toolkit (`sdk::codec`).
 - `crates/kernel/host`: registry, dispatch, follow-up drain, block
-  commit/abort lifecycle, global app-hash composition, and the
+  commit/abort lifecycle, global root-hash composition, and the
   non-deterministic worker seam (`host::worker`).
 - `crates/kernel/node`: loopback and ordered node seams between host and orderer.
 - `crates/kernel/consensus`: commonware Simplex orderer, content store, relay,
@@ -29,9 +29,7 @@ shows what is built and tested.
 - `crates/kernel/recovery`: restart durability — op journal, checkpoints,
   boot-time replay.
 - `crates/kernel/indexer`: derived, node-local read index over the finalized
-  op stream; never part of the app-hash.
-- `crates/system/capability-host`: machine-local executor providers behind the
-  capability seam.
+  op stream; never part of the root-hash.
 
 ## System
 
@@ -41,8 +39,8 @@ shows what is built and tested.
 - `crates/system/governance`: validator-set governance over valset.
 - `crates/system/identity`: canonical accounts, member keys, display names, and
   node bindings.
-- `crates/system/duckdns`: optional `<handle>.duck` → AccountId naming, with
-  no node or service directory.
+- `crates/duckdns`: `<handle>.duck` → AccountId naming. A LIBRARY, not a
+  module — the `gateway` module embeds it and owns the on-chain half.
 - `crates/system/wireguard`: validator-set-backed WireGuard tunnel-upgrade
   protocol; `wireguard::effect` is the apply layer.
 - `crates/system/nat-traversal`, `reachability`, `data-plane`, `overlay-net`:
@@ -51,9 +49,14 @@ shows what is built and tested.
 - `crates/system/lifecycle`, `capability`, `dispatch`, and `tagging`: the
   module code registry, executor capabilities, capability-routed dispatch, and
   engagement routing.
-- `crates/system/blobstore`, `gateway`, `dispatch-oracle`: node-local
-  content-addressed blob store, `.duck` gateway route state, and the
-  host-side dispatch worker.
+- `crates/kernel/blobstore`: node-local content-addressed blob store, never in
+  any root. `crates/modules/system/gateway`: `.duck` gateway route state.
+- `crates/services/compute`: the dispatcher's host-side worker half
+  (`compute-service`), off-chain and outside the module tree.
+- `crates/services/provider`: machine-local executor providers behind the
+  capability seam (`provider-host`).
+- `crates/services/sandbox`, `broker`: the node-private podman/egress muscle
+  and the run-scoped credential loopback the provider run loop drives.
 - `crates/duckfs/client`: OS-side checkout/status/commit engine for duckfs; it
   stays off the consensus path.
 - wire surfaces: each module publishes its types-only payload and query shapes at its crate root (`src/interface.rs`).

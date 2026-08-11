@@ -23,6 +23,8 @@ DUCK="$HOME/.ducktape"
 WSDIR="$DUCK/workspaces/$ID"
 REG="$DUCK/registry.json"
 ORIGIN="demo"   # external author stamped on seeded ops (chat rejects an empty author)
+USERKEY="$DUCK/user.key"          # the app signs writes with THIS local key
+DEMO_PASSWORD="${DEMO_KEY_PASSWORD:-ducktape}"  # unlock password for the demo identity
 
 log(){ printf '\033[36m[demo-seed]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[demo-seed] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -44,11 +46,12 @@ fi
 # ── 2. fresh demo workspace (idempotent) ───────────────────────
 log "creating a fresh '$ID' workspace at $WSDIR"
 rm -rf "$WSDIR"; mkdir -p "$WSDIR"
-read -r P1 P2 P3 < <(bun -e 'const l=Array.from({length:3},()=>Bun.listen({hostname:"127.0.0.1",port:0,socket:{data(){}}}));console.log(l.map(x=>x.port).join(" "));l.forEach(x=>x.stop())')
+read -r P1 P2 P3 < <(bun -e 'const l=Array.from({length:3},()=>Bun.listen({hostname:"127.0.0.1",port:0,socket:{data(){}}}));process.stdout.write(l.map(x=>x.port).join(" ")+"\n");l.forEach(x=>x.stop())')
 # A free UDP port for the overlay's WireGuard socket. This MUST be concrete: the
 # reachability plane refuses to start on port 0 ("wireguard_listen needs a
 # concrete UDP port — plane not started"), which leaves the overlay down.
-WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});console.log(s.port);s.close()')"
+WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});process.stdout.write(String(s.port));s.close()')"
+[[ "$WGP" =~ ^[0-9]+$ ]] || die "UDP port allocation produced non-numeric output"
 # Gateway serving needs the app's workspace_create posture:
 #   --gateway            binds the isolated browser plane that serves the routes
 #   --wireguard-listen   a CONCRETE UDP port (0.0.0.0 = endpoint-less/roaming,
@@ -57,11 +60,17 @@ WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});console.log(s.port);s.close
 #   --primary-coordinator a self-contained local demo does NOT phone home to the
 #     none               public rendezvous coordinator; keeps network.toml (which
 #                        the app reboots from) fully local.
-CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
+INIT_ERR="$(mktemp)"
+if ! CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
   --listen "127.0.0.1:$P1" --advertised "127.0.0.1:$P1" \
   --http "127.0.0.1:$P2" --rpc "127.0.0.1:$P3" --gateway 127.0.0.1:0 \
   --primary-coordinator none \
-  --wireguard-listen "0.0.0.0:$WGP" 2>/dev/null | tail -1)"
+  --wireguard-listen "0.0.0.0:$WGP" 2>"$INIT_ERR" | tail -1)"; then
+  sed -n '1,120p' "$INIT_ERR" >&2
+  rm -f "$INIT_ERR"
+  die "node init failed"
+fi
+rm -f "$INIT_ERR"
 [ -n "$CHAIN" ] || die "init produced no chain-id"
 PUB="$("$NODE_BIN" node key --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
 
@@ -85,6 +94,24 @@ writeFileSync(path, JSON.stringify(registry, null, 2));
 JS
 log "registered '$ID' (chain $CHAIN) — set as active workspace"
 
+# ── 3b. user identity ──────────────────────────────────────────
+# The app signs every write (send a message, add a reaction, edit, create a
+# channel) with a local user key it READS from $HOME/.ducktape/user.key — it
+# never mints one itself. Without it, the demo is read-only: the first reaction
+# fails with "cannot read local user key". Provision one so the demo is
+# writable out of the box. Channels are `open`, so any identity may post — no
+# membership step is needed. An EXISTING key is never overwritten (it may be
+# your real identity); we only report how to unlock it.
+if [ -e "$USERKEY" ]; then
+  KEY_PROVISIONED=0
+  log "user key already present at $USERKEY — unlock it with its own password"
+else
+  printf '%s\n' "$DEMO_PASSWORD" | "$NODE_BIN" user key init --out "$USERKEY" >/dev/null \
+    || die "could not create the demo user key at $USERKEY"
+  KEY_PROVISIONED=1
+  log "created a demo user identity at $USERKEY (password: $DEMO_PASSWORD)"
+fi
+
 # ── 4. start the node, wait for its http surface ───────────────
 log "starting node (http 127.0.0.1:$P2)…"
 "$NODE_BIN" node run --config "$WSDIR/node.toml" >"$WSDIR/seed.log" 2>&1 &
@@ -97,6 +124,25 @@ for _ in $(seq 1 80); do
   sleep 0.5
 done
 curl -sf "$URL/v1/status" >/dev/null 2>&1 || die "node http never came up — see $WSDIR/seed.log"
+
+# ── 4b. grant the compute service ──────────────────────────────
+# The compute plane is consent-gated: a [sandbox] table says HOW a run would
+# be isolated, and the user's grant says WHETHER this node runs any. There is
+# no init flag for it any more, so the demo mints the grant the same way an
+# operator does — `service run` discovers this host's providers, signals them,
+# and --enable grants from that live hello. It only needs to run long enough
+# for the grant to land, so it is stopped once services.toml appears.
+"$NODE_BIN" service run compute --enable --workspace "$WSDIR" >"$WSDIR/service.log" 2>&1 &
+SVC_PID=$!
+for _ in $(seq 1 50); do [ -f "$WSDIR/services.toml" ] && break; sleep 0.1; done
+kill "$SVC_PID" 2>/dev/null; wait "$SVC_PID" 2>/dev/null
+if [ -f "$WSDIR/services.toml" ]; then
+  log "compute granted — agent runs available"
+else
+  log "compute NOT granted (no usable container runtime?) — see $WSDIR/service.log;"
+  log "  the demo still runs, just without agent runs. Grant it later with:"
+  log "  ducktape service run compute --workspace $WSDIR"
+fi
 
 # ── 5. seed ops ────────────────────────────────────────────────
 N=0
@@ -132,20 +178,22 @@ submit chat '{"add_reaction":{"channel_id":"general","seq":1,"emoji":"🦆"}}'
 submit chat '{"post_message":{"channel_id":"engineering","message_id":"e1","blocks":[{"paragraph":[{"text":"CI is green on dev.","marks":[]}]}],"thread":null,"as_agent":null}}'
 submit chat '{"post_message":{"channel_id":"product","message_id":"p1","blocks":[{"paragraph":[{"text":"Demo script for the deck is ready.","marks":[]}]}],"thread":null,"as_agent":null}}'
 
-# tasks — a small board with mixed statuses
-submit tasks '{"create_task":{"task_id":"t1","title":"Draft the launch announcement"}}'
-submit tasks '{"create_task":{"task_id":"t2","title":"Review the onboarding flow"}}'
-submit tasks '{"create_task":{"task_id":"t3","title":"Fix flaky identity test"}}'
-submit tasks '{"update_status":{"task_id":"t2","status":"in_progress"}}'
-submit tasks '{"update_status":{"task_id":"t3","status":"done"}}'
+# tasks — a small board with mixed statuses. both boards ride ONE wire envelope
+# (WorkMsg): task-board ops are wrapped `{"task":{…}}`, job-board ops `{"job":{…}}`.
+submit tasks '{"task":{"create_task":{"task_id":"t1","title":"Draft the launch announcement"}}}'
+submit tasks '{"task":{"create_task":{"task_id":"t2","title":"Review the onboarding flow"}}}'
+submit tasks '{"task":{"create_task":{"task_id":"t3","title":"Fix flaky identity test"}}}'
+submit tasks '{"task":{"update_status":{"task_id":"t2","status":"in_progress"}}}'
+submit tasks '{"task":{"update_status":{"task_id":"t3","status":"done"}}}'
 
 # agent — register a demo agent, watch general for @mentions, then mention it
 submit agent '{"register_agent":{"agent_id":"quackbot","display_name":"Quackbot","capability":"mock-llm-1","prompt_hash":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"allowed_actions":["chat.post","tasks.create"]}}'
 submit runs '{"watch_channel":{"channel_id":"general","policy":"mention"}}'
 submit chat '{"post_message":{"channel_id":"general","message_id":"g4","blocks":[{"paragraph":[{"text":"hey ","marks":[]},{"text":"@quackbot","marks":[{"mention":{"agent":{"module":"runs","agent_id":"quackbot"}}}]},{"text":" can you follow up?","marks":[]}]}],"thread":null,"as_agent":null}}'
 
-# jobs — a job on the board
-submit jobs '{"submit":{"job_id":"j1","kind":"demo","spec":"render the welcome deck"}}'
+# jobs — a job on the board. the job board shares the "tasks" target under the
+# WorkMsg `{"job":{…}}` arm (there is no separate "jobs" module).
+submit tasks '{"job":{"submit":{"job_id":"j1","kind":"demo","spec":"render the welcome deck"}}}'
 
 # inbox — a starter notification for the demo author
 submit inbox '{"deliver":{"member":"demo","kind":"welcome","body":"Your demo network is ready."}}'
@@ -158,13 +206,31 @@ submit automations '{"create_rule":{"rule_id":"deploy-watch","trigger":{"channel
 #   • site — a NETWORK-hosted static app, served from DuckFS by consensus
 #   • app  — a USER-hosted app the gateway proxies to a node-local server
 #   • board — the network-visible kanban reference app
+# Sign the routes with the identity we just provisioned. When the key already
+# existed, we don't hold its password, so pass an empty one — the helper then
+# fails to sign and routes are skipped (non-fatal); chat/tasks/pages are already
+# durable regardless.
 GATEWAY_ROUTES=3
-bun "$SCRIPT_DIR/demo-gateway.mjs" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID"
+GATEWAY_PW=""
+[ "${KEY_PROVISIONED:-0}" -eq 1 ] && GATEWAY_PW="$DEMO_PASSWORD"
+bun "$SCRIPT_DIR/demo-gateway.mjs" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID" "$USERKEY" "$GATEWAY_PW"
 gateway_status=$?
+# Route publishing is a demo garnish — its failure never kills the seed. The
+# core workspace (chat, tasks, pages, identity) is committed before this runs.
 case "$gateway_status" in
   0) ;;
-  78) GATEWAY_ROUTES=0 ;;
-  *) die "gateway route publish failed" ;;
+  # name the LIKELY cause here too, not just in the closing banner: an operator
+  # reading the log tail should not have to reach the end to learn that an
+  # empty signing password (an existing key we hold no password for) is the
+  # overwhelmingly common reason, not helper drift.
+  *)
+    GATEWAY_ROUTES=0
+    if [ "${KEY_PROVISIONED:-0}" -eq 1 ]; then
+      log "gateway routes skipped (exit $gateway_status) — see $WSDIR/seed.log"
+    else
+      log "gateway routes skipped (exit $gateway_status) — demo-seed holds no password for the existing $USERKEY, so the helper signed with an empty one; see $WSDIR/seed.log"
+    fi
+    ;;
 esac
 
 log "seeded $N ops + $GATEWAY_ROUTES gateway web-app routes across pages, chat, tasks, agent, runs, jobs, inbox, automations, files, gateway"
@@ -177,13 +243,47 @@ cat <<EOF
 $(printf '\033[32m[demo-seed] done.\033[0m')
 Open the Ducktape app and it boots into the "$ID" workspace, preloaded.
 
+To WRITE (send a message, add a reaction, edit): the app signs with your local
+user key, so unlock it once — open the connection panel (bottom-left of the
+sidebar), type the key password, and click Connect.
 EOF
+
+if [ "${KEY_PROVISIONED:-0}" -eq 1 ]; then
+cat <<EOF
+  key password: $DEMO_PASSWORD   (a fresh demo identity demo-seed just created)
+
+EOF
+else
+cat <<EOF
+  key password: (your existing $USERKEY — demo-seed left it untouched)
+
+EOF
+fi
 
 if [ "$GATEWAY_ROUTES" -eq 0 ]; then
 cat <<EOF
-Gateway web apps were not published: the embedded gateway component still
-expects Identity's retired node-list wire. Regenerate crates/modules/system/gateway/component.wasm (cargo run -p guest-builder -- crates/modules/system/gateway);
-the seed deliberately does not submit a backwards-compatible payload.
+Gateway web apps were not published — see $WSDIR/seed.log for the exact
+rejection. This is a demo garnish only: chat, tasks, pages and your identity are
+all live.
+$(if [ "${KEY_PROVISIONED:-0}" -eq 1 ]; then
+cat <<'INNER'
+
+demo-seed minted this key and signed with it, so this is not a key problem —
+the route helper is out of step with the current gateway/duckdns wire.
+INNER
+else
+cat <<INNER
+
+Almost certainly your key, not the helper: demo-seed did not create $USERKEY, so
+it does not hold your password and passed an empty one — the helper cannot sign
+the routes with that. A raw-hex PLAINTEXT key fails here for the same reason, and
+is the same thing that makes the app refuse in-app writes with only the Settings
+PLAINTEXT warning to point at it.
+
+Re-run against a workspace with no user key (or move $USERKEY aside) to get the
+routes; nothing else in the seed depends on them.
+INNER
+fi)
 EOF
 else
 cat <<EOF

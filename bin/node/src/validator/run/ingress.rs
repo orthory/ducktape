@@ -8,9 +8,9 @@ use sdk::Msg;
 
 use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
-use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, SUBMIT_HOLD};
+use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
 use crate::host_reads::{
-    read_clients, read_redemptions_from_host, read_valset_members, read_valset_residents,
+    read_clients, read_redemption_from_host, read_valset_members, read_valset_residents,
 };
 use crate::rpc::{
     JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
@@ -42,12 +42,44 @@ impl ValidatorRuntime<'_> {
         );
     }
 
-    /// one direct-peer sample: the exposition parse plus valset standing.
+    /// the ONE observability publish seam: refresh the pricier sections
+    /// (throttled to `OPS_REFRESH_INTERVAL` — the exposition parse AND the
+    /// valset standing reads ride the same pace), then publish this node's
+    /// boundary snapshot into the shared cell. called at startup and at the
+    /// end of every drain turn.
+    pub(super) async fn publish_status(&mut self) {
+        if self.context.current() >= self.next_ops_refresh {
+            let exposition = self.context.encode();
+            self.refresh_operations(&exposition).await;
+            // the peers standing: committed valset roles + chain position for
+            // the off-lane /v1/peers composition. roles move only on valset
+            // change, so the 1/s pace bounds staleness far below block rate.
+            let hex_set = |keys: Vec<Vec<u8>>| keys.iter().map(|k| hex_bytes(k)).collect();
+            self.status.publish_peers(noded::PeersStanding {
+                validators: hex_set(read_valset_members(self.node.host()).await),
+                residents: hex_set(read_valset_residents(self.node.host()).await),
+                height: self.node.finalized().map(|f| f.height).unwrap_or(0),
+                epoch: Some(self.orchestrator.epoch()),
+            });
+            self.next_ops_refresh = self.context.current() + OPS_REFRESH_INTERVAL;
+        }
+        super::publish_boundary_status(
+            &self.status,
+            &self.node,
+            &self.metrics,
+            &self.status_public_key,
+        );
+    }
+
+    /// one direct-peer sample: the exposition parse plus valset standing,
+    /// stamped with this validator's own chain position.
     async fn peers_sample(&self) -> noded::peers::PeersView {
         let hex_set = |keys: Vec<Vec<u8>>| keys.iter().map(|k| hex_bytes(k)).collect();
         let validators = hex_set(read_valset_members(self.node.host()).await);
         let residents = hex_set(read_valset_residents(self.node.host()).await);
-        noded::peers::peers_from_exposition(&self.context.encode(), unix_ms())
+        let height = self.node.finalized().map(|f| f.height).unwrap_or(0);
+        let epoch = Some(self.orchestrator.epoch());
+        noded::peers::peers_from_exposition(&self.context.encode(), unix_ms(), height, epoch)
             .with_roles(&validators, &residents)
     }
 
@@ -97,7 +129,7 @@ impl ValidatorRuntime<'_> {
                 RpcReply {
                     status: Some(RpcStatus {
                         height: node.finalized().map(|f| f.height),
-                        app_hash: hex(&node.app_hash()),
+                        root_hash: hex(&node.root_hash()),
                         modules,
                     }),
                     ..RpcReply::ok()
@@ -160,32 +192,6 @@ impl ValidatorRuntime<'_> {
         let _ = reply.send(resp);
     }
 
-    pub(super) async fn on_oracle_result(&mut self, msg: Msg) {
-        let Self {
-            node,
-            next_seq,
-            signer,
-            label,
-            ..
-        } = self;
-
-        // a completed off-loop provider run: its OracleResult op
-        // re-enters the ordered lane as an ordinary signed
-        // submit — the oracle-as-op, unchanged; only WHERE the
-        // provider ran moved.
-        let seq = *next_seq;
-        *next_seq += 1;
-        if let Err(e) = node.submit(signer, seq, msg).await {
-            tracing::warn!(
-                target: "ducktape::saga",
-                node = %label,
-                error = %e,
-                reason = "oracle_result_submit_failed",
-                "oracle result dropped"
-            );
-        }
-    }
-
     /// the join gate (join ADR §4), arriving over the WireGuard-tunnel
     /// doorbell: the reachability plane already OPENED and VERIFIED the sealed
     /// intro (V1–V5 crypto, V4 expiry, V8 role) and installed the tunnel —
@@ -214,14 +220,12 @@ impl ValidatorRuntime<'_> {
 
         let joiner_bytes = fwd.joiner.clone();
         let issuer_bytes = fwd.issuer.clone();
-        // V6: nonce unspent in committed redemptions. a nonce redeemed by
-        // ANOTHER key can never redeem again — terminal Spent. (redeemed by
-        // the SAME key = this joiner already has standing; V9 handles it.)
-        let redemptions = read_redemptions_from_host(node.host()).await;
-        if let Some(spent) = redemptions
-            .iter()
-            .find(|r| r.nonce == fwd.nonce && r.joiner != joiner_bytes)
-        {
+        // V6: nonce unspent in committed redemptions — a point read by nonce
+        // against the exactly-once set. a nonce redeemed by ANOTHER key can
+        // never redeem again — terminal Spent. (redeemed by the SAME key =
+        // this joiner already has standing; V9 handles it.)
+        let redemption = read_redemption_from_host(node.host(), &fwd.nonce).await;
+        if let Some(spent) = redemption.filter(|r| r.joiner != joiner_bytes) {
             tracing::warn!(
                 target: "ducktape::join",
                 node = %label,
@@ -394,6 +398,16 @@ impl ValidatorRuntime<'_> {
     }
 
     pub(super) async fn on_relay(&mut self, peer: ed25519::PublicKey, bytes: Vec<u8>) {
+        let Ok(msg) = relay::decode_msg(&bytes) else {
+            return;
+        };
+        // the leader nudge is not part of the relay submit protocol — it
+        // carries no frame, needs no standing read, and touches no relay
+        // state — so it dispatches BEFORE the protocol machine.
+        if matches!(msg, relay::RelayMsg::Nudge) {
+            self.on_leader_nudge(&peer).await;
+            return;
+        }
         let Self {
             context,
             node,
@@ -405,9 +419,6 @@ impl ValidatorRuntime<'_> {
         } = self;
         let now = context.current();
 
-        let Ok(msg) = relay::decode_msg(&bytes) else {
-            return;
-        };
         let needs_standing = matches!(
             msg,
             relay::RelayMsg::BlobOffer { .. } | relay::RelayMsg::Submit { .. }
@@ -548,7 +559,7 @@ impl ValidatorRuntime<'_> {
             } => {
                 let seq = self.next_seq;
                 self.next_seq += 1;
-                let frame = node::encode_frame(&self.signer, seq, &Msg { target, payload }, None);
+                let frame = node::encode_frame(&self.signer, seq, &Msg { target, payload });
                 self.submit_local_frame(frame, reply).await;
             }
             // an ALREADY-SIGNED frame: submitted VERBATIM, never re-signed and
@@ -568,41 +579,6 @@ impl ValidatorRuntime<'_> {
                     .await
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
-            }
-            noded::NodeCommand::Status { reply } => {
-                let exposition = self.context.encode();
-                self.refresh_operations(&exposition).await;
-                let modules = MODULE_IDS
-                    .iter()
-                    .map(|m| noded::ModuleStatus {
-                        id: (*m).into(),
-                        root: self
-                            .node
-                            .host()
-                            .module_root(m)
-                            .map(|r| hex(&r))
-                            .unwrap_or_default(),
-                        category: noded::ModuleCategory::of(m),
-                    })
-                    .collect();
-                let _ = reply.send(noded::NodeStatus {
-                    version: env!("CARGO_PKG_VERSION").into(),
-                    app_hash: hex(&self.node.app_hash()),
-                    height: self.node.finalized().map(|f| f.height).unwrap_or(0),
-                    modules,
-                    public_key: self.status_public_key.clone(),
-                    operations: self.metrics.operational_status(),
-                });
-            }
-            noded::NodeCommand::Peers { reply } => {
-                let _ = reply.send(self.peers_sample().await);
-            }
-            noded::NodeCommand::Metrics { reply } => {
-                // one registry: commonware's runtime series plus the
-                // `ducktape_*` block series the drain loop records.
-                let exposition = self.context.encode();
-                self.refresh_operations(&exposition).await;
-                let _ = reply.send(self.context.encode());
             }
         }
     }

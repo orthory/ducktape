@@ -34,7 +34,7 @@
 //!     [`WasmModule::with_store`]): the root IS the store's merkle root and
 //!     sync is the store's resolver lane, so a native module already written
 //!     over `Box<dyn MerkleStore>` ports with a ROOT-CONTINUOUS cutover — the
-//!     same ops commit the same store ops and the app-hash never moves. store
+//!     same ops commit the same store ops and the root-hash never moves. store
 //!     reads are async, so `state-get` misses ride the SAME memoized-replay
 //!     machinery as sibling reads (bounded by [`MAX_STORE_READS`]); the staged
 //!     overlay and the commit/abort boundary are identical in both backings.
@@ -74,7 +74,9 @@ mod bindings {
 }
 
 use bindings::Module as ModuleWorld;
-use bindings::ducktape::module::host::{self, Env as WitEnv, Error as WitError, Origin as WitOrigin};
+use bindings::ducktape::module::host::{
+    self, Env as WitEnv, Error as WitError, Origin as WitOrigin,
+};
 
 /// default per-dispatch fuel budget: the deterministic termination bound. It is
 /// identical on every validator, so a runaway guest traps at the same point on
@@ -131,7 +133,7 @@ pub trait HostOdb {
 /// durable refs file (Task 4), or the in-memory mock the kernel tests drive.
 ///
 /// the crux is `root()` = `StateRoot(sha256(refs_bytes()))` — the canonical refs
-/// image, NOT the host-KV encoding — so a wasm files tenant's app-hash is
+/// image, NOT the host-KV encoding — so a wasm files tenant's root-hash is
 /// byte-identical to native files' `sha256(encode_refs)` and the cutover moves
 /// no root. the guest sees the refs image through the ordinary `state-*` lane
 /// under [`REFS_KEY`] (state-get serves the committed image staged-over, state-set
@@ -179,10 +181,7 @@ pub trait OdbBacking: HostOdb {
     /// fresh substrate with no envelope yet — the per-commit recovery cursor
     /// [`Module::durable_commit_height`] surfaces so trailing-block recovery can
     /// verify a disk substrate that committed a block whose journal seal was lost
-    /// to a crash. byte-identical to native `Files::durable_commit_height`
-    /// (`module.rs`): dropping it would silently downgrade a wasm files tenant's
-    /// crash recovery from `SelectiveReplay` to `AssumeApplied`, so this rides the
-    /// backing to keep the cutover recovery-continuous, not just root-continuous.
+    /// to a crash. This keeps the files recovery path verifiable.
     fn durable_commit_height(&self) -> Option<u64>;
 }
 
@@ -314,7 +313,7 @@ struct HostData {
     /// finishes cleanly.
     pending: Option<PendingRead>,
     /// a ctx-less run (plain [`Module::query`]) has no SIBLING resolver: a memo
-    /// miss on module-root/query-module answers the pre-cutover stub surface
+    /// miss on module-root/query-module answers the ctx-less stub surface
     /// (root `None`, query `unsupported`) instead of pausing the run. state
     /// reads are NOT sealed — the injected store is the module's own state and
     /// is always resolvable, ctx or not.
@@ -332,6 +331,7 @@ struct HostData {
     object_puts: BTreeMap<Vec<u8>, Vec<u8>>,
     out_msgs: Vec<(String, Vec<u8>)>,
     out_events: Vec<(String, Vec<u8>)>,
+    out_assigned: Vec<u8>,
 }
 
 impl host::Host for HostData {
@@ -430,6 +430,9 @@ impl host::Host for HostData {
     fn emit_event(&mut self, source: String, payload: Vec<u8>) {
         self.out_events.push((source, payload));
     }
+    fn set_assigned(&mut self, stamp: Vec<u8>) {
+        self.out_assigned = stamp;
+    }
 }
 
 /// map a host-ctx read error onto the deterministic wit error surface a guest
@@ -485,7 +488,7 @@ pub struct WasmModule {
     component: Component,
     /// sha256 of the component bytes currently loaded — the CODE identity the
     /// host reconciles against the registry's committed active hash. NOT part of
-    /// `root()` (code is invisible to the app-hash); per-node realization only.
+    /// `root()` (code is invisible to the root-hash); per-node realization only.
     code_hash: Vec<u8>,
     backing: StateBacking,
     staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
@@ -495,10 +498,6 @@ pub struct WasmModule {
     /// the block boundary. always empty for non-object tenants.
     staged_objects: BTreeMap<Vec<u8>, Vec<u8>>,
     fuel: u64,
-    /// the canonical committed-state revision this tenant declares (see
-    /// [`Module::state_schema_revision`]). a byte-compatible port keeps the
-    /// native module's revision; a port that changes the state layout bumps it.
-    state_schema_revision: u32,
     /// serve QUERY rounds from committed state ALONE — the staged overlay is
     /// dropped for the read (execute rounds are untouched). opt-in, for a ported
     /// native module whose query surface was committed-only regardless of caller
@@ -532,7 +531,6 @@ impl WasmModule {
             staged: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
             fuel: DEFAULT_FUEL,
-            state_schema_revision: 1,
             committed_queries: false,
             block_height: None,
         })
@@ -627,15 +625,6 @@ impl WasmModule {
         }
     }
 
-    /// declare a non-default canonical-state revision (the recovery/state-sync
-    /// schema fence). a ported module that KEPT its native predecessor's byte
-    /// encoding keeps its revision (directory: 1); a port that changed the
-    /// layout must bump it in the same change, exactly like a native module.
-    pub fn with_state_schema_revision(mut self, revision: u32) -> Self {
-        self.state_schema_revision = revision;
-        self
-    }
-
     /// serve this tenant's QUERY rounds from committed state ALONE — drop the
     /// staged overlay for the read (execute rounds keep their read-your-writes
     /// stage). the opt-in for a ported native module whose query surface was
@@ -660,7 +649,7 @@ impl WasmModule {
     /// The authenticated root of the committed store: SHA-256 over
     /// [`WasmModule::encode_state`]. Deterministic and idempotent — the same
     /// scheme the native map-backed modules use, so it composes into the global
-    /// app-hash exactly like any other module root.
+    /// root-hash exactly like any other module root.
     fn root_of(committed: &BTreeMap<Vec<u8>, Vec<u8>>) -> StateRoot {
         let mut h = Sha256::new();
         h.update(Self::encode_state(committed));
@@ -773,6 +762,7 @@ impl WasmModule {
             object_puts: BTreeMap::new(),
             out_msgs: Vec::new(),
             out_events: Vec::new(),
+            out_assigned: Vec::new(),
         };
         let mut store = Store::new(&self.engine, data);
         let call: Result<Result<Vec<u8>, WitError>, SdkError> = match store.set_fuel(self.fuel) {
@@ -836,7 +826,9 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, SdkError> {
     // each entry costs at least two 8-byte length prefixes — a forged count can
     // never over-allocate.
     if count > (buf.len() / 16) as u64 {
-        return Err(SdkError::Module("snapshot entry count exceeds buffer".into()));
+        return Err(SdkError::Module(
+            "snapshot entry count exceeds buffer".into(),
+        ));
     }
     let mut committed = BTreeMap::new();
     let mut prev: Option<Vec<u8>> = None;
@@ -871,7 +863,7 @@ fn deterministic_config() -> Config {
     c.wasm_component_model(true);
     c.consume_fuel(true);
     // float ops emit ONE canonical NaN bit pattern: a guest computing floats
-    // can never leak host-hardware NaN payloads into state or the app-hash.
+    // can never leak host-hardware NaN payloads into state or the root-hash.
     c.cranelift_nan_canonicalization(true);
     c.wasm_simd(false);
     c.wasm_relaxed_simd(false);
@@ -931,7 +923,7 @@ impl Module for WasmModule {
 
     /// map mode: sha256 over the canonical host-KV encoding. store mode: the
     /// injected store's REAL merkle root, verbatim — the same value the native
-    /// module computed pre-cutover, so the app-hash is continuous.
+    /// module computed pre-cutover, so the root-hash is continuous.
     fn root(&self) -> StateRoot {
         match &self.backing {
             StateBacking::Map { committed } => Self::root_of(committed),
@@ -943,10 +935,6 @@ impl Module for WasmModule {
         }
     }
 
-    fn state_schema_revision(&self) -> u32 {
-        self.state_schema_revision
-    }
-
     fn code_hash(&self) -> Option<Vec<u8>> {
         Some(self.code_hash.clone())
     }
@@ -954,8 +942,7 @@ impl Module for WasmModule {
     /// only an ODB substrate tracks a durable-commit cursor (the native files
     /// recovery bookkeeping it inherits); Map/Store tenants self-durably commit
     /// through their own stores and expose no cursor (the trait default `None`).
-    /// delegating this keeps the files cutover recovery-continuous — a trailing
-    /// unsealed files block still heals via `SelectiveReplay`, exactly as native.
+    /// Delegating this lets recovery verify a trailing unsealed files block.
     fn durable_commit_height(&self) -> Option<u64> {
         match &self.backing {
             StateBacking::Map { .. } | StateBacking::Store { .. } => None,
@@ -1009,11 +996,12 @@ impl Module for WasmModule {
 
     /// Replace the component code IN PLACE, keeping the host-owned state store.
     /// This is the live-update primitive: same store, new logic, and the root is
-    /// computed from the (untouched) store — so app-hash is continuous across the
+    /// computed from the (untouched) store — so root-hash is continuous across the
     /// swap. Staged (yet uncommitted) writes are discarded: a swap is only ever
     /// driven at a clean block boundary, never mid-block.
     fn swap_code(&mut self, component_bytes: &[u8]) -> Result<(), SdkError> {
-        let component = Component::from_binary(&self.engine, component_bytes).map_err(module_err)?;
+        let component =
+            Component::from_binary(&self.engine, component_bytes).map_err(module_err)?;
         self.component = component;
         self.code_hash = sha256(component_bytes);
         self.staged.clear();
@@ -1062,6 +1050,7 @@ impl Module for WasmModule {
                 object_puts: staged_objects0.clone(),
                 out_msgs: Vec::new(),
                 out_events: Vec::new(),
+                out_assigned: Vec::new(),
             };
             let mut store = Store::new(&self.engine, data);
 
@@ -1070,7 +1059,9 @@ impl Module for WasmModule {
                 Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker)
                 {
                     Err(e) => Err(module_err(e)),
-                    Ok(inst) => inst.call_execute(&mut store, &msg.payload).map_err(module_err),
+                    Ok(inst) => inst
+                        .call_execute(&mut store, &msg.payload)
+                        .map_err(module_err),
                 },
             };
 
@@ -1120,6 +1111,9 @@ impl Module for WasmModule {
                     }
                     for (source, payload) in data.out_events {
                         ctx.emit_event(Event { source, payload });
+                    }
+                    if !data.out_assigned.is_empty() {
+                        ctx.set_assigned(data.out_assigned);
                     }
                     Ok(())
                 }
@@ -1315,8 +1309,7 @@ impl Module for WasmModule {
         // tell an odb backing to drop any block-local pending too (native
         // `Fs::abort_block`; a disk backing may sweep orphan object files). in
         // the fatal-or-complete commit model the backing has no pending here
-        // unless a commit failed partway, so this is a forward-compat safety
-        // hook for Task 4's disk cleanup.
+        // unless a commit failed partway.
         match &mut self.backing {
             StateBacking::Odb { backing } => backing.discard_block(),
             StateBacking::Map { .. } | StateBacking::Store { .. } => {}

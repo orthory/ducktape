@@ -5,10 +5,12 @@ version.workspace = true
 
 # the account registry as replicated state: an ACCOUNT (an umbrella keyed by
 # its founding key) collects many MEMBER KEYS of different schemes and owns
-# many NODES (each a mesh/valset identity). depends on sdk + valset wire types
-# (to member-gate binds) + commonware-cryptography (to verify ed25519/p256
-# member certificates deterministically) + p256/base64 (for the bespoke
-# WebAuthn passkey envelope, which commonware's namespaced signer can't cover).
+# many NODES (each a mesh/valset identity). state is pure logic over a
+# host-injected qmdb MerkleStore (StagedStore records); the module root IS the
+# store's merkle root. depends on sdk + valset wire types (to member-gate
+# binds) + commonware-cryptography (to verify ed25519/p256 member certificates
+# deterministically) + p256/base64 (for the bespoke WebAuthn passkey envelope,
+# which commonware's namespaced signer can't cover).
 [dependencies]
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
@@ -16,6 +18,9 @@ guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 sdk = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# the store-record codec: compact, canonical, deterministic — the same
+# envelope the derived tier's fold feed already uses. wire stays sdk::wire.
+borsh = { workspace = true }
 valset = { workspace = true }
 commonware-cryptography = { workspace = true }
 # union_unique: the exact namespaced signing preimage commonware's native
@@ -50,3 +55,6 @@ testkit = []
 [dev-dependencies]
 futures = { workspace = true }
 sdk-testkit = { workspace = true }
+# the sync round-trip proof drives a real qmdb source/joiner pair.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }

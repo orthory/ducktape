@@ -78,8 +78,7 @@ fn managed_prefix(id: &str, suffix: &[String]) -> String {
 /// resolve the caller's workspace vocabulary into the duckfs namespace recorded
 /// in `.duckfs/index.json`. `/workspace` is intentionally local to this RPC: it
 /// maps to an id-scoped managed prefix, so a job can edit its returned disk dir
-/// without knowing the module's writable roots. explicit `/shared...` is still
-/// accepted for the older CLI/e2e contract.
+/// without knowing the module's writable roots.
 fn checkout_prefix(id: &str, requested: &str) -> Result<String, String> {
     let trimmed = requested.trim().trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "/" {
@@ -95,11 +94,7 @@ fn checkout_prefix(id: &str, requested: &str) -> Result<String, String> {
         .map_err(|e| format!("duckfs workspace prefix is invalid: {e}"))?;
     match segs.first().map(String::as_str) {
         Some("workspace") => Ok(managed_prefix(id, &segs[1..])),
-        Some("shared") => Ok(format!("/{}", segs.join("/"))),
-        _ => Err(
-            "duckfs workspace prefix must be /workspace (managed) or /shared (explicit)"
-                .to_string(),
-        ),
+        _ => Err("duckfs workspace prefix must be /workspace".to_string()),
     }
 }
 
@@ -116,8 +111,7 @@ fn unconfigured() -> Response {
 #[derive(Debug, Deserialize)]
 pub struct CreateBody {
     /// the duckfs subtree to check out. omitted/empty/`/workspace` means the
-    /// daemon chooses an id-scoped managed namespace for this local workspace;
-    /// explicit `/shared...` remains available for legacy callers.
+    /// daemon chooses an id-scoped managed namespace for this local workspace.
     #[serde(default)]
     pub prefix: Option<String>,
     /// an explicit snapshot to check out at; omitted/`null` = the committed head

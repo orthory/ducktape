@@ -1,14 +1,12 @@
-//! the adapter-port equivalence proof for the capability cutover: the
-//! `capability` guest component (the NATIVE `capability` crate compiled to wasm
-//! behind `guest-adapter`) and the native `CapabilityRegistry` answer the SAME
-//! op sequence with IDENTICAL query replies, and their roots move in lockstep
-//! (move on commit, hold on no-ops and abort). the roots THEMSELVES differ —
-//! the port persists the native canonical snapshot as one host-KV value, a
-//! declared state-schema break (revision 2) — and this proof pins that
-//! difference so it can never be mistaken for accidental compatibility.
-//! (unlike inbox/tagging, capability's empty root is the ZERO sentinel while
-//! the wasm root hashes the empty host-KV store, so here the break is visible
-//! from GENESIS — as it is for vaults.)
+//! the STORE-BACKED cutover-continuity proof for capability: the `capability`
+//! guest component over `WasmModule::with_store(QmdbStore)` and the native
+//! `CapabilityRegistry` over the same store shape are ROOT-CONTINUOUS — the
+//! same op sequence commits the IDENTICAL qmdb merkle root after every block
+//! (both roots ARE the store's root; qmdb's batch canonicalizes mutations by
+//! hashed key, so the native logical-key commit order and the wasm hashed-key
+//! drain order produce the same op log). capability carries no per-network
+//! genesis config, so both stores start empty and the genesis roots are
+//! already equal.
 //!
 //! capability is MEMBER-GATED against a sibling, which is the point of this
 //! tenant: every announce queries the valset module's live Validators AND
@@ -20,57 +18,71 @@
 //! rejection (outsider) — all decided by sibling reads on the wasm side.
 
 use capability::{
-    decode_reply, encode_msg, encode_query, CapabilityMsg, CapabilityQuery, CapabilityRegistry,
-    CapabilityReply,
+    CapabilityMsg, CapabilityQuery, CapabilityRegistry, CapabilityReply, decode_reply, encode_msg,
+    encode_query,
 };
-use commonware_cryptography::ed25519::PrivateKey;
 use commonware_cryptography::Signer as _;
+use commonware_cryptography::ed25519::PrivateKey;
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Error, Msg, Origin, StateRoot};
-use valset::{encode_msg as valset_encode_msg, Valset, ValsetMsg};
+use statesync::qmdb::QmdbStore;
+use valset::{Valset, ValsetMsg, encode_msg as valset_encode_msg};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `capability` module's guest port by
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const CAPABILITY_WASM: &[u8] = include_bytes!("fixtures/capability.component.wasm");
 
-fn wasm_capability() -> WasmModule {
-    WasmModule::from_bytes("capability", CAPABILITY_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 2 of the capability
-        // canonical state — the declaration bin/node makes at cutover.
-        .with_state_schema_revision(2)
+/// a fresh qmdb store. `label` doubles as the store id: the deterministic
+/// runtime keys storage partitions by id alone (child labels do not namespace
+/// them), so a shared id would make the second store REPLAY the first's
+/// journal. the id is not part of the qmdb root, so distinct ids cost nothing.
+async fn cap_store(
+    context: &deterministic::Context,
+    label: &'static str,
+) -> QmdbStore<deterministic::Context> {
+    QmdbStore::init(context.child(label), label).await
+}
+
+/// the wasm capability over the host-constructed store — exactly the
+/// production construction (`bin/node/src/host_state.rs`).
+fn wasm_capability(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store("capability", CAPABILITY_WASM, store).expect("load component")
 }
 
 /// EXACTLY the production wiring in bin/node's host state — the valset id is
-/// genesis config, so both runtimes (and the guest itself) must gate against
+/// genesis wiring, so both runtimes (and the guest itself) must gate against
 /// the same sibling or the member gate forks.
-fn native_capability() -> CapabilityRegistry {
-    CapabilityRegistry::new("capability", Some("valset".into()))
+fn native_capability(store: Box<dyn sdk::MerkleStore>) -> CapabilityRegistry {
+    CapabilityRegistry::new("capability", store, Some("valset".into()))
 }
 
 /// a REAL valset sibling, genesis-seeded with `validators` — the module whose
 /// live Validators/Residents projections every announce is gated on.
-fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset");
+async fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
+    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
     for v in validators {
-        valset.insert(v.clone());
+        valset.seed(v.clone()).await.expect("seed valset");
     }
+    valset.finish_seed().await.expect("seed valset");
     valset
 }
 
-fn native_host(validators: &[Vec<u8>]) -> Host {
+async fn native_host(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+    let store = cap_store(context, "native_cap").await;
     Host::genesis(vec![
-        Box::new(native_capability()),
-        Box::new(seeded_valset(validators)),
+        Box::new(native_capability(Box::new(store))),
+        Box::new(seeded_valset(validators).await),
     ])
     .expect("genesis")
 }
 
-fn wasm_host_(validators: &[Vec<u8>]) -> Host {
+async fn wasm_host_(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+    let store = cap_store(context, "wasm_cap").await;
     Host::genesis(vec![
-        Box::new(wasm_capability()),
-        Box::new(seeded_valset(validators)),
+        Box::new(wasm_capability(Box::new(store))),
+        Box::new(seeded_valset(validators).await),
     ])
     .expect("genesis")
 }
@@ -224,25 +236,26 @@ fn root_of(h: &Host) -> StateRoot {
 
 #[test]
 fn same_ops_same_replies_roots_in_lockstep_schema_break_pinned() {
-    futures::executor::block_on(same_ops_inner());
+    deterministic::Runner::default().start(|context| async move {
+        same_ops_inner(&context).await;
+    });
 }
 
-async fn same_ops_inner() {
+async fn same_ops_inner(context: &deterministic::Context) {
     let (m1, m2, resident, outsider) = (key(1), key(2), key(3), key(4));
     let validators = [m1.clone(), m2.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
     let keys = [m1.clone(), m2.clone(), resident.clone(), outsider.clone()];
 
-    // the schema break is visible from GENESIS: the native empty registry
-    // reports the ZERO sentinel, the wasm root commits to the (empty) host-KV
-    // store — the vaults shape, not the inbox/tagging coincidence.
-    let wasm_genesis = root_of(&wasm);
-    assert_eq!(root_of(&native), StateRoot::ZERO, "empty registry is ZERO");
-    assert_ne!(
+    // ROOT-CONTINUITY from GENESIS: both roots are the (empty) store's merkle
+    // root, identical across the runtimes and distinct from the ZERO sentinel
+    // convention only in representation — the property below is equality.
+    let genesis = root_of(&wasm);
+    assert_eq!(
         root_of(&native),
-        wasm_genesis,
-        "genesis roots must differ — the port is a DECLARED schema break"
+        genesis,
+        "genesis roots must be continuous across the runtimes"
     );
     // the SIBLING is byte-identical on both hosts, before and (asserted per
     // block below) after every op — it is native on both sides.
@@ -300,8 +313,12 @@ async fn same_ops_inner() {
             assert_eq!(root_of(&native), n_before, "native root moved at {height}");
             assert_eq!(root_of(&wasm), w_before, "wasm root moved at {height}");
         }
-        // ...and the roots themselves always differ (the pinned schema break).
-        assert_ne!(root_of(&native), root_of(&wasm));
+        // THE continuity property: both roots ARE the same store root.
+        assert_eq!(
+            root_of(&native),
+            root_of(&wasm),
+            "the two runtimes diverged at {height}"
+        );
     }
 
     // decoded spot check on the wasm side: the replace and the collapse both
@@ -312,9 +329,9 @@ async fn same_ops_inner() {
     assert_eq!(providers(&wasm, "claude").await, vec![resident.clone()]);
     assert!(providers(&wasm, "codex").await.is_empty());
 
-    // empty the registry: the native root RETURNS to the ZERO sentinel, while
-    // the wasm store now carries an explicit empty snapshot under its reserved
-    // keys — never the genesis store again. the schema-break asymmetry, pinned.
+    // empty the registry: the record set returns to its never-announced shape
+    // and BOTH runtimes stay continuous (the op-log root moves — deletes are
+    // ops — but moves IDENTICALLY on both sides).
     for (height, who) in [(9u64, resident.clone()), (10u64, m1.clone())] {
         for host in [&mut native, &mut wasm] {
             host.submit_at(block(height, ext(&who)), announce(&[]))
@@ -327,17 +344,8 @@ async fn same_ops_inner() {
             "replies diverge after block {height}"
         );
     }
-    assert_eq!(
-        root_of(&native),
-        StateRoot::ZERO,
-        "emptied registry is ZERO"
-    );
-    assert_ne!(
-        root_of(&wasm),
-        wasm_genesis,
-        "the wasm store never returns to its pre-first-write shape"
-    );
-    assert_ne!(root_of(&native), root_of(&wasm));
+    assert_ne!(root_of(&wasm), genesis, "the deletes are committed ops");
+    assert_eq!(root_of(&native), root_of(&wasm));
 
     // queries are read-only on the wasm side too: the root is STABLE across
     // the whole read matrix.
@@ -348,14 +356,16 @@ async fn same_ops_inner() {
 
 #[test]
 fn rejections_match_and_leave_no_trace() {
-    futures::executor::block_on(rejections_inner());
+    deterministic::Runner::default().start(|context| async move {
+        rejections_inner(&context).await;
+    });
 }
 
-async fn rejections_inner() {
+async fn rejections_inner(context: &deterministic::Context) {
     let (m1, outsider) = (key(1), key(4));
     let validators = [m1.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
     let keys = [m1.clone(), outsider.clone()];
 
     for host in [&mut native, &mut wasm] {
@@ -433,20 +443,23 @@ async fn rejections_inner() {
         // abort leaves no trace: both roots byte-identical to pre-block.
         assert_eq!(root_of(&native), n_before, "native root moved on reject");
         assert_eq!(root_of(&wasm), w_before, "wasm root moved on reject");
+        assert_eq!(root_of(&native), root_of(&wasm));
         assert_eq!(replies(&native, &keys).await, replies(&wasm, &keys).await);
     }
 }
 
 #[test]
 fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
-    futures::executor::block_on(multi_dispatch_inner());
+    deterministic::Runner::default().start(|context| async move {
+        multi_dispatch_inner(&context).await;
+    });
 }
 
-async fn multi_dispatch_inner() {
+async fn multi_dispatch_inner(context: &deterministic::Context) {
     let (m1, m2, outsider) = (key(1), key(2), key(4));
     let validators = [m1.clone(), m2.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
     let keys = [m1.clone(), m2.clone(), outsider.clone()];
 
     // ONE block, two announces from DIFFERENT nodes: on the wasm side the
@@ -532,6 +545,7 @@ async fn multi_dispatch_inner() {
     // the accepted member landed (roots moved), the rejected one left nothing.
     assert_ne!(root_of(&native), n_before);
     assert_ne!(root_of(&wasm), w_before);
+    assert_eq!(root_of(&native), root_of(&wasm));
     assert_eq!(replies(&native, &keys).await, replies(&wasm, &keys).await);
     for host in [&native, &wasm] {
         assert_eq!(
@@ -548,14 +562,16 @@ async fn multi_dispatch_inner() {
 
 #[test]
 fn class_claims_apply_identically_and_roots_move_in_lockstep() {
-    futures::executor::block_on(class_claims_inner());
+    deterministic::Runner::default().start(|context| async move {
+        class_claims_inner(&context).await;
+    });
 }
 
-async fn class_claims_inner() {
+async fn class_claims_inner(context: &deterministic::Context) {
     let m1 = key(1);
     let validators = [m1.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
     let keys = [m1.clone()];
 
     // every class-op family, in one deterministic sequence. `moves` says
@@ -599,8 +615,8 @@ async fn class_claims_inner() {
             assert_eq!(root_of(&native), n_before, "native root moved at {height}");
             assert_eq!(root_of(&wasm), w_before, "wasm root moved at {height}");
         }
-        // the pinned schema break: the roots themselves always differ.
-        assert_ne!(root_of(&native), root_of(&wasm));
+        // THE continuity property: both roots ARE the same store root.
+        assert_eq!(root_of(&native), root_of(&wasm));
     }
 
     // decoded spot checks on BOTH sides: the router view is identical.
@@ -625,14 +641,16 @@ async fn class_claims_inner() {
 
 #[test]
 fn class_claim_rejections_match_and_leave_no_trace() {
-    futures::executor::block_on(class_claim_rejections_inner());
+    deterministic::Runner::default().start(|context| async move {
+        class_claim_rejections_inner(&context).await;
+    });
 }
 
-async fn class_claim_rejections_inner() {
+async fn class_claim_rejections_inner(context: &deterministic::Context) {
     let m1 = key(1);
     let validators = [m1.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
     let keys = [m1.clone()];
 
     // seed a committed claim so the rival case has a class to collide with.
@@ -724,14 +742,16 @@ async fn class_claim_rejections_inner() {
 
 #[test]
 fn class_claims_multi_dispatch_block_reads_prior_claims() {
-    futures::executor::block_on(class_multi_dispatch_inner());
+    deterministic::Runner::default().start(|context| async move {
+        class_multi_dispatch_inner(&context).await;
+    });
 }
 
-async fn class_multi_dispatch_inner() {
+async fn class_multi_dispatch_inner(context: &deterministic::Context) {
     let m1 = key(1);
     let validators = [m1.clone()];
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
     let keys = [m1.clone()];
 
     // ONE block, three dispatches: alpha claims "agent"; beta's rival claim on
@@ -775,6 +795,7 @@ async fn class_multi_dispatch_inner() {
     // trace, and both runtimes serve the identical router view.
     assert_ne!(root_of(&native), n_before);
     assert_ne!(root_of(&wasm), w_before);
+    assert_eq!(root_of(&native), root_of(&wasm));
     assert_eq!(replies(&native, &keys).await, replies(&wasm, &keys).await);
     for host in [&native, &wasm] {
         assert_eq!(class_owner(host, "agent").await.as_deref(), Some("alpha"));

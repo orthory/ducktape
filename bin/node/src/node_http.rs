@@ -1,0 +1,306 @@
+//! The operator CLI's thin HTTP client for a node's `/v1` surface: one
+//! `submit` and one `query` primitive, shared by every `user`/`agent` verb so
+//! the `{target, payload}` / `{target, query}` shapes and the receipt/error
+//! handling live in exactly one place instead of being re-inlined per verb.
+//!
+//! Both hit the frameless lanes: `/v1/submit` stamps the NODE's key as the op
+//! origin (valid when the node is bound to the account the op mutates), and
+//! `/v1/query` reads committed module state.
+
+/// Submit one module op over `/v1/submit` `{target, payload}` and return the
+/// commit height from the receipt. A non-2xx status carries the node's
+/// rejection string.
+pub(crate) fn submit(
+    base: &str,
+    target: &str,
+    payload: &serde_json::Value,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let body = post(base, "/v1/submit", &serde_json::json!({ "target": target, "payload": payload }))?;
+    serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["height"].as_u64())
+        .ok_or_else(|| format!("unexpected submit receipt: {body}").into())
+}
+
+/// Read committed module state over `/v1/query` `{target, query}` and return
+/// the module's reply as JSON for the caller to deserialize.
+pub(crate) fn query(
+    base: &str,
+    target: &str,
+    query: serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let body = post(base, "/v1/query", &serde_json::json!({ "target": target, "query": query }))?;
+    Ok(serde_json::from_str(&body)?)
+}
+
+/// Why a node-local read did not produce an answer.
+///
+/// The distinction is the whole point: "the node is not running" is an
+/// ordinary state a read verb must render calmly, while "the node answered
+/// something unexpected" must be surfaced. Collapsing both into one error is
+/// how a 404 or a changed body shape comes to look like "nothing is there".
+pub(crate) enum ReadFailure {
+    /// nothing is listening on the node's HTTP surface.
+    Unreachable,
+    /// the node was reached but the exchange failed (status or body).
+    Rejected(String),
+}
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadFailure::Unreachable => write!(f, "{NODE_NOT_RUNNING}"),
+            ReadFailure::Rejected(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+/// The one sentence for "nothing answered on this node's http surface" — and
+/// the command that fixes it, because a reader who sees this is usually one
+/// `node run` away from a working tool.
+pub(crate) const NODE_NOT_RUNNING: &str =
+    "the node is not running — start it with `ducktape node run`";
+
+/// Why a request never produced a response — ONE discriminant over the only
+/// three things that can be wrong at this boundary, so the sentence a person
+/// reads is a `match` and not a ladder of `is_*()` booleans.
+///
+/// `is_connect()` alone was the old rule and it is NOT this question. It is
+/// false for a connection dropped mid-exchange — precisely what a node
+/// DRAINING does to an in-flight read — so the calm sentence was bypassed at
+/// the one moment someone is most likely to be watching, and the same stopped
+/// node answered `service list` with "the node is not running" and `user cred
+/// list` with `error sending request for url (…)`.
+///
+/// The honest reading of a failed `send()` is that we never heard back. What a
+/// person can DO about that splits three ways, and no further.
+enum Unanswered {
+    /// we could not even form the request: our own bug, or an input that got
+    /// past its boundary check. Never "the node is down".
+    Malformed,
+    /// something IS on that port and did not answer in time — a wedged node is
+    /// a different problem from a stopped one, and must not be reported as it.
+    TimedOut,
+    /// nothing usable answered: refused, reset, hung up mid-exchange.
+    NoAnswer,
+}
+
+/// Decide which of the three a failed `send()` was. Pure.
+fn why_unanswered(error: &reqwest::Error) -> Unanswered {
+    let we_built_it_wrong = error.is_builder() || error.is_redirect();
+    if we_built_it_wrong {
+        return Unanswered::Malformed;
+    }
+    if error.is_timeout() {
+        return Unanswered::TimedOut;
+    }
+    Unanswered::NoAnswer
+}
+
+/// Turn a failed `send()` into what to tell the operator. The one `match`.
+fn transport_failure(path: &str, error: &reqwest::Error) -> ReadFailure {
+    match why_unanswered(error) {
+        Unanswered::NoAnswer => ReadFailure::Unreachable,
+        // the url is deliberately not echoed: it adds nothing a reader can act
+        // on, and every base here is one this CLI resolved itself.
+        Unanswered::Malformed => {
+            ReadFailure::Rejected(format!("{path} could not be requested: {error}"))
+        }
+        Unanswered::TimedOut => ReadFailure::Rejected(format!(
+            "{path} timed out — the node is up but not answering"
+        )),
+    }
+}
+
+/// Read one node-local JSON surface over GET (the `/v1` read routes that are
+/// not module queries, e.g. the volatile service catalog).
+pub(crate) fn get_json(base: &str, path: &str) -> Result<serde_json::Value, ReadFailure> {
+    let resp = reqwest::blocking::Client::new()
+        .get(format!("{base}{path}"))
+        .send()
+        .map_err(|error| transport_failure(path, &error))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(ReadFailure::Rejected(format!(
+            "{path} rejected ({status}): {text}"
+        )));
+    }
+    serde_json::from_str(&text)
+        .map_err(|error| ReadFailure::Rejected(format!("{path} returned undecodable JSON: {error}")))
+}
+
+/// POST one node-local JSON surface and return the decoded reply (the `/v1`
+/// routes that are not module submits, e.g. service signaling).
+pub(crate) fn post_json(
+    base: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    Ok(serde_json::from_str(&post(base, path, body)?)?)
+}
+
+/// One blocking POST of a JSON body, returning the response text or the node's
+/// rejection string on a non-success status.
+fn post(
+    base: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // the SAME classifier the read lane uses: `submit`/`query` are how every
+    // `user`/`agent`/`cred` verb reaches the node, and a down node used to
+    // surface here as a raw `POST http://…: error sending request for url (…)`
+    // while `service list` — one function away — said "the node is not running".
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{base}{path}"))
+        .json(body)
+        .send()
+        .map_err(|error| transport_failure(path, &error).to_string())?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("{path} rejected ({status}): {text}").into());
+    }
+    Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// a listener bound only to learn a port nothing is on. Dropping it
+    /// closes it, so the connect that follows is REFUSED — no sleep, no
+    /// guessed port number.
+    fn a_dead_port() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// BOTH lanes must speak the same sentence about a node that is not up.
+    ///
+    /// The read lane always did; the submit/query lane did not, so `user cred
+    /// list` and `agent sched` answered a stopped node with a raw
+    /// `POST http://127.0.0.1:8844/v1/query: error sending request for url (…)`
+    /// while `service list` — one function away — said "the node is not
+    /// running". This is the test that would have failed.
+    #[test]
+    fn both_lanes_say_the_node_is_not_running() {
+        let base = a_dead_port();
+
+        let read = get_json(&base, "/v1/status").expect_err("nothing listens");
+        assert!(
+            matches!(read, ReadFailure::Unreachable),
+            "the read lane must classify a refused connect: {read}"
+        );
+
+        let write = post(&base, "/v1/query", &serde_json::json!({}))
+            .expect_err("nothing listens")
+            .to_string();
+        assert_eq!(write, NODE_NOT_RUNNING, "the submit lane must say it too");
+        assert!(
+            !write.contains("http://"),
+            "a person is not helped by the url they did not type: {write}"
+        );
+    }
+
+    /// The SHUTDOWN WINDOW, which `is_connect()` alone gets wrong: the socket
+    /// accepts and is then dropped without a response — exactly what a node
+    /// draining does to an in-flight read. `is_connect()` is false for that,
+    /// so this used to degrade into the raw reqwest string at the one moment a
+    /// person is most likely to be looking.
+    ///
+    /// Synchronized on the accept itself, not on a clock. It deliberately does
+    /// not pin WHICH failure the stack reports — a hang-up races the request
+    /// write, so it is a reset on one run and an incomplete message on the
+    /// next, and BOTH are the same thing to the person reading the line. That
+    /// race is exactly what made the previous `std::io::ErrorKind` rule flake:
+    /// only one of the two shapes carries an io error at all.
+    #[test]
+    fn a_connection_dropped_mid_exchange_is_still_a_node_that_is_not_running() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let draining = std::thread::spawn(move || {
+            // accept, then hang up without writing a byte.
+            let (conn, _) = listener.accept().expect("the client connects");
+            drop(conn);
+        });
+
+        let failure = get_json(&base, "/v1/status").expect_err("no response");
+        draining.join().expect("the drain thread finishes");
+        assert!(
+            matches!(failure, ReadFailure::Unreachable),
+            "a hang-up during drain is the same operator condition: {failure}"
+        );
+    }
+
+    /// The three ways a `send()` can fail are three DIFFERENT operator
+    /// problems, and a wedged node must never be reported as a stopped one:
+    /// "start it with `ducktape node run`" is wrong advice for a process that
+    /// is already running and not answering.
+    #[test]
+    fn a_wedged_node_and_a_bad_url_do_not_borrow_the_stopped_nodes_sentence() {
+        let timed_out = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .expect("client")
+            // TEST-NET-1 (RFC 5737): routable-looking and guaranteed dark, so
+            // the connect stalls rather than being refused.
+            .get("http://192.0.2.1:9/v1/status")
+            .send()
+            .expect_err("nothing answers on a reserved address");
+        assert!(
+            matches!(why_unanswered(&timed_out), Unanswered::TimedOut),
+            "a timeout is not a stopped node"
+        );
+
+        // THE MISSING SCHEME IS THE WHOLE TEST, and it is also the only thing
+        // keeping this offline: reqwest rejects a relative url at parse, so no
+        // name is resolved and nothing is dialed. Do NOT "fix" this into
+        // `http://…` — a bare word is not guaranteed to be unresolvable
+        // (a search domain or an NXDOMAIN-hijacking resolver will happily hand
+        // back an address for any label), so a scheme here turns a pure parse
+        // test into a live request against whatever the run's DNS invents.
+        // The word itself carries no meaning; it just has to not look like a
+        // host somebody would try to reach.
+        let malformed = reqwest::blocking::Client::new()
+            .get("not-a-url/v1/status")
+            .send()
+            .expect_err("a bare word is not a url");
+        assert!(
+            matches!(why_unanswered(&malformed), Unanswered::Malformed),
+            "an unbuildable request is not a stopped node"
+        );
+        assert!(
+            !transport_failure("/v1/status", &malformed)
+                .to_string()
+                .contains("not running"),
+            "and it must not say so"
+        );
+    }
+
+    /// ...and anything that is NOT that condition keeps its own words. A node
+    /// that answers is never "not running", however unhappy the answer.
+    #[test]
+    fn a_node_that_answers_is_never_reported_as_down() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let serving = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut conn, _) = listener.accept().expect("the client connects");
+            let mut scratch = [0u8; 1024];
+            let _ = conn.read(&mut scratch);
+            let _ = conn.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n\r\nnope",
+            );
+        });
+
+        let failure = get_json(&base, "/v1/status").expect_err("a 500 is an error");
+        serving.join().expect("the serve thread finishes");
+        let ReadFailure::Rejected(detail) = failure else {
+            panic!("a served 500 must not be reported as a stopped node");
+        };
+        assert!(detail.contains("500"), "{detail}");
+    }
+}

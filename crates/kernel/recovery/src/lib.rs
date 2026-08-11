@@ -45,7 +45,7 @@
 //!   re-committing a qmdb store would MOVE its op-log root and fork us. the
 //!   per-module root compare (live vs sealed pre/post) decides the partition;
 //!   a changed module at NEITHER pre nor post is genuine damage and still
-//!   fail-stops as [`Error::Torn`], and the recomposed-vs-sealed app-hash
+//!   fail-stops as [`Error::Torn`], and the recomposed-vs-sealed root-hash
 //!   check is the final backstop.
 //! - a block that touches several DISK substrates could in principle crash
 //!   BETWEEN their commits — the classic multi-store atomicity limit; today no
@@ -88,49 +88,6 @@ use futures::{StreamExt as _, pin_mut};
 use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use node::{BlockSeal, BlockSink, Disposition, decode_batch};
 use sdk::{ModuleId, StateRoot};
-
-/// Stable machine-readable marker consumed by the native shell when a node
-/// refuses a clean-break-incompatible workspace.
-pub const STATE_SCHEMA_INCOMPATIBLE_MARKER: &str = "DUCKTAPE_STATE_SCHEMA_INCOMPATIBLE";
-
-/// A checkpoint was produced by a different canonical module-state schema.
-/// This is not corruption and is never repaired in place: changing snapshot
-/// bytes would rewrite module roots, the app hash, and sealed history.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "{STATE_SCHEMA_INCOMPATIBLE_MARKER}: workspace state schema {found} is incompatible with this binary ({expected}); workspace data was not modified. Archive this workspace and create a fresh workspace. Ducktape identity and account keys are stored outside workspace state and must be preserved."
-)]
-pub struct IncompatibleStateSchema {
-    expected: FingerprintDisplay,
-    found: FingerprintDisplay,
-}
-
-/// Compare a persisted schema fingerprint with the binary's production
-/// schema.
-pub fn check_state_schema(
-    found: [u8; 32],
-    expected: [u8; 32],
-) -> Result<(), IncompatibleStateSchema> {
-    if found == expected {
-        return Ok(());
-    }
-    Err(IncompatibleStateSchema {
-        expected: FingerprintDisplay(expected),
-        found: FingerprintDisplay(found),
-    })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FingerprintDisplay([u8; 32]);
-
-impl std::fmt::Display for FingerprintDisplay {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
 
 /// runtime bounds every store here needs (same alias the storage crate uses:
 /// `Storage + Clock + Metrics`).
@@ -197,7 +154,6 @@ const MAX_CHECKPOINT_FIELD_LEN: usize = 512 * 1024 * 1024;
 fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     sdk::codec::push_bytes(out, b);
@@ -284,7 +240,7 @@ pub enum Record {
         height: u64,
         disposition: Disposition,
         roots: Vec<(ModuleId, StateRoot)>,
-        app_hash: StateRoot,
+        root_hash: StateRoot,
     },
     /// an epoch cutover: the new epoch, its app-height base, and the engine
     /// participant set it was spawned over. the set rides the record so a
@@ -317,7 +273,7 @@ impl Record {
                 height,
                 disposition,
                 roots,
-                app_hash,
+                root_hash,
             } => {
                 out.push(TAG_SEAL);
                 put_u64(&mut out, *height);
@@ -328,7 +284,7 @@ impl Record {
                     Disposition::Discarded => unreachable!("discarded frames are not sealed"),
                 });
                 put_roots(&mut out, roots);
-                put_root(&mut out, app_hash);
+                put_root(&mut out, root_hash);
             }
             Record::Cutover {
                 epoch,
@@ -365,12 +321,12 @@ impl Record {
                     d => return Err(Error::Corrupt(format!("unknown disposition {d}"))),
                 };
                 let roots = get_roots(&mut c)?;
-                let app_hash = read_root(&mut c, "seal app hash")?;
+                let root_hash = read_root(&mut c, "seal root hash")?;
                 Record::Seal {
                     height,
                     disposition,
                     roots,
-                    app_hash,
+                    root_hash,
                 }
             }
             TAG_CUTOVER => {
@@ -421,8 +377,8 @@ pub struct Manifest {
     /// ordered lane's discard-ceiling view). a restart re-arms the same
     /// deterministic boundary its peers are converging on.
     pub pending_cutover_view: Option<u64>,
-    /// the composed app-hash at `height`.
-    pub app_hash: StateRoot,
+    /// the composed root-hash at `height`.
+    pub root_hash: StateRoot,
     /// every module's root at `height` — the replay baseline.
     pub roots: Vec<(ModuleId, StateRoot)>,
     /// canonical snapshot bytes for the modules that do NOT persist
@@ -438,9 +394,6 @@ pub struct Manifest {
     /// framed (the exactly-once digest gate does not survive the process, so
     /// a reused (origin, seq, payload) triple would re-apply).
     pub next_seq: u64,
-    /// Fingerprint of the exact ordered module/state-schema set that produced
-    /// this checkpoint.
-    pub state_schema: [u8; 32],
 }
 
 impl Manifest {
@@ -463,7 +416,7 @@ impl Manifest {
             }
             None => out.push(0),
         }
-        put_root(&mut out, &self.app_hash);
+        put_root(&mut out, &self.root_hash);
         put_roots(&mut out, &self.roots);
         put_u64(&mut out, self.snapshots.len() as u64);
         for (id, bytes) in &self.snapshots {
@@ -473,7 +426,6 @@ impl Manifest {
         put_u64(&mut out, self.oplog_pos);
         put_u64(&mut out, self.next_seq);
         put_keys(&mut out, &self.residents);
-        out.extend_from_slice(&self.state_schema);
         out
     }
 
@@ -492,7 +444,7 @@ impl Manifest {
             1 => Some(c.u64("pending cutover view")?),
             t => return Err(Error::Corrupt(format!("bad pending-cutover tag {t}"))),
         };
-        let app_hash = read_root(&mut c, "app hash")?;
+        let root_hash = read_root(&mut c, "root hash")?;
         let roots = get_roots(&mut c)?;
         let n = c.u64("snapshots count")? as usize;
         if n > 4096 {
@@ -506,7 +458,6 @@ impl Manifest {
         let oplog_pos = c.u64("oplog pos")?;
         let next_seq = c.u64("next seq")?;
         let residents = get_keys(&mut c)?;
-        let state_schema = c.array::<32>("state schema fingerprint")?;
         c.finish("manifest")?;
         Ok(Self {
             height,
@@ -515,12 +466,11 @@ impl Manifest {
             participants,
             residents,
             pending_cutover_view,
-            app_hash,
+            root_hash,
             roots,
             snapshots,
             oplog_pos,
             next_seq,
-            state_schema,
         })
     }
 
@@ -555,14 +505,68 @@ impl Manifest {
         oplog_pos: u64,
         next_seq: u64,
     ) -> Result<Self, Error> {
-        let snapshot = host
-            .capture_finalized_snapshot(host::FinalizedBlock {
-                // the capture only verifies the app-hash; a genesis manifest
-                // has no boundary yet and 0 is a placeholder, not a height.
-                height: height.unwrap_or(0),
-                app_hash: host.app_hash(),
-            })
-            .map_err(|e| Error::Storage(format!("checkpoint capture: {e}")))?;
+        Self::capture_timed(
+            host,
+            height,
+            epoch,
+            view_base,
+            participants,
+            residents,
+            pending_cutover_view,
+            oplog_pos,
+            next_seq,
+            || std::time::Duration::ZERO,
+        )
+        .map(|(manifest, _)| manifest)
+    }
+
+    /// [`Manifest::capture`] that also reports what each module COST to
+    /// capture, read off the caller's clock (`now`) — the checkpoint runs on
+    /// the node's select loop, and an aggregate `capture_ms` cannot name the
+    /// module that spent it (#1018).
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_timed(
+        host: &Host,
+        height: Option<u64>,
+        epoch: u64,
+        view_base: u64,
+        participants: Vec<Vec<u8>>,
+        residents: Vec<Vec<u8>>,
+        pending_cutover_view: Option<u64>,
+        oplog_pos: u64,
+        next_seq: u64,
+        now: impl FnMut() -> std::time::Duration,
+    ) -> Result<(Self, Vec<(sdk::ModuleId, std::time::Duration)>), Error> {
+        // ONE pass over the registry: the capture computes every module root
+        // exactly once and the composite root is derived from those. this used
+        // to re-read `host.root_hash()` here (twice) on top of the host's own
+        // recompute — four full serializations per map-backed module, for a
+        // check that compared the host's root against itself.
+        let (snapshot, capture_cost) = host.capture_current_snapshot(
+            // a genesis manifest has no boundary yet; 0 is a placeholder, not
+            // a height.
+            height.unwrap_or(0),
+            now,
+        );
+        let root_hash = snapshot.root_hash;
+        // a checkpoint is ALL-OR-NOTHING and that is deliberate: restore reads
+        // bytes back per module, so a manifest missing one module's snapshot is
+        // a checkpoint that cannot restore — and writing it would prune the
+        // journal below a floor nothing can recover from. refusing keeps the
+        // PREVIOUS checkpoint plus the journal, which still restores. every
+        // degraded module is named, not just the first in registry order.
+        if !snapshot.degraded.is_empty() {
+            let named = snapshot
+                .degraded
+                .iter()
+                .map(|m| format!("{}: {}", m.id, m.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(Error::Storage(format!(
+                "checkpoint capture: modules could not prepare a state-sync \
+                 handle, so this checkpoint could not restore — {named}"
+            )));
+        }
         let roots = snapshot
             .modules
             .iter()
@@ -576,29 +580,22 @@ impl Manifest {
                 _ => None,
             })
             .collect();
-        Ok(Self {
-            height,
-            epoch,
-            view_base,
-            participants,
-            residents,
-            pending_cutover_view,
-            app_hash: host.app_hash(),
-            roots,
-            snapshots,
-            oplog_pos,
-            next_seq,
-            state_schema: host.state_schema_fingerprint(),
-        })
-    }
-
-    /// Clean-break state-schema preflight. Call this before opening or
-    /// installing any module substrate.
-    pub fn preflight_state_schema(
-        &self,
-        expected: [u8; 32],
-    ) -> Result<(), IncompatibleStateSchema> {
-        check_state_schema(self.state_schema, expected)
+        Ok((
+            Self {
+                height,
+                epoch,
+                view_base,
+                participants,
+                residents,
+                pending_cutover_view,
+                root_hash,
+                roots,
+                snapshots,
+                oplog_pos,
+                next_seq,
+            },
+            capture_cost,
+        ))
     }
 }
 
@@ -677,7 +674,7 @@ pub struct JournalFrame {
     pub frame: Vec<u8>,
     pub disposition: Disposition,
     pub roots: Vec<(ModuleId, StateRoot)>,
-    pub app_hash: StateRoot,
+    pub root_hash: StateRoot,
 }
 
 impl<E> Recovery<E>
@@ -900,7 +897,7 @@ where
                     height,
                     disposition,
                     roots,
-                    app_hash,
+                    root_hash,
                 } => {
                     if height <= after_height {
                         continue;
@@ -923,7 +920,7 @@ where
                         frame,
                         disposition,
                         roots,
-                        app_hash,
+                        root_hash,
                     });
                 }
                 Record::Pinned { .. } | Record::Cutover { .. } => {}
@@ -984,7 +981,7 @@ where
             height: seal.height,
             disposition: seal.disposition,
             roots: seal.roots.clone(),
-            app_hash: seal.app_hash,
+            root_hash: seal.root_hash,
         }
         .encode();
         async move {
@@ -1020,9 +1017,9 @@ where
 // ============================================================================
 
 /// one re-executed sealed block, as replay hands it to a [`ReplaySink`]: the
-/// SEALED frame bytes, how the block landed, the composed app-hash it left
+/// SEALED frame bytes, how the block landed, the composed root-hash it left
 /// behind (the seal's recorded value), and the deterministic dispatch trace
-/// (empty for a rejected block). the frame + disposition + app-hash ride
+/// (empty for a rejected block). the frame + disposition + root-hash ride
 /// along because a node-layer observer (the explorer's blocks database)
 /// derives its row from the frame's content, not the dispatch trace — the
 /// trace alone cannot reproduce it.
@@ -1030,7 +1027,7 @@ pub struct FoldedBlock<'a> {
     pub height: u64,
     pub frame: &'a [u8],
     pub disposition: Disposition,
-    pub app_hash: StateRoot,
+    pub root_hash: StateRoot,
     pub dispatches: &'a [DispatchRecord],
 }
 
@@ -1058,9 +1055,9 @@ pub trait ReplaySink {
 #[derive(Debug)]
 pub struct Recovered {
     /// the journal tip: the last sealed height (`None` = nothing applied) and
-    /// the verified composed app-hash there.
+    /// the verified composed root-hash there.
     pub height: Option<u64>,
-    pub app_hash: StateRoot,
+    pub root_hash: StateRoot,
     /// the consensus epoch to respawn and its app-height base.
     pub epoch: u64,
     pub view_base: u64,
@@ -1095,7 +1092,7 @@ where
     /// positions; this replays the journal suffix, skipping blocks a module
     /// already contains (root equality) and re-applying the rest, verifying
     /// each re-applied block against its sealed roots and the final state
-    /// against the tip's sealed app-hash.
+    /// against the tip's sealed root-hash.
     pub async fn recover(
         &mut self,
         host: &mut Host,
@@ -1117,7 +1114,7 @@ where
         let code_source = std::sync::Arc::clone(&self.code_source);
         let mut expected: BTreeMap<ModuleId, StateRoot> = manifest.roots.iter().cloned().collect();
         let mut tip_height: Option<u64> = manifest.height;
-        let mut tip_hash = manifest.app_hash;
+        let mut tip_hash = manifest.root_hash;
         let mut epoch = manifest.epoch;
         let mut view_base = manifest.view_base;
         let mut participants = manifest.participants.clone();
@@ -1161,7 +1158,7 @@ where
         // live root matches NO recorded post-root keeps no floor and still
         // fail-stops as `Error::Torn` below (genuine corruption / a torn write) —
         // recovery never heals from a nearest/approximate record. a mis-read
-        // root could only mis-seed a floor and trip the final app-hash
+        // root could only mis-seed a floor and trip the final root-hash
         // recompose (fail-stop), never fork.
         let disk_cohort = host.resolver_backed_ids();
         let mut disk_floor: BTreeMap<ModuleId, u64> = BTreeMap::new();
@@ -1234,7 +1231,7 @@ where
                     height,
                     disposition,
                     roots,
-                    app_hash,
+                    root_hash,
                 } => {
                     if manifest.height.is_some_and(|h| height <= h) {
                         continue;
@@ -1268,7 +1265,7 @@ where
                                     height,
                                     frame: &frame,
                                     disposition,
-                                    app_hash,
+                                    root_hash,
                                     dispatches: &[],
                                                                     }),
                                 // an applied block whose ops moved no root:
@@ -1307,8 +1304,7 @@ where
                         // "durable" = already at this block's post-root OR raced
                         // strictly past it: either way a per-block-durable disk
                         // substrate committed here and must NOT be re-committed.
-                        let all_durable =
-                            (0..changed.len()).all(|i| at_post_of[i] || ahead_of[i]);
+                        let all_durable = (0..changed.len()).all(|i| at_post_of[i] || ahead_of[i]);
                         let all_pre = at_pre_of.iter().all(|&b| b);
                         if all_durable {
                             // nothing to re-commit: the disk cohort already holds
@@ -1332,7 +1328,7 @@ where
                                     height,
                                     frame: &frame,
                                     disposition,
-                                    app_hash,
+                                    root_hash,
                                     dispatches: &dispatches,
                                                                     });
                             }
@@ -1424,7 +1420,7 @@ where
                                     height,
                                     frame: &frame,
                                     disposition,
-                                    app_hash,
+                                    root_hash,
                                     dispatches: &dispatches,
                                                                     });
                             }
@@ -1433,7 +1429,7 @@ where
                             // raced STRICTLY PAST this block sits at a later
                             // post-root (a stale intermediate here), so skip its
                             // per-block verify — it is verified at its own floor
-                            // height, and the final app-hash recompose backstops it
+                            // height, and the final root-hash recompose backstops it
                             // against the sealed tip.
                             for (i, (id, root)) in changed.iter().enumerate() {
                                 if ahead_of[i] {
@@ -1455,7 +1451,7 @@ where
                         expected.insert(id, root);
                     }
                     tip_height = Some(height);
-                    tip_hash = app_hash;
+                    tip_hash = root_hash;
                 }
             }
         }
@@ -1472,14 +1468,8 @@ where
                 .map(|(id, _)| id.clone())
                 .collect();
             let disposition = if moved.is_empty() {
-                let (disposition, dispatches) = apply_block(
-                    host,
-                    height,
-                    &frame,
-                    None,
-                    code_source.as_ref(),
-                )
-                .await?;
+                let (disposition, dispatches) =
+                    apply_block(host, height, &frame, None, code_source.as_ref()).await?;
                 if let Some(sink) = sink.as_mut() {
                     sink.folded_block(&FoldedBlock {
                         height,
@@ -1487,7 +1477,7 @@ where
                         disposition,
                         // the roll-forward seals from the observed outcome
                         // below; this is that same post-block boundary.
-                        app_hash: host.app_hash(),
+                        root_hash: host.root_hash(),
                         dispatches: &dispatches,
                                             });
                 }
@@ -1495,9 +1485,8 @@ where
             } else {
                 // classify for its FAIL-CLOSED rules (an unexplained mover
                 // alongside a verified claimant, or a >1-substrate claim, is
-                // damage). both surviving plans then RE-DERIVE: the legacy
-                // seal-the-observed-roots path (AssumeApplied) is exact only
-                // if every effect of the block is visible in the moved roots
+                // damage). Every accepted case then RE-DERIVES: sealing the
+                // observed roots is exact only if every effect of the block is visible in the moved roots
                 // — unknowable here, because a member's dispatch follow-ups
                 // fan into modules the frame never names, and any in-memory
                 // write among them died with the process. sealing observed
@@ -1506,7 +1495,7 @@ where
                 // trailing [capability + chat] batch); re-derivation is a
                 // deterministic no-op when nothing was lost, and the
                 // reconstruction when something was.
-                let _ = trailing::classify_trailing(height, &moved, &trailing_claims)?;
+                trailing::classify_trailing(height, &moved, &trailing_claims)?;
                 {
                     // re-execute the durable WAL frame committing ONLY the
                     // still-at-pre cohort — reconstructing the writes the
@@ -1542,9 +1531,7 @@ where
                     // moved without a frame that could have moved it.
                     let targets = frame_targets(&frame);
                     for id in &moved {
-                        if !dispatches.iter().any(|d| d.module == *id)
-                            && !targets.contains(id)
-                        {
+                        if !dispatches.iter().any(|d| d.module == *id) && !targets.contains(id) {
                             return Err(Error::Torn(format!(
                                 "trailing block {height} neither dispatched nor targeted \
                                  module {id}, which durably committed it — the observed \
@@ -1558,7 +1545,7 @@ where
                             height,
                             frame: &frame,
                             disposition,
-                            app_hash: host.app_hash(),
+                            root_hash: host.root_hash(),
                             dispatches: &dispatches,
                                                     });
                     }
@@ -1569,7 +1556,7 @@ where
                 height,
                 disposition,
                 roots: host.module_roots(),
-                app_hash: host.app_hash(),
+                root_hash: host.root_hash(),
             };
             BlockSink::seal(self, &seal)
                 .await
@@ -1577,7 +1564,7 @@ where
             self.journal.sync().await.map_err(storage_err)?;
             blocks.push((height, seal.roots.clone()));
             tip_height = Some(height);
-            tip_hash = host.app_hash();
+            tip_hash = host.root_hash();
             rolled_forward = true;
         }
 
@@ -1596,16 +1583,16 @@ where
         // THE verification: the recomposed state must be byte-identical to
         // what consensus sealed at the tip. anything else means the recovered
         // node would fork — refuse to start.
-        let live = host.app_hash();
+        let live = host.root_hash();
         if live != tip_hash {
             return Err(Error::Verify(format!(
-                "recomposed app_hash {live:?} != sealed tip {tip_hash:?} at height {tip_height:?}"
+                "recomposed root_hash {live:?} != sealed tip {tip_hash:?} at height {tip_height:?}"
             )));
         }
 
         Ok(Recovered {
             height: tip_height,
-            app_hash: tip_hash,
+            root_hash: tip_hash,
             epoch,
             view_base,
             participants,
@@ -1632,8 +1619,7 @@ async fn apply_block(
     expect: Option<Disposition>,
     code_source: &dyn host::CodeSource,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
-    let (disposition, dispatches) =
-        replay_batch(host, height, frame, None, code_source).await?;
+    let (disposition, dispatches) = replay_batch(host, height, frame, None, code_source).await?;
     if let Some(expect) = expect
         && disposition != expect
     {
@@ -1676,7 +1662,7 @@ async fn apply_block_committing(
 /// module (forward replay); `Some` = the torn-block heal (commit the rolled-back
 /// in-memory cohort, abort the already-durable disk substrates).
 ///
-/// returns the BLOCK-LEVEL disposition (`Applied` iff the batch MOVED app-hash —
+/// returns the BLOCK-LEVEL disposition (`Applied` iff the batch MOVED root-hash —
 /// the identical rule the live node sealed under, so the caller's `expect` check
 /// is a true divergence detector) plus the aggregate dispatch trace (every
 /// applied member's dispatches in member order, then the once-per-block System
@@ -1686,10 +1672,7 @@ async fn apply_block_committing(
 /// roll-forward's backstop widener: a moved module whose member re-executes
 /// as a duplicate-reject on its own post-state records no dispatch, but the
 /// frame still explains it. undecodable members target nothing
-/// (deterministic no-ops live and on replay alike). includes an envelope's
-/// continuation target beside its parent's: a released continuation moves ITS
-/// module in the same block, and a widener may only over-explain, never
-/// under-explain.
+/// (deterministic no-ops live and on replay alike).
 fn frame_targets(frame: &[u8]) -> BTreeSet<ModuleId> {
     let Ok(members) = decode_batch(frame) else {
         return BTreeSet::new();
@@ -1697,7 +1680,7 @@ fn frame_targets(frame: &[u8]) -> BTreeSet<ModuleId> {
     members
         .iter()
         .filter_map(|m| node::decode_frame(m).ok())
-        .flat_map(|(_, msg, cont)| std::iter::once(msg.target).chain(cont.map(|c| c.target)))
+        .map(|(_, msg)| msg.target)
         .collect()
 }
 
@@ -1723,8 +1706,7 @@ async fn replay_batch(
     let Ok(members) = decode_batch(frame) else {
         return Ok((Disposition::Rejected, Vec::new()));
     };
-    // decode exactly as the live drain does — a journaled frame replays WITH
-    // its continuation (dropping it would fork the replayed app-hash).
+    // decode exactly as the live drain does, or the replayed root-hash forks.
     let mut ops = Vec::new();
     for member in &members {
         if let Ok(op) = node::decode_member(member) {
@@ -1752,11 +1734,11 @@ async fn replay_batch(
         }
     };
     // block-level disposition, DRAIN-based to match the live seal (node's
-    // `drain_delivered`): Applied iff the block ran real work — any member (or
-    // released continuation) applied, or a once-per-block System injection
-    // dispatched. NEVER app-hash-based: a torn-heal (`commit_only = Some`)
+    // `drain_delivered`): Applied iff the block ran real work — any member
+    // applied, or a once-per-block System injection
+    // dispatched. NEVER root-hash-based: a torn-heal (`commit_only = Some`)
     // commits only the rolled-back cohort and ABORTS the already-durable mover,
-    // so the app-hash cannot move even though the block WAS applied — app-hash
+    // so the root-hash cannot move even though the block WAS applied — root-hash
     // movement would spuriously read Rejected and trip the disk-cursor backstop.
     let (ran, dispatches) = outcome.into_trace();
     let disposition = if ran {
@@ -1792,13 +1774,13 @@ mod tests {
                 height: 7,
                 disposition: Disposition::Applied,
                 roots: roots(&[("directory", 3), ("kv", 9)]),
-                app_hash: StateRoot([5; 32]),
+                root_hash: StateRoot([5; 32]),
             },
             Record::Seal {
                 height: 8,
                 disposition: Disposition::Rejected,
                 roots: vec![],
-                app_hash: StateRoot([6; 32]),
+                root_hash: StateRoot([6; 32]),
             },
             Record::Cutover {
                 epoch: 2,
@@ -1857,6 +1839,126 @@ mod tests {
         );
     }
 
+    struct DegradedModule(&'static str);
+
+    #[async_trait::async_trait(?Send)]
+    impl sdk::Module for DegradedModule {
+        fn id(&self) -> ModuleId {
+            self.0.into()
+        }
+
+        fn root(&self) -> StateRoot {
+            StateRoot([5; 32])
+        }
+
+        fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
+            Err(sdk::Error::Module("no pack for committed head".into()))
+        }
+
+        async fn execute(
+            &mut self,
+            _ctx: &mut dyn sdk::Ctx,
+            _msg: &sdk::Msg,
+        ) -> Result<(), sdk::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn checkpoint_capture_refuses_a_manifest_that_cannot_restore() {
+        // the host no longer aborts on a module failure, so the ALL-OR-NOTHING
+        // rule now lives here, where it belongs: restore reads snapshot bytes
+        // back per module, and writing a manifest without them would prune the
+        // journal below a floor nothing can recover from.
+        let host = Host::genesis(vec![
+            Box::new(DegradedModule("forge")),
+            Box::new(DegradedModule("chat")),
+        ])
+        .expect("genesis");
+
+        let err = Manifest::capture(&host, Some(9), 0, 0, vec![], vec![], None, 0, 1)
+            .expect_err("a checkpoint missing a module's bytes must not be written");
+
+        let msg = err.to_string();
+        assert!(msg.contains("forge"), "{msg}");
+        assert!(
+            msg.contains("chat"),
+            "every degraded module is named, not just the first: {msg}",
+        );
+        assert!(msg.contains("no pack for committed head"), "{msg}");
+    }
+
+    /// a module that COUNTS its own `root()` calls. for a map-backed module
+    /// `root()` is a full state serialization + SHA-256, so every extra call is
+    /// another whole pass over the module's state — and the capture is holding
+    /// the node's select loop while it happens (#1018).
+    struct CountingModule {
+        id: &'static str,
+        roots: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl sdk::Module for CountingModule {
+        fn id(&self) -> ModuleId {
+            self.id.into()
+        }
+
+        fn root(&self) -> StateRoot {
+            self.roots
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            StateRoot([7; 32])
+        }
+
+        fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
+            Ok(sdk::StateSyncHandle::SnapshotBytes(vec![7]))
+        }
+
+        async fn execute(
+            &mut self,
+            _ctx: &mut dyn sdk::Ctx,
+            _msg: &sdk::Msg,
+        ) -> Result<(), sdk::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn one_capture_computes_each_module_root_exactly_once() {
+        let forge = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let chat = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let host = Host::genesis(vec![
+            Box::new(CountingModule {
+                id: "forge",
+                roots: forge.clone(),
+            }),
+            Box::new(CountingModule {
+                id: "chat",
+                roots: chat.clone(),
+            }),
+        ])
+        .expect("genesis");
+
+        let count =
+            |c: &std::sync::atomic::AtomicUsize| c.load(std::sync::atomic::Ordering::Relaxed);
+        let (forge_before, chat_before) = (count(&forge), count(&chat));
+        Manifest::capture(&host, Some(9), 0, 0, vec![], vec![], None, 0, 1).expect("capture");
+
+        // the capture used to compute each root FOUR times: twice in this
+        // function (the `root_hash` argument and the manifest field) and twice
+        // inside the host (its own verification recompute plus the per-module
+        // loop). the composite root is now derived from the one pass.
+        assert_eq!(
+            count(&forge) - forge_before,
+            1,
+            "forge root recomputed by one capture"
+        );
+        assert_eq!(
+            count(&chat) - chat_before,
+            1,
+            "chat root recomputed by one capture"
+        );
+    }
+
     fn sample_manifest() -> Manifest {
         Manifest {
             height: Some(42),
@@ -1865,7 +1967,7 @@ mod tests {
             participants: vec![vec![7u8; 32], vec![8u8; 32]],
             residents: vec![vec![9u8; 32]],
             pending_cutover_view: Some(15),
-            app_hash: StateRoot([1; 32]),
+            root_hash: StateRoot([1; 32]),
             roots: roots(&[("directory", 2), ("valset", 3)]),
             snapshots: vec![
                 ("directory".into(), b"dir-bytes".to_vec()),
@@ -1873,7 +1975,6 @@ mod tests {
             ],
             oplog_pos: 17,
             next_seq: 5,
-            state_schema: [0xAB; 32],
         }
     }
 
@@ -1884,26 +1985,6 @@ mod tests {
         assert_eq!(decoded, m);
         assert_eq!(decoded.snapshot("directory"), Some(b"dir-bytes".as_ref()));
         assert_eq!(decoded.root("valset"), Some(StateRoot([3; 32])));
-    }
-
-    #[test]
-    fn schema_mismatch_clean_breaks_with_actionable_error() {
-        let decoded = Manifest::decode(&sample_manifest().encode()).expect("roundtrip");
-        let error = decoded
-            .preflight_state_schema([0xCD; 32])
-            .expect_err("mismatched schema must clean-break");
-        let message = error.to_string();
-        assert!(message.contains(STATE_SCHEMA_INCOMPATIBLE_MARKER));
-        assert!(message.contains("workspace data was not modified"));
-    }
-
-    #[test]
-    fn schema_revision_changes_the_preflight_identity() {
-        let revision_one = host::state_schema_fingerprint([("runs", 1)]);
-        let revision_two = host::state_schema_fingerprint([("runs", 2)]);
-        assert_ne!(revision_one, revision_two);
-        assert!(check_state_schema(revision_two, revision_two).is_ok());
-        assert!(check_state_schema(revision_one, revision_two).is_err());
     }
 
     #[test]
@@ -1919,21 +2000,18 @@ mod tests {
 
     #[test]
     fn manifest_decode_rejects_truncated_tail() {
-        // a checkpoint truncated before the schema fingerprint, or torn inside
-        // it, must fail loud — the node resyncs instead of booting on silent
-        // defaults.
+        // A checkpoint missing or tearing its resident-set tail fails loud.
         let m = Manifest {
             residents: vec![],
             ..sample_manifest()
         };
         let full = m.encode();
-        // the tail is the empty resident keys (8 bytes) + the 32-byte schema.
-        assert!(Manifest::decode(&full[..full.len() - 40]).is_err());
-        assert!(Manifest::decode(&full[..full.len() - 32]).is_err());
+        // The empty resident set is one 8-byte count.
+        assert!(Manifest::decode(&full[..full.len() - 8]).is_err());
         assert!(Manifest::decode(&full[..full.len() - 4]).is_err());
-        // and a torn RESIDENT tail fails loud too.
+        // A torn resident key fails loud too.
         let full = sample_manifest().encode();
-        let torn = &full[..full.len() - 32 - 4]; // inside the resident key bytes.
+        let torn = &full[..full.len() - 4];
         assert!(Manifest::decode(torn).is_err());
     }
 

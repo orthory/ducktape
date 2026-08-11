@@ -86,12 +86,12 @@ type PayloadMailbox = ResolverMailbox<Digest, commonware_cryptography::ed25519::
 ///
 /// # the rekey / respawn contract (read before wiring a new scheme or dynamic validators)
 /// the scheme AND the validator set are fixed at simplex `Engine` construction — neither
-/// can be hot-swapped in a running engine. changing EITHER (a scheme migration, or a
+/// can be hot-swapped in a running engine. changing EITHER (a scheme change, or a
 /// validator join/leave) requires an **epoch transition**: at a height the OLD engine
 /// finalizes, every validator tears down the current engine and RE-SPAWNS a new one with
 /// the new `(scheme, participants)`. finalizing the switch through the old engine FIRST is
 /// what makes every node cut over at the SAME point (else they fork). this one
-/// teardown-and-respawn mechanism backs both scheme migration and dynamic valset. the same
+/// teardown-and-respawn mechanism backs both a scheme change and dynamic valset. the same
 /// epoch boundary is where validator-owned transport membership rotates: bootnodes,
 /// relayers, and control participants must be derived from that epoch's validator set,
 /// not from a static external relay.
@@ -211,7 +211,10 @@ mod sim_carrier {
         pub async fn register(oracle: &Oracle<Pk, E>, me: Pk, quota: Quota) -> Self {
             let control = oracle.control(me.clone());
             let vote = control.register(0, quota).await.expect("register vote");
-            let certificate = control.register(1, quota).await.expect("register certificate");
+            let certificate = control
+                .register(1, quota)
+                .await
+                .expect("register certificate");
             let resolver = control.register(2, quota).await.expect("register resolver");
             let payload = control.register(3, quota).await.expect("register payload");
             let fetch = control.register(4, quota).await.expect("register fetch");
@@ -237,7 +240,9 @@ mod sim_carrier {
             self.vote.take().expect("vote channel taken once")
         }
         fn certificate(&mut self) -> Pair<E> {
-            self.certificate.take().expect("certificate channel taken once")
+            self.certificate
+                .take()
+                .expect("certificate channel taken once")
         }
         fn resolver(&mut self) -> Pair<E> {
             self.resolver.take().expect("resolver channel taken once")
@@ -420,20 +425,18 @@ pub struct ConsensusHandle {
     store: ContentStore,
     /// the same FIFO [`ConsensusAutomaton::propose`] peeks. minted via
     /// [`ConsensusAutomaton::handle`] so submit + propose agree on the queue.
-    pending: Arc<Mutex<VecDeque<Digest>>>,
+    pending: Arc<PendingProposals>,
 }
 
 impl ConsensusHandle {
     /// stage `bytes` for consensus: content-address them into the store (PINNED
     /// — an own submission must survive any number of nullified views and stay
     /// servable to fetching peers until it finalizes) and queue that digest for
-    /// proposal. the entire `submit` body — NO local apply.
+    /// proposal, waking an OPEN idle view so it proposes now. the entire
+    /// `submit` body — NO local apply.
     pub fn submit(&self, bytes: Vec<u8>) {
         let digest = self.store.pin(bytes);
-        self.pending
-            .lock()
-            .expect("pending queue poisoned")
-            .push_back(digest);
+        self.pending.push(digest);
     }
 
     /// current depth of the pending FIFO. the node's heartbeat gates idle-nop
@@ -443,10 +446,7 @@ impl ConsensusHandle {
     /// outstanding nops to one and only when it is alone in the queue, so nops
     /// can never pile up behind — or in front of — real frames.
     pub fn pending_len(&self) -> usize {
-        self.pending
-            .lock()
-            .expect("pending queue poisoned")
-            .len()
+        self.pending.len()
     }
 }
 
@@ -461,27 +461,74 @@ impl ConsensusHandle {
 /// is a no-op `true` — in this single-app sim every payload asked about is one we
 /// stored. generic over the public key `P` so `Context<Digest, P>` lines up with
 /// whatever scheme the engine runs.
-/// the single block-time knob: the target interval between finalized blocks.
-/// an idle chain ticks exactly one nop block per `BLOCK_TIME`; a busy window's
-/// ops all aggregate into the single block that closes the window. the node's
-/// flush/heartbeat loop AND this automaton's idle-wait both pace off this one
-/// value, so no producer can outpace it (the 1-tx-1-block + faster-than-intended
-/// beat regime is gone). raising it slows the visibly-live height tick 1:1.
+/// the IDLE block cadence: the target interval between finalized blocks while
+/// nothing is happening. an idle chain ticks exactly one nop block per
+/// `BLOCK_TIME`; the node's heartbeat AND this automaton's idle view hold both
+/// pace off this one value, so an idle chain never outpaces it. a BUSY chain
+/// has NO interval knob at all: the node flushes pending ops the moment
+/// nothing of its own is in flight, so the block rate is set by the network's
+/// own agreement speed — ops arriving during one block's consensus round
+/// aggregate into the next block, which is what keeps the 1-tx-1-block regime
+/// dead without a timer. raising it slows the idle height tick 1:1.
 pub const BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(1);
-/// how long a leader holds an otherwise-idle view open, polling for an op or the
-/// node's heartbeat nop before declining — keeping a solo validator (no quorum
-/// to wait on) from spinning nullifications, and the height they stamp, at CPU
-/// speed. equal to [`BLOCK_TIME`]: the node's flush loop is the real pacer, so
-/// this is only the safety ceiling for a node whose flush loop is disabled. it
-/// MUST be >= the beat interval so the beat lands inside the window and the view
-/// advances by a single finalized block per beat, never a nullify + a finalize.
+/// how long a leader holds an otherwise-idle view open before declining —
+/// keeping a solo validator (no quorum to wait on) from spinning
+/// nullifications, and the height they stamp, at CPU speed. equal to
+/// [`BLOCK_TIME`], and it MUST be >= the idle beat interval so the beat lands
+/// inside the window and the view advances by a single finalized block per
+/// beat, never a nullify + a finalize. the hold is EVENT-DRIVEN: the pending
+/// queue's enqueue signal wakes it, so a fresh submission (or the beat's nop)
+/// is proposed the instant it lands — this deadline only paces the DECLINE.
 const IDLE_BLOCK_TIME: std::time::Duration = BLOCK_TIME;
-/// how often [`ConsensusAutomaton::propose`] polls the pending FIFO while it
-/// holds an idle view open. matches the node's `DRAIN_TICK`.
-const POLL_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// this node's pending-proposal queue plus its enqueue signal, one shared
+/// allocation: [`ConsensusHandle::submit`] pushes (and signals), the
+/// automaton's `propose` peeks — WOKEN by the signal instead of polling — and
+/// the paired [`SimplexReporter`] removes a digest once it finalizes.
+#[derive(Default)]
+pub struct PendingProposals {
+    queue: Mutex<VecDeque<Digest>>,
+    /// signalled on every push so an OPEN idle view proposes a fresh
+    /// submission the moment it lands. `notify_one` stores a permit when no
+    /// waiter is armed, so a push racing `propose`'s arm-then-peek order can
+    /// never strand the wait.
+    enqueued: tokio::sync::Notify,
+}
+
+impl PendingProposals {
+    fn push(&self, digest: Digest) {
+        self.queue
+            .lock()
+            .expect("pending queue poisoned")
+            .push_back(digest);
+        self.enqueued.notify_one();
+    }
+
+    fn front(&self) -> Option<Digest> {
+        self.queue
+            .lock()
+            .expect("pending queue poisoned")
+            .front()
+            .copied()
+    }
+
+    fn len(&self) -> usize {
+        self.queue.lock().expect("pending queue poisoned").len()
+    }
+
+    /// remove BY VALUE, not blind pop_front — a node that didn't propose this
+    /// digest won't contain it (no-op), and a different still-pending frame
+    /// must never be discarded.
+    fn remove(&self, digest: &Digest) {
+        let mut queue = self.queue.lock().expect("pending queue poisoned");
+        if let Some(pos) = queue.iter().position(|d| d == digest) {
+            queue.remove(pos);
+        }
+    }
+}
 
 pub struct ConsensusAutomaton<P, C> {
-    pending: Arc<Mutex<VecDeque<Digest>>>,
+    pending: Arc<PendingProposals>,
     /// the SAME per-process store the paired handle `put`s into and the reporter
     /// `get`s from — `verify` gates a vote on holding the proposed payload here.
     store: ContentStore,
@@ -508,20 +555,18 @@ impl<P, C> Clone for ConsensusAutomaton<P, C> {
 impl<P, C> ConsensusAutomaton<P, C> {
     pub fn new(store: ContentStore, clock: C) -> Self {
         Self {
-            pending: Arc::new(Mutex::new(VecDeque::new())),
+            pending: Arc::new(PendingProposals::default()),
             store,
             clock: Arc::new(clock),
             _marker: std::marker::PhantomData,
         }
     }
 
-    /// queue a digest to be proposed on the next `propose`. the bytes must
-    /// already be in the [`ContentStore`] so peers can resolve them.
+    /// queue a digest to be proposed on the next `propose` — and wake an OPEN
+    /// idle view so it proposes now. the bytes must already be in the
+    /// [`ContentStore`] so peers can resolve them.
     pub fn enqueue(&self, digest: Digest) {
-        self.pending
-            .lock()
-            .expect("pending queue poisoned")
-            .push_back(digest);
+        self.pending.push(digest);
     }
 
     /// mint a [`ConsensusHandle`] sharing THIS automaton's pending FIFO and the
@@ -542,7 +587,7 @@ impl<P, C> ConsensusAutomaton<P, C> {
     /// share THIS automaton's pending FIFO with its paired [`SimplexReporter`],
     /// so the reporter can remove a digest once it finalizes (peek-until-
     /// finalized: propose peeks the front, the reporter removes on finalization).
-    pub fn pending(&self) -> Arc<Mutex<VecDeque<Digest>>> {
+    pub fn pending(&self) -> Arc<PendingProposals> {
         Arc::clone(&self.pending)
     }
 }
@@ -565,28 +610,30 @@ where
         // with NOTHING queued, do not decline INSTANTLY: a solo validator has no
         // quorum to wait on, so an instant decline spins the view clock — and the
         // block height it stamps — at CPU speed. hold the view open up to one
-        // block-time, polling so a freshly-submitted op or the node's heartbeat
-        // nop is proposed within a tick. still empty at the deadline → drop `tx`
-        // (the engine reads that as "can't propose" and nullifies), now paced to
-        // ~1 block per block-time.
-        let step = POLL_STEP;
-        let mut waited = std::time::Duration::ZERO;
+        // idle window, waiting on the queue's ENQUEUE SIGNAL so a fresh
+        // submission or the node's heartbeat nop is proposed the moment it
+        // lands — no poll step between an op arriving and its proposal. still
+        // empty at the deadline → drop `tx` (the engine reads that as "can't
+        // propose" and nullifies), pacing an idle solo chain to ~1 block per
+        // block-time.
+        let deadline = self.clock.sleep(IDLE_BLOCK_TIME);
+        futures::pin_mut!(deadline);
         loop {
-            if let Some(digest) = self
-                .pending
-                .lock()
-                .expect("pending queue poisoned")
-                .front()
-                .copied()
-            {
+            // arm the enqueue signal BEFORE peeking: a push landing between
+            // the peek and the wait still wakes the wait.
+            let enqueued = self.pending.enqueued.notified();
+            if let Some(digest) = self.pending.front() {
                 tx.send_lossy(digest);
                 break;
             }
-            if waited >= IDLE_BLOCK_TIME {
+            futures::pin_mut!(enqueued);
+            let idle_window_expired = matches!(
+                futures::future::select(enqueued, deadline.as_mut()).await,
+                futures::future::Either::Right(_)
+            );
+            if idle_window_expired {
                 break;
             }
-            self.clock.sleep(step).await;
-            waited += step;
         }
         rx
     }
@@ -633,8 +680,8 @@ where
 
 /// simplex requires a [`Relay`], but with one shared [`ContentStore`] every node
 /// already resolves any finalized digest, so there is nothing to disseminate.
-/// `broadcast` is a no-op that just satisfies the trait. (a real deployment
-/// swaps this for the legacy gossip relay behind the same seam.)
+/// `broadcast` is a no-op that just satisfies the trait. A deployment with
+/// independent stores supplies a disseminating relay behind the same seam.
 #[derive(Clone, Default)]
 pub struct NoopRelay<P>(std::marker::PhantomData<fn() -> P>);
 
@@ -1002,6 +1049,18 @@ struct FinalizedInner {
     /// exactly-once guard on `record` (NOT on `fill_fetched`) — and the replay
     /// guard for the whole ordered lane (see the type doc). unbounded on purpose.
     seen: HashSet<Digest>,
+    /// the delivery wake ([`FinalizedInbox::set_wake`]): pinged whenever a slot
+    /// may have become drainable, so the node's run loop drains a finalized
+    /// block the moment it lands instead of on its next periodic tick. unset
+    /// (or a dropped receiver) degrades to tick-paced draining, never an error.
+    wake: Option<commonware_utils::channel::mpsc::UnboundedSender<()>>,
+}
+
+/// ping the delivery wake, if one is installed. a full/closed channel is fine —
+/// the receiver side coalesces and the periodic drain tick is the backstop.
+fn ping_wake(inner: &FinalizedInner) {
+    let Some(wake) = &inner.wake else { return };
+    let _ = wake.send(());
 }
 
 impl FinalizedInbox {
@@ -1034,6 +1093,8 @@ impl FinalizedInbox {
         if let Some(bytes) = store.get(&digest) {
             inner.log.push_back((view, digest));
             inner.ready.insert(digest, bytes);
+            // a ready slot landed — the release prefix may have grown.
+            ping_wake(&inner);
             false
         } else if resolver_enabled {
             // miss: log the slot so it holds its place; the async fetch fills it.
@@ -1045,6 +1106,16 @@ impl FinalizedInbox {
         }
     }
 
+    /// install the delivery wake: `record`/`fill_fetched` ping it whenever a
+    /// slot may have become drainable, so the owning run loop can drain
+    /// event-driven instead of waiting out its periodic tick.
+    pub fn set_wake(&self, wake: commonware_utils::channel::mpsc::UnboundedSender<()>) {
+        self.inner
+            .lock()
+            .expect("finalized inbox poisoned")
+            .wake = Some(wake);
+    }
+
     /// complete an AWAITING slot with fetched bytes, off the sync reporter (from
     /// the resolver's `Consumer::deliver`). NOT seen-gated: `record` already logged
     /// the slot; this only supplies its bytes so the next `drain` can release it. a
@@ -1052,6 +1123,8 @@ impl FinalizedInbox {
     fn fill_fetched(&self, digest: Digest, bytes: Vec<u8>) {
         let mut inner = self.inner.lock().expect("finalized inbox poisoned");
         inner.ready.insert(digest, bytes);
+        // the fill may have un-halted the release prefix.
+        ping_wake(&inner);
     }
 
     /// count of UNRELEASED slots (the awaiting window) — an ops/metrics surface:
@@ -1164,7 +1237,7 @@ fn newest_finalization_at_or_below(
 #[derive(Clone)]
 pub struct SimplexReporter<S> {
     store: ContentStore,
-    pending: Arc<Mutex<VecDeque<Digest>>>,
+    pending: Arc<PendingProposals>,
     inbox: FinalizedInbox,
     /// the shared retained-certificate window (see [`RetainedFinalizations`]).
     retained: RetainedFinalizations,
@@ -1182,7 +1255,7 @@ impl<S> SimplexReporter<S> {
     /// [`SimplexOrderer`] drains.
     pub fn new(
         store: ContentStore,
-        pending: Arc<Mutex<VecDeque<Digest>>>,
+        pending: Arc<PendingProposals>,
         inbox: FinalizedInbox,
         mailbox: Option<PayloadMailbox>,
         retained: RetainedFinalizations,
@@ -1215,15 +1288,9 @@ where
             let digest = finalization.proposal.payload;
             let view = finalization.proposal.round.view().get();
             // committed: drop it from the pending FIFO so `propose` (peek-only)
-            // advances and never re-proposes it. remove BY VALUE, not blind
-            // pop_front — a node that didn't propose this digest won't contain it
-            // (no-op), and we must never discard a different still-pending frame.
-            {
-                let mut queue = self.pending.lock().expect("pending queue poisoned");
-                if let Some(pos) = queue.iter().position(|d| *d == digest) {
-                    queue.remove(pos);
-                }
-            }
+            // advances and never re-proposes it (removal is by value — see
+            // [`PendingProposals::remove`]).
+            self.pending.remove(&digest);
             // buffer for the async drain in ascending-view order (deduped). a
             // store HIT resolves NOW (the eager path, unchanged); a MISS with a
             // resolver enabled logs an AWAITING slot and we fetch the bytes —
@@ -1316,12 +1383,33 @@ impl SimplexOrderer {
         self.inbox.min_unreleased_view()
     }
 
+    /// the newest RETAINED finalization's engine view (`None` before this
+    /// engine's first finalization) — a validator's best LOCAL read of the
+    /// chain tip, e.g. to estimate the current view (tip + 1) when aiming a
+    /// leader nudge at whoever holds it open.
+    pub fn newest_finalized_view(&self) -> Option<u64> {
+        self.retained
+            .lock()
+            .expect("retained finalizations poisoned")
+            .keys()
+            .next_back()
+            .copied()
+    }
+
     /// depth of this node's pending FIFO — delegates to the shared
     /// [`ConsensusHandle`]. the node's heartbeat reads it to gate idle-nop
     /// injection on an empty queue, so a nop is only ever pushed when nothing
     /// real is already waiting behind it.
     pub fn pending_len(&self) -> usize {
         self.handle.pending_len()
+    }
+
+    /// install the finalization delivery wake on this orderer's inbox: the run
+    /// loop that owns the receiver drains a finalized block the moment it
+    /// lands instead of on its next periodic tick (see
+    /// [`FinalizedInbox::set_wake`]).
+    pub fn set_delivery_wake(&self, wake: commonware_utils::channel::mpsc::UnboundedSender<()>) {
+        self.inbox.set_wake(wake);
     }
 }
 
@@ -1362,7 +1450,7 @@ impl SimplexOrderer {
     /// `S::PublicKey` pinned to ed25519 — the transport identity every p2p bound in
     /// this crate keys on; only the vote/certificate signatures vary by scheme. also
     /// generic over the runtime `context` E, the `blocker` B, and the three engine
-    /// channel pairs (forwarded to `engine.start`). config is the tuned legacy
+    /// channel pairs (forwarded to `engine.start`). config is the tuned
     /// default. the engine's handle lives inside the returned orderer, whose
     /// `Drop` explicitly ABORTS it (a bare handle drop would leak the task).
     ///
@@ -1791,10 +1879,8 @@ where
     R: rand_core::CryptoRngCore,
 {
     use commonware_parallel::Sequential;
-    let finalization = Finalization::<S, Digest>::decode_cfg(
-        bytes,
-        &scheme.certificate_codec_config(),
-    )
+    let finalization =
+        Finalization::<S, Digest>::decode_cfg(bytes, &scheme.certificate_codec_config())
     .map_err(|e| format!("finalization certificate does not decode: {e}"))?;
     if !finalization.verify(rng, scheme, &Sequential) {
         return Err(
@@ -1921,8 +2007,15 @@ impl FollowerOrderer {
         FR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
     {
         let inbox = FinalizedInbox::new();
-        let (mailbox, fetch_handle) =
-            spawn_payload_fetch(&context, blocker, provider, me, store.clone(), inbox.clone(), fetch);
+        let (mailbox, fetch_handle) = spawn_payload_fetch(
+            &context,
+            blocker,
+            provider,
+            me,
+            store.clone(),
+            inbox.clone(),
+            fetch,
+        );
 
         Self {
             store,
@@ -1938,7 +2031,7 @@ impl FollowerOrderer {
     /// admit one BACKFILLED finalized frame — bytes fetched over the
     /// statesync Frames lane rather than proven by an observed certificate.
     /// THE CALLER OWNS THIS LANE'S TRUST: after the fold it must cross-check
-    /// the folded seal (disposition / app-hash) against the served one, the
+    /// the folded seal (disposition / root-hash) against the served one, the
     /// same per-frame verification the post-reboot catch-up performs — this
     /// method only stores the bytes content-addressed and logs the gate
     /// slot. the latest-finalization floor slot is deliberately NOT advanced
@@ -2137,7 +2230,9 @@ mod tests {
             newest_finalization_at_or_below(&retained, sealed_tip).expect("cert retained");
         assert_eq!((view, cert), (1, b"cert-one".to_vec()));
         assert!(
-            inbox.min_unreleased_view().is_none_or(|pending| pending > view),
+            inbox
+                .min_unreleased_view()
+                .is_none_or(|pending| pending > view),
             "everything at or below the selected certificate has released"
         );
         // ...even though the inbox is NOT empty (the old gate's starvation).

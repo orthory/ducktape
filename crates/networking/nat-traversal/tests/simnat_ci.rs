@@ -15,14 +15,11 @@
 //! The coordinator is rendezvous ONLY: there is no relay fallback, so a pair
 //! that cannot hole-punch (e.g. symmetric NAT on both sides) terminally fails
 //! resolution instead of degrading onto a coordinator-carried path.
-//!
-//! Out of THIS gate (node-bin's clippy is pre-existingly red from toolchain
-//! drift): v3 invite signature verify/reject and v2 parse-compatibility live in
-//! `bin/node/src/config.rs` and are covered by Slice 1's own tests.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use commonware_cryptography::{Signer as _, ed25519};
 use nat_traversal::{
     ClientEvent, Coordinator, NatClient, NodeKey, PunchError, SimNat, SocketEvent,
     drive_rebind_reconnect, drive_simulated, run_coordinator,
@@ -34,15 +31,23 @@ fn ip(o: u8) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(198, 51, 100, o))
 }
 
+fn identity(seed: u64) -> (NodeKey, ed25519::PrivateKey) {
+    let signer = ed25519::PrivateKey::from_seed(seed);
+    let mut key = [0; 32];
+    key.copy_from_slice(signer.public_key().as_ref());
+    (NodeKey(key), signer)
+}
+
 #[tokio::test]
 async fn reflexive_discovery() {
     let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
     tokio::spawn(run_coordinator(
         coord_sock,
-        nat_traversal::AuthPolicy::Open { require_pop: false },
+        nat_traversal::AuthPolicy::Public,
     ));
-    let client = NatClient::bind(NodeKey([1u8; 32]), coord_addr)
+    let (key, signer) = identity(1);
+    let client = NatClient::bind(key, vec![coord_addr], signer, None)
         .await
         .unwrap();
     let reflexive = timeout(Duration::from_secs(2), client.discover_reflexive())
@@ -99,14 +104,12 @@ fn endpoint_churn_readvertise_reconnect() {
 async fn multi_coordinator_failover() {
     let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let live_addr = live.local_addr().unwrap();
-    tokio::spawn(run_coordinator(
-        live,
-        nat_traversal::AuthPolicy::Open { require_pop: false },
-    ));
+    tokio::spawn(run_coordinator(live, nat_traversal::AuthPolicy::Public));
     let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = dead.local_addr().unwrap();
 
-    let mut client = NatClient::bind_multi(NodeKey([3u8; 32]), vec![dead_addr, live_addr])
+    let (key, signer) = identity(3);
+    let mut client = NatClient::bind(key, vec![dead_addr, live_addr], signer, None)
         .await
         .unwrap();
     let (idx, _reflexive) = timeout(
@@ -132,12 +135,16 @@ async fn punched_path_survives_coordinator_death() {
     let coord_addr = coord_sock.local_addr().unwrap();
     let coord = tokio::spawn(run_coordinator(
         coord_sock,
-        nat_traversal::AuthPolicy::Open { require_pop: false },
+        nat_traversal::AuthPolicy::Public,
     ));
-    let a_key = NodeKey([0xaa; 32]);
-    let b_key = NodeKey([0xbb; 32]);
-    let a = NatClient::bind(a_key, coord_addr).await.unwrap();
-    let b = NatClient::bind(b_key, coord_addr).await.unwrap();
+    let (a_key, a_signer) = identity(4);
+    let (b_key, b_signer) = identity(5);
+    let a = NatClient::bind(a_key, vec![coord_addr], a_signer, None)
+        .await
+        .unwrap();
+    let b = NatClient::bind(b_key, vec![coord_addr], b_signer, None)
+        .await
+        .unwrap();
     a.register().await.unwrap();
     b.register().await.unwrap();
     let _ = timeout(Duration::from_secs(2), a.lookup(b_key))

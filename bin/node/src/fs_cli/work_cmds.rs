@@ -1,7 +1,7 @@
 //! the working-copy loop: checkout / status / commit / pin. these operate on a
-//! local checkout dir plus its `.duckfs` index; the node address comes from
-//! `--node` / `DUCKTAPE_NODE` and, for verbs that run inside a checkout, the
-//! index's recorded node url.
+//! local checkout dir plus its `.duckfs` index; the node address comes from the
+//! shared [`crate::cli_args::NodeAddr`] ladder, which for verbs running inside a
+//! checkout takes the index's recorded node url as its context rung.
 
 use std::path::Path;
 
@@ -10,23 +10,19 @@ use duckfs_client::commit::{CommitError, CommitOptions, commit_with};
 use duckfs_client::http::HttpNode;
 use duckfs_client::index::Index;
 
-use crate::fs_cli::args::{CliError, NodeAddr, resolve_node, resolve_node_addr};
+use crate::fs_cli::args::{CliError, NodeAddr, resolve_node};
 use crate::fs_cli::{CheckoutArgs, CommitArgs, PinArgs, StatusArgs};
 
-/// resolve the node for a verb running inside `dir`: the addressing chain
-/// (`--node` / `-n/--network` / `DUCKTAPE_NODE`) first, else the `.duckfs`
-/// index's recorded node url.
+/// resolve the node for a verb running inside `dir`: the shared addressing
+/// ladder, with this checkout's `.duckfs` index as the ambient context rung —
+/// below what the operator stated, above the registry inference. A checkout
+/// records the node it came FROM, which beats "the one workspace registered on
+/// this box".
 fn node_for_dir(addr: &NodeAddr, dir: &Path) -> Result<HttpNode, CliError> {
-    if let Some(url) = resolve_node_addr(addr)? {
-        return Ok(HttpNode::new(url));
-    }
-    match Index::load(dir) {
-        Ok(index) if !index.node.is_empty() => Ok(HttpNode::new(index.node)),
-        _ => Err(CliError::usage(
-            "no node address: pass --node <http-url>, -n/--network <id>, set \
-             DUCKTAPE_NODE, or run inside a checkout whose index records a node",
-        )),
-    }
+    let recorded = || Index::load(dir).ok().map(|index| index.node);
+    addr.resolve_with(recorded)
+        .map(HttpNode::new)
+        .map_err(CliError::usage)
 }
 
 fn checkout_err(e: CheckoutError) -> CliError {

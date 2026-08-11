@@ -6,12 +6,13 @@
 //! passes the loopback http URL (that lane is Task 6's e2e). stock git's
 //! fetch-first refusal on the bare remote is the CAS-reject stand-in.
 
+use crate::NodeHandle;
 use super::super::NodedProvisioner;
 use super::super::plane_tests::{
     SKILL_BODY, SKILL_FILE, skill_mount, skill_tree, spawn_files_actor,
 };
 use super::*;
-use dispatch_oracle::WorkspaceProvisioner as _;
+use compute_service::WorkspaceProvisioner as _;
 
 const REPO: &str = "app";
 const BRANCH: &str = "agent/item-7";
@@ -123,9 +124,9 @@ impl Bed {
         format!("file://{}", self.bares.display())
     }
 
-    fn provisioner(&self) -> NodedProvisioner {
+    async fn provisioner(&self) -> NodedProvisioner {
         let (handle, _rx, _hub) = NodeHandle::channel();
-        NodedProvisioner::new(handle.with_forge_repo(&self.repo_base), &self.runs_root)
+        NodedProvisioner::new(crate::agent_provision::test_link(handle.with_forge_repo(&self.repo_base)).await, &self.runs_root)
             .with_forge(Some(self.push_base()), NODE_IDENT)
     }
 
@@ -133,13 +134,13 @@ impl Bed {
     /// receiver — fine for runs with no mounts, but a W6 checkout needs a node
     /// on the other end). `reject_reads` fails the mount checkout mid-way. the
     /// actor handle must outlive the provision, so it comes back with it.
-    fn skill_provisioner(
+    async fn skill_provisioner(
         &self,
         reject_reads: bool,
     ) -> (NodedProvisioner, tokio::task::JoinHandle<()>) {
         let (handle, rx, _hub) = NodeHandle::channel();
         let actor = spawn_files_actor(rx, skill_tree(), reject_reads);
-        let prov = NodedProvisioner::new(handle.with_forge_repo(&self.repo_base), &self.runs_root)
+        let prov = NodedProvisioner::new(crate::agent_provision::test_link(handle.with_forge_repo(&self.repo_base)).await, &self.runs_root)
             .with_forge(Some(self.push_base()), NODE_IDENT);
         (prov, actor)
     }
@@ -253,7 +254,7 @@ fn the_probe_rejects_git_without_the_runtime_rebase_options() {
 async fn a_failed_probe_is_permanent_and_loud_and_leaves_no_debris() {
     let bed = bed();
     let (handle, _rx, _hub) = NodeHandle::channel();
-    let prov = NodedProvisioner::new(handle.with_forge_repo(&bed.repo_base), &bed.runs_root)
+    let prov = NodedProvisioner::new(crate::agent_provision::test_link(handle.with_forge_repo(&bed.repo_base)).await, &bed.runs_root)
         .with_forge_probed(Some(bed.push_base()), NODE_IDENT, || {
             Err("git probe exploded".into())
         });
@@ -276,7 +277,7 @@ async fn a_failed_probe_is_permanent_and_loud_and_leaves_no_debris() {
 async fn no_http_surface_means_a_clear_forge_provision_error() {
     let bed = bed();
     let (handle, _rx, _hub) = NodeHandle::channel();
-    let prov = NodedProvisioner::new(handle.with_forge_repo(&bed.repo_base), &bed.runs_root)
+    let prov = NodedProvisioner::new(crate::agent_provision::test_link(handle.with_forge_repo(&bed.repo_base)).await, &bed.runs_root)
         .with_forge(None, NODE_IDENT);
     let err = provision_err(prov.provision(&bed.spec("s1:0", &bed.head, false)).await);
     assert!(err.contains("no http surface"), "{err}");
@@ -287,7 +288,7 @@ async fn a_handle_without_a_forge_repo_base_is_a_clear_error() {
     let bed = bed();
     let (handle, _rx, _hub) = NodeHandle::channel(); // no with_forge_repo
     let prov =
-        NodedProvisioner::new(handle, &bed.runs_root).with_forge(Some(bed.push_base()), NODE_IDENT);
+        NodedProvisioner::new(crate::agent_provision::test_link(handle).await, &bed.runs_root).with_forge(Some(bed.push_base()), NODE_IDENT);
     let err = provision_err(prov.provision(&bed.spec("s1:0", &bed.head, false)).await);
     assert!(err.contains("no forge repo base"), "{err}");
 }
@@ -328,7 +329,7 @@ async fn provisions_a_self_contained_clone_at_the_pinned_commit_from_an_odb_only
     // clone must still materialize the pinned tree.
     let bed = bed();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -401,7 +402,7 @@ async fn provision_never_touches_shared_repo_refs() {
     set_ref(&repo, BRANCH, &stale);
 
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -427,7 +428,7 @@ async fn a_born_branch_is_forced_to_the_committed_tip_and_pushes_fast_forward() 
     set_ref(&repo, BRANCH, &drift);
 
     let spec = bed.spec("s2:0", &tip, true);
-    let ws = bed.provisioner().provision(&spec).await.expect("provision");
+    let ws = bed.provisioner().await.provision(&spec).await.expect("provision");
     let dir = ws.workdir();
     assert_eq!(
         git_stdout(&dir, &["rev-parse", "HEAD"]),
@@ -464,7 +465,7 @@ async fn concurrent_attempts_of_one_item_both_provision_detached() {
     // no branch refs are held, so there is nothing to refuse — both attempts
     // run and the push loop orders whoever finishes second.
     let bed = bed();
-    let prov = bed.provisioner();
+    let prov = bed.provisioner().await;
     let a = prov
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
@@ -489,7 +490,7 @@ async fn a_shared_repo_ref_force_move_mid_run_cannot_reparent_the_commit() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, true))
         .await
         .expect("provision");
@@ -538,7 +539,7 @@ async fn a_missing_pinned_commit_fails_provision_before_any_worktree() {
     let bed = bed();
     let absent = "ab".repeat(20);
     let err = provision_err(
-        bed.provisioner()
+        bed.provisioner().await
             .provision(&bed.spec("s1:0", &absent, false))
             .await,
     );
@@ -562,7 +563,7 @@ async fn a_repo_missing_on_this_node_fails_provision_loudly() {
         branch_born: false,
         forge_push: true,
     };
-    let err = provision_err(bed.provisioner().provision(&spec).await);
+    let err = provision_err(bed.provisioner().await.provision(&spec).await);
     assert!(
         err.contains("ghost") && err.contains("not materialized"),
         "{err}"
@@ -579,7 +580,7 @@ async fn skill_mounts_land_beside_the_worktree_where_git_can_never_see_them() {
     // never inside the worktree, where `git add -A` would commit and PUSH the
     // skill trees onto the agent's work branch.
     let bed = bed();
-    let (prov, _actor) = bed.skill_provisioner(false);
+    let (prov, _actor) = bed.skill_provisioner(false).await;
     let ws = prov
         .provision(&bed.skill_spec("s1:0", &bed.head))
         .await
@@ -612,7 +613,7 @@ async fn a_failed_skill_mount_checkout_leaves_no_debris() {
     // provision unwinds EVERYTHING it made — the partial ro tree AND the
     // worktree it had already added (metadata in the shared repo included).
     let bed = bed();
-    let (prov, _actor) = bed.skill_provisioner(true);
+    let (prov, _actor) = bed.skill_provisioner(true).await;
     let err = provision_err(prov.provision(&bed.skill_spec("s1:0", &bed.head)).await);
     assert!(
         err.contains("chunk not available"),
@@ -692,68 +693,8 @@ fn attribution_addresses_round_trip_a_label_shaped_agent_id() {
         assert!(agent::validate_agent_id(id).is_ok(), "{id}");
         let local = attribution_email_local_part(id);
         assert_eq!(local, id);
-        assert!(local.len() <= MAX_AGENT_ID_BYTES, "{local}");
+        assert!(local.len() <= 63, "{local}");
     }
-}
-
-/// LEGACY: ids registered before the label rule are not addresses — they still
-/// get a bounded, unique, readable local part off the complete committed id.
-#[test]
-fn attribution_addresses_hash_the_complete_id_after_a_readable_slug() {
-    let ids = ["qa/luna", "qa luna", "qa@luna", "QA-Luna"];
-    let locals = ids.map(attribution_email_local_part);
-    for (id, local) in ids.iter().zip(&locals) {
-        assert!(agent::validate_agent_id(id).is_err(), "{id}");
-        assert!(
-            local.to_ascii_lowercase().starts_with("qa-luna."),
-            "{local}"
-        );
-        assert!(local.len() <= MAX_AGENT_ID_BYTES, "{local}");
-        assert!(local != *id, "{local}");
-    }
-    assert_ne!(locals[0], locals[1]);
-    assert_ne!(locals[0], locals[2]);
-    assert_ne!(locals[1], locals[2]);
-    assert_eq!(locals[0], attribution_email_local_part(ids[0]));
-}
-
-/// THE ADDRESS IS AN IDENTITY — the verbatim and derived branches must not be
-/// able to name the same mailbox. A hash suffix alone did NOT give that: the
-/// derivation is lossy and used to land back in the label alphabet, so legacy
-/// `"qa luna"` derived `qa-luna-<32 hex>` — itself a legal DNS label. A new agent
-/// could register exactly that id, take the verbatim branch, and author commits
-/// as the legacy agent. Both inputs are public (registry state + sha256), so it
-/// was a cheap impersonation, not a birthday collision.
-///
-/// The `.` separator makes the two branches DISJOINT BY CONSTRUCTION: every
-/// derived local part contains a dot, and no id consensus admits ever can.
-#[test]
-fn a_derived_local_part_can_never_be_claimed_by_a_new_agent_id() {
-    let overlong = "x".repeat(200);
-    for legacy in [
-        "qa luna",
-        "qa/luna",
-        "QA-Luna",
-        "agent id",
-        "",
-        "\u{1f}",
-        overlong.as_str(),
-    ] {
-        assert!(agent::validate_agent_id(legacy).is_err(), "{legacy}");
-        let derived = attribution_email_local_part(legacy);
-        assert!(derived.contains('.'), "no dot to disjoin it: {derived}");
-        assert!(
-            agent::validate_agent_id(&derived).is_err(),
-            "a NEW agent could register {derived:?} and inherit {legacy:?}'s address"
-        );
-        assert!(derived.len() <= MAX_AGENT_ID_BYTES, "{derived}");
-        // and no leading/trailing/doubled dot — still a legal RFC 5321 dot-string.
-        assert!(!derived.starts_with('.') && !derived.ends_with('.') && !derived.contains(".."));
-    }
-    // the pre-fix collision, pinned: this is what `"qa luna"` used to derive.
-    let old_form = "qa-luna-4a052e65e069b9f7339f8795b7a7dbae";
-    assert!(agent::validate_agent_id(old_form).is_ok(), "it IS a label");
-    assert_ne!(attribution_email_local_part("qa luna"), old_form);
 }
 
 #[test]
@@ -765,7 +706,7 @@ fn missing_unsafe_and_oversized_proposals_fall_back_to_the_forge_title() {
         Some("dispatch\u{1f}runs\u{1f}private:0"),
         Some(oversized.as_str()),
     ] {
-        let long_name = "오리".repeat(100);
+        let long_name = "🦆".repeat(100);
         let safe_name = sanitize_display_name(&long_name);
         assert!(safe_name.len() <= MAX_DISPLAY_NAME_BYTES);
         assert!(safe_name.is_char_boundary(safe_name.len()));
@@ -833,7 +774,7 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -879,7 +820,7 @@ async fn host_git_ignores_agent_installed_hooks_and_filters() {
     let bed = bed();
     bed.snapshot_bare();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -923,7 +864,7 @@ async fn a_push_granted_dirty_tree_pushes_with_agent_and_node_identity() {
     let bed = bed();
     bed.snapshot_bare();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -949,11 +890,11 @@ async fn a_read_only_clean_tree_yields_no_changes_and_no_push() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.read_only_spec("s1:0", &bed.head))
         .await
         .expect("provision");
-    let runtime = ws.workdir().join(capability_host::RUN_RUNTIME_DIR);
+    let runtime = ws.workdir().join(provider_host::RUN_RUNTIME_DIR);
     assert_eq!(
         git_stdout(&ws.workdir(), &["remote"]),
         "",
@@ -985,7 +926,7 @@ async fn a_read_only_dirty_tree_is_rejected_without_moving_the_remote_ref() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.read_only_spec("s1:0", &bed.head))
         .await
         .expect("provision");
@@ -1006,7 +947,7 @@ async fn an_agent_created_commit_chain_is_pushed_without_rewriting_it() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -1066,7 +1007,7 @@ async fn uncommitted_work_is_captured_on_top_of_the_agents_commit() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -1113,7 +1054,7 @@ async fn no_agent_message_or_forge_title_never_pushes_synthetic_history() {
     // an EMPTY title is the "no usable forge title" case now that the field is
     // required: it fails the commit-message candidate and falls to the prose.
     *item_title = String::new();
-    let ws = bed.provisioner().provision(&spec).await.expect("provision");
+    let ws = bed.provisioner().await.provision(&spec).await.expect("provision");
     std::fs::write(ws.workdir().join("answer.md"), "real work\n").unwrap();
 
     let err = ws.commit("agent run s1:0", None).await.unwrap_err();
@@ -1131,7 +1072,7 @@ async fn an_agent_commit_cannot_spoof_git_identity_and_get_rewritten() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -1160,7 +1101,7 @@ async fn agent_history_must_descend_from_the_pinned_forge_commit() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -1230,7 +1171,7 @@ async fn a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed() {
     set_ref(&bare_repo, BRANCH, &c2);
 
     let spec = bed.spec("s1:0", &bed.head, true);
-    let ws = bed.provisioner().provision(&spec).await.expect("provision");
+    let ws = bed.provisioner().await.provision(&spec).await.expect("provision");
     let dir = ws.workdir();
     std::fs::write(dir.join("mine.txt"), "forked work\n").unwrap();
 
@@ -1273,7 +1214,7 @@ async fn a_concurrent_advance_preserves_agent_merge_topology_and_messages() {
     set_ref(&bare_repo, BRANCH, &rival);
 
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, true))
         .await
         .expect("provision");
@@ -1363,7 +1304,7 @@ async fn an_identical_concurrent_patch_keeps_the_agent_attribution_commit() {
     set_ref(&bare_repo, BRANCH, &c2);
 
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, true))
         .await
         .expect("provision");
@@ -1404,7 +1345,7 @@ async fn a_rebase_conflict_aborts_cleanly_and_degrades() {
     set_ref(&bare_repo, BRANCH, &c2);
 
     let spec = bed.spec("s1:0", &bed.head, true);
-    let ws = bed.provisioner().provision(&spec).await.expect("provision");
+    let ws = bed.provisioner().await.provision(&spec).await.expect("provision");
     let dir = ws.workdir();
     std::fs::write(dir.join("readme.md"), "my conflicting edit\n").unwrap();
 
@@ -1453,7 +1394,7 @@ async fn a_remote_that_always_rejects_exhausts_the_bounded_retries() {
     }
 
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, true))
         .await
         .expect("provision");
@@ -1482,7 +1423,7 @@ async fn cleanup_removes_the_worktree_and_its_metadata_even_uncommitted() {
     // go quietly, metadata and all.
     let bed = bed();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");
@@ -1506,7 +1447,7 @@ async fn cleanup_after_a_successful_push_leaves_only_the_branch_ref() {
     let bed = bed();
     bed.snapshot_bare();
     let ws = bed
-        .provisioner()
+        .provisioner().await
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
         .expect("provision");

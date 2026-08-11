@@ -355,7 +355,7 @@ mod tests {
                 authorizer: auth.clone(),
             },
             IdentityMsg::SetAccountName {
-                display_name: "eddy".into(),
+                display_name: "alice".into(),
             },
             IdentityMsg::SetProfile {
                 avatar: Some("/shared/attachments/avatars/0123456789abcdef.png".into()),
