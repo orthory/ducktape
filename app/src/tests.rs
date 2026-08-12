@@ -1138,6 +1138,123 @@ fn reactions_run_outside_the_mutation_lock() {
     assert_eq!(app.mutation_phase, "idle");
 }
 
+/// THE CANONICAL REFETCH *IS* THE REVERT. A reaction fold is not invertible
+/// under concurrent deltas, so a refusal carries no rollback token — and
+/// nothing else can heal it: a chat delta folds a reactor SET, it never
+/// replaces one, so a chip the chain refused survives every later message until
+/// the room is switched. The resync `reaction_failed` launches is the only
+/// thing that takes it back, on both copies of the row.
+#[test]
+fn a_refused_reaction_is_reverted_by_the_resync_it_launches() {
+    let mut tapped = message(7, "root", false);
+    tapped.reactions = vec![backend::ChatReaction {
+        emoji: "👍".into(),
+        count: 1,
+        reacted_by_me: true,
+        reactors: vec!["user:aa11".into()],
+    }];
+
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.channels = vec![room("general", 7)];
+    app.messages = vec![tapped.clone()];
+    app.thread_messages = vec![tapped];
+    app.active_thread_seq = 7;
+    let resync_before = app.hydration_generation;
+    let thread_before = app.live_thread_generation;
+
+    let _ = app.__update(__DucktapeMessage::ReactionFailed(backend::AppError {
+        message: "the chain refused it".into(),
+        committed: false,
+    }));
+    assert_eq!(app.error, "the chain refused it");
+    assert_ne!(
+        app.hydration_generation, resync_before,
+        "a fresh resync is issued to fetch what is actually there"
+    );
+    assert_eq!(
+        app.mutation_phase, "idle",
+        "and it never took the mutation lock to do it"
+    );
+
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "general",
+        vec![message(7, "root", false)],
+        "",
+        Vec::new(),
+    )));
+    assert!(
+        app.messages[0].reactions.is_empty(),
+        "the canonical page takes the chip back off the timeline"
+    );
+    assert_ne!(
+        app.live_thread_generation, thread_before,
+        "and the open rail is re-fetched for its own copy of the row"
+    );
+}
+
+/// BOTH COPIES OF THE ROW TAKE THE TAP. A message on screen can be the root (or
+/// a reply) of the thread rail open beside it, so a tap that folded into one
+/// list left the two disagreeing about the count until the room was switched.
+/// The un-react direction is the same fold with `added: false` and carries the
+/// same obligation.
+#[test]
+fn every_reaction_tap_folds_into_the_timeline_and_the_thread_rail() {
+    let chat = inlined(include_str!("ui/handlers/chat.ice"));
+    for handler in [
+        "add_reaction_submit(emoji)",
+        "add_reaction_at(seq, emoji)",
+        "remove_reaction_at(seq, emoji)",
+    ] {
+        let body = chat
+            .split_once(&format!("on {handler}\n"))
+            .unwrap_or_else(|| panic!("{handler} is a handler"))
+            .1
+            .split_once("\non ")
+            .expect("a handler ends at the next one")
+            .0;
+        assert!(
+            body.contains("messages = reaction_applied(messages,"),
+            "{handler} folds the timeline"
+        );
+        assert!(
+            body.contains("thread_messages = reaction_applied(thread_messages,"),
+            "{handler} folds the rail with it"
+        );
+    }
+
+    // and the un-react path is wired and gated like the others
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.error = "something older".into();
+
+    let before = app.hydration_generation;
+    let _ = app.__update(__DucktapeMessage::RemoveReactionAt(7, "👍".into()));
+    assert!(app.error.is_empty());
+    assert_ne!(app.hydration_generation, before);
+    assert_eq!(app.mutation_phase, "idle");
+
+    let armed = app.hydration_generation;
+    let _ = app.__update(__DucktapeMessage::RemoveReactionAt(0, "👍".into()));
+    assert_eq!(
+        app.hydration_generation, armed,
+        "there is no row 0 to un-react"
+    );
+    app.active_channel_archived = true;
+    let _ = app.__update(__DucktapeMessage::RemoveReactionAt(7, "👍".into()));
+    assert_eq!(
+        app.hydration_generation, armed,
+        "and an archived room takes no reaction either way"
+    );
+}
+
 #[test]
 fn a_tombstoned_thread_root_renders_deleted_in_place() {
     let (mut app, _) = Ducktape::__boot();
@@ -1962,6 +2079,215 @@ fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
     assert!(!app.history_view);
 }
 
+/// A RESYNC ANSWERS WITH THE TAIL, SO IT FOLDS ONTO THE WINDOW — IT DOES NOT
+/// REPLACE IT.
+///
+/// `load_chat_data` walks a bounded number of roots back from HEAD however far
+/// the reader has paged, and the triggers are ordinary: a huddle join or leave
+/// in the room on screen, a websocket reconnect, any chat op the delta path
+/// cannot fold, the three chat failure resyncs. Assigning that page back threw
+/// away every "Load older" page she had loaded — and, the scrollable staying
+/// mounted at `anchor-y=end`, clamped her offset onto the top of the suddenly
+/// short window, hundreds of rows forward from where she was reading, with no
+/// banner and nothing to click to get back.
+#[test]
+fn a_chat_resync_keeps_the_pages_the_reader_paged_in() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.channels = vec![room("general", 51)];
+
+    // the live tail, then two "Load older" pages behind it
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
+        "general",
+        vec![
+            message(50, "the tail", false),
+            message(51, "and its next", false),
+        ],
+    )));
+    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+    let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
+        generation: app.history_generation,
+        channel_id: "general".into(),
+        messages: vec![message(20, "older", false)],
+    }));
+    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+    let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
+        generation: app.history_generation,
+        channel_id: "general".into(),
+        messages: vec![message(2, "older still", false)],
+    }));
+    assert_eq!(backend::oldest_message_seq(app.messages.clone()), 2);
+    assert!(!app.history_view, "back-paging is not a history window");
+
+    // someone joins the huddle in this room, and the resync it forces answers
+    // with the latest page alone
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "general",
+        vec![
+            message(51, "and its next", false),
+            message(52, "arrived meanwhile", false),
+        ],
+        "",
+        Vec::new(),
+    )));
+
+    assert_eq!(
+        app.messages.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![2, 20, 50, 51, 52],
+        "the pages she loaded survive, with the fresh tail spliced onto them"
+    );
+    assert!(
+        app.has_older_history,
+        "and 'Load older' still points past the oldest row she holds"
+    );
+
+    // A HISTORY WINDOW IS STILL REPLACED: it is not contiguous with the tail,
+    // so merging the two would leave a hole in the middle that nothing pages in.
+    let _ = app.__update(__DucktapeMessage::ChatHitLoaded(chat_data(
+        "general",
+        vec![message(7, "six months ago", false)],
+    )));
+    assert!(app.history_view);
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "general",
+        vec![message(52, "arrived meanwhile", false)],
+        "",
+        Vec::new(),
+    )));
+    assert_eq!(
+        app.messages.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![52],
+        "the window is dropped whole, and the banner goes with it"
+    );
+    assert!(!app.history_view);
+}
+
+/// AND A SPLICE THAT DOES NOT TOUCH IS NOT A SPLICE — it is a HOLE, and the
+/// hole is permanent.
+///
+/// `ModuleEvent::Lagged` says the client fell so far behind that the missed ops
+/// are gone; the resync it forces answers with the last N roots, which can start
+/// PAST the newest row on screen. Merging those two windows draws today's
+/// messages directly under a stretch that is simply missing, and nothing can
+/// ever fill it: "Load older" pages back from `oldest_message_seq`, now the
+/// far-back end, so every click walks further AWAY from the gap. `history_view`
+/// is not the only non-contiguous landing, so the test is the rows themselves.
+#[test]
+fn a_resync_the_window_cannot_reach_replaces_it_rather_than_leaving_a_hole() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.channels = vec![room("general", 900)];
+    app.messages = vec![
+        message(2, "she paged back this far", false),
+        message(20, "and read up to here", false),
+    ];
+    // an in-flight send of her own is still on screen, seq -1 and no page
+    app.messages.push(backend::ChatMessage {
+        seq: -1,
+        pending: true,
+        ..message(0, "mine, still sending", false)
+    });
+
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "general",
+        vec![
+            message(880, "the tail after the lag", false),
+            message(900, "and today", false),
+        ],
+        "",
+        Vec::new(),
+    )));
+
+    assert_eq!(
+        app.messages
+            .iter()
+            .filter(|row| !row.pending)
+            .map(|row| row.seq)
+            .collect::<Vec<_>>(),
+        vec![880, 900],
+        "the unreachable window is dropped whole — no 20-then-880 seam"
+    );
+    assert_eq!(
+        backend::oldest_message_seq(app.messages.clone()),
+        880,
+        "so 'Load older' walks back from the tail, into the gap and not past it"
+    );
+    assert!(
+        app.messages.iter().any(|row| row.pending),
+        "and her own in-flight send is not collateral"
+    );
+}
+
+/// A PLANE OP IS NOT "JUMP TO LATEST".
+///
+/// The resync that lands on every files write, valset change, identity, agent
+/// or governance op carries no chat — the search window and its amber banner are
+/// still exactly what is on screen — and it used to mark the room read to a head
+/// the reader has demonstrably not reached — and `mark_channel_read` only moves
+/// forward, so the badge `chat_sidebar_rooms` paints off that cursor never comes
+/// back. `chat_hit_loaded` refuses that write; this is the handler that was
+/// undoing it one save later.
+#[test]
+fn a_plane_resync_leaves_a_search_window_and_its_badge_alone() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_channel = "general".into();
+    // she read up to 10 when she connected; thirty messages have landed since
+    app.channels = vec![room("general", 10)];
+    app.channel_reads = backend::initial_channel_reads(app.channels.clone(), Vec::new());
+    app.channels = vec![room("general", 40)];
+
+    let _ = app.__update(__DucktapeMessage::ChatHitLoaded(chat_data(
+        "general",
+        vec![message(7, "six months ago", false)],
+    )));
+    assert!(app.history_view);
+    assert!(
+        app.rooms
+            .iter()
+            .any(|row| row.channel.id == "general" && row.unread)
+    );
+
+    let plane_only = backend::LiveRefresh {
+        chat_loaded: false,
+        pages_loaded: false,
+        ..live_refresh(
+            app.hydration_generation,
+            "general",
+            Vec::new(),
+            "",
+            Vec::new(),
+        )
+    };
+    let _ = app.__update(__DucktapeMessage::LiveResynced(plane_only));
+
+    assert!(
+        app.history_view,
+        "the banner is still the only way back to the tail"
+    );
+    assert_eq!(
+        app.messages.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![7],
+        "and the window around the hit is still what she is reading"
+    );
+    assert!(
+        app.rooms
+            .iter()
+            .any(|row| row.channel.id == "general" && row.unread),
+        "so the room is no more read than it was before she saved a file"
+    );
+}
+
 /// A HISTORY WINDOW IS A SNAPSHOT, NOT A LIVE TAIL.
 ///
 /// The rows in hand are a window around one old message, so a post from today
@@ -1996,11 +2322,26 @@ fn a_live_post_does_not_splice_itself_into_a_history_window() {
     app.loading = false;
     app.connected = true;
     app.active_channel = "general".into();
+    // THE SIDEBAR ALREADY KNOWS THE ROOM'S HEAD when the hit lands, which is the
+    // whole point: search is workspace-wide, so the hit routinely opens a room
+    // with unread waiting, and `MessageWindow::Around` is not the tail.
+    app.channels = room();
     let _ = app.__update(__DucktapeMessage::ChatHitLoaded(chat_data(
         "general",
         vec![message(7, "six months ago", false)],
     )));
     assert!(app.history_view);
+    assert_eq!(
+        cursor(&app),
+        None,
+        "opening a search hit is not catching up on the room it landed in"
+    );
+    assert!(
+        app.rooms
+            .iter()
+            .any(|row| row.channel.id == "general" && row.unread),
+        "so the badge she has not cleared is still lit"
+    );
     app.channels = room();
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
@@ -2014,7 +2355,7 @@ fn a_live_post_does_not_splice_itself_into_a_history_window() {
     );
     assert_eq!(
         cursor(&app),
-        Some(0),
+        None,
         "and reading old scrollback is not being caught up on today's post"
     );
 
@@ -2036,7 +2377,7 @@ fn a_live_post_does_not_splice_itself_into_a_history_window() {
     assert!(!app.messages[1].pending, "and the ✓ is over a settled row");
     assert_eq!(
         cursor(&app),
-        Some(0),
+        None,
         "settling her own send is still not catching up on the room"
     );
 
@@ -4560,6 +4901,33 @@ fn block_comment_recovery_always_unlocks_mutations() {
     ));
     assert_eq!(recovered.mutation_phase, "idle");
     assert!(recovered.error.is_empty());
+
+    // AND IT UNLOCKS ONLY WHAT IT LOCKED. "recovering" has a second terminal —
+    // `live_resynced` ends the one `mutation_failed` parks — and it cannot tell
+    // whose recovery it landed on, so this pair can arrive to find the lock
+    // already released and a FRESH mutation holding it. Writing "idle" flatly
+    // there re-enables a button whose write is still in flight, which is a
+    // double submit one click away.
+    let (mut overtaken, _) = Ducktape::__boot();
+    overtaken.block_comments_open = true;
+    overtaken.block_comments_target = "block-1".into();
+    overtaken.block_comments_generation = 8;
+    overtaken.mutation_phase = "channel-create".into();
+    let _ = overtaken.__update(__DucktapeMessage::BlockThreadsRecovered(
+        backend::BlockThreadListData {
+            generation: 8,
+            target: "block-1".into(),
+            from: 0,
+            threads: Vec::new(),
+            total: 0,
+            next_from: 0,
+            has_more: false,
+        },
+    ));
+    assert_eq!(
+        overtaken.mutation_phase, "channel-create",
+        "a stale recovery does not unlock the mutation that came after it"
+    );
 }
 
 #[test]
@@ -6349,6 +6717,53 @@ fn committed_message_change_cannot_be_submitted_twice() {
     assert_eq!(app.mutation_phase, "recovering");
 }
 
+/// AND "recovering" HAS A TERMINAL. It is the phase a write the node COMMITTED
+/// but could not read back parks in — ordinary enough, a `/v1/query` can block
+/// past the RPC timeout (#1018) — and the resync `mutation_failed` launches is
+/// the recovery. Nothing released it: every other writer of "idle" sits behind
+/// a `mutation_phase != "idle"` guard it can no longer pass, so the sidebar went
+/// dead (no room click, no DM, no search hit, no scrollback, no edit or delete)
+/// under a titlebar stuck on "Syncing…", with Settings → Reconnect the only way
+/// out and no reason for anyone to guess at it.
+#[test]
+fn a_committed_mutation_failure_unlocks_when_its_recovery_lands() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.mutation_phase = "channel-create".into();
+
+    let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
+        message: "read failed after commit".into(),
+        committed: true,
+    }));
+    assert_eq!(app.mutation_phase, "recovering");
+
+    // a resync belonging to an abandoned chain answers for nothing
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation - 1,
+        "general",
+        Vec::new(),
+        "",
+        Vec::new(),
+    )));
+    assert_eq!(app.mutation_phase, "recovering", "a stale answer is not it");
+
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "general",
+        Vec::new(),
+        "",
+        Vec::new(),
+    )));
+    assert_eq!(
+        app.mutation_phase, "idle",
+        "the state the lock protected is known good now"
+    );
+    assert!(app.error.is_empty());
+}
+
 #[test]
 fn optimistic_thread_replies_settle_independently_out_of_order() {
     let (mut app, _) = Ducktape::__boot();
@@ -6706,6 +7121,157 @@ fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
     );
 }
 
+/// AND NEITHER DOES A RESYNC'S REPLY — same rule, same seam, wider blast.
+///
+/// `live_resync_load` is a checkpoint-gated multi-query read whose latency the
+/// repo measures in seconds, so every delta the live stream folds inside its
+/// round trip is the NEWER fact. A flat assignment walked a third room's
+/// `head_seq` back to the snapshot — while `channel_reads` was NOT reverted with
+/// it — so `head_seq > last_read` went false and the badge the reader never saw
+/// blinked out, dark until that room got another message.
+#[test]
+fn a_resync_keeps_the_badge_the_live_stream_lit_while_it_was_in_flight() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.channels = vec![room("general", 10), room("eng", 40)];
+    app.channel_reads = backend::initial_channel_reads(app.channels.clone(), Vec::new());
+
+    // mid-RTT: a peer posts into a third room, and another creates a channel
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+        "eng",
+        message(41, "from a peer", false),
+    )));
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "chat".into(),
+        status: "Live".into(),
+        height: 1,
+        chat: backend::ChatDelta {
+            kind: "channel-created".into(),
+            channel: room("brand-new", 0),
+            ..backend::ChatDelta::default()
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    assert!(
+        app.rooms
+            .iter()
+            .any(|row| row.channel.id == "eng" && row.unread)
+    );
+
+    // the resync answers off a snapshot taken before either of them
+    let mut landed = live_refresh(
+        app.hydration_generation,
+        "general",
+        Vec::new(),
+        "",
+        Vec::new(),
+    );
+    landed.channels = vec![room("general", 10), room("eng", 40)];
+    let _ = app.__update(__DucktapeMessage::LiveResynced(landed));
+
+    assert_eq!(
+        backend::channel_head_seq(app.channels.clone(), "eng".into()),
+        41,
+        "the third room's head does not walk back to the snapshot"
+    );
+    assert!(
+        app.rooms
+            .iter()
+            .any(|row| row.channel.id == "eng" && row.unread),
+        "so the badge it lit survives a resync it had nothing to do with"
+    );
+    assert!(
+        app.channels.iter().any(|row| row.id == "brand-new"),
+        "and the room created mid-resync is still in the sidebar"
+    );
+}
+
+/// NOBODY READS A PANE THAT IS NOT MOUNTED.
+///
+/// The live feed is subscribed on `connected`, not on the tab, so an arrival in
+/// the open room while the reader was in Settings or Files marked it read on the
+/// spot: she came back to no divider and no way to tell the new rows from the
+/// ones she had already read, and every OTHER room badged normally while that
+/// one stayed dark. The rows still fold in — only the cursor waits for her.
+#[test]
+fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.channels = vec![room("general", 10), room("eng", 40)];
+    app.channel_reads = backend::initial_channel_reads(app.channels.clone(), Vec::new());
+    app.messages = vec![message(10, "the last thing she read", false)];
+
+    let _ = app.__update(__DucktapeMessage::SelectShellTab("settings".into()));
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+        "general",
+        message(11, "while she was away", false),
+    )));
+
+    assert_eq!(
+        app.messages.len(),
+        2,
+        "the row folds in either way — it is on screen when she returns"
+    );
+    assert!(
+        app.rooms
+            .iter()
+            .any(|row| row.channel.id == "general" && row.unread),
+        "but the room she left open is unread like any other room"
+    );
+
+    // AND THEN SHE SAVES A FILE. A plane op resyncs the client — files, valset,
+    // identity, agent and governance all land in `live_resynced`, carrying no
+    // chat at all — and the read cursor used to move to the head on the way
+    // past, retiring the badge and the divider for a room she has not looked at
+    // since. It is traffic she generates herself, so the off-tab gate above
+    // survived roughly one keystroke without this.
+    let plane_only = backend::LiveRefresh {
+        chat_loaded: false,
+        pages_loaded: false,
+        ..live_refresh(
+            app.hydration_generation,
+            "general",
+            Vec::new(),
+            "",
+            Vec::new(),
+        )
+    };
+    let _ = app.__update(__DucktapeMessage::LiveResynced(plane_only));
+    assert_eq!(
+        app.messages.len(),
+        2,
+        "a resync that carried no chat leaves the window alone"
+    );
+    assert!(
+        app.rooms
+            .iter()
+            .any(|row| row.channel.id == "general" && row.unread),
+        "and it does not catch her up on a room she is not on the tab for"
+    );
+
+    let _ = app.__update(__DucktapeMessage::SelectShellTab("chat".into()));
+    assert_eq!(
+        app.unread_marker_seq, 11,
+        "coming back freezes the divider on what arrived while she was gone"
+    );
+    assert!(
+        !app.rooms
+            .iter()
+            .any(|row| row.channel.id == "general" && row.unread),
+        "and only then is she caught up"
+    );
+
+    // a tab round trip with nothing new must not throw the divider away
+    let _ = app.__update(__DucktapeMessage::SelectShellTab("files".into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab("chat".into()));
+    assert_eq!(app.unread_marker_seq, 11);
+}
+
 /// A SUPERSEDED SWITCH'S FAILURE STAYS WITH IT. Nothing serializes the room
 /// pickers any more, so B's error can arrive after the reader has clicked on to
 /// C — and ungated it would clear `loading` under C (swapping C's plate for "No
@@ -6960,9 +7526,25 @@ fn unread_indicators_are_wired_client_local_only() {
     assert!(lifecycle.contains(
         "unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)"
     ));
-    assert!(lifecycle.contains(
-        "channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))"
-    ));
+    // AND NEITHER LANDING MARKS A ROOM READ UNNAMED. Every read-cursor write
+    // outside a deliberate channel entry goes through a gated channel name, so
+    // that the gate cannot be dropped without this failing: a plane-only resync
+    // (every files/agent/identity op) and an off-tab arrival both reach these
+    // lines, and `mark_channel_read` refuses an empty channel.
+    for gated in [
+        "channel_reads = mark_channel_read(channel_reads, live_tail_channel, channel_head_seq(channels, live_tail_channel))",
+        "channel_reads = mark_channel_read(channel_reads, resync_tail_channel, channel_head_seq(channels, resync_tail_channel))",
+        "channel_reads = mark_channel_read(channel_reads, chat_tab_channel, channel_head_seq(channels, chat_tab_channel))",
+    ] {
+        assert!(lifecycle.contains(gated), "{gated}");
+    }
+    for gate in [
+        "let live_tail_channel = keep_str(!history_view && shell_tab == \"chat\", active_channel, \"\")",
+        "let resync_tail_channel = keep_str(!history_view && shell_tab == \"chat\", active_channel, \"\")",
+        "let chat_tab_channel = keep_str(shell_tab == \"chat\" && !history_view, active_channel, \"\")",
+    ] {
+        assert!(lifecycle.contains(gate), "{gate}");
+    }
 
     // Client-local only: no wire read-cursor leaked into the module surface.
     let backend_ice = inlined(include_str!("ui/extern/backend.ice"));

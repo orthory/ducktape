@@ -372,6 +372,13 @@ on block_comment_post_failed(cause)
   block_comment_threads_loading = true
   run replace lane=block_threads load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_recovered _ | block_threads_recovery_failed _
 
+// A RECOVERY TERMINAL RELEASES ONLY A LOCK THAT IS STILL RECOVERING. "recovering"
+// has a SECOND terminal now — `live_resynced` ends the one `mutation_failed`
+// parks (lifecycle.ice), and it cannot tell whose recovery it is landing on top
+// of — so this pair can arrive to find the lock already released and a fresh
+// mutation (a channel create, a page delete) holding it. A flat `"idle"` there
+// unlocks a write that is still in flight and lets its button be pressed twice.
+// Same term on both arms: a failed recovery is no more entitled to it.
 on block_threads_recovered(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = next.threads
@@ -380,13 +387,13 @@ on block_threads_recovered(next)
   block_comment_threads_next_from = next.next_from
   block_comment_threads_has_more = next.has_more
   block_comment_threads_loading = false
-  mutation_phase = "idle"
+  mutation_phase = keep_str(mutation_phase == "recovering", "idle", mutation_phase)
   error = ""
 
 on block_threads_recovery_failed(cause)
   return if cause.generation != block_comments_generation || !block_comments_open
   block_comment_threads_loading = false
-  mutation_phase = "idle"
+  mutation_phase = keep_str(mutation_phase == "recovering", "idle", mutation_phase)
   error = cause.message
 on pages_updated(next)
   block_comments_generation = block_comments_generation + 1

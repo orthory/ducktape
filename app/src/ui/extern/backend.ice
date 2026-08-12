@@ -64,6 +64,7 @@ extern crate::backend
   pure mark_author_runs(messages:[ChatMessage]) -> [ChatMessage]
   pure merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
   pure merge_message_send_result(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
+  pure resynced_messages(loaded:bool, next:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, history_view:bool) -> [ChatMessage]
   pure rollback_pending_message(messages:[ChatMessage], pending_id:str, committed:bool) -> [ChatMessage]
   pure contains_pending_message(messages:[ChatMessage], pending_id:str) -> bool
   pure reaction_applied(messages:[ChatMessage], seq:i64, emoji:str, added:bool) -> [ChatMessage]
@@ -330,7 +331,6 @@ extern crate::backend
   pure channel_flag_members_only(channels:[ChatChannel], channel:str, current:bool) -> bool
   pure channel_live_huddle_count(channels:[ChatChannel], channel:str, current:i64) -> i64
   pure keep_channels(loaded:bool, next:[ChatChannel], current:[ChatChannel]) -> [ChatChannel]
-  pure keep_messages(loaded:bool, next:[ChatMessage], current:[ChatMessage]) -> [ChatMessage]
   pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
   pure keep_roster(joined:bool, next:[HuddleParticipant]) -> [HuddleParticipant]
   pure keep_peers(loaded:bool, next:[PeerRow], current:[PeerRow]) -> [PeerRow]
