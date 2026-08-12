@@ -39,7 +39,8 @@ pub(crate) enum UserCmd {
     SignRemoveMember(RemoveMemberArgs),
     /// sign one canonical gateway route statement
     SignGatewayRoute(GatewayRouteArgs),
-    /// wrap a module op payload in a user-signed submit frame (hex)
+    /// unlock the key once, then wrap each requested module op payload in a
+    /// user-signed submit frame (hex)
     SignFrame(FrameArgs),
     /// sign one owner control-plane request (the `/v1/admin` per-request PoP)
     SignAdmin(AdminArgs),
@@ -215,12 +216,15 @@ pub(crate) struct FrameArgs {
     /// path to the user key file
     #[arg(long, value_name = "PATH")]
     key: PathBuf,
-    /// the destination module
-    #[arg(long, value_name = "MODULE")]
+}
+
+/// One `<target> <seq> <payload-hex>` request line off the signer's stdin.
+/// `seq` is the frame's ordering/dedup tie-breaker (any u64); it is NOT
+/// tracked in state.
+struct FrameRequest {
     target: String,
-    /// the frame's ordering/dedup tie-breaker (any u64)
-    #[arg(long, value_name = "N")]
     seq: u64,
+    payload: Vec<u8>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -803,41 +807,80 @@ fn cmd_user_sign_gateway_route(
     Ok(())
 }
 
+/// Parse one request line. Whitespace-separated, exactly three fields — the
+/// target and seq ride the line rather than flags precisely because the
+/// unlock is per PROCESS and the requests are per OP.
+fn parse_frame_request(line: &str) -> Result<FrameRequest, String> {
+    let mut fields = line.split_whitespace();
+    let (Some(target), Some(seq), Some(payload_hex), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err("frame request must be `<target> <seq> <payload-hex>`".into());
+    };
+    Ok(FrameRequest {
+        target: target.to_string(),
+        seq: seq.parse().map_err(|_| format!("frame seq: {seq:?}"))?,
+        payload: config::unhex(payload_hex).map_err(|e| format!("payload hex: {e}"))?,
+    })
+}
+
+/// The next request, or `None` at end of input — the signer's own exit
+/// condition. EOF is not an error here: a caller that signed everything it
+/// had closes the pipe.
+fn read_frame_request(stdin: &mut impl std::io::BufRead) -> Result<Option<FrameRequest>, String> {
+    let mut line = String::new();
+    let read = with_prompt("frame-request", stdin_is_tty(), || {
+        stdin.read_line(&mut line)
+    })
+    .map_err(|e| format!("read frame-request from stdin: {e}"))?;
+    if read == 0 {
+        return Ok(None);
+    }
+    parse_frame_request(&line).map(Some)
+}
+
 /// `user-sign-frame` core — see [`cmd_user_sign_frame`].
 fn user_sign_frame(
     args: FrameArgs,
     stdin: &mut impl std::io::BufRead,
-) -> Result<String, Box<dyn std::error::Error>> {
-    // stdin order: password first, then the payload as one hex line. The
-    // payload is not a secret; it rides stdin because a 1 MiB chunk
-    // frame would blow past OS argv limits.
+    out: &mut impl std::io::Write,
+) -> CommandResult {
+    // stdin order: password first, then one request line per frame. The
+    // payload is not a secret; it rides stdin because a 1 MiB chunk frame
+    // would blow past OS argv limits.
     let user = load_user_signer(&args.key, stdin)?;
-    let payload_hex = prompt_stdin_line(stdin, "payload-hex")?;
-    let payload = config::unhex(&payload_hex).map_err(|e| format!("payload hex: {e}"))?;
-
-    let frame = node::encode_frame(
-        &user,
-        args.seq,
-        &sdk::Msg {
-            target: args.target,
-            payload,
-        },
-    );
-    Ok(hex_bytes(&frame))
+    while let Some(request) = read_frame_request(stdin)? {
+        let frame = node::encode_frame(
+            &user,
+            request.seq,
+            &sdk::Msg {
+                target: request.target,
+                payload: request.payload,
+            },
+        );
+        writeln!(out, "{}", hex_bytes(&frame))?;
+        out.flush()?;
+    }
+    Ok(())
 }
 
-/// `user-sign-frame --key <path> --target <module> --seq <n>` — stdin:
-/// password line, then one payload-hex line.
-/// Wraps the payload in a `node` op frame signed by the user key and prints
-/// the frame as hex (the only stdout line). POSTed raw to `/v1/submit/frame`,
-/// the frame's verified signer becomes the op's `Origin::External` — the
-/// authenticated authorship the frameless `/v1/submit`'s plaintext `origin`
-/// convention cannot provide. `seq` is the frame's ordering/dedup tie-breaker
-/// (same-payload resubmits need a fresh seq to survive the consensus lane's
-/// content-digest replay guard); it is NOT tracked in state — any u64 works.
+/// `user-sign-frame --key <path>` — stdin: one password line, then one
+/// `<target> <seq> <payload-hex>` request line per frame; stdout: one frame
+/// hex line per request, in order.
+///
+/// Wraps each payload in a `node` op frame signed by the user key. POSTed raw
+/// to `/v1/submit/frame`, the frame's verified signer becomes the op's
+/// `Origin::External` — the authenticated authorship the frameless
+/// `/v1/submit`'s plaintext `origin` convention cannot provide. `seq` is the
+/// frame's ordering/dedup tie-breaker (same-payload resubmits need a fresh seq
+/// to survive the consensus lane's content-digest replay guard).
+///
+/// The loop is the point: opening the key costs one argon2id pass over 64 MiB
+/// (`userkey::open_user_key`), so the desktop app keeps ONE of these alive for
+/// the session and writes another request line per write. A per-op process
+/// paid that KDF on every reaction tap.
 fn cmd_user_sign_frame(args: FrameArgs, stdin: &mut impl std::io::BufRead) -> CommandResult {
-    println!("{}", user_sign_frame(args, stdin)?);
-    Ok(())
+    user_sign_frame(args, stdin, &mut std::io::stdout().lock())
 }
 
 /// `user-redeem-invite` core — see [`cmd_user_redeem_invite`].
@@ -1698,6 +1741,25 @@ mod userkey_verb_tests {
         assert!(TestUserCli::try_parse_from(["user", "key"]).is_err());
     }
 
+    /// Run the signer over `lines` and hand back its stdout lines.
+    fn sign_frames(key: &std::path::Path, lines: &[&str]) -> Vec<String> {
+        let mut stdin = stdin_of(lines);
+        let mut out = Vec::new();
+        user_sign_frame(
+            FrameArgs {
+                key: key.to_path_buf(),
+            },
+            &mut stdin,
+            &mut out,
+        )
+        .unwrap();
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
     #[test]
     fn sign_frame_round_trips_through_decode_frame() {
         let dir = tempfile::tempdir().unwrap();
@@ -1705,19 +1767,14 @@ mod userkey_verb_tests {
         write_encrypted(&key_path, &[7u8; 32]);
 
         let payload: &[u8] = b"\x00raw chunk bytes";
-        let mut stdin = stdin_of(&[TEST_PASSWORD, &hex_bytes(payload)]);
-        let frame_hex = user_sign_frame(
-            FrameArgs {
-                key: key_path,
-                target: "files".to_string(),
-                seq: 42,
-            },
-            &mut stdin,
-        )
-        .unwrap();
+        let frames = sign_frames(
+            &key_path,
+            &[TEST_PASSWORD, &format!("files 42 {}", hex_bytes(payload))],
+        );
+        assert_eq!(frames.len(), 1);
 
         let (origin, msg) =
-            node::decode_frame(&config::unhex(&frame_hex).unwrap()).expect("frame verifies");
+            node::decode_frame(&config::unhex(&frames[0]).unwrap()).expect("frame verifies");
         let signer = ed25519::PrivateKey::decode([7u8; 32].as_slice()).unwrap();
         assert_eq!(
             origin,
@@ -1725,6 +1782,65 @@ mod userkey_verb_tests {
         );
         assert_eq!(msg.target, "files");
         assert_eq!(msg.payload, payload);
+    }
+
+    /// THE session property: one password line, one key open, N frames — each
+    /// answering its own request line, in order, and each verifying against
+    /// the same user key. This is what lets the desktop app hold one signer
+    /// for the session instead of paying argon2id per write.
+    #[test]
+    fn one_unlock_signs_every_request_line_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("user.key");
+        write_encrypted(&key_path, &[7u8; 32]);
+        let signer = ed25519::PrivateKey::decode([7u8; 32].as_slice()).unwrap();
+
+        let requests: Vec<String> = (0..8)
+            .map(|i| format!("chat {i} {}", hex_bytes(format!("op {i}").as_bytes())))
+            .collect();
+        let mut lines = vec![TEST_PASSWORD.to_string()];
+        lines.extend(requests);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+
+        let frames = sign_frames(&key_path, &lines);
+        assert_eq!(frames.len(), 8);
+        for (i, frame_hex) in frames.iter().enumerate() {
+            let (origin, msg) =
+                node::decode_frame(&config::unhex(frame_hex).unwrap()).expect("frame verifies");
+            assert_eq!(
+                origin,
+                sdk::Origin::External(signer.public_key().as_ref().to_vec())
+            );
+            assert_eq!(msg.target, "chat");
+            assert_eq!(msg.payload, format!("op {i}").into_bytes());
+        }
+    }
+
+    #[test]
+    fn a_malformed_request_line_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("user.key");
+        write_encrypted(&key_path, &[7u8; 32]);
+
+        for bad in [
+            "chat 1",
+            "chat notanumber 00",
+            "chat 1 nothex",
+            "chat 1 00 x",
+        ] {
+            let mut stdin = stdin_of(&[TEST_PASSWORD, bad]);
+            assert!(
+                user_sign_frame(
+                    FrameArgs {
+                        key: key_path.clone()
+                    },
+                    &mut stdin,
+                    &mut Vec::new(),
+                )
+                .is_err(),
+                "accepted {bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -1769,31 +1885,13 @@ mod userkey_verb_tests {
         let line = userkey::seal_user_key(&[9u8; 32], "hunter2duck").unwrap();
         userkey::write_user_key_new(&key_path, &line).unwrap();
 
-        let mut stdin = stdin_of(&["hunter2duck", &hex_bytes(b"{}")]);
-        let frame_hex = user_sign_frame(
-            FrameArgs {
-                key: key_path.clone(),
-                target: "files".to_string(),
-                seq: 0,
-            },
-            &mut stdin,
-        )
-        .unwrap();
-        assert!(node::decode_frame(&config::unhex(&frame_hex).unwrap()).is_ok());
+        let request = format!("files 0 {}", hex_bytes(b"{}"));
+        let frames = sign_frames(&key_path, &["hunter2duck", &request]);
+        assert!(node::decode_frame(&config::unhex(&frames[0]).unwrap()).is_ok());
 
-        // wrong password: refused before any payload is read.
-        let mut stdin = stdin_of(&["wrong password", &hex_bytes(b"{}")]);
-        assert!(
-            user_sign_frame(
-                FrameArgs {
-                    key: key_path,
-                    target: "files".to_string(),
-                    seq: 0,
-                },
-                &mut stdin,
-            )
-            .is_err()
-        );
+        // wrong password: refused before any request line is read.
+        let mut stdin = stdin_of(&["wrong password", &request]);
+        assert!(user_sign_frame(FrameArgs { key: key_path }, &mut stdin, &mut Vec::new()).is_err());
     }
 
     /// The tty wrapper's non-tty path must be a transparent pass-through: no

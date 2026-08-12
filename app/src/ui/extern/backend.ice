@@ -110,6 +110,7 @@ extern crate::backend
   create_user_key(password:str) -> KeyCreated ! AppError
   restore_user_key(words:str, password:str) -> str ! AppError
   unlock_user_key(password:str) -> str ! AppError
+  lock_signer() -> bool
   remember_network(rpc:str) -> bool
   forget_network(id:str, kind:str) -> bool
   restore_hidden_networks() -> bool

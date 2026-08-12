@@ -444,7 +444,7 @@ pub async fn unlock_user_key(password: String) -> Result<String, AppError> {
 }
 
 /// One secret as the CLI's stdin field: the bytes plus the newline, refusing
-/// embedded delimiters the same way `signing_input` does.
+/// embedded delimiters the same way `password_line` does.
 fn secret_line(value: &str) -> Result<Vec<u8>, String> {
     let invalid = value.len() > 16 * 1024
         || value

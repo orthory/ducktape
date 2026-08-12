@@ -16,61 +16,149 @@ pub(crate) async fn signed_write(
     rpc.submit_frame(frame).await.map_err(Into::into)
 }
 
-async fn sign_frame(target: &str, payload: &[u8], mut password: String) -> Result<Vec<u8>, String> {
-    let key = user_key_path()?;
-    require_encrypted_key(&key)?;
-    let payload_hex = hex_encode(payload);
-    let input = signing_input(&password, &payload_hex);
-    password.zeroize();
-    let input = Zeroizing::new(input?);
-    let mut command = tokio::process::Command::new(ducktape_binary());
-    command
-        .arg("user")
-        .arg("sign-frame")
-        .arg("--key")
-        .arg(&key)
-        .arg("--target")
-        .arg(target)
-        .arg("--seq")
-        .arg(next_sequence().to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|error| {
-        format!("could not start the ducktape signer ({error}); build node-bin or set DUCKTAPE_BIN")
-    })?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "ducktape signer stdin is unavailable".to_string())?;
-    stdin
-        .write_all(&input)
-        .await
-        .map_err(|error| format!("could not send payload to signer: {error}"))?;
-    drop(stdin);
-    let output = tokio::time::timeout(RPC_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| "ducktape signer timed out".to_string())?
-        .map_err(|error| format!("ducktape signer failed: {error}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "ducktape signer refused the transaction: {}",
-            bounded_detail(&detail)
-        ));
-    }
-    let stdout = std::str::from_utf8(&output.stdout)
-        .map_err(|_| "ducktape signer returned non-UTF-8 output".to_string())?;
-    let frame_hex = stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .ok_or_else(|| "ducktape signer returned no frame".to_string())?;
-    hex_decode(frame_hex.trim())
+/// THE session signer: one `ducktape user sign-frame` child, unlocked once,
+/// then fed one request line per signed write.
+///
+/// Opening the key runs argon2id over 64 MiB (`bin/node/src/userkey.rs`), so
+/// the per-op process this replaced charged every reaction tap ~200-400 ms of
+/// memory-hard KDF plus a spawn — and five taps in a row (reactions skip
+/// `mutation_phase` on purpose) fanned out five concurrent 64 MiB jobs against
+/// the render thread. The posture is unchanged by construction: the app
+/// already holds the password in state, and the private key still lives only
+/// in the child's address space.
+static SIGNER: tokio::sync::Mutex<Option<Signer>> = tokio::sync::Mutex::const_new(None);
+
+/// How long a signer that just failed a request gets to exit before its
+/// stderr is written off. Short on purpose — the request already spent
+/// `RPC_TIMEOUT`, and this is only here to name the cause.
+const SIGNER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(super) struct Signer {
+    /// The password this child was unlocked with. A different one is a
+    /// different seat (a re-login, or a restored key), so it gets its own
+    /// child instead of signing under the key this one holds.
+    password: Zeroizing<String>,
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    frames: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
 }
 
-pub(crate) fn signing_input(password: &str, payload_hex: &str) -> Result<Vec<u8>, String> {
+impl Signer {
+    /// Spawn the child and hand it the password — the session's one argon2id
+    /// pass. A bad password does not fail here: the child dies on it and the
+    /// first request reports its stderr through [`Signer::reap`].
+    ///
+    /// The binary and key path are arguments rather than reads of
+    /// `ducktape_binary()` / `user_key_path()` so the session can be driven
+    /// against a stub signer without touching this process's environment.
+    pub(super) async fn unlock(
+        binary: PathBuf,
+        key: PathBuf,
+        password: Zeroizing<String>,
+    ) -> Result<Self, String> {
+        require_encrypted_key(&key)?;
+        let input = Zeroizing::new(password_line(&password)?);
+        let mut command = tokio::process::Command::new(binary);
+        command
+            .arg("user")
+            .arg("sign-frame")
+            .arg("--key")
+            .arg(&key)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| {
+            format!(
+                "could not start the ducktape signer ({error}); build node-bin or set DUCKTAPE_BIN"
+            )
+        })?;
+        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            return Err("ducktape signer pipes are unavailable".into());
+        };
+        stdin
+            .write_all(&input)
+            .await
+            .map_err(|error| format!("could not unlock the signer: {error}"))?;
+        Ok(Self {
+            password,
+            child,
+            stdin,
+            frames: tokio::io::BufReader::new(stdout).lines(),
+        })
+    }
+
+    /// One request line out, one frame-hex line back.
+    pub(super) async fn sign(&mut self, request: &str) -> Result<Vec<u8>, String> {
+        self.stdin
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|error| format!("could not send payload to signer: {error}"))?;
+        let answer = tokio::time::timeout(RPC_TIMEOUT, self.frames.next_line())
+            .await
+            .map_err(|_| "ducktape signer timed out".to_string())?
+            .map_err(|error| format!("ducktape signer failed: {error}"))?;
+        let frame_hex = answer.ok_or_else(|| "ducktape signer returned no frame".to_string())?;
+        hex_decode(frame_hex.trim())
+    }
+
+    /// Close the pipe and collect the child's exit — its stderr is the only
+    /// place a session-level refusal (wrong password, unreadable key) is
+    /// spelled out.
+    async fn reap(self) -> Option<String> {
+        drop(self.stdin);
+        drop(self.frames);
+        let output = tokio::time::timeout(SIGNER_EXIT_TIMEOUT, self.child.wait_with_output())
+            .await
+            .ok()?
+            .ok()?;
+        let detail = String::from_utf8_lossy(&output.stderr);
+        if detail.trim().is_empty() {
+            return None;
+        }
+        Some(format!(
+            "ducktape signer refused the transaction: {}",
+            bounded_detail(&detail)
+        ))
+    }
+}
+
+async fn sign_frame(target: &str, payload: &[u8], password: String) -> Result<Vec<u8>, String> {
+    let password = Zeroizing::new(password);
+    let request = format!("{target} {} {}\n", next_sequence(), hex_encode(payload));
+    // The lock IS the semaphore of 1: a burst of reactions queues on one
+    // child instead of fanning out, and it is what keeps the request lines
+    // and the frame lines on the child's pipes paired.
+    let mut session = SIGNER.lock().await;
+    let seated = session
+        .as_ref()
+        .is_some_and(|signer| signer.password == password);
+    if !seated {
+        *session = Some(Signer::unlock(ducktape_binary(), user_key_path()?, password).await?);
+    }
+    let signer = session.as_mut().expect("the session was seated above");
+    let fault = match signer.sign(&request).await {
+        Ok(frame) => return Ok(frame),
+        Err(fault) => fault,
+    };
+    // A signer that failed one request never serves a second: retire it here
+    // so the next write unlocks a fresh one.
+    let Some(refusal) = session.take() else {
+        return Err(fault);
+    };
+    Err(refusal.reap().await.unwrap_or(fault))
+}
+
+/// Retire the session signer — the `Lock` button's other half. Clearing
+/// `password` in state stops the app from signing; this stops the CHILD from
+/// being able to.
+pub async fn lock_signer() -> bool {
+    SIGNER.lock().await.take().is_some()
+}
+
+/// The password as the signer's first stdin line, rejecting what the
+/// line-delimited stdin contract cannot carry.
+pub(crate) fn password_line(password: &str) -> Result<Vec<u8>, String> {
     let invalid_password = password.len() > 16 * 1024
         || password
             .as_bytes()
@@ -82,10 +170,8 @@ pub(crate) fn signing_input(password: &str, payload_hex: &str) -> Result<Vec<u8>
     if password.is_empty() {
         return Err("the local user key is locked; enter its password".into());
     }
-    let mut input = Vec::with_capacity(password.len() + payload_hex.len() + 2);
+    let mut input = Vec::with_capacity(password.len() + 1);
     input.extend_from_slice(password.as_bytes());
-    input.push(b'\n');
-    input.extend_from_slice(payload_hex.as_bytes());
     input.push(b'\n');
     Ok(input)
 }

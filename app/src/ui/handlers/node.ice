@@ -108,8 +108,14 @@ on settings_unlock_failed(cause)
   password = ""
   error = cause.message
 
+// Locking clears the password AND retires the session signer: the child that
+// holds the opened user key must not outlive the seat it was opened for.
 on lock_session
   password = ""
+  run lock_signer() -> signer_locked _
+
+on signer_locked(_retired)
+  error = error
 
 // PREFERENCES — device-local, one endpoint at a time.
 // DANGER ZONE — forget this workspace on THIS DEVICE and go back to onboarding.

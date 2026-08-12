@@ -2075,9 +2075,9 @@ fn files_base64_round_trips() {
 
 #[test]
 fn signer_requires_the_encrypted_v1_key_format() {
-    assert_eq!(signing_input("secret", "00").unwrap(), b"secret\n00\n");
-    assert!(signing_input("", "00").is_err());
-    assert!(signing_input("bad\nsecret", "00").is_err());
+    assert_eq!(password_line("secret").unwrap(), b"secret\n");
+    assert!(password_line("").is_err());
+    assert!(password_line("bad\nsecret").is_err());
 
     let directory = tempfile::tempdir().unwrap();
     let key = directory.path().join("user.key");
@@ -2093,6 +2093,53 @@ fn signer_requires_the_encrypted_v1_key_format() {
     );
     assert!(parse_user_key_status("absent\n").is_none());
     assert!(parse_user_key_status(&format!("plaintext {public_key}\n")).is_none());
+}
+
+/// THE session property on the app's side of the pipe: ONE unlock, then a
+/// frame per request line, each answering ITS OWN request in order. The child
+/// this drives is a stub, but the contract is the real one — a stray or
+/// mispaired line here would mean the app submits the frame for another
+/// operation, and the argon2id pass it skips is the whole point of the
+/// session (a per-op process paid it on every reaction tap).
+#[tokio::test(flavor = "current_thread")]
+async fn one_unlock_signs_every_request_of_the_session() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let key = directory.path().join("user.key");
+    std::fs::write(&key, format!("{ENCRYPTED_KEY_PREFIX}ciphertext")).unwrap();
+    // The stub signer: records its unlock, then echoes each request's payload
+    // back as the frame — so the answer names the request it belongs to.
+    let unlocks = directory.path().join("unlocks");
+    let binary = directory.path().join("stub-signer");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\necho unlock >> {}\nread password\n\
+             while read -r target seq payload; do echo \"$payload\"; done\n",
+            unlocks.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut signer = super::rpc::Signer::unlock(binary, key, Zeroizing::new("secret".into()))
+        .await
+        .expect("the stub signer starts");
+    for op in 0..5u8 {
+        let payload = hex_encode(&[op, op, op]);
+        let frame = signer
+            .sign(&format!("chat {op} {payload}\n"))
+            .await
+            .expect("a frame per request");
+        assert_eq!(frame, vec![op, op, op], "request {op} got another's frame");
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(&unlocks).unwrap(),
+        "unlock\n",
+        "five signed writes, one key open"
+    );
 }
 
 #[test]

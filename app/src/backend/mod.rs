@@ -16,7 +16,7 @@ use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
 use iced::futures::StreamExt as _;
 use pages::index::{PageRow, PagesViewQuery, PagesViewReply, ThreadRow};
 use pages::{BlockKind, NewBlock, PageMsg, PageQuery, PageReply};
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use zeroize::{Zeroize as _, Zeroizing};
 
 // chat's client view model is module-owned (`chat::client`) — the rendered
