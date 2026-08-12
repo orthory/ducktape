@@ -509,6 +509,18 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       active bg=surface text=fg border=warning_line border-w=1.0 r=7.0
                       hovered bg=warning_bg text=fg
                       pressed bg=accent text=fg
+              // THIS GATE IS THE SCROLL RESET. `choose_channel` clears
+              // `messages` before the fetch, so the whole stack — the
+              // scrollable with it — unmounts, its `scrollable::State` drops,
+              // and the next room mounts a fresh one at offset 0, which under
+              // `anchor-y=end` is the tail. Nothing else resets it: there is no
+              // `scroll-to`, and no per-channel offset memory.
+              //
+              // So do NOT hoist the scrollable above this gate to share it with
+              // the empty/loading arm. A shared scrollable survives the switch
+              // and hands the new room the offset the old one was left at.
+              // `message_stream_reset_contract` in `tests/app.ice` is the fence:
+              // it asserts `#chat/message-stream` is GONE once `messages` is.
               if connected && !empty(messages)
                 stack w=fill h=fill
                   sensor show=emit(chat_resized, _, _) resize=emit(chat_resized, _, _)
@@ -524,7 +536,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     // limits, so a long timeline scrolls exactly as before) and
                     // `align-y=end` drops that block onto the composer.
                     box w=fill h=fill align-y=end
-                      scroll
+                      scroll #message-stream
                         with
                           dir=vertical
                           w=fill
@@ -1443,6 +1455,15 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       auto=true
                     // The 16px right inset doubles as the scrollbar
                     // clearance the code/quote slabs needed (#927).
+                    //
+                    // VIRTUALIZED, on the stream's terms and for the stream's
+                    // reason: a thread pages in at the same 256 replies a
+                    // channel does, and a plain column culls only `draw` —
+                    // `update`, `mouse_interaction`, `overlay` and `layout`
+                    // walk every reply ever loaded, on every event and every
+                    // frame. 44px is the stream's estimate and a reply is the
+                    // stream's card. The scroll above is anchor-y=end, which
+                    // virtualization needs.
                     col
                       with
                         w=fill
@@ -1451,6 +1472,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         pr=16.0
                         pt=12.0
                         pb=8.0
+                        virtual-row=44.0
                       for thread_message in thread_messages
                         // THE ROOT GETS ITS OWN DIVIDED BLOCK. One
                         // loop, one discriminant: `active_thread_seq`
@@ -1464,24 +1486,14 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         // is.
                         if thread_message.seq == active_thread_seq
                           ThreadParentBlock message=thread_message
-                        // The settle ✓ mirrors the stream's arms: the one
-                        // reply `thread_send_flash_id` anchors rides the
-                        // shared fade, every other row passes 0.0.
-                        if thread_message.seq != active_thread_seq && thread_message.id == thread_send_flash_id
-                          ThreadMessageCard
-                            with
-                              message=thread_message
-                              selected=(thread_message.seq == thread_target_seq)
-                              menu_open=(thread_message.seq == thread_selected_seq)
-                              disabled=loading
-                              flash=send_flash_value
-                            forward
-                              add_reaction_at
-                              remove_reaction_at
-                              open_thread_for
-                              open_thread_message_actions
-                              open_thread_message_reactions
-                        if thread_message.seq != active_thread_seq && thread_message.id != thread_send_flash_id
+                        // THE REST SPLIT THE WAY THE STREAM'S DO, and for the
+                        // same reason: a `lazy` subtree may read nothing but
+                        // its dependency, so every row whose card reads SCREEN
+                        // state — the search target, the open action menu, the
+                        // settling ✓ — has to be its own live arm, and what is
+                        // left is a pure function of the reply. Selection wins
+                        // over the flash here exactly as it does in the stream.
+                        if thread_message.seq != active_thread_seq && (thread_message.seq == thread_target_seq || thread_message.seq == thread_selected_seq)
                           ThreadMessageCard
                             with
                               message=thread_message
@@ -1495,6 +1507,42 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               open_thread_for
                               open_thread_message_actions
                               open_thread_message_reactions
+                        if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq && thread_message.id == thread_send_flash_id
+                          ThreadMessageCard
+                            with
+                              message=thread_message
+                              selected=false
+                              menu_open=false
+                              disabled=loading
+                              flash=send_flash_value
+                            forward
+                              add_reaction_at
+                              remove_reaction_at
+                              open_thread_for
+                              open_thread_message_actions
+                              open_thread_message_reactions
+                        // THE QUIET ARM. Virtualization stops an offscreen
+                        // reply from being laid out; this stops a VISIBLE one
+                        // from being rebuilt — ~60 nodes of a11y keys and
+                        // scope strings per reply, on every frame the rail is
+                        // open. `disabled=false` is the stream's bargain too: a
+                        // cached row cannot see `loading`, and a row nobody is
+                        // hovering has no button to disable.
+                        if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq && thread_message.id != thread_send_flash_id
+                          lazy thread_message as cached_reply
+                            ThreadMessageCard
+                              with
+                                message=cached_reply
+                                selected=false
+                                menu_open=false
+                                disabled=false
+                                flash=0.0
+                              forward
+                                add_reaction_at
+                                remove_reaction_at
+                                open_thread_for
+                                open_thread_message_actions
+                                open_thread_message_reactions
                       if thread_has_more && thread_next_reply_offset >= 0
                         button "Load more replies" -> emit(load_more_thread)
                           with

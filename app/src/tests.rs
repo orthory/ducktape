@@ -1939,7 +1939,39 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // the thread rail's own scroll sits further down the file, past the split.
     // `h=shrink` is the composer-anchored height: the virtual column reports a
     // whole-list estimate, so a long timeline still hits the box's cap.
-    assert!(above.contains("scroll dir=vertical w=fill h=shrink anchor-y=end auto=true"));
+    assert!(
+        above
+            .contains("scroll #message-stream dir=vertical w=fill h=shrink anchor-y=end auto=true")
+    );
+}
+
+/// THE RAIL IS THE SAME LIST WITH THE SAME BILL. A thread pages in at the same
+/// 256 replies a channel does, and a plain column culls only `draw` — `update`,
+/// `mouse_interaction`, `overlay` and `layout` walk every reply ever loaded, on
+/// every event and every frame. Virtualization culls those four; `lazy` stops
+/// the rows that ARE visible from rebuilding ~60 nodes of scope strings and
+/// a11y keys apiece. The two are not alternatives, and the stream carries both.
+#[test]
+fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
+    let chat = inlined(include_str!("ui/screens/chat.ice"));
+    let above = chat
+        .split_once("col w=fill gap=3.0 pl=16.0 pr=16.0 pt=12.0 pb=8.0 virtual-row=44.0")
+        .expect("the thread rail is a virtual-row column")
+        .0;
+    assert!(above.contains("scroll dir=vertical w=fill h=fill anchor-y=end auto=true"));
+    // A `lazy` subtree reads nothing but its dependency, so the quiet arm can
+    // only exist because the rows that read SCREEN state — the search target,
+    // the open action menu, the settling ✓ — were split off into live arms.
+    // Fold any of them back in and the reply that is selected, or flashing,
+    // renders from a cache that cannot see it.
+    assert!(chat.contains("lazy thread_message as cached_reply"));
+    for live in [
+        "thread_message.seq == thread_target_seq",
+        "thread_message.seq == thread_selected_seq",
+        "thread_message.id == thread_send_flash_id",
+    ] {
+        assert!(chat.contains(live), "the live arm on {live} is gone");
+    }
 }
 
 #[test]
