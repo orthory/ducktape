@@ -273,14 +273,23 @@ on live_updated(next)
   // no live rows and no read cursor. "Jump to latest" is the way back to the
   // tail, and it reloads canonically.
   //
-  // The whole delta is refused, the settle of a send made FROM the window
-  // included: a row posted from here holds its pending mark until the reader
-  // returns to the tail, which the banner is offering one click away. Letting
-  // that one delta through means asking `send_settled_by` a second time, and
-  // its argument is the whole timeline by value — a second deep clone per
-  // delta, on the path this app already pays three on.
+  // HER OWN SETTLE IS THE ONE DELTA THE WINDOW STILL TAKES. The composer posts
+  // from a history window too, and its optimistic row is spliced in there
+  // regardless (`chat_composer_event`) — so refusing that row's settle strands
+  // it `pending: true` forever, under a ✓ that `send_flash` pops on the very
+  // delta the fold just dropped. `send_flash` IS that answer, already computed
+  // one line above: no second pass over the timeline by value. A settling
+  // delta carries exactly the one row it settles, so nothing else rides in.
+  //
+  // Everything else the window misses — edits, deletes, reactions and
+  // reply-count bumps on rows that ARE on screen — waits for "Jump to latest",
+  // which the banner is offering one click away.
+  //
+  // The READ CURSOR takes the strict gate either way: posting into a room you
+  // are reading backwards is not being caught up on it.
   let live_tail_channel = keep_str(!history_view, active_channel, "")
-  messages = apply_chat_messages(messages, next.chat, live_tail_channel)
+  let live_fold_channel = keep_str(!history_view || animation.value(send_flash), active_channel, "")
+  messages = apply_chat_messages(messages, next.chat, live_fold_channel)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   thread_messages = apply_chat_thread(thread_messages, next.chat, active_channel, active_thread_seq)
   channel_members = apply_chat_members(channel_members, next.chat, active_channel)
@@ -404,7 +413,15 @@ on live_resynced(next)
   active_channel = keep_str(next.chat_loaded, next.active_channel, active_channel)
   // The one landing with NO launch behind it, so it is the one that could move
   // the room under a DM header nobody cleared — see `dm_peer_of_channel`.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  //
+  // ONLY WHEN THE ROOM ACTUALLY MOVED, for the same reason every line above it
+  // is gated: `choose_dm` names the peer optimistically and leaves the room
+  // being left in `active_channel` for the several blocks `open_dm` takes to
+  // answer (a CreateChannel write plus two membership seats). A pages-only
+  // resync landing in that window derives the peer against the OLD room and
+  // blanks it, and `chat_updated` then derives "" from "" — the DM opens under
+  // a `#` and the channel's own name, until the reader re-clicks it.
+  active_dm_peer = keep_str(next.chat_loaded, dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel), active_dm_peer)
   active_channel_name = keep_str(next.chat_loaded, next.active_channel_name, active_channel_name)
   active_channel_archived = keep_bool(next.chat_loaded, next.active_channel_archived, active_channel_archived)
   active_channel_members_only = keep_bool(next.chat_loaded, next.active_channel_members_only, active_channel_members_only)

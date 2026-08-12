@@ -1328,9 +1328,12 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
             .split("\non ")
             .next()
             .expect("handler body");
+        // An ASSIGNMENT, not a mention: the token opens a statement line, so
+        // prose naming the field where the write used to be fails here.
         for reading in ["active_dm_peer = ", "history_view = "] {
             assert!(
-                body.contains(reading),
+                body.lines()
+                    .any(|line| line.trim_start().starts_with(reading)),
                 "{mover} moves the reader between rooms and must answer \
                  `{reading}` — a reading of the room cannot outlive it"
             );
@@ -1686,6 +1689,28 @@ fn a_live_post_does_not_splice_itself_into_a_history_window() {
         "and reading old scrollback is not being caught up on today's post"
     );
 
+    // HER OWN SEND IS THE EXCEPTION. The composer posts from a window too and
+    // splices the optimistic row in unconditionally, so a refused settle would
+    // strand it `pending` forever while `send_flash` pops a ✓ over it.
+    app.message_editor = compose("mine, from the window");
+    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+        editor::composer_submit_event(),
+    ));
+    assert!(app.messages[1].pending);
+    let mut settled = message(501, "mine, from the window", false);
+    settled.id = app.messages[1].id.clone();
+    app.channels = room();
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+        "general", settled,
+    )));
+    assert_eq!(app.messages.len(), 2, "her row settled in place, not twice");
+    assert!(!app.messages[1].pending, "and the ✓ is over a settled row");
+    assert_eq!(
+        cursor(&app),
+        Some(0),
+        "settling her own send is still not catching up on the room"
+    );
+
     // Jump to latest, and the tail is live again.
     let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
         "general",
@@ -1752,6 +1777,29 @@ fn a_landing_in_another_room_retires_the_dm_header() {
         Vec::new(),
     )));
     assert!(app.active_dm_peer.is_empty());
+
+    // BUT A RESYNC THAT MOVED NO ROOM DERIVES NOTHING. `choose_dm` names the
+    // peer optimistically and leaves `active_channel` on the room being left
+    // for the several blocks `open_dm` takes to answer; a pages-only resync
+    // landing in that window would otherwise derive the peer against the OLD
+    // room and blank him, and `chat_updated` then derives "" from "" — the DM
+    // opens under a `#` for good.
+    app.active_dm_peer = peer.into();
+    app.active_channel = "general".into();
+    let _ = app.__update(__DucktapeMessage::LiveResynced(backend::LiveRefresh {
+        chat_loaded: false,
+        ..live_refresh(
+            app.hydration_generation,
+            "general",
+            Vec::new(),
+            "",
+            Vec::new(),
+        )
+    }));
+    assert_eq!(
+        app.active_dm_peer, peer,
+        "the room did not move, so nothing about it was re-read"
+    );
 
     // a device with no user key derives no DM id, so it holds no DM — the same
     // answer `rooms_only` gives when `me` is empty
