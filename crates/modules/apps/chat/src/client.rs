@@ -69,8 +69,6 @@ pub struct ChatMessage {
     pub show_author: bool,
     pub initial: String,
     pub avatar_kind: String,
-    /// authored by the viewing device's own user key — the own-message bubble.
-    pub mine: bool,
     /// the block this message settled in; 0 while pending.
     pub height: i64,
     /// that block's `consensus_time` — a block HEIGHT on a validator network
@@ -106,7 +104,6 @@ impl std::hash::Hash for ChatMessage {
             show_author,
             initial,
             avatar_kind,
-            mine,
             height,
             time,
             reactions,
@@ -124,7 +121,6 @@ impl std::hash::Hash for ChatMessage {
         show_author.hash(state);
         initial.hash(state);
         avatar_kind.hash(state);
-        mine.hash(state);
         height.hash(state);
         time.hash(state);
         reactions.hash(state);
@@ -149,7 +145,6 @@ impl Default for ChatMessage {
             show_author: true,
             initial: String::new(),
             avatar_kind: String::new(),
-            mine: false,
             height: 0,
             time: 0,
             reactions: Vec::new(),
@@ -761,9 +756,6 @@ pub fn optimistic_message(
         show_author: true,
         initial,
         avatar_kind: "human".into(),
-        // an optimistic row is this device's own post by construction; it has
-        // no block yet, so height/time stay unset until the canonical row lands.
-        mine: true,
         height: 0,
         time: 0,
         reactions: Vec::new(),
@@ -871,7 +863,6 @@ pub fn thread_offset_after_reply(offset: i64, has_more: bool, committed: bool) -
 
 pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
     let edited = row.rev > 0;
-    let mine = authored_by_user(&row.author, current_user);
     let meta = if edited {
         format!("#{} · edited", row.seq)
     } else {
@@ -902,7 +893,6 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
         show_author: true,
         initial: avatar_initial(&row.author),
         avatar_kind: avatar_kind(&row.author).into(),
-        mine,
         height: number_i64(row.height),
         time: number_i64(row.time),
         reactions: row

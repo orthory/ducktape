@@ -144,7 +144,6 @@ fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
         show_author: true,
         initial: "U".into(),
         avatar_kind: "human".into(),
-        mine: false,
         height: 0,
         time: 0,
         reactions: Vec::new(),
@@ -2162,13 +2161,16 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     // inside a fixed-size button collapses an SVG to a hairline. The other
     // four cells are the artifact's own typographic glyphs, not icons.
     assert_eq!(toolbar.matches("p=5.0 @icon_action").count(), 1);
+    // The name shares BODY size with the message it heads — Slack/Discord's
+    // own convention — and separates on weight alone.
     assert!(components.contains(
-        "text message.author size=13.0 wrap=none font=display @text-fg\n            if message.avatar_kind == \"agent\""
+        "text message.author size=13.5 wrap=none font=display @text-fg\n            if message.avatar_kind == \"agent\""
     ));
     // the stamp beside the author is the block the message was finalized
-    // in — a chain fact the app can prove, never a wall-clock time.
+    // in — a chain fact the app can prove, never a wall-clock time. `muted`
+    // clears the AA contrast floor; `hint` (2.10:1) did not.
     assert!(components.contains(
-        "if message.height > 0\n              text height_label_short(message.height) size=11.0 wrap=none font=code_medium @text-hint"
+        "if message.height > 0\n              text height_label_short(message.height) size=11.0 wrap=none font=code_medium @text-muted"
     ));
     // Slack-style grouping: the shared avatar + author header only renders
     // for a run's first message; continuations keep the body aligned via a
@@ -2504,7 +2506,6 @@ fn thread_pagination_preserves_multiple_pending_replies() {
         show_author: true,
         initial: "U".into(),
         avatar_kind: "human".into(),
-        mine: false,
         height: 0,
         time: 0,
         reactions: Vec::new(),
@@ -6617,8 +6618,11 @@ fn unread_indicators_are_wired_client_local_only() {
     // INTRINSIC width whatever box it is given, so an unclipped long channel
     // name inflated the whole row past the 236px pane and the pane's own clip
     // sliced the row plate square through its rounded corner.
+    // Unread is WEIGHT, not just ink — the same signal `ChannelButton` gives
+    // an unread row over a read one (`font=medium` there, `font=display`
+    // here), the conventional stronger signal.
     assert!(components.contains(
-        "if unread\n                box w=fill clip=true\n                  text channel.name size=13.0 wrap=none font=medium @text-fg"
+        "if unread\n                box w=fill clip=true\n                  text channel.name size=13.0 wrap=none font=display @text-fg"
     ));
 
     let screen = inlined(include_str!("ui/screens/chat.ice"));
@@ -6636,7 +6640,11 @@ fn unread_indicators_are_wired_client_local_only() {
     // cloned the whole timeline once per row per frame.
     assert!(screen.contains("if unread_boundary > 0 && message.seq == unread_marker_seq"));
     assert!(!screen.contains("first_unread_seq("));
-    assert!(screen.contains("text \"New messages\" size=12.5 wrap=none @text-brand"));
+    // The eyebrow spelling: FIELD_LABEL scale (10.0, mono semibold caps) —
+    // every other structural label in the console reads this way, and a
+    // 12.5px sentence-case run inside the message column read as a MESSAGE
+    // at first glance.
+    assert!(screen.contains("text \"NEW\" size=10.0 wrap=none font=code_semibold @text-brand"));
 
     // Freeze happens on a real channel change; connect seeds caught-up.
     let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));

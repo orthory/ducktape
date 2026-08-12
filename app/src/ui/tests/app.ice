@@ -685,6 +685,7 @@ test message_stream_reset_contract
         status
         block_height
         searching=chat_searching
+        searched=chat_searched
         search_hits=chat_search_hits
         rooms
         unread_channel_ids

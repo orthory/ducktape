@@ -13,7 +13,7 @@
 // row, which is 500 weight on 7px of vertical padding. `choose_dm` resolves or
 // creates the two-party channel, so the peer list itself is the entry point and
 // the DIRECT eyebrow needs no `+`, exactly as in the artifact.
-component DmButton(peer:DmPeer, selected:bool, disabled:bool)
+component DmButton(peer:DmPeer, selected:bool, unread:bool, disabled:bool)
   emits
     choose_dm(str)
   box #root
@@ -33,11 +33,11 @@ component DmButton(peer:DmPeer, selected:bool, disabled:bool)
           box
             with
               w=fill
-              pl=10.0
-              pr=10.0
+              pl=8.0
+              pr=8.0
               pt=6.0
               pb=6.0
-            DmRow peer=peer selected=true
+            DmRow peer=peer selected=true unread=unread
           active bg=selected_row text=fg border=transparent border-w=1.0 r=7.0
           hovered bg=selected_row text=fg
           pressed bg=rail_hover text=fg
@@ -52,16 +52,21 @@ component DmButton(peer:DmPeer, selected:bool, disabled:bool)
           box
             with
               w=fill
-              pl=10.0
-              pr=10.0
+              pl=8.0
+              pr=8.0
               pt=6.0
               pb=6.0
-            DmRow peer=peer selected=false
+            DmRow peer=peer selected=false unread=unread
           active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
           hovered bg=rail_hover text=fg
           pressed bg=subtle text=fg
 
-component DmRow(peer:DmPeer, selected:bool)
+// Unread is weight-not-just-ink here too, the same rule `ChannelButton` makes
+// for a room: a read DM stays `font=medium`, an unread one steps up to
+// `font=display` (semibold) — never on the SELECTED arm, which already reads
+// as "the one you are on" and clears its own unread the moment it opens. The
+// trailing brand dot mirrors the channel row's own.
+component DmRow(peer:DmPeer, selected:bool, unread:bool)
   row #root
     with
       w=fill
@@ -81,7 +86,15 @@ component DmRow(peer:DmPeer, selected:bool)
             size=13.0
             wrap=none
             @text-fg
-    if !selected
+    if !selected && unread
+      box w=fill clip=true
+        text peer.name
+          with
+            size=13.0
+            wrap=none
+            font=display
+            @text-fg
+    if !selected && !unread
       box w=fill clip=true
         text peer.name
           with
@@ -103,6 +116,14 @@ component DmRow(peer:DmPeer, selected:bool)
             wrap=none
             font=code_semibold
             @text-primary_fg
+    if unread
+      box
+        with
+          w=7.0
+          h=7.0
+          bg=brand
+          r=3.5
+        space w=1.0 h=1.0
 
 // The chat header's DM identity — a 24px peer plate and the peer's name, in
 // place of the `# channel` title. The AGENT badge marks a machine peer.

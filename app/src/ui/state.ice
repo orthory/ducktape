@@ -205,6 +205,14 @@ state
   chat_search_draft = ""
   chat_search_hits:[ChatSearchHit] = []
   chat_searching = false
+  // Whether a search was SUBMITTED, distinct from `chat_searching` (in flight)
+  // and `chat_search_hits` (the results). The float needs all three: hidden
+  // until a query lands, a skeleton while it is out, "No messages match" when
+  // it comes back empty — three states one boolean and one list cannot tell
+  // apart. Set by `search_chat_submit`, cleared by every handler that already
+  // abandons the search (`clear_chat_search` and the navigations that reset
+  // `chat_search_hits` on their way to a different room).
+  chat_searched = false
   chat_search_generation:i64 = 0
   history_view = false
   // Whether older pages exist below the loaded timeline — mirrored on every

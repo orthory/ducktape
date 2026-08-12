@@ -7,6 +7,7 @@ on search_chat_submit
   return if empty(trim(chat_search_draft))
   chat_search_generation = chat_search_generation + 1
   chat_searching = true
+  chat_searched = true
   chat_search_hits = []
   error = ""
   run search_chat(connected_rpc, "", trim(chat_search_draft), chat_search_generation) -> chat_search_loaded _ | chat_search_failed _
@@ -27,6 +28,7 @@ on clear_chat_search
   chat_search_draft = ""
   chat_search_hits = []
   chat_searching = false
+  chat_searched = false
 
 on open_chat_search_hit(channel_id, root_seq, target_seq)
   // NO `loading` TERM. A hit clicked while another room is still loading used
@@ -42,6 +44,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   shell_tab = "chat"
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
+  chat_searched = false
   // Same abandoned request, same dead button — see `choose_channel`. This route
   // lands in a DIFFERENT channel via `chat_hit_loaded`, so the page still in
   // flight belongs to the room she jumped out of.
@@ -138,6 +141,7 @@ on choose_channel(id)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
+  chat_searched = false
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   // A CACHE HIT IS NOT LOADING. The plate is `loading && empty(messages)`, so
@@ -196,6 +200,7 @@ on choose_dm(peer_key)
   chat_window_loading = true
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
+  chat_searched = false
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = true

@@ -19,7 +19,7 @@
 // were briefly caller-filled slots: a sensor's show/resize route used to accept
 // only bare `_` payloads and could not carry a component event (ui-lang#239).
 
-component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], rooms:[ChatChannel], unread_channel_ids:[str], dm_peers:[DmPeer], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
+component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, searching:bool, searched:bool, search_hits:[ChatSearchHit], rooms:[ChatChannel], unread_channel_ids:[str], dm_peers:[DmPeer], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
   emits
     search_chat_submit()
     clear_chat_search()
@@ -83,13 +83,13 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
         box
           with
             w=fill
-            pl=14.0
-            pr=14.0
-            pt=14.0
-            pb=11.0
+            h=50.0
+            pl=16.0
+            pr=16.0
           row
             with
               w=fill
+              h=fill
               gap=8.0
               align=center
             text network_name
@@ -130,8 +130,8 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
         box
           with
             w=fill
-            pl=12.0
-            pr=12.0
+            pl=16.0
+            pr=16.0
             pt=11.0
             pb=6.0
           // MESSAGE SEARCH LIVES HERE, not in the channel header — the
@@ -190,8 +190,8 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
             w=fill
             pl=16.0
             pr=16.0
-            pt=10.0
-            pb=5.0
+            pt=14.0
+            pb=6.0
           row
             with
               w=fill
@@ -279,8 +279,8 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               box
                 with
                   w=fill
-                  pl=8.0
-                  pr=8.0
+                  pl=16.0
+                  pr=16.0
                   pt=14.0
                   pb=6.0
                 row
@@ -302,7 +302,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       font=code_medium
                       @text-label
             for peer in dm_peers
-              DmButton peer=peer selected=(peer.key == active_dm_peer) disabled=(mutation_phase != "idle")
+              DmButton peer=peer selected=(peer.key == active_dm_peer) unread=is_unread_channel(unread_channel_ids, peer.channel_id) disabled=(mutation_phase != "idle")
                 forward
                   choose_dm
         // No account footer: the rail's avatar and Settings already carry the
@@ -470,7 +470,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 h=fill
                 gap=9.0
                 pl=18.0
-                pr=18.0
+                pr=12.0
                 pt=16.0
                 pb=8.0
               if !connected
@@ -483,14 +483,39 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   with
                     title="No messages yet"
                     description="Nobody has posted here. Send the first message below."
+              // THREE SKELETON ROWS, on the real row's own geometry (30px
+              // avatar, an 11px gap, two bars), not a centred sentence — the
+              // layout does not jump when the messages land on top of them.
+              // No spinner: `spin` is declared and never driven
+              // (`overlay.ice`), so a ring here would paint a frozen arc.
+              // `subtle` is the palette's own track grey, a quiet ghost in
+              // both themes.
               if connected && loading && empty(messages)
-                box
-                  with
-                    w=fill
-                    h=fill
-                    align-x=center
-                    align-y=center
-                  text "Loading messages…" size=12.5 @text-meta
+                col w=fill gap=14.0 pt=4.0
+                  row w=fill gap=11.0 align=start
+                    box w=30.0 h=30.0 bg=subtle r=15.0
+                      space w=1.0 h=1.0
+                    col w=fill gap=6.0 pt=4.0
+                      box w=96.0 h=9.0 bg=subtle r=4.0
+                        space w=1.0 h=1.0
+                      box w=fill max-w=420.0 h=9.0 bg=subtle r=4.0
+                        space w=1.0 h=1.0
+                  row w=fill gap=11.0 align=start
+                    box w=30.0 h=30.0 bg=subtle r=15.0
+                      space w=1.0 h=1.0
+                    col w=fill gap=6.0 pt=4.0
+                      box w=96.0 h=9.0 bg=subtle r=4.0
+                        space w=1.0 h=1.0
+                      box w=fill max-w=420.0 h=9.0 bg=subtle r=4.0
+                        space w=1.0 h=1.0
+                  row w=fill gap=11.0 align=start
+                    box w=30.0 h=30.0 bg=subtle r=15.0
+                      space w=1.0 h=1.0
+                    col w=fill gap=6.0 pt=4.0
+                      box w=96.0 h=9.0 bg=subtle r=4.0
+                        space w=1.0 h=1.0
+                      box w=fill max-w=420.0 h=9.0 bg=subtle r=4.0
+                        space w=1.0 h=1.0
               if connected && !empty(messages) && history_view
                 box
                   with
@@ -638,10 +663,11 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                       h=1.0
                                       bg=brand/40
                                     text ""
-                                  text "New messages"
+                                  text "NEW"
                                     with
-                                      size=12.5
+                                      size=10.0
                                       wrap=none
+                                      font=code_semibold
                                       @text-brand
                                   box
                                     with
@@ -1008,52 +1034,71 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                     active bg=transparent text=muted r=6.0
                                     hovered bg=fg/10 text=fg
                                     pressed bg=fg/15
+              // DATA LOSS READS AT LEAST AS LOUD AS AN EXPECTED REFUSAL. This
+              // used to be a bare muted sentence, quieter than the archived-
+              // channel gate a few lines up — GateNote's own danger-family
+              // plate, mirrored (`danger_zone_bg`/`danger_zone_line` are the
+              // REVERSIBLE-danger pair the archive button already wears: the
+              // draft is recoverable, so this is not `@danger_action` loud).
               if !empty(failed_message_draft)
-                row
+                box
                   with
                     w=fill
-                    gap=6.0
-                    align=center
-                  text "An earlier message wasn’t sent"
+                    px=13.0
+                    py=11.0
+                    bg=danger_zone_bg
+                    border=danger_zone_line
+                    border-w=1.0
+                    r=9.0
+                  row
                     with
                       w=fill
-                      size=12.5
-                      @text-muted
-                  button "Restore" -> emit(restore_failed_message)
-                    with
-                      disabled=(!empty(trim(editor_text(message_editor))) || mutation_phase != "idle")
-                      h=28.0
-                      p=5.0
-                      @secondary_action
-                    active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
-                    hovered bg=fg/14
-                    pressed bg=fg/18
-                  button -> emit(dismiss_failed_message)
-                    with
-                      label="Dismiss unsent message"
-                      w=28.0
-                      h=28.0
-                      p=0.0
-                      @icon_action
+                      gap=8.0
+                      align=center
                     box
                       with
+                        w=6.0
+                        h=6.0
+                        bg=danger_dot
+                        r=3.0
+                      space w=1.0 h=1.0
+                    text "An earlier message wasn’t sent"
+                      with
                         w=fill
-                        h=fill
-                        align-x=center
-                        align-y=center
-                      text "×" size=14.0
-                    active bg=transparent text=muted r=7.0
-                    hovered bg=fg/10 text=fg
-                    pressed bg=fg/15
-            // THE RESULTS FLOAT. This card used to be the column's first
-            // child, so typing a search reflowed the whole conversation down
-            // by 148px; as a stack layer it drops over the stream instead,
-            // and everything below it keeps its place.
+                        size=12.5
+                        line-h=1.45
+                        @text-danger
+                    button "Restore" -> emit(restore_failed_message)
+                      with
+                        disabled=(!empty(trim(editor_text(message_editor))) || mutation_phase != "idle")
+                        h=28.0
+                        p=5.0
+                        @secondary_action
+                      active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
+                      hovered bg=fg/14
+                      pressed bg=fg/18
+                    button -> emit(dismiss_failed_message)
+                      with
+                        label="Dismiss unsent message"
+                        w=28.0
+                        h=28.0
+                        p=0.0
+                        @icon_action
+                      box
+                        with
+                          w=fill
+                          h=fill
+                          align-x=center
+                          align-y=center
+                        text "×" size=14.0
+                      active bg=transparent text=muted r=7.0
+                      hovered bg=fg/10 text=fg
+                      pressed bg=fg/15
             // THE RESULTS FLOAT. This card used to be the column's first
             // child, so a search reflowed the whole conversation down by
             // 148px; as a stack layer it drops over the stream instead and
             // everything beneath keeps its place.
-            if !empty(search_hits)
+            if !empty(search_hits) || searching || (searched && empty(search_hits))
               box
                 with
                   w=fill
@@ -1065,7 +1110,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 box
                   with
                     w=fill
-                    h=148.0
+                    max-h=260.0
                     p=6.0
                     bg=elevated
                     border=fg/10
@@ -1074,16 +1119,34 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     shadow=shadow_popover
                     shadow-y=8.0
                     shadow-blur=24.0
-                  scroll
-                    with
-                      dir=vertical
-                      w=fill
-                      h=fill
-                    col w=fill gap=1.0
-                      for hit in search_hits
-                        ChatSearchResult hit=hit
-                          forward
-                            open_chat_search_hit
+                  col w=fill
+                    if searching
+                      col w=fill gap=14.0 p=8.0
+                        row w=fill gap=11.0 align=start
+                          box w=30.0 h=30.0 bg=subtle r=15.0
+                            space w=1.0 h=1.0
+                          col w=fill gap=6.0 pt=4.0
+                            box w=96.0 h=9.0 bg=subtle r=4.0
+                              space w=1.0 h=1.0
+                            box w=fill max-w=420.0 h=9.0 bg=subtle r=4.0
+                              space w=1.0 h=1.0
+                    if !searching && empty(search_hits)
+                      box w=fill p=14.0 align-x=center
+                        text "No messages match"
+                          with
+                            size=12.5
+                            @text-muted
+                    if !searching && !empty(search_hits)
+                      scroll
+                        with
+                          dir=vertical
+                          w=fill
+                          h=shrink
+                        col w=fill gap=1.0
+                          for hit in search_hits
+                            ChatSearchResult hit=hit
+                              forward
+                                open_chat_search_hit
           // The composer is separated from the stream by a hairline and
           // carries the artifact's own 12/16/14 region padding.
           box
@@ -1104,8 +1167,8 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
             box
               with
                 w=fill
-                pl=16.0
-                pr=16.0
+                pl=18.0
+                pr=18.0
                 pt=12.0
               ComposerGate
                 with
@@ -1113,8 +1176,8 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
           box
             with
               w=fill
-              pl=16.0
-              pr=16.0
+              pl=18.0
+              pr=18.0
               pt=12.0
               pb=14.0
             box
@@ -1185,13 +1248,13 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               box
                 with
                   w=fill
+                  h=50.0
                   pl=16.0
                   pr=10.0
-                  pt=9.0
-                  pb=9.0
                 row
                   with
                     w=fill
+                    h=fill
                     gap=6.0
                     align=center
                   text "Channel details"
@@ -1609,6 +1672,8 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           active bg=transparent text=muted r=7.0
                           hovered bg=fg/9 text=fg
                           pressed bg=brand_bg
+                  // Same danger-family plate as the stream's — see the note
+                  // there.
                   if !empty(failed_reply_draft)
                     box
                       with
@@ -1616,35 +1681,52 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         pl=16.0
                         pr=16.0
                         pt=8.0
-                      row
+                      box
                         with
                           w=fill
-                          gap=6.0
-                          align=center
-                        text "Unsent reply"
+                          px=13.0
+                          py=11.0
+                          bg=danger_zone_bg
+                          border=danger_zone_line
+                          border-w=1.0
+                          r=9.0
+                        row
                           with
                             w=fill
-                            size=12.5
-                            @text-muted
-                        button "Restore" -> emit(restore_failed_reply)
-                          with
-                            disabled=(!empty(trim(editor_text(reply_editor))))
-                            h=26.0
-                            p=5.0
-                            @secondary_action
-                          active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
-                          hovered bg=fg/14
-                          pressed bg=fg/18
-                        button "×" -> emit(dismiss_failed_reply)
-                          with
-                            label="Dismiss unsent reply"
-                            w=26.0
-                            h=26.0
-                            p=4.0
-                            @ghost_action
-                          active bg=transparent text=muted r=7.0
-                          hovered bg=fg/10 text=fg
-                          pressed bg=fg/15
+                            gap=6.0
+                            align=center
+                          box
+                            with
+                              w=6.0
+                              h=6.0
+                              bg=danger_dot
+                              r=3.0
+                            space w=1.0 h=1.0
+                          text "Unsent reply"
+                            with
+                              w=fill
+                              size=12.5
+                              line-h=1.45
+                              @text-danger
+                          button "Restore" -> emit(restore_failed_reply)
+                            with
+                              disabled=(!empty(trim(editor_text(reply_editor))))
+                              h=26.0
+                              p=5.0
+                              @secondary_action
+                            active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
+                            hovered bg=fg/14
+                            pressed bg=fg/18
+                          button "×" -> emit(dismiss_failed_reply)
+                            with
+                              label="Dismiss unsent reply"
+                              w=26.0
+                              h=26.0
+                              p=4.0
+                              @ghost_action
+                            active bg=transparent text=muted r=7.0
+                            hovered bg=fg/10 text=fg
+                            pressed bg=fg/15
                   // The stream's composer plate, in the rail's width: same
                   // surface/control_line/r12 chrome, the same `ComposerMarks`
                   // row, the same Send.
