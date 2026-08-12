@@ -650,3 +650,143 @@ test explorer_whole_answer_contract
   target plate = #explorer/explorer-nothing-matched/root
   expect missing banner
   expect exists plate
+
+preset ui_chat_stream
+  state
+    connected = true
+    loading = false
+    mutation_phase = "idle"
+    error = ""
+    shell_tab = "chat"
+    active_channel = "channel-a"
+    active_channel_name = "general"
+    messages = optimistic_message(messages, "The room she is looking at.", "pending-1")
+
+// THE SCROLL RESET IS THE `!empty(messages)` GATE. Nothing in the app calls
+// `scroll-to` on the timeline and nothing remembers a per-channel offset:
+// `choose_channel` empties `messages`, the gate around the stack goes false,
+// the scrollable unmounts, its offset dies with it, and the next room mounts a
+// fresh one at the tail. That is load-bearing behaviour resting on a widget's
+// LIFETIME, which is exactly the kind of thing a later "stop remounting the
+// scrollable" cleanup deletes without noticing — it would hand the new room the
+// offset the old one was left at, mid-scrollback.
+//
+// So this asserts the lifetime itself: `#chat/message-stream` exists with rows
+// and is GONE without them. (Virtualization note: offscreen rows leave the a11y
+// tree, so a test that wants a message ROW has to scroll it in first. This one
+// only wants the scrollable, which is always mounted when it exists at all.)
+test message_stream_reset_contract
+  preset ui_chat_stream
+  viewport 1120 720
+  mount
+    ChatScreen search_draft<->chat_search_draft message_action_focus<->message_action_focus message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
+      with
+        network_name
+        status
+        block_height
+        searching=chat_searching
+        search_hits=chat_search_hits
+        channels
+        dm_peers
+        channel_reads
+        user_key=settings_user_key
+        channel_create_open
+        connected
+        loading
+        mutation_phase
+        active_channel
+        active_dm_peer
+        active_channel_name
+        active_channel_archived
+        active_channel_members_only
+        channel_members
+        huddle_joined
+        huddle_channel
+        huddle_channel_name
+        huddle_joined_at
+        huddle_now
+        call_muted
+        huddle_popped=false
+        messages
+        has_older_history
+        history_view
+        history_loading
+        unread_boundary
+        unread_marker_seq
+        selected_message_seq
+        selected_message_rev
+        send_flash_id
+        send_flash_value=0.0
+        message_action
+        message_menu_y
+        failed_message_draft
+        channel_settings_open
+        active_thread_seq
+        thread_target_seq
+        thread_messages
+        thread_selected_seq
+        thread_selected_rev
+        thread_message_action
+        thread_menu_y
+        thread_send_flash_id
+        thread_has_more
+        thread_next_reply_offset
+        thread_loading
+        failed_reply_draft
+        shift_held
+      events
+        search_chat_submit -> search_chat_submit
+        clear_chat_search -> clear_chat_search
+        open_chat_search_hit -> open_chat_search_hit _ _ _
+        toggle_channel_create -> toggle_channel_create
+        choose_channel -> choose_channel _
+        choose_dm -> choose_dm _
+        toggle_channel_settings -> toggle_channel_settings
+        pop_huddle -> pop_huddle
+        focus_huddle -> focus_huddle
+        leave_huddle_here -> leave_huddle_here
+        huddle_go_channel -> huddle_go_channel
+        join_huddle_submit -> join_huddle_submit
+        chat_pointer_pressed -> chat_pointer_pressed _ _
+        load_more_history -> load_more_history
+        add_reaction_at -> add_reaction_at _ _
+        remove_reaction_at -> remove_reaction_at _ _
+        open_thread_for -> open_thread_for _
+        open_message_actions -> open_message_actions _ _ _
+        open_message_reactions -> open_message_reactions _ _ _
+        begin_message_edit -> begin_message_edit _ _ _
+        arm_message_delete -> arm_message_delete _ _ _
+        clear_message_selection -> clear_message_selection
+        add_reaction_submit -> add_reaction_submit _
+        edit_message_submit -> edit_message_submit
+        delete_message_submit -> delete_message_submit
+        restore_failed_message -> restore_failed_message
+        dismiss_failed_message -> dismiss_failed_message
+        composer_event -> chat_composer_event _
+        composer_mark -> composer_mark _
+        rename_channel_submit -> rename_channel_submit
+        archive_channel_submit -> archive_channel_submit
+        unarchive_channel_submit -> unarchive_channel_submit
+        add_channel_member_submit -> add_channel_member_submit
+        remove_channel_member_submit -> remove_channel_member_submit _
+        thread_pointer_pressed -> thread_pointer_pressed _ _
+        close_thread -> close_thread
+        open_thread_message_actions -> open_thread_message_actions _ _ _
+        open_thread_message_reactions -> open_thread_message_reactions _ _ _
+        begin_thread_message_edit -> begin_thread_message_edit _ _ _
+        arm_thread_message_delete -> arm_thread_message_delete _ _ _
+        clear_thread_message_selection -> clear_thread_message_selection
+        edit_thread_message_submit -> edit_thread_message_submit
+        delete_thread_message_submit -> delete_thread_message_submit
+        load_more_thread -> load_more_thread
+        restore_failed_reply -> restore_failed_reply
+        dismiss_failed_reply -> dismiss_failed_reply
+        reply_composer_event -> reply_composer_event _
+        reply_composer_mark -> reply_composer_mark _
+        chat_resized -> chat_resized _ _
+        thread_resized -> thread_resized _ _
+  target stream = #chat/message-stream
+  expect exists stream
+  dispatch choose_channel("channel-b")
+  expect empty(messages)
+  expect missing stream
