@@ -38,7 +38,7 @@
 // (validator / resident / guest) — the artifact's viewer/maintainer/admin
 // vocabulary does not exist in this product, so the chain's own word is what
 // gets printed. `about` is the workspace bio, not an invented tagline.
-component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str, connected:bool)
+component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str, answered:bool)
   col #root w=fill gap=7.0
     row
       with
@@ -80,7 +80,7 @@ component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str, connected:bool
       // The repo count and the standing are both READINGS, so neither is
       // printed off a node that answered nothing: `0 repositories` beside a
       // dead connection reads as "this org has no repos".
-      if connected
+      if answered
         row gap=5.0 align=center
           text plural(repos, "repository", "repositories")
             with

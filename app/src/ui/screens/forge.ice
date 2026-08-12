@@ -61,7 +61,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
               about
               repos=len(repos)
               tier
-              connected
+              answered
           // NOT `EmptyPlate`: this screen has no "new repository" button and
           // never will, because forge IS a git remote — a repo comes into
           // existence when a push lands on it. Saying only that a repo

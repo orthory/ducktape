@@ -643,11 +643,12 @@ on select_shell_tab(next)
   // failure paints the GLOBAL error banner over a screen with no file operation
   // in sight. `fs_wrote` still refreshes the tree from inside the files tab.
   //
-  // The HEAVY loaders load only for their own tab: forge walks a git mirror
-  // per repo, explorer flattens the ops of 100 blocks, files walks the tree —
-  // all three used to run on the way into Settings or Members. A `keep_i64`
-  // sends the off-screen ones generation -1; the backend refuses it and the
-  // failed arm's generation guard drops the refusal unread.
+  // The heavy loaders load only for their own tab: explorer flattens the ops
+  // of 100 blocks and files walks the tree. Forge's committed repo LIST is now
+  // cheap; its git-mirror card details start from `forge_loaded`, after the
+  // rows are visible. A `keep_i64` sends the off-screen loaders generation -1;
+  // the backend refuses it and the failed arm's generation guard drops the
+  // refusal unread.
   //
   // members/governance/agents/account are gated the same way, but through
   // `tab_reads_plane` rather than an inline `shell_tab ==`: members fans out

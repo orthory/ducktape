@@ -60,20 +60,57 @@ pub struct ForgeItemData {
     pub change_requests: i64,
 }
 
-/// The repo namespace with committed heads, each row carrying the about line,
-/// language and last-moved stamp the repo card renders.
+async fn list_forge_repos(rpc: &str) -> Result<Vec<serde_json::Value>, String> {
+    let client = rpc_client(rpc)?;
+    let reply: serde_json::Value = client
+        .query("forge", &serde_json::json!("list_repos"))
+        .await?;
+    Ok(reply["repos"].as_array().cloned().unwrap_or_default())
+}
+
+fn listed_forge_repo(repo: &serde_json::Value) -> (String, String) {
+    (
+        repo["name"].as_str().unwrap_or_default().to_string(),
+        repo["head"].as_str().unwrap_or("(unborn)").to_string(),
+    )
+}
+
+/// The repo namespace with committed heads. This is the screen's fast answer:
+/// card facts come from [`load_forge_details`] after these rows are visible.
 pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
     offscreen_guard(generation)?;
     async {
-        let client = rpc_client(&rpc)?;
-        let reply: serde_json::Value = client
-            .query("forge", &serde_json::json!("list_repos"))
-            .await?;
-        let listed = reply["repos"].as_array().cloned().unwrap_or_default();
+        let repos = list_forge_repos(&rpc)
+            .await?
+            .into_iter()
+            .map(|repo| {
+                let (name, head) = listed_forge_repo(&repo);
+                ForgeRepo {
+                    name,
+                    head: short_digest(&head),
+                    ..ForgeRepo::default()
+                }
+            })
+            .collect();
+        Ok(ForgeData { generation, repos })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message: user_error(message),
+    })
+}
+
+/// Fill the optional repo-card facts from local mirrors after the committed
+/// repo rows have landed. Re-listing is a small consensus query and keeps this
+/// work self-contained without carrying full object IDs through the UI.
+pub async fn load_forge_details(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
+    offscreen_guard(generation)?;
+    async {
+        let listed = list_forge_repos(&rpc).await?;
         let mut deriving = Vec::with_capacity(listed.len());
         for repo in listed {
-            let name = repo["name"].as_str().unwrap_or_default().to_string();
-            let head = repo["head"].as_str().unwrap_or("(unborn)").to_string();
+            let (name, head) = listed_forge_repo(&repo);
             let endpoint = rpc.clone();
             deriving.push(tokio::task::spawn_blocking(move || {
                 let (about, language, updated_at) = repo_card_facts(&endpoint, &name, &head);
@@ -90,7 +127,7 @@ pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, Hydra
         for task in deriving {
             let row = task
                 .await
-                .map_err(|error| format!("forge about task failed: {error}"))?;
+                .map_err(|error| format!("forge card-details task failed: {error}"))?;
             repos.push(row);
         }
         Ok(ForgeData { generation, repos })

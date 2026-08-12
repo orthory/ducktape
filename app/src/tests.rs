@@ -780,6 +780,62 @@ fn forge_depth_rides_the_established_seams() {
     assert!(forge_screen.contains("forge_merge_note(forge_item_merge_oid, forge_item_branches)"));
 }
 
+/// THE REPO EXISTS BEFORE ITS CARD FACTS DO. `list_repos` is a small committed
+/// state query; README/language/time require a smart-HTTP mirror fetch that can
+/// take a minute for this repo. The list must land first, then the optional
+/// card enrichment may run in its own lane.
+#[test]
+fn forge_repo_list_lands_before_optional_mirror_facts() {
+    let backend = inlined(include_str!("backend/forge.rs"));
+    let fast = backend
+        .split_once("pub async fn load_forge(")
+        .expect("forge list loader")
+        .1
+        .split_once("pub async fn load_forge_details(")
+        .expect("separate details loader")
+        .0;
+    assert!(fast.contains("list_forge_repos"));
+    assert!(!fast.contains("repo_card_facts"));
+    assert!(!fast.contains("spawn_blocking"));
+
+    let details = backend
+        .split_once("pub async fn load_forge_details(")
+        .expect("forge details loader")
+        .1
+        .split_once("pub async fn load_forge_repo(")
+        .expect("details loader boundary")
+        .0;
+    assert!(details.contains("repo_card_facts"));
+
+    let handlers = inlined(include_str!("ui/handlers/forge.ice"));
+    let loaded = handlers
+        .split_once("on forge_loaded(next)")
+        .expect("forge loaded handler")
+        .1
+        .split_once("\non ")
+        .expect("forge loaded arm")
+        .0;
+    let list_landed = loaded
+        .find("forge_repos = next.repos")
+        .expect("the committed repo rows land");
+    let details_started = loaded
+        .find("run replace lane=forge_details")
+        .expect("card facts load in the background");
+    assert!(list_landed < details_started);
+
+    let components = inlined(include_str!("ui/components/forge.ice"));
+    let header = components
+        .split_once("component ForgeOrgHeader(")
+        .expect("forge org header")
+        .1
+        .split_once("\ncomponent ")
+        .expect("forge org header boundary")
+        .0;
+    assert!(header.contains("answered:bool"));
+    assert!(header.contains("if answered"));
+    assert!(!header.contains("if connected"));
+}
+
 #[test]
 fn background_refresh_preserves_editing_state() {
     let root = inlined(include_str!("ui/app.ice"));
