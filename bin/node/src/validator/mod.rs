@@ -26,7 +26,6 @@ pub(crate) async fn run_validator(
     quota: Quota,
     metrics: noded::NodeMetrics,
     status: noded::StatusCell,
-    sync_source: Option<ed25519::PublicKey>,
     advertised_reach: Ingress,
     status_public_key: String,
     signer: ed25519::PrivateKey,
@@ -46,7 +45,6 @@ pub(crate) async fn run_validator(
     chain_id: String,
     mesh_state_file: std::path::PathBuf,
     checkpoint_blocks: u64,
-    promoted: bool,
     dev_demo: bool,
     rpc_listener: Option<std::net::TcpListener>,
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
@@ -143,39 +141,6 @@ pub(crate) async fn run_validator(
         planes.clone(),
     )
     .await;
-    let (
-        sync_tx,
-        sync_rx,
-        mut recovery,
-        host,
-        resumed,
-        next_seq,
-        prev_ckpt,
-        recovery_manifest_for_resume,
-        boot_fold,
-    ) = boot::post_reboot_catchup(
-        &context,
-        promoted,
-        sync_source,
-        sync_tx,
-        sync_rx,
-        recovery,
-        host,
-        resumed,
-        next_seq,
-        prev_ckpt,
-        recovery_manifest_for_resume,
-        boot_fold,
-        signer.clone(),
-        label.clone(),
-        namespace.clone(),
-        validators.clone(),
-        forge_repo.clone(),
-        duckfs_dir.clone(),
-        blobs.clone(),
-    )
-    .await;
-
     let wiring::RuntimeWiring {
         member_keys,
         participants,

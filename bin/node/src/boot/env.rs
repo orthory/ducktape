@@ -11,7 +11,7 @@ use crate::config::{self, Resolved, hex_bytes};
 
 /// `run_node`'s boot-time config derivation (phase P0): the `Resolved`
 /// destructure plus everything derived from it before the first listener
-/// bind — promoted state, the chain-id string, the mesh-state path,
+/// bind — the chain-id string, the mesh-state path,
 /// and the cold-restart mesh dial seeds folded into `bootstrappers`.
 pub(crate) struct BootEnv {
     pub(crate) signer: ed25519::PrivateKey,
@@ -72,7 +72,6 @@ pub(crate) struct BootEnv {
     /// for its pool's ledger, so the scheduler can never be promised what this
     /// host cannot seat. EMPTY for a consensus-only node.
     pub(crate) sandbox_capacity: BTreeMap<String, u64>,
-    pub(crate) promoted: bool,
 }
 
 pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
@@ -122,23 +121,19 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         wireguard_advertised,
         compute_backend,
     } = resolved;
-    // a key outside the GENESIS validator set is not an error: post-genesis
-    // members are admitted via governance. with a recovery checkpoint on disk
-    // (a previous run promoted this identity) boot proceeds as a validator
-    // off the recovery record; with a fresh storage dir the node enters
-    // JOINER mode — park on the mesh, sync a boundary whose participant set
-    // includes this key, fabricate the equivalent recovery checkpoint, and
-    // reboot through the normal restore path. this filesystem probe mirrors
-    // the recovery store's layout (storage_dir/<partition>/) and only gates
-    // which listeners bind — the runtime re-decides joiner-vs-validator from
-    // the real store.
-    let promoted = storage
+    // A key outside the GENESIS validator set is not an error: post-genesis
+    // standing is admitted via governance and resolved from the latest
+    // committed manifest at runtime. This cheap filesystem probe only decides
+    // whether the fresh-joiner banner is truthful; the real recovery store is
+    // opened later.
+    let has_recovery_manifest = storage
         .join("recovery-manifest")
         .read_dir()
         .map(|mut entries| entries.next().is_some())
         .unwrap_or(false);
-    let joiner = !sync_only && !validators.contains(&signer.public_key()) && !promoted;
-    if joiner {
+    let fresh_joiner =
+        !sync_only && !validators.contains(&signer.public_key()) && !has_recovery_manifest;
+    if fresh_joiner {
         if invite_token.is_some() {
             tracing::info!(
                 target: "ducktape::join",
@@ -354,6 +349,5 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         sandbox,
         compute_backend,
         sandbox_capacity,
-        promoted,
     }
 }

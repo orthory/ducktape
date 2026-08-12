@@ -40,25 +40,15 @@ pub(crate) const NOP_TARGET: &str = noded::projection::NOP_TARGET;
 // finalizes (its height keeps ticking) and any pending cutover still crosses
 // — paced to the same interval the leader's idle-propose holds a view open,
 // so the idle beat never outpaces the view hold.
-/// request timeout for the promoted-validator boot catch-up client. it is long
-/// enough to let discovery links warm, but bounded so boot cannot hang forever
-/// before the statesync server bridge is installed.
-pub(crate) const BOOT_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 /// how often the reachability plane re-offers whatever it still waits on —
 /// un-acked gossip while assembling, stalled handshake messages after
 /// verification (`ReachabilityCommand::Nudge`). fast enough that a lost
 /// message costs one beat of mesh convergence, slow enough to be noise-free
 /// — the nudge is a no-op once the epoch's handshakes have all completed.
 pub(crate) const NUDGE_INTERVAL: Duration = Duration::from_secs(2);
-/// post-reboot catch-up should close the reboot gap, not chase a live chain
-/// forever. any tiny lag left after this cap is handled by the normal engine.
-pub(crate) const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
-/// how many times the promoted-validator boot retries an unavailable catch-up
-/// source before failing over to the supervisor. sized (with the escalating
-/// beat at the retry site) to ride out an overlay-only source whose tunnels
-/// are still assembling after the reboot — several minutes, not seconds: an
-/// exec-restart would only redo the plane restore from zero.
-pub(crate) const POST_REBOOT_CATCHUP_MAX_ATTEMPTS: usize = 60;
+/// suffix catch-up should close one boundary gap, not chase a live chain
+/// forever. any tiny lag left after this cap is handled by the follower.
+pub(crate) const SUFFIX_CATCHUP_MAX_ITERS: usize = 8;
 /// max wire message size we accept on a channel (2 MiB). the tallest honest
 /// messages are (a) an op frame carrying a full 1 MiB duckfs chunk — capped at
 /// `node::MAX_FRAME_BYTES` by the submit-boundary guard, then gossiped raw on

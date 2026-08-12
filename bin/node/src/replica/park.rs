@@ -27,7 +27,7 @@ use crate::relay;
 use crate::relay_runtime;
 use crate::replica;
 use crate::rpc::{JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
-use crate::sync::catchup::{PostRebootCatchupError, catch_up_post_reboot_frames};
+use crate::sync::catchup::{SuffixCatchupError, catch_up_suffix_frames};
 use crate::sync::serve::{
     ServedSeal, reopen_preflight_synced_host, reopen_recovery, replica_backfill,
     replica_orchestrator_at, replica_verifier, verify_manifest_floor, write_boundary_checkpoint,
@@ -511,15 +511,23 @@ pub(super) async fn park(
     let mut last_indexed_root: Option<StateRoot> = None;
     // ---- REPLICA RESTART: recover by journal replay --------------
     //
-    // a checkpoint that routed us here (it names this key a resident,
-    // not a participant) is a real recovery base: replay the journal
+    // A resident checkpoint is a real recovery base: replay the journal
     // exactly as a validator restart would — restore the checkpoint
     // host, fold the retained suffix, verify the recomposed root-hash
     // — and enter the park loop ALREADY serving at the recovered tip.
     // no re-bootstrap: the fold driver closes any offline gap over
     // the Frames lane the moment the first certificate's parent
-    // linkage names it.
-    if let Some(ckpt) = manifest.as_ref() {
+    // linkage names it. A checkpoint that seats this key as a validator
+    // cannot choose the current role: the key may have been removed and
+    // re-granted resident standing while offline. Leave that checkpoint cold
+    // so the manifest poll below resolves the latest role before ascending.
+    let resident_checkpoint = manifest.as_ref().filter(|ckpt| {
+        !ckpt
+            .participants
+            .iter()
+            .any(|key| key.as_slice() == me_bytes.as_slice())
+    });
+    if let Some(ckpt) = resident_checkpoint {
         let restored = restore_host(
             &context,
             &forge_repo,
@@ -1602,7 +1610,7 @@ pub(super) async fn park(
             let root_hash = node_r.host().root_hash();
             let (host, mut recovery) = node_r.into_parts();
             // the promotion checkpoint: the manifest seats this key, so a
-            // crash from here restarts straight onto the validator path.
+            // crash from here re-enters role resolution with a valid state base.
             // (next_seq stays 1 — the fabricated-checkpoint rejoin edge,
             // accepted until submit sequences ride app state.)
             let pos = recovery.oplog_pos().await;
@@ -1943,18 +1951,18 @@ pub(super) async fn park(
                             // through the SAME journal a validator
                             // restart would replay; every served
                             // frame is seal-verified inside.
-                            let caught = match catch_up_post_reboot_frames(
+                            let caught = match catch_up_suffix_frames(
                                 &client,
                                 &mut recovery,
                                 &mut host,
                                 None,
                                 m.height,
-                                POST_REBOOT_CATCHUP_MAX_ITERS,
+                                SUFFIX_CATCHUP_MAX_ITERS,
                             )
                             .await
                             {
                                 Ok(c) => c,
-                                Err(PostRebootCatchupError::Fatal(e)) => {
+                                Err(SuffixCatchupError::Fatal(e)) => {
                                     metrics.record_sync_failure(e.clone());
                                     metrics.set_role_phase(
                                         noded::NodeRole::Resident,
@@ -1969,13 +1977,13 @@ pub(super) async fn park(
                                     );
                                     fatal!(label, "replica suffix fold: {e}");
                                 }
-                                Err(e) => {
-                                    metrics.record_sync_retry(format!("{e:?}"));
+                                Err(SuffixCatchupError::Retry(e)) => {
+                                    metrics.record_sync_retry(e.clone());
                                     tracing::warn!(
                                         target: "ducktape::statesync",
                                         node = %label,
                                         height = m.height,
-                                        error = ?e,
+                                        error = %e,
                                         "replica suffix fold unavailable; re-bootstrapping"
                                     );
                                     recovery_slot = Some(recovery);
@@ -2295,7 +2303,7 @@ pub(super) async fn park(
     );
 
     // fabricate the checkpoint a restart would have left; a crash from
-    // here restarts straight onto the validator path. (a REJOINING key
+    // here re-enters role resolution with a valid state base. (a REJOINING key
     // that later resubmits a byte-identical (seq, payload) pair could
     // be dropped by a peer's in-process digest gate; accepted edge
     // until submit sequences ride app state.)

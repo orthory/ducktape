@@ -51,9 +51,10 @@ pub(crate) type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tok
 /// the joiner/replica role (unified-node phase 2): park on the mesh,
 /// bootstrap a boundary, fold the head, and — at the activation cutover
 /// that seats this key — promote to a validator IN-PROCESS. entered by
-/// `run_node` exactly when this key holds neither a recovery checkpoint's
-/// participant seat nor genesis validator standing (`!checkpoint_seats_me
-/// && !validators.contains(…)`); the promotion seat is the ONLY return —
+/// `run_node` exactly when this key holds no genesis validator standing.
+/// Recovery checkpoints are local state bases, not role authority: this path
+/// resolves current resident/validator standing from the latest committed
+/// manifest. The promotion seat is the ONLY return —
 /// the [`crate::validator::PromotionBaton`] carries everything the
 /// validator role continues with — and every other exit is
 /// `std::process::exit`.

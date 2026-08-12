@@ -768,4 +768,108 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         residents.is_empty(),
         "promotion must clear resident standing (got {residents:?})"
     );
+
+    // (8) restart the still-seated promoted validator. Non-genesis keys now
+    //     resolve every boot from the latest committed manifest, so the same
+    //     resolver must return a promotion baton while the key remains seated.
+    cluster.kill(1);
+    cluster.spawn(1);
+    cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
+    cluster.submit(
+        0,
+        "directory",
+        &directory::encode_msg(&DirMsg::Set {
+            key: "validator-role-restart".into(),
+            value: "voting".into(),
+        }),
+    );
+    poll(
+        "the restarted validator to restore quorum and serve the new write",
+        Box::new(|| {
+            cluster
+                .query(
+                    1,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "validator-role-restart".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "voting"))
+        }),
+    );
+
+    // (9) remove the promoted validator. The two-member electorate needs one
+    //     ballot from each node; the cutover drops the friend and its validator
+    //     process halts itself at that committed boundary.
+    let (ok, out) = cluster.run_membership_verb("member remove", &friend_key);
+    assert!(ok, "founder member remove ballot failed:\n{out}");
+    assert!(
+        out.contains("waiting on other voters"),
+        "the first removal ballot should await the friend:\n{out}"
+    );
+    let (ok, out) = cluster.run_membership_verb_as(1, "member remove", &friend_key);
+    assert!(ok, "friend member remove ballot failed:\n{out}");
+    assert!(out.contains("removed"), "unexpected removal output:\n{out}");
+    cluster.wait_marker(1, "demoted from the validator set; halting", CONVERGE);
+    cluster.wait_exit(1, CONVERGE);
+    poll(
+        "the removal to leave only the founder validator",
+        Box::new(|| {
+            cluster
+                .query(0, "valset", &valset::encode_query(&ValsetQuery::Validators))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, ValsetReply::Validators(v) if v.len() == 1))
+        }),
+    );
+
+    // (10) re-grant the stopped key as a resident, then restart its actual
+    //     process with the validator-seating checkpoint left by promotion.
+    //     The latest committed standing, not that stale checkpoint role, must
+    //     select the resident path and resume the follow.
+    let (ok, out) = cluster.run_membership_verb("resident accept", &friend_key);
+    assert!(ok, "post-removal resident accept failed:\n{out}");
+    assert!(
+        out.contains("granted resident standing"),
+        "unexpected post-removal resident grant:\n{out}"
+    );
+    poll(
+        "the removed validator to regain resident standing",
+        Box::new(|| {
+            cluster
+                .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
+                .is_some_and(|r| {
+                    matches!(
+                        r,
+                        ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
+                    )
+                })
+        }),
+    );
+    cluster.spawn(1);
+    cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
+    cluster.submit(
+        0,
+        "directory",
+        &directory::encode_msg(&DirMsg::Set {
+            key: "validator-to-resident-restart".into(),
+            value: "followed".into(),
+        }),
+    );
+    poll(
+        "the restarted resident to follow a new write",
+        Box::new(|| {
+            cluster
+                .query(
+                    1,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "validator-to-resident-restart".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "followed"))
+        }),
+    );
 }
