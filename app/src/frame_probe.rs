@@ -246,6 +246,32 @@ fn probe_channel(index: i64) -> backend::ChatChannel {
     }
 }
 
+/// One window loader's answer: a full page of scrollback for one room, against
+/// the whole channel list. Extracted so the switch probe can land the same
+/// window in several rooms; the rail fixture overrides the two thread fields.
+fn probe_chat_data(channel: &str, generation: i64) -> backend::ChatData {
+    backend::ChatData {
+        generation,
+        channels: (0..CHANNELS).map(probe_channel).collect(),
+        messages: (1..=ROWS).map(probe_message).collect(),
+        active_channel: channel.into(),
+        active_channel_name: channel.into(),
+        active_channel_archived: false,
+        active_channel_members_only: false,
+        active_channel_huddle_count: 0,
+        huddle_roster: Vec::new(),
+        channel_members: Vec::new(),
+        selected_message_seq: 0,
+        selected_message_rev: 0,
+        selected_message_body: String::new(),
+        active_thread_seq: 0,
+        thread_target_seq: 0,
+        thread_messages: Vec::new(),
+        thread_next_reply_offset: 0,
+        thread_has_more: false,
+    }
+}
+
 /// A console sitting in chat, on a channel with a full page of scrollback,
 /// installed through `chat_updated` — the canonical install — so every
 /// mirrored field (`rooms`, `dm_rows`, `post_refusal`,
@@ -291,24 +317,9 @@ fn console_in_chat_with_thread(
     app.settings_user_key = "probe-user".into();
 
     let next = backend::ChatData {
-        generation: app.chat_generation,
-        channels: (0..CHANNELS).map(probe_channel).collect(),
-        messages: (1..=ROWS).map(probe_message).collect(),
-        active_channel: "channel-0".into(),
-        active_channel_name: "channel-0".into(),
-        active_channel_archived: false,
-        active_channel_members_only: false,
-        active_channel_huddle_count: 0,
-        huddle_roster: Vec::new(),
-        channel_members: Vec::new(),
-        selected_message_seq: 0,
-        selected_message_rev: 0,
-        selected_message_body: String::new(),
         active_thread_seq,
-        thread_target_seq: 0,
         thread_messages,
-        thread_next_reply_offset: 0,
-        thread_has_more: false,
+        ..probe_chat_data("channel-0", app.chat_generation)
     };
     let _ = app.__update(__DucktapeMessage::ChatUpdated(next));
     let dm_peers = (0..4)
@@ -827,5 +838,78 @@ fn probe() {
          argument is deep-cloned, the ABI is by value), a per-row scan of a mirrored \
          list, or a lost `virtual-row=`/`lazy` on the stream. Find it before raising \
          this number — the ceiling is the gate, not the target."
+    );
+}
+
+/// A console alternating between rooms until the window cache is FULL —
+/// `CHANNEL_WINDOW_CACHE` parked windows of `ROWS` rows each, which is what a
+/// reader who moves between three rooms carries.
+fn console_with_a_full_window_cache() -> Ducktape {
+    let (mut app, _) = console_in_chat();
+    for channel in ["channel-1", "channel-2", "channel-3"] {
+        let _ = app.__update(__DucktapeMessage::ChooseChannel(channel.into()));
+        let landed = probe_chat_data(channel, app.chat_generation);
+        let _ = app.__update(__DucktapeMessage::ChatUpdated(landed));
+    }
+    assert_eq!(
+        app.message_cache.len(),
+        3,
+        "the switch probe measures a FULL cache, not a warm one"
+    );
+    app
+}
+
+/// ALLOCATIONS PER ROOM SWITCH, REDUCER ONLY — the click's own cost, before any
+/// view work.
+///
+/// The extern ABI passes every list BY VALUE, so each `message_cache` argument
+/// is a deep copy of ALL three parked windows — thousands of `ChatMessage`
+/// clones — and the switch used to spend three of them before a pixel moved:
+/// the park, then one each for the rows and the member roll. Measured with this
+/// fixture: **23 345** allocations with the restore folded into one
+/// `cached_window` call, **30 265** with it split back into two calls asking
+/// the same window for two of its fields. The ceiling sits between them.
+const CHANNEL_SWITCH_ALLOCATION_CEILING: u64 = 27_000;
+
+#[test]
+fn a_channel_switch_stays_under_its_allocation_ceiling() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_channel_switch)
+        .expect("the switch probe thread spawns")
+        .join()
+        .expect("the switch probe thread finishes");
+}
+
+fn probe_channel_switch() {
+    let mut app = console_with_a_full_window_cache();
+    let mut switch = Phase::new("channel switch (reducer)");
+
+    // A→B→A is the motion the cache exists for, and both rooms are parked, so
+    // every sample is the cache-HIT path with a full cache behind it.
+    for frame in 0..FRAMES {
+        let target = match frame % 2 == 0 {
+            true => "channel-1",
+            false => "channel-2",
+        };
+        switch.sample(|| {
+            let _ = app.__update(__DucktapeMessage::ChooseChannel(target.into()));
+        });
+        assert_eq!(
+            app.messages.len(),
+            ROWS as usize,
+            "each sample must be a cache HIT — an empty room measures nothing"
+        );
+    }
+    switch.report();
+
+    let per_switch = switch.median_allocations();
+    assert!(
+        per_switch < CHANNEL_SWITCH_ALLOCATION_CEILING,
+        "one room switch cost {per_switch} allocations, over the \
+         {CHANNEL_SWITCH_ALLOCATION_CEILING} ceiling. Something walks the window cache \
+         an extra time: every `message_cache` argument is a deep copy of every parked \
+         window, so two calls asking the same window for two of its fields cost twice \
+         what one does. Find it before raising this number."
     );
 }

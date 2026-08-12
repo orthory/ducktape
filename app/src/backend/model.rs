@@ -281,8 +281,9 @@ pub fn near_scroll_top(relative_offset: f64) -> bool {
 }
 
 /// The last rows and member roll seen in one channel, kept so a switch back
-/// paints in one frame instead of on the network.
-#[derive(Clone, Debug, Hash, PartialEq)]
+/// paints in one frame instead of on the network. The default IS the cache
+/// miss — an empty room with no roll — which is what [`cached_window`] answers.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct ChannelWindow {
     pub channel_id: String,
     pub messages: Vec<ChatMessage>,
@@ -334,19 +335,17 @@ pub fn cache_channel_window(
     kept
 }
 
-pub fn cached_window_messages(cache: Vec<ChannelWindow>, channel_id: String) -> Vec<ChatMessage> {
+/// The parked window for one room, or the empty one.
+///
+/// ONE WALK, ONE CLONE. The extern ABI passes the cache BY VALUE, so asking for
+/// the rows and the roll through two calls deep-copied every parked window
+/// twice — up to three windows of `CHAT_VIEW_PAGE_LIMIT` rows each, thousands
+/// of `ChatMessage` clones, synchronously on the click that the cache exists to
+/// make instant. Both answers live in the same struct; one call hands over both.
+pub fn cached_window(cache: Vec<ChannelWindow>, channel_id: String) -> ChannelWindow {
     cache
         .into_iter()
         .find(|window| window.channel_id == channel_id)
-        .map(|window| window.messages)
-        .unwrap_or_default()
-}
-
-pub fn cached_window_members(cache: Vec<ChannelWindow>, channel_id: String) -> Vec<ChatMember> {
-    cache
-        .into_iter()
-        .find(|window| window.channel_id == channel_id)
-        .map(|window| window.members)
         .unwrap_or_default()
 }
 
@@ -583,6 +582,28 @@ pub fn thread_loading_after_refresh(
 
 pub fn retain_thread_messages(messages: Vec<ChatMessage>, root_seq: i64) -> Vec<ChatMessage> {
     if root_seq > 0 { messages } else { Vec::new() }
+}
+
+/// The clicked message as the rail's first row, so a thread opens on the
+/// message it is ABOUT instead of a blank 330px plate for the whole round trip.
+/// `thread_loaded` replaces the vec wholesale on arrival, and a load that FAILS
+/// leaves the root standing rather than a permanently empty pane.
+///
+/// BOTH LISTS, because `open_thread_for` is emitted from inside the rail too: a
+/// re-root onto a reply names a seq that lives in `thread`, never in the
+/// timeline. Answers empty when neither holds it — the honest state, and the
+/// one the rail drew before.
+pub fn thread_root_seed(
+    messages: Vec<ChatMessage>,
+    thread: Vec<ChatMessage>,
+    seq: i64,
+) -> Vec<ChatMessage> {
+    messages
+        .into_iter()
+        .chain(thread)
+        .find(|message| message.seq == seq)
+        .into_iter()
+        .collect()
 }
 
 pub fn remember_orphaned_comment_drafts(

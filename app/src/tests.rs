@@ -1530,8 +1530,10 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
             "chat_hit_loaded",
             "chat_updated",
             "choose_channel",
+            "choose_dm",
             "console_opened",
             "live_resynced",
+            "open_chat_search_hit",
             "reconnect",
             "workspace_connected",
         ],
@@ -1624,6 +1626,61 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
             );
         }
     }
+}
+
+/// THE STREAM'S TAIL IS ASSERTED BY THE SWITCH, NOT INHERITED FROM THE LAST ROOM.
+///
+/// The scroll reset used to be a side effect of the timeline going empty: the
+/// `if connected && !empty(messages)` gate around the stack dropped, the
+/// scrollable unmounted, and its `scrollable::State` — the offset with it —
+/// died. The window cache ended that. A handler that paints PARKED rows takes
+/// `messages` non-empty → non-empty in one reducer pass, the gate never renders
+/// false, and iced's positional `Tree::diff` hands the surviving offset to the
+/// room being entered — a distance from the BOTTOM under `anchor-y=end`, so an
+/// 800px scroll-up in #general opens #design 800px above its own tail.
+///
+/// So the rule is mechanical: a handler that restores a window from the cache
+/// asserts the tail explicitly. Absolute `0.0` IS the tail under this anchor
+/// (`snap-end`'s relative 1.0 would be the TOP of scrollback). The lint keys on
+/// `cached_window(` rather than a hardcoded handler list, so the next picker
+/// that gains a cache restore fails here until it carries the operation too.
+#[test]
+fn a_room_restored_from_the_cache_asserts_the_streams_tail() {
+    const HANDLERS: &str = include_str!("ui/handlers/chat.ice");
+    const TAIL: &str = "task widget scroll-to #workspace-tabs/content/chat/message-stream 0.0 0.0";
+
+    let mut restorers: Vec<&str> = Vec::new();
+    for block in HANDLERS.split("\non ").skip(1) {
+        let handler = block.split('(').next().unwrap_or(block).trim();
+        let handler = handler.lines().next().unwrap_or(handler).trim();
+        let restores = block
+            .lines()
+            .any(|line| line.trim_start().starts_with("let ") && line.contains("cached_window("));
+        if !restores {
+            continue;
+        }
+        restorers.push(handler);
+        assert!(
+            block.lines().any(|line| line.trim() == TAIL),
+            "`on {handler}` paints parked rows into a scrollable that survives \
+             the switch, so it must end with `{TAIL}` — the unmount is no longer \
+             the reset"
+        );
+    }
+    assert_eq!(
+        restorers,
+        ["choose_channel", "choose_dm"],
+        "a handler started or stopped restoring a parked window: it owes the \
+         stream its tail"
+    );
+
+    // And the screen no longer claims the gate is the reset — that comment sent
+    // the last reader looking for a reset that #1059 had already deleted.
+    const SCREEN: &str = include_str!("ui/screens/chat.ice");
+    assert!(
+        !SCREEN.contains("THIS GATE IS THE SCROLL RESET"),
+        "the stream's gate stopped being the scroll reset when the cache landed"
+    );
 }
 
 /// A MIRRORED VIEW READING IS ONLY AS GOOD AS ITS WRITERS, SO THE WRITERS ARE
@@ -7392,6 +7449,170 @@ fn switching_back_to_a_parked_room_paints_its_rows_without_waiting_on_the_node()
     assert!(app.post_refusal.is_empty());
 }
 
+/// A DM CLICK LANDS THE WHOLE ROOM, NOT JUST THE FACE.
+///
+/// `choose_dm` used to move `active_dm_peer` and nothing else about the room,
+/// so for the several blocks `open_dm` takes — a channel create plus two
+/// membership seats on a first open — the peer's name sat beside the ARCHIVED
+/// badge, the "· N added" count and the composer refusal of the room she left.
+/// The id is derivable here (`dm_channel_id` is the same deterministic hash
+/// `open_dm` resolves), which also makes a re-opened DM eligible for the park.
+#[test]
+fn a_dm_click_takes_the_room_with_it_instead_of_wearing_the_last_ones_badges() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.settings_user_key = "me".into();
+    app.active_channel = "locked".into();
+    app.active_channel_name = "locked".into();
+    app.active_channel_archived = true;
+    app.active_channel_members_only = true;
+    app.channel_members = vec![backend::ChatMember {
+        key: "someone-else".into(),
+        label: "Someone else".into(),
+    }];
+    app.post_refusal = "channel_archived".into();
+    app.messages = vec![message(10, "in the room she leaves", false)];
+    app.dm_peers = vec![backend::DmPeer {
+        key: "peer".into(),
+        name: "Peer".into(),
+        initials: "P".into(),
+        is_agent: false,
+        channel_id: backend::dm_channel_id("me".into(), "peer".into()),
+    }];
+
+    let _ = app.__update(__DucktapeMessage::ChooseDm("peer".into()));
+    let dm = backend::dm_channel_id("me".into(), "peer".into());
+    assert_eq!(app.active_channel, dm, "the DM's own room, on the click");
+    assert_eq!(app.active_dm_peer, "peer");
+    assert!(!app.active_channel_archived, "not the left room's badge");
+    assert!(!app.active_channel_members_only);
+    assert!(app.channel_members.is_empty(), "nor its member count");
+    assert!(app.post_refusal.is_empty(), "nor its composer refusal");
+    assert!(!app.history_view, "a DM open is a live tail");
+    assert!(app.loading, "this peer has never been read");
+
+    // And back out and in again: the DM is an ordinary room in the park now.
+    let mut landed = chat_data(&dm, vec![message(30, "from the peer", false)]);
+    landed.generation = app.chat_generation;
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(landed));
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("locked".into()));
+    let _ = app.__update(__DucktapeMessage::ChooseDm("peer".into()));
+    assert_eq!(app.messages.len(), 1, "the DM came back from the park");
+    assert!(!app.loading, "a parked DM is not a loading one");
+}
+
+/// A SEARCH HIT PAINTS THE ROOM IT IS JUMPING TO, NOT THE ROOM IT LEFT.
+///
+/// Every landing field used to move only in `chat_hit_loaded`, so a hit that
+/// lives in another room kept that room's header, rows and sidebar highlight
+/// for the whole walk — the one navigation whose entire purpose is to jump
+/// somewhere else, and the only one still showing the "did my click land?" void
+/// #1059 removed from the pickers. The park is deliberately NOT restored: a hit
+/// is a history window, and an empty timeline under the skeleton is honest.
+#[test]
+fn opening_a_search_hit_moves_the_room_on_the_click() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.settings_user_key = "me".into();
+    app.active_channel = "general".into();
+    app.active_channel_name = "general".into();
+    app.active_channel_archived = true;
+    app.channels = vec![room("general", 10), room("design", 40)];
+    app.messages = vec![message(10, "in general", false)];
+    app.channel_members = vec![backend::ChatMember {
+        key: "me".into(),
+        label: "me".into(),
+    }];
+
+    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("design".into(), 7, 7));
+    assert_eq!(
+        app.active_channel, "design",
+        "the sidebar moves on the click"
+    );
+    assert_eq!(app.active_channel_name, "design", "and so does the header");
+    assert!(!app.active_channel_archived, "not general's badge");
+    assert!(app.channel_members.is_empty(), "nor general's roll");
+    assert!(app.post_refusal.is_empty());
+    assert!(app.messages.is_empty(), "general's rows leave with general");
+    assert!(
+        app.loading,
+        "so the skeleton draws for the room being entered"
+    );
+    assert!(app.history_view, "a hit is a window around one old message");
+
+    // Leaving parks general, so the way back out of the hit is one frame.
+    let parked = backend::cached_window(app.message_cache.clone(), "general".into());
+    assert_eq!(parked.messages.len(), 1);
+}
+
+/// THE THREAD RAIL OPENS ON THE MESSAGE IT IS ABOUT.
+///
+/// `open_thread_for` emptied `thread_messages` and the rail's only body is a
+/// loop over it, with both loading arms gated on `thread_has_more` — which the
+/// same handler clears. So the click produced a 330px pane of bare background
+/// with no root row, no skeleton and a disabled composer for the whole round
+/// trip, and a load that FAILED left it that way until Close. The clicked
+/// message is already in hand; seeding it costs one filter.
+#[test]
+fn opening_a_thread_seeds_its_root_row_instead_of_a_blank_rail() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "a".into();
+    app.messages = vec![message(7, "the message it is about", false)];
+
+    let _ = app.__update(__DucktapeMessage::OpenThreadFor(7));
+    assert_eq!(app.active_thread_seq, 7);
+    assert!(app.thread_loading, "the replies are still out");
+    assert_eq!(
+        app.thread_messages
+            .iter()
+            .map(|row| row.seq)
+            .collect::<Vec<_>>(),
+        vec![7],
+        "the root draws on the click, before the node answers"
+    );
+
+    // A FAILURE LEAVES THE ROOT STANDING. `thread_failed` clears the busy term
+    // and routes the text to the app banner; it never touches the rail, so an
+    // unseeded rail stayed blank for as long as it was open.
+    let _ = app.__update(__DucktapeMessage::ThreadFailed(backend::HydrationError {
+        generation: app.thread_generation,
+        message: "the node did not answer".into(),
+    }));
+    assert!(!app.thread_loading);
+    assert_eq!(
+        app.thread_messages.len(),
+        1,
+        "the rail still says which thread"
+    );
+
+    // AND A RE-ROOT ONTO A REPLY WORKS TOO: that seq lives in the rail's own
+    // vec, never in the timeline, because the button is on a reply card.
+    let mut loaded = backend::ThreadLoadData {
+        generation: 0,
+        root_seq: 7,
+        target_seq: 0,
+        messages: vec![message(7, "root", false), message(9, "a reply", false)],
+        next_reply_offset: 0,
+        has_more: false,
+    };
+    let _ = app.__update(__DucktapeMessage::OpenThreadFor(7));
+    loaded.generation = app.thread_generation;
+    let _ = app.__update(__DucktapeMessage::ThreadLoaded(loaded));
+    let _ = app.__update(__DucktapeMessage::OpenThreadFor(9));
+    assert_eq!(
+        app.thread_messages
+            .iter()
+            .map(|row| row.seq)
+            .collect::<Vec<_>>(),
+        vec![9],
+        "the reply the reader re-rooted on is the new rail's root"
+    );
+}
+
 /// A PARKED WINDOW IS NOT A SETTLED ONE, AND HISTORY MAY NOT PAGE FROM IT. The
 /// cache hit paints the rows she left behind with `loading` false, so `loading`
 /// — the only in-flight term the two history routes had — stopped covering the
@@ -7483,7 +7704,7 @@ fn the_parked_window_keeps_only_committed_rows() {
         Vec::new(),
         false,
     );
-    let rows = backend::cached_window_messages(parked.clone(), "a".into());
+    let rows = backend::cached_window(parked.clone(), "a".into()).messages;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].seq, 10);
 
@@ -7496,7 +7717,11 @@ fn the_parked_window_keeps_only_committed_rows() {
         Vec::new(),
         true,
     );
-    assert!(backend::cached_window_messages(refused, "a".into()).is_empty());
+    assert!(
+        backend::cached_window(refused, "a".into())
+            .messages
+            .is_empty()
+    );
 }
 
 /// SCROLLING NEAR THE TOP STARTS THE PAGE. The offset arrives relative to the
