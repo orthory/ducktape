@@ -45,6 +45,11 @@ ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", re
 
 [dev-dependencies]
 commonware-cryptography.workspace = true
+# `src/frame_probe.rs` needs a headless `UserInterface` to measure a whole
+# frame (build + layout + event walk + draw), and iced does not re-export
+# `iced_runtime`. Nothing new is compiled: ui-lang-runtime's default
+# `test-runtime` feature already pulls this exact version into the graph.
+iced_test = "=0.14.0"
 node.workspace = true
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
