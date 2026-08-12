@@ -1401,18 +1401,38 @@ impl PodmanService {
     /// wait until the service is answering on its socket (bounded). The service
     /// child creates the socket asynchronously after spawn; poll a cheap `_ping`
     /// until it responds rather than sleeping a fixed time.
+    ///
+    /// The 60s budget is load-stated, not tuned: several rootless podman
+    /// services sharing one runtime routinely push socket bring-up past the old
+    /// 5s budget on a busy box, so 5s FATALed healthy boots. 60s only fires
+    /// when podman is stuck outright.
     async fn await_socket(&self) -> Result<(), String> {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        const BUDGET_POLLS: u32 = 1200; // 60s of 50ms polls
+        const OLD_BUDGET_POLLS: u32 = 100; // the old 5s budget — warn once when crossed
         let client = self.client();
-        for _ in 0..100 {
+        let started = std::time::Instant::now();
+        for attempt in 0..BUDGET_POLLS {
             if UnixStream::connect(&self.socket).await.is_ok()
                 && client.request("GET", "/_ping", None).await.is_ok()
             {
                 return Ok(());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let crossed_old_budget = attempt == OLD_BUDGET_POLLS;
+            if crossed_old_budget {
+                tracing::warn!(
+                    target: "ducktape::sandbox",
+                    reason = "podman_socket_slow",
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "podman service socket not answering yet; still waiting (machine load \
+                     routinely pushes this past 5s)"
+                );
+            }
+            tokio::time::sleep(POLL).await;
         }
         Err(format!(
-            "podman service did not answer on {} within 5s",
+            "podman service did not answer on {} within 60s — machine load (several podman \
+             services sharing the runtime) is the known cause of long waits",
             self.socket.display()
         ))
     }

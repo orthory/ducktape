@@ -1,6 +1,9 @@
+use std::io::BufRead as _;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519::PrivateKey};
@@ -25,6 +28,77 @@ fn command_output(out: &std::process::Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// wedged-detector backstop, NOT a tuned budget: the wait below is event-driven
+/// (each stderr line arrives over a channel the moment the node writes it), so
+/// this only fires when the node is stuck outright. Idle runs see every marker
+/// in under 10s; a busy box merely arrives later on the same events.
+const WEDGED_BACKSTOP: Duration = Duration::from_secs(120);
+
+/// Event-driven wait on a spawned node's stderr — where tracing writes. A
+/// reader thread forwards each line over a channel and appends it to a shared
+/// transcript (the assertions also check ABSENCE of markers, and panics print
+/// everything read so far). stdout stays on the log file, so a full pipe can
+/// never block the child.
+struct NodeStderr {
+    rx: mpsc::Receiver<String>,
+    transcript: Arc<Mutex<String>>,
+}
+
+impl NodeStderr {
+    /// take the child's piped stderr and start the reader thread. The thread
+    /// drains until EOF even if the test side stops listening, so the child can
+    /// never block on a full stderr pipe.
+    fn pipe(child: &mut Child) -> Self {
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (tx, rx) = mpsc::channel();
+        let transcript = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&transcript);
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr).lines() {
+                let Ok(line) = line else { return };
+                {
+                    let mut t = sink.lock().unwrap_or_else(|e| e.into_inner());
+                    t.push_str(&line);
+                    t.push('\n');
+                }
+                // receiver may already be gone during teardown; keep draining.
+                let _ = tx.send(line);
+            }
+        });
+        Self { rx, transcript }
+    }
+
+    /// everything read from stderr so far — the panic/absence-check record.
+    fn transcript(&self) -> String {
+        self.transcript
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// block until a stderr line contains one of `markers` (returning the index
+    /// of the matched marker), the child exits (stderr EOF — subsumes a
+    /// `try_wait` liveness poll), or the wedged backstop fires.
+    fn wait_for_any(&self, markers: &[&str]) -> Result<usize, &'static str> {
+        let deadline = Instant::now() + WEDGED_BACKSTOP;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = match self.rx.recv_timeout(remaining) {
+                Ok(line) => line,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("the node exited (stderr EOF)");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err("no marker within the wedged-detector backstop");
+                }
+            };
+            if let Some(matched) = markers.iter().position(|m| line.contains(m)) {
+                return Ok(matched);
+            }
+        }
+    }
 }
 
 /// mint (or reuse) `<dir>/identity.key` via the `keygen` verb and return its
@@ -343,47 +417,32 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
         command_output(&init)
     );
 
+    // stdout goes to a file (a full pipe could block the child); stderr — where
+    // tracing writes — is piped to a reader thread for event-driven waits.
     let log_path = dir.path().join("founder-heal.log");
     let out = std::fs::File::create(&log_path).expect("create node log");
-    let err = out.try_clone().expect("clone node log handle");
     let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .arg("node")
         .arg("run")
         .arg("--config")
         .arg(founder.join("node.toml"))
         .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn ducktape");
+    let stderr = NodeStderr::pipe(&mut child);
 
-    let wait_for = |marker: &str, budget: Duration| -> (bool, String) {
-        let deadline = Instant::now() + budget;
-        loop {
-            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-            if log.contains(marker) {
-                return (true, log);
-            }
-            if Instant::now() >= deadline {
-                return (false, log);
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
-
-    // act 1 — dark: the plane reports the outage and keeps the node up.
-    let (saw_unavailable, log) = wait_for(
-        "coordinator rendezvous unavailable",
-        Duration::from_secs(25),
-    );
-    let still_running = child.try_wait().expect("poll node").is_none();
-    if !saw_unavailable || !still_running {
+    // act 1 — dark: the plane reports the outage and keeps the node up (an
+    // early exit surfaces as stderr EOF).
+    if let Err(why) = stderr.wait_for_any(&["coordinator rendezvous unavailable"]) {
         let _ = child.kill();
         let _ = child.wait();
         panic!(
-            "the node must stay up and report the dark coordinator (running: \
-             {still_running}):\n{log}"
+            "the node must stay up and report the dark coordinator ({why}):\n{}",
+            stderr.transcript()
         );
     }
+    let log = stderr.transcript();
     assert!(
         !log.contains("coordinator-observed reflexive"),
         "nothing answered yet — no reflexive can exist:\n{log}"
@@ -402,14 +461,16 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
     });
 
     // ...and the running node registers on its own: establishment retries at
-    // 3s doubling to 30s, so one full backoff cycle bounds the wait.
-    let (healed, log) = wait_for("coordinator-observed reflexive", Duration::from_secs(45));
+    // 3s doubling to 30s, and the channel wait follows the node's own backoff
+    // instead of racing a tuned budget.
+    let healed = stderr.wait_for_any(&["coordinator-observed reflexive"]);
     let _ = child.kill();
     let _ = child.wait();
     assert!(
-        healed,
+        healed.is_ok(),
         "the plane must establish rendezvous once the coordinator answers — \
-         without a process restart:\n{log}"
+         without a process restart:\n{}",
+        stderr.transcript()
     );
 }
 
@@ -463,40 +524,29 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
     );
 
     // the node never exits on its own here (a healthy solo founder runs
-    // forever), so we drive our own deadline: poll the log until the plane
-    // either DEGRADES (pass) or refuses to start (fail), then tear the node
-    // down. Returning on the first decisive line keeps the test fast.
+    // forever), so wait on its piped stderr for whichever decisive marker
+    // arrives first — the plane DEGRADES (pass) or refuses to start (fail) —
+    // then tear the node down. An early exit surfaces as stderr EOF.
     let log_path = dir.path().join("founder-run.log");
     let out = std::fs::File::create(&log_path).expect("create node log");
-    let err = out.try_clone().expect("clone node log handle");
     let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .arg("node")
         .arg("run")
         .arg("--config")
         .arg(founder.join("node.toml"))
         .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn ducktape");
+    let stderr = NodeStderr::pipe(&mut child);
 
-    let deadline = Instant::now() + Duration::from_secs(25);
-    let (degraded, log) = loop {
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        if log.contains("coordinator rendezvous unavailable") {
-            break (true, log);
-        }
-        if log.contains("plane not started") {
-            break (false, log);
-        }
-        if Instant::now() >= deadline || child.try_wait().expect("poll node").is_some() {
-            break (false, log);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let outcome = stderr.wait_for_any(&["coordinator rendezvous unavailable", "plane not started"]);
     let still_running = child.try_wait().expect("poll node").is_none();
     let _ = child.kill();
     let _ = child.wait();
+    let log = stderr.transcript();
 
+    let degraded = matches!(outcome, Ok(0));
     assert!(
         degraded,
         "an unreachable coordinator must DEGRADE the plane (\"coordinator rendezvous \
