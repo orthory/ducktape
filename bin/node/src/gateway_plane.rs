@@ -742,7 +742,12 @@ async fn proxy_loopback(
                                 return;
                             }
                         }
-                        return; // signed cap reached; close the chunked body at the boundary
+                        let _ = tx
+                            .send(Err(GatewayFailure::Unavailable(
+                                "loopback response exceeds the signed route cap".into(),
+                            )))
+                            .await;
+                        return;
                     }
                     total = total.saturating_add(chunk_len);
                     Ok(chunk)
@@ -1403,7 +1408,12 @@ fn spawn_body_pump<S: AsyncRead + Unpin + Send + 'static>(
     mut buf: Vec<u8>,
     max_response_bytes: u64,
 ) -> noded::GatewayBody {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(16);
+    // One slot is load-bearing: after a normal body chunk, the pump cannot
+    // enqueue a terminal Failure until Hyper has consumed that chunk. Hyper
+    // therefore observes Pending before the error, commits the response head,
+    // and surfaces a deterministic mid-body truncation instead of occasionally
+    // collapsing the whole request into `IncompleteMessage` at `.send()`.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(1);
     tokio::spawn(async move {
         let mut total: u64 = 0;
         loop {
