@@ -50,6 +50,35 @@ state
   rooms:[ChatChannel] = []
   unread_channel_ids:[str] = []
   messages:[ChatMessage] = []
+  // THE LAST TWO OR THREE ROOMS, KEPT. A channel click used to empty the pane
+  // and wait out the load, so alternating between two rooms paid the whole trip
+  // both ways and the reader watched a "Loading messages…" plate every time.
+  // `choose_channel` parks the room it leaves here and paints the room it
+  // enters from here — one frame, `loading` false — and the refetch replays
+  // over it through the same `merge_pending_messages` the live fold uses.
+  //
+  // The member roll rides along because `post_refusal` is computed from it: a
+  // restored window with someone else's members would gate the composer of the
+  // room it just painted.
+  message_cache:[ChannelWindow] = []
+  // THE SWITCH'S OWN GENERATION. Every route that moves the reader between
+  // rooms bumps it and stamps it on the load it launches, so `chat_updated`
+  // can drop a room she has already clicked past — A→B→C lands on C even when
+  // B answers last. It replaced a `return if loading` at the TOP of those
+  // handlers, which made the FIRST click win and every click during the load
+  // vanish with no feedback at all.
+  chat_generation:i64 = 0
+  // IS A SWITCH STILL OUT — the term `loading` stopped carrying the moment a
+  // cache hit began painting parked rows with `loading` false. The rows on
+  // screen during that round trip are the PREVIOUS window, and the reply is
+  // about to replace them wholesale: a history page requested against their
+  // oldest seq prepends under a window that no longer starts there, punching a
+  // silent, unmarked gap into the middle of the timeline that only a resync
+  // heals. So the two history routes read this instead — and NO switch handler
+  // does, which is the whole point of the generation guard above: the click is
+  // always taken, only the paging it would corrupt is held. The view reads it
+  // once, so the "Load older" button says which of the two it is refusing on.
+  chat_window_loading = false
   channel_reads:[ChannelRead] = []
   unread_boundary:i64 = 0
   // The seq wearing the "New" divider — first_unread_seq(messages,

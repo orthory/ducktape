@@ -167,7 +167,12 @@ view
               messages
               has_older_history
               history_view
-              history_loading
+              // THE BUTTON TELLS THE TRUTH ABOUT BOTH REFUSALS. `load_more_history`
+              // refuses on `chat_window_loading` as well, and a cache-hit switch
+              // paints the parked rows — button included — with `loading` false,
+              // so without this the one control on screen during that round trip
+              // is a live-looking button that swallows the press.
+              history_loading=(history_loading || chat_window_loading)
               unread_boundary
               unread_marker_seq
               selected_message_seq
@@ -206,6 +211,7 @@ view
               join_huddle_submit -> join_huddle_submit
               chat_pointer_pressed -> chat_pointer_pressed _ _
               load_more_history -> load_more_history
+              chat_scrolled -> chat_scrolled _ _ _ _
               add_reaction_at -> add_reaction_at _ _
               remove_reaction_at -> remove_reaction_at _ _
               open_thread_for -> open_thread_for _

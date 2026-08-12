@@ -179,6 +179,8 @@ on console_opened(id)
   // the old `connected_rpc` may never answer and "Load older" would stay dead
   // in the new network for the rest of the session.
   history_loading = false
+  // Same abandoned reply, same rest of the session — see `chat_window_loading`.
+  chat_window_loading = false
   channel_reads = []
   unread_boundary = 0
   unread_marker_seq = 0

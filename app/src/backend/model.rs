@@ -211,6 +211,34 @@ pub fn channel_head_seq(channels: Vec<ChatChannel>, channel: String) -> i64 {
     head_seq_of(&channels, &channel)
 }
 
+/// FOLD A LOAD'S ROWS INTO THE LIST ON SCREEN — do not replace it with them.
+///
+/// The switch loader is handed the list the reader is already looking at and
+/// answers with the one row it refreshed (`load_channel_window_data`), so
+/// assigning its list back would revert every delta the live stream folded
+/// during the round trip: a peer's post in a THIRD room and the unread badge it
+/// lit, a channel created, renamed or archived. Nothing re-pages the list
+/// afterwards — `load_chat` is raised only by a reconnect — so that loss is
+/// permanent, not a frame of staleness.
+///
+/// `head_seq` only moves FORWARD. The row was read mid-flight; a delta folded
+/// after that read is the newer fact, and letting the row walk it back relights
+/// a badge the reader has already cleared.
+pub fn upsert_channel_rows(
+    mut channels: Vec<ChatChannel>,
+    refreshed: Vec<ChatChannel>,
+) -> Vec<ChatChannel> {
+    for mut row in refreshed {
+        let Some(current) = channels.iter_mut().find(|current| current.id == row.id) else {
+            channels.push(row);
+            continue;
+        };
+        row.head_seq = row.head_seq.max(current.head_seq);
+        *current = row;
+    }
+    channels
+}
+
 // active-channel scalars re-derived from the (delta-folded) channel list,
 // keeping the current value when the channel is absent from the list.
 
@@ -223,6 +251,103 @@ pub fn channel_display_name(
         .iter()
         .find(|row| row.id == channel)
         .map_or(current, |row| row.name.clone())
+}
+
+/// Is the clicked channel archived / members-only, per the list the sidebar is
+/// already drawn from? Both ride the click, not the round trip: `post_refusal`
+/// is recomputed the moment the room changes, and reading the room she LEFT for
+/// one round trip is how a public channel came up refusing her post.
+pub fn channel_is_archived(channels: Vec<ChatChannel>, channel: String) -> bool {
+    channels.iter().any(|row| row.id == channel && row.archived)
+}
+
+pub fn channel_is_members_only(channels: Vec<ChatChannel>, channel: String) -> bool {
+    channels
+        .iter()
+        .any(|row| row.id == channel && row.members_only)
+}
+
+/// Is the reader inside the last tenth of the loaded scrollback?
+///
+/// The stream is bottom-anchored, so a scrollable reports its offset relative
+/// to the END — 1.0 is the TOP of the history in hand, which is where the next
+/// older page belongs.
+///
+/// A NaN offset (content that fits reports `0/0`) compares false against
+/// everything, which is the answer this wants anyway — iced does not publish a
+/// viewport at all in that case, so it is a belt, not the braces.
+pub fn near_scroll_top(relative_offset: f64) -> bool {
+    relative_offset >= 0.9
+}
+
+/// The last rows and member roll seen in one channel, kept so a switch back
+/// paints in one frame instead of on the network.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChannelWindow {
+    pub channel_id: String,
+    pub messages: Vec<ChatMessage>,
+    pub members: Vec<ChatMember>,
+}
+
+/// How many rooms the cache remembers. Alternating between two rooms is the
+/// motion this pays for; a third covers "back out through the room you came
+/// from". Past that it is memory held for windows the refetch would replace
+/// anyway.
+const CHANNEL_WINDOW_CACHE: usize = 3;
+
+/// Park the room being left, most-recent first.
+///
+/// PENDING ROWS DO NOT GO IN. An in-flight send settles against `messages` for
+/// the room the reader is IN — `message_sent`/`message_send_failed` both drop
+/// their timeline surgery once she has moved — so a parked pending row has no
+/// writer left to retire it and would come back as a permanent "Sending…".
+///
+/// A HISTORY WINDOW DOES NOT GO IN EITHER. Those rows are a page around one old
+/// message, not the tail; restoring them under a cleared `history_view` would
+/// paint months-old scrollback as the live conversation.
+pub fn cache_channel_window(
+    cache: Vec<ChannelWindow>,
+    channel_id: String,
+    messages: Vec<ChatMessage>,
+    members: Vec<ChatMember>,
+    history_view: bool,
+) -> Vec<ChannelWindow> {
+    let committed: Vec<ChatMessage> = messages
+        .into_iter()
+        .filter(|message| !message.pending)
+        .collect();
+    let worth_keeping = !history_view && !channel_id.is_empty() && !committed.is_empty();
+    if !worth_keeping {
+        return cache;
+    }
+    let mut kept: Vec<ChannelWindow> = vec![ChannelWindow {
+        channel_id: channel_id.clone(),
+        messages: committed,
+        members,
+    }];
+    kept.extend(
+        cache
+            .into_iter()
+            .filter(|window| window.channel_id != channel_id)
+            .take(CHANNEL_WINDOW_CACHE - 1),
+    );
+    kept
+}
+
+pub fn cached_window_messages(cache: Vec<ChannelWindow>, channel_id: String) -> Vec<ChatMessage> {
+    cache
+        .into_iter()
+        .find(|window| window.channel_id == channel_id)
+        .map(|window| window.messages)
+        .unwrap_or_default()
+}
+
+pub fn cached_window_members(cache: Vec<ChannelWindow>, channel_id: String) -> Vec<ChatMember> {
+    cache
+        .into_iter()
+        .find(|window| window.channel_id == channel_id)
+        .map(|window| window.members)
+        .unwrap_or_default()
 }
 
 /// The clicked page's title, from the index the sidebar is already drawn from

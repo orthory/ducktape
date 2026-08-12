@@ -2743,9 +2743,28 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     let thread = load_thread_data(&rpc, "general", 1, 0).await.unwrap();
     assert_eq!(thread.messages.len(), 2);
     assert_eq!(thread.messages[1].body, "a threaded reply");
-    let hit = load_chat_hit(origin.clone(), "general".into(), 1, 3)
-        .await
-        .unwrap();
+    let hit = load_chat_hit(
+        origin.clone(),
+        chat.channels.clone(),
+        "general".into(),
+        1,
+        3,
+        7,
+    )
+    .await
+    .unwrap();
+    // ONE ROW BACK, NOT THE LIST IT WAS HANDED. The switch loaders take the
+    // reader's list only as a `head_seq` hint; carrying it back would have the
+    // reducer revert every delta the live stream folded during the round trip
+    // (`upsert_channel_rows`).
+    assert_eq!(
+        hit.channels
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["general"]
+    );
+    assert_eq!(hit.generation, 7);
     assert_eq!(hit.selected_message_seq, 1);
     assert_eq!(hit.active_thread_seq, 1);
     assert_eq!(hit.thread_target_seq, 3);
@@ -4011,7 +4030,10 @@ async fn a_failed_title_lookup_keeps_the_page_hits_it_could_not_name() {
 /// cannot tell them apart.
 #[test]
 fn chat_reads_never_cross_the_dispatch_query_lane() {
+    // `load_channel_row` is the fold's caller; `load_channel_facts` is the read
+    // itself, shared with the channel-switch window loader.
     const LIVE: &str = include_str!("live.rs");
+    const LOAD: &str = include_str!("load.rs");
     let load_channel_row = LIVE
         .split("pub(crate) async fn load_channel_row(")
         .nth(1)
@@ -4020,13 +4042,26 @@ fn chat_reads_never_cross_the_dispatch_query_lane() {
         .next()
         .expect("load_channel_row body");
     assert!(
-        load_channel_row.contains("ChatViewQuery::Channel {"),
+        load_channel_row.contains("load_channel_facts("),
+        "the channel row goes through the shared index-view read"
+    );
+    let load_channel_facts = LOAD
+        .split("pub(crate) async fn load_channel_facts(")
+        .nth(1)
+        .expect("load_channel_facts is declared")
+        .split("\npub ")
+        .next()
+        .expect("load_channel_facts body");
+    assert!(
+        load_channel_facts.contains("ChatViewQuery::Channel {"),
         "the channel row reads the index view arm"
     );
-    assert!(
-        !load_channel_row.contains(".query("),
-        "a chat read on /v1/query pays the node's checkpoint tax"
-    );
+    for body in [load_channel_row, load_channel_facts] {
+        assert!(
+            !body.contains(".query("),
+            "a chat read on /v1/query pays the node's checkpoint tax"
+        );
+    }
 
     // The whole crate, not just this function: `ChatQuery`/`ChatReply` are the
     // dispatch-lane types, and `backend/mod.rs` is the one `use` every backend

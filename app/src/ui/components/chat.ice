@@ -1,6 +1,6 @@
 // A sidebar channel row: 7px radius, 8px side inset, the hash in `label` ink
 // and the name in `list` weight. Selected is the same tint capsule the rail uses.
-component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
+component ChannelButton(channel:ChatChannel, selected:bool, unread:bool, disabled:bool)
   emits
     choose_channel(str)
   box
@@ -13,6 +13,7 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
         button -> emit(choose_channel, channel.id)
           with
             label=channel.name
+            disabled=disabled
             w=fill
             p=0.0
             @icon_action
@@ -69,6 +70,7 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
         button -> emit(choose_channel, channel.id)
           with
             label=channel.name
+            disabled=disabled
             w=fill
             p=0.0
             @icon_action

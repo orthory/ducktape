@@ -136,6 +136,11 @@ pub fn chat_settle(
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatData {
+    /// The switch this window answers for. Every route that moves the reader
+    /// bumps `chat_generation` and stamps it here, so a room she has already
+    /// clicked past cannot land on top of the one she is looking at — the same
+    /// supersede-by-generation the thread, history and search loaders use.
+    pub generation: i64,
     pub channels: Vec<ChatChannel>,
     pub messages: Vec<ChatMessage>,
     pub active_channel: String,

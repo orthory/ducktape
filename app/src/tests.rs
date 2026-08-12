@@ -423,6 +423,7 @@ fn posted_delta(channel: &str, row: backend::ChatMessage) -> backend::LiveUpdate
 
 fn chat_data(active_channel: &str, messages: Vec<backend::ChatMessage>) -> backend::ChatData {
     backend::ChatData {
+        generation: 0,
         channels: Vec::new(),
         messages,
         active_channel: active_channel.into(),
@@ -1292,13 +1293,20 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
 
     // And the launches genuinely carry the clear — a mover list alone would pass
     // with every clear deleted.
-    for launch in [
-        "choose_channel",
-        "choose_dm",
-        "open_chat_search_hit",
-        "create_channel_submit",
-        "reconnect",
-        "console_opened",
+    //
+    // THE SECOND TERM RIDES THE SAME LIST. `chat_window_loading` is the "a chat
+    // load is in flight" reading the history routes gained when a cache hit
+    // stopped raising `loading`, and it splits this list in two: the three
+    // routes that LAUNCH a window load raise it, and the three that abandon one
+    // without starting another lower it — a launch that raised it with no
+    // landing left to lower it refuses "Load older" for the rest of the session.
+    for (launch, window_term) in [
+        ("choose_channel", "chat_window_loading = true"),
+        ("choose_dm", "chat_window_loading = true"),
+        ("open_chat_search_hit", "chat_window_loading = true"),
+        ("create_channel_submit", "chat_window_loading = false"),
+        ("reconnect", "chat_window_loading = false"),
+        ("console_opened", "chat_window_loading = false"),
     ] {
         let body = HANDLERS
             .split(&format!("\non {launch}"))
@@ -1310,6 +1318,35 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
         assert!(
             body.contains("history_loading = false"),
             "{launch} abandons a history request and must release the flag"
+        );
+        assert!(
+            body.contains(window_term),
+            "{launch} must write `{window_term}`"
+        );
+    }
+
+    // The landings lower it, and each is generation-guarded: a superseded reply
+    // must not open the history routes against rows the winning load is still
+    // about to replace.
+    for landing in ["chat_updated", "chat_hit_loaded", "chat_load_failed"] {
+        let body = HANDLERS
+            .split(&format!("\non {landing}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{landing} is a handler"))
+            .split("\non ")
+            .next()
+            .expect("handler body");
+        let guard = body
+            .lines()
+            .position(|line| line.trim_start().starts_with("return if "))
+            .expect("a generation guard");
+        let release = body
+            .lines()
+            .position(|line| line.trim() == "chat_window_loading = false")
+            .expect("the window term is released");
+        assert!(
+            guard < release,
+            "{landing} must release `chat_window_loading` BELOW its generation guard"
         );
     }
 
@@ -1734,8 +1771,9 @@ fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
 /// the sidebar: the reader is not caught up on a room she is reading backwards.
 #[test]
 fn a_live_post_does_not_splice_itself_into_a_history_window() {
-    // the room as the sidebar knows it, re-seated after each landing because a
-    // landing installs the reply's own channel list
+    // the room as the sidebar knows it. re-seated by hand between steps: a
+    // landing FOLDS its refreshed row into this list rather than installing
+    // one (`upsert_channel_rows`), so the fixture has to put the row back.
     let room = || {
         vec![backend::ChatChannel {
             id: "general".into(),
@@ -1807,15 +1845,17 @@ fn a_live_post_does_not_splice_itself_into_a_history_window() {
         vec![message(499, "the latest", false)],
     )));
     app.channels = room();
+    // 502, not 500: her own send settled at 501 two steps up, so a post that
+    // arrives after the jump is newer than that.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
         "general",
-        message(500, "posted just now", false),
+        message(502, "posted just now", false),
     )));
     assert_eq!(app.messages.len(), 2);
     assert_eq!(app.messages[1].body, "posted just now");
     assert_eq!(
         cursor(&app),
-        Some(500),
+        Some(502),
         "the tail marks the room read as it arrives"
     );
 }
@@ -6222,6 +6262,7 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
         ],
     );
     switched.channels = vec![channel("general", 100), channel("random", 50)];
+    switched.generation = app.chat_generation;
     let _ = app.__update(__DucktapeMessage::ChatUpdated(switched));
     assert_eq!(app.active_channel, "random");
     assert_eq!(app.unread_boundary, 30);
@@ -6246,9 +6287,321 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
         backend::mark_channel_read(app.channel_reads.clone(), "general".into(), 100);
     let mut caught_up = chat_data("general", vec![message(100, "x", false)]);
     caught_up.channels = vec![channel("general", 100), channel("random", 60)];
+    caught_up.generation = app.chat_generation;
     let _ = app.__update(__DucktapeMessage::ChatUpdated(caught_up));
     assert_eq!(app.active_channel, "general");
     assert_eq!(app.unread_boundary, 0);
+}
+
+fn room(id: &str, head: i64) -> backend::ChatChannel {
+    backend::ChatChannel {
+        id: id.into(),
+        name: id.into(),
+        archived: false,
+        members_only: false,
+        huddle_count: 0,
+        head_seq: head,
+    }
+}
+
+/// THE LAST CLICK WINS. `choose_channel` used to open `return if loading`, and
+/// `loading` covers the whole switch it starts — so the second and third clicks
+/// of a fast A→B→C were discarded on the way out, with nothing on screen
+/// admitting it. The clicks are taken now and the SUPERSEDED REPLY is dropped:
+/// B answering after C must not drag the reader back into B.
+#[test]
+fn a_burst_of_channel_clicks_lands_on_the_last_one_and_drops_the_replies_it_passed() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "a".into();
+    app.channels = vec![room("a", 10), room("b", 20), room("c", 30)];
+
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("b".into()));
+    let for_b = app.chat_generation;
+    // The click DURING the load is what used to vanish.
+    assert!(app.loading);
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("c".into()));
+    assert_eq!(app.active_channel, "c", "the second click moved the reader");
+    assert_ne!(app.chat_generation, for_b);
+
+    // One refreshed row is the whole channel list a window loader answers with.
+    let mut late_b = chat_data("b", vec![message(20, "from b", false)]);
+    late_b.channels = vec![room("b", 20)];
+    late_b.generation = for_b;
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(late_b));
+    assert_eq!(app.active_channel, "c", "b's reply must not take the pane");
+    assert!(app.messages.is_empty());
+    assert!(app.loading, "c is still in flight — the plate stays up");
+
+    let mut for_c = chat_data("c", vec![message(30, "from c", false)]);
+    for_c.channels = vec![room("c", 30)];
+    for_c.generation = app.chat_generation;
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(for_c));
+    assert_eq!(app.active_channel, "c");
+    assert_eq!(app.messages.len(), 1);
+    assert!(!app.loading);
+}
+
+/// A SWITCH REPLY FOLDS INTO THE SIDEBAR, IT DOES NOT REPLACE IT.
+///
+/// The window loader is handed the list the reader is already looking at and
+/// answers with the one row it refreshed, so everything the live stream landed
+/// DURING the round trip has to survive the reply: a peer's post in a THIRD
+/// room and the unread badge it lit, and a channel someone created while she
+/// waited. Nothing re-pages the list afterwards — `load_chat` is raised only
+/// for `kind == "ready"`, i.e. a websocket reconnect — so a revert here is not
+/// a frame of staleness, it is permanent.
+#[test]
+fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "general".into();
+    app.channels = vec![room("general", 10), room("random", 20), room("eng", 40)];
+    app.channel_reads = backend::initial_channel_reads(app.channels.clone(), Vec::new());
+
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("random".into()));
+    let switch = app.chat_generation;
+
+    // Mid-RTT: a peer posts into a third room, and another creates a channel.
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+        "eng",
+        message(41, "from a peer", false),
+    )));
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "chat".into(),
+        status: "Live".into(),
+        height: 1,
+        chat: backend::ChatDelta {
+            kind: "channel-created".into(),
+            channel: room("brand-new", 0),
+            ..backend::ChatDelta::default()
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    assert!(app.unread_channel_ids.iter().any(|id| id == "eng"));
+
+    let mut landed = chat_data("random", vec![message(20, "from random", false)]);
+    landed.channels = vec![room("random", 20)];
+    landed.generation = switch;
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(landed));
+
+    assert_eq!(
+        app.channels
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["general", "random", "eng", "brand-new"],
+        "the room created mid-switch is still in the sidebar"
+    );
+    assert_eq!(
+        backend::channel_head_seq(app.channels.clone(), "eng".into()),
+        41,
+        "and the third room's head did not walk back to the pre-click snapshot"
+    );
+    assert!(
+        app.unread_channel_ids.iter().any(|id| id == "eng"),
+        "so its badge survives the switch it had nothing to do with"
+    );
+}
+
+/// A SUPERSEDED SWITCH'S FAILURE STAYS WITH IT. Nothing serializes the room
+/// pickers any more, so B's error can arrive after the reader has clicked on to
+/// C — and ungated it would clear `loading` under C (swapping C's plate for "No
+/// messages yet") and put B's message in the banner until C lands.
+#[test]
+fn a_failed_switch_the_reader_clicked_past_does_not_land_on_the_room_she_is_in() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "a".into();
+    app.channels = vec![room("a", 10), room("b", 20), room("c", 30)];
+
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("b".into()));
+    let for_b = app.chat_generation;
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("c".into()));
+
+    let _ = app.__update(__DucktapeMessage::ChatLoadFailed(backend::HydrationError {
+        generation: for_b,
+        message: "b is unreachable".into(),
+    }));
+    assert!(app.loading, "c is still in flight — the plate stays up");
+    assert!(app.error.is_empty(), "and b's failure is not c's");
+
+    let for_c = app.chat_generation;
+    let _ = app.__update(__DucktapeMessage::ChatLoadFailed(backend::HydrationError {
+        generation: for_c,
+        message: "c is unreachable too".into(),
+    }));
+    assert!(!app.loading);
+    assert_eq!(app.error, "c is unreachable too");
+}
+
+/// A→B→A PAINTS IN ONE FRAME. The room being left is parked with its member
+/// roll; the room being entered is restored from that park with `loading`
+/// false, so the switch back costs no round trip to become readable — and the
+/// composer's gate comes back with it rather than reading the room she left.
+#[test]
+fn switching_back_to_a_parked_room_paints_its_rows_without_waiting_on_the_node() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.settings_user_key = "me".into();
+    app.active_channel = "a".into();
+    app.channels = vec![room("a", 10), room("b", 20)];
+    app.messages = vec![message(9, "older", false), message(10, "newest", false)];
+    app.channel_members = vec![backend::ChatMember {
+        key: "me".into(),
+        label: "me".into(),
+    }];
+
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("b".into()));
+    assert!(app.messages.is_empty(), "#b has never been read");
+    assert!(app.loading);
+
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("a".into()));
+    assert_eq!(app.messages.len(), 2, "#a came back from the park");
+    assert!(!app.loading, "a parked room is not a loading one");
+    assert_eq!(app.channel_members.len(), 1, "its member roll came with it");
+    assert!(app.has_older_history, "derived from the restored rows");
+    assert!(app.post_refusal.is_empty());
+}
+
+/// A PARKED WINDOW IS NOT A SETTLED ONE, AND HISTORY MAY NOT PAGE FROM IT. The
+/// cache hit paints the rows she left behind with `loading` false, so `loading`
+/// — the only in-flight term the two history routes had — stopped covering the
+/// round trip the switch is still inside. #a grew while she was away, so the
+/// walk answers with a LATER window: a page requested from the PARKED window's
+/// oldest seq lands after that replacement and prepends under rows it does not
+/// touch, deleting the seqs between them from the MIDDLE of the timeline with no
+/// gap marker, and `has_older_history` then walks backwards past the hole
+/// forever. `chat_window_loading` is the term that covers it.
+#[test]
+fn a_switch_still_in_flight_refuses_the_history_page_its_parked_rows_would_ask_for() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.mutation_phase = "idle".into();
+    app.active_channel = "a".into();
+    app.channels = vec![room("a", 100), room("b", 20)];
+    app.messages = vec![
+        message(50, "a-fifty", false),
+        message(100, "a-hundred", false),
+    ];
+
+    // Away and back: #a comes off the park in one frame, and its refetch is out.
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("b".into()));
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("a".into()));
+    assert_eq!(app.messages.len(), 2, "the parked window is on screen");
+    assert!(!app.loading, "a parked room is not a loading one");
+    assert!(app.has_older_history, "so the paging routes are live");
+    let idle = app.history_generation;
+
+    // Neither route may spend a request on seqs the walk is about to replace —
+    // the scroll prefetch and the button both.
+    let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 900.0, 0.0, 0.95));
+    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+    assert!(
+        !app.history_loading,
+        "no page may be requested from a window a switch is still replacing"
+    );
+    assert_eq!(app.history_generation, idle, "nothing went out");
+
+    // The walk answers, and it answers with a window that starts LATER than the
+    // parked one — the whole reason its seqs could not be paged from.
+    let mut fresh = chat_data(
+        "a",
+        vec![
+            message(90, "a-ninety", false),
+            message(140, "a-head", false),
+        ],
+    );
+    fresh.channels = vec![room("a", 140)];
+    fresh.generation = app.chat_generation;
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(fresh));
+    assert_eq!(app.messages.first().map(|row| row.seq), Some(90));
+
+    // Now the button is honest work again, and the page joins the window it was
+    // actually requested from.
+    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+    assert!(app.history_loading, "the settled window pages normally");
+    let in_flight = app.history_generation;
+    let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
+        generation: in_flight,
+        channel_id: "a".into(),
+        messages: vec![
+            message(88, "a-eightyeight", false),
+            message(89, "a-eightynine", false),
+        ],
+    }));
+    let seqs: Vec<i64> = app.messages.iter().map(|row| row.seq).collect();
+    assert_eq!(
+        seqs,
+        vec![88, 89, 90, 140],
+        "the timeline is continuous — no seq vanished from its middle"
+    );
+}
+
+/// A PENDING SEND IS NOT PARKED. Its settle handlers only touch the timeline of
+/// the room the reader is IN, so a parked pending row would have no writer left
+/// to retire it and would come back as a permanent "Sending…".
+#[test]
+fn the_parked_window_keeps_only_committed_rows() {
+    let parked = backend::cache_channel_window(
+        Vec::new(),
+        "a".into(),
+        vec![message(10, "committed", false), {
+            let mut row = message(-1, "in flight", false);
+            row.pending = true;
+            row
+        }],
+        Vec::new(),
+        false,
+    );
+    let rows = backend::cached_window_messages(parked.clone(), "a".into());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].seq, 10);
+
+    // A history window is a page around one old message, not the tail: parking
+    // it would repaint months-old scrollback as the live conversation.
+    let refused = backend::cache_channel_window(
+        Vec::new(),
+        "a".into(),
+        vec![message(10, "committed", false)],
+        Vec::new(),
+        true,
+    );
+    assert!(backend::cached_window_messages(refused, "a".into()).is_empty());
+}
+
+/// SCROLLING NEAR THE TOP STARTS THE PAGE. The offset arrives relative to the
+/// scrollable's anchor, and the stream is bottom-anchored, so 1.0 is the top.
+#[test]
+fn approaching_the_top_of_the_scrollback_prefetches_the_older_page() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "a".into();
+    app.messages = vec![message(40, "oldest loaded", false)];
+    app.has_older_history = true;
+
+    // Mid-scrollback: nothing happens, and no message means no view pass spent.
+    let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 120.0, 0.0, 0.4));
+    assert!(!app.history_loading);
+
+    // Content that FITS reports 0/0. Nothing scrolls, so nothing is approached
+    // — and the explicit button is already on screen.
+    let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 0.0, 0.0, f64::NAN));
+    assert!(!app.history_loading);
+
+    let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 900.0, 0.0, 0.95));
+    assert!(app.history_loading, "the older page is already on its way");
+    let started = app.history_generation;
+
+    // And it does not fan out: the in-flight page holds the next steps off.
+    let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 950.0, 0.0, 0.98));
+    assert_eq!(app.history_generation, started);
 }
 
 #[test]
@@ -6256,10 +6609,9 @@ fn unread_indicators_are_wired_client_local_only() {
     // Sidebar badge: ChannelButton takes an `unread` flag and paints the
     // brand treatment + dot when set.
     let components = inlined(include_str!("ui/components/chat.ice"));
-    assert!(
-        components
-            .contains("component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)")
-    );
+    assert!(components.contains(
+        "component ChannelButton(channel:ChatChannel, selected:bool, unread:bool, disabled:bool)"
+    ));
     assert!(components.contains("if unread\n                box w=7.0 h=7.0 bg=brand r=3.5"));
     // The name rides a `box w=fill clip=true`: `wrap=none` text lays out at its
     // INTRINSIC width whatever box it is given, so an unclipped long channel
