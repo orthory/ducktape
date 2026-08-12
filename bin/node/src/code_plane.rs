@@ -514,7 +514,7 @@ mod tests {
         (0..(2 * WINDOW + 777)).map(|i| (i % 250) as u8).collect()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn push_streams_verifies_and_reports_stored() {
         let (a, b, peers, net) = two_peer_net();
         let (sa, sb) = plane_pair(&net, a, b, &peers);
@@ -531,7 +531,7 @@ mod tests {
         assert_eq!(dst.get_chunk(&digest), Some(payload()));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn push_to_a_holder_is_already_have_and_unknown_kind_refused() {
         let (a, b, peers, net) = two_peer_net();
         let (sa, sb) = plane_pair(&net, a, b, &peers);
@@ -553,7 +553,7 @@ mod tests {
         assert!(err.contains("refused"), "got: {err}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pull_serves_from_offset_and_misses_honestly() {
         let (a, b, peers, net) = two_peer_net();
         let (sa, sb) = plane_pair(&net, a, b, &peers);

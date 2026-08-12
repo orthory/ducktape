@@ -302,7 +302,7 @@ mod tests {
     use data_plane::PlaneConfig;
     use data_plane::sim::{LinkModel, SimNet};
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn live_output_crosses_nodes_once_and_keeps_its_source() {
         let key_a = ed25519::PrivateKey::from_seed(1).public_key();
         let key_b = ed25519::PrivateKey::from_seed(2).public_key();
