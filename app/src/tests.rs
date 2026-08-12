@@ -1338,38 +1338,94 @@ fn an_archived_channel_says_why_it_dropped_the_reaction() {
         assert!(app.messages[0].reactions.is_empty(), "{route}");
     }
 
-    // ♡ opens nothing on an archived channel — the picker it opened was a
-    // dead-end overlay whose only exit was Esc.
-    let (mut app, _) = Ducktape::__boot();
-    app.connected_rpc = "http://node".into();
-    app.loading = false;
-    app.active_channel = "general".into();
-    app.active_channel_archived = true;
-    app.messages = vec![message(7, "root", false)];
+    // ♡ OPENS NOTHING ON AN ARCHIVED CHANNEL — in the stream and in the RAIL
+    // alike. The picker it opened was a dead-end overlay of 32 disabled cells
+    // whose only exit was Esc, and the rail mounts the very same one; the ⋯
+    // menu's "Manage reactions" row routes here too, live precisely so its
+    // press reaches this refusal instead of dying on a disabled button.
+    // A ♡ route: what the press is, and which action slot its picker lands in.
+    type PickerRoute = (&'static str, fn() -> __DucktapeMessage, fn(&Ducktape) -> &str);
+    let picker_routes: [PickerRoute; 2] = [
+        (
+            "stream ♡",
+            || __DucktapeMessage::OpenMessageReactions(7, "root".into(), 1),
+            |app| app.message_action.as_str(),
+        ),
+        (
+            "rail ♡",
+            || __DucktapeMessage::OpenThreadMessageReactions(7, "root".into(), 1),
+            |app| app.thread_message_action.as_str(),
+        ),
+    ];
+    for (route, press, opened_action) in picker_routes {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected_rpc = "http://node".into();
+        app.loading = false;
+        app.active_channel = "general".into();
+        app.active_channel_archived = true;
+        app.messages = vec![message(7, "root", false)];
 
-    let _ = app.__update(__DucktapeMessage::OpenMessageReactions(7, "root".into(), 1));
+        let _ = app.__update(press());
 
-    assert_eq!(app.message_action, "toolbar", "the picker never opened");
-    assert!(app.error.contains("archived"));
+        assert_eq!(
+            opened_action(&app),
+            "toolbar",
+            "{route}: the picker never opened"
+        );
+        assert!(app.error.contains("archived"), "{route}: and it said why");
 
-    // AND ON A LIVE CHANNEL THE REFUSAL LINE WRITES NOTHING. Opening ♡ is a
-    // READ — it must hand the standing banner back untouched, or reaching for
-    // a reaction becomes the gesture that wipes the failure you had not read
-    // yet. Only the three mutations clear it, on their own line, where the
-    // clear has always been.
-    app.active_channel_archived = false;
-    app.error = "Send failed — the node refused the message.".into();
-    let _ = app.__update(__DucktapeMessage::OpenMessageReactions(7, "root".into(), 1));
-    assert_eq!(
-        app.error, "Send failed — the node refused the message.",
-        "opening the picker is a read and must not clear the banner"
-    );
-    assert_eq!(app.message_action, "reactions", "the picker opened");
+        // AND ON A LIVE CHANNEL THE REFUSAL LINE WRITES NOTHING. Opening ♡ is a
+        // READ — it must hand the standing banner back untouched, or reaching
+        // for a reaction becomes the gesture that wipes the failure you had not
+        // read yet. Only the three mutations clear it, on their own line, where
+        // the clear has always been.
+        app.active_channel_archived = false;
+        app.error = "Send failed — the node refused the message.".into();
+        let _ = app.__update(press());
+        assert_eq!(
+            app.error, "Send failed — the node refused the message.",
+            "{route}: opening the picker is a read and must not clear the banner"
+        );
+        assert_eq!(opened_action(&app), "reactions", "{route}: the picker opened");
 
-    app.selected_message_seq = 7;
-    let _ = app.__update(__DucktapeMessage::AddReactionAt(7, "👍".into()));
-    assert_eq!(app.error, "", "the mutation clears the banner it replaces");
-    assert!(!app.messages[0].reactions.is_empty());
+        // …and the mutation that follows still clears the banner on its own
+        // line. Only the banner is read here: the fold itself needs the
+        // process-wide `cached_user_key`, which is what
+        // `every_reaction_tap_folds_into_the_timeline_and_the_thread_rail`
+        // covers — asserting it from here would make this test depend on
+        // whichever sibling happened to seed that global first.
+        app.selected_message_seq = 7;
+        let _ = app.__update(__DucktapeMessage::AddReactionAt(7, "👍".into()));
+        assert_eq!(
+            app.error, "",
+            "{route}: the mutation clears the banner it replaces"
+        );
+    }
+
+    // AND THE COMMENT OVER `add_reaction_submit` CLAIMS ALL FIVE. Keep the
+    // claim honest: every handler that reaches a reaction op must carry the
+    // refusal line, so a sixth route cannot ship silent.
+    let chat = inlined(include_str!("ui/handlers/chat.ice"));
+    for handler in [
+        "add_reaction_submit(emoji)",
+        "add_reaction_at(seq, emoji)",
+        "remove_reaction_at(seq, emoji)",
+        "open_message_reactions(seq, body, rev)",
+        "open_thread_message_reactions(seq, body, rev)",
+    ] {
+        let body = chat
+            .split_once(&format!("on {handler}\n"))
+            .unwrap_or_else(|| panic!("{handler} is a handler"))
+            .1
+            .split_once("\non ")
+            .expect("a handler ends at the next one")
+            .0;
+        assert!(
+            body.contains("error = reaction_refusal(active_channel_archived, error)")
+                && body.contains("return if active_channel_archived"),
+            "{handler} must answer an archived channel with the banner"
+        );
+    }
 }
 
 #[test]
@@ -4226,8 +4282,21 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     /// brightened. `IconAction` is the opt-in that hands an svg its own hover
     /// arm; a plain glyph just leaves the color to the button.
     ///
-    /// Single-glyph buttons only: a multi-child row (a title over a meta line)
-    /// paints its children on purpose.
+    /// SINGLE-GLYPH BUTTONS ONLY, AND THE EXCLUSION IS DELIBERATE — say what it
+    /// lets through rather than let the `[glyph]` destructure quietly decide.
+    /// Thirteen multi-glyph buttons across these two files light a plate over
+    /// glyphs that all name their own colour: the ⋯ menu's icon+label rows
+    /// (`Icon tone="muted"` beside a `@text-accent_fg` label under
+    /// `hovered … text=fg`), the channel rows, the reaction chips, the search
+    /// hits. They are NOT the defect this hunts. On a row the PLATE is the
+    /// hover affordance and each glyph's colour is its ROLE — a `@text-danger`
+    /// "Delete message…" that brightened to `fg` under the cursor would be the
+    /// bug, and a muted icon beside an accent label is a two-tone hierarchy
+    /// somebody chose. An icon-ONLY control has no plate hierarchy and no
+    /// second glyph: its ink is the whole signal, which is why it is the one
+    /// shape held to inheritance here. (The dead `text=` term such a row
+    /// carries is inert, not wrong — it is the recipe's default reaching
+    /// nothing.)
     ///
     /// AND NO `IconAction` SILENCES ITS DISABLED TERM. Its ramp keys on the
     /// svg's OWN bounds — iced computes `svg::Status::Hovered` in

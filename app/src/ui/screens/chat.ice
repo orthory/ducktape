@@ -798,10 +798,16 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   p=5.0
                                   style=raised_style()
                                 col w=fill gap=1.0
+                                  // LIVE, SO THE PRESS REACHES THE REFUSAL. A
+                                  // disabled row is pixel-identical to a live
+                                  // one here (`@ghost_action` idles at the same
+                                  // ink), so it read as a working row that ate
+                                  // the click; now the press lands in
+                                  // `open_message_reactions`, which answers with
+                                  // the archived banner.
                                   button -> emit(open_message_reactions, selected_message_seq, message_edit_draft, selected_message_rev)
                                     with
                                       label="Manage reactions"
-                                      disabled=active_channel_archived
                                       w=fill
                                       h=30.0
                                       p=0.0
@@ -1861,10 +1867,10 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               p=5.0
                               style=raised_style()
                             col w=fill gap=1.0
+                              // Live for the same reason as the stream's twin.
                               button -> emit(open_thread_message_reactions, thread_selected_seq, thread_edit_draft, thread_selected_rev)
                                 with
                                   label="Manage reactions"
-                                  disabled=active_channel_archived
                                   w=fill
                                   h=30.0
                                   p=0.0

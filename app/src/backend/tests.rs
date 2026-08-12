@@ -4333,9 +4333,45 @@ async fn a_forge_op_does_not_walk_the_repo_mirrors_for_a_closed_pane() {
 /// The disabled step is the other half of the same gap: `disabled:opacity-50`
 /// multiplies the BUTTON's ink, which an svg never reads, so a dead icon was
 /// painted at full strength until this halved it here.
+///
+/// THE APP'S OWN THEME, both readings — not iced's built-in `Light`/`Dark`.
+/// The hover step paints `palette().text`, and the term it has to match is the
+/// `text=fg` the .ice authors; against a stock palette those are unrelated
+/// colours and the equality proves nothing. So the generated theme is what is
+/// under test, and the `fg` it is measured against is read back out of
+/// `theme.ice` — the day the `text` slot repoints away from `fg`, this fails.
 #[test]
 fn a_disabled_icon_control_neither_brightens_nor_holds_its_full_ink() {
-    for theme in [iced::Theme::Light, iced::Theme::Dark] {
+    for (palette, block) in [
+        (crate::AppTheme::App, "palette app for AppTheme"),
+        (crate::AppTheme::AppDark, "palette app_dark for AppTheme"),
+    ] {
+        let (mut app, _) = crate::Ducktape::__boot();
+        app.app_palette = palette;
+        let theme = app.__theme(iced::window::Id::unique());
+
+        let authored_fg = include_str!("../ui/theme.ice")
+            .split_once(block)
+            .expect("the palette block")
+            .1
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("fg "))
+            .expect("every palette names `fg`")
+            .trim()
+            .trim_start_matches('#')
+            .to_owned();
+        let authored_fg = u32::from_str_radix(&authored_fg, 16).expect("a hex triplet");
+        assert_eq!(
+            theme.palette().text,
+            iced::Color::from_rgb8(
+                (authored_fg >> 16) as u8,
+                (authored_fg >> 8) as u8,
+                authored_fg as u8,
+            ),
+            "{block}: the theme's text slot IS `fg` — every `text=fg` term \
+             below rides on that"
+        );
+
         let resting = icon_tint(&theme, iced::widget::svg::Status::Idle, "muted");
         let live_hover =
             icon_action_tint(&theme, iced::widget::svg::Status::Hovered, "muted", false);
