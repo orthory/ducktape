@@ -86,6 +86,10 @@ on reconnect
   channel_reads = []
   unread_boundary = 0
   active_channel = ""
+  // The room is gone, so its two readings go with it: no peer names an empty
+  // channel, and no window survives a reconnect.
+  active_dm_peer = ""
+  history_view = false
   active_channel_name = ""
   active_channel_archived = false
   active_channel_members_only = false
@@ -167,10 +171,17 @@ on workspace_connected(next)
   channels = next.channels
   channel_reads = initial_channel_reads(next.channels, channel_reads)
   unread_boundary = 0
+  // A connect answers with the LATEST page of whatever room it landed on, so
+  // whatever window a search hit had put on screen is gone — see
+  // `chat_hit_loaded`.
+  history_view = false
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   has_older_history = history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   active_channel = next.active_channel
+  // A reconnect lands on `channels.first()`, which is nobody's DM unless the
+  // derivation says so — see `dm_peer_of_channel`.
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
@@ -249,7 +260,36 @@ on live_updated(next)
   send_flash = (send_settled_by(messages, next.chat, active_channel)) || (reply_settled_by(thread_messages, next.chat, active_channel))
   send_flash_id = settled_send_id(messages, next.chat, active_channel, send_flash_id)
   thread_send_flash_id = settled_reply_id(thread_messages, next.chat, active_channel, thread_send_flash_id)
-  messages = apply_chat_messages(messages, next.chat, active_channel)
+  // A HISTORY WINDOW IS A SNAPSHOT, NOT A LIVE TAIL. The rows in hand are a
+  // window around one old message, so a new post's seq is past every one of
+  // them and `insert_committed_root` puts it at the END of the window — a
+  // message from today drawn directly under one from six months ago, folded
+  // into the same author run, with no gap marker and nothing in "Load older"
+  // that would say the middle is missing. Marking the channel read from that
+  // window is the same lie in the sidebar: the reader is not caught up.
+  //
+  // Naming the channel is what gates both — the folds are already inert for a
+  // delta belonging to another room, so a window that belongs to no room takes
+  // no live rows and no read cursor. "Jump to latest" is the way back to the
+  // tail, and it reloads canonically.
+  //
+  // HER OWN SETTLE IS THE ONE DELTA THE WINDOW STILL TAKES. The composer posts
+  // from a history window too, and its optimistic row is spliced in there
+  // regardless (`chat_composer_event`) — so refusing that row's settle strands
+  // it `pending: true` forever, under a ✓ that `send_flash` pops on the very
+  // delta the fold just dropped. `send_flash` IS that answer, already computed
+  // one line above: no second pass over the timeline by value. A settling
+  // delta carries exactly the one row it settles, so nothing else rides in.
+  //
+  // Everything else the window misses — edits, deletes, reactions and
+  // reply-count bumps on rows that ARE on screen — waits for "Jump to latest",
+  // which the banner is offering one click away.
+  //
+  // The READ CURSOR takes the strict gate either way: posting into a room you
+  // are reading backwards is not being caught up on it.
+  let live_tail_channel = keep_str(!history_view, active_channel, "")
+  let live_fold_channel = keep_str(!history_view || animation.value(send_flash), active_channel, "")
+  messages = apply_chat_messages(messages, next.chat, live_fold_channel)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   thread_messages = apply_chat_thread(thread_messages, next.chat, active_channel, active_thread_seq)
   channel_members = apply_chat_members(channel_members, next.chat, active_channel)
@@ -258,7 +298,7 @@ on live_updated(next)
   active_channel_archived = channel_flag_archived(channels, active_channel, active_channel_archived)
   active_channel_members_only = channel_flag_members_only(channels, active_channel, active_channel_members_only)
   active_channel_huddle_count = channel_live_huddle_count(channels, active_channel, active_channel_huddle_count)
-  channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
+  channel_reads = mark_channel_read(channel_reads, live_tail_channel, channel_head_seq(channels, live_tail_channel))
   // THE PAGES FOLD. A committed text edit lands in the open document's blocks
   // with no query at all — the autosave commits one per tick while a reader
   // types, and each used to buy three sequential reads of the very document
@@ -326,6 +366,11 @@ on live_resynced(next)
   hydration_retry_attempt = 0
   channels = keep_channels(next.chat_loaded, next.channels, channels)
   channel_reads = initial_channel_reads(channels, channel_reads)
+  // A resync that carried chat replaced the window with `load_chat_data`'s
+  // LATEST page, so the banner it left up described rows that are no longer on
+  // screen — see `chat_hit_loaded`. One that carried no chat kept the window
+  // and keeps the banner with it.
+  history_view = history_view && !next.chat_loaded
   messages = keep_messages(next.chat_loaded, merge_pending_messages(next.messages, messages, active_channel, next.active_channel, ""), messages)
   has_older_history = history_has_older(messages)
   // A resync can move the room WITHOUT a launch that abandoned the request, so
@@ -366,6 +411,23 @@ on live_resynced(next)
   message_draft = retain_for_endpoint(message_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   pending_message = retain_for_endpoint(pending_message, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   active_channel = keep_str(next.chat_loaded, next.active_channel, active_channel)
+  // The one landing with NO launch behind it, so it is the one that could move
+  // the room under a DM header nobody cleared — see `dm_peer_of_channel`.
+  //
+  // ONLY WHEN THE ROOM ACTUALLY MOVED, for the same reason every line above it
+  // is gated: `choose_dm` names the peer optimistically and leaves the room
+  // being left in `active_channel` for the several blocks `open_dm` takes to
+  // answer (a CreateChannel write plus two membership seats). A pages-only
+  // resync landing in that window derives the peer against the OLD room and
+  // blanks it, and `chat_updated` then derives "" from "" — the DM opens under
+  // a `#` and the channel's own name, until the reader re-clicks it.
+  //
+  // AND ONLY WHEN NO LANDING IS IN FLIGHT: a CHAT-carrying resync inside that
+  // same window carries the OLD room too (`live_resync_load` is launched with
+  // today's `active_channel`), so `chat_loaded` alone still blanks him.
+  // `loading` is true for precisely the `choose_dm` -> `chat_updated`/`failed`
+  // window, and the landing it names re-derives the peer itself.
+  active_dm_peer = keep_str(next.chat_loaded && !loading, dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel), active_dm_peer)
   active_channel_name = keep_str(next.chat_loaded, next.active_channel_name, active_channel_name)
   active_channel_archived = keep_bool(next.chat_loaded, next.active_channel_archived, active_channel_archived)
   active_channel_members_only = keep_bool(next.chat_loaded, next.active_channel_members_only, active_channel_members_only)
@@ -736,9 +798,17 @@ on connect_failed(cause)
   error = cause.message
   run connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _
 
+// ONE LOAD FAILED; THE CONNECTION DID NOT SAY ANYTHING. This is the failed arm
+// of `load_chat`, `open_dm`, `load_chat_hit` and the three page routes, and it
+// used to write `status = "Offline"` — the connection's own word, over a live
+// socket. `connected` stays true, so nothing reconnects and nothing corrects
+// it: the sidebar dot goes red and the titlebar pill reads Offline until the
+// next block's `live_updated` overwrites the status, up to 3s on a quiet chain.
+// A single `/v1/query` blocking past the RPC timeout is ordinary (see
+// `connect_failed` above), so this arm says what it knows — the load failed —
+// and leaves the connection's word to the connection's own handlers.
 on failed(cause)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = false
-  status = "Offline"
   error = cause.message

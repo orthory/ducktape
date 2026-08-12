@@ -425,6 +425,12 @@ state
   // filter over that list. There is deliberately no `active_dm_name` /
   // `active_dm_is_agent` pair: nothing ever wrote them, and a header fed from
   // two fields no handler fills renders a blank name.
+  //
+  // IT IS A READING OF `active_channel`, NOT A FLAG. Every handler that writes
+  // the channel re-derives it through `dm_peer_of_channel` (or blanks it with
+  // the room), so it can never name a peer whose DM is not the room on screen
+  // — the header suppresses the `#` and the channel name, so a stale peer left
+  // the room the composer posts into unnamed. Pinned in tests.rs.
   dm_peers_generation:i64 = 0
   active_dm_peer = ""
   // HUDDLE — whether SHE is in it, where, since when, the tick that drives the

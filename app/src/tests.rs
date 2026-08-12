@@ -1312,6 +1312,33 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
             "{launch} abandons a history request and must release the flag"
         );
     }
+
+    // TWO READINGS OF THE ROOM RIDE WITH IT. `active_dm_peer` decides whether
+    // the header names a peer instead of the channel (suppressing the `#` and
+    // the channel name with it), and `history_view` decides whether the amber
+    // banner claims these rows are old scrollback. Both used to be written by
+    // one handler each — the DM picker and the search hit — so every OTHER
+    // route that moved the room left them describing a pane that was gone.
+    // A mover answers both or the build fails here.
+    for mover in movers {
+        let body = HANDLERS
+            .split(&format!("\non {mover}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{mover} is a handler"))
+            .split("\non ")
+            .next()
+            .expect("handler body");
+        // An ASSIGNMENT, not a mention: the token opens a statement line, so
+        // prose naming the field where the write used to be fails here.
+        for reading in ["active_dm_peer = ", "history_view = "] {
+            assert!(
+                body.lines()
+                    .any(|line| line.trim_start().starts_with(reading)),
+                "{mover} moves the reader between rooms and must answer \
+                 `{reading}` — a reading of the room cannot outlive it"
+            );
+        }
+    }
 }
 
 /// CLOSING RETIRES THE LOAD THAT WOULD REOPEN WHAT YOU JUST LEFT. Every forge
@@ -1544,6 +1571,357 @@ fn history_windows_offer_a_jump_back_to_latest() {
     let chat = inlined(include_str!("ui/screens/chat.ice"));
     assert!(chat.contains("button \"Jump to latest\""));
     assert!(chat.contains("-> emit(choose_channel, active_channel)"));
+}
+
+/// THE BANNER DESCRIBES THE ROWS IN HAND, SO EVERY WRITER OF THEM ANSWERS IT.
+///
+/// `history_view` was raised by the search hit and lowered by a channel load,
+/// and by nothing else — so a resync (a `files` write in another window, a
+/// teammate joining a huddle, any plane op at all) replaced the window with
+/// `load_chat_data`'s LATEST page and left the amber "Viewing history" banner
+/// up over the live tail, with a "Jump to latest" that reloads the channel the
+/// reader is already at the end of. Same after a create.
+#[test]
+fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
+    let (mut app, _) = Ducktape::__boot();
+    app.loading = false;
+    app.active_channel = "general".into();
+    let _ = app.__update(__DucktapeMessage::ChatHitLoaded(chat_data(
+        "general",
+        vec![message(7, "six months ago", false)],
+    )));
+    assert!(app.history_view);
+
+    // a resync carrying no chat news leaves the window — and its banner — alone
+    let _ = app.__update(__DucktapeMessage::LiveResynced(backend::LiveRefresh {
+        chat_loaded: false,
+        ..live_refresh(
+            app.hydration_generation,
+            "general",
+            Vec::new(),
+            "",
+            Vec::new(),
+        )
+    }));
+    assert!(
+        app.history_view,
+        "a pages-only resync did not touch the timeline, so the window stands"
+    );
+
+    // one that carries chat replaced it with the latest page
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "general",
+        vec![message(50, "the latest", false)],
+        "",
+        Vec::new(),
+    )));
+    assert!(
+        !app.history_view,
+        "the rows on screen are the tail now — the banner is a lie about them"
+    );
+
+    // and a create lands you in a brand-new room, which has no history at all
+    let _ = app.__update(__DucktapeMessage::ChatHitLoaded(chat_data(
+        "general",
+        vec![message(7, "six months ago", false)],
+    )));
+    assert!(app.history_view);
+    let _ = app.__update(__DucktapeMessage::ChannelCreated(chat_data(
+        "brand-new",
+        Vec::new(),
+    )));
+    assert!(!app.history_view);
+}
+
+/// A HISTORY WINDOW IS A SNAPSHOT, NOT A LIVE TAIL.
+///
+/// The rows in hand are a window around one old message, so a post from today
+/// has a seq past every one of them and `insert_committed_root` appends it to
+/// the END of the window — today's message drawn directly under one from six
+/// months ago, and (authors matching) folded into the same run, with no gap
+/// marker anywhere. Marking the channel read off that fold is the same lie in
+/// the sidebar: the reader is not caught up on a room she is reading backwards.
+#[test]
+fn a_live_post_does_not_splice_itself_into_a_history_window() {
+    // the room as the sidebar knows it, re-seated after each landing because a
+    // landing installs the reply's own channel list
+    let room = || {
+        vec![backend::ChatChannel {
+            id: "general".into(),
+            name: "general".into(),
+            archived: false,
+            members_only: false,
+            huddle_count: 0,
+            head_seq: 7,
+        }]
+    };
+    let cursor = |app: &Ducktape| {
+        app.channel_reads
+            .iter()
+            .find(|read| read.channel == "general")
+            .map(|read| read.seq)
+    };
+
+    let (mut app, _) = Ducktape::__boot();
+    app.loading = false;
+    app.connected = true;
+    app.active_channel = "general".into();
+    let _ = app.__update(__DucktapeMessage::ChatHitLoaded(chat_data(
+        "general",
+        vec![message(7, "six months ago", false)],
+    )));
+    assert!(app.history_view);
+    app.channels = room();
+
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+        "general",
+        message(500, "posted just now", false),
+    )));
+    assert_eq!(
+        app.messages.len(),
+        1,
+        "a message 493 seqs newer is not the next row of this window"
+    );
+    assert_eq!(
+        cursor(&app),
+        Some(0),
+        "and reading old scrollback is not being caught up on today's post"
+    );
+
+    // HER OWN SEND IS THE EXCEPTION. The composer posts from a window too and
+    // splices the optimistic row in unconditionally, so a refused settle would
+    // strand it `pending` forever while `send_flash` pops a ✓ over it.
+    app.message_editor = compose("mine, from the window");
+    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+        editor::composer_submit_event(),
+    ));
+    assert!(app.messages[1].pending);
+    let mut settled = message(501, "mine, from the window", false);
+    settled.id = app.messages[1].id.clone();
+    app.channels = room();
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+        "general", settled,
+    )));
+    assert_eq!(app.messages.len(), 2, "her row settled in place, not twice");
+    assert!(!app.messages[1].pending, "and the ✓ is over a settled row");
+    assert_eq!(
+        cursor(&app),
+        Some(0),
+        "settling her own send is still not catching up on the room"
+    );
+
+    // Jump to latest, and the tail is live again.
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
+        "general",
+        vec![message(499, "the latest", false)],
+    )));
+    app.channels = room();
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+        "general",
+        message(500, "posted just now", false),
+    )));
+    assert_eq!(app.messages.len(), 2);
+    assert_eq!(app.messages[1].body, "posted just now");
+    assert_eq!(
+        cursor(&app),
+        Some(500),
+        "the tail marks the room read as it arrives"
+    );
+}
+
+/// THE DM HEADER NAMES A PEER, AND THE ROOM IT NAMES HIM FOR IS `active_channel`.
+///
+/// A non-empty `active_dm_peer` draws `DmHeader` AND suppresses both the `#`
+/// glyph and `active_channel_name`, so a peer that outlived the room he named
+/// put Alice's face over #general's timeline with the room the composer posts
+/// into never named — and left two sidebar rows reading as selected. It is a
+/// derivation of the room now, so no landing can disagree with the pane.
+#[test]
+fn a_landing_in_another_room_retires_the_dm_header() {
+    let me = "aa";
+    let peer = "bb";
+    let dm = backend::dm_channel_id(me.into(), peer.into());
+
+    let (mut app, _) = Ducktape::__boot();
+    app.loading = false;
+    app.settings_user_key = me.into();
+    app.active_dm_peer = peer.into();
+    app.active_channel = dm.clone();
+
+    // a search hit jumps to an ordinary room…
+    let _ = app.__update(__DucktapeMessage::ChatHitLoaded(chat_data(
+        "general",
+        vec![message(7, "an old message", false)],
+    )));
+    assert!(
+        app.active_dm_peer.is_empty(),
+        "the peer does not follow the reader into #general"
+    );
+
+    // …and a landing inside the DM itself keeps him
+    app.active_dm_peer = peer.into();
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
+        &dm,
+        vec![message(1, "hey", false)],
+    )));
+    assert_eq!(app.active_dm_peer, peer, "this room IS his DM");
+
+    // the resync is the landing with no launch behind it — it moves the room
+    // on its own, which is how the peer used to survive every other route
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "general",
+        vec![message(9, "in the room she was moved to", false)],
+        "",
+        Vec::new(),
+    )));
+    assert!(app.active_dm_peer.is_empty());
+
+    // BUT A RESYNC THAT MOVED NO ROOM DERIVES NOTHING. `choose_dm` names the
+    // peer optimistically and leaves `active_channel` on the room being left
+    // for the several blocks `open_dm` takes to answer; a pages-only resync
+    // landing in that window would otherwise derive the peer against the OLD
+    // room and blank him, and `chat_updated` then derives "" from "" — the DM
+    // opens under a `#` for good.
+    app.active_dm_peer = peer.into();
+    app.active_channel = "general".into();
+    let _ = app.__update(__DucktapeMessage::LiveResynced(backend::LiveRefresh {
+        chat_loaded: false,
+        ..live_refresh(
+            app.hydration_generation,
+            "general",
+            Vec::new(),
+            "",
+            Vec::new(),
+        )
+    }));
+    assert_eq!(
+        app.active_dm_peer, peer,
+        "the room did not move, so nothing about it was re-read"
+    );
+
+    // NOR DOES A CHAT-CARRYING ONE INSIDE THAT SAME WINDOW. `live_resync_load`
+    // is launched with today's `active_channel`, so a `ready`/`Lagged{chat}`
+    // resync lands `chat_loaded` on the room being LEFT — deriving against it
+    // blanks the peer just as permanently as the pages-only case above.
+    app.active_dm_peer = peer.into();
+    app.active_channel = "general".into();
+    app.loading = true;
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "general",
+        Vec::new(),
+        "",
+        Vec::new(),
+    )));
+    assert_eq!(
+        app.active_dm_peer, peer,
+        "a landing is in flight — it answers for the peer, this resync does not"
+    );
+    app.loading = false;
+
+    // a device with no user key derives no DM id, so it holds no DM — the same
+    // answer `rooms_only` gives when `me` is empty
+    app.settings_user_key = String::new();
+    app.active_dm_peer = peer.into();
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
+        &dm,
+        vec![message(1, "hey", false)],
+    )));
+    assert!(app.active_dm_peer.is_empty());
+}
+
+/// ONE COMMITTED REPLY, ONE ROW, ONE STEP OF THE CURSOR.
+///
+/// `thread_reply_send_failed` bumped the reply cursor for a reply that had
+/// committed, and then the SAME reply's delta arrived on the live stream and
+/// bumped it again — two observers of one row. The cursor then pointed one
+/// reply past the loaded run, so the next "Load more replies" started late and
+/// the skipped reply was never rendered at all.
+#[test]
+fn a_committed_reply_moves_the_thread_cursor_exactly_once() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.active_thread_seq = 1;
+    app.thread_messages = vec![message(1, "the root", false), message(2, "a reply", false)];
+    app.thread_next_reply_offset = 1;
+    app.thread_has_more = false;
+    app.reply_editor = compose("mine");
+
+    let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+        editor::composer_submit_event(),
+    ));
+    let operation_id = app.thread_messages[2].id.clone();
+
+    // the write committed, but the read after it failed
+    let _ = app.__update(__DucktapeMessage::ThreadReplySendFailed(
+        backend::OptimisticMutationError {
+            message: "read failed after commit".into(),
+            committed: true,
+            operation_id: operation_id.clone(),
+            scope_id: "general".into(),
+            body: "mine".into(),
+        },
+    ));
+    assert_eq!(
+        app.thread_next_reply_offset, 1,
+        "the failure counts nothing — the reply's own delta is the observer"
+    );
+
+    // …and here is that delta, settling the pending row in place
+    let mut settled = message(3, "mine", false);
+    settled.id = operation_id;
+    settled.thread_seq = 1;
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "chat".into(),
+        status: "Live".into(),
+        height: 3,
+        chat: backend::ChatDelta {
+            kind: "reply".into(),
+            channel_id: "general".into(),
+            seq: 3,
+            root_seq: 1,
+            message: settled,
+            ..backend::ChatDelta::default()
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    assert_eq!(app.thread_messages.len(), 3, "root plus two replies");
+    assert!(app.thread_messages.iter().all(|reply| !reply.pending));
+    assert_eq!(
+        app.thread_next_reply_offset,
+        app.thread_messages.len() as i64 - 1,
+        "the cursor is where the loaded run ends, not one past it"
+    );
+}
+
+/// A LOAD FAILED; THE CONNECTION SAID NOTHING.
+///
+/// The generic failed arm wrote `status = "Offline"` for one slow load, over a
+/// live socket — and `connected` stays true, so nothing reconnects and nothing
+/// corrects it: the sidebar dot goes red and the pill reads Offline until the
+/// next block's `live_updated` overwrites the status, up to 3s on a quiet chain.
+#[test]
+fn a_single_failed_load_does_not_report_the_connection_offline() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = true;
+    app.status = "Live".into();
+
+    let _ = app.__update(__DucktapeMessage::Failed(backend::AppError {
+        message: "the channel did not load".into(),
+        committed: false,
+    }));
+
+    assert_eq!(
+        app.status, "Live",
+        "the connection's word belongs to the connection's own handlers"
+    );
+    assert_eq!(app.error, "the channel did not load");
+    assert!(!app.loading, "and the pane is released either way");
 }
 
 #[test]
