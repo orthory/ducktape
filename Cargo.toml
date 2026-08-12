@@ -379,7 +379,7 @@ opt-level = 2
 # this box, Pages->Chat with 40 mounted rows stalled ~700 ms with these at
 # opt-0. They rebuild only on a pin bump (ducktape-ui) or rarely (design), so
 # the compile-time cost of optimizing them is paid almost never.
-[profile.dev.package.ducktape-ui]
+[profile.dev.package.ui-lang-components]
 opt-level = 2
 
 [profile.dev.package.ui-lang-runtime]

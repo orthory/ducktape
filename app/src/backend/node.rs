@@ -81,7 +81,7 @@ pub struct NodeLogLine {
     pub line: String,
 }
 
-pub type NodeLogTimelineEvent = ducktape_ui::ui::log_timeline::LogTimelineEvent<String>;
+pub type NodeLogTimelineEvent = ui_lang_components::ui::log_timeline::LogTimelineEvent<String>;
 
 /// Retained native timeline state plus the bounded rows it renders.
 ///
@@ -89,7 +89,7 @@ pub type NodeLogTimelineEvent = ducktape_ui::ui::log_timeline::LogTimelineEvent<
 /// the Ice assignment that requested the clone.
 #[derive(Debug)]
 pub struct NodeLogTimelineState {
-    timeline: ducktape_ui::ui::log_timeline::LogTimelineState<String>,
+    timeline: ui_lang_components::ui::log_timeline::LogTimelineState<String>,
     lines: Arc<[NodeLogLine]>,
     visible: Arc<[NodeLogLine]>,
     filter: String,
@@ -109,16 +109,16 @@ impl Clone for NodeLogTimelineState {
 const NODE_LOG_LIMIT: usize = 4_096;
 const NODE_LOG_TRIM: usize = 1_024;
 
-fn node_log_timeline_config() -> ducktape_ui::ui::log_timeline::VirtualListConfig {
-    ducktape_ui::ui::log_timeline::VirtualListConfig::new(26.0)
+fn node_log_timeline_config() -> ui_lang_components::ui::log_timeline::VirtualListConfig {
+    ui_lang_components::ui::log_timeline::VirtualListConfig::new(26.0)
         .expect("node log row geometry is fixed")
         .overscan(4)
 }
 
 pub fn node_log_timeline_state() -> NodeLogTimelineState {
     NodeLogTimelineState {
-        timeline: ducktape_ui::ui::log_timeline::LogTimelineState::new(
-            ducktape_ui::ui::log_timeline::VirtualListId::new("node-log-timeline"),
+        timeline: ui_lang_components::ui::log_timeline::LogTimelineState::new(
+            ui_lang_components::ui::log_timeline::VirtualListId::new("node-log-timeline"),
         ),
         lines: Arc::from([]),
         visible: Arc::from([]),
@@ -191,8 +191,8 @@ pub fn node_log_timeline<'a>(
     state: &'a NodeLogTimelineState,
     source: &'a str,
 ) -> iced::Element<'a, NodeLogTimelineEvent> {
-    use ducktape_ui::ui::log_timeline::{LogTimelineEvent, log_timeline};
-    use ducktape_ui::ui::theme::DARK;
+    use ui_lang_components::ui::log_timeline::{LogTimelineEvent, log_timeline};
+    use ui_lang_components::ui::theme::DARK;
     use iced::widget::{Space, button, column, container, row, text};
     use iced::{Border, Color, Font, Length};
 

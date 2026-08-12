@@ -94,11 +94,11 @@ fn rgb(hex: u32) -> iced::Color {
 }
 
 /// The token set matching the live palette reading.
-fn app_tokens(theme: &iced::Theme) -> ducktape_ui::ui::theme::Theme {
+fn app_tokens(theme: &iced::Theme) -> ui_lang_components::ui::theme::Theme {
     if theme_is_dark(theme) {
-        ducktape_ui::ui::theme::DARK
+        ui_lang_components::ui::theme::DARK
     } else {
-        ducktape_ui::ui::theme::LIGHT
+        ui_lang_components::ui::theme::LIGHT
     }
 }
 

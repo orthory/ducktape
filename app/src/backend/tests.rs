@@ -1308,7 +1308,7 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
 
 #[test]
 fn container_depth_uses_only_shared_design_roles() {
-    let tokens = ducktape_ui::ui::theme::LIGHT;
+    let tokens = ui_lang_components::ui::theme::LIGHT;
     let theme = iced::Theme::Light;
     let card = card_style(&theme);
     let raised = raised_style(&theme);
