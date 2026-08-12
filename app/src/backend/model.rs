@@ -335,6 +335,48 @@ pub fn cache_channel_window(
     kept
 }
 
+/// One room's unsent composer text, parked while the reader is somewhere else.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+pub struct ChannelDraft {
+    pub channel_id: String,
+    pub text: String,
+}
+
+/// Park the composer of the room being left, and drop the entry when there is
+/// nothing to park.
+///
+/// A SEPARATE STORE FROM [`ChannelWindow`], deliberately. That cache refuses an
+/// empty or history window and evicts past `CHANNEL_WINDOW_CACHE`, all of which
+/// are correct for ROWS the refetch would replace anyway — and every one of them
+/// would silently destroy typed text. Drafts are tiny and self-clearing (an
+/// empty text removes the entry, a send empties the composer, the next park
+/// removes it), so this list holds one short string per room she has unsent
+/// words in and needs no cap.
+pub fn park_message_draft(
+    drafts: Vec<ChannelDraft>,
+    channel_id: String,
+    text: String,
+) -> Vec<ChannelDraft> {
+    let mut kept: Vec<ChannelDraft> = drafts
+        .into_iter()
+        .filter(|draft| draft.channel_id != channel_id)
+        .collect();
+    let worth_keeping = !channel_id.is_empty() && !text.is_empty();
+    if worth_keeping {
+        kept.push(ChannelDraft { channel_id, text });
+    }
+    kept
+}
+
+/// The parked composer text for one room, or nothing.
+pub fn parked_message_draft(drafts: Vec<ChannelDraft>, channel_id: String) -> String {
+    drafts
+        .into_iter()
+        .find(|draft| draft.channel_id == channel_id)
+        .map(|draft| draft.text)
+        .unwrap_or_default()
+}
+
 /// The parked window for one room, or the empty one.
 ///
 /// ONE WALK, ONE CLONE. The extern ABI passes the cache BY VALUE, so asking for

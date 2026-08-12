@@ -467,7 +467,14 @@ on live_resynced(next)
   thread_loading = thread_loading_after_refresh(thread_loading, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
   failed_reply_draft = retain_for_endpoint(failed_reply_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   active_thread_seq = refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq)
-  failed_reply_draft = remember_failed_draft(failed_reply_draft, "thread", reply_draft, active_thread_seq > 0)
+  // NO STASH WHEN THIS CLOSES THE RAIL. The line that used to sit here
+  // harvested `reply_draft` — the SETTLED mirror, which reads "" the whole time
+  // someone is typing — into a plate that is mounted INSIDE the rail, so it
+  // captured nothing and had nowhere to render if it had. The text itself
+  // survives the close: no resync writes `reply_editor`, so it sits in the
+  // unmounted buffer, and the ONE point it can be lost is the next
+  // `open_thread_for` — which now harvests the LIVE buffer. Stashing in both
+  // places appends the same reply to the plate twice.
   thread_target_seq = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_target_seq)
   thread_next_reply_offset = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_next_reply_offset)
   thread_messages = retain_thread_messages(thread_messages, active_thread_seq)
@@ -817,7 +824,34 @@ subscribe
   run call_session(connected_rpc, huddle_channel) when (connected && huddle_joined && !empty(huddle_channel)) -> call_event _
   // Video has NO subscription: the tile strip is a self-redrawing widget
   // that repaints only its own window at the capture cadence.
-  keyboard press when (connected || palette_open) -> global_key_pressed _
+  // `status=ignored` IS THIS SUBSCRIPTION'S PRICE TAG, not a nicety. An
+  // unfiltered `keyboard press` fires for keys a focused widget already
+  // CONSUMED, and the message it publishes cannot join the batch that widget's
+  // own message is in: it leaves through the event-loop proxy and comes back as
+  // a winit user event on the NEXT turn, where iced 0.14 rebuilds
+  // unconditionally (there is no dirty check). So every character typed into a
+  // composer bought a SECOND full ChatScreen build+layout — twice the
+  // allocations the frame-cost gate reports, because the gate drives only the
+  // widget's message.
+  //
+  // Every chord this handler routes bubbles by construction: the rich editor
+  // lets command-letter presses through (`command_shortcut_bubbles`) and drops
+  // Escape uncaptured (`Binding::Unfocus`), and iced's single-line input
+  // consumes neither.
+  keyboard press status=ignored when (connected || palette_open) -> global_key_pressed _
+  // EXCEPT ESCAPE OUT OF A PLAIN `input`, which iced's text_input DOES consume
+  // — the palette's own field, the create-channel modal, the details drawer.
+  // The captured half is routed for exactly that, gated on the ESCAPE LADDER'S
+  // OWN reading of whether any transient layer is up: with none open a captured
+  // key has nothing to dismiss, and that is precisely the state a reader typing
+  // into a composer is in, so the hot path pays nothing for this line.
+  //
+  // ponytail: this is a layer-level gate standing in for a key-level one. While
+  // a layer IS open, typing into its search field still pays the extra rebuild.
+  // The upgrade path is upstream — a `keyboard press key=escape` filter in the
+  // subscription grammar (`ui-lang-core`), filed beside the #1058 ask — after
+  // which this becomes one unconditional Escape-only subscription.
+  keyboard press status=captured when !empty(topmost_overlay(palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, forge_repo_menu)) -> global_key_pressed _
   // THE PANE SCROLL'S KEYS ARE THE LEFTOVERS. `status=ignored` drops every key
   // a focused widget CONSUMED — Home in a text field, an arrow in an open
   // list — but it is only half the arbitration: iced's single-line input drops

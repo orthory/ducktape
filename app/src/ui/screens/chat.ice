@@ -1794,7 +1794,11 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   // optimistic append and a rollback under a raw 400.
                   // `active_channel_archived` drops out because post_gate's
                   // `channel_archived` arm IS that case (see ComposerGate) — one
-                  // discriminant, not two. The reason SENTENCE stays mounted once,
+                  // discriminant, not two. The stream's `loading` drops out for a
+                  // different reason: it is the STREAM's readiness, the rail's is
+                  // `thread_loading`, and `reply_composer_event` no longer refuses
+                  // on it either — a term in the guard that the button does not
+                  // wear is a dead control. The reason SENTENCE stays mounted once,
                   // over the stream's plate: 330px has no room to say it twice.
                   box
                     with

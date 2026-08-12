@@ -792,7 +792,13 @@ fn probe() {
 
         // ONE KEYSTROKE, WHOLE FRAME: the composer message through the real
         // handler, then the rebuild every message forces (iced 0.14 has no
-        // dirty check). This pair IS what a user pays per typed character.
+        // dirty check). This pair IS what a user pays per typed character —
+        // and it is the whole bill only because the app's global key
+        // subscription carries `status=ignored`. Unfiltered, it published a
+        // SECOND message for the very key the editor had just consumed, in the
+        // next loop turn and so in its own batch, and this number was half the
+        // truth. `no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer`
+        // in `tests.rs` is what keeps it honest; the ceiling cannot see it.
         let ui = keystroke_frame.sample(|| {
             let _ = app.__update(keystroke());
             UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)

@@ -47,6 +47,8 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // OUT of a search hit is a click on that room, and without this it is the one
   // navigation in the pane that still pays a full round trip.
   message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
+  // AND PARK HER UNSENT WORDS WITH IT — see `message_drafts`.
+  message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
   // FREEZE THE DIVIDER WHILE `active_channel` STILL NAMES THE ROOM SHE LEAVES —
   // same reason as `choose_channel`.
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, channel_id, unread_boundary)
@@ -110,6 +112,10 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   reply_draft = ""
   reply_editor = editor("")
   pending_reply = ""
+  // AND THE MESSAGE COMPOSER COMES OFF ITS OWN PARK — the line that made this
+  // comment true. It said "both composers are rebuilt" while only the rail's
+  // was, so the stream's draft walked into the hit's room armed to send there.
+  message_editor = editor(parked_message_draft(message_drafts, active_channel))
   // Both composers are rebuilt under the caret and the tab moved besides.
   composer_focus = "none"
   error = ""
@@ -137,6 +143,8 @@ on choose_channel(id)
   invalidate lane=live_thread
   // PARK THE ROOM SHE IS LEAVING, while `active_channel` still names it.
   message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
+  // AND PARK HER UNSENT WORDS WITH IT — see `message_drafts`.
+  message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
   active_dm_peer = ""
   active_dm = no_dm_peer()
   // "Jump to latest" IS this handler, aimed at the room already on screen — so
@@ -210,6 +218,9 @@ on choose_channel(id)
   reply_draft = ""
   reply_editor = editor("")
   pending_reply = ""
+  // A NEW ROOM'S COMPOSER IS THAT ROOM'S COMPOSER. Its own parked words, or an
+  // empty box — never the ones she was writing next door.
+  message_editor = editor(parked_message_draft(message_drafts, active_channel))
   // A new room's composer is a new box: the caret does not come with it.
   composer_focus = "none"
   error = ""
@@ -247,6 +258,8 @@ on choose_dm(peer_key)
   // The room she is leaving is parked here too — she may come back to it from
   // the DM.
   message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
+  // AND PARK HER UNSENT WORDS WITH IT — see `message_drafts`.
+  message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
   active_dm_peer = peer_key
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   // A DM IS A CHANNEL AND ITS ID IS DERIVABLE. `dm_channel_id` is the same
@@ -315,6 +328,9 @@ on choose_dm(peer_key)
   reply_draft = ""
   reply_editor = editor("")
   pending_reply = ""
+  // Same per-room composer as `choose_channel`. A DM is an ordinary channel and
+  // its draft parks under `dm_room` like any other.
+  message_editor = editor(parked_message_draft(message_drafts, active_channel))
   // Same new box as `choose_channel`.
   composer_focus = "none"
   error = ""
@@ -950,6 +966,16 @@ on open_thread_for(seq)
   thread_messages = thread_root_seed(messages, thread_messages, seq)
   thread_next_reply_offset = 0
   thread_has_more = false
+  // A HALF-TYPED REPLY IS NOT THE PRICE OF LOOKING AT ANOTHER THREAD. The three
+  // lines below blank the LIVE buffer, and this handler is what every "N
+  // replies" row in the timeline beside the rail emits — so a click meant to
+  // check something destroyed text nobody asked to discard, with no banner and
+  // no way back. Same harvest `thread_reply_send_failed` makes, into the same
+  // "Unsent reply" plate: `remember_failed_draft` no-ops on an empty editor, so
+  // an ordinary rail open is untouched, and the plate + Restore mount in the
+  // rail this very click is opening. `close_thread` stays the one route that
+  // discards a reply, because that one is a request to.
+  failed_reply_draft = remember_failed_draft(failed_reply_draft, "another thread", trim(editor_text(reply_editor)), false)
   reply_draft = ""
   reply_editor = editor("")
   pending_reply = ""
@@ -1199,11 +1225,21 @@ on reaction_failed(cause)
 // is already stale. Re-read the gate here or the reply is optimistically
 // appended, refused by the module, and rolled back under a raw 400. Same terms
 // as the view; `settings_user_key` is what the screen mounts as `user_key`.
+//
+// AND THE STREAM'S LOAD FLAG IS NOT THE RAIL'S. `loading` used to open this
+// guard, and it is in NEITHER of the rail's `disabled=` expressions — so the
+// one state that could raise it under an open rail met a fully lit Send that
+// swallowed the click with no error and no banner. Every chat-plane writer of
+// `loading = true` zeroes `active_thread_seq` in the same handler, so the term
+// never fired for a chat load at all; the only state it caught was a PAGES load
+// still out behind a cross-tab bounce (`open_page_search_hit`, `choose_page`),
+// during which a reply is perfectly valid. `thread_loading` is the rail's own
+// readiness, and it is what the button wears.
 on reply_composer_event(event)
   composer_focus = "reply"
   reply_editor = apply_composer_event(reply_editor, event)
   return if !composer_submits(event)
-  return if loading || thread_loading || !connected || empty(active_channel) || active_thread_seq <= 0 || !empty(post_refusal) || empty(trim(editor_text(reply_editor)))
+  return if thread_loading || !connected || empty(active_channel) || active_thread_seq <= 0 || !empty(post_refusal) || empty(trim(editor_text(reply_editor)))
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0

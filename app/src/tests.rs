@@ -269,6 +269,49 @@ fn the_explorer_is_handed_the_live_head_and_the_phase() {
     );
 }
 
+/// A TYPED CHARACTER COSTS ONE VIEW REBUILD, NOT TWO.
+///
+/// iced 0.14 rebuilds the whole UI once per message batch and has no dirty
+/// check. A `keyboard press` with no `status=` fires for keys a focused widget
+/// already CONSUMED, and the message it publishes cannot join the batch that
+/// widget's own message is in — it leaves through the event-loop proxy and
+/// comes back a turn later. So an unfiltered global key subscription charged
+/// every character typed into a composer a SECOND full ChatScreen build+layout,
+/// which `frame_probe`'s keystroke gate could not see: that gate drives the
+/// widget's message alone.
+///
+/// The arbitration is mechanical, so it is pinned rather than commented. Every
+/// `keyboard press` names a `status=`, and the one that takes the CAPTURED half
+/// is gated on the escape ladder's OWN reading of whether a transient layer is
+/// up — iced's single-line input consumes Escape, and that is the only reason
+/// the captured half exists. With no layer open a captured key has nothing to
+/// dismiss, which is exactly the state a reader typing into a composer is in.
+///
+/// Pinned as a SET, for the reason the node streams below are: a `contains` is
+/// equally satisfied by a second, unfiltered subscription sitting beside the
+/// right one.
+#[test]
+fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
+    let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
+    let presses: Vec<_> = lifecycle
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("keyboard press"))
+        .collect();
+    assert_eq!(
+        presses,
+        [
+            "keyboard press status=ignored when (connected || palette_open) -> global_key_pressed _",
+            "keyboard press status=captured when !empty(topmost_overlay(palette_open, bell_open, \
+             channel_create_open, thread_message_action, message_action, channel_settings_open, \
+             forge_repo_menu)) -> global_key_pressed _",
+            "keyboard press status=ignored -> content_scroll_key _",
+        ],
+        "a `keyboard press` without `status=` bills every captured key a whole \
+         extra view rebuild, and the captured half must stay gated on an open layer"
+    );
+}
+
 /// STATUS EVERYWHERE, PEERS ONLY WHERE IT IS DRAWN — pinned as sets, because a
 /// `contains` is satisfied by a commented-out line and equally by a SECOND,
 /// wrongly-gated subscription sitting beside the right one.
@@ -1752,6 +1795,41 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
         assert!(
             guard < release,
             "{landing} must release `chat_window_loading` BELOW its generation guard"
+        );
+    }
+
+    // THE COMPOSER IS PER-ROOM, AND ITS TWO LINES ARE ORDER-DEPENDENT. The park
+    // must read `active_channel` while it still names the room being LEFT and
+    // the restore must read it once it names the room being ENTERED, so the
+    // rule is not "both lines are present" but "park, move, restore" — a
+    // restore above the move hands the old room its own draft back and the new
+    // one whatever it was already holding.
+    for picker in ["choose_channel", "choose_dm", "open_chat_search_hit"] {
+        let body = HANDLERS
+            .split(&format!("\non {picker}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{picker} is a handler"))
+            .split("\non ")
+            .next()
+            .expect("handler body");
+        let at = |token: &str| {
+            body.lines()
+                .position(|line| line.trim_start().starts_with(token))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{picker} moves the reader between rooms and must carry \
+                         `{token}` — a composer that follows her is armed to send \
+                         the room she left into the room she clicked"
+                    )
+                })
+        };
+        let park = at("message_drafts = park_message_draft(");
+        let moved = at("active_channel = ");
+        let restore = at("message_editor = editor(parked_message_draft(");
+        assert!(
+            park < moved && moved < restore,
+            "{picker} must park BEFORE it moves `active_channel` and restore AFTER \
+             (park {park}, move {moved}, restore {restore})"
         );
     }
 
@@ -3454,6 +3532,10 @@ fn opening_another_thread_invalidates_the_pending_thread() {
     assert_eq!(app.active_thread_seq, 2);
     assert!(app.thread_messages.is_empty());
     assert!(reply_composer(&app).is_empty());
+    assert_eq!(
+        app.failed_reply_draft, "old reply",
+        "the box is emptied, the words are not thrown away"
+    );
 
     let _ = app.__update(__DucktapeMessage::ThreadLoaded(backend::ThreadLoadData {
         generation: 4,
@@ -3464,6 +3546,138 @@ fn opening_another_thread_invalidates_the_pending_thread() {
         has_more: false,
     }));
     assert_eq!(app.active_thread_seq, 2);
+}
+
+/// CLICKING ANOTHER THREAD IS NOT A REQUEST TO THROW THE REPLY AWAY.
+///
+/// The rail sits beside a timeline that stays mounted, and every "N replies"
+/// row in it emits `open_thread_for` — which blanks `reply_editor`, the LIVE
+/// buffer every keystroke lands in. So three sentences into a reply, a click
+/// meant to check something next door destroyed them: no banner, no Restore,
+/// nothing. The recovery machinery was already sitting thirty lines away in
+/// `thread_reply_send_failed`; this is the same harvest into the same plate.
+///
+/// `close_thread` stays the one route that discards, because that one is a
+/// request to — the drawer got the same treatment in
+/// `the_channel_drawer_does_not_eat_a_reply_you_are_typing`.
+#[test]
+fn opening_another_thread_stashes_the_reply_it_cannot_carry() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.active_thread_seq = 1;
+    app.reply_editor = compose("three sentences in and");
+
+    let _ = app.__update(__DucktapeMessage::OpenThreadFor(2));
+    assert_eq!(
+        app.active_thread_seq, 2,
+        "the rail she clicked is the one open"
+    );
+    assert!(
+        reply_composer(&app).is_empty(),
+        "a rail that just opened has an untouched composer"
+    );
+    assert_eq!(
+        app.failed_reply_draft, "three sentences in and",
+        "and the words she was typing must be reachable from the rail she landed in"
+    );
+
+    // The plate's Restore hands them back, the same route a failed send uses.
+    let _ = app.__update(__DucktapeMessage::RestoreFailedReply);
+    assert_eq!(reply_composer(&app), "three sentences in and");
+    assert!(app.failed_reply_draft.is_empty());
+
+    // AND AN ORDINARY RAIL OPEN STASHES NOTHING — an empty editor is not an
+    // unsent reply, so the plate must not appear over every thread she opens.
+    let (mut quiet, _) = Ducktape::__boot();
+    quiet.active_channel = "general".into();
+    let _ = quiet.__update(__DucktapeMessage::OpenThreadFor(4));
+    assert!(
+        quiet.failed_reply_draft.is_empty(),
+        "nothing was typed, so there is nothing to recover"
+    );
+}
+
+/// THE STREAM'S LOAD FLAG IS NOT THE RAIL'S, AND THE RAIL'S SEND SAID SO.
+///
+/// `reply_composer_event` refused on `loading` — a term neither the reply
+/// editor, its marks row nor its Send button wears — so in the one state that
+/// can raise it under an open rail the reader saw a fully lit Send, pressed it,
+/// and got nothing: no post, no error, no banner. Every chat-plane writer of
+/// `loading = true` zeroes `active_thread_seq` in the same handler, so the term
+/// never fired for a chat load at all; the state it caught was a PAGES load
+/// still in flight behind a cross-tab bounce.
+#[test]
+fn a_pages_load_in_flight_does_not_deaden_the_lit_reply_send() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "general".into();
+    app.active_thread_seq = 7;
+    // What `open_page_search_hit` leaves behind: the stream's flag up, the rail
+    // untouched, and `select_shell_tab` back to Chat clears neither.
+    app.loading = true;
+    app.reply_editor = compose("on it");
+
+    let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+        editor::composer_submit_event(),
+    ));
+    assert_eq!(
+        app.thread_messages.len(),
+        1,
+        "a Send the surface draws as live must actually send"
+    );
+    assert!(app.thread_messages[0].pending);
+    assert!(reply_composer(&app).is_empty());
+}
+
+/// A TERM IN THE GUARD THAT THE BUTTON DOES NOT WEAR IS A DEAD CONTROL.
+///
+/// The affordance is decided at render time and the guard runs at apply time,
+/// so the guard may re-read a term — but it may not carry a term the button
+/// never showed, or the click lands in a silent `return`. The two the rail's
+/// MOUNT already answers are the exception: the whole plate is drawn under
+/// `if active_thread_seq > 0`, and `open_thread_for` refuses an empty channel.
+#[test]
+fn the_reply_send_refuses_only_on_what_its_button_shows() {
+    const HANDLERS: &str = include_str!("ui/handlers/chat.ice");
+    const SCREEN: &str = include_str!("ui/screens/chat.ice");
+    const ANSWERED_BY_THE_MOUNT: [&str; 2] = ["active_thread_seq <= 0", "empty(active_channel)"];
+
+    let guard = HANDLERS
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("return if ") && line.contains("editor_text(reply_editor)"))
+        .and_then(|line| line.strip_prefix("return if "))
+        .expect("the reply submit guard");
+    let send = SCREEN
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            line.starts_with("disabled=(thread_loading")
+                && line.contains("editor_text(reply_editor)")
+        })
+        .and_then(|line| line.strip_prefix("disabled=("))
+        .and_then(|line| line.strip_suffix(')'))
+        .expect("the reply Send's disabled expression");
+
+    let terms = |expression: &str| -> Vec<String> {
+        expression
+            .split("||")
+            .map(|term| term.trim().to_owned())
+            .collect()
+    };
+    let shown = terms(send);
+    for term in terms(guard) {
+        let on_the_button = shown.contains(&term);
+        let structural = ANSWERED_BY_THE_MOUNT.contains(&term.as_str());
+        assert!(
+            on_the_button || structural,
+            "`reply_composer_event` refuses on `{term}`, which the rail's Send does \
+             not wear — put it on the button or take it out of the guard"
+        );
+    }
 }
 
 #[test]
@@ -7837,6 +8051,63 @@ fn switching_back_to_a_parked_room_paints_its_rows_without_waiting_on_the_node()
     assert_eq!(app.channel_members.len(), 1, "its member roll came with it");
     assert!(app.has_older_history, "derived from the restored rows");
     assert!(app.post_refusal.is_empty());
+}
+
+/// AND THE COMPOSER IS PER-ROOM TOO — the one piece of per-room state no
+/// switch handler touched.
+///
+/// `choose_channel` resets a dozen fields and the rail's editor, and left
+/// `message_editor` exactly as it found it: half a sentence typed in
+/// #private-ops followed the reader into whatever room she clicked next, sat
+/// there above a live Send, and was prepended to the next thing she typed and
+/// posted THERE. A chain post is permanent in history even after a tombstone
+/// delete, and the leaked text is by construction from the room she just left.
+///
+/// The rule is the one `chat.ice` already states for a failed send — "the
+/// composer belongs to the room she is in now" — finally applied to the live
+/// buffer, and drafts survive the switch instead of being thrown away for it.
+#[test]
+fn the_composer_belongs_to_the_room_she_is_in_and_waits_in_the_one_she_left() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.mutation_phase = "idle".into();
+    app.active_channel = "private-ops".into();
+    app.channels = vec![room("private-ops", 10), room("general", 20)];
+    app.message_editor = compose("the incident started at");
+
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("general".into()));
+    assert!(
+        composer(&app).is_empty(),
+        "#general's composer is #general's — nothing from next door is armed to \
+         send here"
+    );
+
+    app.message_editor = compose("ok");
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("private-ops".into()));
+    assert_eq!(
+        composer(&app),
+        "the incident started at",
+        "and the sentence she was writing is waiting where she left it"
+    );
+
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("general".into()));
+    assert_eq!(composer(&app), "ok", "both rooms keep their own");
+
+    // A SENT DRAFT DOES NOT COME BACK. The composer empties on submit, and the
+    // park that runs on the way out drops the entry rather than storing "".
+    // (#general has never been read here, so the switch left `loading` up.)
+    app.loading = false;
+    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+        editor::composer_submit_event(),
+    ));
+    assert!(composer(&app).is_empty(), "the send emptied the box");
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("private-ops".into()));
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("general".into()));
+    assert!(
+        composer(&app).is_empty(),
+        "a message she already sent must not be handed back as a draft"
+    );
 }
 
 /// A DM CLICK LANDS THE WHOLE ROOM, NOT JUST THE FACE.
