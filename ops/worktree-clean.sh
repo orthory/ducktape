@@ -11,8 +11,9 @@
 #   ops/worktree-clean.sh --yes        # do it
 #   ops/worktree-clean.sh --yes --force  # also take worktrees that have live processes
 #
-# Refuses, always, to touch a worktree that is dirty or carries a commit not in
-# origin/dev. Unmerged work is never this script's to throw away.
+# Refuses, always, to touch a worktree that is dirty or carries undelivered
+# work — a commit neither an ancestor of origin/dev nor the exact HEAD of a
+# squash-merged PR. Unmerged work is never this script's to throw away.
 set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
@@ -47,6 +48,21 @@ pids_under() {
   done
 }
 
+# ── did this branch land as a squash merge? ──────────────────────────────────
+# A squash merge lands the PR as ONE new commit on dev; the branch's own
+# commits never become ancestors, so ancestry (`rev-list origin/dev..`) calls
+# every squash-merged worktree unmerged forever. GitHub is the authority here:
+# a MERGED PR whose head oid equals this worktree's HEAD proves the content
+# landed and nothing was committed after the merge. gh missing or offline =
+# not proven = refuse.
+squash_merged() {
+  local wt="$1" branch="$2" head merged_heads
+  head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || return 1
+  merged_heads=$(gh pr list --state merged --head "$branch" \
+    --json headRefOid --jq '.[].headRefOid' 2>/dev/null) || return 1
+  case "$merged_heads" in *"$head"*) return 0 ;; *) return 1 ;; esac
+}
+
 echo "Worktrees whose work is fully in origin/dev:"
 found=0
 # Process substitution, not a pipe: a piped `while` runs in a subshell, so
@@ -62,8 +78,8 @@ while read -r wt; do
   live=$(pids_under "$wt" | wc -w)
 
   # The two refusals that make this safe to run without reading the code.
-  if [ "$ahead" != "0" ]; then
-    echo "- SKIP $branch — $ahead commit(s) not in dev"; continue
+  if [ "$ahead" != "0" ] && ! squash_merged "$wt" "$branch"; then
+    echo "- SKIP $branch — $ahead commit(s) not in dev, no merged PR at this HEAD"; continue
   fi
   if [ "$dirty" != "0" ]; then
     echo "- SKIP $(basename "$wt") — $dirty uncommitted change(s)"; continue
@@ -80,8 +96,10 @@ while read -r wt; do
   fi
   say "git worktree remove --force $wt"
   run git worktree remove --force "$wt"
-  say "git branch -d $branch"
-  run git branch -d "$branch"
+  # -D, not -d: git's own merged-ness test is ancestry, so it refuses a
+  # squash-merged branch — the proof of delivery already happened above.
+  say "git branch -D $branch"
+  run git branch -D "$branch"
 done < <(git worktree list --porcelain | awk '/^worktree /{print $2}')
 [ "$found" = 0 ] && echo "  none"
 
