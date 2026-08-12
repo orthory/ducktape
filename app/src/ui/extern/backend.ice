@@ -8,6 +8,7 @@ extern crate::backend
   ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
   ChannelWindow(channel_id:str, messages:[ChatMessage], members:[ChatMember])
+  ChannelDraft(channel_id:str, text:str)
   ChatData(generation:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
   SendReceipt(operation_id:str, channel_id:str)
   ChatDelta(kind:str, channel_id:str, seq:i64, root_seq:i64, message:ChatMessage, channel:ChatChannel, name:str, archived:bool, emoji:str, added:bool, reactor:str, by_me:bool, member:ChatMember)
@@ -327,6 +328,16 @@ extern crate::backend
   // for the rows and the roll separately walked (and deep-cloned) the whole
   // cache twice per click. Same reason `chat_settle` returns three at once.
   pure cached_window(cache:[ChannelWindow], channel_id:str) -> ChannelWindow
+  // The composer's own park. NOT a field on `ChannelWindow`: that cache refuses
+  // empty and history windows and evicts past three rooms, and each of those
+  // would throw away typed text.
+  pure park_message_draft(drafts:[ChannelDraft], channel_id:str, text:str) -> [ChannelDraft]
+  pure parked_message_draft(drafts:[ChannelDraft], channel_id:str) -> str
+  // The rail's twin, keyed by room AND root. NOT a `failed_reply_draft` harvest
+  // — that one is channel-scoped and would re-target the words at another
+  // thread; see `park_reply_draft`.
+  pure park_reply_draft(drafts:[ChannelDraft], channel_id:str, thread_seq:i64, text:str) -> [ChannelDraft]
+  pure parked_reply_draft(drafts:[ChannelDraft], channel_id:str, thread_seq:i64) -> str
   // The pages twin of `channel_display_name`: the header title of a page that
   // has only just been clicked, read from the list already in hand.
   pure page_display_title(pages:[PageItem], page:str, current:str) -> str

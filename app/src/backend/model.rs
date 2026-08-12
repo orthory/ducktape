@@ -335,6 +335,85 @@ pub fn cache_channel_window(
     kept
 }
 
+/// One room's unsent composer text, parked while the reader is somewhere else.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+pub struct ChannelDraft {
+    pub channel_id: String,
+    pub text: String,
+}
+
+/// Park the composer of the room being left, and drop the entry when there is
+/// nothing to park.
+///
+/// A SEPARATE STORE FROM [`ChannelWindow`], deliberately. That cache refuses an
+/// empty or history window and evicts past `CHANNEL_WINDOW_CACHE`, all of which
+/// are correct for ROWS the refetch would replace anyway — and every one of them
+/// would silently destroy typed text. Drafts are tiny and self-clearing (an
+/// empty text removes the entry, a send empties the composer, the next park
+/// removes it), so this list holds one short string per room she has unsent
+/// words in and needs no cap.
+pub fn park_message_draft(
+    drafts: Vec<ChannelDraft>,
+    channel_id: String,
+    text: String,
+) -> Vec<ChannelDraft> {
+    let mut kept: Vec<ChannelDraft> = drafts
+        .into_iter()
+        .filter(|draft| draft.channel_id != channel_id)
+        .collect();
+    let worth_keeping = !channel_id.is_empty() && !text.is_empty();
+    if worth_keeping {
+        kept.push(ChannelDraft { channel_id, text });
+    }
+    kept
+}
+
+/// The parked composer text for one room, or nothing.
+pub fn parked_message_draft(drafts: Vec<ChannelDraft>, channel_id: String) -> String {
+    drafts
+        .into_iter()
+        .find(|draft| draft.channel_id == channel_id)
+        .map(|draft| draft.text)
+        .unwrap_or_default()
+}
+
+/// A thread's park key: the rail belongs to a room AND a root, and the same seq
+/// under two rooms is two different threads.
+fn thread_draft_key(channel_id: &str, thread_seq: i64) -> String {
+    format!("{channel_id}#{thread_seq}")
+}
+
+/// Park the reply composer of the thread being left, in its OWN store.
+///
+/// NOT a harvest into `failed_reply_draft`: that field is channel-scoped, so a
+/// reply typed in thread A would raise its "Unsent reply" plate over every later
+/// thread of the room and Restore would arm A's words to post in B. Parked text
+/// is invisible until she opens the thread it belongs to, which is the only
+/// place it can be posted.
+pub fn park_reply_draft(
+    drafts: Vec<ChannelDraft>,
+    channel_id: String,
+    thread_seq: i64,
+    text: String,
+) -> Vec<ChannelDraft> {
+    // NO OPEN RAIL, NOTHING TO PARK. The composite key is never empty on its
+    // own, so `park_message_draft`'s empty-room check cannot stand in for this.
+    let open_rail = !channel_id.is_empty() && thread_seq > 0;
+    if !open_rail {
+        return drafts;
+    }
+    park_message_draft(drafts, thread_draft_key(&channel_id, thread_seq), text)
+}
+
+/// The parked reply text for one thread, or nothing.
+pub fn parked_reply_draft(
+    drafts: Vec<ChannelDraft>,
+    channel_id: String,
+    thread_seq: i64,
+) -> String {
+    parked_message_draft(drafts, thread_draft_key(&channel_id, thread_seq))
+}
+
 /// The parked window for one room, or the empty one.
 ///
 /// ONE WALK, ONE CLONE. The extern ABI passes the cache BY VALUE, so asking for

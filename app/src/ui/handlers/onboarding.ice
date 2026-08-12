@@ -230,6 +230,12 @@ on console_opened(id)
   message_edit_draft = ""
   message_draft = ""
   message_editor = editor("")
+  // AND THE PARKS GO WITH THE NETWORK. A channel id is a user-chosen string, so
+  // network A's `#general` and network B's `#general` share a park key — without
+  // these two lines a sentence typed on one node was handed back on ANOTHER,
+  // armed to send there. Same reasoning as the by-name clears around them.
+  message_drafts = []
+  reply_drafts = []
   failed_message_draft = ""
   failed_reply_draft = ""
   active_thread_seq = 0

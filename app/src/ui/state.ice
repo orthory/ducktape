@@ -15,8 +15,21 @@ state
   status = "Connecting…"
   connected = false
   loading = false
-  // Live shift state from the `keyboard modifiers` subscription — the rich
-  // composer classifies Enter with it (plain Enter sends, ⇧↵ breaks a line).
+  // A LAGGED MIRROR of the shift key, not live state, and the rich composer
+  // classifies Enter with it (plain Enter sends, ⇧↵ breaks a line). It is
+  // written by the `keyboard modifiers` SUBSCRIPTION, whose message leaves
+  // through the event-loop proxy and returns a full turn later — so the closure
+  // walking a key press was built from the previous turn's reading, and a ⇧↵
+  // chord whose two downs land in one drain classifies as Submit and POSTS the
+  // half-written message. Widening the window is a defect; narrowing it
+  // app-side is not possible.
+  //
+  // ponytail: the real fix is upstream and is a net deletion here — a public
+  // `RichTextEditor::key_binding(impl Fn(&KeyPress) -> Option<Binding<Edit>>)`
+  // (iced's stock `text_editor` already ships one; ducktape-ui's own
+  // `editor_binding` is one line from it) lets `rich_composer` decide from
+  // `press.modifiers.shift()` at the press, and this field, its subscription
+  // and `classify`'s bool argument all go away. Filed beside the #1058 ask.
   shift_held = false
   block_height:i64 = -1
   hydration_generation:i64 = 0
@@ -48,6 +61,27 @@ state
   // restored window with someone else's members would gate the composer of the
   // room it just painted.
   message_cache:[ChannelWindow] = []
+  // AND THE COMPOSER IS PER-ROOM TOO. `message_editor` was the one piece of
+  // per-room state no switch handler touched, so half a sentence typed in
+  // #private-ops followed the reader into whatever room she clicked next — sat
+  // there above a live Send, and got prepended to the next thing she typed and
+  // posted THERE. A chain post is permanent in history even after a tombstone.
+  // Parked on the way out while `active_channel` still names the room she is
+  // leaving, restored on the way in once it names the room she is entering; the
+  // four room switches carry both lines and a lint in `app/src/tests.rs` pins
+  // the order. Its own store rather than a `ChannelWindow` field — see
+  // `park_message_draft`.
+  message_drafts:[ChannelDraft] = []
+  // AND THE RAIL'S COMPOSER IS PER-THREAD, on the same rule one level down.
+  // `open_thread_for` blanked the live `reply_editor` and every "N replies" row
+  // in the timeline beside the rail emits it, so a click meant to check
+  // something next door destroyed three sentences. Keyed by room AND root
+  // because a thread belongs to both: parked on the way out of a thread (and on
+  // the way out of the room that holds it), handed back when she opens that
+  // same thread again. `close_thread` parks EMPTY — that click is a request to
+  // discard. Not a `failed_reply_draft` harvest, which is channel-scoped and
+  // would offer thread A's words to thread B — see `park_reply_draft`.
+  reply_drafts:[ChannelDraft] = []
   // THE SWITCH'S OWN GENERATION. Every route that moves the reader between
   // rooms bumps it and stamps it on the load it launches, so `chat_updated`
   // can drop a room she has already clicked past — A→B→C lands on C even when

@@ -189,6 +189,9 @@ fn content_version(document: &Content) -> ContentVersion {
     ContentVersion::new(0, hasher.finish())
 }
 
+/// Enter or newline, decided from a mirror of the shift key that lags the press
+/// by an event-loop turn — see `shift_held` in `ui/state.ice` for the mechanism
+/// and the upstream hook that retires this argument.
 fn classify(action: RichAction, shift: bool) -> ComposerEvent {
     let plain_enter = matches!(
         action,

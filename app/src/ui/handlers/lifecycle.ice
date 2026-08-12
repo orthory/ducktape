@@ -105,6 +105,17 @@ on reconnect
   chat_window_loading = false
   channel_reads = []
   unread_boundary = 0
+  // A RECONNECT IS A ROOM SWITCH SPREAD OVER TWO HANDLERS, so it parks like the
+  // four pickers do — here, while `active_channel` and `active_thread_seq` still
+  // name the room and thread she is in — and `workspace_connected` restores
+  // below its own landing write. The line below blanks the key, so a park under
+  // it would file both composers under "" and drop them. Without this the live
+  // composer carried across by the harvest above landed in
+  // `landing_channel(channels)` — the first room with traffic, not the one she
+  // left — armed to send there, and the next pick parked her words under THAT
+  // room's id.
+  message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
+  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   active_channel = ""
   // The room is gone, so its two readings go with it: no peer names an empty
   // channel, and no window survives a reconnect.
@@ -133,6 +144,10 @@ on reconnect
   live_thread_generation = live_thread_generation + 1
   thread_loading = false
   reply_draft = ""
+  // THE RAIL CLOSES AND ITS WORDS DO NOT GO WITH IT. This blank used to be the
+  // one composer a reconnect still ate, two dozen lines below a handler that
+  // goes out of its way to carry the stream's — the park above holds it under
+  // `channel#seq`, and the next `open_thread_for` on that thread hands it back.
   reply_editor = editor("")
   pending_reply = ""
   // Both composers above are new empty boxes and the rail is gone. `connected`
@@ -205,6 +220,13 @@ on workspace_connected(next)
   has_older_history = history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   active_channel = next.active_channel
+  // AND THE LANDING ROOM'S COMPOSER IS THE LANDING ROOM'S — the restore half of
+  // the park `reconnect` files. The room above is `landing_channel(channels)`,
+  // the first room with traffic and rarely the one she left, so without this
+  // her half-typed line stood over a stranger's Send. `message_drafts` survives
+  // the reconnect (same endpoint, no store reset), so this hands back whatever
+  // THIS room was left holding, and nothing else.
+  message_editor = editor(parked_message_draft(message_drafts, active_channel))
   // A reconnect lands on `channels.first()`, which is nobody's DM unless the
   // derivation says so — see `dm_peer_of_channel`.
   active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
@@ -466,8 +488,21 @@ on live_resynced(next)
   thread_generation = thread_generation_after_refresh(thread_generation, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
   thread_loading = thread_loading_after_refresh(thread_loading, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
   failed_reply_draft = retain_for_endpoint(failed_reply_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
+  // PARK ABOVE THE LINE THAT CAN CLOSE THE RAIL, while `active_channel` and
+  // `active_thread_seq` still name the thread being typed in. The line below
+  // zeroes the seq when the root was deleted or the room moved under her — and
+  // a park read AFTER it is `thread_seq <= 0`, which `park_reply_draft` refuses
+  // outright, so the next `open_thread_for` cannot harvest what is no longer
+  // addressable. The stash this replaced took `reply_draft`, the SETTLED mirror
+  // that reads "" the whole time someone is typing, into a plate mounted INSIDE
+  // the rail: it captured nothing and had nowhere to render it. Idempotent on
+  // the ordinary resync that leaves the rail alone — same key, same text, and
+  // the entry drops itself once the box is empty.
+  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   active_thread_seq = refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq)
-  failed_reply_draft = remember_failed_draft(failed_reply_draft, "thread", reply_draft, active_thread_seq > 0)
+  // NO RESTORE BESIDE IT: a resync either leaves the rail on the thread it was
+  // already on — where `reply_editor` is untouched and the live buffer is the
+  // truth — or closes it, and a closed rail has no composer to fill.
   thread_target_seq = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_target_seq)
   thread_next_reply_offset = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_next_reply_offset)
   thread_messages = retain_thread_messages(thread_messages, active_thread_seq)
@@ -817,7 +852,42 @@ subscribe
   run call_session(connected_rpc, huddle_channel) when (connected && huddle_joined && !empty(huddle_channel)) -> call_event _
   // Video has NO subscription: the tile strip is a self-redrawing widget
   // that repaints only its own window at the capture cadence.
-  keyboard press when (connected || palette_open) -> global_key_pressed _
+  // `status=ignored` IS THIS SUBSCRIPTION'S PRICE TAG, not a nicety. An
+  // unfiltered `keyboard press` fires for keys a focused widget already
+  // CONSUMED, and the message it publishes cannot join the batch that widget's
+  // own message is in: it leaves through the event-loop proxy and comes back as
+  // a winit user event on the NEXT turn, where iced 0.14 rebuilds
+  // unconditionally (there is no dirty check). So every character typed into a
+  // composer bought a SECOND full ChatScreen build+layout — twice the
+  // allocations the frame-cost gate reports, because the gate drives only the
+  // widget's message.
+  //
+  // Every chord this handler routes bubbles by construction: the rich editor
+  // lets command-letter presses through (`command_shortcut_bubbles`) and drops
+  // Escape uncaptured (`Binding::Unfocus`), and iced's single-line input
+  // consumes neither.
+  keyboard press status=ignored when (connected || palette_open) -> global_key_pressed _
+  // EXCEPT ESCAPE OUT OF A PLAIN `input`, which iced's text_input DOES consume
+  // — the palette's own field, the create-channel modal, the details drawer.
+  // The captured half is routed for exactly that, gated on the ESCAPE LADDER'S
+  // OWN reading of whether any transient layer is up: with none open a captured
+  // key has nothing to dismiss, and that is precisely the state a reader typing
+  // into a composer is in, so the hot path pays nothing for this line.
+  //
+  // IT CARRIES NO `connected` TERM, and that asymmetry with the line above is
+  // deliberate. `topmost_overlay` IS this half's precondition — a layer that is
+  // up ate the key and must come down whether or not the socket is alive, and a
+  // drawer that refused Escape while disconnected would be a trap. Nothing else
+  // gets through: `palette_key_action`'s open arm is separately gated on
+  // `connected` in `overlays.ice`, as are the mark and page chords, and the
+  // chord keys bubble anyway so they arrive on the IGNORED half.
+  //
+  // ponytail: this is a layer-level gate standing in for a key-level one. While
+  // a layer IS open, typing into its search field still pays the extra rebuild.
+  // The upgrade path is upstream — a `keyboard press key=escape` filter in the
+  // subscription grammar (`ui-lang-core`), filed beside the #1058 ask — after
+  // which this becomes one unconditional Escape-only subscription.
+  keyboard press status=captured when !empty(topmost_overlay(palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, forge_repo_menu)) -> global_key_pressed _
   // THE PANE SCROLL'S KEYS ARE THE LEFTOVERS. `status=ignored` drops every key
   // a focused widget CONSUMED — Home in a text field, an arrow in an open
   // list — but it is only half the arbitration: iced's single-line input drops
