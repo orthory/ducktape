@@ -535,6 +535,34 @@ fn quorum_tolerates_one_fault() {
     }
 }
 
+/// The harness must not let one node's derived invite listener land on another
+/// node's WireGuard listener. Each endpoint gets its own reserved port and the
+/// generated config carries that reservation explicitly.
+#[test]
+fn wireguard_configs_reserve_explicit_disjoint_invite_ports() {
+    let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
+    cluster.wireguard = true;
+
+    let listeners = cluster
+        .p2p_ports
+        .iter()
+        .chain(&cluster.invite_ports)
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(listeners.len(), 4, "wireguard and invite ports overlap");
+
+    for idx in 0..2 {
+        let config = std::fs::read_to_string(cluster.config_path(idx)).expect("node config");
+        assert!(
+            config.contains(&format!(
+                "invite_listen = \"127.0.0.1:{}\"",
+                cluster.invite_ports[idx]
+            )),
+            "node {idx} did not receive its reserved invite listener:\n{config}"
+        );
+    }
+}
+
 /// the staged reachability plane must converge a mesh on a FRESH boot: both
 /// nodes fire their boot `Retarget` (and the initial `EndpointRecord` send it
 /// triggers) before the p2p actors have any live connection, so the plane's
