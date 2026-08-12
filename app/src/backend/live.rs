@@ -869,12 +869,18 @@ pub async fn create_channel(
 /// anywhere in the product, and a dot that always reads "offline" is a lie.
 ///
 /// `is_agent` is always false today — see [`load_dm_peers`].
+///
+/// `channel_id` is the pair's deterministic two-party channel id
+/// (`dm_channel_id(me, key)`), computed once at load time rather than at
+/// every render — the sidebar's unread check reads `is_unread_channel`
+/// against it directly, the same lookup a room row makes.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct DmPeer {
     pub key: String,
     pub name: String,
     pub initials: String,
     pub is_agent: bool,
+    pub channel_id: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -922,11 +928,16 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
                 Some(name) if !name.is_empty() => name.to_string(),
                 _ => short_label(&key),
             };
+            let channel_id = me
+                .as_deref()
+                .map(|me| dm_channel_id(me.to_string(), key.clone()))
+                .unwrap_or_default();
             peers.push(DmPeer {
                 initials: initials_of(&name),
                 is_agent: false,
                 key,
                 name,
+                channel_id,
             });
         }
         Ok(DmPeersData { generation, peers })

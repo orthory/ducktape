@@ -232,7 +232,7 @@ on console_opened(id)
   chat_search_draft = ""
   chat_search_hits = []
   chat_search_generation = chat_search_generation + 1
-  chat_searching = false
+  chat_search_phase = "idle"
   pages = []
   doc_tabs = []
   blocks = []

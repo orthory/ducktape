@@ -204,7 +204,22 @@ state
   failed_reply_draft = ""
   chat_search_draft = ""
   chat_search_hits:[ChatSearchHit] = []
-  chat_searching = false
+  // ONE DISCRIMINANT, the same shape `mutation_phase` already owns. The float
+  // has three readings — hidden until a query lands, a skeleton while it is
+  // out, "No messages match" when it comes back empty — which a `searching`
+  // boolean and a `searched` boolean could express only as a compound over two
+  // loosely-related flags, and where a handler that cleared one but not the
+  // other painted a confident zero-result card for a search that had ERRORED.
+  //
+  //   "idle"      no search is up; the float is closed and the hits are empty
+  //   "searching" a query is out; the float shows the skeleton
+  //   "done"      hits landed (possibly none); the float shows them or the miss
+  //
+  // A FAILED search returns to "idle": the error banner is the report, and the
+  // float has nothing honest to say. Every handler that abandons a search
+  // (`clear_chat_search`, the two navigations, the workspace resets) writes
+  // "idle" in the same statement that empties `chat_search_hits`.
+  chat_search_phase = "idle"
   chat_search_generation:i64 = 0
   history_view = false
   // Whether older pages exist below the loaded timeline — mirrored on every

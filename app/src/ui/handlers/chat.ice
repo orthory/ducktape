@@ -1,12 +1,12 @@
-// NO `chat_searching` TERM, for the same reason the field no longer disables on
-// it: a refined query pressed while the first one is still out must run, not be
+// NO `chat_search_phase` TERM, for the same reason the field no longer disables
+// on it: a refined query pressed while the first one is still out must run, not be
 // swallowed. `chat_search_loaded`/`chat_search_failed` both guard on
 // `chat_search_generation`, which this bumps, so the superseded reply is what
 // gets dropped — the last Enter wins, exactly as the last click does.
 on search_chat_submit
   return if empty(trim(chat_search_draft))
   chat_search_generation = chat_search_generation + 1
-  chat_searching = true
+  chat_search_phase = "searching"
   chat_search_hits = []
   error = ""
   run search_chat(connected_rpc, "", trim(chat_search_draft), chat_search_generation) -> chat_search_loaded _ | chat_search_failed _
@@ -14,19 +14,23 @@ on search_chat_submit
 on chat_search_loaded(next)
   return if next.generation != chat_search_generation
   chat_search_hits = next.hits
-  chat_searching = false
+  chat_search_phase = "done"
   error = ""
 
 on chat_search_failed(cause)
   return if cause.generation != chat_search_generation
-  chat_searching = false
+  // BACK TO "idle", NOT "done". `search_chat_submit` already emptied the hits,
+  // so a phase that stayed non-idle here floats "No messages match" over a
+  // search that never ran — a confident zero-result card beside the error
+  // banner that says the opposite.
+  chat_search_phase = "idle"
   error = cause.message
 
 on clear_chat_search
   chat_search_generation = chat_search_generation + 1
   chat_search_draft = ""
   chat_search_hits = []
-  chat_searching = false
+  chat_search_phase = "idle"
 
 on open_chat_search_hit(channel_id, root_seq, target_seq)
   // NO `loading` TERM. A hit clicked while another room is still loading used
@@ -41,7 +45,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   palette_open = false
   shell_tab = "chat"
   chat_search_generation = chat_search_generation + 1
-  chat_searching = false
+  chat_search_phase = "idle"
   // Same abandoned request, same dead button — see `choose_channel`. This route
   // lands in a DIFFERENT channel via `chat_hit_loaded`, so the page still in
   // flight belongs to the room she jumped out of.
@@ -137,7 +141,7 @@ on choose_channel(id)
   chat_window_loading = true
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   chat_search_generation = chat_search_generation + 1
-  chat_searching = false
+  chat_search_phase = "idle"
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   // A CACHE HIT IS NOT LOADING. The plate is `loading && empty(messages)`, so
@@ -195,7 +199,7 @@ on choose_dm(peer_key)
   // Same window still out — see `chat_window_loading`.
   chat_window_loading = true
   chat_search_generation = chat_search_generation + 1
-  chat_searching = false
+  chat_search_phase = "idle"
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = true

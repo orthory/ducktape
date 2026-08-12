@@ -13,7 +13,7 @@
 // row, which is 500 weight on 7px of vertical padding. `choose_dm` resolves or
 // creates the two-party channel, so the peer list itself is the entry point and
 // the DIRECT eyebrow needs no `+`, exactly as in the artifact.
-component DmButton(peer:DmPeer, selected:bool, disabled:bool)
+component DmButton(peer:DmPeer, selected:bool, unread:bool, disabled:bool)
   emits
     choose_dm(str)
   box #root
@@ -30,14 +30,29 @@ component DmButton(peer:DmPeer, selected:bool, disabled:bool)
             w=fill
             p=0.0
             @icon_action
-          box
-            with
-              w=fill
-              pl=10.0
-              pr=10.0
-              pt=6.0
-              pb=6.0
-            DmRow peer=peer selected=true
+          // THE SAME 2.5px BRAND BAR `ChannelButton` WEARS, for the same
+          // reason: an unselected row's `pressed` plate scores 0.00 from
+          // `selected_row` by the repo's own metric, so a grey plate alone
+          // cannot survive a press, and the peer name's ink is the only other
+          // difference. `brand` is 68.00/82.33 from every row plate. The
+          // content box loses 2.5px of its `pl` so the avatar lands on the
+          // unselected row's edge.
+          row gap=0.0
+            box
+              with
+                w=2.5
+                h=fill
+                bg=brand
+                r=1.25
+              space w=1.0 h=1.0
+            box
+              with
+                w=fill
+                pl=5.5
+                pr=8.0
+                pt=6.0
+                pb=6.0
+              DmRow peer=peer selected=true unread=unread
           active bg=selected_row text=fg border=transparent border-w=1.0 r=7.0
           hovered bg=selected_row text=fg
           pressed bg=rail_hover text=fg
@@ -52,16 +67,21 @@ component DmButton(peer:DmPeer, selected:bool, disabled:bool)
           box
             with
               w=fill
-              pl=10.0
-              pr=10.0
+              pl=8.0
+              pr=8.0
               pt=6.0
               pb=6.0
-            DmRow peer=peer selected=false
+            DmRow peer=peer selected=false unread=unread
           active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
           hovered bg=rail_hover text=fg
           pressed bg=subtle text=fg
 
-component DmRow(peer:DmPeer, selected:bool)
+// Unread is weight-not-just-ink here too, the same rule `ChannelButton` makes
+// for a room: a read DM stays `font=medium`, an unread one steps up to
+// `font=display` (semibold) — never on the SELECTED arm, which already reads
+// as "the one you are on" and clears its own unread the moment it opens. The
+// trailing brand dot mirrors the channel row's own.
+component DmRow(peer:DmPeer, selected:bool, unread:bool)
   row #root
     with
       w=fill
@@ -81,7 +101,15 @@ component DmRow(peer:DmPeer, selected:bool)
             size=13.0
             wrap=none
             @text-fg
-    if !selected
+    if !selected && unread
+      box w=fill clip=true
+        text peer.name
+          with
+            size=13.0
+            wrap=none
+            font=display
+            @text-fg
+    if !selected && !unread
       box w=fill clip=true
         text peer.name
           with
@@ -103,6 +131,17 @@ component DmRow(peer:DmPeer, selected:bool)
             wrap=none
             font=code_semibold
             @text-primary_fg
+    // Confined to the UNSELECTED arm, exactly as `ChannelButton` confines its
+    // own: the open row clears its unread the moment it opens, so a dot there
+    // is a claim the next frame contradicts.
+    if unread && !selected
+      box
+        with
+          w=7.0
+          h=7.0
+          bg=brand
+          r=3.5
+        space w=1.0 h=1.0
 
 // The chat header's DM identity — a 24px peer plate and the peer's name, in
 // place of the `# channel` title. The AGENT badge marks a machine peer.
