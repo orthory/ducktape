@@ -421,7 +421,13 @@ on live_resynced(next)
   // resync landing in that window derives the peer against the OLD room and
   // blanks it, and `chat_updated` then derives "" from "" — the DM opens under
   // a `#` and the channel's own name, until the reader re-clicks it.
-  active_dm_peer = keep_str(next.chat_loaded, dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel), active_dm_peer)
+  //
+  // AND ONLY WHEN NO LANDING IS IN FLIGHT: a CHAT-carrying resync inside that
+  // same window carries the OLD room too (`live_resync_load` is launched with
+  // today's `active_channel`), so `chat_loaded` alone still blanks him.
+  // `loading` is true for precisely the `choose_dm` -> `chat_updated`/`failed`
+  // window, and the landing it names re-derives the peer itself.
+  active_dm_peer = keep_str(next.chat_loaded && !loading, dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel), active_dm_peer)
   active_channel_name = keep_str(next.chat_loaded, next.active_channel_name, active_channel_name)
   active_channel_archived = keep_bool(next.chat_loaded, next.active_channel_archived, active_channel_archived)
   active_channel_members_only = keep_bool(next.chat_loaded, next.active_channel_members_only, active_channel_members_only)

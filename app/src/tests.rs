@@ -1801,6 +1801,26 @@ fn a_landing_in_another_room_retires_the_dm_header() {
         "the room did not move, so nothing about it was re-read"
     );
 
+    // NOR DOES A CHAT-CARRYING ONE INSIDE THAT SAME WINDOW. `live_resync_load`
+    // is launched with today's `active_channel`, so a `ready`/`Lagged{chat}`
+    // resync lands `chat_loaded` on the room being LEFT — deriving against it
+    // blanks the peer just as permanently as the pages-only case above.
+    app.active_dm_peer = peer.into();
+    app.active_channel = "general".into();
+    app.loading = true;
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "general",
+        Vec::new(),
+        "",
+        Vec::new(),
+    )));
+    assert_eq!(
+        app.active_dm_peer, peer,
+        "a landing is in flight — it answers for the peer, this resync does not"
+    );
+    app.loading = false;
+
     // a device with no user key derives no DM id, so it holds no DM — the same
     // answer `rooms_only` gives when `me` is empty
     app.settings_user_key = String::new();
