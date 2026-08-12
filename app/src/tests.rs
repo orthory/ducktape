@@ -1653,9 +1653,14 @@ fn a_room_restored_from_the_cache_asserts_the_streams_tail() {
     for block in HANDLERS.split("\non ").skip(1) {
         let handler = block.split('(').next().unwrap_or(block).trim();
         let handler = handler.lines().next().unwrap_or(handler).trim();
+        // ANY CALL, NOT JUST A `let`-BOUND ONE. Keying on the `let ` prefix let
+        // a restore written as `messages = cached_window(…).messages` slip the
+        // fence entirely — the operation is what matters, not how its answer is
+        // spelled. Comment lines are skipped so naming the function in prose
+        // does not conscript a handler that never calls it.
         let restores = block
             .lines()
-            .any(|line| line.trim_start().starts_with("let ") && line.contains("cached_window("));
+            .any(|line| !line.trim_start().starts_with("//") && line.contains("cached_window("));
         if !restores {
             continue;
         }

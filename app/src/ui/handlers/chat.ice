@@ -65,6 +65,13 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // a live tail and these are a page around one old message. An empty timeline
   // under the skeleton is the honest state, and `history_view` says up front
   // which kind of window is coming.
+  //
+  // A HIT THAT FAILS LEAVES IT RAISED, and that is the honest reading too: the
+  // amber "Viewing history" banner is gated on `!empty(messages)`
+  // (`screens/chat.ice`), so the empty room shows the error banner alone, and
+  // the raised flag keeps the read cursor off a room whose window never
+  // arrived — the three `!history_view` gates in `lifecycle.ice`. It is lowered
+  // by the next `choose_channel`/`choose_dm` or by any chat-carrying resync.
   history_view = true
   messages = []
   channel_members = []
@@ -249,6 +256,14 @@ on choose_dm(peer_key)
   // that room's "Archived" badge, its "· 7 added" count and its composer
   // refusal for the several blocks a DM open takes.
   let dm_room = dm_channel_id(settings_user_key, active_dm_peer)
+  // WITH NO USER KEY BOUND, `dm_room` IS A PHANTOM — `dm_channel_id` hashes ""
+  // against the peer and answers an id no channel in the list carries, while
+  // the node resolves the real one from its OWN key. That degrades to exactly
+  // the behaviour this line replaced and no further: the cache misses, the
+  // header keeps its previous name (`channel_display_name` falls back to
+  // `current`), no sidebar row highlights, and `chat_updated` lands the real
+  // room a round trip later. The DM header still draws, because it reads
+  // `active_dm_peer`, which is the payload.
   // A DM open is a live tail, never a history window — see `history_view`.
   history_view = false
   // FREEZE THE DIVIDER WHILE `active_channel` STILL NAMES THE ROOM SHE LEAVES,
