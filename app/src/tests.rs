@@ -1735,8 +1735,9 @@ fn a_resync_that_lands_the_live_tail_lowers_the_history_banner() {
 /// the sidebar: the reader is not caught up on a room she is reading backwards.
 #[test]
 fn a_live_post_does_not_splice_itself_into_a_history_window() {
-    // the room as the sidebar knows it, re-seated after each landing because a
-    // landing installs the reply's own channel list
+    // the room as the sidebar knows it. re-seated by hand between steps: a
+    // landing FOLDS its refreshed row into this list rather than installing
+    // one (`upsert_channel_rows`), so the fixture has to put the row back.
     let room = || {
         vec![backend::ChatChannel {
             id: "general".into(),
@@ -1808,15 +1809,17 @@ fn a_live_post_does_not_splice_itself_into_a_history_window() {
         vec![message(499, "the latest", false)],
     )));
     app.channels = room();
+    // 502, not 500: her own send settled at 501 two steps up, so a post that
+    // arrives after the jump is newer than that.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
         "general",
-        message(500, "posted just now", false),
+        message(502, "posted just now", false),
     )));
     assert_eq!(app.messages.len(), 2);
     assert_eq!(app.messages[1].body, "posted just now");
     assert_eq!(
         cursor(&app),
-        Some(500),
+        Some(502),
         "the tail marks the room read as it arrives"
     );
 }
@@ -6286,8 +6289,9 @@ fn a_burst_of_channel_clicks_lands_on_the_last_one_and_drops_the_replies_it_pass
     assert_eq!(app.active_channel, "c", "the second click moved the reader");
     assert_ne!(app.chat_generation, for_b);
 
+    // One refreshed row is the whole channel list a window loader answers with.
     let mut late_b = chat_data("b", vec![message(20, "from b", false)]);
-    late_b.channels = vec![room("a", 10), room("b", 20), room("c", 30)];
+    late_b.channels = vec![room("b", 20)];
     late_b.generation = for_b;
     let _ = app.__update(__DucktapeMessage::ChatUpdated(late_b));
     assert_eq!(app.active_channel, "c", "b's reply must not take the pane");
@@ -6295,12 +6299,107 @@ fn a_burst_of_channel_clicks_lands_on_the_last_one_and_drops_the_replies_it_pass
     assert!(app.loading, "c is still in flight — the plate stays up");
 
     let mut for_c = chat_data("c", vec![message(30, "from c", false)]);
-    for_c.channels = vec![room("a", 10), room("b", 20), room("c", 30)];
+    for_c.channels = vec![room("c", 30)];
     for_c.generation = app.chat_generation;
     let _ = app.__update(__DucktapeMessage::ChatUpdated(for_c));
     assert_eq!(app.active_channel, "c");
     assert_eq!(app.messages.len(), 1);
     assert!(!app.loading);
+}
+
+/// A SWITCH REPLY FOLDS INTO THE SIDEBAR, IT DOES NOT REPLACE IT.
+///
+/// The window loader is handed the list the reader is already looking at and
+/// answers with the one row it refreshed, so everything the live stream landed
+/// DURING the round trip has to survive the reply: a peer's post in a THIRD
+/// room and the unread badge it lit, and a channel someone created while she
+/// waited. Nothing re-pages the list afterwards — `load_chat` is raised only
+/// for `kind == "ready"`, i.e. a websocket reconnect — so a revert here is not
+/// a frame of staleness, it is permanent.
+#[test]
+fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "general".into();
+    app.channels = vec![room("general", 10), room("random", 20), room("eng", 40)];
+    app.channel_reads = backend::initial_channel_reads(app.channels.clone(), Vec::new());
+
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("random".into()));
+    let switch = app.chat_generation;
+
+    // Mid-RTT: a peer posts into a third room, and another creates a channel.
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+        "eng",
+        message(41, "from a peer", false),
+    )));
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "chat".into(),
+        status: "Live".into(),
+        height: 1,
+        chat: backend::ChatDelta {
+            kind: "channel-created".into(),
+            channel: room("brand-new", 0),
+            ..backend::ChatDelta::default()
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    assert!(app.unread_channel_ids.iter().any(|id| id == "eng"));
+
+    let mut landed = chat_data("random", vec![message(20, "from random", false)]);
+    landed.channels = vec![room("random", 20)];
+    landed.generation = switch;
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(landed));
+
+    assert_eq!(
+        app.channels
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["general", "random", "eng", "brand-new"],
+        "the room created mid-switch is still in the sidebar"
+    );
+    assert_eq!(
+        backend::channel_head_seq(app.channels.clone(), "eng".into()),
+        41,
+        "and the third room's head did not walk back to the pre-click snapshot"
+    );
+    assert!(
+        app.unread_channel_ids.iter().any(|id| id == "eng"),
+        "so its badge survives the switch it had nothing to do with"
+    );
+}
+
+/// A SUPERSEDED SWITCH'S FAILURE STAYS WITH IT. Nothing serializes the room
+/// pickers any more, so B's error can arrive after the reader has clicked on to
+/// C — and ungated it would clear `loading` under C (swapping C's plate for "No
+/// messages yet") and put B's message in the banner until C lands.
+#[test]
+fn a_failed_switch_the_reader_clicked_past_does_not_land_on_the_room_she_is_in() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "a".into();
+    app.channels = vec![room("a", 10), room("b", 20), room("c", 30)];
+
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("b".into()));
+    let for_b = app.chat_generation;
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("c".into()));
+
+    let _ = app.__update(__DucktapeMessage::ChatLoadFailed(backend::HydrationError {
+        generation: for_b,
+        message: "b is unreachable".into(),
+    }));
+    assert!(app.loading, "c is still in flight — the plate stays up");
+    assert!(app.error.is_empty(), "and b's failure is not c's");
+
+    let for_c = app.chat_generation;
+    let _ = app.__update(__DucktapeMessage::ChatLoadFailed(backend::HydrationError {
+        generation: for_c,
+        message: "c is unreachable too".into(),
+    }));
+    assert!(!app.loading);
+    assert_eq!(app.error, "c is unreachable too");
 }
 
 /// A→B→A PAINTS IN ONE FRAME. The room being left is parked with its member

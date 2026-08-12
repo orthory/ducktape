@@ -1,5 +1,10 @@
+// NO `chat_searching` TERM, for the same reason the field no longer disables on
+// it: a refined query pressed while the first one is still out must run, not be
+// swallowed. `chat_search_loaded`/`chat_search_failed` both guard on
+// `chat_search_generation`, which this bumps, so the superseded reply is what
+// gets dropped — the last Enter wins, exactly as the last click does.
 on search_chat_submit
-  return if chat_searching || empty(trim(chat_search_draft))
+  return if empty(trim(chat_search_draft))
   chat_search_generation = chat_search_generation + 1
   chat_searching = true
   chat_search_hits = []
@@ -29,6 +34,10 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // carries `chat_generation`, so the one it supersedes is dropped on arrival
   // instead of this click being dropped on the way out.
   return if mutation_phase != "idle"
+  // PARK THE ROOM SHE IS LEAVING, exactly as the two pickers do — the way back
+  // OUT of a search hit is a click on that room, and without this it is the one
+  // navigation in the pane that still pays a full round trip.
+  message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
   palette_open = false
   shell_tab = "chat"
   chat_search_generation = chat_search_generation + 1
@@ -63,7 +72,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   composer_focus = "none"
   error = ""
   chat_generation = chat_generation + 1
-  run load_chat_hit(connected_rpc, channels, channel_id, root_seq, target_seq, chat_generation) -> chat_hit_loaded _ | failed _
+  run load_chat_hit(connected_rpc, channels, channel_id, root_seq, target_seq, chat_generation) -> chat_hit_loaded _ | chat_load_failed _
 
 // THE LAST CLICK WINS. This used to open `return if loading`, and `loading` is
 // true for the entire switch it starts — so the second click of a fast A→B→C
@@ -102,7 +111,14 @@ on choose_channel(id)
   active_channel_members_only = channel_is_members_only(channels, active_channel)
   messages = cached_window_messages(message_cache, active_channel)
   channel_members = cached_window_members(message_cache, active_channel)
-  post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
+  // A SEAT IS EITHER KNOWN OR NOT CLAIMED. The roll is [] on a cache miss, and
+  // `post_gate` reads an empty roll as "not seated" — which would refuse the
+  // composer of a members-only room she IS in, for a whole round trip. Archived
+  // and open rooms need no roll to answer, so only the members-only miss is
+  // unknown, and the honest answer there is nothing: a miss leaves `messages`
+  // empty, so `loading` below is true and holds the composer anyway.
+  let seat_known = !active_channel_members_only || !empty(channel_members)
+  post_refusal = keep_str(seat_known, post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key), "")
   has_older_history = history_has_older(messages)
   // THE FLAG BELONGS TO THE REQUEST, AND THE REQUEST BELONGS TO THE ROOM YOU
   // LEFT. `load_more_history` returns early on it and nothing else here lowers
@@ -147,7 +163,7 @@ on choose_channel(id)
   // re-paged the whole list on every switch — a round trip in front of the
   // first row, for a list this handler is reading two statements above and the
   // live fold keeps current.
-  run load_channel_window(connected_rpc, channels, active_channel, chat_generation) -> chat_updated _ | failed _
+  run load_channel_window(connected_rpc, channels, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
 
 // A DM is not a second message plane: it is the two-party members-only channel
 // at `dm_channel_id(me, peer)`, resolved or created on the way in. Everything
@@ -197,7 +213,7 @@ on choose_dm(peer_key)
   // Reads the peer back from state: `active_dm_peer = peer_key` above already
   // moved the payload, so passing `peer_key` here would be a use after move.
   chat_generation = chat_generation + 1
-  run open_dm(connected_rpc, password, active_dm_peer, chat_generation) -> chat_updated _ | failed _
+  run open_dm(connected_rpc, password, active_dm_peer, chat_generation) -> chat_updated _ | chat_load_failed _
 
 on create_channel_submit
   return if loading || mutation_phase != "idle" || empty(trim(channel_draft))
@@ -409,13 +425,18 @@ on chat_updated(next)
   // swap the loading plate for "No messages yet" mid-switch.
   return if next.generation != chat_generation
   history_view = false
-  channels = next.channels
+  // FOLD, DO NOT REPLACE. `load_channel_window` answers with the one row it
+  // refreshed, and the list it was handed is the PRE-CLICK snapshot: assigning
+  // it back reverted every delta `live_updated` folded during the round trip —
+  // a peer's post in a third room and the badge it lit, a channel created,
+  // renamed or archived — and nothing re-pages the list to heal it.
+  channels = upsert_channel_rows(channels, next.channels)
   rooms = rooms_only(channels, dm_peers, settings_user_key)
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   has_older_history = history_has_older(messages)
-  unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
+  unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
-  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
+  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
   unread_channel_ids = unread_channels(channel_reads, channels)
   active_channel = next.active_channel
   // A LANDING ANSWERS FOR THE PEER TOO. The DM header suppresses the `#` and
@@ -465,13 +486,14 @@ on chat_hit_loaded(next)
   // banner sits over a live tail with a "Jump to latest" that reloads the
   // channel you are already at the end of.
   history_view = true
-  channels = next.channels
+  // Same fold as `chat_updated`, same loader, same reason.
+  channels = upsert_channel_rows(channels, next.channels)
   rooms = rooms_only(channels, dm_peers, settings_user_key)
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   has_older_history = history_has_older(messages)
-  unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
+  unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
-  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
+  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
   unread_channel_ids = unread_channels(channel_reads, channels)
   active_channel = next.active_channel
   // Same landing answer as `chat_updated`: a hit in another room retires the
@@ -508,6 +530,20 @@ on chat_hit_loaded(next)
   error = ""
   // Same close-if-ended mirror as `chat_updated` above.
   task window close target=window_target_unless(huddle_joined, huddle_win)
+
+// A SWITCH'S FAILURE BELONGS TO THAT SWITCH. The generic `failed` arm is not
+// guarded — it could not be, it serves the page routes too — and while the room
+// pickers were serialized by `return if loading` there was at most one chat load
+// in flight, so it never had to be. That invariant is gone: the last click wins
+// and the ones it passed are still out. Without this guard, A→B→C where B errors
+// clears `loading` under C — swapping C's loading plate for "No messages yet" —
+// and writes B's message into the banner until C lands.
+on chat_load_failed(cause)
+  return if cause.generation != chat_generation
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  loading = false
+  error = cause.message
 
 on channel_created(next)
   // The lock and the modal come down whether or not this landing still counts:

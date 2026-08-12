@@ -221,6 +221,13 @@ pub(crate) async fn load_channel_facts(
 /// so a switch costs one round trip plus whatever the timeline walk itself
 /// needs, instead of the list page followed by the same fan-out.
 ///
+/// `channels` CARRIES BACK ONLY THE ROW THIS REFRESHED, and `known` is a read
+/// hint, not the answer: handing the pre-click snapshot back would have the
+/// reducer revert every delta the live stream folded during the round trip —
+/// a peer's post in a third room and its unread badge, a channel created,
+/// renamed or archived. See `upsert_channel_rows`, which folds this row into
+/// the list on screen instead of replacing it.
+///
 /// The window is authoritative about where it landed: it names the channel it
 /// was asked for or it fails. `load_chat_data`'s "requested id I cannot see
 /// falls back to the landing channel" rule is right for a refresh and wrong
@@ -251,14 +258,9 @@ pub(crate) async fn load_channel_window_data(
         load_channel_members(rpc, channel_id),
         messages_leg
     )?;
-    let mut channels = known;
-    match channels.iter_mut().find(|row| row.id == channel.id) {
-        Some(row) => row.clone_from(&channel),
-        None => channels.push(channel.clone()),
-    }
     Ok(ChatData {
         generation: 0,
-        channels,
+        channels: vec![channel.clone()],
         messages,
         active_channel: channel.id,
         active_channel_name: channel.name,

@@ -2753,6 +2753,17 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     )
     .await
     .unwrap();
+    // ONE ROW BACK, NOT THE LIST IT WAS HANDED. The switch loaders take the
+    // reader's list only as a `head_seq` hint; carrying it back would have the
+    // reducer revert every delta the live stream folded during the round trip
+    // (`upsert_channel_rows`).
+    assert_eq!(
+        hit.channels
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["general"]
+    );
     assert_eq!(hit.generation, 7);
     assert_eq!(hit.selected_message_seq, 1);
     assert_eq!(hit.active_thread_seq, 1);

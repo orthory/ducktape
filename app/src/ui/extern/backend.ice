@@ -303,6 +303,10 @@ extern crate::backend
   sync apply_chat_members(members:[ChatMember], delta:ChatDelta, active_channel:str) -> [ChatMember]
   sync thread_offset_after_live(offset:i64, has_more:bool, delta:ChatDelta, active_channel:str, root:i64) -> i64
   sync channel_display_name(channels:[ChatChannel], channel:str, current:str) -> str
+  // A load's rows FOLD into the sidebar list; they do not replace it. The
+  // switch loader answers with the one row it refreshed, against a list the
+  // live stream is still folding into.
+  sync upsert_channel_rows(channels:[ChatChannel], refreshed:[ChatChannel]) -> [ChatChannel]
   sync near_scroll_top(relative_offset:f64) -> bool
   sync channel_is_archived(channels:[ChatChannel], channel:str) -> bool
   sync channel_is_members_only(channels:[ChatChannel], channel:str) -> bool
@@ -357,8 +361,12 @@ extern crate::backend
   sync keep_participants(loaded:bool, next:[HuddleParticipant], current:[HuddleParticipant]) -> [HuddleParticipant]
   sync huddle_recipient_nodes(roster:[HuddleParticipant]) -> [str]
   sync huddle_refresh_hits(delta:ChatDelta, active_channel:str) -> bool
-  load_channel_window(rpc:str, channels:[ChatChannel], channel_id:str, generation:i64) -> ChatData ! AppError
-  load_chat_hit(rpc:str, channels:[ChatChannel], channel_id:str, root_seq:i64, target_seq:i64, generation:i64) -> ChatData ! AppError
+  // ! HydrationError, not ! AppError: the three room-switch loaders below fail
+  // with the generation of the switch they belong to, so `chat_load_failed` can
+  // drop a failure the reader has already clicked past. `committed` is what
+  // `AppError` adds and a switch has nothing to commit.
+  load_channel_window(rpc:str, channels:[ChatChannel], channel_id:str, generation:i64) -> ChatData ! HydrationError
+  load_chat_hit(rpc:str, channels:[ChatChannel], channel_id:str, root_seq:i64, target_seq:i64, generation:i64) -> ChatData ! HydrationError
   create_channel(rpc:str, password:str, name:str, members_only:bool, generation:i64) -> ChatData ! AppError
   rename_channel(rpc:str, password:str, channel_id:str, name:str) -> bool ! AppError
   archive_channel(rpc:str, password:str, channel_id:str) -> bool ! AppError
@@ -376,7 +384,7 @@ extern crate::backend
   sync rooms_only(channels:[ChatChannel], peers:[DmPeer], me:str) -> [ChatChannel]
   sync dm_peer_named(peers:[DmPeer], key:str) -> DmPeer
   sync no_dm_peer() -> DmPeer
-  open_dm(rpc:str, password:str, peer_key:str, generation:i64) -> ChatData ! AppError
+  open_dm(rpc:str, password:str, peer_key:str, generation:i64) -> ChatData ! HydrationError
   sync post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str
   send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
   load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> ThreadLoadData ! HydrationError

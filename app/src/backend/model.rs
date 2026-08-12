@@ -211,6 +211,34 @@ pub fn channel_head_seq(channels: Vec<ChatChannel>, channel: String) -> i64 {
     head_seq_of(&channels, &channel)
 }
 
+/// FOLD A LOAD'S ROWS INTO THE LIST ON SCREEN — do not replace it with them.
+///
+/// The switch loader is handed the list the reader is already looking at and
+/// answers with the one row it refreshed (`load_channel_window_data`), so
+/// assigning its list back would revert every delta the live stream folded
+/// during the round trip: a peer's post in a THIRD room and the unread badge it
+/// lit, a channel created, renamed or archived. Nothing re-pages the list
+/// afterwards — `load_chat` is raised only by a reconnect — so that loss is
+/// permanent, not a frame of staleness.
+///
+/// `head_seq` only moves FORWARD. The row was read mid-flight; a delta folded
+/// after that read is the newer fact, and letting the row walk it back relights
+/// a badge the reader has already cleared.
+pub fn upsert_channel_rows(
+    mut channels: Vec<ChatChannel>,
+    refreshed: Vec<ChatChannel>,
+) -> Vec<ChatChannel> {
+    for mut row in refreshed {
+        let Some(current) = channels.iter_mut().find(|current| current.id == row.id) else {
+            channels.push(row);
+            continue;
+        };
+        row.head_seq = row.head_seq.max(current.head_seq);
+        *current = row;
+    }
+    channels
+}
+
 // active-channel scalars re-derived from the (delta-folded) channel list,
 // keeping the current value when the channel is absent from the list.
 
@@ -245,10 +273,9 @@ pub fn channel_is_members_only(channels: Vec<ChatChannel>, channel: String) -> b
 /// to the END — 1.0 is the TOP of the history in hand, which is where the next
 /// older page belongs.
 ///
-/// A scrollable whose content fits its viewport reports `0/0`, and every
-/// comparison against NaN is false. That is the answer this wants: nothing
-/// scrolls, so the reader never approaches anything, and the explicit "Load
-/// older messages" button is already on screen for her.
+/// A NaN offset (content that fits reports `0/0`) compares false against
+/// everything, which is the answer this wants anyway — iced does not publish a
+/// viewport at all in that case, so it is a belt, not the braces.
 pub fn near_scroll_top(relative_offset: f64) -> bool {
     relative_offset >= 0.9
 }

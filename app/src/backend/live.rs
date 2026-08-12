@@ -689,12 +689,20 @@ pub fn keep_i64(loaded: bool, next: i64, current: i64) -> i64 {
 /// The channel the reader just clicked, loaded against the channel list she is
 /// already looking at — see [`load_channel_window_data`] for why the list is
 /// passed in rather than re-paged.
+///
+/// A GENERATION, NOT AN `AppError` — the same reason [`connect`] fails with
+/// one. Nothing serializes these any more (`choose_channel` takes every click
+/// and drops the superseded REPLY), so a failure has to be able to say which
+/// switch it belongs to: without that, B erroring after the reader has clicked
+/// on to C clears `loading` under C, swapping C's plate for "No messages yet",
+/// and writes B's error into the banner. `committed` is what `AppError` adds,
+/// and a room switch has nothing to commit.
 pub async fn load_channel_window(
     rpc: String,
     channels: Vec<ChatChannel>,
     channel_id: String,
     generation: i64,
-) -> Result<ChatData, AppError> {
+) -> Result<ChatData, HydrationError> {
     async {
         let rpc = rpc_client(&rpc)?;
         let mut chat =
@@ -703,7 +711,10 @@ pub async fn load_channel_window(
         Ok(chat)
     }
     .await
-    .map_err(app_error)
+    .map_err(|message: String| HydrationError {
+        generation,
+        message: user_error(message),
+    })
 }
 
 /// The reply a search hit points at, when it points at one at all. A hit on the
@@ -720,6 +731,7 @@ async fn load_hit_reply(
     load_message_at(rpc, channel_id, target_seq).await.map(Some)
 }
 
+/// Same generation-carrying failure as [`load_channel_window`], same reason.
 pub async fn load_chat_hit(
     rpc: String,
     channels: Vec<ChatChannel>,
@@ -727,7 +739,7 @@ pub async fn load_chat_hit(
     root_seq: i64,
     target_seq: i64,
     generation: i64,
-) -> Result<ChatData, AppError> {
+) -> Result<ChatData, HydrationError> {
     async {
         let root_seq = positive_sequence(root_seq)?;
         let target_seq = positive_sequence(target_seq)?;
@@ -766,7 +778,10 @@ pub async fn load_chat_hit(
         Ok(chat)
     }
     .await
-    .map_err(app_error)
+    .map_err(|message: String| HydrationError {
+        generation,
+        message: user_error(message),
+    })
 }
 
 /// Land on the channel that was just made.
@@ -1011,12 +1026,18 @@ pub fn no_dm_peer() -> DmPeer {
 /// NOT confidential. `MembersOnly` gates who may POST; every node replicates
 /// the channel's plaintext, so a DM is a two-person room, not a private one.
 /// Any copy on this surface that promises secrecy is a lie about the wire.
+///
+/// Fails with a generation for the reason [`load_channel_window`] gives: this
+/// is one of the three routes that move the reader between rooms, and a
+/// superseded failure must not land under the room she is in now. The writes it
+/// makes are idempotent by construction — `dm_channel_id` is deterministic and
+/// `SetMembership` is a set — so `committed` had nothing to warn about.
 pub async fn open_dm(
     rpc: String,
     password: String,
     peer_key: String,
     generation: i64,
-) -> Result<ChatData, AppError> {
+) -> Result<ChatData, HydrationError> {
     async {
         let peer = public_key(&peer_key, "peer public key")?;
         let me = local_user_key()
@@ -1061,17 +1082,18 @@ pub async fn open_dm(
                 }),
                 password.clone(),
             )
-            .await
-            .map_err(committed_error)?;
+            .await?;
         }
-        let data = load_chat_data(&client, Some(&channel_id))
-            .await
-            .map_err(committed_error)?;
+        let data = load_chat_data(&client, Some(&channel_id)).await?;
         let mut data = landed_on_channel(data, channel_id, peer_name, true, seated);
         data.generation = generation;
         Ok(data)
     }
     .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message: user_error(message),
+    })
 }
 
 /// Why the viewer may not post here, as a stable reason token — empty when
