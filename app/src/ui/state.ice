@@ -32,6 +32,23 @@ state
   mutation_phase = "idle"
   error = ""
   channels:[ChatChannel] = []
+  // THE SIDEBAR'S TWO DERIVED LISTS, mirrored for the reason `unread_marker_seq`
+  // below is: a `sync` extern takes every list BY VALUE, so a call in a view
+  // expression is a deep clone per frame — and these two were the worst of them.
+  // `rooms_only` ran TWICE a frame (the CHANNELS count and the list itself),
+  // each pass cloning `channels` and `dm_peers` and computing `dm_channel_id`
+  // — a SHA-256 plus a hex encode — once per DM peer. `channel_is_unread` ran
+  // once per ROW, each cloning the whole read-cursor list: O(channels × reads)
+  // String allocations per frame, growing quadratically with the workspace.
+  //
+  // Both move only where their sources move, so they are written there:
+  // `rooms` wherever `channels`, `dm_peers` or `settings_user_key` is assigned,
+  // `unread_channel_ids` wherever `channels` or `channel_reads` is. That set is
+  // the contract, so it is linted rather than remembered —
+  // `every_writer_of_a_mirrored_view_reading_refreshes_its_mirror` in
+  // app/src/tests.rs fails the build on a writer that forgets one.
+  rooms:[ChatChannel] = []
+  unread_channel_ids:[str] = []
   messages:[ChatMessage] = []
   channel_reads:[ChannelRead] = []
   unread_boundary:i64 = 0
@@ -46,6 +63,16 @@ state
   active_channel_members_only = false
   active_channel_huddle_count:i64 = 0
   channel_members:[ChatMember] = []
+  // WHY THIS DEVICE MAY NOT POST HERE — "" when it may. The same
+  // `post_gate(archived, members_only, members, me)` verdict the gate note and
+  // both composers used to call at their own mount: EIGHT calls per frame,
+  // every one of them deep-cloning `channel_members` through the by-value
+  // extern ABI for a two-branch `any()`. Mirrored on the same terms as `rooms`
+  // above and pinned by the same lint — written wherever `channel_members`,
+  // `active_channel_archived`, `active_channel_members_only` or
+  // `settings_user_key` is assigned. Both composer handlers read it at apply
+  // time, which is what the frame-old `disabled=` could never be trusted for.
+  post_refusal = ""
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
@@ -135,6 +162,12 @@ state
   // shared `send_flash` drives both opacities — two lanes settling in the
   // same beat share one fade, which reads fine and needs no second animation.
   thread_send_flash_id = ""
+  // Scratch, not a reading: the settle verdict `live_updated` computes ONCE
+  // per delta and then spends on the three fields above. A `let` cannot hold
+  // it — a run-route payload's fields do not type inside one (E151), and
+  // `next.chat` is exactly such a payload — so it is a field the handler writes
+  // and reads in the same pass, the same shape as `page_install` below.
+  live_settle:ChatSettle = no_chat_settle()
   send_flash:animation[bool] = false
     easing ease-in-out
     duration 400ms
@@ -421,10 +454,17 @@ state
   forge_tab = "code"
   forge_repo_menu = false
   // DIRECT — a DM is a two-party members-only channel; `active_dm_peer` names
-  // the peer and `dm_peers` carries the rest of him, so the header plate is a
-  // filter over that list. There is deliberately no `active_dm_name` /
-  // `active_dm_is_agent` pair: nothing ever wrote them, and a header fed from
-  // two fields no handler fills renders a blank name.
+  // the peer and `active_dm` carries the rest of him.
+  //
+  // The header used to be a FILTER over `dm_peers` (`for peer in dm_peers` /
+  // `if peer.key == active_dm_peer`) because Ice cannot index a list by field.
+  // That deep-cloned every peer and allocated a per-child scope String, per
+  // frame, so that at most one row rendered — so the row is resolved ONCE,
+  // where `active_dm_peer` is written, through `dm_peer_named`. It is the same
+  // reading, not a second one: it is written by the same statement list, from
+  // the key that statement just decided, and the lint pins the pair. A peer who
+  // has left the identity roster resolves to the blank row, and the header
+  // falls through to the `#` title exactly as the no-match filter arm did.
   //
   // IT IS A READING OF `active_channel`, NOT A FLAG. Every handler that writes
   // the channel re-derives it through `dm_peer_of_channel` (or blanks it with
@@ -433,6 +473,7 @@ state
   // the room the composer posts into unnamed. Pinned in tests.rs.
   dm_peers_generation:i64 = 0
   active_dm_peer = ""
+  active_dm:DmPeer = no_dm_peer()
   // HUDDLE — whether SHE is in it, where, since when, the tick that drives the
   // elapsed clock, and who else is on the call. There is no `popped` bool:
   // the huddle window's own existence (`huddle_win`) is that state.

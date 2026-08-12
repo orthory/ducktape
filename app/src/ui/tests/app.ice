@@ -686,20 +686,21 @@ test message_stream_reset_contract
         block_height
         searching=chat_searching
         search_hits=chat_search_hits
-        channels
+        rooms
+        unread_channel_ids
         dm_peers
-        channel_reads
-        user_key=settings_user_key
         channel_create_open
         connected
         loading
         mutation_phase
         active_channel
         active_dm_peer
+        active_dm
         active_channel_name
         active_channel_archived
         active_channel_members_only
         channel_members
+        post_refusal
         huddle_joined
         huddle_channel
         huddle_channel_name

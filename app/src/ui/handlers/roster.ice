@@ -92,6 +92,10 @@ on members_failed(cause)
 on dm_peers_loaded(next)
   return if next.generation != dm_peers_generation
   dm_peers = next.peers
+  // The directory decides which channels are DMs and who the header names, so
+  // both mirrors move with it — see state.ice's `rooms` note.
+  rooms = rooms_only(channels, dm_peers, settings_user_key)
+  active_dm = dm_peer_named(dm_peers, active_dm_peer)
 
 on dm_peers_failed(cause)
   return if cause.generation != dm_peers_generation

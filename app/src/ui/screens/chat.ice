@@ -19,7 +19,7 @@
 // were briefly caller-filled slots: a sensor's show/resize route used to accept
 // only bare `_` payloads and could not carry a component event (ui-lang#239).
 
-component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], channels:[ChatChannel], dm_peers:[DmPeer], channel_reads:[ChannelRead], user_key:str, channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
+component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], rooms:[ChatChannel], unread_channel_ids:[str], dm_peers:[DmPeer], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
   emits
     search_chat_submit()
     clear_chat_search()
@@ -197,7 +197,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 font=code_semibold
                 @text-label
             space w=fill
-            text len(rooms_only(channels, dm_peers, user_key))
+            text len(rooms)
               with
                 size=10.5
                 wrap=none
@@ -251,12 +251,12 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
             // DMs are filtered out here, not hidden by CSS: they are real
             // channels and would otherwise list twice, once under each
             // eyebrow. See `rooms_only`.
-            for channel in rooms_only(channels, dm_peers, user_key)
+            for channel in rooms
               ChannelButton
                 with
                   channel
                   selected=(channel.id == active_channel)
-                  unread=channel_is_unread(channel_reads, channel.id, channel.head_seq)
+                  unread=is_unread_channel(unread_channel_ids, channel.id)
                 forward
                   choose_channel
             // DIRECT — the artifact's own word for it, and the honest
@@ -325,17 +325,18 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     h=fill
                     gap=9.0
                     align=center
-                  // A DM IS A PERSON, NOT A `#`. The peer is a filter
-                  // over `dm_peers` — Ice cannot index a list by field,
-                  // so the row that matches `active_dm_peer` draws and
-                  // the rest do not. A DM whose peer has left the
-                  // identity roster matches nothing and falls back to
-                  // the channel title below, which is the derived
-                  // two-party name — never a blank plate.
+                  // A DM IS A PERSON, NOT A `#`. The row is resolved
+                  // where `active_dm_peer` is written (`dm_peer_named`),
+                  // not filtered here: Ice cannot index a list by field,
+                  // so this was `for peer in dm_peers` / `if peer.key ==
+                  // active_dm_peer` — every peer deep-cloned and given a
+                  // scope String, per frame, so that one of them drew.
+                  // A DM whose peer has left the identity roster resolves
+                  // to the blank row and falls back to the channel title
+                  // below, which is the derived two-party name — never a
+                  // blank plate.
                   if !empty(active_dm_peer)
-                    for peer in dm_peers
-                      if peer.key == active_dm_peer
-                        DmHeader peer=peer
+                    DmHeader peer=active_dm
                   if empty(active_dm_peer)
                     text "#"
                       with
@@ -1051,12 +1052,15 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               h=1.0
               bg=separator
             space w=1.0 h=1.0
-          // THE GATE ABOVE THE PLATE. `post_gate` is called here rather
-          // than mirrored into a state field: it is pure over three
-          // facts the view already holds, `channel_members` lands in
-          // SEVEN handlers, and a seventh copy is six chances to drift.
-          // An empty reason renders nothing and gates nothing.
-          if !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key))
+          // THE GATE ABOVE THE PLATE. `post_refusal` IS `post_gate`'s
+          // verdict, mirrored into state — the call used to sit at each
+          // of its EIGHT mounts, and the extern ABI is by-value, so the
+          // member roll was deep-cloned eight times a frame for a
+          // two-branch `any()`. The seven writers it was worth avoiding
+          // are now seven one-line assignments, and a lint fails the
+          // build on a writer that forgets one. An empty reason renders
+          // nothing and gates nothing.
+          if !empty(post_refusal)
             box
               with
                 w=fill
@@ -1065,7 +1069,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 pt=12.0
               ComposerGate
                 with
-                  reason=post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)
+                  reason=post_refusal
           box
             with
               w=fill
@@ -1085,7 +1089,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 shadow-y=1.0
                 shadow-blur=2.0
               col w=fill
-                extern rich_composer(message_editor, "Message the channel…", (loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key))), shift_held, 44.0, 150.0, 10.0) #message -> emit(composer_event, _)
+                extern rich_composer(message_editor, "Message the channel…", (loading || !connected || empty(active_channel) || !empty(post_refusal)), shift_held, 44.0, 150.0, 10.0) #message -> emit(composer_event, _)
                 // The Slack seat: format controls on the left, send on the
                 // right, one row under the input. `ComposerMarks` is the SAME
                 // row the rail's composer mounts — it moved into a component
@@ -1103,7 +1107,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       align=center
                     ComposerMarks
                       with
-                        disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)))
+                        disabled=(loading || !connected || empty(active_channel) || !empty(post_refusal))
                       events
                         mark -> emit(composer_mark, _)
                     space w=fill
@@ -1116,7 +1120,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     space w=8.0
                     button "Send" -> emit(composer_event, composer_submit_event())
                       with
-                        disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)) || empty(trim(editor_text(message_editor))))
+                        disabled=(loading || !connected || empty(active_channel) || !empty(post_refusal) || empty(trim(editor_text(message_editor))))
                         h=29.0
                         @primary_action
                         @px-12px
@@ -1628,7 +1632,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         shadow-y=1.0
                         shadow-blur=2.0
                       col w=fill
-                        extern rich_composer(reply_editor, "Reply…", (thread_loading || !connected || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key))), shift_held, 44.0, 150.0, 10.0) #reply -> emit(reply_composer_event, _)
+                        extern rich_composer(reply_editor, "Reply…", (thread_loading || !connected || !empty(post_refusal)), shift_held, 44.0, 150.0, 10.0) #reply -> emit(reply_composer_event, _)
                         box
                           with
                             w=fill
@@ -1642,14 +1646,14 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               align=center
                             ComposerMarks
                               with
-                                disabled=(thread_loading || !connected || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)))
+                                disabled=(thread_loading || !connected || !empty(post_refusal))
                               events
                                 mark -> emit(reply_composer_mark, _)
                             space w=fill
                             button "Send" -> emit(reply_composer_event, composer_submit_event())
                               with
                                 label="Send reply"
-                                disabled=(thread_loading || !connected || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)) || empty(trim(editor_text(reply_editor))))
+                                disabled=(thread_loading || !connected || !empty(post_refusal) || empty(trim(editor_text(reply_editor))))
                                 h=28.0
                                 @primary_action
                                 @px-11px

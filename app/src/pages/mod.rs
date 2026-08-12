@@ -360,24 +360,38 @@ fn toggle_todo(mut document: Content, line: usize) -> Content {
     document
 }
 
-/// The Cmd/Ctrl+Z / +Shift+Z route off the app's ONE keyboard subscription —
-/// the editor deliberately bubbles command-letter chords. An empty verdict is
-/// the identity, so the caller stays branch-free.
-pub fn page_history_key(
-    document: Content,
+/// WHICH history move the Cmd/Ctrl+Z / +Shift+Z chord asks for — "undo",
+/// "redo", or "" for every other press. Split out of [`page_history_key`] so
+/// the keyboard handler can resolve the chord BEFORE it decides to rebuild the
+/// buffer: the assignment that applies the move lowers to
+/// `mem::take(&mut page_editor)`, and a taken `editor` leaves a fresh
+/// `Content::default()` behind — a cosmic-text buffer built under a write lock
+/// on the process-global font system, per key press, for a chord that fires
+/// once in a thousand.
+pub fn page_history_shortcut(
     _logical: iced::keyboard::Key,
     physical: iced::keyboard::key::Physical,
     modifiers: iced::keyboard::Modifiers,
     ready: bool,
-) -> Content {
+) -> String {
     use iced::keyboard::key::{Code, Physical};
     let is_z = matches!(physical, Physical::Code(Code::KeyZ));
     if !ready || !is_z || !modifiers.command() {
-        return document;
+        return String::new();
     }
-    let restored = match modifiers.shift() {
-        false => history::undo(|| (document.text(), document.cursor())),
-        true => history::redo(|| (document.text(), document.cursor())),
+    match modifiers.shift() {
+        false => "undo".to_owned(),
+        true => "redo".to_owned(),
+    }
+}
+
+/// Apply the move [`page_history_shortcut`] named. An empty verdict is the
+/// identity, so the caller stays branch-free.
+pub fn page_history_key(document: Content, action: String) -> Content {
+    let restored = match action.as_str() {
+        "undo" => history::undo(|| (document.text(), document.cursor())),
+        "redo" => history::redo(|| (document.text(), document.cursor())),
+        _ => return document,
     };
     restored.unwrap_or(document)
 }
@@ -1119,40 +1133,44 @@ mod tests {
             PageEvent::Action(PageAction::Edit(Action::Edit(Edit::Insert('y')))),
         );
         assert_eq!(typed_doc.text(), "Title\nbody");
-        let undone = page_history_key(
-            typed_doc,
+        let undo = page_history_shortcut(
             Key::Unidentified,
             Physical::Code(Code::KeyZ),
             Modifiers::COMMAND,
             true,
         );
+        assert_eq!(undo, "undo");
+        let undone = page_history_key(typed_doc, undo);
         assert_eq!(undone.text(), "Title\nbod");
         // The caret returns to where the group STARTED, not to the origin.
         assert_eq!(
             undone.cursor().position,
             iced::widget::text_editor::Position { line: 1, column: 3 }
         );
-        let redone = page_history_key(
-            undone,
+        let redo = page_history_shortcut(
             Key::Unidentified,
             Physical::Code(Code::KeyZ),
             Modifiers::COMMAND | Modifiers::SHIFT,
             true,
         );
+        assert_eq!(redo, "redo");
+        let redone = page_history_key(undone, redo);
         assert_eq!(redone.text(), "Title\nbody");
         // …and redo puts it back where the caret sat when Cmd+Z was pressed.
         assert_eq!(
             redone.cursor().position,
             iced::widget::text_editor::Position { line: 1, column: 4 }
         );
-        // Off the pages tab the chord is the identity.
-        let parked = page_history_key(
-            redone,
+        // Off the pages tab the chord names no move — which is what keeps
+        // `global_key_pressed` from taking the buffer on an ordinary keystroke.
+        let parked_move = page_history_shortcut(
             Key::Unidentified,
             Physical::Code(Code::KeyZ),
             Modifiers::COMMAND,
             false,
         );
+        assert_eq!(parked_move, "");
+        let parked = page_history_key(redone, parked_move);
         assert_eq!(parked.text(), "Title\nbody");
         history::reset();
     }

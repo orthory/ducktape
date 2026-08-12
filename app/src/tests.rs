@@ -1341,6 +1341,96 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
     }
 }
 
+/// A MIRRORED VIEW READING IS ONLY AS GOOD AS ITS WRITERS, SO THE WRITERS ARE
+/// PINNED. Four fields exist purely so the view stops paying for them —
+/// `rooms`, `unread_channel_ids`, `post_refusal` and `active_dm` — because a
+/// `sync` extern takes every list BY VALUE and a call in a view expression is
+/// therefore a deep clone per frame (`rooms_only` also ran a SHA-256 per DM
+/// peer, twice a frame). The trade is real: a mirror that a writer forgets is a
+/// sidebar listing DMs under CHANNELS, an unread dot that never lights, a
+/// composer refused in a room she may post in, or a stranger's face over the
+/// header — none of which any type checker can see.
+///
+/// So the rule is mechanical and checked here: a handler that assigns any of a
+/// mirror's SOURCES assigns the mirror too. That is what makes mirroring
+/// cheaper than the per-frame call instead of six chances to drift, and it is
+/// the same shape as the caret-retire and room-mover lints above.
+#[test]
+fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
+    // (mirror, the sources whose movement invalidates it). `settings_user_key`
+    // is in two of them because THIS DEVICE'S KEY decides both which channels
+    // are its own DMs and whether it is seated in a members-only room.
+    const MIRRORS: [(&str, &[&str]); 4] = [
+        ("rooms", &["channels", "dm_peers", "settings_user_key"]),
+        ("unread_channel_ids", &["channels", "channel_reads"]),
+        (
+            "post_refusal",
+            &[
+                "channel_members",
+                "active_channel_archived",
+                "active_channel_members_only",
+                "settings_user_key",
+            ],
+        ),
+        ("active_dm", &["active_dm_peer", "dm_peers"]),
+    ];
+
+    // Every handler file, because a mirror's source can move in any of them.
+    macro_rules! handler_sources {
+        ($($path:literal),* $(,)?) => { [$(($path, include_str!($path))),*] };
+    }
+    let files = handler_sources![
+        "ui/handlers/chat.ice",
+        "ui/handlers/files.ice",
+        "ui/handlers/forge.ice",
+        "ui/handlers/huddle.ice",
+        "ui/handlers/lifecycle.ice",
+        "ui/handlers/node.ice",
+        "ui/handlers/onboarding.ice",
+        "ui/handlers/overlays.ice",
+        "ui/handlers/pages.ice",
+        "ui/handlers/roster.ice",
+    ];
+
+    // An ASSIGNMENT opens a statement line — prose naming a field, and a call
+    // that merely READS one, are not writes.
+    let assigns = |body: &str, field: &str| {
+        let statement = format!("{field} = ");
+        body.lines()
+            .any(|line| line.trim_start().starts_with(&statement))
+    };
+
+    let mut checked = 0usize;
+    for (path, source) in files {
+        for block in source
+            .split(
+                "
+on ",
+            )
+            .skip(1)
+        {
+            let handler = block.split('(').next().unwrap_or(block).trim();
+            let handler = handler.lines().next().unwrap_or(handler).trim();
+            for (mirror, sources) in MIRRORS {
+                let Some(moved) = sources.iter().find(|field| assigns(block, field)) else {
+                    continue;
+                };
+                checked += 1;
+                assert!(
+                    assigns(block, mirror),
+                    "{path}: `on {handler}` assigns `{moved}`, so it must also                      assign `{mirror}` — the view reads the mirror and never                      recomputes it (see state.ice)"
+                );
+            }
+        }
+    }
+    // The sweep must actually have found writers: a rename that silently
+    // stopped matching would otherwise pass with nothing checked at all.
+    assert!(
+        checked >= 20,
+        "the mirror sweep matched only {checked} writers — it has stopped seeing them"
+    );
+}
+
 /// CLOSING RETIRES THE LOAD THAT WOULD REOPEN WHAT YOU JUST LEFT. Every forge
 /// loader guards on generation equality alone, so a close that did not bump the
 /// generation answered its own in-flight read: `forge_repo_loaded` re-assigns
@@ -4931,9 +5021,10 @@ fn every_current_row_marker_rests_on_one_selection_token() {
 #[test]
 fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
     // The two reasons `post_gate` names, each driven through both composers.
-    for (reason, archived, members_only) in
-        [("channel_archived", true, false), ("members_only", false, true)]
-    {
+    for (reason, archived, members_only) in [
+        ("channel_archived", true, false),
+        ("members_only", false, true),
+    ] {
         let (mut app, _) = Ducktape::__boot();
         app.connected = true;
         app.loading = false;
@@ -4943,6 +5034,16 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
         // Empty roster: she is not seated, which is what `members_only` refuses.
         app.channel_members = Vec::new();
         app.settings_user_key = "me".into();
+        // The gate the composers re-ask is the MIRROR every handler that moves
+        // one of those four inputs writes — so the fixture writes it the same
+        // way, through `post_gate` itself, and the two reasons are still real.
+        app.post_refusal = backend::post_gate(
+            archived,
+            members_only,
+            app.channel_members.clone(),
+            app.settings_user_key.clone(),
+        );
+        assert_eq!(app.post_refusal, reason);
 
         app.message_editor = compose("into the void");
         let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
@@ -4982,6 +5083,16 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
         label: "me".into(),
     }];
     app.settings_user_key = "me".into();
+    app.post_refusal = backend::post_gate(
+        false,
+        true,
+        app.channel_members.clone(),
+        app.settings_user_key.clone(),
+    );
+    assert!(
+        app.post_refusal.is_empty(),
+        "a seated member is not refused"
+    );
 
     app.message_editor = compose("hello");
     let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
@@ -5444,6 +5555,115 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
 }
 
 /// One Cmd/Ctrl chord, shaped the way the keyboard subscription delivers it.
+/// AN ORDINARY KEYSTROKE IS NOT A CHORD, AND MUST NOT BE CHARGED AS ONE.
+/// `global_key_pressed` rides the app's ONE keyboard subscription, so it sees
+/// every letter typed into a composer. Its three `editor` self-assignments each
+/// lower to `mem::take(&mut self.<editor>)`, which leaves a `Content::default()`
+/// behind — a fresh cosmic-text buffer built under a WRITE lock on the
+/// process-global font system — so a letter used to pay three of them on the
+/// literal typing path, serialized against whatever the renderer was shaping.
+/// The handler now resolves all four verdicts up front and returns when the
+/// press names none of them.
+///
+/// The saving is invisible in state (a take hands the same document straight
+/// back), so the guard's POSITION is pinned in the source and its only real
+/// failure mode — refusing a press that should act — is driven here, one press
+/// per class the guard tests.
+#[test]
+fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
+    let overlays = inlined(include_str!("ui/handlers/overlays.ice"));
+    let body = overlays
+        .split_once("\non global_key_pressed(event)")
+        .expect("the keyboard handler")
+        .1;
+    let guard = body
+        .find("  return if empty(escape_key)")
+        .expect("the inert-press guard");
+    for take in [
+        "message_editor = composer_toggle_mark(",
+        "reply_editor = composer_toggle_mark(",
+        "page_editor = page_history_key(",
+    ] {
+        let at = body.find(take).expect(take);
+        assert!(
+            guard < at,
+            "`{take}…` takes the editor, so it must sit BELOW the inert-press guard"
+        );
+    }
+
+    fn plain(code: iced::keyboard::key::Code, key: iced::keyboard::Key) -> __IceKeyPress {
+        __IceKeyPress {
+            key,
+            modified_key: iced::keyboard::Key::Unidentified,
+            physical_key: iced::keyboard::key::Physical::Code(code),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }
+    }
+    let escape = || {
+        plain(
+            iced::keyboard::key::Code::Escape,
+            iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+        )
+    };
+
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.shell_tab = "chat".into();
+    app.active_channel = "general".into();
+    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+        editor::ComposerEvent::Apply(editor::RichAction::Edit(
+            iced::widget::text_editor::Action::Move(iced::widget::text_editor::Motion::DocumentEnd),
+        )),
+    ));
+    app.message_editor = compose("draft");
+
+    // Inert: a bare letter marks nothing and opens nothing.
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(plain(
+        iced::keyboard::key::Code::KeyB,
+        iced::keyboard::Key::Character("b".into()),
+    )));
+    assert_eq!(composer(&app), "draft", "a bare letter is not a mark");
+    assert!(!app.palette_open);
+
+    // …and every class the guard tests still gets through it.
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
+        iced::keyboard::key::Code::KeyB,
+    )));
+    assert_eq!(composer(&app), "****draft", "the chord still marks");
+
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
+        iced::keyboard::key::Code::KeyK,
+    )));
+    assert!(app.palette_open, "Cmd+K still opens the palette");
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape()));
+    assert!(!app.palette_open, "Escape still closes it");
+
+    app.channel_settings_open = true;
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape()));
+    assert!(
+        !app.channel_settings_open,
+        "and the escape ladder still runs below the guard"
+    );
+
+    // The pages chord is the third take, so it is driven too.
+    app.shell_tab = "pages".into();
+    app.page_editor = iced::widget::text_editor::Content::with_text("one");
+    pages::history::record(|| ("".to_owned(), app.page_editor.cursor()));
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
+        iced::keyboard::key::Code::KeyZ,
+    )));
+    assert_eq!(
+        app.page_editor.text(),
+        "",
+        "Cmd+Z on the pages tab still reaches the buffer"
+    );
+    pages::history::reset();
+}
+
 fn command_chord(code: iced::keyboard::key::Code) -> __IceKeyPress {
     __IceKeyPress {
         key: iced::keyboard::Key::Unidentified,
@@ -6009,11 +6229,7 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
         backend::first_unread_seq(app.messages.clone(), app.unread_boundary),
         31
     );
-    assert!(!backend::channel_is_unread(
-        app.channel_reads.clone(),
-        "random".into(),
-        50
-    ));
+    assert!(!app.unread_channel_ids.contains(&"random".to_owned()));
 
     // A same-channel live delta that brings a NEW message must NOT move
     // the frozen boundary — the divider would jump as you read.
@@ -6054,8 +6270,12 @@ fn unread_indicators_are_wired_client_local_only() {
     ));
 
     let screen = inlined(include_str!("ui/screens/chat.ice"));
+    // The flag reads a MIRROR, not a per-row extern call: `channel_is_unread`
+    // took the read-cursor list by value, so the sidebar cloned it once per
+    // channel, per frame — O(channels x reads) allocations for a badge that
+    // moves on a delta. `unread_channel_ids` is written where the cursors are.
     assert!(screen.contains(
-        "ChannelButton channel selected=(channel.id == active_channel) unread=channel_is_unread(channel_reads, channel.id, channel.head_seq)"
+        "ChannelButton channel selected=(channel.id == active_channel) unread=is_unread_channel(unread_channel_ids, channel.id)"
     ));
     // In-channel divider anchored on the first message past the frozen
     // boundary. The seq is a STATE FIELD recomputed where messages or the
