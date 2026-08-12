@@ -163,7 +163,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
               hovered bg=muted_bg border=control_line
               disabled bg=transparent value=muted
-            if !empty(search_hits)
+            if search_phase != "idle"
               button -> emit(clear_chat_search)
                 with
                   label="Clear message search"

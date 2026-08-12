@@ -7317,3 +7317,25 @@ fn the_chat_surface_holds_to_its_measured_geometry() {
     // mirror — which is what `DmPeer.channel_id` was added to make possible.
     assert!(screen.contains("unread=is_unread_channel(unread_channel_ids, peer.channel_id)"));
 }
+
+/// THE ZERO-HIT SEARCH CARD MUST STAY DISMISSABLE. The Clear-search × used to
+/// gate on `!empty(search_hits)`, but the float itself opens on
+/// `search_phase != "idle"` — so a `done && empty(search_hits)` search drew
+/// "No messages match" with no way to close it: not the × (hidden), not
+/// Escape (`chat-search` carries no `escape_target` layer), not re-pressing
+/// Enter (lands `done`+empty again), not clearing the field (the submit
+/// handler returns early on an empty query, leaving the phase untouched).
+/// Only a channel/DM switch or a reconnect ever wrote "idle" again. The ×
+/// must share the float's own gate, not a narrower one.
+#[test]
+fn the_clear_search_button_survives_a_zero_hit_result() {
+    let screen = inlined(include_str!("ui/screens/chat.ice"));
+    assert!(
+        screen.contains("if search_phase != \"idle\"\n") ,
+        "the float and the clear button read the same discriminant"
+    );
+    assert!(
+        !screen.contains("if !empty(search_hits)\n"),
+        "the clear control must not gate on hits — a done+empty search has none"
+    );
+}
