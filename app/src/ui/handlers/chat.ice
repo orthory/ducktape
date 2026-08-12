@@ -312,7 +312,12 @@ on chat_composer_event(event)
   pending_message_id = fresh_operation_id("message")
   message_draft = ""
   message_editor = editor("")
-  messages = optimistic_message(messages, pending_message, pending_message_id)
+  // The mint does not re-mark the runs — the rail mints through the same call
+  // and its `[root] ++ replies` vec must keep the first reply's header. This
+  // vec is a plain run, so it re-marks here: the pending row groups under the
+  // reader's previous message instead of drawing a header that vanishes the
+  // moment the settle delta replaces it.
+  messages = mark_author_runs(optimistic_message(messages, pending_message, pending_message_id))
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   error = ""
   run send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _

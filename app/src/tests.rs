@@ -5238,19 +5238,25 @@ fn a_pending_send_survives_a_history_page_without_poisoning_it() {
     );
 }
 
-/// TWO SENDS IN A ROW ARE ONE AUTHOR RUN.
+/// A SEND CONTINUES THE READER'S OWN RUN.
 ///
 /// The optimistic row used to be minted with a hand-written `"You"` while every
 /// committed row of the reader's own renders `"you"`, so `mark_message_groups`
-/// opened a run on it: the second send drew a full avatar + header that vanished
-/// — shifting the row up by the header's height — the moment the settle delta
-/// replaced it.
+/// opened a run on it: a send that followed one of your own drew a full avatar +
+/// header that vanished — shifting the row up by the header's height — the
+/// moment the settle delta replaced it. The COMMITTED row below is the fence:
+/// without it both rows are minted by the same call and carry the same label
+/// whatever literal it uses.
 #[test]
 fn consecutive_sends_stay_in_one_author_run() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
+    app.messages = vec![backend::ChatMessage {
+        author: "you".into(),
+        ..message(40, "landed a minute ago", false)
+    }];
 
     for body in ["first", "second"] {
         app.message_editor = compose(body);
@@ -5259,15 +5265,68 @@ fn consecutive_sends_stay_in_one_author_run() {
         ));
     }
 
-    assert_eq!(app.messages.len(), 2);
+    let authors: Vec<&str> = app
+        .messages
+        .iter()
+        .map(|message| message.author.as_str())
+        .collect();
     assert_eq!(
-        app.messages[0].author, app.messages[1].author,
-        "both rows are the reader's own and must carry one author label"
+        authors,
+        vec!["you", "you", "you"],
+        "the mint renders the reader the way a committed row of hers does"
     );
-    assert!(app.messages[0].show_author, "the first opens the run");
-    assert!(
-        !app.messages[1].show_author,
-        "the second continues it — no header to draw and then take away"
+    let headers: Vec<bool> = app
+        .messages
+        .iter()
+        .map(|message| message.show_author)
+        .collect();
+    assert_eq!(
+        headers,
+        vec![true, false, false],
+        "the committed row opens the run and both sends continue it — no header \
+         to draw and then take away"
+    );
+}
+
+/// THE RAIL IS NOT A PLAIN RUN, SO THE MINT MUST NOT RE-MARK IT.
+///
+/// A thread's vec is `[root] ++ replies` and the root renders as its own divided
+/// block, so `load_thread_data` marks the REPLIES only. Re-marking the whole vec
+/// when a reply is minted folds the first reply under a root that shares its
+/// author and swallows that reply's header — which then comes back on the next
+/// thread load: the same render jump, one pane over.
+#[test]
+fn a_minted_reply_keeps_the_first_reply_header() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.active_thread_seq = 7;
+    app.thread_messages = vec![
+        backend::ChatMessage {
+            author: "you".into(),
+            ..message(7, "the root", false)
+        },
+        backend::ChatMessage {
+            author: "you".into(),
+            ..message(8, "the first reply", false)
+        },
+    ];
+    app.reply_editor = compose("and one more");
+
+    let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+        editor::composer_submit_event(),
+    ));
+
+    let headers: Vec<bool> = app
+        .thread_messages
+        .iter()
+        .map(|message| message.show_author)
+        .collect();
+    assert_eq!(
+        headers,
+        vec![true, true, true],
+        "the root's header and the first reply's both stand"
     );
 }
 

@@ -761,6 +761,12 @@ pub fn settled_send_id(
 /// the moment the settle delta replaced it. Without a cached identity there is
 /// no handle to render, so the row stays unattributed and simply opens its own
 /// run, which is what an unknown author means everywhere else.
+///
+/// It does NOT re-mark the runs: the thread rail mints through here too, and
+/// its vec is `[root] ++ replies` — the root renders as its own divided block,
+/// so a whole-vec pass would fold the first reply under it and swallow that
+/// reply's header (see `load_thread_data`, which marks the replies only). The
+/// timeline re-marks at its call site, where the vec is a plain run.
 pub fn optimistic_message(
     mut messages: Vec<ChatMessage>,
     body: String,
@@ -796,7 +802,6 @@ pub fn optimistic_message(
         time: 0,
         reactions: Vec::new(),
     });
-    mark_message_groups(&mut messages);
     messages
 }
 

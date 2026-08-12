@@ -60,6 +60,7 @@ extern crate::backend
   load_older_messages(rpc:str, channel_id:str, before_seq:i64, generation:i64) -> HistoryPageData ! HydrationError
   sync fresh_operation_id(prefix:str) -> str
   sync optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
+  sync mark_author_runs(messages:[ChatMessage]) -> [ChatMessage]
   sync merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
   sync merge_message_send_result(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
   sync rollback_pending_message(messages:[ChatMessage], pending_id:str, committed:bool) -> [ChatMessage]
