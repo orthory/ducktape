@@ -100,22 +100,25 @@ on reveal_confirm
 
 on go_restore
   return if mutation_phase != "idle"
+  restore_words = ""
   onboarding_error = ""
   hub_step = "restore"
 
 on go_login
   return if mutation_phase != "idle"
+  restore_words = ""
   onboarding_error = ""
   hub_step = hub_entry_step(hub_key_state)
 
-on restore_submit(words, pw)
-  return if mutation_phase != "idle" || empty(trim(words)) || empty(pw)
+on restore_submit(pw)
+  return if mutation_phase != "idle" || empty(restore_words) || empty(pw)
   onboarding_error = ""
   password = pw
   mutation_phase = "onboarding"
-  run every restore_user_key(words, password) -> key_restored _ | login_failed _
+  run every restore_user_key(restore_words, password) -> key_restored _ | login_failed _
 
 on key_restored(_pubkey)
+  restore_words = ""
   mutation_phase = "idle"
   hub_key_state = "encrypted"
   hub_step = "networks"
@@ -189,6 +192,8 @@ on console_opened(id)
   rooms = []
   unread_channel_ids = []
   messages = []
+  node_log_filter = ""
+  node_log_timeline = node_log_timeline_reset()
   // The old network's history lane was invalidated above, so a socket that
   // never answers cannot keep "Load older" disabled in the new network.
   history_loading = false
@@ -319,25 +324,28 @@ on restore_hidden_submit
 // settles back into it through the provisioning/live screens.
 on go_join
   return if mutation_phase != "idle"
+  join_invite = ""
   hub_step = "join"
   onboarding_error = ""
 
 on go_networks
   return if mutation_phase != "idle"
+  restore_words = ""
+  join_invite = ""
   onboarding_error = ""
   hub_step = "networks"
   run replace lane=hub_state hub_state() -> hub_refreshed _
 
-on join_network_submit(blob)
-  return if mutation_phase != "idle" || empty(trim(blob))
-  onboarding_invite = trim(blob)
+on join_network_submit
+  return if mutation_phase != "idle" || empty(join_invite)
   onboarding_error = ""
   mutation_phase = "onboarding"
-  run every join_network(onboarding_invite) -> workspace_materialized _ | onboarding_failed _
+  run every join_network(join_invite) -> workspace_materialized _ | onboarding_failed _
 
 // The workspace now exists on disk. Point the app at its endpoint and start
 // watching for the node that will serve it.
 on workspace_materialized(init)
+  join_invite = ""
   mutation_phase = "idle"
   onboarding_chain = init.chain_id
   onboarding_name = init.chain_id

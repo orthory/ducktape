@@ -2,10 +2,14 @@
 // settings screen behind them, and leaving the workspace.
 
 on node_log_line(line)
-  node_log_lines = push_log_line(node_log_lines, line)
+  node_log_timeline = node_log_timeline_push(node_log_timeline, line)
 
 on node_log_filter_changed(next)
   node_log_filter = next
+  node_log_timeline = node_log_timeline_filter(node_log_timeline, next)
+
+on node_log_timeline_changed(event)
+  node_log_timeline = node_log_timeline_apply(node_log_timeline, event)
 
 on peers_loaded(next)
   return if next.generation != node_peers_generation

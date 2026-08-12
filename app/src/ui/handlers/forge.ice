@@ -142,13 +142,14 @@ on forge_comment_drop(anchor)
 on forge_review_submit
   return if !connected || forge_review_busy || empty(forge_repo) || forge_item_number <= 0
   forge_review_busy = true
-  run every submit_forge_review(connected_rpc, password, forge_repo, forge_item_number, forge_review_verdict, forge_review_draft, forge_item_source_oid, forge_comment_staged) -> forge_review_submitted _ | forge_review_failed _
+  run every submit_forge_review(connected_rpc, password, forge_repo, forge_item_number, forge_review_verdict, forge_review_draft, forge_item_source_oid, forge_comment_staged) -> forge_review_submitted(forge_repo, forge_item_number, _) | forge_review_failed(forge_repo, forge_item_number, _)
 
 // The staged comments went out INSIDE this review, so they are cleared with the
 // body. A failure keeps them — the whole submit is one transaction, and losing
 // a page of written comments to a transient RPC error is not recoverable.
-on forge_review_submitted(_result)
+on forge_review_submitted(started_repo, started_number, _result)
   forge_review_busy = false
+  return if started_repo != forge_repo || started_number != forge_item_number
   forge_review_draft = ""
   forge_review_verdict = "comment"
   forge_comment_staged = []
@@ -158,30 +159,30 @@ on forge_review_submitted(_result)
   forge_comment_draft = ""
   error = ""
 
-on forge_review_failed(cause)
+on forge_review_failed(started_repo, started_number, cause)
   forge_review_busy = false
+  return if started_repo != forge_repo || started_number != forge_item_number
   error = cause.message
 
 on forge_merge_submit
   return if !connected || forge_merge_busy || empty(forge_repo) || forge_item_number <= 0
   forge_merge_busy = true
   forge_merge_conflicts = []
-  run every merge_forge_pr(connected_rpc, password, forge_repo, forge_item_number, forge_item_source_branch, forge_item_source_oid, forge_item_target_oid) -> forge_merged _ | forge_merge_failed _
+  run every merge_forge_pr(connected_rpc, password, forge_repo, forge_item_number, forge_item_source_branch, forge_item_source_oid, forge_item_target_oid) -> forge_merged(forge_repo, forge_item_number, _) | forge_merge_failed(forge_repo, forge_item_number, _)
 
-on forge_merged(next)
+on forge_merged(started_repo, started_number, next)
   // RELEASED ABOVE THE IDENTITY CHECK, the same shape as `history_loaded`.
-  // This guard is on repo+number rather than on a generation, and
-  // `forge_close_item` zeroes `forge_item_number` — so closing an item mid-merge
-  // dropped the ONLY reply that lowers this flag, and `forge_merge_submit`
-  // returns early on it: the Merge button stayed disabled for the rest of the
-  // session. The body below still belongs to the item that asked.
+  // The launch route snapshots repo+number; `forge_close_item` zeroes the
+  // current number, so closing an item mid-merge rejects the body while this
+  // reply still lowers the one session-wide busy flag.
   forge_merge_busy = false
-  return if next.repo != forge_repo || next.number != forge_item_number
+  return if started_repo != forge_repo || started_number != forge_item_number
   forge_merge_conflicts = next.conflicts
   error = ""
 
-on forge_merge_failed(cause)
+on forge_merge_failed(started_repo, started_number, cause)
   forge_merge_busy = false
+  return if started_repo != forge_repo || started_number != forge_item_number
   error = cause.message
 
 on forge_composer_event(event)

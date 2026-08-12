@@ -308,6 +308,7 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
         with
           label="Switch repo"
           description=repo.name
+          checked=active
           w=fill
           p=0.0
           @icon_action
@@ -338,6 +339,7 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
         with
           label="Switch repo"
           description=repo.name
+          checked=active
           w=fill
           p=0.0
           @icon_action

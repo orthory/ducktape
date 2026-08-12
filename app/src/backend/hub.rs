@@ -406,16 +406,27 @@ pub async fn create_user_key(password: String) -> Result<KeyCreated, AppError> {
 
 /// `user key restore` — re-seal an identity from its 24 words under a new
 /// password. Returns the pubkey.
-pub async fn restore_user_key(words: String, password: String) -> Result<String, AppError> {
+pub async fn restore_user_key(
+    words: ui_lang_runtime::Secret,
+    mut password: String,
+) -> Result<String, AppError> {
     async {
-        let normalized = words.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = Zeroizing::new(
+            words
+                .expose()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
         if normalized.split(' ').count() != 24 {
             return Err("a recovery phrase is exactly 24 words".to_string());
         }
         let path = user_key_path()?;
+        let password_line = secret_line(&password);
+        password.zeroize();
         let input = secret_line(&normalized)?
             .into_iter()
-            .chain(secret_line(&password)?)
+            .chain(password_line?)
             .collect::<Vec<u8>>();
         let stdout = user_key_cli_raw(&["restore", "--out"], &path, input).await?;
         let pubkey = last_line(&stdout)?;

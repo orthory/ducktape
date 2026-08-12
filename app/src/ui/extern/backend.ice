@@ -90,7 +90,7 @@ extern crate::backend
   sync canonical_endpoint(input:str) -> str
   pure network_slug(name:str) -> str
   WorkspaceInit(chain_id:str, workspace:str, rpc:str)
-  join_network(blob:str) -> WorkspaceInit ! AppError
+  join_network(blob:secret) -> WorkspaceInit ! AppError
   mint_invite(workspace:str, role:str, ttl_days:i64) -> str ! AppError
   ProvisionStep(index:i64, label:str, state:str, settled:bool)
   stream provision_progress(workspace:str, rpc:str) -> ProvisionStep
@@ -110,7 +110,7 @@ extern crate::backend
   sync window_target(current:window-id?) -> window-id
   sync window_target_unless(keep:bool, current:window-id?) -> window-id
   create_user_key(password:str) -> KeyCreated ! AppError
-  restore_user_key(words:str, password:str) -> str ! AppError
+  restore_user_key(words:secret, password:str) -> str ! AppError
   unlock_user_key(password:str) -> str ! AppError
   lock_signer() -> bool
   remember_network(rpc:str) -> bool
@@ -175,15 +175,19 @@ extern crate::backend
   pure initial_of(name:str) -> str
   pure initials_of(name:str) -> str
   NodeLogLine(cursor:str, line:str)
-  LogParts(time:str, level:str, message:str)
-  pure split_log_line(line:str) -> LogParts
+  NodeLogTimelineState()
+  NodeLogTimelineEvent()
+  sync node_log_timeline_state() -> NodeLogTimelineState
+  sync node_log_timeline_reset() -> NodeLogTimelineState
+  pure node_log_timeline_push(state:NodeLogTimelineState, line:NodeLogLine) -> NodeLogTimelineState
+  pure node_log_timeline_filter(state:NodeLogTimelineState, filter:str) -> NodeLogTimelineState
+  pure node_log_timeline_apply(state:NodeLogTimelineState, event:NodeLogTimelineEvent) -> NodeLogTimelineState
+  component node_log_timeline(state:&NodeLogTimelineState, source:&str) -> NodeLogTimelineEvent
   NodeFacts(generation:i64, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, phase:str, phase_since:i64, sync_target:i64, sync_applied:i64, sync_retries:i64, sync_failures:i64, sync_last_error:str)
   load_node_facts(rpc:str, generation:i64) -> NodeFacts ! HydrationError
   pure optional_number(value:i64?) -> str
   PeerRow(key:str, role:str, live:bool)
   PeersData(generation:i64, peers:[PeerRow])
-  pure push_log_line(lines:[NodeLogLine], line:NodeLogLine) -> [NodeLogLine]
-  pure filter_log_lines(lines:[NodeLogLine], filter:str) -> [NodeLogLine]
   stream node_logs(rpc:str) -> NodeLogLine
   pure sync_label(phase:str, applied:i64, target:i64) -> str
   stream node_status_live(rpc:str) -> NodeFacts
@@ -207,7 +211,7 @@ extern crate::backend
   ForgeReview(author:str, author_name:str, verdict:str, body:str, commit:str, outdated:bool, created_at:i64, comments:[ForgeReviewComment])
   ForgeItemData(generation:i64, repo:str, number:i64, title:str, state:str, kind:str, body:str, author_name:str, branches:str, channel_id:str, source_branch:str, source_oid:str, target_oid:str, merge_oid:str, diff:str, diff_truncated:bool, files_changed:i64, additions:i64, deletions:i64, reviews:[ForgeReview], approvals:i64, change_requests:i64)
   ForgeDiscussionData(generation:i64, channel_id:str, messages:[ChatMessage], members:[ChatMember])
-  ForgeMergeOutcome(repo:str, number:i64, merged:bool, merge_oid:str, conflicts:[str])
+  ForgeMergeOutcome(merged:bool, merge_oid:str, conflicts:[str])
   ForgeLiveData(generation:i64, repos_loaded:bool, repos:[ForgeRepo], repo_loaded:bool, branches:[str], items:[ForgeItem], item_loaded:bool, item:ForgeItemData)
   load_forge(rpc:str, generation:i64) -> ForgeData ! HydrationError
   load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError

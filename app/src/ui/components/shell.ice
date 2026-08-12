@@ -575,6 +575,7 @@ component RailButton(item:NavItem)
       button -> emit(select_shell_tab, item.id)
         with
           label=item.title
+          checked=item.active
           w=58.0
           p=0.0
           @icon_action
@@ -602,6 +603,7 @@ component RailButton(item:NavItem)
       button -> emit(select_shell_tab, item.id)
         with
           label=item.title
+          checked=item.active
           w=58.0
           p=0.0
           @icon_action
@@ -710,6 +712,7 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
         button -> emit(select_shell_tab, "settings")
           with
             label="Settings"
+            checked=true
             p=8.0
             @icon_action
           Icon
@@ -724,6 +727,7 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
         button -> emit(select_shell_tab, "settings")
           with
             label="Settings"
+            checked=false
             p=8.0
             @icon_action
           Icon

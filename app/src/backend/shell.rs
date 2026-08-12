@@ -377,16 +377,22 @@ pub fn network_slug(name: String) -> String {
 
 /// Materialize this device's workspace from an invite blob:
 /// `ducktape node join <blob>`.
-pub async fn join_network(blob: String) -> Result<WorkspaceInit, AppError> {
+pub async fn join_network(blob: ui_lang_runtime::Secret) -> Result<WorkspaceInit, AppError> {
     async {
-        let blob = bounded_text(blob, "invite", 64 * 1024)?;
+        let blob = blob.expose().trim();
+        let valid = !blob.is_empty()
+            && blob.len() <= 64 * 1024
+            && !blob.chars().any(|character| character == '\0');
+        if !valid {
+            return Err("invite must be between 1 and 65536 bytes".into());
+        }
         // `join` reports progress on stderr, so the workspace it materialized
         // is identified by diffing the registry around the call.
         let before: BTreeSet<String> = registered_workspaces()
             .into_iter()
             .map(|(chain_id, _)| chain_id)
             .collect();
-        ducktape_cli(&["node", "join", &blob]).await?;
+        ducktape_cli(&["node", "join", blob]).await?;
         let chain_id = registered_workspaces()
             .into_iter()
             .map(|(chain_id, _)| chain_id)

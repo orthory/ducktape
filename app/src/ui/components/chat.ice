@@ -14,6 +14,7 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool, disable
           with
             label=channel.name
             disabled=disabled
+            checked=selected
             w=fill
             p=0.0
             @icon_action
@@ -85,6 +86,7 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool, disable
           with
             label=channel.name
             disabled=disabled
+            checked=selected
             w=fill
             p=0.0
             @icon_action
@@ -398,6 +400,7 @@ component ReactionChip(reaction:ChatReaction, seq:i64)
         with
           label="Remove reaction"
           description=reaction.emoji
+          checked=reaction.reacted_by_me
           p=0.0
           @icon_action
         box
@@ -441,6 +444,7 @@ component ReactionChip(reaction:ChatReaction, seq:i64)
         with
           label="Add reaction"
           description=reaction.emoji
+          checked=reaction.reacted_by_me
           p=0.0
           @icon_action
         box

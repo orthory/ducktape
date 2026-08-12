@@ -268,6 +268,8 @@ test launch_unlock_contract
         tier=""
         error=""
         busy=false
+        restore_empty=true
+        join_empty=true
       events
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
@@ -275,7 +277,7 @@ test launch_unlock_contract
         reveal_confirm -> reveal_confirm
         go_restore -> go_restore
         go_login -> go_login
-        restore_submit -> restore_submit _ _
+        restore_submit -> restore_submit _
         pick_network -> pick_network _
         open_network_submit -> open_network_submit
         forget_network_submit -> forget_network_submit _ _
@@ -283,7 +285,7 @@ test launch_unlock_contract
         restore_hidden_submit -> restore_hidden_submit
         go_join -> go_join
         go_networks -> go_networks
-        join_network_submit -> join_network_submit _
+        join_network_submit -> join_network_submit
         copy_onboarding_invite -> copy_onboarding_invite
         enter_console -> enter_console
   target pw = #hub/root/unlock/root/unlock-password
@@ -313,6 +315,8 @@ test launch_networks_empty_contract
         tier=""
         error=""
         busy=false
+        restore_empty=true
+        join_empty=true
       events
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
@@ -320,7 +324,7 @@ test launch_networks_empty_contract
         reveal_confirm -> reveal_confirm
         go_restore -> go_restore
         go_login -> go_login
-        restore_submit -> restore_submit _ _
+        restore_submit -> restore_submit _
         pick_network -> pick_network _
         open_network_submit -> open_network_submit
         forget_network_submit -> forget_network_submit _ _
@@ -328,7 +332,7 @@ test launch_networks_empty_contract
         restore_hidden_submit -> restore_hidden_submit
         go_join -> go_join
         go_networks -> go_networks
-        join_network_submit -> join_network_submit _
+        join_network_submit -> join_network_submit
         copy_onboarding_invite -> copy_onboarding_invite
         enter_console -> enter_console
   target cta = #hub/root/networks/root/join-cta
@@ -484,7 +488,6 @@ test settings_keyboard_scroll_contract
             node_sync_failures
             node_sync_last_error
             node_peers
-            node_log_lines
           events
             select_shell_tab -> select_shell_tab _
             reconnect -> reconnect
@@ -501,6 +504,8 @@ test settings_keyboard_scroll_contract
             node_log_filter_changed -> node_log_filter_changed _
             set_appearance_light -> set_appearance_light
             set_appearance_dark -> set_appearance_dark
+          activity_log:
+            extern node_log_timeline(node_log_timeline, settings_endpoint) #node-log-timeline -> node_log_timeline_changed _
       explorer:
         space w=1.0 h=1.0
       palette:
@@ -508,7 +513,11 @@ test settings_keyboard_scroll_contract
       bell:
         space w=1.0 h=1.0
   target body = #workspace-tabs/content/settings/settings-body
+  target overview_tab = #workspace-tabs/content/settings/settings-body/node-overview-tab
+  target activity_tab = #workspace-tabs/content/settings/settings-body/node-activity-tab
   expect body.content_height > body.visible_height
+  expect a11y overview_tab checked true
+  expect a11y activity_tab checked false
   expect body.scroll_y ~= 0.0
   key escape
   expect body.scroll_y ~= 0.0

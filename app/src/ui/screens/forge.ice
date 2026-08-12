@@ -123,6 +123,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
               button -> emit(forge_toggle_repo_menu)
                 with
                   label="Switch repository"
+                  expanded=repo_menu
                   w=fill
                   p=0.0
                   @ghost_action
@@ -211,6 +212,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 button -> emit(select_forge_tab, "code")
                   with
                     label="Browse the code"
+                    checked=(tab == "code")
                     p=0.0
                     @ghost_action
                   TabLabel
@@ -224,6 +226,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 button -> emit(select_forge_tab, "pulls")
                   with
                     label="Show pull requests"
+                    checked=(tab == "pulls")
                     p=0.0
                     @ghost_action
                   TabLabel
@@ -237,6 +240,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 button -> emit(select_forge_tab, "issues")
                   with
                     label="Show issues"
+                    checked=(tab == "issues")
                     p=0.0
                     @ghost_action
                   TabLabel
@@ -564,6 +568,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     button -> emit(forge_review_pick, "comment")
                       with
                         label="Pick comment verdict"
+                        checked=(review_verdict == "comment")
                         h=24.0
                         p=5.0
                         @ghost_action
@@ -574,6 +579,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     button -> emit(forge_review_pick, "approve")
                       with
                         label="Pick approve verdict"
+                        checked=(review_verdict == "approve")
                         h=24.0
                         p=5.0
                         @ghost_action
@@ -584,6 +590,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     button -> emit(forge_review_pick, "request_changes")
                       with
                         label="Pick request-changes verdict"
+                        checked=(review_verdict == "request_changes")
                         h=24.0
                         p=5.0
                         @ghost_action

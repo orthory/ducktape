@@ -1511,11 +1511,10 @@ on ",
 /// `forge_repo` and `forge_item_loaded` re-assigns `forge_item_number`, dropping
 /// the user straight back into the repo or item they had just backed out of.
 ///
-/// `forge_merged` is the one reply NOT keyed on the generation — it is guarded on
-/// repo + number, and `forge_close_item` zeroes the number. It therefore releases
-/// `forge_merge_busy` ABOVE that check: this reply is the only thing that lowers
-/// the flag and `forge_merge_submit` returns early on it, so closing an item
-/// mid-merge left the Merge button disabled for the rest of the session.
+/// Review and merge launches snapshot repo + number into their completion
+/// routes. That identity follows the request without requiring the backend to
+/// echo UI routing state, while the busy flag still comes down before a stale
+/// completion is rejected.
 #[test]
 fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
     let handlers = inlined(include_str!("ui/handlers/forge.ice"));
@@ -1588,13 +1587,15 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
     let _ = merging.__update(__DucktapeMessage::ForgeMergeSubmit);
     assert!(merging.forge_merge_busy);
     let _ = merging.__update(__DucktapeMessage::ForgeCloseItem);
-    let _ = merging.__update(__DucktapeMessage::ForgeMerged(backend::ForgeMergeOutcome {
-        repo: "core".into(),
-        number: 7,
-        merged: false,
-        merge_oid: String::new(),
-        conflicts: vec!["app/src/main.rs".into()],
-    }));
+    let _ = merging.__update(__DucktapeMessage::ForgeMerged(
+        "core".into(),
+        7,
+        backend::ForgeMergeOutcome {
+            merged: false,
+            merge_oid: String::new(),
+            conflicts: vec!["app/src/main.rs".into()],
+        },
+    ));
     assert!(
         !merging.forge_merge_busy,
         "closing an item mid-merge must not disable Merge for the rest of the session"
@@ -1602,6 +1603,55 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
     // The identity check still guards the BODY: that outcome describes an item
     // nobody has open, so nothing of it is rendered.
     assert!(merging.forge_merge_conflicts.is_empty());
+}
+
+#[test]
+fn forge_review_completion_cannot_clear_a_new_items_draft() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.forge_repo = "core".into();
+    app.forge_item_number = 7;
+    app.forge_review_draft = "review seven".into();
+
+    let _ = app.__update(__DucktapeMessage::ForgeReviewSubmit);
+    assert!(app.forge_review_busy);
+
+    app.forge_item_number = 8;
+    app.forge_review_draft = "review eight".into();
+    let _ = app.__update(__DucktapeMessage::ForgeReviewSubmitted(
+        "core".into(),
+        7,
+        true,
+    ));
+
+    assert!(!app.forge_review_busy);
+    assert_eq!(app.forge_review_draft, "review eight");
+}
+
+#[test]
+fn onboarding_capabilities_are_secret_buffers_cleared_on_navigation() {
+    let (mut app, _) = Ducktape::__boot();
+    let recovery = "duck ".repeat(24);
+    let invite = "duck-capability".to_string();
+
+    let _ = app.__update(__DucktapeMessage::__SecretTyped(
+        "restore_words".into(),
+        recovery.clone(),
+    ));
+    let _ = app.__update(__DucktapeMessage::__SecretTyped(
+        "join_invite".into(),
+        invite.clone(),
+    ));
+    assert_eq!(app.__ice_secrets.text("restore_words"), recovery);
+    assert_eq!(app.__ice_secrets.text("join_invite"), invite);
+    let snapshot = format!("{app:?}");
+    assert!(!snapshot.contains("duck-capability"));
+    assert!(!snapshot.contains("duck duck"));
+
+    let _ = app.__update(__DucktapeMessage::GoNetworks);
+    assert!(app.__ice_secrets.text("restore_words").is_empty());
+    assert!(app.__ice_secrets.text("join_invite").is_empty());
 }
 
 #[test]

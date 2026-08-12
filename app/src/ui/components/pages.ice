@@ -14,6 +14,7 @@ component PageButton(page:PageItem, selected:bool)
       button -> emit(choose_page, page.id)
         with
           label=page.title
+          checked=selected
           w=fill
           @ghost_action
           @px-12px
@@ -48,6 +49,7 @@ component PageButton(page:PageItem, selected:bool)
       button -> emit(choose_page, page.id)
         with
           label=page.title
+          checked=selected
           w=fill
           @ghost_action
           @px-12px

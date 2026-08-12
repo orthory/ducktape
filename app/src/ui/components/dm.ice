@@ -27,6 +27,7 @@ component DmButton(peer:DmPeer, selected:bool, unread:bool, disabled:bool)
           with
             label=peer.name
             disabled=disabled
+            checked=selected
             w=fill
             p=0.0
             @icon_action
@@ -61,6 +62,7 @@ component DmButton(peer:DmPeer, selected:bool, unread:bool, disabled:bool)
           with
             label=peer.name
             disabled=disabled
+            checked=selected
             w=fill
             p=0.0
             @icon_action

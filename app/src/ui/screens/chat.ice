@@ -214,6 +214,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               button -> emit(toggle_channel_create)
                 with
                   label="New channel"
+                  expanded=channel_create_open
                   disabled=(loading || mutation_phase != "idle" || !connected)
                   p=0.0
                   @icon_action
@@ -229,6 +230,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               button -> emit(toggle_channel_create)
                 with
                   label="Close new channel"
+                  expanded=channel_create_open
                   disabled=(loading || mutation_phase != "idle")
                   w=24.0
                   h=24.0
@@ -439,6 +441,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   button -> emit(toggle_channel_settings)
                     with
                       label="Channel details"
+                      expanded=channel_settings_open
                       w=27.0
                       h=25.0
                       p=0.0
@@ -1234,6 +1237,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   button -> emit(toggle_channel_settings)
                     with
                       label="Close channel details"
+                      expanded=channel_settings_open
                       w=28.0
                       h=28.0
                       p=0.0

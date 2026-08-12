@@ -138,6 +138,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
                 confirm -> emit(fs_delete_submit)
         button "History" -> emit(fs_toggle_history)
           with
+            expanded=history_open
             h=26.0
             p=5.0
             @secondary_action
@@ -672,6 +673,7 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
             button -> emit(pick_explorer_kind, "all")
               with
                 label="Show every result"
+                checked=(kind == "all")
                 p=0.0
                 @ghost_action
               FilterChip
@@ -687,6 +689,7 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                 with
                   label="Filter results by kind"
                   description=kind_count.label
+                  checked=(kind == kind_count.kind)
                   p=0.0
                   @ghost_action
                 FilterChip
@@ -940,6 +943,7 @@ component ExplorerBlockRow(block:ExplorerBlock, selected:bool)
       button -> emit(select_explorer_block, block.height)
         with
           label="Inspect block"
+          checked=selected
           w=fill
           p=6.0
           @ghost_action
@@ -951,6 +955,7 @@ component ExplorerBlockRow(block:ExplorerBlock, selected:bool)
       button -> emit(select_explorer_block, block.height)
         with
           label="Inspect block"
+          checked=selected
           w=fill
           p=6.0
           @ghost_action
