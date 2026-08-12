@@ -344,6 +344,10 @@ preset ui_palette_overlay
   state
     palette_open = true
     palette_draft = ""
+    // Every keystroke here launches a real `palette_search`. Pinned for the
+    // reason `ui_chat_stream` states at length: an empty endpoint is a
+    // fallback, not a refusal.
+    connected_rpc = "http://127.0.0.1:1"
 
 // The palette is an `overlay`, not a tinted box, so the backdrop takes the
 // pointer instead of letting clicks through to the console behind it. This
@@ -666,24 +670,41 @@ preset ui_chat_stream
     loading = false
     mutation_phase = "idle"
     error = ""
+    // THE ENDPOINT IS PINNED BECAUSE AN EMPTY ONE IS NOT INERT. `choose_channel`
+    // launches a real `load_channel_window`, and `rpc_client("")` does not
+    // refuse — it falls back to `$DUCKTAPE_NODE`, then to the dev box's
+    // `~/.ducktape` workspace registry, then to `DEFAULT_RPC`. So this test
+    // issued an HTTP request to whatever the machine running it happened to
+    // have, and the driver's 10s quiescence budget was the only thing between a
+    // slow answer and a red test (`DUCKTAPE_NODE` pointed at a blackhole fails
+    // it 100%). Port 1 on loopback can hold no listener — binding below 1024
+    // needs root — so the connect is refused immediately and the task settles
+    // on the dispatch, deterministically and off the network.
+    connected_rpc = "http://127.0.0.1:1"
     shell_tab = "chat"
     active_channel = "channel-a"
     active_channel_name = "general"
     messages = optimistic_message(messages, "The room she is looking at.", "pending-1")
 
-// THE SCROLL RESET IS THE `!empty(messages)` GATE. Nothing in the app calls
-// `scroll-to` on the timeline and nothing remembers a per-channel offset:
-// `choose_channel` empties `messages`, the gate around the stack goes false,
-// the scrollable unmounts, its offset dies with it, and the next room mounts a
-// fresh one at the tail. That is load-bearing behaviour resting on a widget's
-// LIFETIME, which is exactly the kind of thing a later "stop remounting the
-// scrollable" cleanup deletes without noticing — it would hand the new room the
-// offset the old one was left at, mid-scrollback.
+// THE GATE IS THE STREAM'S LIFETIME — IT IS NO LONGER THE SCROLL RESET. It was
+// both until the window cache landed: `choose_channel` emptied `messages`, the
+// `!empty(messages)` gate around the stack went false, the scrollable unmounted
+// and its offset died with it. A cache hit now goes non-empty → non-empty in
+// one reducer pass, the gate never renders false, and iced's positional diff
+// hands the surviving offset to the room being entered — so `choose_channel`
+// and `choose_dm` each end with `task widget scroll-to … 0.0 0.0` and ASSERT
+// the tail. `a_room_restored_from_the_cache_asserts_the_streams_tail` in
+// `tests.rs` is the fence over that half: every handler painting parked rows
+// must carry the operation.
 //
-// So this asserts the lifetime itself: `#chat/message-stream` exists with rows
-// and is GONE without them. (Virtualization note: offscreen rows leave the a11y
-// tree, so a test that wants a message ROW has to scroll it in first. This one
-// only wants the scrollable, which is always mounted when it exists at all.)
+// This is the other half, and it is still load-bearing: on a MISS the room goes
+// empty and the stream must actually be gone, or the app paints a live pane
+// around no rows. So it asserts the lifetime — `#chat/message-stream` exists
+// with rows and is GONE without them — which a later "stop remounting the
+// scrollable" cleanup would delete without noticing. (Virtualization note:
+// offscreen rows leave the a11y tree, so a test that wants a message ROW has to
+// scroll it in first. This one only wants the scrollable, which is always
+// mounted when it exists at all.)
 test message_stream_reset_contract
   preset ui_chat_stream
   viewport 1120 720

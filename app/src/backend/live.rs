@@ -510,12 +510,21 @@ pub fn resync_planes(load_chat: bool, load_pages: bool) -> String {
 // per-field keepers: apply a refreshed value only when its plane loaded —
 // the Ice handler assigns every field unconditionally and these self-select.
 
+/// The channel keeper folds rather than replaces — [`upsert_channel_rows`]
+/// states why — and it owns the loaded pick so the fold is never paid for on a
+/// plane-only resync, which is most of them. Written as an argument
+/// (`keep_channels(loaded, upsert_channel_rows(channels, next), channels)`) the
+/// upsert ran on every pages-only refresh and was thrown away one call later.
+/// Same early-return shape as [`resynced_messages`] below.
 pub fn keep_channels(
     loaded: bool,
     next: Vec<ChatChannel>,
     current: Vec<ChatChannel>,
 ) -> Vec<ChatChannel> {
-    if loaded { next } else { current }
+    if !loaded {
+        return current;
+    }
+    upsert_channel_rows(current, next)
 }
 
 /// The committed `seq` range of a timeline window, or `None` when it holds no

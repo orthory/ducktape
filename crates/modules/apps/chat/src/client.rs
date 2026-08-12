@@ -1755,6 +1755,20 @@ mod tests {
         assert!(spans.iter().any(|span| span.highlight));
         assert!(spans.iter().all(|span| !span.text.contains("**")));
 
+        // A LINK SPAN IS ALWAYS HIGHLIGHTED — `highlight = link.is_some() ||
+        // mention` up in `word_spans`, and the view's arms are carved out of
+        // that. It paints a link with `!empty(span.link)`, a mention with
+        // `span.highlight && empty(span.link)`, and the four plain runs with
+        // `!span.highlight && …`; a link span that came back unhighlighted
+        // would match the link arm AND a plain arm and render the URL twice.
+        let links_are_highlighted = spans
+            .iter()
+            .all(|span| span.link.is_empty() || span.highlight);
+        assert!(
+            links_are_highlighted,
+            "a span carrying a link must be highlighted, or the view draws it twice"
+        );
+
         assert!(plain_rich_spans("no marks here").is_empty());
         assert!(plain_rich_spans("**multi**\nline").is_empty());
     }
