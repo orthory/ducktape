@@ -531,11 +531,28 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           h=shrink
                           anchor-y=end
                           auto=true
+                        // VIRTUALIZED. Only the rows the viewport can see are
+                        // laid out, so the timeline no longer shapes text for
+                        // scrollback nobody is looking at — the mount stopped
+                        // being linear in how far back she paged.
+                        //
+                        // 44px is the middle of a real row: a run header (avatar
+                        // + name line + body over 12px of card padding) runs
+                        // ~54, a grouped continuation ~31. Biased low on purpose
+                        // — too small over-mounts for one pass and corrects
+                        // itself, too large leaves a gap at the bottom until the
+                        // next.
+                        //
+                        // The scroll above is anchor-y=end, and this needs it:
+                        // measuring a never-seen row ABOVE the viewport moves
+                        // everything below it, and only a bottom-anchored offset
+                        // carries the visible rows along with it.
                         col
                           with
                             w=fill
                             gap=3.0
                             pr=6.0
+                            virtual-row=44.0
                           if has_older_history
                             box
                               with

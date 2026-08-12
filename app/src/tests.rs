@@ -1547,6 +1547,24 @@ fn history_windows_offer_a_jump_back_to_latest() {
 }
 
 #[test]
+fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
+    let chat = inlined(include_str!("ui/screens/chat.ice"));
+    // Only the rows the viewport can see are laid out, which is what lets the
+    // timeline hold a whole channel without paying a text layout per row.
+    let above = chat
+        .split_once("col w=fill gap=3.0 pr=6.0 virtual-row=44.0")
+        .expect("the message timeline is a virtual-row column")
+        .0;
+    // That is only correct under an end-anchored scroll: measuring a row ABOVE
+    // the viewport moves everything below it, and a bottom-anchored offset is
+    // what carries the visible rows along with it. The two travel together —
+    // the thread rail's own scroll sits further down the file, past the split.
+    // `h=shrink` is the composer-anchored height: the virtual column reports a
+    // whole-list estimate, so a long timeline still hits the box's cap.
+    assert!(above.contains("scroll dir=vertical w=fill h=shrink anchor-y=end auto=true"));
+}
+
+#[test]
 fn message_actions_require_explicit_intent() {
     let (mut app, _) = Ducktape::__boot();
     app.mutation_phase = "idle".into();

@@ -2185,25 +2185,6 @@ fn reply_settle_flash_mirrors_the_stream_for_the_thread_rail() {
 }
 
 #[test]
-fn leaving_chat_prunes_scrollback_to_one_load() {
-    let mut messages = Vec::new();
-    for seq in 0..(CHAT_TIMELINE_ROOT_LIMIT + 50) {
-        messages = optimistic_message(messages, format!("m{seq}"), format!("id-{seq}"));
-    }
-    // Staying on chat keeps the paged-in scrollback…
-    let kept = trim_timeline_on_leave("chat".into(), messages.clone());
-    assert_eq!(kept.len(), CHAT_TIMELINE_ROOT_LIMIT + 50);
-    // …and leaving prunes to one load's worth, newest rows surviving.
-    let trimmed = trim_timeline_on_leave("pages".into(), messages);
-    assert_eq!(trimmed.len(), CHAT_TIMELINE_ROOT_LIMIT);
-    assert_eq!(
-        trimmed.last().unwrap().body,
-        format!("m{}", CHAT_TIMELINE_ROOT_LIMIT + 49)
-    );
-    assert_eq!(trimmed.first().unwrap().body, "m50");
-}
-
-#[test]
 fn send_settle_flash_fires_only_for_own_pending_rows() {
     let pending = optimistic_message(Vec::new(), "hello".into(), "message-a".into());
     let mut settled_row = pending[0].clone();
@@ -3015,6 +2996,72 @@ async fn timeline_pages_past_thread_only_traffic() {
     assert_eq!(sparse.next_reply_offset, -1);
     assert_eq!(sparse.messages.len(), 2);
     assert_eq!(sparse.messages[1].body, "reply 256");
+    sim.shutdown();
+}
+
+/// The page that carried the walk past the root quota is kept whole rather
+/// than trimmed back to it. Those rows already came over the wire, so
+/// discarding them would only mean fetching them again on the first "Load
+/// older messages" click — and the timeline that mounts them is virtualized,
+/// so holding them costs no layout. The quota bounds round trips, not rows.
+#[tokio::test(flavor = "current_thread")]
+async fn a_timeline_load_keeps_the_page_that_crossed_the_root_quota() {
+    let storage = tempfile::tempdir().unwrap();
+    let sim = simnode::boot(
+        storage.path(),
+        "127.0.0.1:0".parse().unwrap(),
+        simnode::SimOpts {
+            auto: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let origin = format!("http://{}", sim.addr());
+    let rpc = RpcClient::new(&origin).unwrap();
+    let signer = ed25519::PrivateKey::from_seed(9);
+
+    submit_test(
+        &rpc,
+        &signer,
+        1,
+        "chat",
+        chat::encode_msg(&ChatMsg::CreateChannel {
+            channel_id: "general".into(),
+            name: "General".into(),
+            post_policy: PostPolicy::Open,
+        }),
+    )
+    .await;
+
+    // Comfortably past the quota, and still inside one 256-row page, so the
+    // walk crosses the quota and stops within a single fetch.
+    let roots = CHAT_TIMELINE_ROOT_QUOTA + 20;
+    for index in 0..roots {
+        submit_test(
+            &rpc,
+            &signer,
+            index as u64 + 2,
+            "chat",
+            chat::encode_msg(&ChatMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: format!("root-{index}"),
+                blocks: vec![chat::Block::paragraph(format!("root {index}"))],
+                thread: None,
+                as_agent: None,
+            }),
+        )
+        .await;
+    }
+
+    let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
+    assert_eq!(
+        chat.messages.len(),
+        roots,
+        "the crossing page is returned whole; trimming it back to the quota \
+         would re-fetch these rows on the first Load older click"
+    );
+    assert_eq!(chat.messages[0].body, "root 0");
+    assert_eq!(chat.messages[roots - 1].body, format!("root {}", roots - 1));
     sim.shutdown();
 }
 

@@ -71,7 +71,6 @@ extern crate::backend
   sync settled_reply_id(thread:[ChatMessage], delta:ChatDelta, active_channel:str, current:str) -> str
   sync append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
   sync merge_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
-  sync trim_timeline_on_leave(tab:str, messages:[ChatMessage]) -> [ChatMessage]
   sync history_has_older(messages:[ChatMessage]) -> bool
   sync oldest_message_seq(messages:[ChatMessage]) -> i64
   sync prepend_history(messages:[ChatMessage], older:[ChatMessage]) -> [ChatMessage]

@@ -316,13 +316,18 @@ pub(crate) async fn load_messages(
 /// Walk a channel's history backward from `cursor` in view-sized pages, keeping
 /// only thread roots, oldest first.
 ///
-/// Bounded at BOTH ends. It stops at [`CHAT_TIMELINE_ROOT_LIMIT`] roots as it
-/// always did, and now also after [`CHAT_TIMELINE_MAX_PAGES`] pages: replies are
-/// filtered client-side, so a channel whose traffic is mostly thread replies
-/// never fills the root quota and used to walk head→1 in 256-row hops with the
-/// message list blank the whole time. Stopping early leaves
-/// [`history_has_older`] true, so the "Load older messages" button covers the
-/// rest — one bounded page per click instead of one unbounded walk per open.
+/// Both bounds here are on ROUND TRIPS, not on rows. It stops asking once it
+/// holds [`CHAT_TIMELINE_ROOT_QUOTA`] roots, and after [`CHAT_TIMELINE_MAX_PAGES`]
+/// pages regardless: replies are filtered client-side, so a channel whose
+/// traffic is mostly thread replies never fills the root quota and used to walk
+/// head→1 in 256-row hops with the message list blank the whole time. Stopping
+/// early leaves [`history_has_older`] true, so the "Load older messages" button
+/// covers the rest — one bounded page per click instead of one unbounded walk
+/// per open.
+///
+/// The final page is returned whole. It is already in memory, the timeline that
+/// mounts it is virtualized, and trimming it back to the quota would only mean
+/// fetching the same rows again on the first "Load older messages" click.
 async fn walk_roots_back(
     rpc: &RpcClient,
     channel_id: &str,
@@ -331,7 +336,7 @@ async fn walk_roots_back(
     let mut fetched = 0;
     let mut roots = Vec::new();
     while cursor > 0 {
-        let quota_filled = roots.len() >= CHAT_TIMELINE_ROOT_LIMIT;
+        let quota_filled = roots.len() >= CHAT_TIMELINE_ROOT_QUOTA;
         // The page bound applies only once the walk has something to show. An
         // empty page would return no roots, leave `oldest_message_seq` exactly
         // where it was, and turn "Load older messages" into a button that can
@@ -365,8 +370,6 @@ async fn walk_roots_back(
         cursor = from_seq - 1;
     }
     roots.sort_by_key(|row| row.seq);
-    let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
-    roots.drain(..excess);
     Ok(roots)
 }
 
@@ -386,19 +389,6 @@ pub struct HistoryPageData {
 /// there is older history to page in.
 pub fn history_has_older(messages: Vec<ChatMessage>) -> bool {
     messages.first().is_some_and(|message| message.seq > 1)
-}
-
-/// Leaving the Chat tab prunes paged-in scrollback back to one load's worth.
-/// Re-entering chat cold-rebuilds every mounted row in a single frame, so the
-/// mount cost must not compound with how far someone once paged back —
-/// "Load older messages" re-earns the rest on demand.
-pub fn trim_timeline_on_leave(tab: String, mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    if tab != "chat" && messages.len() > CHAT_TIMELINE_ROOT_LIMIT {
-        let excess = messages.len() - CHAT_TIMELINE_ROOT_LIMIT;
-        messages.drain(..excess);
-        mark_message_groups(&mut messages);
-    }
-    messages
 }
 
 /// The seq of the oldest loaded root (the ceiling for the next older page).
