@@ -324,7 +324,14 @@ on live_updated(next)
   //
   // The READ CURSOR takes the strict gate either way: posting into a room you
   // are reading backwards is not being caught up on it.
-  let live_tail_channel = keep_str(!history_view, active_channel, "")
+  //
+  // AND NOBODY READS A PANE THAT IS NOT MOUNTED. The live feed is subscribed on
+  // `connected`, not on the tab, so an arrival while the reader is in Settings
+  // or Files used to mark the last-opened room read on the spot: she came back
+  // to no divider, and every OTHER room badged while that one stayed dark. The
+  // rows still fold in (`live_fold_channel` below is untouched) — only the
+  // cursor waits, and `select_shell_tab` moves it when she actually returns.
+  let live_tail_channel = keep_str(!history_view && shell_tab == "chat", active_channel, "")
   let live_fold_channel = keep_str(!history_view || animation.value(send_flash), active_channel, "")
   messages = apply_chat_messages(messages, next.chat, live_fold_channel)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
@@ -406,14 +413,36 @@ on live_updated(next)
 on live_resynced(next)
   return if next.generation != hydration_generation
   hydration_retry_attempt = 0
-  channels = keep_channels(next.chat_loaded, next.channels, channels)
+  // FOLD, DO NOT REPLACE — the same rule `chat_updated` states, for the same
+  // reason. This read left the node several queries ago, and `channel_reads` is
+  // NOT reverted with it, so a flat assignment walked a third room's `head_seq`
+  // back under a cursor that stayed put: `head_seq > last_read` went false and
+  // the badge a mid-flight post lit went out, dark until that room got another
+  // message. `upsert_channel_rows` keeps `head_seq` monotonic and keeps a row
+  // the answer does not carry at all — a channel created while it was in flight.
+  //
+  // IT IS NOT A FULL MERGE, and the rest of the row is the snapshot's: a rename
+  // or an archive folded during the round trip is overwritten here. That one
+  // self-heals — the next chat-carrying resync re-reads the renamed row — where
+  // the badge did not, which is why only the cursor's invariant is enforced.
+  channels = keep_channels(next.chat_loaded, upsert_channel_rows(channels, next.channels), channels)
   channel_reads = initial_channel_reads(channels, channel_reads)
-  // A resync that carried chat replaced the window with `load_chat_data`'s
-  // LATEST page, so the banner it left up described rows that are no longer on
-  // screen — see `chat_hit_loaded`. One that carried no chat kept the window
-  // and keeps the banner with it.
+  // SAME FOLD, ONE LINE ABOVE THE BANNER, because it reads `history_view` while
+  // it is still the window's own answer. `load_chat_data` replies with the
+  // LATEST page however far back the reader has paged, so assigning it back
+  // dropped every "Load older" page she had loaded — on a huddle join in the
+  // room on screen, a ws reconnect, or any chat op the delta path cannot fold.
+  // `resynced_messages` splices the fresh tail onto the rows she is looking at,
+  // and falls back to the replace whenever the two do not overlap — a history
+  // window, or a tail the client lagged too far behind to still reach — because
+  // a merge across a gap leaves a hole nothing can page in. It takes
+  // `chat_loaded` itself rather than sitting under an outer loaded-pick: most
+  // resyncs are plane-only, and the merge is a full copy of the window.
+  messages = resynced_messages(next.chat_loaded, next.messages, messages, active_channel, next.active_channel, history_view)
+  // A resync that replaced the window left the banner describing rows that are
+  // no longer on screen — see `chat_hit_loaded`. One that carried no chat kept
+  // the window and keeps the banner with it.
   history_view = history_view && !next.chat_loaded
-  messages = keep_messages(next.chat_loaded, merge_pending_messages(next.messages, messages, active_channel, next.active_channel, ""), messages)
   has_older_history = history_has_older(messages)
   // A resync can move the room WITHOUT a launch that abandoned the request, so
   // this is the one dropper that must ask. Conditional, not a flat clear: a
@@ -487,9 +516,23 @@ on live_resynced(next)
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = keep_members(next.chat_loaded, next.channel_members, channel_members)
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
+  // THE READ CURSOR TAKES THE LIVE FOLD'S TWO GATES, and it has to: a
+  // PLANE-ONLY resync lands here on every files write, valset change, identity
+  // or agent or governance op — routine traffic the reader causes herself by
+  // saving a file — and an ungated mark from one of those undid both of the
+  // answers this file just gave. Off-tab: the arrival `live_updated` refused to
+  // mark read got marked read anyway on her next save, so the divider
+  // `select_shell_tab` freezes had nothing left to name. On a search hit: the
+  // room was marked read to a head she never reached while her
+  // `MessageWindow::Around` window — and the banner — were still on screen.
+  //
+  // A CHAT-CARRYING resync is the one landing that legitimately catches up:
+  // `history_view` is lowered above and the tail is what she is looking at, so
+  // it takes the mark like `chat_updated` does — if she is on the tab.
+  let resync_tail_channel = keep_str(!history_view && shell_tab == "chat", active_channel, "")
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
-  channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
+  channel_reads = mark_channel_read(channel_reads, resync_tail_channel, channel_head_seq(channels, resync_tail_channel))
   rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // A resync carries whatever page was active WHEN IT WAS ISSUED and takes
@@ -554,6 +597,40 @@ on live_resynced(next)
   // page would be overwritten with a blank one it never loaded.
   let resynced_buffer_is_clean = page_text(page_editor) == page_saved_text
   buffer_page = keep_str(resynced_buffer_is_clean && pages_answer_is_current, active_page, buffer_page)
+  // THE RECOVERY'S TERMINAL. `mutation_failed` parks the lock at "recovering"
+  // for a write the node COMMITTED and then failed to read back, and launches
+  // this resync to learn what actually landed — but nothing ever released it:
+  // every other writer of "idle" sits behind a `mutation_phase != "idle"` guard
+  // it can no longer pass, so the whole sidebar stayed disabled (and the
+  // titlebar stuck on "Syncing…") until Settings → Reconnect. The state the
+  // lock was protecting is known good exactly here, and `live_resync_failed`
+  // retries forever, so this is the one landing that can end it — the same
+  // shape `block_threads_recovered`/`_recovery_failed` already uses in pages.
+  //
+  // IT RELEASES EITHER ORIGIN'S RECOVERY — `block_comment_post_failed` parks the
+  // same phase, and this landing cannot tell whose it is holding. That is a
+  // sidebar unlocked while the comment rail is still refetching, no worse; what
+  // it must NOT become is a lock released twice, so those two pages terminals
+  // now take the same `== "recovering"` term rather than flatly writing "idle"
+  // over whatever mutation started in the gap.
+  //
+  // AND IT IS STILL ORPHANABLE — the known ceiling, named here because the guard
+  // at the top of this handler is where it bites. `mutation_failed` bumps
+  // `hydration_generation` to launch its recovery, and ANY later bump makes the
+  // answer stale, so `return if next.generation != hydration_generation` drops
+  // it and the `live_resync_failed` retry chain with it. Almost every bumper is
+  // behind a `mutation_phase != "idle"` guard "recovering" cannot pass; the ones
+  // that are NOT are the two acts that deliberately run outside the lock — a
+  // message send (`message_composer_event`, `reply_composer_event`) and a
+  // reaction tap (`add_reaction_submit`, `add_reaction_at`,
+  // `remove_reaction_at`) — none of which launch a replacement on the
+  // `live_resync` lane. One of those inside the recovery's round trip leaves the
+  // lock held with no terminal again, and Settings → Reconnect (whitelisted for
+  // "recovering" at the top of this file) is the escape. Closing it means giving
+  // the recovery a generation of its own rather than riding this one, which is a
+  // wider change than the lock is worth today: this is strictly the residue of a
+  // case that used to be unconditional.
+  mutation_phase = keep_str(mutation_phase == "recovering", "idle", mutation_phase)
   error = ""
   block_comments_generation = block_comments_generation + 1
   live_thread_generation = live_thread_generation + 1
@@ -606,7 +683,24 @@ on select_shell_tab(next)
   // Every handler that writes `shell_tab` retires it, linted in tests.rs.
   composer_focus = "none"
   has_older_history = history_has_older(messages)
+  // A RETURN TO THE CHAT TAB IS A CHANNEL ENTRY, and it is the other half of
+  // `live_updated`'s tab gate: the cursor stood still while the pane was
+  // unmounted, so this is where the room she is coming back to is caught up —
+  // after the divider naming what arrived in her absence is frozen, which has
+  // to happen BEFORE the cursor moves past it.
+  //
+  // `chat_tab_channel` carries all three gates: on any other tab it is "" and
+  // every line is inert (`mark_channel_read` refuses an empty channel), and a
+  // history window is no more caught up here than it is in the live fold. The
+  // boundary re-freezes only when the room actually grew unread rows, so a tab
+  // round trip with nothing new keeps the divider she left on screen.
+  let chat_tab_channel = keep_str(shell_tab == "chat" && !history_view, active_channel, "")
+  let chat_tab_arrivals = channel_head_seq(channels, chat_tab_channel) > channel_last_read(channel_reads, chat_tab_channel)
+  unread_boundary = keep_i64(chat_tab_arrivals, channel_last_read(channel_reads, chat_tab_channel), unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
+  channel_reads = mark_channel_read(channel_reads, chat_tab_channel, channel_head_seq(channels, chat_tab_channel))
+  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // A hydration error belongs to the pane that raised it. Leaving it up after
   // a navigation tells the user the pane they just opened is broken, which is
   // a lie the banner has no way to walk back — it is dismissed by hand or not

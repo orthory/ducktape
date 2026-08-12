@@ -529,7 +529,17 @@ on chat_hit_loaded(next)
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
-  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
+  // AND NO READ MARK, which is the one line this handler must NOT copy from
+  // `chat_updated`. The rows in hand are `MessageWindow::Around(hit)`, not the
+  // tail, and search is workspace-wide — so a hit clicked in a room with 80
+  // unread would move the cursor to a head the reader has demonstrably not
+  // reached, and `mark_channel_read` only ever moves forward, so the badge
+  // `chat_sidebar_rooms` paints off that cursor would go out for good.
+  // `live_updated` refuses exactly this write for a history window, and
+  // `history_view = true` above says this is one. "Jump to latest" routes
+  // through `choose_channel` -> `chat_updated`, which marks the room read when
+  // she actually reaches the tail. The sidebar mirrors still refresh: the
+  // `channels` fold above moved, even though the cursor did not.
   rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_channel = next.active_channel
@@ -1036,6 +1046,15 @@ on reaction_acked(_result)
 // no rollback token (the fold is not invertible under concurrent deltas), so
 // the canonical refetch IS the revert — committed or not. No phase to reset:
 // reactions run outside the mutation lock.
+//
+// IT REVERTS WHAT THE CANONICAL PAGE COVERS, which is the tail. A tap on a row
+// the reader had paged BACK to is outside `load_chat_data`'s last-N-roots
+// answer, so `resynced_messages` finds no canonical row to win on `rev` with
+// and the phantom chip rides along until she re-enters the room. Taking it back
+// there needs the failing (seq, emoji) carried to the landing — this cause
+// carries a message and nothing else — and the alternative, replacing the whole
+// window on this one path, throws away the scrollback that fold exists to keep.
+// One stale chip on an old row is the cheaper lie.
 on reaction_failed(cause)
   error = cause.message
   hydration_generation = hydration_generation + 1

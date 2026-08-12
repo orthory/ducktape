@@ -518,12 +518,72 @@ pub fn keep_channels(
     if loaded { next } else { current }
 }
 
-pub fn keep_messages(
+/// The committed `seq` range of a timeline window, or `None` when it holds no
+/// committed row at all. Pending sends carry `seq == -1` and answer for nothing
+/// (the same rule `oldest_committed` states in `load.rs`).
+fn committed_seq_span(rows: &[ChatMessage]) -> Option<(i64, i64)> {
+    let mut seqs = rows
+        .iter()
+        .filter(|row| !row.pending && row.seq > 0)
+        .map(|row| row.seq);
+    let first = seqs.next()?;
+    Some(seqs.fold((first, first), |(oldest, newest), seq| {
+        (oldest.min(seq), newest.max(seq))
+    }))
+}
+
+/// FOLD THE RESYNC'S PAGE ONTO THE WINDOW ON SCREEN — do not replace it.
+///
+/// [`load_chat_data`] answers with the LATEST page (the last
+/// `CHAT_TIMELINE_ROOT_QUOTA` roots) no matter how far back the reader has
+/// paged, so assigning it back threw away every "Load older" page she had
+/// loaded — and, the scrollable staying mounted at `anchor-y=end`, clamped her
+/// offset onto the top of the suddenly-short window. The trigger is ordinary: a
+/// huddle join/leave in the room on screen, a websocket reconnect, a chat op the
+/// delta path cannot fold, or any of the three chat failure resyncs.
+///
+/// So the tail path merges with [`merge_message_send_result`] — union by `seq`
+/// with the canonical row winning on `rev`, pending rows re-appended at the
+/// tail — and regroups, because the retained rows and the canonical page each
+/// carry the author runs of their own page and the seam between them would
+/// otherwise draw a duplicate (or swallow a) run header.
+///
+/// A SPLICE THAT DOES NOT TOUCH REPLACES INSTEAD, and the fresh page wins.
+/// Merging two windows that do not overlap leaves a HOLE in the middle that
+/// nothing can ever page in: "Load older" walks back from `oldest_message_seq`,
+/// which is now the far-back end, so it steps past the gap forever
+/// (`handlers/chat.ice` states the same hazard for the search window). Two
+/// landings are non-contiguous — a `history_view` window, which is a snapshot
+/// around one old hit; and a tail the client fell too far behind to still
+/// reach, which is what `ModuleEvent::Lagged` means: the missed ops are never
+/// replayed, so the canonical page can start past the newest row on screen. One
+/// overlapping `seq` is the whole test — thread replies leave gaps in the root
+/// sequence, so "the pages abut" is not `+1`.
+pub fn resynced_messages(
     loaded: bool,
     next: Vec<ChatMessage>,
     current: Vec<ChatMessage>,
+    current_channel: String,
+    next_channel: String,
+    history_view: bool,
 ) -> Vec<ChatMessage> {
-    if loaded { next } else { current }
+    // the plane-only resync, which is most of them: no chat came back, so the
+    // window on screen IS the answer and the merge below is never paid for.
+    if !loaded {
+        return current;
+    }
+    let pages_overlap = match (committed_seq_span(&next), committed_seq_span(&current)) {
+        (Some((oldest_canonical, _)), Some((_, newest_held))) => oldest_canonical <= newest_held,
+        _ => false,
+    };
+    let splice_is_continuous = !history_view && pages_overlap;
+    if !splice_is_continuous {
+        return merge_pending_messages(next, current, current_channel, next_channel, String::new());
+    }
+    let mut merged =
+        merge_message_send_result(next, current, current_channel, next_channel, String::new());
+    mark_message_groups(&mut merged);
+    merged
 }
 
 pub fn keep_members(
