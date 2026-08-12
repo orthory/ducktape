@@ -1,7 +1,7 @@
 //! an in-process node for the MCP e2e, over noded's shared in-proc daemon
 //! testkit: a REAL `host::Host::genesis` with the agent registry, saga (the
 //! registry's declared collaborator) and tasks, fronted by `noded::router` on a
-//! local listener — the same shape as `bin/fs`'s harness, plus the modules the
+//! local listener — the same shape as the `ducktape fs` harness, plus the modules the
 //! tool plane's gate is built on.
 //!
 //! chat and pages are deliberately ABSENT. both need a commonware runtime

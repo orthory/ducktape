@@ -34,8 +34,9 @@ covers rendezvous.
   is consensus state that survives restart, with staged uploads, atomic
   per-path-CAS commits, pinned snapshots, snapshot-addressed reads,
   resolver-backed state sync to full possession, and a noded HTTP surface. The
-  checkout/commit engine (`crates/duckfs/client`), `ducktape-fs`
-  checkout/status/commit/pin loop, and FUSE-gated `mount` verb also exist. The
+  checkout/commit engine (`crates/duckfs/client`) and `ducktape fs`
+  checkout/status/commit/pin loop also exist. Kernel mounting is deliberately
+  not part of the current surface. The
   old memory/workspace role is absorbed by duckfs snapshots and `duck://files/...`
   evidence. Remaining work is the app FilesView/UX rebuilt on duckfs verbs.
 

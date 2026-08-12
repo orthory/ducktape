@@ -1641,6 +1641,8 @@ mod json_output_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     fn completions() -> (String, String) {
         let bash = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1655,100 +1657,107 @@ mod tests {
         (bash, zsh)
     }
 
-    /// the completion declarations belonging to ONE family: every line naming a
-    /// `<family>_*` variable.
-    ///
-    /// Scoping is what makes the guard real. A whole-file `contains` passes for
-    /// `service run` purely because `run` already appears under `node`, so a
-    /// family that borrows a verb name from a sibling would never be caught.
-    /// (Every family's declarations are kept on ONE line each so this filter is
-    /// a plain line match.)
-    fn family_scope(text: &str, family: &str) -> String {
-        let needle = format!("{family}_");
+    /// Exact tokens declared by one completion variable family. Both shipped
+    /// files keep each `local` assignment on one line, so the same tiny parser
+    /// covers Bash's quoted words and Zsh's parenthesized words.
+    fn declaration_tokens(text: &str, stem: &str) -> BTreeSet<String> {
         text.lines()
-            .filter(|line| line.contains(&needle))
-            .collect::<Vec<_>>()
-            .join("\n")
+            .filter_map(|line| line.trim_start().strip_prefix("local "))
+            .filter_map(|declaration| declaration.split_once('='))
+            .filter(|(name, _)| {
+                let exact_stem = *name == stem;
+                let nested_stem = name
+                    .strip_prefix(stem)
+                    .is_some_and(|suffix| suffix.starts_with('_'));
+                exact_stem || nested_stem
+            })
+            .flat_map(|(_, words)| {
+                words
+                    .trim()
+                    .trim_matches(|c| matches!(c, '"' | '(' | ')'))
+                    .split_whitespace()
+            })
+            .map(str::to_string)
+            .collect()
     }
 
-    /// the drift guard: every verb token and every non-hidden long flag in the
-    /// CLAP TREE (the grammar itself, not a parallel table) must appear in BOTH
-    /// completion files, WITHIN ITS OWN FAMILY's declarations. renaming a verb
-    /// or adding a flag without updating the hand-written completions fails
-    /// here, and so does adding one whose name a sibling family already uses.
-    #[test]
-    fn completion_files_cover_the_verb_table_per_family() {
-        let (bash, zsh) = completions();
-        fn walk(cmd: &clap::Command, scope: &str, file: &str, family: &str) {
-            for sub in cmd.get_subcommands() {
-                if sub.is_hide_set() {
-                    continue;
-                }
-                let token = sub.get_name();
-                if token == "help" {
-                    continue;
-                }
-                assert!(
-                    scope.contains(token),
-                    "{file}: family {family:?} is missing verb {token:?}"
-                );
-                for arg in sub.get_arguments() {
-                    if arg.is_hide_set() {
-                        continue;
-                    }
-                    let Some(long) = arg.get_long() else { continue };
-                    if long == "help" {
-                        continue;
-                    }
-                    let flag = format!("--{long}");
-                    assert!(
-                        scope.contains(&flag),
-                        "{file}: family {family:?} is missing flag {flag}"
-                    );
-                }
-                walk(sub, scope, file, family);
+    fn grammar_tokens(cmd: &clap::Command, tokens: &mut BTreeSet<String>) {
+        for arg in cmd.get_arguments().filter(|arg| !arg.is_hide_set()) {
+            if let Some(long) = arg.get_long().filter(|long| *long != "help") {
+                tokens.insert(format!("--{long}"));
+            }
+            if let Some(short) = arg.get_short().filter(|short| *short != 'h') {
+                tokens.insert(format!("-{short}"));
             }
         }
+        for sub in cmd.get_subcommands().filter(|sub| !sub.is_hide_set()) {
+            tokens.insert(sub.get_name().to_string());
+            grammar_tokens(sub, tokens);
+        }
+    }
 
+    fn assert_same_tokens(
+        file: &str,
+        scope: &str,
+        declared: &BTreeSet<String>,
+        required: &BTreeSet<String>,
+        allowed: &BTreeSet<String>,
+    ) {
+        for token in required {
+            assert!(
+                declared.contains(token),
+                "{file}: {scope} is missing {token:?}"
+            );
+        }
+        for token in declared {
+            assert!(
+                allowed.contains(token),
+                "{file}: {scope} advertises stale token {token:?}"
+            );
+        }
+    }
+
+    /// The drift guard is bidirectional: every visible Clap verb/flag appears
+    /// in both completion files, and every advertised token still exists in
+    /// that family's grammar. This catches stale extras as well as omissions.
+    #[test]
+    fn completion_files_match_the_clap_tree_per_family() {
+        let (bash, zsh) = completions();
         let cli = <crate::Cli as clap::CommandFactory>::command();
-        for family in cli.get_subcommands() {
-            if family.is_hide_set() {
-                continue;
-            }
+        let mut top = cli
+            .get_subcommands()
+            .filter(|family| !family.is_hide_set())
+            .map(|family| family.get_name().to_string())
+            .collect::<BTreeSet<_>>();
+        top.extend(
+            ["help", "--help", "-h", "--version", "-V"].map(str::to_string),
+        );
+        for (file, text) in [("ducktape.bash", &bash), ("ducktape.zsh", &zsh)] {
+            let declared = declaration_tokens(text, "families");
+            assert_same_tokens(file, "top level", &declared, &top, &top);
+        }
+
+        for family in cli.get_subcommands().filter(|family| !family.is_hide_set()) {
             let name = family.get_name();
             if name == "help" {
                 continue;
             }
+            let mut required = BTreeSet::new();
+            grammar_tokens(family, &mut required);
+            required.remove("--version");
+            required.remove("-V");
+            let mut allowed = required.clone();
+            allowed.insert("help".into());
+            if name == "service" {
+                allowed.extend(["compute", "agent", "airlock"].map(str::to_string));
+            }
             for (file, text) in [("ducktape.bash", &bash), ("ducktape.zsh", &zsh)] {
-                // the family token itself is offered at the top level.
-                assert!(text.contains(name), "{file}: missing family {name:?}");
-                let has_grammar = family.get_subcommands().next().is_some()
-                    || family
-                        .get_arguments()
-                        .any(|arg| !arg.is_hide_set() && arg.get_long().is_some_and(|l| l != "help"));
-                if !has_grammar {
-                    continue; // a bare family (`mcp`) declares no verbs to scope.
+                let declared = declaration_tokens(text, name);
+                let bare_family = required.is_empty() && declared.is_empty();
+                if bare_family {
+                    continue;
                 }
-                let scope = family_scope(text, name);
-                assert!(
-                    !scope.is_empty(),
-                    "{file}: family {name:?} has verbs but no {name}_* declarations"
-                );
-                walk(family, &scope, file, name);
-                for arg in family.get_arguments() {
-                    if arg.is_hide_set() {
-                        continue;
-                    }
-                    let Some(long) = arg.get_long() else { continue };
-                    if long == "help" {
-                        continue;
-                    }
-                    let flag = format!("--{long}");
-                    assert!(
-                        scope.contains(&flag),
-                        "{file}: family {name:?} is missing flag {flag}"
-                    );
-                }
+                assert_same_tokens(file, name, &declared, &required, &allowed);
             }
         }
     }
@@ -1758,7 +1767,7 @@ mod tests {
     #[test]
     fn the_family_scope_does_not_borrow_a_siblings_verb() {
         let (bash, _zsh) = completions();
-        let service = family_scope(&bash, "service");
+        let service = declaration_tokens(&bash, "service");
         assert!(service.contains("run"), "service declares its own run verb");
         // `promote` lives under `node member`; it must not read as covered here.
         assert!(
@@ -1766,7 +1775,7 @@ mod tests {
             "the service scope must not see node's verbs"
         );
         assert!(
-            family_scope(&bash, "gateway").contains("bind"),
+            declaration_tokens(&bash, "gateway").contains("bind"),
             "a family scope still finds its own verbs"
         );
     }

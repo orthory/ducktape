@@ -794,8 +794,8 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
         (status, received)
     });
     assert_eq!(status, reqwest::StatusCode::OK, "the head commits before the cap trips");
-    assert!(
-        received < 16 * CHUNK,
-        "the running cap must truncate the body ({received} bytes made it through)"
+    assert_eq!(
+        received, CHUNK,
+        "the running cap must end the body exactly at its signed byte boundary"
     );
 }

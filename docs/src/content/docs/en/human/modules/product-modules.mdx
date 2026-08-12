@@ -166,10 +166,10 @@ give any module change notifications delivered atomically with the triggering
 commit.
 
 The client half is the OS-side checkout/commit engine (`crates/duckfs/client`)
-and the `ducktape-fs` CLI. A checkout materializes a duckfs subtree into a real
-working directory beside a `.duckfs/index.json` — git's index discipline: the
+and the `ducktape fs` command family. A checkout materializes a duckfs subtree
+into a real working directory beside a `.duckfs/index.json` — git's index discipline: the
 base snapshot the copy descends from, the node it talks to, and a per-path
-hash/size/mtime record. `ducktape-fs` has read verbs (`ls`, `cat`, `stat`,
+hash/size/mtime record. `ducktape fs` has read verbs (`ls`, `cat`, `stat`,
 `history`, `diff`) and the working-copy loop (`checkout`, `status`, `commit`,
 `pin`); the engine hashes and names every object client-side (byte-identical to
 what validators derive), stages only the chunks the cluster lacks, and submits
@@ -181,24 +181,8 @@ rejection, since the module's reason string does not survive consensus
 finalization). The workspace RPC (`POST /v1/fs/workspaces`, `.../commit`,
 `DELETE`) is the jobs/sandbox seam: the daemon manages checkouts under its own
 root, driving the same engine over the actor lane so a job can edit files on disk
-and commit them without a self-dial. `ducktape-fs mount <prefix> <dir>` fronts a
-duckfs subtree as a real kernel filesystem, behind the `fuse` cargo feature
-(unprivileged, via `fusermount3` — a default build needs no libfuse and keeps the
-verb a clear "rebuild with `--features fuse`" error). Read-only by default, it
-serves over the sync `NodeApi` at a snapshot resolved ONCE and PINNED for the
-mount's lifetime — a stable, reproducible view whose immutable content caches
-hard (a lazy `ls`/`stat` inode table and a bounded read-through block cache);
-reads never see the moving head, so a remount is how you observe newer commits.
-`--rw` fronts a REAL working copy — a checkout into a hidden `<dir>.duckfs-backing`
-directory served passthrough — whose writes become cluster truth only on commit:
-explicit by default (unmount prints how to commit; nothing auto-lands), or
-`--auto-commit N` to commit every N seconds while dirty (auto-rebasing disjoint
-upstream work; a genuine conflict is logged loudly and the mount KEEPS serving —
-never a silent merge, never a dropped write). SIGINT/SIGTERM unmounts cleanly.
-Documented non-goals: no cross-node lock or mmap coherence; uid/gid/mode are
-synthetic (size, mtime, and the exec bit still pass through on `--rw`);
-case-colliding sibling names cannot materialize on a case-insensitive host; and a
-crash leaves a stale mountpoint recoverable with `fusermount3 -u <dir>`.
+and commit them without a self-dial. Kernel mounting is not a shipped surface:
+the explicit checkout/status/commit loop is the filesystem boundary.
 
 ## Jobs
 

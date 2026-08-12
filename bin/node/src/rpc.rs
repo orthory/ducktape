@@ -13,7 +13,7 @@ pub(crate) enum RpcRequest {
     /// node status: latest applied boundary + every module root.
     Status,
     /// the verified join requests parked joiners announced to THIS member —
-    /// the queue the approve button (or `invite-accept`) settles.
+    /// the queue the approve button (or `node resident accept`) settles.
     JoinRequests,
     /// the node-owned join state (ADR §6): the ONE authoritative source the
     /// app renders instead of parsing daemon.log markers. derived from gate

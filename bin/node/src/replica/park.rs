@@ -707,7 +707,7 @@ pub(super) async fn park(
     // deleted, by that task), a terminal `Rejected` exits there (R2). the
     // loop below just picks the flag up; the RESTORE path (persisted
     // standing) and the token-less MANUAL path (out-of-band pubkey, admitted
-    // by `invite-accept`/`promote`) keep their existing detection.
+    // by `node resident accept`/`node member promote`) keep their existing detection.
     let (boundary, host, floor) = loop {
         attempt += 1;
         if !resident_standing && admitted.load(std::sync::atomic::Ordering::Acquire) {
@@ -2123,7 +2123,7 @@ pub(super) async fn park(
                 continue;
             }
             // the token-less MANUAL / restore path polling for an out-of-band
-            // grant (`invite-accept`/`promote`): the tokened join gate already
+            // grant (`node resident accept`/`node member promote`): the tokened join gate already
             // ran to completion above, so there is nothing to re-announce here
             // — just keep polling for the grant to land.
             metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Joining);

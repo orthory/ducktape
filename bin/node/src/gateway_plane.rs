@@ -731,16 +731,20 @@ async fn proxy_loopback(
         while let Some(chunk) = chunks.next().await {
             let item = match chunk {
                 Ok(chunk) => {
-                    total = total.saturating_add(chunk.len() as u64);
-                    let over_cap = cap != 0 && total > cap;
+                    let chunk_len = chunk.len() as u64;
+                    let over_cap = cap != 0 && chunk_len > cap.saturating_sub(total);
                     if over_cap {
-                        let _ = tx
-                            .send(Err(GatewayFailure::Unavailable(
-                                "loopback response exceeds the signed route cap".into(),
-                            )))
-                            .await;
-                        return;
+                        let remaining = cap.saturating_sub(total);
+                        if remaining != 0 {
+                            let prefix_len = usize::try_from(remaining)
+                                .expect("remaining response cap fits the current chunk");
+                            if tx.send(Ok(chunk.slice(..prefix_len))).await.is_err() {
+                                return;
+                            }
+                        }
+                        return; // signed cap reached; close the chunked body at the boundary
                     }
+                    total = total.saturating_add(chunk_len);
                     Ok(chunk)
                 }
                 Err(error) => {
