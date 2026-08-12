@@ -35,6 +35,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
     join_huddle_submit()
     chat_pointer_pressed(f64, f64)
     load_more_history()
+    chat_scrolled(f64, f64, f64, f64)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
@@ -146,7 +147,13 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               with
                 label="Search messages"
                 hint="Search…"
-                disabled=(!connected || searching)
+                // NOT `|| searching`. The field went dead the instant Enter
+                // was pressed and stayed dead for the whole round trip, so the
+                // query could not be refined while waiting — and a disabled
+                // input drops the caret besides. `chat_search_loaded` already
+                // guards on `chat_search_generation`, so the LATE reply is what
+                // gets dropped; killing the field bought nothing.
+                disabled=!connected
                 submit=emit(search_chat_submit)
                 w=fill
                 p=6.2
@@ -257,6 +264,11 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   channel
                   selected=(channel.id == active_channel)
                   unread=is_unread_channel(unread_channel_ids, channel.id)
+                  // EXACTLY THE TERM `choose_channel` STILL REFUSES ON. A load
+                  // no longer refuses a click — the last one wins — so a row
+                  // greyed while one is in flight would put the swallowing back.
+                  // A mutation does still refuse, and the row now says so.
+                  disabled=(mutation_phase != "idle")
                 forward
                   choose_channel
             // DIRECT — the artifact's own word for it, and the honest
@@ -290,7 +302,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       font=code_medium
                       @text-label
             for peer in dm_peers
-              DmButton peer=peer selected=(peer.key == active_dm_peer)
+              DmButton peer=peer selected=(peer.key == active_dm_peer) disabled=(mutation_phase != "idle")
                 forward
                   choose_dm
         // No account footer: the rail's avatar and Settings already carry the
@@ -544,6 +556,14 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           h=shrink
                           anchor-y=end
                           auto=true
+                          // PREFETCH BEFORE THE HARD STOP. The offset is
+                          // relative to the ANCHOR, which is the end here, so
+                          // 1.0 is the top of the scrollback — `chat_scrolled`
+                          // starts the older page inside the last tenth of it.
+                          // iced drops a viewport identical to the last one it
+                          // published, so this is one message per real scroll
+                          // step, not one per wheel event.
+                          scroll=emit(chat_scrolled, _, _, _, _)
                         // VIRTUALIZED. Only the rows the viewport can see are
                         // laid out, so the timeline no longer shapes text for
                         // scrollback nobody is looking at — the mount stopped
@@ -566,7 +586,27 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                             gap=3.0
                             pr=6.0
                             virtual-row=44.0
-                          if has_older_history
+                          // TWO ARMS, ONE BUTTON. The page is a walk of up to
+                          // four sequential round trips and the control carried
+                          // no busy reading at all — `disabled` alone is what a
+                          // dead button looks like. The label says which it is.
+                          if has_older_history && history_loading
+                            box
+                              with
+                                w=fill
+                                align-x=center
+                                pt=4.0
+                                pb=8.0
+                              button "Loading older messages…" -> emit(load_more_history)
+                                with
+                                  disabled=true
+                                  h=30.0
+                                  p=6.0
+                                  @secondary_action
+                                active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=8.0
+                                hovered bg=fg/10 text=fg border=fg/14
+                                pressed bg=fg/14 text=fg
+                          if has_older_history && !history_loading
                             box
                               with
                                 w=fill
@@ -575,7 +615,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 pb=8.0
                               button "Load older messages" -> emit(load_more_history)
                                 with
-                                  disabled=(history_loading || mutation_phase != "idle")
+                                  disabled=(mutation_phase != "idle")
                                   h=30.0
                                   p=6.0
                                   @secondary_action
@@ -1547,10 +1587,21 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 open_thread_for
                                 open_thread_message_actions
                                 open_thread_message_reactions
-                      if thread_has_more && thread_next_reply_offset >= 0
+                      if thread_has_more && thread_next_reply_offset >= 0 && thread_loading
+                        button "Loading replies…" -> emit(load_more_thread)
+                          with
+                            disabled=true
+                            w=fill
+                            h=28.0
+                            p=5.0
+                            @secondary_action
+                          active bg=transparent text=muted r=7.0
+                          hovered bg=fg/9 text=fg
+                          pressed bg=brand_bg
+                      if thread_has_more && thread_next_reply_offset >= 0 && !thread_loading
                         button "Load more replies" -> emit(load_more_thread)
                           with
-                            disabled=(thread_loading || mutation_phase != "idle")
+                            disabled=(mutation_phase != "idle")
                             w=fill
                             h=28.0
                             p=5.0

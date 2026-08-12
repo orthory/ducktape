@@ -225,6 +225,104 @@ pub fn channel_display_name(
         .map_or(current, |row| row.name.clone())
 }
 
+/// Is the clicked channel archived / members-only, per the list the sidebar is
+/// already drawn from? Both ride the click, not the round trip: `post_refusal`
+/// is recomputed the moment the room changes, and reading the room she LEFT for
+/// one round trip is how a public channel came up refusing her post.
+pub fn channel_is_archived(channels: Vec<ChatChannel>, channel: String) -> bool {
+    channels.iter().any(|row| row.id == channel && row.archived)
+}
+
+pub fn channel_is_members_only(channels: Vec<ChatChannel>, channel: String) -> bool {
+    channels
+        .iter()
+        .any(|row| row.id == channel && row.members_only)
+}
+
+/// Is the reader inside the last tenth of the loaded scrollback?
+///
+/// The stream is bottom-anchored, so a scrollable reports its offset relative
+/// to the END — 1.0 is the TOP of the history in hand, which is where the next
+/// older page belongs.
+///
+/// A scrollable whose content fits its viewport reports `0/0`, and every
+/// comparison against NaN is false. That is the answer this wants: nothing
+/// scrolls, so the reader never approaches anything, and the explicit "Load
+/// older messages" button is already on screen for her.
+pub fn near_scroll_top(relative_offset: f64) -> bool {
+    relative_offset >= 0.9
+}
+
+/// The last rows and member roll seen in one channel, kept so a switch back
+/// paints in one frame instead of on the network.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChannelWindow {
+    pub channel_id: String,
+    pub messages: Vec<ChatMessage>,
+    pub members: Vec<ChatMember>,
+}
+
+/// How many rooms the cache remembers. Alternating between two rooms is the
+/// motion this pays for; a third covers "back out through the room you came
+/// from". Past that it is memory held for windows the refetch would replace
+/// anyway.
+const CHANNEL_WINDOW_CACHE: usize = 3;
+
+/// Park the room being left, most-recent first.
+///
+/// PENDING ROWS DO NOT GO IN. An in-flight send settles against `messages` for
+/// the room the reader is IN — `message_sent`/`message_send_failed` both drop
+/// their timeline surgery once she has moved — so a parked pending row has no
+/// writer left to retire it and would come back as a permanent "Sending…".
+///
+/// A HISTORY WINDOW DOES NOT GO IN EITHER. Those rows are a page around one old
+/// message, not the tail; restoring them under a cleared `history_view` would
+/// paint months-old scrollback as the live conversation.
+pub fn cache_channel_window(
+    cache: Vec<ChannelWindow>,
+    channel_id: String,
+    messages: Vec<ChatMessage>,
+    members: Vec<ChatMember>,
+    history_view: bool,
+) -> Vec<ChannelWindow> {
+    let committed: Vec<ChatMessage> = messages
+        .into_iter()
+        .filter(|message| !message.pending)
+        .collect();
+    let worth_keeping = !history_view && !channel_id.is_empty() && !committed.is_empty();
+    if !worth_keeping {
+        return cache;
+    }
+    let mut kept: Vec<ChannelWindow> = vec![ChannelWindow {
+        channel_id: channel_id.clone(),
+        messages: committed,
+        members,
+    }];
+    kept.extend(
+        cache
+            .into_iter()
+            .filter(|window| window.channel_id != channel_id)
+            .take(CHANNEL_WINDOW_CACHE - 1),
+    );
+    kept
+}
+
+pub fn cached_window_messages(cache: Vec<ChannelWindow>, channel_id: String) -> Vec<ChatMessage> {
+    cache
+        .into_iter()
+        .find(|window| window.channel_id == channel_id)
+        .map(|window| window.messages)
+        .unwrap_or_default()
+}
+
+pub fn cached_window_members(cache: Vec<ChannelWindow>, channel_id: String) -> Vec<ChatMember> {
+    cache
+        .into_iter()
+        .find(|window| window.channel_id == channel_id)
+        .map(|window| window.members)
+        .unwrap_or_default()
+}
+
 /// The clicked page's title, from the index the sidebar is already drawn from
 /// — the header has to move with the click, not with the round trip. Falls
 /// back to the current title while the id is not in the list yet.

@@ -355,25 +355,8 @@ fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
 /// off-loop — identical payload, no checkpoint tax.
 pub(crate) async fn load_channel_row(rpc: &str, channel_id: &str) -> Result<ChatChannel, String> {
     let rpc = rpc_client(rpc)?;
-    let reply: ChatViewReply = rpc
-        .view(
-            "chat",
-            &ChatViewQuery::Channel {
-                channel_id: channel_id.to_string(),
-            },
-        )
-        .await?;
-    let ChatViewReply::Channel(Some(info)) = reply else {
-        return Err("channel record was not found".into());
-    };
-    Ok(ChatChannel {
-        id: info.channel.id,
-        name: info.channel.name,
-        archived: info.channel.archived,
-        members_only: info.channel.post_policy == PostPolicy::MembersOnly,
-        huddle_count: count_i64(info.channel.huddle.len()),
-        head_seq: number_i64(info.head_seq),
-    })
+    let (channel, _roster) = load_channel_facts(&rpc, channel_id, None).await?;
+    Ok(channel)
 }
 
 /// One scoped catch-up load, flag-selected per plane: the chat slices
@@ -703,40 +686,75 @@ pub fn keep_i64(loaded: bool, next: i64, current: i64) -> i64 {
     if loaded { next } else { current }
 }
 
-pub async fn load_chat(rpc: String, channel_id: String) -> Result<ChatData, AppError> {
+/// The channel the reader just clicked, loaded against the channel list she is
+/// already looking at — see [`load_channel_window_data`] for why the list is
+/// passed in rather than re-paged.
+pub async fn load_channel_window(
+    rpc: String,
+    channels: Vec<ChatChannel>,
+    channel_id: String,
+    generation: i64,
+) -> Result<ChatData, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        let mut chat =
+            load_channel_window_data(&rpc, channels, &channel_id, MessageWindow::Tail).await?;
+        chat.generation = generation;
+        Ok(chat)
     }
     .await
     .map_err(app_error)
 }
 
+/// The reply a search hit points at, when it points at one at all. A hit on the
+/// thread ROOT is answered by the window around it and needs no second read.
+async fn load_hit_reply(
+    rpc: &RpcClient,
+    channel_id: &str,
+    root_seq: u64,
+    target_seq: u64,
+) -> Result<Option<MsgRow>, String> {
+    if target_seq == root_seq {
+        return Ok(None);
+    }
+    load_message_at(rpc, channel_id, target_seq).await.map(Some)
+}
+
 pub async fn load_chat_hit(
     rpc: String,
+    channels: Vec<ChatChannel>,
     channel_id: String,
     root_seq: i64,
     target_seq: i64,
+    generation: i64,
 ) -> Result<ChatData, AppError> {
     async {
         let root_seq = positive_sequence(root_seq)?;
         let target_seq = positive_sequence(target_seq)?;
         let rpc = rpc_client(&rpc)?;
-        let mut chat = load_chat_data(&rpc, Some(&channel_id)).await?;
-        chat.messages = load_messages_around(&rpc, &channel_id, root_seq).await?;
+        // THREE SEQUENTIAL PHASES, CONCURRENT. This used to re-page the channel
+        // list, walk the channel's live tail, THROW that walk away for a window
+        // around the hit, and only then read the reply — the slowest navigation
+        // in the app, with the pane on the loading plate for all of it. The
+        // window and the reply are independent of the channel's row and its
+        // member roll, so the whole thing is one round trip now.
+        let (mut chat, reply) = tokio::try_join!(
+            load_channel_window_data(&rpc, channels, &channel_id, MessageWindow::Around(root_seq)),
+            load_hit_reply(&rpc, &channel_id, root_seq, target_seq)
+        )?;
         let root = chat
             .messages
             .iter()
             .find(|message| message.seq == number_i64(root_seq))
             .cloned()
             .ok_or_else(|| "message was not found".to_string())?;
+        chat.generation = generation;
         chat.selected_message_seq = root.seq;
         chat.selected_message_rev = root.rev;
         chat.selected_message_body.clone_from(&root.body);
-        if target_seq == root_seq {
+        let Some(reply) = reply else {
             return Ok(chat);
-        }
-        let reply = load_message_at(&rpc, &channel_id, target_seq).await?;
+        };
         if reply.thread != Some(root_seq) {
             return Err("search result does not belong to the selected thread".into());
         }
@@ -801,6 +819,7 @@ pub async fn create_channel(
     password: String,
     name: String,
     members_only: bool,
+    generation: i64,
 ) -> Result<ChatData, AppError> {
     async {
         let name = bounded_text(name, "channel name", 128)?;
@@ -824,13 +843,9 @@ pub async fn create_channel(
         let data = load_chat_data(&rpc, Some(&channel_id))
             .await
             .map_err(committed_error)?;
-        Ok(landed_on_channel(
-            data,
-            channel_id,
-            landing_name,
-            members_only,
-            Vec::new(),
-        ))
+        let mut data = landed_on_channel(data, channel_id, landing_name, members_only, Vec::new());
+        data.generation = generation;
+        Ok(data)
     }
     .await
 }
@@ -1000,6 +1015,7 @@ pub async fn open_dm(
     rpc: String,
     password: String,
     peer_key: String,
+    generation: i64,
 ) -> Result<ChatData, AppError> {
     async {
         let peer = public_key(&peer_key, "peer public key")?;
@@ -1009,8 +1025,9 @@ pub async fn open_dm(
         let channel_id = dm_channel_id(hex_encode(&me), hex_encode(&peer));
         let peer_name = short_label(&hex_encode(&peer));
         let client = rpc_client(&rpc)?;
-        let existing = load_chat_data(&client, Some(&channel_id)).await?;
+        let mut existing = load_chat_data(&client, Some(&channel_id)).await?;
         if existing.active_channel == channel_id {
+            existing.generation = generation;
             return Ok(existing);
         }
         signed_write(
@@ -1050,7 +1067,9 @@ pub async fn open_dm(
         let data = load_chat_data(&client, Some(&channel_id))
             .await
             .map_err(committed_error)?;
-        Ok(landed_on_channel(data, channel_id, peer_name, true, seated))
+        let mut data = landed_on_channel(data, channel_id, peer_name, true, seated);
+        data.generation = generation;
+        Ok(data)
     }
     .await
 }

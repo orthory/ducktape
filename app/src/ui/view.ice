@@ -206,6 +206,7 @@ view
               join_huddle_submit -> join_huddle_submit
               chat_pointer_pressed -> chat_pointer_pressed _ _
               load_more_history -> load_more_history
+              chat_scrolled -> chat_scrolled _ _ _ _
               add_reaction_at -> add_reaction_at _ _
               remove_reaction_at -> remove_reaction_at _ _
               open_thread_for -> open_thread_for _

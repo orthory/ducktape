@@ -50,6 +50,24 @@ state
   rooms:[ChatChannel] = []
   unread_channel_ids:[str] = []
   messages:[ChatMessage] = []
+  // THE LAST TWO OR THREE ROOMS, KEPT. A channel click used to empty the pane
+  // and wait out the load, so alternating between two rooms paid the whole trip
+  // both ways and the reader watched a "Loading messages…" plate every time.
+  // `choose_channel` parks the room it leaves here and paints the room it
+  // enters from here — one frame, `loading` false — and the refetch replays
+  // over it through the same `merge_pending_messages` the live fold uses.
+  //
+  // The member roll rides along because `post_refusal` is computed from it: a
+  // restored window with someone else's members would gate the composer of the
+  // room it just painted.
+  message_cache:[ChannelWindow] = []
+  // THE SWITCH'S OWN GENERATION. Every route that moves the reader between
+  // rooms bumps it and stamps it on the load it launches, so `chat_updated`
+  // can drop a room she has already clicked past — A→B→C lands on C even when
+  // B answers last. It replaced a `return if loading` at the TOP of those
+  // handlers, which made the FIRST click win and every click during the load
+  // vanish with no feedback at all.
+  chat_generation:i64 = 0
   channel_reads:[ChannelRead] = []
   unread_boundary:i64 = 0
   // The seq wearing the "New" divider — first_unread_seq(messages,

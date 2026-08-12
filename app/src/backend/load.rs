@@ -147,6 +147,7 @@ pub(crate) async fn load_chat_data(
         )?,
     };
     Ok(ChatData {
+        generation: 0,
         channels,
         messages,
         active_channel,
@@ -154,6 +155,116 @@ pub(crate) async fn load_chat_data(
         active_channel_archived,
         active_channel_members_only,
         active_channel_huddle_count,
+        huddle_roster,
+        channel_members,
+        selected_message_seq: 0,
+        selected_message_rev: 0,
+        selected_message_body: String::new(),
+        active_thread_seq: 0,
+        thread_target_seq: 0,
+        thread_messages: Vec::new(),
+        thread_next_reply_offset: 0,
+        thread_has_more: false,
+    })
+}
+
+/// Which rows a channel window opens on: the live tail, or a page centred on
+/// one older message a search hit named.
+#[derive(Clone, Copy)]
+pub(crate) enum MessageWindow {
+    Tail,
+    Around(u64),
+}
+
+/// One channel's row and its huddle roster, read from the index view. The
+/// roster length is not derivable from an op, so the row still has to be read.
+pub(crate) async fn load_channel_facts(
+    rpc: &RpcClient,
+    channel_id: &str,
+    me: Option<&[u8]>,
+) -> Result<(ChatChannel, Vec<HuddleParticipant>), String> {
+    let reply: ChatViewReply = rpc
+        .view(
+            "chat",
+            &ChatViewQuery::Channel {
+                channel_id: channel_id.to_string(),
+            },
+        )
+        .await?;
+    let ChatViewReply::Channel(Some(info)) = reply else {
+        return Err("channel record was not found".into());
+    };
+    let roster = huddle_roster(&info.channel.huddle, me);
+    Ok((
+        ChatChannel {
+            id: info.channel.id,
+            name: info.channel.name,
+            archived: info.channel.archived,
+            members_only: info.channel.post_policy == PostPolicy::MembersOnly,
+            huddle_count: count_i64(info.channel.huddle.len()),
+            head_seq: number_i64(info.head_seq),
+        },
+        roster,
+    ))
+}
+
+/// One channel's window, WITHOUT re-paging the channel list.
+///
+/// This is the SWITCH path's loader; [`load_chat_data`] is the cold-boot and
+/// resync one, where the list itself is the thing being learned. A channel
+/// click already holds that list in state and the live fold keeps it fresh, so
+/// re-paging it put a whole extra round trip — more on a workspace past one
+/// page — in front of the first row the reader was waiting for.
+///
+/// What is left is three INDEPENDENT reads: the channel's own row (for the
+/// huddle roster), the member roll, and the messages. They run concurrently,
+/// so a switch costs one round trip plus whatever the timeline walk itself
+/// needs, instead of the list page followed by the same fan-out.
+///
+/// The window is authoritative about where it landed: it names the channel it
+/// was asked for or it fails. `load_chat_data`'s "requested id I cannot see
+/// falls back to the landing channel" rule is right for a refresh and wrong
+/// here — the reducer drops a reply for another room, so a silent fallback
+/// would leave the pane loading forever.
+pub(crate) async fn load_channel_window_data(
+    rpc: &RpcClient,
+    known: Vec<ChatChannel>,
+    channel_id: &str,
+    window: MessageWindow,
+) -> Result<ChatData, String> {
+    let head_seq = known
+        .iter()
+        .find(|channel| channel.id == channel_id)
+        .map_or(0, |channel| u64::try_from(channel.head_seq).unwrap_or(0));
+    // Awaited before the fan-out so the cached identity is warm for every leg:
+    // there is no single-flight, and three cold callers would each spawn the
+    // CLI. Same reason `load_chat_data` awaits it above its own join.
+    let me = local_user_key().await;
+    let messages_leg = async {
+        match window {
+            MessageWindow::Tail => load_messages(rpc, channel_id, head_seq).await,
+            MessageWindow::Around(seq) => load_messages_around(rpc, channel_id, seq).await,
+        }
+    };
+    let ((channel, huddle_roster), channel_members, messages) = tokio::try_join!(
+        load_channel_facts(rpc, channel_id, me.as_deref()),
+        load_channel_members(rpc, channel_id),
+        messages_leg
+    )?;
+    let mut channels = known;
+    match channels.iter_mut().find(|row| row.id == channel.id) {
+        Some(row) => row.clone_from(&channel),
+        None => channels.push(channel.clone()),
+    }
+    Ok(ChatData {
+        generation: 0,
+        channels,
+        messages,
+        active_channel: channel.id,
+        active_channel_name: channel.name,
+        active_channel_archived: channel.archived,
+        active_channel_members_only: channel.members_only,
+        active_channel_huddle_count: channel.huddle_count,
         huddle_roster,
         channel_members,
         selected_message_seq: 0,

@@ -24,7 +24,11 @@ on clear_chat_search
   chat_searching = false
 
 on open_chat_search_hit(channel_id, root_seq, target_seq)
-  return if loading || mutation_phase != "idle"
+  // NO `loading` TERM. A hit clicked while another room is still loading used
+  // to be discarded outright — see `choose_channel`. The load this launches
+  // carries `chat_generation`, so the one it supersedes is dropped on arrival
+  // instead of this click being dropped on the way out.
+  return if mutation_phase != "idle"
   palette_open = false
   shell_tab = "chat"
   chat_search_generation = chat_search_generation + 1
@@ -58,10 +62,24 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // Both composers are rebuilt under the caret and the tab moved besides.
   composer_focus = "none"
   error = ""
-  run load_chat_hit(connected_rpc, channel_id, root_seq, target_seq) -> chat_hit_loaded _ | failed _
+  chat_generation = chat_generation + 1
+  run load_chat_hit(connected_rpc, channels, channel_id, root_seq, target_seq, chat_generation) -> chat_hit_loaded _ | failed _
 
+// THE LAST CLICK WINS. This used to open `return if loading`, and `loading` is
+// true for the entire switch it starts — so the second click of a fast A→B→C
+// was discarded with no sidebar move, no header change and no busy affordance
+// anywhere, and the reader clicked again into the same void. The click is taken
+// unconditionally now and the SUPERSEDED LOAD is what gets dropped, on
+// `chat_generation` — the guard `thread_loaded`, `history_loaded` and
+// `chat_search_loaded` have always used.
+//
+// `mutation_phase` stays: it is a mutation lock, not a load, and
+// `channel_created` lands the reader in the room it just made. The sidebar rows
+// disable on exactly that term, so the guard and the affordance agree.
 on choose_channel(id)
-  return if loading || mutation_phase != "idle"
+  return if mutation_phase != "idle"
+  // PARK THE ROOM SHE IS LEAVING, while `active_channel` still names it.
+  message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
   active_dm_peer = ""
   active_dm = no_dm_peer()
   // "Jump to latest" IS this handler, aimed at the room already on screen — so
@@ -72,24 +90,36 @@ on choose_channel(id)
   // `chat_updated` runs its own freeze, which then correctly keeps this value.
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, id, unread_boundary)
   // The switch is visible NOW: the clicked room takes the header and the
-  // sidebar highlight, and the previous room's messages leave the pane before
-  // the round-trip — a click that repaints nothing reads as a dead app.
+  // sidebar highlight, and — when it is one of the rooms the cache remembers —
+  // its rows too, in this frame, with `loading` false. The refetch replays over
+  // them through `merge_pending_messages` exactly as a live delta would.
   active_channel = id
   active_channel_name = channel_display_name(channels, active_channel, active_channel_name)
-  messages = []
-  has_older_history = false
+  // BOTH GATE FACTS RIDE THE CLICK. `post_refusal` is recomputed here, and
+  // computing it from the room she LEFT is how a public channel came up
+  // refusing her post for a whole round trip.
+  active_channel_archived = channel_is_archived(channels, active_channel)
+  active_channel_members_only = channel_is_members_only(channels, active_channel)
+  messages = cached_window_messages(message_cache, active_channel)
+  channel_members = cached_window_members(message_cache, active_channel)
+  post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
+  has_older_history = history_has_older(messages)
   // THE FLAG BELONGS TO THE REQUEST, AND THE REQUEST BELONGS TO THE ROOM YOU
   // LEFT. `load_more_history` returns early on it and nothing else here lowers
   // it, so "Load older" is dead in the room you land in until the abandoned
   // page lands — forever if it hangs. `history_loaded` drops that page on its
   // channel check anyway.
   history_loading = false
-  unread_marker_seq = 0
+  unread_marker_seq = first_unread_seq(messages, unread_boundary)
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  loading = true
+  // A CACHE HIT IS NOT LOADING. The plate is `loading && empty(messages)`, so
+  // painting parked rows already retires it — but `loading` also disables both
+  // composers, and a room that repaints instantly with a dead message box is
+  // the same "did my click land?" question one step later.
+  loading = empty(messages)
   chat_search_hits = []
   selected_message_seq = 0
   selected_message_rev = 0
@@ -112,13 +142,23 @@ on choose_channel(id)
   // A new room's composer is a new box: the caret does not come with it.
   composer_focus = "none"
   error = ""
-  run load_chat(connected_rpc, active_channel) -> chat_updated _ | failed _
+  chat_generation = chat_generation + 1
+  // THE CHANNEL LIST GOES DOWN, IT DOES NOT COME BACK. `load_chat_data`
+  // re-paged the whole list on every switch — a round trip in front of the
+  // first row, for a list this handler is reading two statements above and the
+  // live fold keeps current.
+  run load_channel_window(connected_rpc, channels, active_channel, chat_generation) -> chat_updated _ | failed _
 
 // A DM is not a second message plane: it is the two-party members-only channel
 // at `dm_channel_id(me, peer)`, resolved or created on the way in. Everything
 // downstream of `chat_updated` is the ordinary channel path.
 on choose_dm(peer_key)
-  return if loading || mutation_phase != "idle" || empty(peer_key)
+  // Same last-click-wins rule as `choose_channel`, and the same reason.
+  return if mutation_phase != "idle" || empty(peer_key)
+  // The room she is leaving is parked here too — she may come back to it from
+  // the DM. The DM itself is NOT restored from the cache: this handler does not
+  // know the two-party channel id, `open_dm` resolves it.
+  message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
   active_dm_peer = peer_key
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   // Same visible switch as `choose_channel`: the stale room leaves the pane
@@ -156,7 +196,8 @@ on choose_dm(peer_key)
   error = ""
   // Reads the peer back from state: `active_dm_peer = peer_key` above already
   // moved the payload, so passing `peer_key` here would be a use after move.
-  run open_dm(connected_rpc, password, active_dm_peer) -> chat_updated _ | failed _
+  chat_generation = chat_generation + 1
+  run open_dm(connected_rpc, password, active_dm_peer, chat_generation) -> chat_updated _ | failed _
 
 on create_channel_submit
   return if loading || mutation_phase != "idle" || empty(trim(channel_draft))
@@ -171,7 +212,8 @@ on create_channel_submit
   pending_channel = trim(channel_draft)
   channel_draft = ""
   error = ""
-  run create_channel(connected_rpc, password, pending_channel, channel_create_members_only) -> channel_created _ | mutation_failed _
+  chat_generation = chat_generation + 1
+  run create_channel(connected_rpc, password, pending_channel, channel_create_members_only, chat_generation) -> channel_created _ | mutation_failed _
 
 on toggle_channel_create_members_only
   channel_create_members_only = !channel_create_members_only
@@ -360,6 +402,12 @@ on message_send_failed(cause)
   run live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 on chat_updated(next)
+  // THE ROOM SHE IS IN NOW, OR NOTHING. Two clicks in flight land in the order
+  // the node answers, not the order she clicked, so without this the FIRST
+  // reply won and A→B→C settled on B. `loading` is deliberately NOT released
+  // here: the load this one lost to is still running, and clearing it would
+  // swap the loading plate for "No messages yet" mid-switch.
+  return if next.generation != chat_generation
   history_view = false
   channels = next.channels
   rooms = rooms_only(channels, dm_peers, settings_user_key)
@@ -409,6 +457,8 @@ on chat_updated(next)
   task window close target=window_target_unless(huddle_joined, huddle_win)
 
 on chat_hit_loaded(next)
+  // Superseded by a later switch — see `chat_updated`.
+  return if next.generation != chat_generation
   // THE ONE HANDLER THAT RAISES IT. `history_view` is a property of HOW the
   // rows in hand were fetched — a window around one old message — so every
   // other writer of `messages` lowers it, or the amber "Viewing history"
@@ -460,10 +510,16 @@ on chat_hit_loaded(next)
   task window close target=window_target_unless(huddle_joined, huddle_win)
 
 on channel_created(next)
+  // The lock and the modal come down whether or not this landing still counts:
+  // a create she has since clicked away from must not leave the sidebar's
+  // buttons dead. Same order `history_loaded` releases `history_loading` in.
   pending_channel = ""
   channel_create_open = false
   channel_create_members_only = false
   mutation_phase = "idle"
+  // Superseded by a later switch — see `chat_updated`. The channel is still
+  // created; it arrives in the list on the next fold.
+  return if next.generation != chat_generation
   // A brand-new channel's latest page IS the whole channel — see
   // `chat_hit_loaded`.
   history_view = false
@@ -727,6 +783,24 @@ on thread_page_failed(cause)
   return if cause.generation != thread_generation || !thread_loading
   thread_loading = false
   error = cause.message
+
+// PREFETCH BEFORE THE HARD STOP. Paging older history was reachable only by
+// scrolling to the very top and hunting for a button: the reader hit a wall,
+// found it, clicked, and only then ate the frame that mounts the page. The
+// offset arrives relative to the scrollable's ANCHOR, and the stream is
+// `anchor-y=end`, so 1.0 IS the top — the page starts inside the last tenth of
+// the scrollback and is usually in by the time she reaches it. The button stays
+// as the explicit fallback and every other term below is its guard verbatim.
+//
+// `has_older_history` rather than `history_has_older(messages)`: this fires per
+// scroll step, and the extern takes the timeline BY VALUE. The mirror in state
+// is written by every handler that moves `messages` for exactly this reason.
+on chat_scrolled(_absolute_x, _absolute_y, _relative_x, relative_y)
+  return if !near_scroll_top(relative_y) || history_loading || loading || mutation_phase != "idle" || empty(active_channel) || !has_older_history
+  history_generation = history_generation + 1
+  history_loading = true
+  error = ""
+  run load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages), history_generation) -> history_loaded _ | history_failed _
 
 on load_more_history
   return if history_loading || loading || mutation_phase != "idle" || empty(active_channel) || empty(messages) || !history_has_older(messages)

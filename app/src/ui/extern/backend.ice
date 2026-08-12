@@ -7,7 +7,8 @@ extern crate::backend
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
   ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, mine:bool, height:i64, time:i64, reactions:[ChatReaction])
   HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
-  ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
+  ChannelWindow(channel_id:str, messages:[ChatMessage], members:[ChatMember])
+  ChatData(generation:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
   SendReceipt(operation_id:str, channel_id:str)
   ChatDelta(kind:str, channel_id:str, seq:i64, root_seq:i64, message:ChatMessage, channel:ChatChannel, name:str, archived:bool, emoji:str, added:bool, reactor:str, by_me:bool, member:ChatMember)
   PagesDelta(kind:str, block_id:str, text:str)
@@ -302,6 +303,13 @@ extern crate::backend
   sync apply_chat_members(members:[ChatMember], delta:ChatDelta, active_channel:str) -> [ChatMember]
   sync thread_offset_after_live(offset:i64, has_more:bool, delta:ChatDelta, active_channel:str, root:i64) -> i64
   sync channel_display_name(channels:[ChatChannel], channel:str, current:str) -> str
+  sync near_scroll_top(relative_offset:f64) -> bool
+  sync channel_is_archived(channels:[ChatChannel], channel:str) -> bool
+  sync channel_is_members_only(channels:[ChatChannel], channel:str) -> bool
+  // The two-or-three room window cache the channel switch paints from.
+  sync cache_channel_window(cache:[ChannelWindow], channel_id:str, messages:[ChatMessage], members:[ChatMember], history_view:bool) -> [ChannelWindow]
+  sync cached_window_messages(cache:[ChannelWindow], channel_id:str) -> [ChatMessage]
+  sync cached_window_members(cache:[ChannelWindow], channel_id:str) -> [ChatMember]
   // The pages twin of `channel_display_name`: the header title of a page that
   // has only just been clicked, read from the list already in hand.
   sync page_display_title(pages:[PageItem], page:str, current:str) -> str
@@ -349,9 +357,9 @@ extern crate::backend
   sync keep_participants(loaded:bool, next:[HuddleParticipant], current:[HuddleParticipant]) -> [HuddleParticipant]
   sync huddle_recipient_nodes(roster:[HuddleParticipant]) -> [str]
   sync huddle_refresh_hits(delta:ChatDelta, active_channel:str) -> bool
-  load_chat(rpc:str, channel_id:str) -> ChatData ! AppError
-  load_chat_hit(rpc:str, channel_id:str, root_seq:i64, target_seq:i64) -> ChatData ! AppError
-  create_channel(rpc:str, password:str, name:str, members_only:bool) -> ChatData ! AppError
+  load_channel_window(rpc:str, channels:[ChatChannel], channel_id:str, generation:i64) -> ChatData ! AppError
+  load_chat_hit(rpc:str, channels:[ChatChannel], channel_id:str, root_seq:i64, target_seq:i64, generation:i64) -> ChatData ! AppError
+  create_channel(rpc:str, password:str, name:str, members_only:bool, generation:i64) -> ChatData ! AppError
   rename_channel(rpc:str, password:str, channel_id:str, name:str) -> bool ! AppError
   archive_channel(rpc:str, password:str, channel_id:str) -> bool ! AppError
   unarchive_channel(rpc:str, password:str, channel_id:str) -> bool ! AppError
@@ -368,7 +376,7 @@ extern crate::backend
   sync rooms_only(channels:[ChatChannel], peers:[DmPeer], me:str) -> [ChatChannel]
   sync dm_peer_named(peers:[DmPeer], key:str) -> DmPeer
   sync no_dm_peer() -> DmPeer
-  open_dm(rpc:str, password:str, peer_key:str) -> ChatData ! AppError
+  open_dm(rpc:str, password:str, peer_key:str, generation:i64) -> ChatData ! AppError
   sync post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str
   send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
   load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> ThreadLoadData ! HydrationError
