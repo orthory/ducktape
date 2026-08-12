@@ -7339,3 +7339,352 @@ fn the_clear_search_button_survives_a_zero_hit_result() {
         "the clear control must not gate on hits — a done+empty search has none"
     );
 }
+
+// ===========================================================================
+// THE FRAME-COST LINTS.
+//
+// `src/frame_probe.rs` asserts one number — allocations per keystroke on a
+// 256-row channel. A number catches a regression the day someone runs it; a
+// source sweep catches the two SHAPES that produce that regression at the
+// moment they are written, and names them. CLAUDE.md's own rule: guard a
+// load-bearing shape with a lint, not a comment.
+//
+// Both sweeps walk the whole `.ice` view tree rather than a list of files,
+// and both carry an allowlist that must stay LIVE — an entry matching nothing
+// fails the test, so the ledger cannot rot into a blanket exemption.
+// ===========================================================================
+
+/// Every `.ice` file that is a VIEW: the mounts, the screens, the components.
+/// Handlers and extern declarations are not views (a handler runs once per
+/// event, a view expression runs once per frame), and the `.ice` tests mount
+/// their own fixtures.
+fn view_sources() -> Vec<(String, String)> {
+    ice_sources()
+        .into_iter()
+        .filter(|(path, _)| {
+            let path = path.replace('\\', "/");
+            !path.contains("/handlers/") && !path.contains("/extern/") && !path.contains("/tests/")
+        })
+        .collect()
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// The code half of a line, with any trailing comment cut off.
+fn code_of(line: &str) -> &str {
+    line.split("//").next().unwrap_or_default()
+}
+
+/// A component mount is a node whose name is Capitalized — `MessageCard`,
+/// `Badge.Secondary`. Every other node in the language is lowercase.
+fn mounts_a_component(code: &str) -> bool {
+    let node = code.trim();
+    let Some(first) = node.chars().next() else {
+        return false;
+    };
+    first.is_ascii_uppercase()
+        && node.split_whitespace().next().is_some_and(|name| {
+            name.chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        })
+}
+
+/// A REPEATED MOUNT IS A PER-FRAME COST MULTIPLIED BY A LIST LENGTH.
+///
+/// Iced 0.14 has no dirty check: every message rebuilds the whole mounted
+/// tree. A plain `col` culls only `draw` — `update`, `mouse_interaction`,
+/// `overlay` and `layout` walk every child on every event and every frame. So
+/// a `for` that mounts a component pays its whole subtree, per row, forever,
+/// unless a `col virtual-row=` above it culls all six passes against the
+/// viewport.
+///
+/// `lazy` is NOT a substitute and this sweep deliberately does not accept one:
+/// it memoizes the element and its layout node, so it saves the BUILD and the
+/// text re-shape of an unchanged row — and saves nothing at all on the walks,
+/// which still recurse into every cached subtree. The chat stream carries both,
+/// and needs both.
+///
+/// Everything not virtualized is listed below, which is the point: the list is
+/// the app's inventory of un-culled repetition, argued in four buckets.
+///
+/// This is the lint that catches a deleted `virtual-row=` — the exact edit a
+/// later "make the a11y test see this row" change would make, because an
+/// offscreen child is not in the a11y tree.
+#[test]
+fn every_repeated_component_mount_is_culled_or_argued() {
+    // (file, the loop head as authored). Four buckets, and the fourth is the
+    // reason this ledger is worth keeping — it says out loud which surfaces
+    // still have the problem chat had.
+    //
+    // `messages` and `thread_messages` are deliberately absent: both are
+    // chain-fed, both grow with a "load older" click, and both are virtualized.
+    const ARGUED: &[(&str, &str)] = &[
+        // 1. WORKSPACE-SHAPED — channels, DMs, members, repos, pages,
+        //    validators, peers. Length tracks how big the workspace is, not
+        //    how long the chain has run, and it moves on a delta, not a scroll.
+        ("screens/chat.ice", "for channel in rooms"),
+        ("screens/chat.ice", "for peer in dm_peers"),
+        ("screens/chat.ice", "for member in channel_members"),
+        ("screens/pages.ice", "for page in pages"),
+        ("screens/pages.ice", "for child in subpage_blocks(blocks)"),
+        ("screens/forge.ice", "for repo in repos"),
+        ("screens/forge.ice", "for entry in tree_entries"),
+        ("screens/forge.ice", "for review in forge_item_reviews"),
+        (
+            "screens/roster.ice",
+            "for member in filter_members(rows, filter)",
+        ),
+        ("screens/roster.ice", "for member in rows"),
+        ("screens/roster.ice", "for agent in rows"),
+        ("screens/governance.ice", "for proposal in rows"),
+        (
+            "screens/governance.ice",
+            "for proposal in settled_proposals(rows)",
+        ),
+        ("screens/settings.ice", "for peer in node_peers"),
+        ("components/huddle.ice", "for person in roster"),
+        ("components/node.ice", "for entry in rows"),
+        ("components/onboarding.ice", "for row in networks"),
+        ("components/onboarding.ice", "for step in steps"),
+        ("components/forge.ice", "for item in items"),
+        // 2. WITHIN ONE ROW — one message's blocks and reactions, one
+        //    proposal's quorum dots, the nav bar. Bounded by the row that
+        //    contains them, and the chat ones already sit inside the stream's
+        //    own `lazy`, so they are built once per row change, not per frame.
+        ("components/chat.ice", "for block in message.blocks"),
+        ("components/chat.ice", "for reaction in message.reactions"),
+        (
+            "components/kit.ice",
+            "for seat in quorum_dots(proposal.approvals, proposal.required_yes)",
+        ),
+        (
+            "components/shell.ice",
+            "for item in shell_nav(tab, approvals, agent_live)",
+        ),
+        ("screens/storage.ice", "for kind_count in kinds"),
+        ("screens/storage.ice", "for block in blocks"),
+        // 3. QUERY-CAPPED — whatever one query answered with. The list is
+        //    replaced wholesale by the next query, never appended to.
+        ("screens/chat.ice", "for hit in search_hits"),
+        ("screens/pages.ice", "for hit in page_search_hits"),
+        (
+            "screens/pages.ice",
+            "for comment_thread in block_comment_threads",
+        ),
+        (
+            "screens/pages.ice",
+            "for page_comment in block_thread_comments",
+        ),
+        ("screens/storage.ice", "for hit in hits"),
+        (
+            "screens/storage.ice",
+            "for op in explorer_ops_at(ops, selected)",
+        ),
+        ("view.ice", "for item in bell_items"),
+        // 4. UNCULLED AND KNOWN — genuinely unbounded, fed by a log, a file or
+        //    a thread, and simply not done yet. These are chat's problem on
+        //    another surface; each is a `virtual-row=` away. Listed rather
+        //    than silently excused so the next perf pass has its worklist.
+        (
+            "screens/settings.ice",
+            "for line in filter_log_lines(node_log_lines, node_log_filter)",
+        ),
+        ("screens/forge.ice", "for line in source_lines(file_text)"),
+        ("screens/forge.ice", "for message in discussion"),
+        ("screens/storage.ice", "for entry in entries"),
+        ("components/forge.ice", "for line in lines"),
+    ];
+
+    let mut unculled: Vec<String> = Vec::new();
+    let mut matched: Vec<(&str, &str)> = Vec::new();
+    for (path, source) in view_sources() {
+        let path = path.replace('\\', "/");
+        let lines: Vec<String> = inlined(&source).lines().map(str::to_owned).collect();
+        for (index, line) in lines.iter().enumerate() {
+            let code = code_of(line);
+            let head = code.trim();
+            if !head.starts_with("for ") {
+                continue;
+            }
+            let loop_indent = indent_of(code);
+            let repeats_a_component = lines[index + 1..]
+                .iter()
+                .take_while(|next| next.trim().is_empty() || indent_of(next) > loop_indent)
+                .any(|line| mounts_a_component(code_of(line)));
+            if !repeats_a_component {
+                continue;
+            }
+            let mut virtualized = false;
+            let mut depth = loop_indent;
+            for above in lines[..index].iter().rev() {
+                if above.trim().is_empty() || indent_of(above) >= depth {
+                    continue;
+                }
+                depth = indent_of(above);
+                virtualized |= above.contains("virtual-row=");
+                if virtualized || depth == 0 {
+                    break;
+                }
+            }
+            if virtualized {
+                continue;
+            }
+            match ARGUED
+                .iter()
+                .find(|(file, loop_head)| path.ends_with(file) && *loop_head == head)
+            {
+                Some(entry) => matched.push(*entry),
+                None => unculled.push(format!("(\"{path}\", \"{head}\"),")),
+            }
+        }
+    }
+
+    assert!(
+        unculled.is_empty(),
+        "a repeated component mount walks every row on every event and every \
+         frame. Put it under a `col virtual-row=` — a `lazy` row does not cull \
+         a walk — or argue it into ARGUED above with the bucket it belongs \
+         to:\n{}",
+        unculled.join("\n")
+    );
+    for entry in ARGUED {
+        assert!(
+            matched.contains(entry),
+            "{entry:?} argues for a loop that no longer exists — delete the \
+             entry so the ledger keeps saying something true"
+        );
+    }
+}
+
+/// EVERY EXTERN ARGUMENT IS BY VALUE, SO A LIST ARGUMENT IS A DEEP CLONE.
+///
+/// `sync f(rows:[T])` called from a view expression clones the whole list into
+/// the call, once per frame, per call site — and if the site sits inside a
+/// `for`, once per row per frame. `state.ice` records three fields
+/// (`unread_marker_seq`, `has_older_history`, `rooms`) that exist only because
+/// this was measured and paid for; the fix is always the same, mirror the
+/// answer into state where the list is written.
+///
+/// So: a view may not hand a list to an extern. The ledger below is every
+/// place that still does — pre-existing, on screens whose frame cost nobody
+/// has measured. It is a ratchet, not a blessing: the next one fails.
+#[test]
+fn no_view_expression_hands_an_extern_a_list() {
+    let list_taking: Vec<String> = ice_sources()
+        .into_iter()
+        .filter(|(path, _)| path.replace('\\', "/").contains("/extern/"))
+        .flat_map(|(_, source)| {
+            source
+                .lines()
+                .filter_map(|line| {
+                    let declaration = line.trim().strip_prefix("sync ")?;
+                    let (name, rest) = declaration.split_once('(')?;
+                    let (args, _) = rest.split_once(')')?;
+                    args.contains(":[").then(|| name.to_owned())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        list_taking.len() > 50,
+        "the extern sweep found the declarations, not an empty file"
+    );
+
+    // (file, extern), in two buckets by how often the clone happens. Every
+    // entry predates this sweep; the sweep exists so the next one does not.
+    const ARGUED: &[(&str, &str)] = &[
+        // 1. ONCE PER FRAME — one clone of a workspace-shaped list per
+        //    rebuild. The mount file's props are the bulk of it: `view.ice`
+        //    is evaluated once, not per row.
+        ("view.ice", "member_tier"),
+        ("view.ice", "members_is_admin"),
+        ("view.ice", "bell_worst_severity"),
+        ("view.ice", "open_proposals"),
+        ("view.ice", "any_agent_active"),
+        ("screens/settings.ice", "member_tier"),
+        ("screens/settings.ice", "members_is_admin"),
+        ("screens/settings.ice", "members_summary"),
+        ("screens/settings.ice", "filter_log_lines"),
+        ("screens/pages.ice", "doc_tab_rows"),
+        ("screens/pages.ice", "subpage_blocks"),
+        ("screens/pages.ice", "thread_is_resolved"),
+        ("screens/pages.ice", "comment_compose_hint"),
+        ("screens/forge.ice", "forge_open_count"),
+        ("screens/forge.ice", "filter_forge_items"),
+        ("screens/forge.ice", "forge_comment_cap_reached"),
+        ("screens/storage.ice", "fs_counts_summary"),
+        ("screens/storage.ice", "fs_dir_count"),
+        ("screens/storage.ice", "explorer_ops_at"),
+        ("screens/governance.ice", "proposals_summary"),
+        ("screens/governance.ice", "open_proposals"),
+        ("screens/governance.ice", "pending_label"),
+        ("screens/governance.ice", "settled_proposals"),
+        ("screens/roster.ice", "members_summary"),
+        ("screens/roster.ice", "agents_summary"),
+        ("screens/roster.ice", "filter_members"),
+        // 2. ONCE PER ROW PER FRAME — the expensive kind, and the reason this
+        //    ledger names its entries instead of counting them. Each of these
+        //    sits inside a `for`, so the list is cloned n times a frame:
+        //    O(rows x list). `is_unread_channel` is chat's residue — the sweep
+        //    that mirrored `unread_channel_ids` into state killed the
+        //    `[ChannelRead]` clone per channel and left a `[str]` one; it is
+        //    bounded by the workspace and it did not move the keystroke
+        //    number, so it is named here rather than half-fixed.
+        ("screens/chat.ice", "is_unread_channel"),
+        ("screens/pages.ice", "comment_anchor_label"),
+        ("components/huddle.ice", "call_peer_muted"),
+    ];
+
+    let mut cloned: Vec<String> = Vec::new();
+    let mut matched: Vec<(&str, &str)> = Vec::new();
+    for (path, source) in view_sources() {
+        let path = path.replace('\\', "/");
+        for line in inlined(&source).lines() {
+            let code = code_of(line);
+            for name in &list_taking {
+                if !calls(code, name) {
+                    continue;
+                }
+                match ARGUED
+                    .iter()
+                    .find(|(file, extern_name)| path.ends_with(file) && extern_name == name)
+                {
+                    Some(entry) => matched.push(*entry),
+                    None => cloned.push(format!("(\"{path}\", \"{name}\"), // {}", code.trim())),
+                }
+            }
+        }
+    }
+
+    assert!(
+        cloned.is_empty(),
+        "a view expression handed a list to an extern — the ABI is by value, so \
+         that is a deep clone of the whole list on every frame. Mirror the answer \
+         into a `state.ice` field written where the list is written:\n{}",
+        cloned.join("\n")
+    );
+    for entry in ARGUED {
+        assert!(
+            matched.contains(entry),
+            "{entry:?} argues for a call that is gone — delete the entry"
+        );
+    }
+}
+
+/// `name(` at an identifier boundary, so `post_gate` does not match
+/// `no_post_gate`.
+fn calls(code: &str, name: &str) -> bool {
+    let mut rest = code;
+    while let Some(at) = rest.find(name) {
+        let before = rest[..at].chars().next_back();
+        let after = rest[at + name.len()..].chars().next();
+        let bounded = !before.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if bounded && after == Some('(') {
+            return true;
+        }
+        rest = &rest[at + name.len()..];
+    }
+    false
+}

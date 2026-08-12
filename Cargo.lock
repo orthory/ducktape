@@ -3221,6 +3221,7 @@ dependencies = [
  "git2",
  "governance",
  "iced",
+ "iced_test",
  "identity",
  "inbox",
  "jpeg-encoder",
