@@ -1352,12 +1352,23 @@ fn an_archived_channel_says_why_it_dropped_the_reaction() {
     assert_eq!(app.message_action, "toolbar", "the picker never opened");
     assert!(app.error.contains("archived"));
 
-    // And a live channel is untouched: the same call clears the banner and
-    // folds the reaction.
+    // AND ON A LIVE CHANNEL THE REFUSAL LINE WRITES NOTHING. Opening ♡ is a
+    // READ — it must hand the standing banner back untouched, or reaching for
+    // a reaction becomes the gesture that wipes the failure you had not read
+    // yet. Only the three mutations clear it, on their own line, where the
+    // clear has always been.
     app.active_channel_archived = false;
+    app.error = "Send failed — the node refused the message.".into();
+    let _ = app.__update(__DucktapeMessage::OpenMessageReactions(7, "root".into(), 1));
+    assert_eq!(
+        app.error, "Send failed — the node refused the message.",
+        "opening the picker is a read and must not clear the banner"
+    );
+    assert_eq!(app.message_action, "reactions", "the picker opened");
+
     app.selected_message_seq = 7;
     let _ = app.__update(__DucktapeMessage::AddReactionAt(7, "👍".into()));
-    assert_eq!(app.error, "");
+    assert_eq!(app.error, "", "the mutation clears the banner it replaces");
     assert!(!app.messages[0].reactions.is_empty());
 }
 
@@ -2623,17 +2634,23 @@ fn a_landing_in_another_room_retires_the_dm_header() {
 /// It also branches on the resolved NAME, not the key: `dm_peer_named` answers
 /// a roster miss with the blank peer while the key stays set, so branching on
 /// the key drew an empty plate with no name — never the fall-through to the
-/// derived two-party title that three comments promise.
+/// derived two-party title that three comments promise. ONE discriminant for
+/// the whole surface: the thread rail draws the same room's breadcrumb, and a
+/// rail still reading the KEY would print that room without its `#` while the
+/// header above it printed one — two readings of one room, on screen together.
 #[test]
 fn the_dm_header_takes_the_slack_the_channel_title_would() {
     let screen = inlined(include_str!("ui/screens/chat.ice"));
     assert!(screen.contains(
         "if !empty(active_dm.name)\n                    box w=fill clip=true\n                      DmHeader peer=active_dm"
     ));
-    // Both fall-through arms read the same derivation, so a roster miss draws
-    // the `#` and the channel title instead of a nameless avatar plate.
-    assert_eq!(screen.matches("if empty(active_dm.name)").count(), 2);
-    assert!(!screen.contains("active_dm_peer)\n                    DmHeader"));
+    // The header's two fall-through arms (`#` glyph, channel title) and the
+    // thread rail's breadcrumb, all reading the one derivation.
+    assert_eq!(screen.matches("if empty(active_dm.name)").count(), 3);
+    // No arm anywhere on this screen decides a title from the KEY, which
+    // survives the roster miss the resolved row does not.
+    assert!(!screen.contains("if empty(active_dm_peer)"));
+    assert!(!screen.contains("if !empty(active_dm_peer)"));
 }
 
 /// ONE COMMITTED REPLY, ONE ROW, ONE STEP OF THE CURSOR.
@@ -4211,8 +4228,27 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     ///
     /// Single-glyph buttons only: a multi-child row (a title over a meta line)
     /// paints its children on purpose.
+    ///
+    /// AND NO `IconAction` SILENCES ITS DISABLED TERM. Its ramp keys on the
+    /// svg's OWN bounds — iced computes `svg::Status::Hovered` in
+    /// `Button::update`, which forwards to its content BEFORE it looks at
+    /// `on_press` — so the button's term is the only thing that knows the
+    /// control is dead, and a mount that hands down `false` brightens the glyph
+    /// of a control nobody can press. (Dropping the prop outright is the Ice
+    /// compiler's error, not this lint's: `E123 missing prop`.)
     fn assert_icon_controls_inherit_ink(name: &str, source: &str) {
         let lines: Vec<_> = source.lines().collect();
+        for mount in lines
+            .iter()
+            .map(|line| line.trim_start())
+            .filter(|line| line.starts_with("IconAction "))
+        {
+            assert!(
+                !mount.contains("disabled=false"),
+                "{name}: an `IconAction` hovers on its own bounds, so it must carry its \
+                 button's disabled term, never a literal: {mount:?}"
+            );
+        }
         for (index, _) in lines
             .iter()
             .enumerate()

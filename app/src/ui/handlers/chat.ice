@@ -779,7 +779,9 @@ on open_message_reactions(seq, body, rev)
   return if seq <= 0
   // ♡ ON AN ARCHIVED CHANNEL OPENS NOTHING. Its 32 cells are all disabled
   // there, so the picker was a dead-end overlay whose only exit was Esc.
-  error = reaction_refusal(active_channel_archived)
+  // Opening it is a READ, so the live arm hands the banner back untouched —
+  // a failed send is not cleared by the reach for a reaction.
+  error = reaction_refusal(active_channel_archived, error)
   return if active_channel_archived
   message_menu_y = block_action_menu_y(chat_pointer_y, chat_height)
   selected_message_seq = seq
@@ -1003,15 +1005,17 @@ on delete_message_submit
 // the surface cannot carry that refusal — the quiet message rows are `lazy` on
 // ONE dependency, so `active_channel_archived` never reaches a chip or a
 // one-tap bar, and each of them kept its full hover/press ramp for an act that
-// never happened. `reaction_refusal` is empty when the channel is live, so the
-// same line that speaks the refusal is the one that clears the last one.
+// never happened. `reaction_refusal` hands the banner back on a live channel,
+// so the refusing line changes nothing there and each mutation still clears the
+// banner on its own line, below.
 on add_reaction_submit(emoji)
   return if loading || empty(active_channel) || selected_message_seq <= 0
-  error = reaction_refusal(active_channel_archived)
+  error = reaction_refusal(active_channel_archived, error)
   return if active_channel_archived
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
+  error = ""
   messages = reaction_applied(messages, selected_message_seq, emoji, true)
   thread_messages = reaction_applied(thread_messages, selected_message_seq, emoji, true)
   run every add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> reaction_acked _ | reaction_failed _
@@ -1022,22 +1026,24 @@ on add_reaction_submit(emoji)
 // overlay is anchored to the selection.
 on add_reaction_at(seq, emoji)
   return if loading || empty(active_channel) || seq <= 0
-  error = reaction_refusal(active_channel_archived)
+  error = reaction_refusal(active_channel_archived, error)
   return if active_channel_archived
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
+  error = ""
   messages = reaction_applied(messages, seq, emoji, true)
   thread_messages = reaction_applied(thread_messages, seq, emoji, true)
   run every add_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 on remove_reaction_at(seq, emoji)
   return if loading || seq <= 0
-  error = reaction_refusal(active_channel_archived)
+  error = reaction_refusal(active_channel_archived, error)
   return if active_channel_archived
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
+  error = ""
   messages = reaction_applied(messages, seq, emoji, false)
   thread_messages = reaction_applied(thread_messages, seq, emoji, false)
   run every remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _

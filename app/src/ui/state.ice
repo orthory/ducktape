@@ -500,7 +500,10 @@ state
   // reading, not a second one: it is written by the same statement list, from
   // the key that statement just decided, and the lint pins the pair. A peer who
   // has left the identity roster resolves to the blank row, and the header
-  // falls through to the `#` title exactly as the no-match filter arm did.
+  // falls through to the `#` title exactly as the no-match filter arm did —
+  // which is why the header branches on the RESOLVED `active_dm.name` and not
+  // on this key: the key stays set through that miss, and branching on it drew
+  // a nameless avatar plate instead of the fall-through.
   //
   // IT IS A READING OF `active_channel`, NOT A FLAG. Every handler that writes
   // the channel re-derives it through `dm_peer_of_channel` (or blanks it with

@@ -4323,3 +4323,43 @@ async fn a_forge_op_does_not_walk_the_repo_mirrors_for_a_closed_pane() {
     );
     assert!(data.repos.is_empty());
 }
+
+/// A DEAD CONTROL'S GLYPH DOES NOT ANSWER THE CURSOR. An `IconAction`'s ramp
+/// keys on the SVG'S OWN bounds — iced computes `svg::Status::Hovered` in
+/// `Button::update`, which forwards the event to its content before it ever
+/// looks at `on_press` — so status alone cannot tell a live control from a
+/// disabled one, and the button's own term is the only thing that knows.
+///
+/// The disabled step is the other half of the same gap: `disabled:opacity-50`
+/// multiplies the BUTTON's ink, which an svg never reads, so a dead icon was
+/// painted at full strength until this halved it here.
+#[test]
+fn a_disabled_icon_control_neither_brightens_nor_holds_its_full_ink() {
+    for theme in [iced::Theme::Light, iced::Theme::Dark] {
+        let resting = icon_tint(&theme, iced::widget::svg::Status::Idle, "muted");
+        let live_hover =
+            icon_action_tint(&theme, iced::widget::svg::Status::Hovered, "muted", false);
+        let dead_hover =
+            icon_action_tint(&theme, iced::widget::svg::Status::Hovered, "muted", true);
+        let dead_idle = icon_action_tint(&theme, iced::widget::svg::Status::Idle, "muted", true);
+
+        assert_ne!(
+            live_hover.color, resting.color,
+            "a live control's glyph brightens with its plate"
+        );
+        assert_eq!(
+            live_hover.color,
+            Some(theme.palette().text),
+            "to the same `fg` the button's own `hovered … text=fg` names"
+        );
+        assert_eq!(
+            dead_hover.color, dead_idle.color,
+            "a disabled control's glyph must not move under the cursor"
+        );
+        let dimmed = resting.color.map(|color| color.scale_alpha(0.5));
+        assert_eq!(
+            dead_idle.color, dimmed,
+            "a disabled glyph takes the same halving the recipe gives the button"
+        );
+    }
+}

@@ -223,11 +223,17 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   disabled=(loading || mutation_phase != "idle" || !connected)
                   p=0.0
                   @icon_action
+                // THE SAME TERM TWICE, because an svg hovers on its OWN bounds
+                // and never reads the button's ink: the glyph would brighten
+                // under a cursor that can press nothing. The other three mounts
+                // hand down a `disabled` prop; this button spells its own out,
+                // so this one repeats it rather than inventing a state field.
                 IconAction
                   with
                     name="plus"
                     tone="label"
                     px=16.0
+                    disabled=(loading || mutation_phase != "idle" || !connected)
                 active bg=transparent text=muted border=transparent border-w=1.0 r=5.0
                 hovered bg=separator text=fg
                 pressed bg=subtle text=fg
@@ -1536,7 +1542,10 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                             font=display
                             @text-fg
                       row gap=2.0 align=center
-                        if empty(active_dm_peer)
+                        // The same discriminant the main header reads: the
+                        // RESOLVED name, so a roster miss shows `# <channel>`
+                        // in both places instead of two readings of one room.
+                        if empty(active_dm.name)
                           text "#"
                             with
                               size=11.0

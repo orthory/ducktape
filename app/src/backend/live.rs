@@ -1024,14 +1024,19 @@ pub fn dm_channel_id(a: String, b: String) -> String {
 /// `peer` survives only while `channel` is that peer's own two-party channel;
 /// every other room answers "".
 ///
-/// `active_dm_peer` decides the whole header: a non-empty one draws `DmHeader`
-/// with the peer's avatar and name, and SUPPRESSES the `#` glyph and
-/// `active_channel_name` (`screens/chat.ice:335-355`). Cleared by the channel
-/// picker alone, it rode a search hit, a create, a reconnect and every resync
-/// into another room — Alice's face over #general's timeline, with the room the
-/// composer actually posts into never named. So every landing that assigns
-/// `active_channel` from a reply re-derives the peer through here, and the
-/// field cannot disagree with the room again.
+/// `active_dm_peer` decides the whole header, one step removed: it resolves the
+/// row (`dm_peer_named`) that the header actually branches on, so a peer this
+/// key names draws `DmHeader` with his avatar and name and SUPPRESSES the `#`
+/// glyph and `active_channel_name` — while a key whose peer has left the
+/// identity roster resolves to the blank row and falls THROUGH to that title
+/// (the `empty(active_dm.name)` arms in `screens/chat.ice`), instead of drawing
+/// a nameless avatar plate the way branching on the key itself did.
+///
+/// Cleared by the channel picker alone, it rode a search hit, a create, a
+/// reconnect and every resync into another room — Alice's face over #general's
+/// timeline, with the room the composer actually posts into never named. So
+/// every landing that assigns `active_channel` from a reply re-derives the peer
+/// through here, and the field cannot disagree with the room again.
 ///
 /// A device with no user key derives no DM id at all, so it holds no DM — the
 /// same answer `chat_sidebar_rooms` gives when `me` is empty.
@@ -1158,8 +1163,8 @@ pub fn post_gate(
     String::new()
 }
 
-/// THE BANNER A REFUSED REACTION LEAVES BEHIND — empty when the reaction is
-/// allowed, so one call both writes the refusal and clears the last one.
+/// THE BANNER A REFUSED REACTION LEAVES BEHIND — and, on a live channel, the
+/// banner already on screen, returned untouched.
 ///
 /// The reaction handlers refuse an archived channel because the module does
 /// (`check_post_policy`, reached through `reaction_target`), and until now they
@@ -1168,9 +1173,15 @@ pub fn post_gate(
 /// quiet message rows are `lazy` on ONE dependency, so `active_channel_archived`
 /// never reaches the chips or the one-tap bar, and every row keeps its full
 /// hover/press ramp. So the refusal has to speak.
-pub fn reaction_refusal(archived: bool) -> String {
+///
+/// It carries the banner through rather than clearing it because Ice handlers
+/// are straight-line — a `return if` guard, never a branch — so the refusing
+/// write happens on the live path too. Opening the ♡ picker is a read: it must
+/// not wipe a failed send the reader has not read yet. The three mutations
+/// clear the banner on their own line, where they always did.
+pub fn reaction_refusal(archived: bool, banner: String) -> String {
     match archived {
         true => "This channel is archived — reactions are closed. Unarchive it from Channel details to react here again.".into(),
-        false => String::new(),
+        false => banner,
     }
 }
