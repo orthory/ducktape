@@ -3930,7 +3930,7 @@ fn ice_sources_hold_to_the_design_system() {
     }
     assert!(app.contains(&format!("text-size {}", design::type_scale::BODY)));
 
-    let palette = ducktape_ui::ui::theme::LIGHT.palette;
+    let palette = ui_lang_components::ui::theme::LIGHT.palette;
     for (token, color) in [
         ("bg", palette.background),
         ("surface", palette.card),
@@ -4009,8 +4009,8 @@ fn every_status_fill_carries_a_readable_foreground_in_both_themes() {
     const AA_SMALL: f32 = 4.5;
 
     for (theme_name, theme) in [
-        ("light", ducktape_ui::ui::theme::LIGHT),
-        ("dark", ducktape_ui::ui::theme::DARK),
+        ("light", ui_lang_components::ui::theme::LIGHT),
+        ("dark", ui_lang_components::ui::theme::DARK),
     ] {
         let p = theme.palette;
         for (fill_name, fill, foreground) in [
