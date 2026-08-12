@@ -6,7 +6,7 @@
 // one family, and the guards in main.rs name several of its members verbatim.
 // Everything outside that family drops the redundant `forge_` prefix.
 
-component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], open_repo:str, repo_menu:bool, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_entries:[TreeEntry], file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], answered:bool, discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, shift_held:bool, wall_now:i64)
+component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_born:bool, tree_entries:[TreeEntry], code_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, shift_held:bool, wall_now:i64)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -61,14 +61,20 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
               about
               repos=len(repos)
               tier
-              answered
+              answered=(list_phase == "ready")
+          if empty(repos) && list_phase == "loading"
+            box w=fill p=30.0 align-x=center
+              text "Loading repositories…" size=13.0 @text-meta
+          if empty(repos) && list_phase == "failed"
+            box w=fill p=30.0 align-x=center
+              text "Could not load repositories. Reopen Forge to try again." size=13.0 @text-meta
           // NOT `EmptyPlate`: this screen has no "new repository" button and
           // never will, because forge IS a git remote — a repo comes into
           // existence when a push lands on it. Saying only that a repo
           // "appears here once it is created" and naming no way to create one
           // is a dead end, so the plate carries the command with this
           // workspace's own endpoint already in it.
-          if empty(repos) && answered
+          if empty(repos) && list_phase == "ready"
             box
               with
                 w=fill
@@ -281,33 +287,50 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     author=""
                     stamp=""
                   files:
-                    // ONE GUARD, AT THE TOP OF THE PANE. The listing
-                    // paints only for the repo it was read from —
-                    // `forge_open_repo` lives in a handler file this one
-                    // does not own and clears none of this, and another
-                    // project's files under a new breadcrumb is a wrong
-                    // reading, not a stale one. Picking Code re-reads
-                    // the root, so the tab itself is the recovery.
+                    // Loading, failure and a truly empty tree are different
+                    // facts. In particular, a slow first mirror fetch must
+                    // never paint "nothing committed" while bytes are still
+                    // arriving.
                     col w=fill
-                      if tree_repo != open_repo
+                      if code_phase == "tree_loading"
                         box
                           with
                             w=fill
                             pl=16.0
                             pr=16.0
                             pt=8.0
-                          // Reached only by an UNBORN repo now that opening one
-                          // loads its tree: a repo with no push on it has no
-                          // files to list, and saying so beats asking the
-                          // reader to click the tab they are already on.
-                          text "Nothing committed on this branch yet."
+                          text "Loading repository files…"
                             with
                               w=fill
                               size=11.5
                               line-h=1.5
                               @text-label
-                      if tree_repo == open_repo
+                      if code_phase == "tree_failed"
+                        box w=fill pl=16.0 pr=16.0 pt=8.0
+                          text "Could not load code. Pick Code to try again."
+                            with
+                              w=fill
+                              size=11.5
+                              line-h=1.5
+                              @text-label
+                      if tree_repo == open_repo && code_phase != "tree_loading" && code_phase != "tree_failed"
                         col w=fill
+                          if empty(tree_entries) && !tree_born
+                            box w=fill pl=16.0 pr=16.0 pt=8.0
+                              text "Nothing committed on this repository yet."
+                                with
+                                  w=fill
+                                  size=11.5
+                                  line-h=1.5
+                                  @text-label
+                          if empty(tree_entries) && tree_born
+                            box w=fill pl=16.0 pr=16.0 pt=8.0
+                              text "No files in this commit."
+                                with
+                                  w=fill
+                                  size=11.5
+                                  line-h=1.5
+                                  @text-label
                           if !empty(tree_path)
                             button -> emit(forge_open_dir, "")
                               with
@@ -358,24 +381,28 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                                   hovered bg=rail_hover text=fg
                                   pressed bg=elevated text=fg
                   source:
-                    // The reader's three states, each with its own true
-                    // reason. Nothing here claims a file is empty.
+                    // The reader's states, each with its own true reason.
                     col w=fill
-                      // A TREE WITH NOTHING IN IT IS NOT A TREE TO PICK FROM.
-                      // The sidebar already says "Nothing committed on this
-                      // branch yet"; telling the reader to pick a file from it
-                      // in the same breath sends them looking for something
-                      // that screen has just said does not exist.
-                      if empty(file_path) && empty(tree_entries)
-                        ForgeCodeEmpty name="" note="Nothing is committed on this branch yet, so there is no file to read."
-                      if empty(file_path) && !empty(tree_entries)
+                      if code_phase == "tree_loading"
+                        ForgeCodeEmpty name="" note="Loading repository files…"
+                      if code_phase == "file_loading"
+                        ForgeCodeEmpty name=file_path note="Loading file…"
+                      if code_phase == "tree_failed"
+                        ForgeCodeEmpty name="" note="Could not load code. Pick Code to try again."
+                      if code_phase == "file_failed"
+                        ForgeCodeEmpty name=file_path note="Could not load this file. Pick it again to retry."
+                      if code_phase == "ready" && empty(file_path) && empty(tree_entries) && !tree_born
+                        ForgeCodeEmpty name="" note="Nothing is committed on this repository yet, so there is no file to read."
+                      if code_phase == "ready" && empty(file_path) && empty(tree_entries) && tree_born
+                        ForgeCodeEmpty name="" note="This commit has no files to read."
+                      if code_phase == "ready" && empty(file_path) && !empty(tree_entries)
                         ForgeCodeEmpty name="" note="Pick a file from the tree to read it."
-                      if !empty(file_path) && file_binary
+                      if code_phase == "ready" && !empty(file_path) && file_binary
                         ForgeCodeEmpty
                           with
                             name=file_path
                             note="This is not text — the reader shows no preview for it."
-                      if !empty(file_path) && !file_binary
+                      if code_phase == "ready" && !empty(file_path) && !file_binary
                         col
                           with
                             w=fill
@@ -401,6 +428,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
               "issues"
                 ForgeTrackerList
                   with
+                    phase=repo_phase
                     items=filter_forge_items(items, "issue")
                     empty_message="No issues — this app reads the tracker but cannot open one yet."
                   forward
@@ -408,6 +436,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
               _
                 ForgeTrackerList
                   with
+                    phase=repo_phase
                     items=filter_forge_items(items, "pr")
                     empty_message="No pull requests — an agent run opens one when it delivers its work."
                   forward
@@ -418,7 +447,23 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
             // the plate described an enforcement that does not exist.
             // The one true sentence about it lives beside the merge
             // button, where the decision is made.
-        if forge_item_number > 0
+        if forge_item_number > 0 && item_phase == "loading"
+          col w=fill h=fill p=22.0 gap=14.0
+            button "Back to tracker" -> emit(forge_close_item)
+              with
+                h=28.0
+                p=6.0
+                @secondary_action
+            EmptyPlate message="Loading tracker item…"
+        if forge_item_number > 0 && item_phase == "failed"
+          col w=fill h=fill p=22.0 gap=14.0
+            button "Back to tracker" -> emit(forge_close_item)
+              with
+                h=28.0
+                p=6.0
+                @secondary_action
+            EmptyPlate message="Could not load this item. Go back and open it again to retry."
+        if forge_item_number > 0 && item_phase == "ready"
           scroll
             with
               dir=vertical

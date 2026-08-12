@@ -3840,6 +3840,21 @@ fn tree_listing_puts_directories_first_and_sizes_the_files() {
 }
 
 #[test]
+fn branch_presence_distinguishes_an_unborn_repo_from_an_empty_commit() {
+    let unborn_dir = tempfile::tempdir().unwrap();
+    let unborn = git2::Repository::init_bare(unborn_dir.path()).unwrap();
+    assert!(!mirror_has_born_branch(&unborn).unwrap());
+
+    let born_dir = tempfile::tempdir().unwrap();
+    let born = browsable_mirror(&born_dir, &[]);
+    assert!(mirror_has_born_branch(&born).unwrap());
+    assert!(
+        read_tree(&born, "", "").unwrap().is_empty(),
+        "a born branch can point at a real empty tree"
+    );
+}
+
+#[test]
 fn blob_read_counts_lines_and_names_binary_content() {
     let dir = tempfile::tempdir().unwrap();
     let mirror = browsable_mirror(&dir, &[("a.txt", "one\ntwo\n"), ("bin.dat", "head\0tail")]);

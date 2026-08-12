@@ -173,6 +173,12 @@ on console_opened(id)
   invalidate lane=block_threads
   invalidate lane=block_comments
   invalidate lane=live_resync
+  invalidate lane=forge_load
+  invalidate lane=forge_details
+  invalidate lane=forge_live
+  invalidate lane=forge_repo
+  invalidate lane=forge_item
+  invalidate lane=forge_discussion
   invalidate lane=forge_code
   invalidate lane=files_preview
   console_win = some(id)
@@ -291,6 +297,44 @@ on console_opened(id)
   page_search_hits = []
   page_search_generation = page_search_generation + 1
   page_searching = false
+  // Forge's open repo, tracker item, code mirror reading and drafts all name
+  // the network being left. The new endpoint may even have the same repo/item
+  // names, so identity strings cannot make any of these safe to retain.
+  forge_generation = forge_generation + 1
+  forge_code_generation = forge_code_generation + 1
+  forge_discussion_generation = forge_discussion_generation + 1
+  forge_list_phase = "idle"
+  forge_repos = []
+  forge_repo = ""
+  forge_repo_phase = "idle"
+  forge_repo_menu = false
+  forge_branches = []
+  forge_items = []
+  forge_item_number = 0
+  forge_item_phase = "idle"
+  forge_item_diff = ""
+  forge_item_channel = ""
+  forge_review_draft = ""
+  forge_comment_path = ""
+  forge_comment_line = ""
+  forge_comment_side = ""
+  forge_comment_draft = ""
+  forge_comment_staged = []
+  forge_merge_conflicts = []
+  forge_discussion = []
+  forge_discussion_members = []
+  forge_discussion_pending = ""
+  forge_discussion_editor = editor("")
+  forge_tree_repo = ""
+  forge_tree_rev = ""
+  forge_tree_path = ""
+  forge_tree_born = false
+  forge_tree_entries = []
+  forge_file_path = ""
+  forge_file_text = ""
+  forge_file_binary = false
+  forge_file_truncated = false
+  forge_code_phase = "idle"
   // The huddle and its media session belong to the PREVIOUS network.
   // `call_session` is subscribed `when huddle_joined`, so this clear IS the
   // teardown — the stream drops and the old node's presence gate reaps the

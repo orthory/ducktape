@@ -401,19 +401,24 @@ view
               connected_rpc
               tier=member_tier(members_rows)
               repos=forge_repos
+              list_phase=forge_list_phase
               open_repo=forge_repo
               repo_menu=forge_repo_menu
+              repo_phase=forge_repo_phase
               branches=forge_branches
               tab=forge_tab
               items=forge_items
               tree_repo=forge_tree_repo
               tree_path=forge_tree_path
+              tree_born=forge_tree_born
               tree_entries=forge_tree_entries
+              code_phase=forge_code_phase
               file_path=forge_file_path
               file_text=forge_file_text
               file_binary=forge_file_binary
               file_truncated=forge_file_truncated
               forge_item_number
+              item_phase=forge_item_phase
               forge_item_kind
               forge_item_title
               forge_item_state
@@ -437,7 +442,6 @@ view
               review_busy=forge_review_busy
               comment_target=forge_comment_target(forge_comment_path, forge_comment_line, forge_comment_side)
               staged_comments=forge_comment_staged
-              answered=forge_answered
               discussion=forge_discussion
               discussion_pending=forge_discussion_pending
               connected

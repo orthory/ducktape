@@ -1749,14 +1749,20 @@ component ReviewVerdict(verdict:str)
 // One seat of the forge tab bar: the tracker under one kind filter. Both the
 // Pull requests and the Issues arms are this component with a different filter
 // and a different empty line, so the two lists can never drift apart.
-component ForgeTrackerList(items:[ForgeItem], empty_message:str)
+component ForgeTrackerList(phase:str, items:[ForgeItem], empty_message:str)
   emits
     forge_open_item(i64)
   col #root w=fill h=fill
-    if empty(items)
+    if phase == "loading"
+      box w=fill p=22.0
+        EmptyPlate message="Loading repository tracker…"
+    if phase == "failed"
+      box w=fill p=22.0
+        EmptyPlate message="Could not load this repository. Return to all repos and open it again to retry."
+    if phase == "ready" && empty(items)
       box w=fill p=22.0
         EmptyPlate message=empty_message
-    if !empty(items)
+    if phase == "ready" && !empty(items)
       scroll
         with
           dir=vertical
