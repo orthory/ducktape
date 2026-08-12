@@ -75,7 +75,6 @@ extern crate::backend
   sync history_has_older(messages:[ChatMessage]) -> bool
   sync oldest_message_seq(messages:[ChatMessage]) -> i64
   sync prepend_history(messages:[ChatMessage], older:[ChatMessage]) -> [ChatMessage]
-  sync thread_offset_after_reply(offset:i64, has_more:bool, committed:bool) -> i64
   sync merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
   sync restore_draft(current:str, pending:str, keep_pending:bool) -> str
   // Chat's message/thread menus still place themselves this way; the name is
@@ -359,6 +358,7 @@ extern crate::backend
   DmPeersData(generation:i64, peers:[DmPeer])
   load_dm_peers(rpc:str, generation:i64) -> DmPeersData ! HydrationError
   sync dm_channel_id(a:str, b:str) -> str
+  sync dm_peer_of_channel(peer:str, me:str, channel:str) -> str
   sync rooms_only(channels:[ChatChannel], peers:[DmPeer], me:str) -> [ChatChannel]
   open_dm(rpc:str, password:str, peer_key:str) -> ChatData ! AppError
   sync post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str

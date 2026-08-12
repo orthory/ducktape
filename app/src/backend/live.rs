@@ -919,6 +919,30 @@ pub fn dm_channel_id(a: String, b: String) -> String {
     chat::client::dm_channel_id(&a, &b)
 }
 
+/// THE DM PEER IS A READING OF THE ROOM ON SCREEN, NOT A FLAG THAT OUTLIVES IT.
+/// `peer` survives only while `channel` is that peer's own two-party channel;
+/// every other room answers "".
+///
+/// `active_dm_peer` decides the whole header: a non-empty one draws `DmHeader`
+/// with the peer's avatar and name, and SUPPRESSES the `#` glyph and
+/// `active_channel_name` (`screens/chat.ice:335-355`). Cleared by the channel
+/// picker alone, it rode a search hit, a create, a reconnect and every resync
+/// into another room — Alice's face over #general's timeline, with the room the
+/// composer actually posts into never named. So every landing that assigns
+/// `active_channel` from a reply re-derives the peer through here, and the
+/// field cannot disagree with the room again.
+///
+/// A device with no user key derives no DM id at all, so it holds no DM — the
+/// same answer `rooms_only` gives when `me` is empty.
+pub fn dm_peer_of_channel(peer: String, me: String, channel: String) -> String {
+    let peer_owns_the_room =
+        !peer.is_empty() && !me.is_empty() && dm_channel_id(me, peer.clone()) == channel;
+    match peer_owns_the_room {
+        true => peer,
+        false => String::new(),
+    }
+}
+
 /// The channel list MINUS this viewer's DMs. A DM *is* an ordinary chat
 /// channel, so it arrives in the same listing as the rooms and used to appear
 /// twice over — once under CHANNELS wearing its derived id as a name, and once

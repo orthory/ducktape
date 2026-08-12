@@ -63,6 +63,9 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
 on choose_channel(id)
   return if loading || mutation_phase != "idle"
   active_dm_peer = ""
+  // "Jump to latest" IS this handler, aimed at the room already on screen — so
+  // the window the banner describes ends here, not at the reply.
+  history_view = false
   // FREEZE THE DIVIDER HERE, while the previous room is still `active_channel`
   // — the optimistic assignment below makes current == next by the time
   // `chat_updated` runs its own freeze, which then correctly keeps this value.
@@ -361,6 +364,10 @@ on chat_updated(next)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
   active_channel = next.active_channel
+  // A LANDING ANSWERS FOR THE PEER TOO. The DM header suppresses the `#` and
+  // the channel name, so a peer that outlives the room it named leaves the room
+  // on screen unnamed under someone else's face — see `dm_peer_of_channel`.
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
@@ -394,6 +401,11 @@ on chat_updated(next)
   task window close target=window_target_unless(huddle_joined, huddle_win)
 
 on chat_hit_loaded(next)
+  // THE ONE HANDLER THAT RAISES IT. `history_view` is a property of HOW the
+  // rows in hand were fetched — a window around one old message — so every
+  // other writer of `messages` lowers it, or the amber "Viewing history"
+  // banner sits over a live tail with a "Jump to latest" that reloads the
+  // channel you are already at the end of.
   history_view = true
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
@@ -402,6 +414,9 @@ on chat_hit_loaded(next)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
   active_channel = next.active_channel
+  // Same landing answer as `chat_updated`: a hit in another room retires the
+  // peer, a hit inside the DM keeps him.
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
@@ -437,6 +452,9 @@ on channel_created(next)
   channel_create_open = false
   channel_create_members_only = false
   mutation_phase = "idle"
+  // A brand-new channel's latest page IS the whole channel — see
+  // `chat_hit_loaded`.
+  history_view = false
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   has_older_history = history_has_older(messages)
@@ -444,6 +462,8 @@ on channel_created(next)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
   active_channel = next.active_channel
+  // Creating lands you in the new room, which is nobody's DM.
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
@@ -864,7 +884,12 @@ on thread_reply_send_failed(cause)
   thread_messages = rollback_pending_message(thread_messages, cause.operation_id, cause.committed)
   reply_draft = restore_draft(trim(editor_text(reply_editor)), cause.body, cause.committed)
   reply_editor = editor(reply_draft)
-  thread_next_reply_offset = thread_offset_after_reply(thread_next_reply_offset, thread_has_more, cause.committed)
+  // AND IT DOES NOT MOVE THE REPLY CURSOR. A committed reply grows the loaded
+  // run by exactly one row, and `live_updated`'s `thread_offset_after_live`
+  // already counts it when that reply's delta lands — which it does for every
+  // committed reply, this one included. Counting it here too advanced the
+  // cursor past a row nobody had loaded, and the next "Load more replies"
+  // started one reply late: the skipped reply was never rendered at all.
   return if !cause.committed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0

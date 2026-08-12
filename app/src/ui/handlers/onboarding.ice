@@ -181,6 +181,10 @@ on console_opened(id)
   unread_boundary = 0
   unread_marker_seq = 0
   active_channel = ""
+  // Same two readings of the room as `reconnect`, and this one points at a
+  // DIFFERENT node: a peer from the network she left names nothing here.
+  active_dm_peer = ""
+  history_view = false
   active_channel_name = ""
   active_channel_archived = false
   active_channel_members_only = false
