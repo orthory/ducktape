@@ -108,10 +108,14 @@ impl ResolverTarget {
 /// max snapshot bytes per [`SyncResponse::Chunk`]. sized so a chunk plus
 /// framing stays far under the mesh's 1 MiB message cap.
 pub const CHUNK_LEN: usize = 256 * 1024;
-/// max recovery frames per [`SyncResponse::Frames`] batch. suffix install loops
-/// over batches; one response stays far below the mesh frame cap unless a
-/// single frame itself is already too large for the transport.
+/// max recovery frames examined per [`SyncResponse::Frames`] batch. This is a
+/// work bound, not a byte guarantee: the node serve path separately budgets the
+/// exact encoded response against its configured mesh message cap.
 pub const FRAME_BATCH_LEN: usize = 64;
+
+/// fixed bytes prepended to every authenticated statesync request and reply:
+/// requester(32) + proof(64) + request id(8).
+pub const RPC_AUTHED_HEADER_LEN: usize = 32 + 64 + 8;
 
 /// how many boundary captures a server retains. more than one lets a second
 /// joiner start syncing without invalidating the first joiner's in-flight
@@ -727,6 +731,32 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
     out
 }
 
+/// exact encoded body length of a Frames response.
+///
+/// Add RPC_AUTHED_HEADER_LEN for the complete mesh message. Saturating
+/// arithmetic makes an impossible aggregate overflow fail closed at any
+/// caller comparing the result with a transport budget.
+pub fn encoded_frames_response_len(frames: &[FinalizedFrame]) -> usize {
+    const TAG_LEN: usize = 1;
+    const U64_LEN: usize = 8;
+    const DISPOSITION_LEN: usize = 1;
+
+    frames.iter().fold(TAG_LEN + U64_LEN, |len, frame| {
+        let roots_len = frame.roots.iter().fold(0usize, |len, (module_id, _)| {
+            len.saturating_add(U64_LEN)
+                .saturating_add(module_id.len())
+                .saturating_add(ROOT_LEN)
+        });
+        len.saturating_add(U64_LEN)
+            .saturating_add(U64_LEN)
+            .saturating_add(frame.frame.len())
+            .saturating_add(DISPOSITION_LEN)
+            .saturating_add(U64_LEN)
+            .saturating_add(roots_len)
+            .saturating_add(ROOT_LEN)
+    })
+}
+
 pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
     let mut buf = bytes;
     let tag = wire::take_u8(&mut buf)?;
@@ -961,7 +991,7 @@ pub const SYNC_AUTH_NAMESPACE: &[u8] = b"ducktape-statesync-auth-v1";
 /// client gates replies by transport peer and root-verifies payloads, so a
 /// reply's requester/proof are never inspected.
 pub fn encode_rpc_authed(requester: &[u8; 32], proof: &[u8; 64], id: u64, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + 64 + 8 + body.len());
+    let mut out = Vec::with_capacity(RPC_AUTHED_HEADER_LEN + body.len());
     out.extend_from_slice(requester);
     out.extend_from_slice(proof);
     out.extend_from_slice(&id.to_le_bytes());
@@ -2147,6 +2177,33 @@ mod tests {
     }
 
     #[test]
+    fn frames_response_length_matches_codec() {
+        let frames = vec![
+            FinalizedFrame {
+                height: 8,
+                frame: vec![0xAB; 31],
+                disposition: FrameDisposition::Applied,
+                roots: vec![
+                    ("kv".into(), StateRoot([3u8; ROOT_LEN])),
+                    ("a-longer-module-id".into(), StateRoot([4u8; ROOT_LEN])),
+                ],
+                root_hash: StateRoot([5u8; ROOT_LEN]),
+            },
+            FinalizedFrame {
+                height: 9,
+                frame: Vec::new(),
+                disposition: FrameDisposition::Rejected,
+                roots: Vec::new(),
+                root_hash: StateRoot([6u8; ROOT_LEN]),
+            },
+        ];
+        let encoded = encode_response(&SyncResponse::Frames {
+            frames: frames.clone(),
+        });
+        assert_eq!(encoded_frames_response_len(&frames), encoded.len());
+    }
+
+    #[test]
     fn index_archive_round_trips_and_rejects_truncation() {
         let files = vec![
             ("manifest-000001".to_string(), vec![1u8, 2, 3]),
@@ -2190,6 +2247,7 @@ mod tests {
         assert_eq!(p, &proof);
         assert_eq!(id, 99);
         assert_eq!(body, b"body");
+        assert_eq!(framed.len(), RPC_AUTHED_HEADER_LEN + body.len());
         // anything shorter than the 32+64+8 fixed header is Truncated.
         assert!(
             decode_rpc_authed(&framed[..32 + 64 + 7]).is_err(),
