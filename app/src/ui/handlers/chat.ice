@@ -609,6 +609,12 @@ on chat_updated(next)
   message_action = "toolbar"
   message_edit_draft = next.selected_message_body
   active_thread_seq = next.active_thread_seq
+  // AND THE THREAD'S OWN COMPOSER COMES WITH IT — see `reply_drafts`. The
+  // window loaders answer with seq 0, so today this is `editor("")` on top of a
+  // box `choose_channel`/`choose_dm` already emptied; it rides with the write
+  // because the rule is per-writer, not per-handler — a payload that starts
+  // seating a thread must not have to remember to add it.
+  reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
   thread_next_reply_offset = next.thread_next_reply_offset
@@ -681,6 +687,12 @@ on chat_hit_loaded(next)
   message_action = "toolbar"
   message_edit_draft = next.selected_message_body
   active_thread_seq = next.active_thread_seq
+  // AND THE THREAD'S OWN COMPOSER COMES WITH IT — see `reply_drafts`. This is
+  // the landing that made the line necessary: `load_chat_hit` answers with
+  // `root.seq` when the hit is a reply, so a chat-search jump SEATS a thread —
+  // and it did it with an empty box over a parked reply, which the next
+  // keystroke then parked over.
+  reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
   thread_next_reply_offset = next.thread_next_reply_offset
@@ -773,6 +785,12 @@ on channel_created(next)
   message_action = "toolbar"
   message_edit_draft = next.selected_message_body
   active_thread_seq = next.active_thread_seq
+  // AND THE THREAD'S OWN COMPOSER COMES WITH IT — see `reply_drafts`. A create
+  // lands on seq 0 and this is `editor("")`, but it is the same one line every
+  // writer of `active_thread_seq` owes: without it a landing that seats a
+  // thread leaves the box empty over a parked reply, and the first character
+  // typed into it parks OVER her stored words under that same key.
+  reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
   thread_next_reply_offset = next.thread_next_reply_offset

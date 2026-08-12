@@ -486,6 +486,31 @@ fn chat_data(active_channel: &str, messages: Vec<backend::ChatMessage>) -> backe
     }
 }
 
+fn workspace(active_channel: &str) -> backend::WorkspaceData {
+    backend::WorkspaceData {
+        generation: 0,
+        rpc: "http://node".into(),
+        status: "current".into(),
+        height: 1,
+        channels: Vec::new(),
+        messages: Vec::new(),
+        active_channel: active_channel.into(),
+        active_channel_name: active_channel.into(),
+        active_channel_archived: false,
+        active_channel_members_only: false,
+        active_channel_huddle_count: 0,
+        huddle_roster: Vec::new(),
+        channel_members: Vec::new(),
+        pages: Vec::new(),
+        blocks: Vec::new(),
+        active_page: String::new(),
+        active_page_title: String::new(),
+        active_page_parent: String::new(),
+        comment_thread_total: 0,
+        commented_block_hits: Vec::new(),
+    }
+}
+
 #[test]
 fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
     let (mut app, _) = Ducktape::__boot();
@@ -1814,39 +1839,55 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
     // (`chat_updated`, `chat_hit_loaded`, `live_resynced`) are NOT switches:
     // they re-affirm or correct the id of the room already on screen, so a park
     // there would file the live composer under a room she never left.
-    for switch in [
-        "choose_channel",
-        "choose_dm",
-        "open_chat_search_hit",
-        "channel_created",
-    ] {
-        let body = HANDLERS
-            .split(&format!("\non {switch}"))
+    //
+    // AND ONE SWITCH IS SPREAD OVER TWO HANDLERS, which is how it escaped: the
+    // pair is `reconnect` (blanks the room, carrying the live composer across)
+    // and `workspace_connected` (lands on `landing_channel(channels)` — the
+    // first room with traffic, which is rarely the room she left). Both halves
+    // are named here so the ordering rule reaches across the round trip.
+    let body_of = |handler: &str| {
+        HANDLERS
+            .split(&format!("\non {handler}"))
             .nth(1)
-            .unwrap_or_else(|| panic!("{switch} is a handler"))
+            .unwrap_or_else(|| panic!("{handler} is a handler"))
             .split("\non ")
             .next()
-            .expect("handler body");
-        let at = |token: &str| {
-            body.lines()
-                .position(|line| line.trim_start().starts_with(token))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{switch} moves the reader between rooms and must carry \
-                         `{token}` — a composer that follows her is armed to send \
-                         the room she left into the room she clicked"
-                    )
-                })
-        };
-        let park = at("message_drafts = park_message_draft(");
-        let rail_park = at("reply_drafts = park_reply_draft(");
-        let moved = at("active_channel = ");
-        let restore = at("message_editor = editor(parked_message_draft(");
+            .expect("handler body")
+    };
+    let at = |handler: &str, body: &str, token: &str| {
+        body.lines()
+            .position(|line| line.trim_start().starts_with(token))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{handler} moves the reader between contexts and must carry \
+                     `{token}` — a composer that follows her is armed to send \
+                     what she wrote next door into the room she clicked"
+                )
+            })
+    };
+    for (leaves, lands) in [
+        ("choose_channel", "choose_channel"),
+        ("choose_dm", "choose_dm"),
+        ("open_chat_search_hit", "open_chat_search_hit"),
+        ("channel_created", "channel_created"),
+        ("reconnect", "workspace_connected"),
+    ] {
+        let out = body_of(leaves);
+        let landing = body_of(lands);
+        let park = at(leaves, out, "message_drafts = park_message_draft(");
+        let rail_park = at(leaves, out, "reply_drafts = park_reply_draft(");
+        let left = at(leaves, out, "active_channel = ");
+        let arrived = at(lands, landing, "active_channel = ");
+        let restore = at(
+            lands,
+            landing,
+            "message_editor = editor(parked_message_draft(",
+        );
         assert!(
-            park < moved && rail_park < moved && moved < restore,
-            "{switch} must park BOTH composers BEFORE it moves `active_channel` \
-             and restore AFTER (park {park}, rail park {rail_park}, move \
-             {moved}, restore {restore})"
+            park < left && rail_park < left && arrived < restore,
+            "{leaves} must park BOTH composers BEFORE it moves `active_channel` \
+             and {lands} must restore AFTER (park {park}, rail park {rail_park}, \
+             move {left}, landing move {arrived}, restore {restore})"
         );
     }
 
@@ -1854,25 +1895,54 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
     // `active_thread_seq` instead of `active_channel`. `open_thread_for` is
     // what every "N replies" row in the timeline emits, so this is the ordinary
     // click that used to destroy a half-typed reply.
-    let rail = HANDLERS
-        .split("\non open_thread_for")
-        .nth(1)
-        .expect("open_thread_for is a handler")
-        .split("\non ")
-        .next()
-        .expect("handler body");
-    let at = |token: &str| {
-        rail.lines()
-            .position(|line| line.trim_start().starts_with(token))
-            .unwrap_or_else(|| panic!("open_thread_for must carry `{token}`"))
-    };
-    let park = at("reply_drafts = park_reply_draft(");
-    let moved = at("active_thread_seq = ");
-    let restore = at("reply_editor = editor(parked_reply_draft(");
+    //
+    // THE PARK MUST SIT ABOVE THE WRITE, not merely inside the handler:
+    // `park_reply_draft` refuses `thread_seq <= 0` outright, so a park read
+    // below a line that can zero the seq — `live_resynced`'s deleted-root and
+    // channel-move arms — is a guaranteed no-op that files nothing.
+    for parker in ["open_thread_for", "live_resynced"] {
+        let body = body_of(parker);
+        let park = at(parker, body, "reply_drafts = park_reply_draft(");
+        let moved = at(parker, body, "active_thread_seq = ");
+        assert!(
+            park < moved,
+            "{parker} must park the reply BEFORE it moves `active_thread_seq` — \
+             a park below the move reads a seq that no longer names the thread \
+             (park {park}, move {moved})"
+        );
+    }
+
+    // AND EVERY LANDING THAT SEATS A THREAD RESTORES BESIDE THE WRITE. Arriving
+    // in a thread by any other route left an empty box over parked words, and
+    // the first character typed into it parked OVER them under the same key —
+    // silent overwrite, not just loss of a live buffer. `chat_hit_loaded` is the
+    // reachable one (`load_chat_hit` answers with `root.seq` for a reply hit);
+    // the other two answer 0 today and ride the same rule so a payload that
+    // starts seating a thread cannot forget it.
+    //
+    // `thread_loaded` IS DELIBERATELY NOT HERE. It lands under an OPEN rail that
+    // `open_thread_for` already restored, so a second restore would overwrite
+    // whatever was typed during the round trip — the live buffer is the truth
+    // there, exactly as it is across a resync.
+    for landing in [
+        "open_thread_for",
+        "chat_updated",
+        "chat_hit_loaded",
+        "channel_created",
+    ] {
+        let body = body_of(landing);
+        let moved = at(landing, body, "active_thread_seq = ");
+        let restore = at(landing, body, "reply_editor = editor(parked_reply_draft(");
+        assert!(
+            moved < restore,
+            "{landing} seats `active_thread_seq` and must restore the parked \
+             reply AFTER it (move {moved}, restore {restore})"
+        );
+    }
     assert!(
-        park < moved && moved < restore,
-        "open_thread_for must park the reply BEFORE it moves `active_thread_seq` \
-         and restore AFTER (park {park}, move {moved}, restore {restore})"
+        !body_of("thread_loaded").contains("parked_reply_draft("),
+        "thread_loaded lands under a rail that is already open and typeable — a \
+         restore there overwrites the keystrokes the round trip collected"
     );
 
     // TWO READINGS OF THE ROOM RIDE WITH IT. `active_dm_peer` decides whether
@@ -3674,6 +3744,81 @@ fn opening_another_thread_parks_the_reply_in_the_thread_it_belongs_to() {
     );
 }
 
+/// A PEER DELETING THE ROOT IS NOT A REQUEST TO THROW THE REPLY AWAY EITHER.
+///
+/// `live_resynced` closes the rail on its own whenever `refreshed_known_message_seq`
+/// finds the root deleted or the room moved. The park has to sit ABOVE that
+/// line: `park_reply_draft` refuses `thread_seq <= 0` outright, so a park read
+/// below it is a guaranteed no-op — the rail vanishes, nothing is filed, and the
+/// next thread she opens hands her an empty box with her words nowhere.
+#[test]
+fn a_resync_that_closes_the_rail_parks_the_reply_it_closes_over() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.hydration_generation = 4;
+    app.active_thread_seq = 7;
+    app.reply_editor = compose("three sentences in and");
+
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        4,
+        "general",
+        vec![message(7, "the root", true)],
+        "",
+        Vec::new(),
+    )));
+    assert_eq!(
+        app.active_thread_seq, 0,
+        "a deleted root closes the rail under the caret"
+    );
+    assert_eq!(
+        backend::parked_reply_draft(app.reply_drafts.clone(), "general".into(), 7),
+        "three sentences in and",
+        "and the words are filed under the thread they were written in"
+    );
+
+    // Which is the only place they can be posted, so that is where they come
+    // back — through the ordinary rail open, no banner and no Restore needed.
+    app.reply_editor = compose("");
+    let _ = app.__update(__DucktapeMessage::OpenThreadFor(7));
+    assert_eq!(reply_composer(&app), "three sentences in and");
+}
+
+/// AND ARRIVING IN A THREAD BY THE SEARCH ROUTE RESTORES THE SAME PARK.
+///
+/// `load_chat_hit` answers with `root.seq` when the hit is a reply, so a
+/// chat-search jump SEATS a thread — and `chat_hit_loaded` wrote
+/// `active_thread_seq` with no restore beside it. The rail opened on an empty
+/// box over her parked reply, and the first character typed into it parked OVER
+/// those words under the same `general#7` key: a silent overwrite, not just the
+/// loss of a live buffer.
+#[test]
+fn a_search_hit_that_seats_a_thread_opens_on_that_threads_parked_reply() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.active_thread_seq = 7;
+    app.reply_editor = compose("half an answer");
+
+    // Clicking another thread parks it — the route the park was built for.
+    let _ = app.__update(__DucktapeMessage::OpenThreadFor(9));
+    assert!(reply_composer(&app).is_empty());
+
+    let mut hit = chat_data("general", vec![message(7, "the root", false)]);
+    hit.generation = app.chat_generation;
+    hit.active_thread_seq = 7;
+    let _ = app.__update(__DucktapeMessage::ChatHitLoaded(hit));
+
+    assert_eq!(app.active_thread_seq, 7, "the hit seated its thread");
+    assert_eq!(
+        reply_composer(&app),
+        "half an answer",
+        "and the rail it opened is the rail she left words in"
+    );
+}
+
 /// THE STREAM'S LOAD FLAG IS NOT THE RAIL'S, AND THE RAIL'S SEND SAID SO.
 ///
 /// `reply_composer_event` refused on `loading` — a term neither the reply
@@ -4403,6 +4548,56 @@ fn same_endpoint_reconnect_preserves_unsent_drafts() {
     assert_eq!(app.connected_rpc, "http://node-a");
     assert_eq!(composer(&app), "next message");
     assert_eq!(app.failed_message_draft, "unsent message");
+}
+
+/// SURVIVING THE RECONNECT IS NOT THE SAME AS SURVIVING IT IN THE RIGHT ROOM.
+///
+/// The reconnect is one room switch spread over two handlers, and that is how it
+/// escaped the park: `reconnect` carries the live composer across and blanks
+/// `active_channel`, then `workspace_connected` lands on
+/// `landing_channel(channels)` — the first room with traffic, rarely the room
+/// she left. So #private-ops' half-typed incident note stood over #general's
+/// Send, and the next pick parked those words under #general's id: she found
+/// #private-ops empty and her sentence filed in a room she never typed it in.
+/// The rail's composer had it worse — the reconnect simply ate it.
+#[test]
+fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
+    let (mut app, _) = Ducktape::__boot();
+    app.loading = false;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "private-ops".into();
+    app.active_thread_seq = 3;
+    app.message_editor = compose("the incident started at");
+    app.reply_editor = compose("half a reply");
+
+    let _ = app.__update(__DucktapeMessage::Reconnect);
+
+    let mut landed = workspace("general");
+    landed.generation = app.connect_generation;
+    landed.channels = vec![room("private-ops", 10), room("general", 20)];
+    let _ = app.__update(__DucktapeMessage::WorkspaceConnected(landed));
+
+    assert_eq!(app.active_channel, "general", "the connect picks the landing");
+    assert!(
+        composer(&app).is_empty(),
+        "#general's composer is #general's — the note she was writing next door \
+         is not armed to send here"
+    );
+
+    app.mutation_phase = "idle".into();
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("private-ops".into()));
+    assert_eq!(
+        composer(&app),
+        "the incident started at",
+        "it is waiting in the room she was writing it in"
+    );
+
+    let _ = app.__update(__DucktapeMessage::OpenThreadFor(3));
+    assert_eq!(
+        reply_composer(&app),
+        "half a reply",
+        "and the rail the reconnect closed kept its reply too"
+    );
 }
 
 #[test]
