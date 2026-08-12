@@ -217,6 +217,7 @@ extern crate::backend
   ForgeMergeOutcome(merged:bool, merge_oid:str, conflicts:[str])
   ForgeLiveData(generation:i64, repos_loaded:bool, repos:[ForgeRepo], repo_loaded:bool, branches:[str], items:[ForgeItem], item_loaded:bool, item:ForgeItemData)
   load_forge(rpc:str, generation:i64) -> ForgeData ! HydrationError
+  load_forge_details(rpc:str, generation:i64) -> ForgeData ! HydrationError
   load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError
   load_forge_item(rpc:str, repo:str, number:i64, generation:i64) -> ForgeItemData ! HydrationError
   load_forge_discussion(rpc:str, channel_id:str, generation:i64) -> ForgeDiscussionData ! HydrationError
