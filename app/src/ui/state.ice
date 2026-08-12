@@ -68,10 +68,20 @@ state
   // posted THERE. A chain post is permanent in history even after a tombstone.
   // Parked on the way out while `active_channel` still names the room she is
   // leaving, restored on the way in once it names the room she is entering; the
-  // three pickers carry both lines and a lint in `app/src/tests.rs` pins the
-  // order. Its own store rather than a `ChannelWindow` field — see
+  // four room switches carry both lines and a lint in `app/src/tests.rs` pins
+  // the order. Its own store rather than a `ChannelWindow` field — see
   // `park_message_draft`.
   message_drafts:[ChannelDraft] = []
+  // AND THE RAIL'S COMPOSER IS PER-THREAD, on the same rule one level down.
+  // `open_thread_for` blanked the live `reply_editor` and every "N replies" row
+  // in the timeline beside the rail emits it, so a click meant to check
+  // something next door destroyed three sentences. Keyed by room AND root
+  // because a thread belongs to both: parked on the way out of a thread (and on
+  // the way out of the room that holds it), handed back when she opens that
+  // same thread again. `close_thread` parks EMPTY — that click is a request to
+  // discard. Not a `failed_reply_draft` harvest, which is channel-scoped and
+  // would offer thread A's words to thread B — see `park_reply_draft`.
+  reply_drafts:[ChannelDraft] = []
   // THE SWITCH'S OWN GENERATION. Every route that moves the reader between
   // rooms bumps it and stamps it on the load it launches, so `chat_updated`
   // can drop a room she has already clicked past — A→B→C lands on C even when

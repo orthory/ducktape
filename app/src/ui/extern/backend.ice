@@ -333,6 +333,11 @@ extern crate::backend
   // would throw away typed text.
   pure park_message_draft(drafts:[ChannelDraft], channel_id:str, text:str) -> [ChannelDraft]
   pure parked_message_draft(drafts:[ChannelDraft], channel_id:str) -> str
+  // The rail's twin, keyed by room AND root. NOT a `failed_reply_draft` harvest
+  // — that one is channel-scoped and would re-target the words at another
+  // thread; see `park_reply_draft`.
+  pure park_reply_draft(drafts:[ChannelDraft], channel_id:str, thread_seq:i64, text:str) -> [ChannelDraft]
+  pure parked_reply_draft(drafts:[ChannelDraft], channel_id:str, thread_seq:i64) -> str
   // The pages twin of `channel_display_name`: the header title of a page that
   // has only just been clicked, read from the list already in hand.
   pure page_display_title(pages:[PageItem], page:str, current:str) -> str

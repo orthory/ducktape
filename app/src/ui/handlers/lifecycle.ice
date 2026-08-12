@@ -846,6 +846,14 @@ subscribe
   // key has nothing to dismiss, and that is precisely the state a reader typing
   // into a composer is in, so the hot path pays nothing for this line.
   //
+  // IT CARRIES NO `connected` TERM, and that asymmetry with the line above is
+  // deliberate. `topmost_overlay` IS this half's precondition — a layer that is
+  // up ate the key and must come down whether or not the socket is alive, and a
+  // drawer that refused Escape while disconnected would be a trap. Nothing else
+  // gets through: `palette_key_action`'s open arm is separately gated on
+  // `connected` in `overlays.ice`, as are the mark and page chords, and the
+  // chord keys bubble anyway so they arrive on the IGNORED half.
+  //
   // ponytail: this is a layer-level gate standing in for a key-level one. While
   // a layer IS open, typing into its search field still pays the extra rebuild.
   // The upgrade path is upstream — a `keyboard press key=escape` filter in the

@@ -47,8 +47,10 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // OUT of a search hit is a click on that room, and without this it is the one
   // navigation in the pane that still pays a full round trip.
   message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
-  // AND PARK HER UNSENT WORDS WITH IT — see `message_drafts`.
+  // AND PARK HER UNSENT WORDS WITH IT — see `message_drafts`. Both composers:
+  // the rail belongs to this room too, and the reset below closes it.
   message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
+  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   // FREEZE THE DIVIDER WHILE `active_channel` STILL NAMES THE ROOM SHE LEAVES —
   // same reason as `choose_channel`.
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, channel_id, unread_boundary)
@@ -143,8 +145,10 @@ on choose_channel(id)
   invalidate lane=live_thread
   // PARK THE ROOM SHE IS LEAVING, while `active_channel` still names it.
   message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
-  // AND PARK HER UNSENT WORDS WITH IT — see `message_drafts`.
+  // AND PARK HER UNSENT WORDS WITH IT — see `message_drafts`. Both composers:
+  // the rail belongs to this room too, and the reset below closes it.
   message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
+  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   active_dm_peer = ""
   active_dm = no_dm_peer()
   // "Jump to latest" IS this handler, aimed at the room already on screen — so
@@ -258,8 +262,10 @@ on choose_dm(peer_key)
   // The room she is leaving is parked here too — she may come back to it from
   // the DM.
   message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
-  // AND PARK HER UNSENT WORDS WITH IT — see `message_drafts`.
+  // AND PARK HER UNSENT WORDS WITH IT — see `message_drafts`. Both composers:
+  // the rail belongs to this room too, and the reset below closes it.
   message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
+  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   active_dm_peer = peer_key
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   // A DM IS A CHANNEL AND ITS ID IS DERIVABLE. `dm_channel_id` is the same
@@ -732,10 +738,21 @@ on channel_created(next)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
   rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
+  // A CREATE IS A ROOM SWITCH, so both composers park here like they do in the
+  // three pickers — the line below lands her IN the new channel. Both keys must
+  // be read while `active_channel` still names the room she is leaving.
+  message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
+  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   active_channel = next.active_channel
   // Creating lands you in the new room, which is nobody's DM.
   active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
+  // AND THE NEW ROOM'S COMPOSER IS THE NEW ROOM'S. Without this the sentence
+  // she was writing in the room she left followed her into the channel she just
+  // made, sat above a live Send there, and the NEXT switch parked it under the
+  // new room's id — silently reattributing it, so it was gone when she went
+  // back for it.
+  message_editor = editor(parked_message_draft(message_drafts, active_channel))
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
@@ -939,6 +956,10 @@ on open_message_link(url)
 
 on open_thread_for(seq)
   return if seq <= 0 || empty(active_channel)
+  // PARK THE REPLY OF THE THREAD SHE IS LEAVING, while `active_thread_seq`
+  // still names it — see `reply_drafts`. A no-op on an ordinary open, where the
+  // rail was closed or its composer empty.
+  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   channel_settings_open = false
   selected_message_seq = 0
   selected_message_rev = 0
@@ -966,18 +987,16 @@ on open_thread_for(seq)
   thread_messages = thread_root_seed(messages, thread_messages, seq)
   thread_next_reply_offset = 0
   thread_has_more = false
-  // A HALF-TYPED REPLY IS NOT THE PRICE OF LOOKING AT ANOTHER THREAD. The three
-  // lines below blank the LIVE buffer, and this handler is what every "N
-  // replies" row in the timeline beside the rail emits — so a click meant to
-  // check something destroyed text nobody asked to discard, with no banner and
-  // no way back. Same harvest `thread_reply_send_failed` makes, into the same
-  // "Unsent reply" plate: `remember_failed_draft` no-ops on an empty editor, so
-  // an ordinary rail open is untouched, and the plate + Restore mount in the
-  // rail this very click is opening. `close_thread` stays the one route that
-  // discards a reply, because that one is a request to.
-  failed_reply_draft = remember_failed_draft(failed_reply_draft, "another thread", trim(editor_text(reply_editor)), false)
+  // A HALF-TYPED REPLY IS NOT THE PRICE OF LOOKING AT ANOTHER THREAD. This
+  // handler is what every "N replies" row in the timeline beside the rail
+  // emits, and it blanks the LIVE buffer — so a click meant to check something
+  // destroyed text nobody asked to discard, with no banner and no way back. The
+  // park above holds it; the line below hands back whatever THIS thread was
+  // left holding, which is the only thread those words can be posted in.
+  // `close_thread` stays the one route that discards a reply, because that one
+  // is a request to.
   reply_draft = ""
-  reply_editor = editor("")
+  reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
   pending_reply = ""
   // A rail that just opened has an UNTOUCHED reply composer, and the click
   // that opened it was on a message row, not on either editor — so the caret
@@ -1088,6 +1107,10 @@ on close_thread
   invalidate lane=live_thread
   thread_generation = thread_generation + 1
   live_thread_generation = live_thread_generation + 1
+  // CLOSE IS A REQUEST TO DISCARD, and the park has to hear it: an empty park
+  // DROPS the entry, so the reply she closed away does not come back the next
+  // time she opens that thread. Read while `active_thread_seq` still names it.
+  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, "")
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
