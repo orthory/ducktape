@@ -625,14 +625,18 @@ on live_resynced(next)
   // that are NOT are the two acts that deliberately run outside the lock — a
   // message send (`chat_composer_event`, `reply_composer_event`) and a
   // reaction tap (`add_reaction_submit`, `add_reaction_at`,
-  // `remove_reaction_at`) — plus `chat_load_failed`, which is a LANDING rather
-  // than an act: its launchers are all gated on the lock, but a switch already
-  // in flight when `mutation_failed` parked it lands under "recovering" and
-  // `mutation_failed` does not invalidate the `chat_load` lane. None of the six
-  // launch a replacement on the `live_resync` lane, so any of them inside the
-  // recovery's round trip leaves the lock held with no terminal again, and
+  // `remove_reaction_at`) — plus two LANDINGS rather than acts,
+  // `chat_load_failed` and `failed` (the `load_page` error arm below): their
+  // launchers are all gated on the lock, but a switch already in flight when
+  // `mutation_failed` parked it lands under "recovering", and `mutation_failed`
+  // invalidates neither the `chat_load` nor the `page_load` lane. None of the
+  // seven launch a replacement on the `live_resync` lane, so any of them inside
+  // the recovery's round trip leaves the lock held with no terminal again, and
   // Settings → Reconnect (whitelisted for "recovering" at the top of this file)
-  // is the escape. Closing it means giving the recovery a generation of its own
+  // is the escape. `connect_failed` bumps ungated too and is deliberately NOT on
+  // that list: its own forever-retry ends at `workspace_connected`, which writes
+  // `mutation_phase = "idle"` unconditionally, so that chain releases the lock
+  // itself. Closing the rest means giving the recovery a generation of its own
   // rather than riding this one, which is a wider change than the lock is worth
   // today: this is strictly the residue of a case that used to be
   // unconditional.
