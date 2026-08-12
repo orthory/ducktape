@@ -85,6 +85,9 @@ on reconnect
   // Same abandoned request, same dead button — see `choose_channel`. A reconnect
   // drops the socket the page was requested on, so it may never answer at all.
   history_loading = false
+  // And the window load with it: same dropped socket, and the reply that would
+  // lower this term may never come — see `chat_window_loading`.
+  chat_window_loading = false
   channel_reads = []
   unread_boundary = 0
   active_channel = ""

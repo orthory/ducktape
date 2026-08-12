@@ -68,6 +68,17 @@ state
   // handlers, which made the FIRST click win and every click during the load
   // vanish with no feedback at all.
   chat_generation:i64 = 0
+  // IS A SWITCH STILL OUT — the term `loading` stopped carrying the moment a
+  // cache hit began painting parked rows with `loading` false. The rows on
+  // screen during that round trip are the PREVIOUS window, and the reply is
+  // about to replace them wholesale: a history page requested against their
+  // oldest seq prepends under a window that no longer starts there, punching a
+  // silent, unmarked gap into the middle of the timeline that only a resync
+  // heals. So the two history routes read this instead — and NO switch handler
+  // does, which is the whole point of the generation guard above: the click is
+  // always taken, only the paging it would corrupt is held. The view reads it
+  // once, so the "Load older" button says which of the two it is refusing on.
+  chat_window_loading = false
   channel_reads:[ChannelRead] = []
   unread_boundary:i64 = 0
   // The seq wearing the "New" divider — first_unread_seq(messages,

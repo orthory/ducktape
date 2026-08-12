@@ -167,7 +167,12 @@ view
               messages
               has_older_history
               history_view
-              history_loading
+              // THE BUTTON TELLS THE TRUTH ABOUT BOTH REFUSALS. `load_more_history`
+              // refuses on `chat_window_loading` as well, and a cache-hit switch
+              // paints the parked rows — button included — with `loading` false,
+              // so without this the one control on screen during that round trip
+              // is a live-looking button that swallows the press.
+              history_loading=(history_loading || chat_window_loading)
               unread_boundary
               unread_marker_seq
               selected_message_seq

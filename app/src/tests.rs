@@ -1293,13 +1293,20 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
 
     // And the launches genuinely carry the clear — a mover list alone would pass
     // with every clear deleted.
-    for launch in [
-        "choose_channel",
-        "choose_dm",
-        "open_chat_search_hit",
-        "create_channel_submit",
-        "reconnect",
-        "console_opened",
+    //
+    // THE SECOND TERM RIDES THE SAME LIST. `chat_window_loading` is the "a chat
+    // load is in flight" reading the history routes gained when a cache hit
+    // stopped raising `loading`, and it splits this list in two: the three
+    // routes that LAUNCH a window load raise it, and the three that abandon one
+    // without starting another lower it — a launch that raised it with no
+    // landing left to lower it refuses "Load older" for the rest of the session.
+    for (launch, window_term) in [
+        ("choose_channel", "chat_window_loading = true"),
+        ("choose_dm", "chat_window_loading = true"),
+        ("open_chat_search_hit", "chat_window_loading = true"),
+        ("create_channel_submit", "chat_window_loading = false"),
+        ("reconnect", "chat_window_loading = false"),
+        ("console_opened", "chat_window_loading = false"),
     ] {
         let body = HANDLERS
             .split(&format!("\non {launch}"))
@@ -1311,6 +1318,35 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
         assert!(
             body.contains("history_loading = false"),
             "{launch} abandons a history request and must release the flag"
+        );
+        assert!(
+            body.contains(window_term),
+            "{launch} must write `{window_term}`"
+        );
+    }
+
+    // The landings lower it, and each is generation-guarded: a superseded reply
+    // must not open the history routes against rows the winning load is still
+    // about to replace.
+    for landing in ["chat_updated", "chat_hit_loaded", "chat_load_failed"] {
+        let body = HANDLERS
+            .split(&format!("\non {landing}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{landing} is a handler"))
+            .split("\non ")
+            .next()
+            .expect("handler body");
+        let guard = body
+            .lines()
+            .position(|line| line.trim_start().starts_with("return if "))
+            .expect("a generation guard");
+        let release = body
+            .lines()
+            .position(|line| line.trim() == "chat_window_loading = false")
+            .expect("the window term is released");
+        assert!(
+            guard < release,
+            "{landing} must release `chat_window_loading` BELOW its generation guard"
         );
     }
 
@@ -6430,6 +6466,81 @@ fn switching_back_to_a_parked_room_paints_its_rows_without_waiting_on_the_node()
     assert_eq!(app.channel_members.len(), 1, "its member roll came with it");
     assert!(app.has_older_history, "derived from the restored rows");
     assert!(app.post_refusal.is_empty());
+}
+
+/// A PARKED WINDOW IS NOT A SETTLED ONE, AND HISTORY MAY NOT PAGE FROM IT. The
+/// cache hit paints the rows she left behind with `loading` false, so `loading`
+/// — the only in-flight term the two history routes had — stopped covering the
+/// round trip the switch is still inside. #a grew while she was away, so the
+/// walk answers with a LATER window: a page requested from the PARKED window's
+/// oldest seq lands after that replacement and prepends under rows it does not
+/// touch, deleting the seqs between them from the MIDDLE of the timeline with no
+/// gap marker, and `has_older_history` then walks backwards past the hole
+/// forever. `chat_window_loading` is the term that covers it.
+#[test]
+fn a_switch_still_in_flight_refuses_the_history_page_its_parked_rows_would_ask_for() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.mutation_phase = "idle".into();
+    app.active_channel = "a".into();
+    app.channels = vec![room("a", 100), room("b", 20)];
+    app.messages = vec![
+        message(50, "a-fifty", false),
+        message(100, "a-hundred", false),
+    ];
+
+    // Away and back: #a comes off the park in one frame, and its refetch is out.
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("b".into()));
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("a".into()));
+    assert_eq!(app.messages.len(), 2, "the parked window is on screen");
+    assert!(!app.loading, "a parked room is not a loading one");
+    assert!(app.has_older_history, "so the paging routes are live");
+    let idle = app.history_generation;
+
+    // Neither route may spend a request on seqs the walk is about to replace —
+    // the scroll prefetch and the button both.
+    let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 900.0, 0.0, 0.95));
+    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+    assert!(
+        !app.history_loading,
+        "no page may be requested from a window a switch is still replacing"
+    );
+    assert_eq!(app.history_generation, idle, "nothing went out");
+
+    // The walk answers, and it answers with a window that starts LATER than the
+    // parked one — the whole reason its seqs could not be paged from.
+    let mut fresh = chat_data(
+        "a",
+        vec![
+            message(90, "a-ninety", false),
+            message(140, "a-head", false),
+        ],
+    );
+    fresh.channels = vec![room("a", 140)];
+    fresh.generation = app.chat_generation;
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(fresh));
+    assert_eq!(app.messages.first().map(|row| row.seq), Some(90));
+
+    // Now the button is honest work again, and the page joins the window it was
+    // actually requested from.
+    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+    assert!(app.history_loading, "the settled window pages normally");
+    let in_flight = app.history_generation;
+    let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
+        generation: in_flight,
+        channel_id: "a".into(),
+        messages: vec![
+            message(88, "a-eightyeight", false),
+            message(89, "a-eightynine", false),
+        ],
+    }));
+    let seqs: Vec<i64> = app.messages.iter().map(|row| row.seq).collect();
+    assert_eq!(
+        seqs,
+        vec![88, 89, 90, 140],
+        "the timeline is continuous — no seq vanished from its middle"
+    );
 }
 
 /// A PENDING SEND IS NOT PARKED. Its settle handlers only touch the timeline of

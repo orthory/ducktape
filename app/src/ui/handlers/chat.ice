@@ -46,6 +46,8 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // lands in a DIFFERENT channel via `chat_hit_loaded`, so the page still in
   // flight belongs to the room she jumped out of.
   history_loading = false
+  // AND THE WINDOW IT LANDS IN IS STILL OUT — see `chat_window_loading`.
+  chat_window_loading = true
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = true
@@ -126,6 +128,13 @@ on choose_channel(id)
   // page lands — forever if it hangs. `history_loaded` drops that page on its
   // channel check anyway.
   history_loading = false
+  // AND THE ROWS ON SCREEN ARE PROVISIONAL UNTIL THE WALK ANSWERS. A cache hit
+  // paints the PREVIOUS window with `loading` false below, and the reply
+  // replaces it wholesale — so the two history routes read this rather than
+  // `loading`, or a page requested against a seq the fresh window no longer
+  // starts at prepends a gap into the middle of the timeline. Only those two
+  // routes read it: the switch handlers stay unswallowed.
+  chat_window_loading = true
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
@@ -183,6 +192,8 @@ on choose_dm(peer_key)
   has_older_history = false
   // Same abandoned request, same dead button — see `choose_channel`.
   history_loading = false
+  // Same window still out — see `chat_window_loading`.
+  chat_window_loading = true
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   hydration_generation = hydration_generation + 1
@@ -225,6 +236,11 @@ on create_channel_submit
   // abandoned here. `mutation_phase` masks the dead button only until the
   // create settles.
   history_loading = false
+  // AND THE SWITCH IT ABANDONS TOO. The bump above discards the reply of any
+  // window load still out, so nothing will ever lower this term for it, and
+  // "Load older" would stay refused in the new room for the rest of the
+  // session. `mutation_phase` guards the window this create replaces.
+  chat_window_loading = false
   pending_channel = trim(channel_draft)
   channel_draft = ""
   error = ""
@@ -471,6 +487,11 @@ on chat_updated(next)
   live_thread_generation = live_thread_generation + 1
   thread_loading = false
   loading = false
+  // THE WINDOW ON SCREEN IS THE ANSWER NOW, so history may page against its
+  // seqs again. Below the generation guard on purpose: a superseded reply must
+  // not open the routes against rows the winning load is still about to
+  // replace.
+  chat_window_loading = false
   error = ""
   // The huddle ended under this fold (or the roster she is on is another
   // channel's): the window mirrors the old popped-card gate, which also
@@ -527,6 +548,11 @@ on chat_hit_loaded(next)
   live_thread_generation = live_thread_generation + 1
   thread_loading = false
   loading = false
+  // THE WINDOW ON SCREEN IS THE ANSWER NOW, so history may page against its
+  // seqs again. Below the generation guard on purpose: a superseded reply must
+  // not open the routes against rows the winning load is still about to
+  // replace.
+  chat_window_loading = false
   error = ""
   // Same close-if-ended mirror as `chat_updated` above.
   task window close target=window_target_unless(huddle_joined, huddle_win)
@@ -543,6 +569,10 @@ on chat_load_failed(cause)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = false
+  // Nothing is coming to replace the rows on screen, so they are as canonical
+  // as they will get and history may page against them — same release as
+  // `chat_updated`, under the same generation guard.
+  chat_window_loading = false
   error = cause.message
 
 on channel_created(next)
@@ -832,14 +862,22 @@ on thread_page_failed(cause)
 // scroll step, and the extern takes the timeline BY VALUE. The mirror in state
 // is written by every handler that moves `messages` for exactly this reason.
 on chat_scrolled(_absolute_x, _absolute_y, _relative_x, relative_y)
-  return if !near_scroll_top(relative_y) || history_loading || loading || mutation_phase != "idle" || empty(active_channel) || !has_older_history
+  return if !near_scroll_top(relative_y) || history_loading || loading || chat_window_loading || mutation_phase != "idle" || empty(active_channel) || !has_older_history
   history_generation = history_generation + 1
   history_loading = true
   error = ""
   run load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages), history_generation) -> history_loaded _ | history_failed _
 
+// `chat_window_loading` rides with `loading` in BOTH guards, and it is the one
+// term that survived the cache hit: `loading` is false for the whole round trip
+// of a switch back into a parked room, and the parked rows this would page from
+// are about to be replaced by the walk's own window. Paging against them
+// prepends under a window that no longer starts there — seqs vanish from the
+// MIDDLE of the timeline with no gap marker and `has_older_history` keeps
+// walking backwards past the hole. It gates the two history routes and nothing
+// else: the switch handlers themselves take every click.
 on load_more_history
-  return if history_loading || loading || mutation_phase != "idle" || empty(active_channel) || empty(messages) || !history_has_older(messages)
+  return if history_loading || loading || chat_window_loading || mutation_phase != "idle" || empty(active_channel) || empty(messages) || !history_has_older(messages)
   history_generation = history_generation + 1
   history_loading = true
   error = ""
