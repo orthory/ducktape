@@ -70,7 +70,7 @@ pub struct MountPlan {
 /// build the neutral `/ducktape/*` mount plan from a run's HOST paths. every
 /// mapping hides the host side:
 /// - `workdir` → `/ducktape/workspace` (rw, the cwd)
-/// - `bin`     → `/ducktape/bin/<filename>` (ro)
+/// - `bin` + declared companion binaries → `/ducktape/bin/<filename>` (ro)
 /// - each `rw_dir` (CLI auth/state under `home`) → `/ducktape/home/<rel>` (rw)
 /// - a FILE in `ro_paths` (the workspace-parent context doc) → `/ducktape/<name>`,
 ///   one level above the workspace so `../<name>` still resolves
@@ -78,6 +78,7 @@ pub struct MountPlan {
 pub fn plan_mounts(
     workdir: &Path,
     bin: &Path,
+    companion_bins: &[PathBuf],
     ro_paths: &[PathBuf],
     rw_dirs: &[PathBuf],
     home: &Path,
@@ -100,6 +101,15 @@ pub fn plan_mounts(
             read_only: true,
         },
     ];
+    mounts.extend(companion_bins.iter().map(|companion| Mount {
+        host: companion.clone(),
+        guest: root.join("bin").join(
+            companion
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("companion")),
+        ),
+        read_only: true,
+    }));
     for dir in rw_dirs {
         // spec.rs guaranteed these live under HOME; a defensive fallback keeps
         // the basename if a stray one does not, rather than leaking the path.
@@ -1518,6 +1528,7 @@ mod tests {
         let plan = plan_mounts(
             Path::new(HOST_WORKSPACE),
             Path::new("/usr/bin/claude"),
+            &[],
             &[PathBuf::from("/opt/skills")],
             &[PathBuf::from(HOST_AUTH_DIR)],
             home,
@@ -1608,6 +1619,7 @@ mod tests {
             Path::new(HOST_WORKSPACE),
             Path::new("/usr/bin/claude"),
             &[],
+            &[],
             &[PathBuf::from(HOST_AUTH_DIR)],
             home,
         );
@@ -1650,6 +1662,30 @@ mod tests {
             !guest_view.contains(HOST_USER) && !guest_view.contains("provider-runs"),
             "guest-visible leak: {guest_view}"
         );
+    }
+
+    #[test]
+    fn executor_companions_land_beside_the_primary_binary() {
+        let companion = PathBuf::from("/opt/codex/bin/codex-code-mode-host");
+        let plan = plan_mounts(
+            Path::new(HOST_WORKSPACE),
+            Path::new("/opt/codex/bin/codex"),
+            std::slice::from_ref(&companion),
+            &[],
+            &[],
+            Path::new(HOST_HOME),
+        );
+
+        let mounted = plan
+            .mounts
+            .iter()
+            .find(|mount| mount.host == companion)
+            .expect("the declared companion is mounted");
+        assert_eq!(
+            mounted.guest,
+            Path::new("/ducktape/bin/codex-code-mode-host")
+        );
+        assert!(mounted.read_only);
     }
 
     #[test]
