@@ -119,7 +119,7 @@ use replica::promotion::{
 #[cfg(test)]
 use sdk::{Msg, StateRoot};
 #[cfg(test)]
-use sync::catchup::{apply_post_reboot_catchup_frames, apply_verified_suffix_frame};
+use sync::catchup::{apply_suffix_frames, apply_verified_suffix_frame};
 #[cfg(test)]
 use sync::serve::assert_floor_binds_view;
 #[cfg(test)]
@@ -360,7 +360,6 @@ fn run_node(
         sandbox,
         compute_backend,
         sandbox_capacity,
-        promoted,
     } = boot::env::derive(resolved, sync_only);
 
     // A node whose config says it can isolate runs, booting with no compute
@@ -616,21 +615,14 @@ fn run_node(
         // ---- the JOINER / REPLICA: park on the mesh, bootstrap a boundary,
         // then FOLD the head (unified-node phase 2) ----
         //
-        // decided from the REAL store (the pre-runtime probe only gated
-        // listeners): a key outside the genesis set that no checkpoint seats
-        // as a participant. a fresh join has no checkpoint at all; a
-        // RESTARTED replica has one that names it a resident — it re-enters
-        // here and re-ascends (a fresh bootstrap into its existing journal;
-        // recovering the folded state by journal replay instead is the
-        // remaining phase-2 follow-up). after PROMOTION the checkpoint
-        // seats this key, so a rebooted process falls through to the
-        // validator path below.
-        let checkpoint_seats_me = manifest.as_ref().is_some_and(|m| {
-            m.participants
-                .iter()
-                .any(|k| k.as_slice() == signer.public_key().as_ref())
-        });
-        if !checkpoint_seats_me && !validators.contains(&signer.public_key()) {
+        // Every key outside the immutable genesis set enters the role resolver.
+        // A local checkpoint is only a recovery base; it cannot authoritatively
+        // name the key's CURRENT role while the process was offline. The replica
+        // path reads the latest committed manifest, remains resident when that
+        // boundary grants resident standing, or returns a promotion baton when
+        // it seats the key as a validator.
+        let genesis_validator = validators.contains(&signer.public_key());
+        if !genesis_validator {
             let baton = replica::run(
                 context,
                 network,
@@ -728,7 +720,6 @@ fn run_node(
             quota,
             metrics,
             status,
-            sync_source,
             advertised_reach,
             status_public_key,
             signer,
@@ -748,7 +739,6 @@ fn run_node(
             chain_id,
             mesh_state_file,
             checkpoint_blocks,
-            promoted,
             dev_demo,
             rpc_listener,
             http_cmds,

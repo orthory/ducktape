@@ -643,11 +643,17 @@ impl NetworkShapeCluster {
         reply["status"].clone()
     }
 
-    /// drive a membership ceremony verb (`member promote`, `resident accept`,
-    /// `resident remove`) against node 0's running rpc, from node 0's config.
+    /// drive a membership ceremony verb (`member promote`, `member remove`,
+    /// `resident accept`, `resident remove`) against node `idx`'s running rpc,
+    /// from that node's config.
     /// `verb` is the space-separated two-token spelling; it is split into argv.
-    pub fn run_membership_verb(&self, verb: &str, pubkey_hex: &str) -> (bool, String) {
-        let cfg = self.config_file(0);
+    pub fn run_membership_verb_as(
+        &self,
+        idx: usize,
+        verb: &str,
+        pubkey_hex: &str,
+    ) -> (bool, String) {
+        let cfg = self.config_file(idx);
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
         cmd.arg("node");
         for token in verb.split(' ') {
@@ -659,6 +665,11 @@ impl NetworkShapeCluster {
             .output()
             .unwrap_or_else(|e| panic!("run {verb}: {e}"));
         (out.status.success(), command_output(&out))
+    }
+
+    /// drive a membership ceremony from the founder's running node.
+    pub fn run_membership_verb(&self, verb: &str, pubkey_hex: &str) -> (bool, String) {
+        self.run_membership_verb_as(0, verb, pubkey_hex)
     }
 
     /// drive the DIRECT admission ceremony (`member promote` — the pre-staged
