@@ -35,6 +35,8 @@ const CHANNELS: i64 = 24;
 const WINDOW: Size = Size::new(1440.0, 900.0);
 const HUDDLE_WINDOW: Size = Size::new(320.0, 460.0);
 const PAGE_ROWS: usize = 128;
+/// Two thread pages of replies in the open rail (root + 127 replies).
+const THREAD_ROWS: i64 = 128;
 const HUDDLE_ROWS: usize = 32;
 const LONG_LIST_ROWS: usize = 2_048;
 const FILE_ROWS: usize = 256;
@@ -45,12 +47,14 @@ const FRAMES: usize = 12;
 
 /// ALLOCATIONS PER KEYSTROKE, AND NOTHING ELSE IS ASSERTED.
 ///
-/// Measured on `dev` after the QA sweep landed: about **16 700** allocations.
+/// Measured on `dev` after the QA sweep landed: about **16 700** allocations;
+/// the ducktape-ui a099fa6b pin's borrow-aware `for` rows brought the same
+/// fixture to **15 982**, and the ceiling moved down to keep that win locked.
 /// The count is stable inside one process but can move slightly with global
 /// font/cache initialization, so the ceiling leaves broad headroom. Deleting
 /// the stream's `virtual-row=` alone takes it above 27 000, still well beyond
 /// the budget.
-const KEYSTROKE_ALLOCATION_CEILING: u64 = 22_000;
+const KEYSTROKE_ALLOCATION_CEILING: u64 = 21_000;
 
 struct ScreenProbe {
     label: &'static str,
@@ -68,6 +72,16 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
         size: WINDOW,
         fixture: console_in_page_comments,
         allocation_ceiling: 120_000,
+    },
+    // 18,836 vs 54,599 for removing the quiet-arm `lazy` on the rail's
+    // replies. Removing the rail's `virtual-row=` moves build time
+    // (2.4ms -> 2.7ms median here, and every offscreen reply's layout)
+    // but few allocations, so the lazy control is the one that gates.
+    ScreenProbe {
+        label: "chat thread rail build+layout",
+        size: WINDOW,
+        fixture: console_in_chat_thread,
+        allocation_ceiling: 22_000,
     },
     // 4,947 vs 7,059 for restoring per-row peer lookup.
     ScreenProbe {
@@ -237,6 +251,38 @@ fn probe_channel(index: i64) -> backend::ChatChannel {
 /// mirrored field (`rooms`, `dm_rows`, `post_refusal`,
 /// `unread_marker_seq`, …) holds what it would hold in front of a user.
 fn console_in_chat() -> (Ducktape, iced::window::Id) {
+    console_in_chat_with_thread(Vec::new(), 0)
+}
+
+/// [`console_in_chat`] with the THREAD RAIL open on message 1 and a full
+/// page of replies. The rail is the app's one `for`-bound ChatMessage list
+/// (the stream and the forge discussion are keyed virtual columns), so this
+/// is the fixture that sees a lost `virtual-row=` or quiet-arm `lazy` on the
+/// rail — and the one that will measure the cheap-key `lazy … by` adoption
+/// when ui-lang accepts component-param chain roots (ducktape-ui#589 defers
+/// them; every screen list in this app arrives as a component prop).
+fn console_in_chat_thread() -> (Ducktape, iced::window::Id) {
+    let root = probe_message(1);
+    let replies = (2..=THREAD_ROWS).map(|seq| {
+        let mut reply = probe_message(seq);
+        reply.thread_seq = 1;
+        reply
+    });
+    let thread = std::iter::once(root).chain(replies).collect();
+    let (app, console) = console_in_chat_with_thread(thread, 1);
+    assert_eq!(
+        app.thread_messages.len(),
+        THREAD_ROWS as usize,
+        "the probe drives a full page of replies, not an empty rail"
+    );
+    assert_eq!(app.active_thread_seq, 1, "the rail is open");
+    (app, console)
+}
+
+fn console_in_chat_with_thread(
+    thread_messages: Vec<backend::ChatMessage>,
+    active_thread_seq: i64,
+) -> (Ducktape, iced::window::Id) {
     let (mut app, _) = Ducktape::__boot();
     let console = iced::window::Id::unique();
     app.console_win = Some(console);
@@ -258,9 +304,9 @@ fn console_in_chat() -> (Ducktape, iced::window::Id) {
         selected_message_seq: 0,
         selected_message_rev: 0,
         selected_message_body: String::new(),
-        active_thread_seq: 0,
+        active_thread_seq,
         thread_target_seq: 0,
-        thread_messages: Vec::new(),
+        thread_messages,
         thread_next_reply_offset: 0,
         thread_has_more: false,
     };
@@ -625,7 +671,7 @@ fn probe_large_screens() {
     );
     for probe in SCREEN_PROBES {
         let (app, window) = (probe.fixture)();
-        let allocations = probe_unchanged_build(probe.label, &app, window, probe.size);
+        let allocations = probe_unchanged_build(probe.label, app, window, probe.size);
         assert!(
             allocations < probe.allocation_ceiling,
             "{} rebuilt in {allocations} allocations, over the {} ceiling. Restore the \
@@ -638,7 +684,7 @@ fn probe_large_screens() {
 
 fn probe_unchanged_build(
     label: &'static str,
-    app: &Ducktape,
+    mut app: Ducktape,
     window: iced::window::Id,
     size: Size,
 ) -> u64 {
@@ -646,7 +692,7 @@ fn probe_unchanged_build(
     let mut clipboard = clipboard::Null;
     let mut messages: Vec<__DucktapeMessage> = Vec::new();
     let mut cache = user_interface::Cache::default();
-    for _ in 0..WARMUP_FRAMES {
+    for warm_frame in 0..WARMUP_FRAMES {
         let mut ui = UserInterface::build(app.__view(window), size, cache, &mut renderer);
         ui.update(
             &[Event::Window(iced::window::Event::RedrawRequested(
@@ -657,12 +703,23 @@ fn probe_unchanged_build(
             &mut clipboard,
             &mut messages,
         );
+        // A first frame may PRIME the fixture — chat's scrolls publish their
+        // initial viewport as a real `chat_scrolled` message, exactly as they
+        // do in front of a user — so warm-up applies what the view emits. It
+        // must SETTLE before measurement: a fixture still emitting on the
+        // last warm frame is a feedback loop, and the phase below would be
+        // measuring it rather than an unchanged frame.
+        let settled = messages.is_empty();
+        let last_warm_frame = warm_frame + 1 == WARMUP_FRAMES;
         assert!(
-            messages.is_empty(),
-            "warming {label} must not mutate the fixture"
+            settled || !last_warm_frame,
+            "warming {label} did not settle: {} messages on the last warm frame",
+            messages.len()
         );
-        messages.clear();
         cache = ui.into_cache();
+        for message in messages.drain(..) {
+            let _ = app.__update(message);
+        }
     }
 
     let mut build = Phase::new(label);
