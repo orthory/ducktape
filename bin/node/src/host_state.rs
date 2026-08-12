@@ -1392,7 +1392,25 @@ mod tests {
     /// Compose the production genesis host in a throwaway storage root and
     /// return `(module ids sorted, root hash hex)` — everything both pins below
     /// need, so neither has to keep its own copy of the construction.
+    ///
+    /// Production runs this root future on macOS's ~8 MiB process stack. Run
+    /// the test twin on the same budget: libtest's 2 MiB worker stack is just
+    /// below this full 20-module composition's debug-build requirement.
+    const GENESIS_TEST_STACK_BYTES: usize = 8 * 1024 * 1024;
+
     fn genesis_facts() -> (Vec<String>, String) {
+        std::thread::Builder::new()
+            .name("production-genesis-test".into())
+            .stack_size(GENESIS_TEST_STACK_BYTES)
+            .spawn(compose_genesis_facts)
+            .expect("spawn production genesis test")
+            .join()
+            // Keep the original assertion or construction panic and location;
+            // turning it into a generic join failure would hide the regression.
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    }
+
+    fn compose_genesis_facts() -> (Vec<String>, String) {
         let dir = tempfile::tempdir().expect("tempdir");
         let forge_repo = dir.path().join("forge");
         let duckfs_dir = dir.path().join("duckfs");
