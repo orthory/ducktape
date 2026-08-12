@@ -260,7 +260,7 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
             label="Dismiss"
             p=0.0
             @icon_action
-          Toast.Confirm message=toast tone=tone
+          Toast message=toast tone=tone
           active bg=transparent text=fg border=transparent border-w=1.0 r=10.0
           hovered bg=transparent text=fg
           pressed bg=transparent text=fg

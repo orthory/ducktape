@@ -9,7 +9,7 @@ on search_chat_submit
   chat_search_phase = "searching"
   chat_search_hits = []
   error = ""
-  run search_chat(connected_rpc, "", trim(chat_search_draft), chat_search_generation) -> chat_search_loaded _ | chat_search_failed _
+  run replace lane=chat_search search_chat(connected_rpc, "", trim(chat_search_draft), chat_search_generation) -> chat_search_loaded _ | chat_search_failed _
 
 on chat_search_loaded(next)
   return if next.generation != chat_search_generation
@@ -27,6 +27,7 @@ on chat_search_failed(cause)
   error = cause.message
 
 on clear_chat_search
+  invalidate lane=chat_search
   chat_search_generation = chat_search_generation + 1
   chat_search_draft = ""
   chat_search_hits = []
@@ -38,6 +39,10 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // carries `chat_generation`, so the one it supersedes is dropped on arrival
   // instead of this click being dropped on the way out.
   return if mutation_phase != "idle"
+  invalidate lane=chat_search
+  invalidate lane=history
+  invalidate lane=thread
+  invalidate lane=live_thread
   // PARK THE ROOM SHE IS LEAVING, exactly as the two pickers do — the way back
   // OUT of a search hit is a click on that room, and without this it is the one
   // navigation in the pane that still pays a full round trip.
@@ -78,7 +83,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   composer_focus = "none"
   error = ""
   chat_generation = chat_generation + 1
-  run load_chat_hit(connected_rpc, channels, channel_id, root_seq, target_seq, chat_generation) -> chat_hit_loaded _ | chat_load_failed _
+  run replace lane=chat_load load_chat_hit(connected_rpc, channels, channel_id, root_seq, target_seq, chat_generation) -> chat_hit_loaded _ | chat_load_failed _
 
 // THE LAST CLICK WINS. This used to open `return if loading`, and `loading` is
 // true for the entire switch it starts — so the second click of a fast A→B→C
@@ -93,6 +98,10 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
 // disable on exactly that term, so the guard and the affordance agree.
 on choose_channel(id)
   return if mutation_phase != "idle"
+  invalidate lane=chat_search
+  invalidate lane=history
+  invalidate lane=thread
+  invalidate lane=live_thread
   // PARK THE ROOM SHE IS LEAVING, while `active_channel` still names it.
   message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
   active_dm_peer = ""
@@ -127,10 +136,7 @@ on choose_channel(id)
   post_refusal = keep_str(seat_known, post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key), "")
   has_older_history = history_has_older(messages)
   // THE FLAG BELONGS TO THE REQUEST, AND THE REQUEST BELONGS TO THE ROOM YOU
-  // LEFT. `load_more_history` returns early on it and nothing else here lowers
-  // it, so "Load older" is dead in the room you land in until the abandoned
-  // page lands — forever if it hangs. `history_loaded` drops that page on its
-  // channel check anyway.
+  // LEFT. Invalidating `history` above ends both before the new room paints.
   history_loading = false
   // AND THE ROWS ON SCREEN ARE PROVISIONAL UNTIL THE WALK ANSWERS. A cache hit
   // paints the PREVIOUS window with `loading` false below, and the reply
@@ -176,7 +182,7 @@ on choose_channel(id)
   // re-paged the whole list on every switch — a round trip in front of the
   // first row, for a list this handler is reading two statements above and the
   // live fold keeps current.
-  run load_channel_window(connected_rpc, channels, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
+  run replace lane=chat_load load_channel_window(connected_rpc, channels, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
 
 // A DM is not a second message plane: it is the two-party members-only channel
 // at `dm_channel_id(me, peer)`, resolved or created on the way in. Everything
@@ -184,6 +190,11 @@ on choose_channel(id)
 on choose_dm(peer_key)
   // Same last-click-wins rule as `choose_channel`, and the same reason.
   return if mutation_phase != "idle" || empty(peer_key)
+  invalidate lane=chat_search
+  invalidate lane=history
+  invalidate lane=thread
+  invalidate lane=live_thread
+  invalidate lane=chat_load
   // The room she is leaving is parked here too — she may come back to it from
   // the DM. The DM itself is NOT restored from the cache: this handler does not
   // know the two-party channel id, `open_dm` resolves it.
@@ -194,7 +205,7 @@ on choose_dm(peer_key)
   // immediately; the DM header is resolved from `dm_peers` right above.
   messages = []
   has_older_history = false
-  // Same abandoned request, same dead button — see `choose_channel`.
+  // Same lane cancellation as `choose_channel`.
   history_loading = false
   // Same window still out — see `chat_window_loading`.
   chat_window_loading = true
@@ -228,7 +239,7 @@ on choose_dm(peer_key)
   // Reads the peer back from state: `active_dm_peer = peer_key` above already
   // moved the payload, so passing `peer_key` here would be a use after move.
   chat_generation = chat_generation + 1
-  run open_dm(connected_rpc, password, active_dm_peer, chat_generation) -> chat_updated _ | chat_load_failed _
+  run every open_dm(connected_rpc, password, active_dm_peer, chat_generation) -> chat_updated _ | chat_load_failed _
 
 on create_channel_submit
   return if loading || mutation_phase != "idle" || empty(trim(channel_draft))
@@ -249,7 +260,7 @@ on create_channel_submit
   channel_draft = ""
   error = ""
   chat_generation = chat_generation + 1
-  run create_channel(connected_rpc, password, pending_channel, channel_create_members_only, chat_generation) -> channel_created _ | mutation_failed _
+  run every create_channel(connected_rpc, password, pending_channel, channel_create_members_only, chat_generation) -> channel_created _ | mutation_failed _
 
 on toggle_channel_create_members_only
   channel_create_members_only = !channel_create_members_only
@@ -297,7 +308,7 @@ on rename_channel_submit
   hydration_retry_attempt = 0
   mutation_phase = "channel-rename"
   error = ""
-  run rename_channel(connected_rpc, password, active_channel, trim(channel_name_draft)) -> chat_acked _ | mutation_failed _
+  run every rename_channel(connected_rpc, password, active_channel, trim(channel_name_draft)) -> chat_acked _ | mutation_failed _
 
 on archive_channel_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived
@@ -305,7 +316,7 @@ on archive_channel_submit
   hydration_retry_attempt = 0
   mutation_phase = "channel-archive"
   error = ""
-  run archive_channel(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
+  run every archive_channel(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
 
 on unarchive_channel_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || !active_channel_archived
@@ -313,7 +324,7 @@ on unarchive_channel_submit
   hydration_retry_attempt = 0
   mutation_phase = "channel-unarchive"
   error = ""
-  run unarchive_channel(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
+  run every unarchive_channel(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
 
 on add_channel_member_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || empty(trim(member_key_draft))
@@ -321,7 +332,7 @@ on add_channel_member_submit
   hydration_retry_attempt = 0
   mutation_phase = "channel-member"
   error = ""
-  run add_channel_member(connected_rpc, password, active_channel, trim(member_key_draft)) -> chat_acked _ | mutation_failed _
+  run every add_channel_member(connected_rpc, password, active_channel, trim(member_key_draft)) -> chat_acked _ | mutation_failed _
 
 on remove_channel_member_submit(key)
   return if loading || mutation_phase != "idle" || empty(active_channel)
@@ -329,7 +340,7 @@ on remove_channel_member_submit(key)
   hydration_retry_attempt = 0
   mutation_phase = "channel-member"
   error = ""
-  run remove_channel_member(connected_rpc, password, active_channel, key) -> chat_acked _ | mutation_failed _
+  run every remove_channel_member(connected_rpc, password, active_channel, key) -> chat_acked _ | mutation_failed _
 
 // JOINING IS A SIGNED CHAIN WRITE, SO IT NEEDS AN INVERSE THE UI CAN REACH.
 // `huddle_joined` is the discriminant that splits the header's "Huddle" start
@@ -347,7 +358,7 @@ on join_huddle_submit
   hydration_retry_attempt = 0
   mutation_phase = "huddle"
   error = ""
-  run join_huddle(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
+  run every join_huddle(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
 
 // Leaving is `leave_huddle_here` in handlers/huddle.ice, which leaves the
 // HUDDLE'S channel rather than the one on screen — the same button serves the
@@ -405,7 +416,7 @@ on chat_composer_event(event)
   messages = mark_author_runs(optimistic_message(messages, pending_message, pending_message_id))
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   error = ""
-  run send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _
+  run every send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _
 
 on message_sent(next)
   return if active_channel != next.channel_id
@@ -435,7 +446,7 @@ on message_send_failed(cause)
   return if !cause.committed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  run live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 on chat_updated(next)
   // THE ROOM SHE IS IN NOW, OR NOTHING. Two clicks in flight land in the order
@@ -728,7 +739,7 @@ on edit_thread_message_submit
   hydration_retry_attempt = 0
   mutation_phase = "message-edit"
   error = ""
-  run edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft), channel_members) -> chat_acked _ | mutation_failed _
+  run every edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft), channel_members) -> chat_acked _ | mutation_failed _
 
 on delete_thread_message_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || thread_selected_seq <= 0 || thread_message_action != "delete"
@@ -737,7 +748,7 @@ on delete_thread_message_submit
   hydration_retry_attempt = 0
   mutation_phase = "message-delete"
   error = ""
-  run delete_message(connected_rpc, password, active_channel, thread_selected_seq) -> chat_acked _ | mutation_failed _
+  run every delete_message(connected_rpc, password, active_channel, thread_selected_seq) -> chat_acked _ | mutation_failed _
 
 on open_message_actions(seq, body, rev)
   return if seq <= 0
@@ -815,7 +826,7 @@ on open_thread_for(seq)
   // steers the first Cmd+B into an empty box.
   composer_focus = "none"
   error = ""
-  run load_thread(connected_rpc, active_channel, seq, 0, 0, thread_generation) -> thread_loaded _ | thread_failed _
+  run replace lane=thread load_thread(connected_rpc, active_channel, seq, 0, 0, thread_generation) -> thread_loaded _ | thread_failed _
 
 on clear_message_selection
   selected_message_seq = 0
@@ -839,7 +850,7 @@ on load_more_thread
   live_thread_generation = live_thread_generation + 1
   thread_loading = true
   error = ""
-  run load_thread_page(connected_rpc, active_channel, active_thread_seq, thread_next_reply_offset, thread_generation) -> thread_page_loaded _ | thread_page_failed _
+  run replace lane=thread load_thread_page(connected_rpc, active_channel, active_thread_seq, thread_next_reply_offset, thread_generation) -> thread_page_loaded _ | thread_page_failed _
 
 on thread_page_loaded(next)
   return if next.generation != thread_generation || !thread_loading
@@ -885,7 +896,7 @@ on load_more_history
   history_generation = history_generation + 1
   history_loading = true
   error = ""
-  run load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages), history_generation) -> history_loaded _ | history_failed _
+  run replace lane=history load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages), history_generation) -> history_loaded _ | history_failed _
 
 on history_loaded(next)
   return if next.generation != history_generation || !history_loading
@@ -914,6 +925,8 @@ on thread_failed(cause)
   error = cause.message
 
 on close_thread
+  invalidate lane=thread
+  invalidate lane=live_thread
   thread_generation = thread_generation + 1
   live_thread_generation = live_thread_generation + 1
   active_thread_seq = 0
@@ -939,7 +952,7 @@ on edit_message_submit
   hydration_retry_attempt = 0
   mutation_phase = "message-edit"
   error = ""
-  run edit_message(connected_rpc, password, active_channel, selected_message_seq, selected_message_rev, trim(message_edit_draft), channel_members) -> chat_acked _ | mutation_failed _
+  run every edit_message(connected_rpc, password, active_channel, selected_message_seq, selected_message_rev, trim(message_edit_draft), channel_members) -> chat_acked _ | mutation_failed _
 
 on delete_message_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0 || message_action != "delete"
@@ -948,7 +961,7 @@ on delete_message_submit
   hydration_retry_attempt = 0
   mutation_phase = "message-delete"
   error = ""
-  run delete_message(connected_rpc, password, active_channel, selected_message_seq) -> chat_acked _ | mutation_failed _
+  run every delete_message(connected_rpc, password, active_channel, selected_message_seq) -> chat_acked _ | mutation_failed _
 
 // REACTIONS DO NOT TAKE THE MUTATION LOCK. They are additive reactor-set ops
 // with no rev CAS — like message sends, which already run concurrently on
@@ -967,7 +980,7 @@ on add_reaction_submit(emoji)
   error = ""
   messages = reaction_applied(messages, selected_message_seq, emoji, true)
   thread_messages = reaction_applied(thread_messages, selected_message_seq, emoji, true)
-  run add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> reaction_acked _ | reaction_failed _
+  run every add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> reaction_acked _ | reaction_failed _
 
 // One-tap reactions do NOT select the row: the tap is its own complete act,
 // and parking the selection tint on the message until the next Esc read as
@@ -981,7 +994,7 @@ on add_reaction_at(seq, emoji)
   error = ""
   messages = reaction_applied(messages, seq, emoji, true)
   thread_messages = reaction_applied(thread_messages, seq, emoji, true)
-  run add_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
+  run every add_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 on remove_reaction_at(seq, emoji)
   return if loading || active_channel_archived || seq <= 0
@@ -991,7 +1004,7 @@ on remove_reaction_at(seq, emoji)
   error = ""
   messages = reaction_applied(messages, seq, emoji, false)
   thread_messages = reaction_applied(thread_messages, seq, emoji, false)
-  run remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
+  run every remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 // The settle-✓'s two-beat teardown. Beat one reads the animation still
 // aimed at visible, keeps its anchor and flips the fade; beat two reads it
@@ -1017,7 +1030,7 @@ on reaction_failed(cause)
   error = cause.message
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  run live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 // A composer's `disabled=` is decided at RENDER time; this runs at APPLY time,
 // and the refusal can change in between — a subscription drop flips `connected`,
@@ -1039,7 +1052,7 @@ on reply_composer_event(event)
   reply_editor = editor("")
   thread_messages = optimistic_message(thread_messages, pending_reply, pending_reply_id)
   error = ""
-  run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply_id, pending_reply, channel_members) -> thread_reply_sent _ | thread_reply_send_failed _
+  run every send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply_id, pending_reply, channel_members) -> thread_reply_sent _ | thread_reply_send_failed _
 
 // Same rule as `message_send_failed`, and the hole is wider here: `close_thread`
 // clears `thread_messages`, so merely closing the rail under an in-flight reply
@@ -1061,7 +1074,7 @@ on thread_reply_send_failed(cause)
   return if !cause.committed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  run live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 on thread_reply_sent(next)
   return if active_channel != next.channel_id

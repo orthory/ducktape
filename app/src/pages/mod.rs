@@ -446,7 +446,7 @@ pub fn apply_page_action(mut document: Content, action: PageAction) -> Content {
 
 /// The document's text, for the save tick's dirty check and its plan.
 ///
-/// Owned, not borrowed: the `sync` extern boundary hands state fields by value.
+/// Owned, not borrowed: the extern boundary hands state fields by value.
 /// VERBATIM: iced 0.14's `Content::text()` joins lines without inventing a
 /// trailing newline, so a trailing newline here IS a final empty line — the
 /// empty paragraph a page can end on. Trimming it made every such page dirty

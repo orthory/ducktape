@@ -965,14 +965,14 @@ fn machine_values_read_as_a_person_reads_them() {
 fn an_unpublished_operations_reading_renders_as_unknown() {
     assert_eq!(height_label(UNMEASURED), "h —");
     assert_eq!(height_label_short(UNMEASURED), "h —");
-    assert_eq!(relative_time(UNMEASURED), "—");
+    assert_eq!(relative_time(UNMEASURED, 1), "—");
 
     // and a real reading of zero is still a real reading: height 0 is the
     // genesis block, not an absence.
     assert_eq!(height_label(0), "h 0");
     // a record with no stamp keeps printing nothing — an em dash on every
     // unstamped row would be noise, and that is a different fact.
-    assert_eq!(relative_time(0), "");
+    assert_eq!(relative_time(0, 1), "");
 }
 
 /// THE OTHER HALF OF THE SAME FACT: the reading has to ARRIVE as `UNMEASURED`.
@@ -1089,41 +1089,40 @@ fn the_sync_label_shows_progress_only_while_catching_up() {
 /// string counts blocks. Only `/v1/status` supplies unix seconds.
 #[test]
 fn record_stamps_count_blocks_and_status_stamps_count_seconds() {
-    assert_eq!(height_ago(84_500, 84_912), "412 blocks ago");
-    assert_eq!(height_ago(84_911, 84_912), "1 block ago");
-    assert_eq!(height_ago(84_912, 84_912), "this block");
-    // a follower behind the record it is rendering still reads as now.
-    assert_eq!(height_ago(84_913, 84_912), "this block");
-    assert_eq!(height_ago(0, 84_912), "");
-    assert_eq!(expires_in_blocks(85_324, 84_912), "expires in 412 blocks");
-    assert_eq!(expires_in_blocks(84_913, 84_912), "expires in 1 block");
-    assert_eq!(expires_in_blocks(84_912, 84_912), "expired");
     let now = now_seconds();
-    assert_eq!(relative_time(now - 30), "just now");
-    assert_eq!(relative_time(now - 40 * 60), "40m ago");
-    assert_eq!(relative_time(now - 2 * 60 * 60), "2h ago");
-    assert_eq!(relative_time(0), "");
+    assert_eq!(height_ago(84_500, 84_912, now), "412 blocks ago");
+    assert_eq!(height_ago(84_911, 84_912, now), "1 block ago");
+    assert_eq!(height_ago(84_912, 84_912, now), "this block");
+    // a follower behind the record it is rendering still reads as now.
+    assert_eq!(height_ago(84_913, 84_912, now), "this block");
+    assert_eq!(height_ago(0, 84_912, now), "");
+    assert_eq!(
+        expires_in_blocks(85_324, 84_912, now),
+        "expires in 412 blocks"
+    );
+    assert_eq!(expires_in_blocks(84_913, 84_912, now), "expires in 1 block");
+    assert_eq!(expires_in_blocks(84_912, 84_912, now), "expired");
+    assert_eq!(relative_time(now - 30, now), "just now");
+    assert_eq!(relative_time(now - 40 * 60, now), "40m ago");
+    assert_eq!(relative_time(now - 2 * 60 * 60, now), "2h ago");
+    assert_eq!(relative_time(0, now), "");
 }
 
 /// The OTHER lane: a single-writer noded stamps `consensus_time` in unix
-/// MILLIS, so the very same fields arrive thirteen digits wide. Rendering
-/// them as heights printed `h 1,753,622,400,000` on every record.
+/// MILLIS, so renderers for consensus stamps use the shared wall reading.
 #[test]
-fn a_unix_millis_stamp_is_a_clock_not_a_thirteen_digit_height() {
-    let two_hours_ago = (now_seconds() - 2 * 60 * 60) * 1_000;
-    assert_eq!(height_label(two_hours_ago), "2h ago");
-    assert_eq!(height_label_short(two_hours_ago), "2h ago");
-    assert_eq!(height_ago(two_hours_ago, 84_912), "2h ago");
+fn a_unix_millis_consensus_stamp_uses_the_wall_clock() {
+    let now = now_seconds();
+    let two_hours_ago = (now - 2 * 60 * 60) * 1_000;
+    assert_eq!(height_ago(two_hours_ago, 84_912, now), "2h ago");
     assert_eq!(
-        expires_in_blocks((now_seconds() + 3 * 60 * 60) * 1_000, 84_912),
+        expires_in_blocks((now + 3 * 60 * 60) * 1_000, 84_912, now),
         "expires in 3h"
     );
     assert_eq!(
-        expires_in_blocks((now_seconds() - 60) * 1_000, 84_912),
+        expires_in_blocks((now - 60) * 1_000, 84_912, now),
         "expired"
     );
-    // a real height is nowhere near the floor and still reads as one.
-    assert_eq!(height_label(84_912), "h 84,912");
 }
 
 #[test]

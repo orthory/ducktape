@@ -40,7 +40,7 @@ test palette_escape_contract
   preset ui_palette_open
   viewport 1120 720
   mount
-    WorkspaceTabs #workspace-tabs
+    WorkspaceTabs wall_now=wall_now #workspace-tabs
       with
         network="testnet"
         status
@@ -170,7 +170,7 @@ test minimum_window_layout_contract
   preset ui_offline
   viewport 1280 800
   mount
-    WorkspaceTabs #workspace-tabs
+    WorkspaceTabs wall_now=wall_now #workspace-tabs
       with
         network="testnet"
         status
@@ -400,7 +400,7 @@ test settings_keyboard_scroll_contract
   preset ui_settings_scroll
   viewport 1120 460
   mount
-    WorkspaceTabs #workspace-tabs
+    WorkspaceTabs wall_now=wall_now #workspace-tabs
       with
         network="testnet"
         status
@@ -445,7 +445,7 @@ test settings_keyboard_scroll_contract
       governance:
         space w=1.0 h=1.0
       settings:
-        SettingsScreen account_name_draft<->account_name_draft node_log_filter<->node_log_filter #settings
+        SettingsScreen wall_now=wall_now account_name_draft<->account_name_draft node_log_filter<->node_log_filter #settings
           with
             account_name
             network_name

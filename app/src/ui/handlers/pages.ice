@@ -4,7 +4,7 @@ on search_pages_submit
   page_searching = true
   page_search_hits = []
   error = ""
-  run search_pages(connected_rpc, "", trim(page_search_draft), page_search_generation) -> page_search_loaded _ | page_search_failed _
+  run replace lane=page_search search_pages(connected_rpc, "", trim(page_search_draft), page_search_generation) -> page_search_loaded _ | page_search_failed _
 
 on page_search_loaded(next)
   return if next.generation != page_search_generation
@@ -18,6 +18,7 @@ on page_search_failed(cause)
   error = cause.message
 
 on clear_page_search
+  invalidate lane=page_search
   page_search_generation = page_search_generation + 1
   page_search_draft = ""
   page_search_hits = []
@@ -25,6 +26,9 @@ on clear_page_search
 
 on open_page_search_hit(page_id, _block_id)
   return if loading || mutation_phase != "idle"
+  invalidate lane=page_search
+  invalidate lane=block_threads
+  invalidate lane=block_comments
   palette_open = false
   shell_tab = "pages"
   // Same tab-move rule as `select_shell_tab`.
@@ -56,10 +60,13 @@ on open_page_search_hit(page_id, _block_id)
   block_autosave_status = "idle"
   page_delete_armed = false
   error = ""
-  run load_page(connected_rpc, page_id) -> pages_updated _ | failed _
+  run replace lane=page_load load_page(connected_rpc, page_id) -> pages_updated _ | failed _
 
 on choose_page(id)
   return if loading || mutation_phase != "idle"
+  invalidate lane=page_search
+  invalidate lane=block_threads
+  invalidate lane=block_comments
   page_search_generation = page_search_generation + 1
   page_searching = false
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
@@ -105,7 +112,7 @@ on choose_page(id)
   block_autosave_status = "idle"
   page_delete_armed = false
   error = ""
-  run load_page(connected_rpc, id) -> pages_updated _ | failed _
+  run replace lane=page_load load_page(connected_rpc, id) -> pages_updated _ | failed _
 
 on create_page_submit
   return if loading || mutation_phase != "idle" || empty(trim(page_draft))
@@ -115,7 +122,7 @@ on create_page_submit
   pending_page = trim(page_draft)
   page_draft = ""
   error = ""
-  run create_page(connected_rpc, password, pending_page) -> pages_mutated _ | mutation_failed _
+  run every create_page(connected_rpc, password, pending_page) -> pages_mutated _ | mutation_failed _
 
 on toggle_page_create
   page_create_open = !page_create_open
@@ -139,7 +146,7 @@ on delete_page_submit
   mutation_phase = "page-delete"
   page_delete_armed = false
   error = ""
-  run delete_page(connected_rpc, password, active_page) -> pages_mutated _ | mutation_failed _
+  run every delete_page(connected_rpc, password, active_page) -> pages_mutated _ | mutation_failed _
 on use_orphaned_comment_draft(draft)
   return if loading || mutation_phase != "idle" || !empty(trim(block_comment_draft))
   block_comment_draft = draft
@@ -185,9 +192,11 @@ on toggle_block_comments
   pending_block_comment = ""
   error = ""
   return if !block_comments_open
-  run load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
+  run replace lane=block_threads load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on close_block_comments
+  invalidate lane=block_threads
+  invalidate lane=block_comments
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
@@ -223,7 +232,7 @@ on load_more_block_threads
   block_comments_generation = block_comments_generation + 1
   block_comment_threads_loading = true
   error = ""
-  run load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_page_loaded _ | block_threads_failed _
+  run replace lane=block_threads load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_page_loaded _ | block_threads_failed _
 
 on block_threads_page_loaded(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
@@ -252,7 +261,7 @@ on open_block_comment_thread(id, target)
   block_thread_comments_has_more = false
   block_thread_comments_loading = true
   error = ""
-  run load_block_comment_page(connected_rpc, active_thread_target, active_block_comment_thread, 0, block_comments_generation) -> block_comment_page_loaded _ | block_comment_page_failed _
+  run replace lane=block_comments load_block_comment_page(connected_rpc, active_thread_target, active_block_comment_thread, 0, block_comments_generation) -> block_comment_page_loaded _ | block_comment_page_failed _
 
 on block_comment_page_loaded(next)
   return if next.generation != block_comments_generation || next.target != active_thread_target || next.thread_id != active_block_comment_thread || !block_comments_open
@@ -267,7 +276,7 @@ on load_more_block_comments
   block_comments_generation = block_comments_generation + 1
   block_thread_comments_loading = true
   error = ""
-  run load_block_comment_page(connected_rpc, active_thread_target, active_block_comment_thread, block_thread_comments_next_from, block_comments_generation) -> block_comment_page_appended _ | block_comment_page_failed _
+  run replace lane=block_comments load_block_comment_page(connected_rpc, active_thread_target, active_block_comment_thread, block_thread_comments_next_from, block_comments_generation) -> block_comment_page_appended _ | block_comment_page_failed _
 
 on block_comment_page_appended(next)
   return if next.generation != block_comments_generation || next.target != active_thread_target || next.thread_id != active_block_comment_thread || !block_comments_open
@@ -286,20 +295,21 @@ on resolve_thread_submit(resolved)
   return if loading || mutation_phase != "idle" || !block_comments_open || empty(active_block_comment_thread)
   mutation_phase = "comment-resolve"
   error = ""
-  run resolve_comment_thread(connected_rpc, password, active_block_comment_thread, resolved) -> thread_resolved _ | thread_resolve_failed _
+  run every resolve_comment_thread(connected_rpc, password, active_block_comment_thread, resolved) -> thread_resolved _ | thread_resolve_failed _
 
 on thread_resolved(_written)
   mutation_phase = "idle"
   block_comments_generation = block_comments_generation + 1
   block_comment_threads_loading = true
   error = ""
-  run load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
+  run replace lane=block_threads load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on thread_resolve_failed(cause)
   mutation_phase = "idle"
   error = cause.message
 
 on close_block_comment_thread
+  invalidate lane=block_comments
   block_comments_generation = block_comments_generation + 1
   active_block_comment_thread = ""
   active_thread_target = ""
@@ -323,7 +333,7 @@ on post_block_comment_submit
   block_comments_generation = block_comments_generation + 1
   block_thread_comments_loading = true
   error = ""
-  run post_block_comment(connected_rpc, password, active_thread_target, active_block_comment_thread, pending_block_comment, block_comments_generation) -> block_comment_posted _ | block_comment_post_failed _
+  run every post_block_comment(connected_rpc, password, active_thread_target, active_block_comment_thread, pending_block_comment, block_comments_generation) -> block_comment_posted _ | block_comment_post_failed _
 
 on block_comment_posted(next)
   return if next.generation != block_comments_generation || next.target != active_thread_target || !block_comments_open
@@ -337,7 +347,7 @@ on block_comment_posted(next)
   error = ""
   block_comments_generation = block_comments_generation + 1
   block_comment_threads_loading = true
-  run load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
+  run replace lane=block_threads load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on block_comment_post_failed(cause)
   block_comment_draft = restore_draft(block_comment_draft, pending_block_comment, cause.committed)
@@ -347,7 +357,7 @@ on block_comment_post_failed(cause)
   error = cause.message
   block_comments_generation = block_comments_generation + 1
   block_comment_threads_loading = true
-  run load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_recovered _ | block_threads_recovery_failed _
+  run replace lane=block_threads load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_recovered _ | block_threads_recovery_failed _
 
 on block_threads_recovered(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
@@ -408,7 +418,7 @@ on pages_updated(next)
   loading = false
   error = ""
   doc_tabs = doc_tabs_with(doc_tabs_pruned(doc_tabs, pages), active_page)
-  run save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
+  run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 on pages_mutated(next)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_autosave_generation = block_autosave_generation + 1
@@ -460,7 +470,7 @@ on pages_mutated(next)
   // no removal here: `doc_tab_rows` resolves every tab against the live page
   // list and drops the ones it cannot find.
   doc_tabs = doc_tabs_with(doc_tabs_pruned(doc_tabs, pages), active_page)
-  run save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
+  run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 
 on doc_tabs_saved(_result)
   error = error
@@ -484,8 +494,8 @@ on close_doc_tab(id)
   hydration_retry_attempt = 0
   loading = true
   parallel
-    run save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
-    run load_page(connected_rpc, active_page) -> pages_updated _ | failed _
+    run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
+    run replace lane=page_load load_page(connected_rpc, active_page) -> pages_updated _ | failed _
 
 // THE DOCUMENT'S ONE EDIT ROUTE. Every key lands here: `apply_page_action`
 // resolves the list/indent behaviours in the buffer and NOTHING reaches the
@@ -512,8 +522,8 @@ on page_edited(event)
   page_link = page_link_of(event)
   return if empty(page_link) && !page_rail_open
   parallel
-    run open_external_url(page_link) -> external_url_opened _ | external_url_failed _
-    run load_page_threads(connected_rpc, keep_str(page_rail_open, active_page, ""), block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
+    run every open_external_url(page_link) -> external_url_opened _ | external_url_failed _
+    run replace lane=block_threads load_page_threads(connected_rpc, keep_str(page_rail_open, active_page, ""), block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on external_url_opened(_opened)
   error = error
@@ -556,7 +566,7 @@ on page_autosave_tick
   block_autosave_generation = block_autosave_generation + 1
   page_inflight_text = text
   error = ""
-  run save_page_document(connected_rpc, password, active_page, text, page_saved_text, block_autosave_generation) -> page_document_saved _ | page_document_save_failed _
+  run every save_page_document(connected_rpc, password, active_page, text, page_saved_text, block_autosave_generation) -> page_document_saved _ | page_document_save_failed _
 
 // The baseline is the node's own text after a write, and the submitted text
 // after a no-op — `saved_baseline` carries the reasoning. Either way anything

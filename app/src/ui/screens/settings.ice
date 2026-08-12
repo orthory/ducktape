@@ -23,7 +23,7 @@
 // rather than hidden: this pair refreshes with `node_facts_generation` — on
 // connect and on a shell-tab change — so it is a coherent sample, not a live
 // one, and reads `h —` until the first one lands.
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, sync_line:str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine])
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, sync_line:str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:str, node_peers:[PeerRow], bind node_log_filter:str, node_log_lines:[NodeLogLine], wall_now:i64)
   emits
     select_shell_tab(str)
     reconnect()
@@ -624,48 +624,49 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
               NodeAccessCard tier=member_tier(members_rows) admin=members_is_admin(members_rows)
               PermissionMatrix tier=member_tier(members_rows)
           "activity"
-            col w=fill gap=9.0
-              row
-                with
-                  w=fill
-                  gap=10.0
-                  align=center
-                GroupLabel label="LOG RING"
-                space w=fill
-                input "" #log-filter <-> node_log_filter
+            LogTimeline.Frame
+              with
+                title="Log ring"
+                description="Live node events retained in the in-memory ring."
+              col w=fill gap=9.0
+                row
                   with
-                    label="Filter logs"
-                    change=emit(node_log_filter_changed, _)
-                    hint="filter logs…"
-                    w=200.0
-                    p=6.2
-                    text-size=13.0
-                    line-h=1.2
-                    @control
-                  active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
-                  hovered bg=muted_bg border=control_line
-              box w=fill h=420.0
-                NodeLogConsole source=settings_endpoint
-                  col w=fill gap=5.0
-                    if empty(node_log_lines)
-                      text "Waiting for the node's log ring…"
-                        with
-                          size=12.0
-                          wrap=none
-                          font=code
-                          @text-input
-                    // The waiting arm above is keyed on the UNFILTERED ring, so
-                    // a filter that matches nothing left this 420px console
-                    // blank — indistinguishable from a log stream that died.
-                    if !empty(node_log_lines) && empty(filter_log_lines(node_log_lines, node_log_filter))
-                      text "No lines match this filter."
-                        with
-                          size=12.0
-                          wrap=none
-                          font=code
-                          @text-input
-                    for line in filter_log_lines(node_log_lines, node_log_filter)
-                      LogLine parts=split_log_line(line.line)
+                    w=fill
+                    align=end
+                  input "" #log-filter <-> node_log_filter
+                    with
+                      label="Filter logs"
+                      change=emit(node_log_filter_changed, _)
+                      hint="filter logs…"
+                      w=200.0
+                      p=6.2
+                      text-size=13.0
+                      line-h=1.2
+                      @control
+                    active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
+                    hovered bg=muted_bg border=control_line
+                box w=fill h=420.0
+                  NodeLogConsole source=settings_endpoint
+                    col w=fill gap=5.0
+                      if empty(node_log_lines)
+                        text "Waiting for the node's log ring…"
+                          with
+                            size=12.0
+                            wrap=none
+                            font=code
+                            @text-input
+                      // The waiting arm above is keyed on the UNFILTERED ring, so
+                      // a filter that matches nothing left this 420px console
+                      // blank — indistinguishable from a log stream that died.
+                      if !empty(node_log_lines) && empty(filter_log_lines(node_log_lines, node_log_filter))
+                        text "No lines match this filter."
+                          with
+                            size=12.0
+                            wrap=none
+                            font=code
+                            @text-input
+                      for line in filter_log_lines(node_log_lines, node_log_filter)
+                        LogLine parts=split_log_line(line.line)
           _
             col w=fill gap=13.0
               GroupLabel label="NETWORK"
@@ -687,7 +688,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                 StatCard
                   with
                     label="LAST FINALIZED"
-                    value=relative_time(node_last_finalized)
+                    value=relative_time(node_last_finalized, wall_now)
                     note=""
               if members_is_admin(members_rows)
                 grid min-cell=170.0 gap=10.0
@@ -702,7 +703,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                   KeyValueRow
                     with
                       label="Phase"
-                      value=reading_pair(sync_line, relative_time(node_phase_since))
+                      value=reading_pair(sync_line, relative_time(node_phase_since, wall_now))
                       last=false
                   // CUMULATIVE, and labelled so. These two only ever climb —
                   // nothing in the node resets them — so a nonzero total is

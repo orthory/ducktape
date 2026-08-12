@@ -61,7 +61,7 @@ view
           toggle_call_mute -> toggle_call_mute
           toggle_call_camera -> toggle_call_camera
     if console_win == some(window)
-      WorkspaceTabs #workspace-tabs
+      WorkspaceTabs wall_now=wall_now #workspace-tabs
         with
           network=network_name
           status
@@ -360,7 +360,7 @@ view
         agents:
           AgentsScreen rows=agents_rows connected answered=agents_answered #agents
         forge:
-          ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
+          ForgeScreen wall_now=wall_now review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
             with
               org=network_name
               about=account_bio
@@ -438,7 +438,7 @@ view
               gov_vote -> gov_vote _ _
               gov_execute -> gov_execute _
         settings:
-          SettingsScreen account_name_draft<->account_name_draft node_log_filter<->node_log_filter #settings
+          SettingsScreen wall_now=wall_now account_name_draft<->account_name_draft node_log_filter<->node_log_filter #settings
             with
               account_name
               network_name
@@ -657,10 +657,6 @@ view
                           dir=vertical
                           w=fill
                           h=290.0
-                        col
-                          with
-                            w=fill
-                            p=5.0
-                            gap=1.0
-                          for item in bell_items
-                            BellRow item=item
+                          anchor-y=keep
+                        keyed item in bell_items by=item.seq virtual-row=58.0 w=fill p=5.0 gap=1.0
+                          BellRow item=item

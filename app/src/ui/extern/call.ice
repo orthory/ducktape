@@ -11,10 +11,10 @@ extern crate::call
   stream call_session(rpc:str, channel_id:str) -> CallEvent
   sync call_set_muted(muted:bool) -> bool
   sync call_recipients(nodes:[str]) -> bool
-  sync call_status_after(current:str, event:CallEvent) -> str
-  sync apply_call_peer(peers:[CallEvent], event:CallEvent) -> [CallEvent]
-  sync call_peer_muted(peers:[CallEvent], node:str) -> bool
-  sync call_video_live_after(peers:[CallEvent], camera:bool) -> bool
+  pure call_status_after(current:str, event:CallEvent) -> str
+  pure apply_call_peer(peers:[CallEvent], event:CallEvent) -> [CallEvent]
+  pure call_peer_muted(peers:[CallEvent], node:str) -> bool
+  pure call_video_live_after(peers:[CallEvent], camera:bool) -> bool
 
 // The camera leg — `crate::video`: capture/encode on its own thread, decoded
 // peer frames in a store the tile strip reads. `call_video_tiles` is a

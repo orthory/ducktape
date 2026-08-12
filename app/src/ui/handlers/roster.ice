@@ -23,13 +23,13 @@ on account_rename_submit
   return if !connected || !account_bound || account_renaming || empty(trim(account_name_draft))
   account_renaming = true
   error = ""
-  run set_account_name(connected_rpc, password, trim(account_name_draft)) -> account_renamed _ | account_rename_failed _
+  run every set_account_name(connected_rpc, password, trim(account_name_draft)) -> account_renamed _ | account_rename_failed _
 
 on account_renamed(_result)
   account_renaming = false
   account_name_draft = ""
   account_generation = account_generation + 1
-  run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
+  run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
 
 on account_rename_failed(cause)
   account_renaming = false
@@ -56,24 +56,24 @@ on governance_failed(cause)
 on gov_vote(proposal_id, approve)
   return if !connected || !empty(gov_voting)
   gov_voting = proposal_id
-  run governance_vote(connected_rpc, password, gov_voting, approve) -> gov_acted _ | gov_act_failed _
+  run every governance_vote(connected_rpc, password, gov_voting, approve) -> gov_acted _ | gov_act_failed _
 
 on gov_execute(proposal_id)
   return if !connected || !empty(gov_voting)
   gov_voting = proposal_id
-  run governance_execute(connected_rpc, password, gov_voting) -> gov_acted _ | gov_act_failed _
+  run every governance_execute(connected_rpc, password, gov_voting) -> gov_acted _ | gov_act_failed _
 
 // The quorum-gated membership actions the roster detail panel offers. They
 // share `gov_voting` with vote/execute: one governance write is in flight.
 on gov_propose(action, target_key)
   return if !connected || !empty(gov_voting)
   gov_voting = target_key
-  run governance_propose(connected_rpc, password, action, gov_voting) -> gov_acted _ | gov_act_failed _
+  run every governance_propose(connected_rpc, password, action, gov_voting) -> gov_acted _ | gov_act_failed _
 
 on gov_acted(_result)
   gov_voting = ""
   gov_generation = gov_generation + 1
-  run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
+  run replace lane=governance_load load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
 
 on gov_act_failed(cause)
   gov_voting = ""
@@ -115,9 +115,9 @@ on pick_members_filter(filter)
 // the view offers this on `is_mine` rows, and the node refuses anyone else.
 on agent_set_status(agent_id, paused)
   return if !connected
-  run set_agent_status(connected_rpc, password, agent_id, paused) -> agent_status_set _ | mutation_failed _
+  run every set_agent_status(connected_rpc, password, agent_id, paused) -> agent_status_set _ | mutation_failed _
 
 on agent_status_set(_result)
   agents_generation = agents_generation + 1
   error = ""
-  run load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
+  run replace lane=agents_load load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _

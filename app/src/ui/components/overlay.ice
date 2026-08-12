@@ -122,11 +122,7 @@ component ModalShell(title:str, width:f64)
 // The only confirmation surface the artifact has: an ink pill on the bottom
 // edge. The stack that positions it and the timer that retires it belong to
 // the view; this is one toast.
-// NAME: the contract froze this as `Toast`, which is already taken by the
-// vendored `Toast(title, description)` in ducktape-ui/components.ice — a file
-// no item in this campaign owns. `Toast.Confirm` is the same component under
-// the family's own dotted convention (Badge.Success, Alert.Warning).
-component Toast.Confirm(message:str, tone:str)
+component Toast(message:str, tone:str)
   box #root
     with
       px=16.0

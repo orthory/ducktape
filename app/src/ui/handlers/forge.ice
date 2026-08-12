@@ -21,6 +21,8 @@ on forge_failed(cause)
 // the user just navigated to, with the crumb as the only way out.
 on forge_open_repo(name)
   return if !connected
+  invalidate lane=forge_item
+  invalidate lane=forge_discussion
   forge_repo_menu = false
   forge_repo = name
   forge_item_number = 0
@@ -40,8 +42,8 @@ on forge_open_repo(name)
   forge_file_binary = false
   forge_file_truncated = false
   parallel
-    run load_forge_repo(connected_rpc, forge_repo, forge_generation) -> forge_repo_loaded _ | forge_failed _
-    run forge_tree(connected_rpc, forge_repo, "", "", forge_code_generation) -> forge_tree_loaded _ | forge_code_failed _
+    run replace lane=forge_repo load_forge_repo(connected_rpc, forge_repo, forge_generation) -> forge_repo_loaded _ | forge_failed _
+    run replace lane=forge_code forge_tree(connected_rpc, forge_repo, "", "", forge_code_generation) -> forge_tree_loaded _ | forge_code_failed _
 
 on forge_repo_loaded(next)
   return if next.generation != forge_generation
@@ -51,6 +53,7 @@ on forge_repo_loaded(next)
 
 on forge_open_item(number)
   return if !connected || empty(forge_repo)
+  invalidate lane=forge_discussion
   forge_item_number = number
   forge_review_verdict = "comment"
   forge_review_draft = ""
@@ -67,7 +70,7 @@ on forge_open_item(number)
   forge_discussion_pending = ""
   forge_discussion_editor = editor("")
   forge_generation = forge_generation + 1
-  run load_forge_item(connected_rpc, forge_repo, forge_item_number, forge_generation) -> forge_item_loaded _ | forge_failed _
+  run replace lane=forge_item load_forge_item(connected_rpc, forge_repo, forge_item_number, forge_generation) -> forge_item_loaded _ | forge_failed _
 
 on forge_item_loaded(next)
   return if next.generation != forge_generation
@@ -93,7 +96,7 @@ on forge_item_loaded(next)
   forge_item_change_requests = next.change_requests
   forge_discussion_generation = forge_discussion_generation + 1
   return if empty(forge_item_channel)
-  run load_forge_discussion(connected_rpc, forge_item_channel, forge_discussion_generation) -> forge_discussion_loaded _ | forge_discussion_failed _
+  run replace lane=forge_discussion load_forge_discussion(connected_rpc, forge_item_channel, forge_discussion_generation) -> forge_discussion_loaded _ | forge_discussion_failed _
 
 on forge_discussion_loaded(next)
   return if next.generation != forge_discussion_generation || next.channel_id != forge_item_channel
@@ -139,7 +142,7 @@ on forge_comment_drop(anchor)
 on forge_review_submit
   return if !connected || forge_review_busy || empty(forge_repo) || forge_item_number <= 0
   forge_review_busy = true
-  run submit_forge_review(connected_rpc, password, forge_repo, forge_item_number, forge_review_verdict, forge_review_draft, forge_item_source_oid, forge_comment_staged) -> forge_review_submitted _ | forge_review_failed _
+  run every submit_forge_review(connected_rpc, password, forge_repo, forge_item_number, forge_review_verdict, forge_review_draft, forge_item_source_oid, forge_comment_staged) -> forge_review_submitted _ | forge_review_failed _
 
 // The staged comments went out INSIDE this review, so they are cleared with the
 // body. A failure keeps them — the whole submit is one transaction, and losing
@@ -163,7 +166,7 @@ on forge_merge_submit
   return if !connected || forge_merge_busy || empty(forge_repo) || forge_item_number <= 0
   forge_merge_busy = true
   forge_merge_conflicts = []
-  run merge_forge_pr(connected_rpc, password, forge_repo, forge_item_number, forge_item_source_branch, forge_item_source_oid, forge_item_target_oid) -> forge_merged _ | forge_merge_failed _
+  run every merge_forge_pr(connected_rpc, password, forge_repo, forge_item_number, forge_item_source_branch, forge_item_source_oid, forge_item_target_oid) -> forge_merged _ | forge_merge_failed _
 
 on forge_merged(next)
   // RELEASED ABOVE THE IDENTITY CHECK, the same shape as `history_loaded`.
@@ -186,7 +189,7 @@ on forge_composer_event(event)
   return if !composer_submits(event)
   return if loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending) || empty(trim(editor_text(forge_discussion_editor)))
   forge_discussion_pending = fresh_operation_id("forge-note")
-  run send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending, trim(editor_text(forge_discussion_editor)), forge_discussion_members) -> forge_note_sent _ | forge_note_failed _
+  run every send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending, trim(editor_text(forge_discussion_editor)), forge_discussion_members) -> forge_note_sent _ | forge_note_failed _
 
 on forge_note_sent(next)
   return if next.channel_id != forge_item_channel
@@ -235,11 +238,12 @@ on forge_refreshed(next)
 // The breadcrumb home. Nothing else clears `forge_repo`, so without this the
 // repo grid is unreachable for the rest of the session once a repo is opened.
 on forge_close_repo
-  // Closing RETIRES the in-flight load the same way opening does. Every forge
-  // loader guards on generation equality only, so without this bump a
-  // `load_forge_repo` still in flight answers with the number the guard is
-  // still comparing against and `forge_repo_loaded` re-assigns `forge_repo` —
-  // dropping the user back into the repo they just left.
+  // Closing retires each scoped request immediately; the generation bump is
+  // the matching state guard if an already-delivered completion is queued.
+  invalidate lane=forge_repo
+  invalidate lane=forge_item
+  invalidate lane=forge_discussion
+  invalidate lane=forge_code
   forge_generation = forge_generation + 1
   forge_repo = ""
   forge_branches = []
@@ -257,9 +261,10 @@ on forge_toggle_repo_menu
   forge_repo_menu = !forge_repo_menu
 
 on forge_close_item
-  // Same retirement as the close above: `forge_item_loaded` re-assigns
-  // `forge_item_number` from a reply that only has to match the generation, so
-  // an unbumped close reopens the item the moment the load lands.
+  // Same retirement as the close above: cancel the scoped work and bump the
+  // state guard before clearing the item it could otherwise reopen.
+  invalidate lane=forge_item
+  invalidate lane=forge_discussion
   forge_generation = forge_generation + 1
   forge_item_number = 0
   forge_item_diff = ""
@@ -311,7 +316,7 @@ on select_forge_tab(tab)
   forge_file_text = ""
   forge_file_binary = false
   forge_file_truncated = false
-  run forge_tree(connected_rpc, forge_repo, "", "", forge_code_generation) -> forge_tree_loaded _ | forge_code_failed _
+  run replace lane=forge_code forge_tree(connected_rpc, forge_repo, "", "", forge_code_generation) -> forge_tree_loaded _ | forge_code_failed _
 
 // A directory row NAVIGATES. `forge_tree` answers for one path, so there is no
 // whole-tree read to expand in place against — the same shape the duckfs tree
@@ -321,7 +326,7 @@ on forge_open_dir(path)
   forge_code_generation = forge_code_generation + 1
   forge_tree_path = path
   forge_tree_entries = []
-  run forge_tree(connected_rpc, forge_repo, "", path, forge_code_generation) -> forge_tree_loaded _ | forge_code_failed _
+  run replace lane=forge_code forge_tree(connected_rpc, forge_repo, "", path, forge_code_generation) -> forge_tree_loaded _ | forge_code_failed _
 
 on forge_tree_loaded(next)
   return if next.generation != forge_code_generation
@@ -335,7 +340,7 @@ on forge_open_file(path)
   forge_code_generation = forge_code_generation + 1
   forge_file_path = path
   forge_file_text = ""
-  run forge_blob(connected_rpc, forge_repo, "", path, forge_code_generation) -> forge_blob_loaded _ | forge_code_failed _
+  run replace lane=forge_code forge_blob(connected_rpc, forge_repo, "", path, forge_code_generation) -> forge_blob_loaded _ | forge_code_failed _
 
 on forge_blob_loaded(next)
   return if next.generation != forge_code_generation
