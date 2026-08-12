@@ -33,6 +33,10 @@ description = "OpenAI Codex CLI, non-interactive one-shot exec mode (BYO auth: t
 # capability, never a silent fallback to PATH).
 bin = "codex"
 env = "DUCKTAPE_CODEX_BIN"
+# Current Codex releases resolve Code Mode through this sibling executable.
+# It is required at discovery and mounted beside `codex` in sandbox guests;
+# declaring it here keeps executor-specific package knowledge out of Rust.
+companions = ["codex-code-mode-host"]
 
 [invoke]
 # One-shot exec, workspace-write sandbox (edits confined to the cwd = the

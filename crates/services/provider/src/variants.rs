@@ -81,6 +81,7 @@ pub(crate) fn expand(
             tag,
             description: base.description.clone(),
             bin: base.bin.clone(),
+            companions: base.companions.clone(),
             env: base.env.clone(),
             args: variant.args.clone(),
             timeout_secs: base.timeout_secs,
@@ -137,6 +138,7 @@ tag = "prov"
 description = "a provider family"
 [detect]
 bin = "prov-cli"
+companions = ["prov-helper"]
 env = "MOCK_PROV_BIN"
 [invoke]
 args = ["run", "--default"]
@@ -176,6 +178,7 @@ args = ["run", "--model", "m1", "--effort", "high"]
         let v = &specs[1];
         assert_eq!(v.args, vec!["run", "--model", "m1", "--effort", "low"]);
         assert_eq!(v.bin, "prov-cli", "bin inherited");
+        assert_eq!(v.companions, ["prov-helper"], "companions inherited");
         assert_eq!(v.env.as_deref(), Some("MOCK_PROV_BIN"), "env inherited");
         assert_eq!(v.description, "a provider family", "description inherited");
         assert_eq!(v.timeout_secs, 120, "timeout inherited");

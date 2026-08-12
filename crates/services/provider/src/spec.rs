@@ -102,6 +102,10 @@ pub struct CapabilitySpec {
     pub description: String,
     /// the binary name probed on `PATH`.
     pub bin: String,
+    /// executable files the binary resolves beside itself at runtime. Each is
+    /// a plain sibling name; discovery requires every one, and sandbox backends
+    /// mount only these declared files beside the primary executable.
+    pub companions: Vec<String>,
     /// optional env var naming an explicit binary path. an override that
     /// points at nothing is a loud warning + absent capability, never a
     /// silent fallback to the `PATH` probe.
@@ -419,7 +423,37 @@ struct RawCapability {
 struct RawDetect {
     bin: String,
     #[serde(default)]
+    companions: Vec<String>,
+    #[serde(default)]
     env: Option<String>,
+}
+
+/// A companion is resolved relative to the primary executable's REAL parent.
+/// Keeping this to a plain file name makes `[detect]` describe one install
+/// bundle without turning a trusted spec into an arbitrary extra host mount.
+fn validate_companions(names: &[String], bin: &str, origin: &str) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for name in names {
+        let is_plain_name =
+            !name.is_empty() && Path::new(name).file_name() == Some(std::ffi::OsStr::new(name));
+        if !is_plain_name || matches!(name.as_str(), "." | "..") {
+            return Err(format!(
+                "{origin}: detect.companions entry {name:?} must be a plain file name"
+            ));
+        }
+        let repeats_primary = Path::new(bin).file_name() == Some(std::ffi::OsStr::new(name));
+        if repeats_primary {
+            return Err(format!(
+                "{origin}: detect.companions repeats the primary binary {name:?}"
+            ));
+        }
+        if !seen.insert(name) {
+            return Err(format!(
+                "{origin}: duplicate detect.companions entry {name:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -547,6 +581,7 @@ impl CapabilitySpec {
         if raw.detect.bin.is_empty() {
             return Err(format!("{origin}: detect.bin must be non-empty"));
         }
+        validate_companions(&raw.detect.companions, &raw.detect.bin, origin)?;
         // the prompt always reaches the child via stdin (an argv placeholder
         // would leak prompts into `ps` output and hit ARG_MAX); the field is
         // validated but carries no choice.
@@ -600,6 +635,7 @@ impl CapabilitySpec {
                 tag,
                 description: raw.capability.description,
                 bin: raw.detect.bin,
+                companions: raw.detect.companions,
                 env: raw.detect.env,
                 args: raw.invoke.args,
                 timeout_secs: raw.invoke.timeout_secs,
@@ -741,6 +777,27 @@ format = "text"
         let tags: std::collections::BTreeSet<&str> =
             specs.iter().map(|s| s.tag.as_str()).collect();
         assert_eq!(tags.len(), specs.len(), "embedded tags are unique");
+    }
+
+    #[test]
+    fn detect_companions_are_plain_sibling_names() {
+        let with_companion = spec_toml("bundle").replacen(
+            "bin = \"bundle-cli\"",
+            "bin = \"bundle-cli\"\ncompanions = [\"bundle-helper\"]",
+            1,
+        );
+        let spec = CapabilitySpec::parse(&with_companion, "t").unwrap();
+        assert_eq!(spec.companions, ["bundle-helper"]);
+
+        for bad in ["../helper", "subdir/helper", ".", ""] {
+            let invalid = spec_toml("bundle").replacen(
+                "bin = \"bundle-cli\"",
+                &format!("bin = \"bundle-cli\"\ncompanions = [{bad:?}]"),
+                1,
+            );
+            let error = CapabilitySpec::parse(&invalid, "t").unwrap_err();
+            assert!(error.contains("plain file name"), "{bad:?}: {error}");
+        }
     }
 
     #[test]

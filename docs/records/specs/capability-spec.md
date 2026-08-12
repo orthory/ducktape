@@ -210,6 +210,7 @@ being silently ignored.
 |---|---|---|---|
 | `bin` | string | yes | non-empty; probed on `PATH` |
 | `env` | string | no | env var naming an explicit binary path; override wins, broken override = warn + absent |
+| `companions` | string array | no (default `[]`) | required executable sibling file names; each is mounted beside `bin` in sandbox guests, and a missing one makes the capability absent |
 
 ### `[invoke]`
 
