@@ -682,7 +682,7 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
 /// the read. The settings facts are the exception: `settings_user_key` is
 /// chat's `me`, chat returns above the tab block, and nothing chat does ever
 /// re-issues the load. Lose it and `me` stays "" for the session — which
-/// `rooms_only` reads as "show every DM under CHANNELS" and `post_gate` as
+/// `chat_sidebar_rooms` reads as "show every DM under CHANNELS" and `post_gate` as
 /// "not seated", refusing the composer on every DM.
 #[test]
 fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load() {
@@ -1416,10 +1416,11 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
 }
 
 /// A MIRRORED VIEW READING IS ONLY AS GOOD AS ITS WRITERS, SO THE WRITERS ARE
-/// PINNED. Four fields exist purely so the view stops paying for them —
-/// `rooms`, `unread_channel_ids`, `post_refusal` and `active_dm` — because a
+/// PINNED. These fields exist purely so the view stops paying for them —
+/// sidebar rows, page-comment anchors, huddle tile mute readings,
+/// `post_refusal`, and `active_dm` — because a
 /// `sync` extern takes every list BY VALUE and a call in a view expression is
-/// therefore a deep clone per frame (`rooms_only` also ran a SHA-256 per DM
+/// therefore a deep clone per frame (the room projection also ran a SHA-256 per DM
 /// peer, twice a frame). The trade is real: a mirror that a writer forgets is a
 /// sidebar listing DMs under CHANNELS, an unread dot that never lights, a
 /// composer refused in a room she may post in, or a stranger's face over the
@@ -1434,9 +1435,26 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
     // (mirror, the sources whose movement invalidates it). `settings_user_key`
     // is in two of them because THIS DEVICE'S KEY decides both which channels
     // are its own DMs and whether it is seated in a members-only room.
-    const MIRRORS: [(&str, &[&str]); 4] = [
-        ("rooms", &["channels", "dm_peers", "settings_user_key"]),
-        ("unread_channel_ids", &["channels", "channel_reads"]),
+    const MIRRORS: [(&str, &[&str]); 9] = [
+        (
+            "rooms",
+            &["channels", "dm_peers", "settings_user_key", "channel_reads"],
+        ),
+        ("dm_rows", &["channels", "dm_peers", "channel_reads"]),
+        (
+            "block_comment_rows",
+            &["blocks", "block_comment_threads", "active_page"],
+        ),
+        (
+            "active_thread_anchor",
+            &["blocks", "active_thread_target", "active_page"],
+        ),
+        (
+            "huddle_rows",
+            &["huddle_roster", "call_peers", "call_muted"],
+        ),
+        ("fs_preview_entry", &["fs_entries", "fs_preview_path"]),
+        ("fs_dirs", &["fs_entries"]),
         (
             "post_refusal",
             &[
@@ -1502,6 +1520,24 @@ on ",
     assert!(
         checked >= 20,
         "the mirror sweep matched only {checked} writers — it has stopped seeing them"
+    );
+}
+
+#[test]
+fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
+    let handler = inlined(include_str!("ui/handlers/huddle.ice"));
+    let leave = handler
+        .split_once("on leave_huddle_here")
+        .expect("the leave handler exists")
+        .1;
+
+    assert!(leave.contains("call_peers = []"));
+    assert!(leave.contains(
+        "huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)"
+    ));
+    assert!(
+        !leave.contains("huddle_rows = []"),
+        "an uncommitted leave failure retains the roster, so blanking its mirror is permanent"
     );
 }
 
@@ -2061,7 +2097,7 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     app.loading = false;
 
     // a device with no user key derives no DM id, so it holds no DM — the same
-    // answer `rooms_only` gives when `me` is empty
+    // answer `chat_sidebar_rooms` gives when `me` is empty
     app.settings_user_key = String::new();
     app.active_dm_peer = peer.into();
     let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
@@ -6381,7 +6417,11 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
         backend::first_unread_seq(app.messages.clone(), app.unread_boundary),
         31
     );
-    assert!(!app.unread_channel_ids.contains(&"random".to_owned()));
+    assert!(
+        !app.rooms
+            .iter()
+            .any(|row| row.channel.id == "random" && row.unread)
+    );
 
     // A same-channel live delta that brings a NEW message must NOT move
     // the frozen boundary — the divider would jump as you read.
@@ -6491,7 +6531,11 @@ fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
         },
         ..backend::LiveUpdate::default()
     }));
-    assert!(app.unread_channel_ids.iter().any(|id| id == "eng"));
+    assert!(
+        app.rooms
+            .iter()
+            .any(|row| row.channel.id == "eng" && row.unread)
+    );
 
     let mut landed = chat_data("random", vec![message(20, "from random", false)]);
     landed.channels = vec![room("random", 20)];
@@ -6512,7 +6556,9 @@ fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
         "and the third room's head did not walk back to the pre-click snapshot"
     );
     assert!(
-        app.unread_channel_ids.iter().any(|id| id == "eng"),
+        app.rooms
+            .iter()
+            .any(|row| row.channel.id == "eng" && row.unread),
         "so its badge survives the switch it had nothing to do with"
     );
 }
@@ -6736,12 +6782,10 @@ fn unread_indicators_are_wired_client_local_only() {
     ));
 
     let screen = inlined(include_str!("ui/screens/chat.ice"));
-    // The flag reads a MIRROR, not a per-row extern call: `channel_is_unread`
-    // took the read-cursor list by value, so the sidebar cloned it once per
-    // channel, per frame — O(channels x reads) allocations for a badge that
-    // moves on a delta. `unread_channel_ids` is written where the cursors are.
+    // The prepared row owns the scalar. No list-taking extern runs in either
+    // sidebar loop.
     assert!(screen.contains(
-        "ChannelButton channel selected=(channel.id == active_channel) unread=is_unread_channel(unread_channel_ids, channel.id)"
+        "ChannelButton channel=room.channel selected=(room.channel.id == active_channel) unread=room.unread"
     ));
     // In-channel divider anchored on the first message past the frozen
     // boundary. The seq is a STATE FIELD recomputed where messages or the
@@ -6959,6 +7003,7 @@ fn a_disconnected_screen_stands_its_registers_down_too() {
 #[test]
 fn the_files_pane_reports_only_a_directory_it_has_listed() {
     let entry = |path: &str, kind: &str| backend::FsEntry {
+        key: 0,
         path: path.into(),
         name: path.rsplit('/').next().unwrap_or(path).into(),
         kind: kind.into(),
@@ -7049,7 +7094,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
     );
     for gate in [
         "meta=fs_counts_summary(connected, listed, entries)",
-        "if connected && listed && fs_dir_count(entries) <= 0",
+        "if connected && listed && empty(directories)",
         "if connected && listed",
         "if listed && empty(entries)",
         "if listed && !empty(entries)",
@@ -7242,6 +7287,7 @@ fn a_disconnected_console_reports_no_counts_at_all() {
         live: true,
     }];
     app.fs_entries = vec![backend::FsEntry {
+        key: 0,
         path: "/shared/notes".into(),
         name: "notes".into(),
         kind: "file".into(),
@@ -7423,9 +7469,8 @@ fn the_chat_surface_holds_to_its_measured_geometry() {
         "box w=fill px=13.0 py=11.0 bg=danger_zone_bg border=danger_zone_line border-w=1.0 r=9.0"
     ));
 
-    // THE DM ROW CARRIES THE SAME UNREAD MARK AS A CHANNEL ROW, off the same
-    // mirror — which is what `DmPeer.channel_id` was added to make possible.
-    assert!(screen.contains("unread=is_unread_channel(unread_channel_ids, peer.channel_id)"));
+    // THE DM ROW CARRIES THE SAME PREPARED UNREAD MARK AS A CHANNEL ROW.
+    assert!(screen.contains("unread=dm.unread"));
 }
 
 /// THE ZERO-HIT SEARCH CARD MUST STAY DISMISSABLE. The Clear-search × used to
@@ -7517,16 +7562,15 @@ fn mounts_a_component(code: &str) -> bool {
 /// and needs both.
 ///
 /// Everything not virtualized is listed below, which is the point: the list is
-/// the app's inventory of un-culled repetition, argued in four buckets.
+/// the app's inventory of un-culled repetition, argued in three bounded buckets.
 ///
 /// This is the lint that catches a deleted `virtual-row=` — the exact edit a
 /// later "make the a11y test see this row" change would make, because an
 /// offscreen child is not in the a11y tree.
 #[test]
 fn every_repeated_component_mount_is_culled_or_argued() {
-    // (file, the loop head as authored). Four buckets, and the fourth is the
-    // reason this ledger is worth keeping — it says out loud which surfaces
-    // still have the problem chat had.
+    // (file, the loop head as authored), grouped by why the bounded walk is
+    // acceptable without virtualization.
     //
     // `messages` and `thread_messages` are deliberately absent: both are
     // chain-fed, both grow with a "load older" click, and both are virtualized.
@@ -7534,8 +7578,8 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         // 1. WORKSPACE-SHAPED — channels, DMs, members, repos, pages,
         //    validators, peers. Length tracks how big the workspace is, not
         //    how long the chain has run, and it moves on a delta, not a scroll.
-        ("screens/chat.ice", "for channel in rooms"),
-        ("screens/chat.ice", "for peer in dm_peers"),
+        ("screens/chat.ice", "for room in rooms"),
+        ("screens/chat.ice", "for dm in dm_rows"),
         ("screens/chat.ice", "for member in channel_members"),
         ("screens/pages.ice", "for page in pages"),
         ("screens/pages.ice", "for child in subpage_blocks(blocks)"),
@@ -7554,7 +7598,7 @@ fn every_repeated_component_mount_is_culled_or_argued() {
             "for proposal in settled_proposals(rows)",
         ),
         ("screens/settings.ice", "for peer in node_peers"),
-        ("components/huddle.ice", "for person in roster"),
+        ("components/huddle.ice", "for tile in rows"),
         ("components/node.ice", "for entry in rows"),
         ("components/onboarding.ice", "for row in networks"),
         ("components/onboarding.ice", "for step in steps"),
@@ -7579,10 +7623,7 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         //    replaced wholesale by the next query, never appended to.
         ("screens/chat.ice", "for hit in search_hits"),
         ("screens/pages.ice", "for hit in page_search_hits"),
-        (
-            "screens/pages.ice",
-            "for comment_thread in block_comment_threads",
-        ),
+        ("screens/pages.ice", "for comment_row in block_comment_rows"),
         (
             "screens/pages.ice",
             "for page_comment in block_thread_comments",
@@ -7592,14 +7633,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
             "screens/storage.ice",
             "for op in explorer_ops_at(ops, selected)",
         ),
-        // 4. UNCULLED AND KNOWN — genuinely unbounded, fed by a log, a file or
-        //    a thread, and simply not done yet. These are chat's problem on
-        //    another surface; each is a `virtual-row=` away. Listed rather
-        //    than silently excused so the next perf pass has its worklist.
-        ("screens/forge.ice", "for line in source_lines(file_text)"),
-        ("screens/forge.ice", "for message in discussion"),
-        ("screens/storage.ice", "for entry in entries"),
-        ("components/forge.ice", "for line in lines"),
     ];
 
     let mut unculled: Vec<String> = Vec::new();
@@ -7610,7 +7643,8 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         for (index, line) in lines.iter().enumerate() {
             let code = code_of(line);
             let head = code.trim();
-            if !head.starts_with("for ") {
+            let repeated = head.starts_with("for ") || head.starts_with("keyed ");
+            if !repeated {
                 continue;
             }
             let loop_indent = indent_of(code);
@@ -7621,7 +7655,7 @@ fn every_repeated_component_mount_is_culled_or_argued() {
             if !repeats_a_component {
                 continue;
             }
-            let mut virtualized = false;
+            let mut virtualized = head.contains("virtual-row=");
             let mut depth = loop_indent;
             for above in lines[..index].iter().rev() {
                 if above.trim().is_empty() || indent_of(above) >= depth {
@@ -7700,8 +7734,8 @@ fn no_view_expression_hands_an_extern_a_list() {
         "the extern sweep found the declarations, not an empty file"
     );
 
-    // (file, extern), in two buckets by how often the clone happens. Every
-    // entry predates this sweep; the sweep exists so the next one does not.
+    // (file, extern). Every entry clones once per frame and predates this
+    // sweep; the sweep exists so the next one does not.
     const ARGUED: &[(&str, &str)] = &[
         // 1. ONCE PER FRAME — one clone of a workspace-shaped list per
         //    rebuild. The mount file's props are the bulk of it: `view.ice`
@@ -7722,7 +7756,6 @@ fn no_view_expression_hands_an_extern_a_list() {
         ("screens/forge.ice", "filter_forge_items"),
         ("screens/forge.ice", "forge_comment_cap_reached"),
         ("screens/storage.ice", "fs_counts_summary"),
-        ("screens/storage.ice", "fs_dir_count"),
         ("screens/storage.ice", "explorer_ops_at"),
         ("screens/governance.ice", "proposals_summary"),
         ("screens/governance.ice", "open_proposals"),
@@ -7731,17 +7764,6 @@ fn no_view_expression_hands_an_extern_a_list() {
         ("screens/roster.ice", "members_summary"),
         ("screens/roster.ice", "agents_summary"),
         ("screens/roster.ice", "filter_members"),
-        // 2. ONCE PER ROW PER FRAME — the expensive kind, and the reason this
-        //    ledger names its entries instead of counting them. Each of these
-        //    sits inside a `for`, so the list is cloned n times a frame:
-        //    O(rows x list). `is_unread_channel` is chat's residue — the sweep
-        //    that mirrored `unread_channel_ids` into state killed the
-        //    `[ChannelRead]` clone per channel and left a `[str]` one; it is
-        //    bounded by the workspace and it did not move the keystroke
-        //    number, so it is named here rather than half-fixed.
-        ("screens/chat.ice", "is_unread_channel"),
-        ("screens/pages.ice", "comment_anchor_label"),
-        ("components/huddle.ice", "call_peer_muted"),
     ];
 
     let mut cloned: Vec<String> = Vec::new();

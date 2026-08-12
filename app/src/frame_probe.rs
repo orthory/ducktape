@@ -1,22 +1,22 @@
-//! THE CHAT SCREEN'S FRAME-COST GATE.
+//! THE APP'S FRAME-COST PROBES.
 //!
 //! Ported from ducktape-ui's `crates/ui-lang-runtime/tests/frame_probe.rs`,
-//! but driving THIS app's real `ChatScreen` — the generated view, the real
-//! 47 props, over state installed through the real reducers — rather than a
-//! chat-shaped stand-in. The app is a bin crate, so `app/tests/` cannot see
-//! `Ducktape`; this lives in the crate as a `#[cfg(test)]` module instead.
+//! but driving THIS app's generated views over state installed through the
+//! real reducers rather than screen-shaped stand-ins. The app is a bin crate,
+//! so `app/tests/` cannot see `Ducktape`; this lives in the crate as a
+//! `#[cfg(test)]` module instead.
 //!
-//! It prints six phases (build, event walk, draw, keystroke rebuild, one-row
-//! edit, screen switch) and asserts EXACTLY ONE number: allocations per
-//! simulated keystroke. Wall-clock is printed, never asserted — it measures
-//! the box, not the code, and an absolute microsecond budget only flakes.
-//! Allocation counts do not care how busy the machine is, and every render
-//! finding the QA pass raised (a list-taking extern cloned per frame, a
-//! per-row read-cursor clone, an un-virtualized column laying out every row)
-//! lands in this one number.
+//! Chat prints six phases and gates allocations per simulated keystroke. Five
+//! other screen states gate their warmed build+layout allocation medians.
+//! Wall-clock is printed, never asserted — it measures the box, not the code,
+//! and an absolute microsecond budget only flakes. Allocation counts do not
+//! care how busy the machine is, and the large fixtures make per-row list
+//! clones and lost virtualization visible in the medians.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::borrow::Cow;
 use std::cell::Cell;
+use std::sync::Once;
 
 use iced::advanced::renderer;
 use iced::advanced::{clipboard, mouse};
@@ -33,19 +33,73 @@ const ROWS: i64 = 256;
 /// A workspace big enough that the sidebar's per-row work is visible.
 const CHANNELS: i64 = 24;
 const WINDOW: Size = Size::new(1440.0, 900.0);
+const HUDDLE_WINDOW: Size = Size::new(320.0, 460.0);
+const PAGE_ROWS: usize = 128;
+const HUDDLE_ROWS: usize = 32;
+const LONG_LIST_ROWS: usize = 2_048;
+const FILE_ROWS: usize = 256;
+const DISCUSSION_ROWS: usize = 256;
 /// Enough passes to fill the lazy parking lot and settle the text caches.
 const WARMUP_FRAMES: usize = 4;
 const FRAMES: usize = 12;
 
 /// ALLOCATIONS PER KEYSTROKE, AND NOTHING ELSE IS ASSERTED.
 ///
-/// Measured on `dev` after the QA sweep landed: **16 657**, and bit-identical
-/// across repeated runs — this counts allocations, not time, so there is no
-/// run-to-run noise to absorb. The ceiling is that median plus ~32%: deleting
-/// the stream's `virtual-row=` alone takes it to 27 622, so the headroom is
-/// wide enough never to flake and still far below the first regression it is
-/// here to catch.
+/// Measured on `dev` after the QA sweep landed: about **16 700** allocations.
+/// The count is stable inside one process but can move slightly with global
+/// font/cache initialization, so the ceiling leaves broad headroom. Deleting
+/// the stream's `virtual-row=` alone takes it above 27 000, still well beyond
+/// the budget.
 const KEYSTROKE_ALLOCATION_CEILING: u64 = 22_000;
+
+struct ScreenProbe {
+    label: &'static str,
+    size: Size,
+    fixture: fn() -> (Ducktape, iced::window::Id),
+    allocation_ceiling: u64,
+}
+
+const SCREEN_PROBES: &[ScreenProbe] = &[
+    // Each ceiling sits between the optimized baseline and the smallest
+    // one-change negative control measured with this deterministic fixture:
+    // 31,973 vs 233,957 allocations for restoring per-row anchor lookup.
+    ScreenProbe {
+        label: "pages comments build+layout",
+        size: WINDOW,
+        fixture: console_in_page_comments,
+        allocation_ceiling: 120_000,
+    },
+    // 4,947 vs 7,059 for restoring per-row peer lookup.
+    ScreenProbe {
+        label: "huddle build+layout",
+        size: HUDDLE_WINDOW,
+        fixture: console_in_huddle,
+        allocation_ceiling: 6_000,
+    },
+    // 142,166 vs 150,202 for removing source-row virtualization.
+    ScreenProbe {
+        label: "forge code build+layout",
+        size: WINDOW,
+        fixture: console_in_forge_code,
+        allocation_ceiling: 146_000,
+    },
+    // 382,671 vs 387,952 for removing discussion virtualization; removing
+    // diff virtualization is a larger regression.
+    ScreenProbe {
+        label: "forge PR build+layout",
+        size: WINDOW,
+        fixture: console_in_forge_pr,
+        allocation_ceiling: 385_300,
+    },
+    // 60,437 vs 61,979 for restoring the selected-entry scan; removing the
+    // directory-row virtualization reaches 61,993.
+    ScreenProbe {
+        label: "files build+layout",
+        size: WINDOW,
+        fixture: console_in_files,
+        allocation_ceiling: 61_200,
+    },
+];
 
 // ---------------------------------------------------------------------------
 // The counter. A `GlobalAlloc` shim over `System`, per-thread so the rest of
@@ -180,7 +234,7 @@ fn probe_channel(index: i64) -> backend::ChatChannel {
 
 /// A console sitting in chat, on a channel with a full page of scrollback,
 /// installed through `chat_updated` — the canonical install — so every
-/// mirrored field (`rooms`, `unread_channel_ids`, `post_refusal`,
+/// mirrored field (`rooms`, `dm_rows`, `post_refusal`,
 /// `unread_marker_seq`, …) holds what it would hold in front of a user.
 fn console_in_chat() -> (Ducktape, iced::window::Id) {
     let (mut app, _) = Ducktape::__boot();
@@ -211,20 +265,317 @@ fn console_in_chat() -> (Ducktape, iced::window::Id) {
         thread_has_more: false,
     };
     let _ = app.__update(__DucktapeMessage::ChatUpdated(next));
+    let dm_peers = (0..4)
+        .map(|index| backend::DmPeer {
+            key: format!("peer-{index}"),
+            name: format!("Direct peer {index}"),
+            initials: "DP".into(),
+            is_agent: false,
+            channel_id: format!("dm-channel-{index}"),
+        })
+        .collect();
+    let _ = app.__update(__DucktapeMessage::DmPeersLoaded(backend::DmPeersData {
+        generation: app.dm_peers_generation,
+        peers: dm_peers,
+    }));
     assert_eq!(
         app.messages.len(),
         ROWS as usize,
         "the probe drives a full page of scrollback, not an empty room"
     );
+    assert_eq!(app.dm_rows.len(), 4, "the probe mounts DIRECT rows too");
+    (app, console)
+}
+
+fn console_on(tab: &str) -> (Ducktape, iced::window::Id) {
+    let (mut app, _) = Ducktape::__boot();
+    let console = iced::window::Id::unique();
+    app.console_win = Some(console);
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(tab.into()));
+    assert_eq!(app.shell_tab, tab, "the probe mounts the requested screen");
+    (app, console)
+}
+
+fn probe_page_block(index: usize) -> backend::PageBlock {
+    backend::PageBlock {
+        key: index as i64,
+        id: format!("block-{index}"),
+        parent: "page".into(),
+        kind: "Text".into(),
+        text: format!(
+            "Page paragraph {index} gives the comment rail a stable, non-empty anchor label."
+        ),
+        pending: false,
+        checked: false,
+        prefix: String::new(),
+        child_count: 0,
+    }
+}
+
+fn console_in_page_comments() -> (Ducktape, iced::window::Id) {
+    let (mut app, console) = console_on("pages");
+    let blocks: Vec<_> = (0..PAGE_ROWS).map(probe_page_block).collect();
+    let _ = app.__update(__DucktapeMessage::PagesUpdated(backend::PagesData {
+        pages: vec![backend::PageItem {
+            id: "page".into(),
+            title: "Performance notes".into(),
+            parent: String::new(),
+            prefix: String::new(),
+            child_count: 0,
+        }],
+        blocks,
+        active_page: "page".into(),
+        active_page_title: "Performance notes".into(),
+        active_page_parent: String::new(),
+        comment_thread_total: PAGE_ROWS as i64,
+        commented_block_hits: Vec::new(),
+    }));
+    let _ = app.__update(__DucktapeMessage::ToggleBlockComments);
+    let generation = app.block_comments_generation;
+    let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
+        backend::BlockThreadListData {
+            generation,
+            target: "page".into(),
+            from: 0,
+            threads: (0..PAGE_ROWS)
+                .map(|index| backend::PageCommentThread {
+                    id: format!("thread-{index}"),
+                    target: format!("block-{index}"),
+                    author: format!("reviewer-{}", index % 7),
+                    meta: format!("#{index}"),
+                    resolved: false,
+                    comment_count: 1,
+                })
+                .collect(),
+            total: PAGE_ROWS as i64,
+            next_from: 0,
+            has_more: false,
+        },
+    ));
+    assert_eq!(app.blocks.len(), PAGE_ROWS);
+    assert_eq!(app.block_comment_threads.len(), PAGE_ROWS);
+    assert!(app.block_comments_open);
+    (app, console)
+}
+
+fn probe_huddle_participant(index: usize) -> backend::HuddleParticipant {
+    backend::HuddleParticipant {
+        key: format!("user-{index}"),
+        label: format!("Huddle member {index}"),
+        initials: "HM".into(),
+        is_agent: false,
+        is_you: index == 0,
+        joined_at: index as i64,
+        node: format!("node-{index}"),
+    }
+}
+
+fn console_in_huddle() -> (Ducktape, iced::window::Id) {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.settings_user_key = "user-0".into();
+    let huddle = iced::window::Id::unique();
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(backend::ChatData {
+        generation: app.chat_generation,
+        channels: vec![probe_channel(0)],
+        messages: Vec::new(),
+        active_channel: "channel-0".into(),
+        active_channel_name: "channel-0".into(),
+        active_channel_archived: false,
+        active_channel_members_only: false,
+        active_channel_huddle_count: HUDDLE_ROWS as i64,
+        huddle_roster: (0..HUDDLE_ROWS).map(probe_huddle_participant).collect(),
+        channel_members: Vec::new(),
+        selected_message_seq: 0,
+        selected_message_rev: 0,
+        selected_message_body: String::new(),
+        active_thread_seq: 0,
+        thread_target_seq: 0,
+        thread_messages: Vec::new(),
+        thread_next_reply_offset: 0,
+        thread_has_more: false,
+    }));
+    let _ = app.__update(__DucktapeMessage::HuddleOpened(huddle));
+    for index in 0..HUDDLE_ROWS {
+        let _ = app.__update(__DucktapeMessage::CallEvent(super::call::CallEvent {
+            kind: "peer".into(),
+            peer: format!("node-{index}"),
+            muted: index % 2 == 0,
+            ..super::call::CallEvent::default()
+        }));
+    }
+    assert_eq!(app.huddle_roster.len(), HUDDLE_ROWS);
+    assert_eq!(app.call_peers.len(), HUDDLE_ROWS);
+    assert_eq!(app.huddle_win, Some(huddle));
+    (app, huddle)
+}
+
+fn forge_source() -> String {
+    (0..LONG_LIST_ROWS)
+        .map(|index| format!("let line_{index:04} = {index};\n"))
+        .collect()
+}
+
+fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
+    let (mut app, console) = console_on("forge");
+    let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("probe".into()));
+    let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
+        generation: app.forge_generation,
+        repo: "probe".into(),
+        branches: vec!["dev".into()],
+        items: Vec::new(),
+    }));
+    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
+        generation: app.forge_code_generation,
+        repo: "probe".into(),
+        rev: "dev".into(),
+        path: String::new(),
+        entries: vec![backend::TreeEntry {
+            name: "probe.rs".into(),
+            path: "probe.rs".into(),
+            kind: "file".into(),
+            size: 0,
+        }],
+    }));
+    let _ = app.__update(__DucktapeMessage::ForgeOpenFile("probe.rs".into()));
+    let source = forge_source();
+    assert!(source.len() < 64 * 1024);
+    let _ = app.__update(__DucktapeMessage::ForgeBlobLoaded(backend::BlobView {
+        generation: app.forge_code_generation,
+        repo: "probe".into(),
+        rev: "dev".into(),
+        path: "probe.rs".into(),
+        text: source,
+        truncated: false,
+        binary: false,
+        lines: LONG_LIST_ROWS as i64,
+    }));
+    assert_eq!(app.forge_file_text.lines().count(), LONG_LIST_ROWS);
+    assert_eq!(app.forge_file_path, "probe.rs");
+    (app, console)
+}
+
+fn forge_diff() -> String {
+    let mut diff = String::from(
+        "diff --git a/probe.rs b/probe.rs\n--- a/probe.rs\n+++ b/probe.rs\n@@ -1,1 +1,2048 @@\n",
+    );
+    for index in 0..LONG_LIST_ROWS {
+        use std::fmt::Write as _;
+        writeln!(&mut diff, "+line {index:04}").expect("writing to a String cannot fail");
+    }
+    diff
+}
+
+fn console_in_forge_pr() -> (Ducktape, iced::window::Id) {
+    let (mut app, console) = console_on("forge");
+    let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("probe".into()));
+    let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
+        generation: app.forge_generation,
+        repo: "probe".into(),
+        branches: vec!["dev".into()],
+        items: Vec::new(),
+    }));
+    let _ = app.__update(__DucktapeMessage::ForgeOpenItem(7));
+    let diff = forge_diff();
+    assert!(diff.len() < 48 * 1024);
+    let _ = app.__update(__DucktapeMessage::ForgeItemLoaded(backend::ForgeItemData {
+        generation: app.forge_generation,
+        repo: "probe".into(),
+        number: 7,
+        title: "Bound every rendered list".into(),
+        state: "open".into(),
+        kind: "pr".into(),
+        author_name: "reviewer".into(),
+        branches: "perf/probe → dev".into(),
+        channel_id: "forge:probe:7".into(),
+        source_branch: "perf/probe".into(),
+        source_oid: "abc123".into(),
+        target_oid: "def456".into(),
+        diff,
+        files_changed: 1,
+        additions: LONG_LIST_ROWS as i64,
+        ..backend::ForgeItemData::default()
+    }));
+    let _ = app.__update(__DucktapeMessage::ForgeDiscussionLoaded(
+        backend::ForgeDiscussionData {
+            generation: app.forge_discussion_generation,
+            channel_id: "forge:probe:7".into(),
+            messages: (1..=DISCUSSION_ROWS as i64).map(probe_message).collect(),
+            members: Vec::new(),
+        },
+    ));
+    assert_eq!(
+        backend::diff_lines(app.forge_item_diff.clone()).len(),
+        LONG_LIST_ROWS + 4
+    );
+    assert_eq!(app.forge_discussion.len(), DISCUSSION_ROWS);
+    (app, console)
+}
+
+fn probe_fs_entry(index: usize) -> backend::FsEntry {
+    let kind = if index.is_multiple_of(2) {
+        "dir"
+    } else {
+        "file"
+    };
+    backend::FsEntry {
+        key: index as i64,
+        path: format!("/shared/entry-{index:04}"),
+        name: format!("entry-{index:04}"),
+        kind: kind.into(),
+        size: index as i64,
+        object: format!("object-{index:04}"),
+    }
+}
+
+fn console_in_files() -> (Ducktape, iced::window::Id) {
+    let (mut app, console) = console_on("files");
+    let entries: Vec<_> = (0..FILE_ROWS).map(probe_fs_entry).collect();
+    let selected = entries
+        .last()
+        .expect("the fixture is non-empty")
+        .path
+        .clone();
+    let _ = app.__update(__DucktapeMessage::FsListed(backend::FsListing {
+        generation: app.fs_generation,
+        path: "/shared".into(),
+        entries,
+    }));
+    let _ = app.__update(__DucktapeMessage::FsOpenFile(selected.clone()));
+    let _ = app.__update(__DucktapeMessage::FsPreviewed(backend::FsPreview {
+        generation: app.fs_generation,
+        path: selected.clone(),
+        text: "selected file preview".into(),
+        truncated: false,
+        binary: false,
+    }));
+    assert_eq!(app.fs_entries.len(), FILE_ROWS);
+    assert_eq!(app.fs_preview_path, selected);
+    assert_eq!(app.fs_preview_entry.path, app.fs_preview_path);
     (app, console)
 }
 
 fn headless_renderer() -> iced::Renderer {
+    static LOAD_FONTS: Once = Once::new();
+    LOAD_FONTS.call_once(|| {
+        let mut fonts = iced::advanced::graphics::text::font_system()
+            .write()
+            .expect("the shared font system lock");
+        fonts.load_font(Cow::Borrowed(include_bytes!(
+            "../../crates/design/assets/fonts/Geist[wght].ttf"
+        )));
+        fonts.load_font(Cow::Borrowed(include_bytes!(
+            "../../crates/design/assets/fonts/GeistMono[wght].ttf"
+        )));
+    });
     tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("a current-thread runtime to block the headless renderer on")
         .block_on(<iced::Renderer as iced::advanced::renderer::Headless>::new(
-            iced::Font::DEFAULT,
+            iced::Font::with_name("Geist"),
             iced::Pixels(13.5),
             Some("tiny-skia"),
         ))
@@ -256,6 +607,74 @@ fn a_chat_keystroke_stays_under_its_allocation_ceiling() {
         .expect("the probe thread finishes");
 }
 
+#[test]
+fn large_screens_stay_under_their_allocation_ceilings() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_large_screens)
+        .expect("the screen probe thread spawns")
+        .join()
+        .expect("the screen probe thread finishes");
+}
+
+fn probe_large_screens() {
+    eprintln!(
+        "large screen frame probes: {PAGE_ROWS} page rows, {HUDDLE_ROWS} huddle rows, \
+         {LONG_LIST_ROWS} source/diff rows, {DISCUSSION_ROWS} discussion rows, \
+         {FILE_ROWS} file rows"
+    );
+    for probe in SCREEN_PROBES {
+        let (app, window) = (probe.fixture)();
+        let allocations = probe_unchanged_build(probe.label, &app, window, probe.size);
+        assert!(
+            allocations < probe.allocation_ceiling,
+            "{} rebuilt in {allocations} allocations, over the {} ceiling. Restore the \
+             prepared row projection or keyed virtual-row before changing the budget.",
+            probe.label,
+            probe.allocation_ceiling,
+        );
+    }
+}
+
+fn probe_unchanged_build(
+    label: &'static str,
+    app: &Ducktape,
+    window: iced::window::Id,
+    size: Size,
+) -> u64 {
+    let mut renderer = headless_renderer();
+    let mut clipboard = clipboard::Null;
+    let mut messages: Vec<__DucktapeMessage> = Vec::new();
+    let mut cache = user_interface::Cache::default();
+    for _ in 0..WARMUP_FRAMES {
+        let mut ui = UserInterface::build(app.__view(window), size, cache, &mut renderer);
+        ui.update(
+            &[Event::Window(iced::window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            ))],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard,
+            &mut messages,
+        );
+        assert!(
+            messages.is_empty(),
+            "warming {label} must not mutate the fixture"
+        );
+        messages.clear();
+        cache = ui.into_cache();
+    }
+
+    let mut build = Phase::new(label);
+    for _ in 0..FRAMES {
+        cache = build
+            .sample(|| UserInterface::build(app.__view(window), size, cache, &mut renderer))
+            .into_cache();
+    }
+    build.report();
+    build.median_allocations()
+}
+
 fn probe() {
     let (mut app, console) = console_in_chat();
     let mut renderer = headless_renderer();
@@ -271,7 +690,7 @@ fn probe() {
     let mut build = Phase::new("unchanged build+layout");
     let mut walk = Phase::new("cursor-move event walk");
     let mut draw = Phase::new("draw");
-    let mut keystroke_rebuild = Phase::new("composer keystroke rebuild");
+    let mut keystroke_frame = Phase::new("composer keystroke+rebuild");
     let mut row_edit = Phase::new("one-row edit rebuild");
     let mut screen_switch = Phase::new("screen switch (pages->chat)");
 
@@ -305,9 +724,10 @@ fn probe() {
         // ONE KEYSTROKE, WHOLE FRAME: the composer message through the real
         // handler, then the rebuild every message forces (iced 0.14 has no
         // dirty check). This pair IS what a user pays per typed character.
-        let _ = app.__update(keystroke());
-        let ui = keystroke_rebuild
-            .sample(|| UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer));
+        let ui = keystroke_frame.sample(|| {
+            let _ = app.__update(keystroke());
+            UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
+        });
         cache = ui.into_cache();
 
         // One row's dependency changes — an edit landing on the stream.
@@ -337,11 +757,11 @@ fn probe() {
     build.report();
     walk.report();
     draw.report();
-    keystroke_rebuild.report();
+    keystroke_frame.report();
     row_edit.report();
     screen_switch.report();
 
-    let per_keystroke = keystroke_rebuild.median_allocations();
+    let per_keystroke = keystroke_frame.median_allocations();
     assert!(
         per_keystroke < KEYSTROKE_ALLOCATION_CEILING,
         "one chat keystroke rebuilt the frame in {per_keystroke} allocations, over the \

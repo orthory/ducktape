@@ -24,6 +24,8 @@ pub mod markdown;
 pub mod menu;
 pub mod sync;
 
+use std::collections::BTreeMap;
+
 /// The `sync` predicate at the extern boundary, which hands values, not
 /// borrows.
 pub fn has_unclosed_fence(text: String) -> bool {
@@ -73,24 +75,64 @@ pub fn comment_anchor_label(
     target: String,
     page_id: String,
 ) -> String {
+    anchor_label(&comment_anchor_labels(&blocks), &target, &page_id)
+}
+
+/// One thread-list row with its document anchor already resolved. The Ice
+/// view reads the scalar; it never clones and searches the whole block list
+/// once per thread.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct PageCommentThreadRow {
+    pub thread: crate::backend::PageCommentThread,
+    pub anchor: String,
+}
+
+pub fn page_comment_thread_rows(
+    blocks: Vec<crate::backend::PageBlock>,
+    threads: Vec<crate::backend::PageCommentThread>,
+    page_id: String,
+) -> Vec<PageCommentThreadRow> {
+    let labels = comment_anchor_labels(&blocks);
+    threads
+        .into_iter()
+        .map(|thread| PageCommentThreadRow {
+            anchor: anchor_label(&labels, &thread.target, &page_id),
+            thread,
+        })
+        .collect()
+}
+
+fn comment_anchor_labels(blocks: &[crate::backend::PageBlock]) -> BTreeMap<String, String> {
+    let text_by_id: BTreeMap<&str, &str> = blocks
+        .iter()
+        .map(|block| (block.id.as_str(), block.text.as_str()))
+        .collect();
+    sync::line_spans(blocks)
+        .into_iter()
+        .map(|(id, start, _)| {
+            let text = text_by_id.get(id.as_str()).copied().unwrap_or_default();
+            (id, format!("line {start} · {}", anchor_snippet(text)))
+        })
+        .collect()
+}
+
+fn anchor_label(labels: &BTreeMap<String, String>, target: &str, page_id: &str) -> String {
     if target.is_empty() || target == page_id {
         return "this page".into();
     }
-    let spans = sync::line_spans(&blocks);
-    let Some((_, start, _)) = spans.into_iter().find(|(id, _, _)| *id == target) else {
-        return "a removed block".into();
-    };
-    let snippet = blocks
-        .iter()
-        .find(|block| block.id == target)
-        .map(|block| block.text.trim().to_string())
-        .unwrap_or_default();
-    let snippet = match snippet.char_indices().nth(36) {
-        Some((cut, _)) => format!("{}…", &snippet[..cut]),
-        None if snippet.is_empty() => "an empty line".into(),
-        None => snippet,
-    };
-    format!("line {start} · {snippet}")
+    labels
+        .get(target)
+        .cloned()
+        .unwrap_or_else(|| "a removed block".into())
+}
+
+fn anchor_snippet(text: &str) -> String {
+    let text = text.trim();
+    match text.char_indices().nth(36) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None if text.is_empty() => "an empty line".into(),
+        None => text.to_owned(),
+    }
 }
 
 use iced::advanced::text::Wrapping;

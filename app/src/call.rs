@@ -22,7 +22,7 @@
 //! from `mixed` frames. Late audio is dead audio: the ring caps at ~200 ms
 //! and drops oldest, capture frames drop when the pump is behind.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -637,11 +637,35 @@ pub fn call_video_live_after(peers: Vec<CallEvent>, camera: bool) -> bool {
     camera || peers.iter().any(|peer| peer.camera_on)
 }
 
-/// Whether the roster row at `node` is currently muted, per the beacons.
-pub fn call_peer_muted(peers: Vec<CallEvent>, node: String) -> bool {
-    peers
-        .iter()
-        .any(|peer| peer.peer == node && peer.muted)
+/// One huddle tile with its mute decision already attached.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct HuddleTileRow {
+    pub person: crate::backend::HuddleParticipant,
+    pub muted: bool,
+}
+
+/// Tile rows prepared whenever the roster, call beacons, or local mute moves.
+pub fn huddle_tile_rows(
+    roster: Vec<crate::backend::HuddleParticipant>,
+    peers: Vec<CallEvent>,
+    local_muted: bool,
+) -> Vec<HuddleTileRow> {
+    let muted_peers: BTreeSet<String> = peers
+        .into_iter()
+        .filter(|peer| peer.muted)
+        .map(|peer| peer.peer)
+        .collect();
+    roster
+        .into_iter()
+        .map(|person| HuddleTileRow {
+            muted: if person.is_you {
+                local_muted
+            } else {
+                muted_peers.contains(&person.node)
+            },
+            person,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -717,11 +741,30 @@ mod tests {
             ..CallEvent::default()
         };
         let peers = apply_call_peer(Vec::new(), beacon("aa", true));
-        let peers = apply_call_peer(peers, beacon("bb", false));
+        let peers = apply_call_peer(peers, beacon("bb", true));
         let peers = apply_call_peer(peers, beacon("aa", false));
         assert_eq!(peers.len(), 2);
-        assert!(!call_peer_muted(peers.clone(), "aa".into()));
-        assert!(!call_peer_muted(peers, "cc".into()));
+        let participant = |node: &str, is_you: bool| crate::backend::HuddleParticipant {
+            key: node.into(),
+            label: node.into(),
+            initials: node.into(),
+            is_agent: false,
+            is_you,
+            joined_at: 0,
+            node: node.into(),
+        };
+        let rows = huddle_tile_rows(
+            vec![
+                participant("aa", false),
+                participant("bb", false),
+                participant("cc", true),
+            ],
+            peers,
+            true,
+        );
+        assert!(!rows[0].muted);
+        assert!(rows[1].muted);
+        assert!(rows[2].muted, "the local tile reads the local mute");
     }
 
     #[test]

@@ -462,13 +462,13 @@ on chat_updated(next)
   // a peer's post in a third room and the badge it lit, a channel created,
   // renamed or archived — and nothing re-pages the list to heal it.
   channels = upsert_channel_rows(channels, next.channels)
-  rooms = rooms_only(channels, dm_peers, settings_user_key)
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
-  unread_channel_ids = unread_channels(channel_reads, channels)
+  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_channel = next.active_channel
   // A LANDING ANSWERS FOR THE PEER TOO. The DM header suppresses the `#` and
   // the channel name, so a peer that outlives the room it named leaves the room
@@ -485,6 +485,7 @@ on chat_updated(next)
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
   huddle_joined = huddle_self(next.huddle_roster)
   huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
@@ -524,13 +525,13 @@ on chat_hit_loaded(next)
   history_view = true
   // Same fold as `chat_updated`, same loader, same reason.
   channels = upsert_channel_rows(channels, next.channels)
-  rooms = rooms_only(channels, dm_peers, settings_user_key)
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
-  unread_channel_ids = unread_channels(channel_reads, channels)
+  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_channel = next.active_channel
   // Same landing answer as `chat_updated`: a hit in another room retires the
   // peer, a hit inside the DM keeps him.
@@ -546,6 +547,7 @@ on chat_hit_loaded(next)
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
   huddle_joined = huddle_self(next.huddle_roster)
   huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
@@ -605,13 +607,13 @@ on channel_created(next)
   // `chat_hit_loaded`.
   history_view = false
   channels = next.channels
-  rooms = rooms_only(channels, dm_peers, settings_user_key)
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
-  unread_channel_ids = unread_channels(channel_reads, channels)
+  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_channel = next.active_channel
   // Creating lands you in the new room, which is nobody's DM.
   active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
@@ -626,6 +628,7 @@ on channel_created(next)
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
   huddle_joined = huddle_self(next.huddle_roster)
   huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members

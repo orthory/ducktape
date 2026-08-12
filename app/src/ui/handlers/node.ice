@@ -90,7 +90,8 @@ on settings_loaded(next)
   // whether it is seated in a members-only room. The facts load lands after the
   // first chat load, so without these the sidebar listed every DM under
   // CHANNELS and the composer stayed refused until the next delta.
-  rooms = rooms_only(channels, dm_peers, settings_user_key)
+  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   settings_open_tabs = next.open_tabs
 

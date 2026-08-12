@@ -696,8 +696,7 @@ test message_stream_reset_contract
         search_phase=chat_search_phase
         search_hits=chat_search_hits
         rooms
-        unread_channel_ids
-        dm_peers
+        dm_rows
         channel_create_open
         connected
         loading

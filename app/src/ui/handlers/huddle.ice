@@ -28,11 +28,13 @@ on call_event(event)
   call_muted = keep_bool(event.kind == "connecting", false, call_muted)
   call_camera = keep_bool(event.kind == "connecting", false, call_camera)
   call_peers = apply_call_peer(call_peers, event)
+  huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
   call_video_live = call_video_live_after(call_peers, call_camera)
   call_steered = call_recipients(huddle_recipient_nodes(huddle_roster))
 
 on toggle_call_mute
   call_muted = call_set_muted(!call_muted)
+  huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
 
 on toggle_call_camera
   call_camera = call_set_camera(!call_camera)
@@ -100,6 +102,10 @@ on leave_huddle_here
   call_camera = false
   call_video_live = false
   call_peers = []
+  // Keep the retained roster visible if the leave is refused. The peer and
+  // local mute state above are already reset, so rebuild the same projection
+  // every other writer of those sources rebuilds.
+  huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
   error = ""
   // Leaving is the one thing that ends the huddle window: it has nothing left
   // to show. A window task is terminal, so the leave call rides beside it.

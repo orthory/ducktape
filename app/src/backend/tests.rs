@@ -211,6 +211,7 @@ fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
         settled_height: 0,
     };
     let entry = FsEntry {
+        key: 0,
         path: "/shared/notes".into(),
         name: "notes".into(),
         kind: "file".into(),
@@ -277,6 +278,14 @@ fn a_diff_paints_gutters_signs_and_kinds() {
     );
     let kinds: Vec<&str> = rows.iter().map(|row| row.kind.as_str()).collect();
     assert_eq!(kinds, ["file", "hunk", "ctx", "del", "add"]);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.key)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        rows.len(),
+        "every parsed patch row has a unique keyed identity"
+    );
     let context = &rows[2];
     assert_eq!(
         (context.old_no.as_str(), context.new_no.as_str()),
@@ -287,6 +296,70 @@ fn a_diff_paints_gutters_signs_and_kinds() {
     assert_eq!(rows[4].sign, "+");
     assert_eq!(rows[4].new_no, "139");
     assert_eq!(rows[4].text, "added");
+}
+
+#[test]
+fn a_changed_diff_rekeys_rows_instead_of_transferring_focus() {
+    let before = diff_lines(
+        concat!(
+            "+++ b/one.rs\n",
+            "@@ -10,1 +10,2 @@\n",
+            " kept\n",
+            "+target\n",
+        )
+        .into(),
+    );
+    let after = diff_lines(
+        concat!(
+            "+++ b/one.rs\n",
+            "@@ -10,1 +10,3 @@\n",
+            " kept\n",
+            "+unrelated\n",
+            "+target\n",
+        )
+        .into(),
+    );
+    let after_identical = diff_lines(
+        concat!(
+            "+++ b/one.rs\n",
+            "@@ -10,1 +10,3 @@\n",
+            " kept\n",
+            "+target\n",
+            "+target\n",
+        )
+        .into(),
+    );
+    let before_target = before
+        .iter()
+        .find(|row| row.text == "target")
+        .expect("the target row is parsed before the insertion");
+    let after_target = after
+        .iter()
+        .find(|row| row.text == "target")
+        .expect("the target row is parsed after the insertion");
+
+    assert_ne!(before_target.new_no, after_target.new_no);
+    assert_ne!(before_target.key, after_target.key);
+    assert!(
+        after_identical
+            .iter()
+            .filter(|row| row.text == "target")
+            .all(|row| row.key != before_target.key),
+        "even an indistinguishable inserted line cannot inherit a focused button"
+    );
+    assert_eq!(
+        diff_lines(
+            concat!(
+                "+++ b/one.rs\n",
+                "@@ -10,1 +10,2 @@\n",
+                " kept\n",
+                "+target\n",
+            )
+            .into()
+        ),
+        before,
+        "an unchanged patch keeps its keyed tree"
+    );
 }
 
 /// Every code row knows which FILE it is in, across a multi-file patch.
@@ -734,10 +807,13 @@ fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
         channel(&dm_channel_id(a.clone(), b.clone())),
         channel("general"),
     ];
-    let rooms = rooms_only(listing.clone(), peers.clone(), a.clone());
+    let rooms = chat_sidebar_rooms(listing.clone(), peers.clone(), a.clone(), Vec::new());
     assert_eq!(rooms.len(), 1);
-    assert_eq!(rooms[0].id, "general");
-    assert_eq!(rooms_only(listing, peers, String::new()).len(), 2);
+    assert_eq!(rooms[0].channel.id, "general");
+    assert_eq!(
+        chat_sidebar_rooms(listing, peers, String::new(), Vec::new()).len(),
+        2
+    );
 
     // the id the app mints is the id chat will accept from a USER author:
     // ':' is reserved for module origins and '/' is refused outright, so a
@@ -776,7 +852,9 @@ fn the_post_gate_names_why_a_viewer_cannot_post() {
 fn the_crumb_counts_split_the_listing_in_two() {
     let entries = ["dir", "file", "file"]
         .into_iter()
-        .map(|kind| FsEntry {
+        .enumerate()
+        .map(|(key, kind)| FsEntry {
+            key: key as i64,
             path: format!("/shared/{kind}"),
             name: kind.into(),
             kind: kind.into(),
@@ -793,6 +871,44 @@ fn the_crumb_counts_split_the_listing_in_two() {
     );
     assert_eq!(fs_dir_count(Vec::new()), 0);
     assert_eq!(fs_file_count(Vec::new()), 0);
+}
+
+#[test]
+fn the_selected_fs_entry_resolves_or_blanks() {
+    let selected = FsEntry {
+        key: 1,
+        path: "/shared/notes".into(),
+        name: "notes".into(),
+        kind: "file".into(),
+        size: 7,
+        object: "abc".into(),
+    };
+
+    assert_eq!(
+        fs_entry_named(vec![no_fs_entry(), selected.clone()], selected.path.clone(),),
+        selected
+    );
+    assert_eq!(
+        fs_entry_named(Vec::new(), "/shared/missing".into()),
+        no_fs_entry()
+    );
+}
+
+#[test]
+fn directory_rows_are_prepared_from_the_listing() {
+    let entry = |name: &str, kind: &str| FsEntry {
+        key: 0,
+        path: format!("/shared/{name}"),
+        name: name.into(),
+        kind: kind.into(),
+        size: 0,
+        object: String::new(),
+    };
+
+    assert_eq!(
+        fs_directories(vec![entry("docs", "dir"), entry("readme", "file")]),
+        vec![entry("docs", "dir")]
+    );
 }
 
 #[test]
@@ -3339,19 +3455,43 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
         reads.len()
     );
 
-    // unread_channels: every channel whose head is past the seen cursor, in
-    // one pass — and `is_unread_channel` is the row's own reading of it.
-    let unread = unread_channels(reads.clone(), channels.clone());
-    assert_eq!(unread, vec!["random".to_owned()]);
-    assert!(is_unread_channel(unread.clone(), "random".into()));
-    assert!(!is_unread_channel(unread, "general".into()));
-    assert!(unread_channels(reads.clone(), vec![channel("random", 30)]).is_empty());
+    // Every prepared row carries its own unread scalar. Both sections resolve
+    // it once when source state moves, never from a list-taking view call.
+    let rooms = chat_sidebar_rooms(channels.clone(), Vec::new(), String::new(), reads.clone());
+    assert!(!rooms[0].unread);
+    assert!(rooms[1].unread);
+    let dm = DmPeer {
+        key: "peer".into(),
+        name: "Peer".into(),
+        initials: "P".into(),
+        is_agent: false,
+        channel_id: "random".into(),
+    };
+    let dms = chat_sidebar_dms(channels.clone(), vec![dm], reads.clone());
+    assert!(dms[0].unread);
+    assert!(
+        !chat_sidebar_rooms(
+            vec![channel("random", 30)],
+            Vec::new(),
+            String::new(),
+            reads.clone(),
+        )[0]
+        .unread
+    );
 
     // initial_channel_reads: seed absent channels to head, preserve existing.
     let seeded = initial_channel_reads(channels.clone(), vec![read("random", 30)]);
     assert_eq!(channel_last_read(seeded.clone(), "random".into()), 30);
     assert_eq!(channel_last_read(seeded.clone(), "general".into()), 100);
-    assert!(unread_channels(seeded, vec![channel("general", 100)]).is_empty());
+    assert!(
+        !chat_sidebar_rooms(
+            vec![channel("general", 100)],
+            Vec::new(),
+            String::new(),
+            seeded,
+        )[0]
+        .unread
+    );
 
     // first_unread_seq: first message past the boundary; pending (seq -1)
     // never anchors it; 0 when caught up.

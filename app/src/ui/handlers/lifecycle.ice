@@ -4,6 +4,7 @@ state
   // The DIRECT section of the chat sidebar: every principal you can open a
   // two-party channel with.
   dm_peers:[DmPeer] = []
+  dm_rows:[DmSidebarRow] = []
   // The duckfs path list behind the 206px tree, which is a different question
   // from `fs_entries` (one directory) and comes from a different call. It is
   // the find route's FIRST page — 256 paths (duckfs wire.rs MAX_PAGE) — so a
@@ -93,7 +94,7 @@ on reconnect
   connected = false
   channels = []
   rooms = []
-  unread_channel_ids = []
+  dm_rows = []
   messages = []
   has_older_history = false
   // The history lane was invalidated above, so its old socket and button state
@@ -155,12 +156,14 @@ on reconnect
   block_comments_open = false
   block_comments_target = ""
   block_comment_threads = []
+  block_comment_rows = []
   block_comment_thread_total = 0
   block_comment_threads_next_from = 0
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
   active_thread_target = ""
+  active_thread_anchor = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -191,8 +194,8 @@ on workspace_connected(next)
   block_height = next.height
   channels = next.channels
   channel_reads = initial_channel_reads(next.channels, channel_reads)
-  rooms = rooms_only(channels, dm_peers, settings_user_key)
-  unread_channel_ids = unread_channels(channel_reads, channels)
+  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   unread_boundary = 0
   // A connect answers with the LATEST page of whatever room it landed on, so
   // whatever window a search hit had put on screen is gone — see
@@ -216,6 +219,7 @@ on workspace_connected(next)
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
   huddle_joined = huddle_self(next.huddle_roster)
   huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
@@ -223,6 +227,8 @@ on workspace_connected(next)
   pages = next.pages
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
+  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
   // The blocks in hand are this page's, and every route into a connect blanks
@@ -279,7 +285,6 @@ on live_updated(next)
   block_height = keep_i64(next.height >= 0, next.height, block_height)
   return if next.kind == "tip"
   channels = apply_chat_channels(channels, next.chat)
-  rooms = rooms_only(channels, dm_peers, settings_user_key)
   // Settle-✓ choreography, read against the PRE-fold rows: the settle delta
   // pops the tick (true), any later live event — the next block at the
   // latest — starts its fade (false). Same-value writes are no-ops.
@@ -332,7 +337,8 @@ on live_updated(next)
   active_channel_huddle_count = channel_live_huddle_count(channels, active_channel, active_channel_huddle_count)
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   channel_reads = mark_channel_read(channel_reads, live_tail_channel, channel_head_seq(channels, live_tail_channel))
-  unread_channel_ids = unread_channels(channel_reads, channels)
+  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // THE PAGES FOLD. A committed text edit lands in the open document's blocks
   // with no query at all — the autosave commits one per tick while a reader
   // types, and each used to buy three sequential reads of the very document
@@ -351,6 +357,8 @@ on live_updated(next)
   pages = apply_page_rename(pages, next.pages)
   active_page_title = apply_page_title(active_page_title, next.pages, active_page)
   blocks = apply_page_text(blocks, next.pages)
+  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
   let folded_saved = refreshed_page_saved(page_editor, active_page_title, blocks, page_saved_text)
   page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
   page_saved_text = folded_saved
@@ -400,7 +408,6 @@ on live_resynced(next)
   hydration_retry_attempt = 0
   channels = keep_channels(next.chat_loaded, next.channels, channels)
   channel_reads = initial_channel_reads(channels, channel_reads)
-  rooms = rooms_only(channels, dm_peers, settings_user_key)
   // A resync that carried chat replaced the window with `load_chat_data`'s
   // LATEST page, so the banner it left up described rows that are no longer on
   // screen — see `chat_hit_loaded`. One that carried no chat kept the window
@@ -475,6 +482,7 @@ on live_resynced(next)
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
   huddle_joined = keep_bool(next.chat_loaded, huddle_self(next.huddle_roster), huddle_joined)
   huddle_roster = keep_roster(huddle_joined, keep_participants(next.chat_loaded, next.huddle_roster, huddle_roster))
+  huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = keep_members(next.chat_loaded, next.channel_members, channel_members)
@@ -482,7 +490,8 @@ on live_resynced(next)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
-  unread_channel_ids = unread_channels(channel_reads, channels)
+  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // A resync carries whatever page was active WHEN IT WAS ISSUED and takes
   // several queries to answer, so a mutation landing in between leaves it
   // speaking for a document nobody is on — measured on a page create. The page
@@ -517,6 +526,8 @@ on live_resynced(next)
   block_comment_thread_total = keep_i64(pages_answer_is_current, next.comment_thread_total, block_comment_thread_total)
   commented_block_hits = keep_strs(pages_answer_is_current, next.commented_block_hits, commented_block_hits)
   active_page = keep_str(pages_answer_is_current, next.active_page, active_page)
+  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
   active_page_title = keep_str(pages_answer_is_current, next.active_page_title, active_page_title)
   active_page_parent = keep_str(pages_answer_is_current, next.active_page_parent, active_page_parent)
   // AFTER the title lands, because the title is line 0 of the buffer. The
@@ -619,7 +630,7 @@ on select_shell_tab(next)
   // returns above this block, so nothing chat does ever re-issues them. Bump
   // unconditionally and a move into Members while the connect load is in
   // flight orphans it — the -1 in its place is refused, and `me` stays "" for
-  // the session, which `rooms_only` reads as "show every DM under CHANNELS"
+  // the session, which `chat_sidebar_rooms` reads as "show every DM under CHANNELS"
   // and `post_gate` as "not seated", refusing the composer on every DM.
   settings_generation = keep_i64(shell_tab == "settings", settings_generation + 1, settings_generation)
   node_peers_generation = node_peers_generation + 1

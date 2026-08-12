@@ -388,7 +388,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                           // happens in backend.rs and the gutter counts
                           // the rows it actually produced rather than
                           // guessing where the file breaks.
-                          col w=fill
+                          col w=fill virtual-row=20.0
                             for line in source_lines(file_text)
                               ForgeCodeLine number=line.number code=line.text
                           if file_truncated
@@ -741,7 +741,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 GroupLabel label="DISCUSSION"
                 if empty(discussion)
                   text "No discussion yet." size=12.5 @text-caption
-                for message in discussion
+                keyed message in discussion by=message.seq virtual-row=44.0 w=fill gap=9.0
                   row
                     with
                       w=fill

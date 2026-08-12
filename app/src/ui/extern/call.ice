@@ -13,7 +13,8 @@ extern crate::call
   sync call_recipients(nodes:[str]) -> bool
   pure call_status_after(current:str, event:CallEvent) -> str
   pure apply_call_peer(peers:[CallEvent], event:CallEvent) -> [CallEvent]
-  pure call_peer_muted(peers:[CallEvent], node:str) -> bool
+  HuddleTileRow(person:HuddleParticipant, muted:bool)
+  pure huddle_tile_rows(roster:[HuddleParticipant], peers:[CallEvent], local_muted:bool) -> [HuddleTileRow]
   pure call_video_live_after(peers:[CallEvent], camera:bool) -> bool
 
 // The camera leg — `crate::video`: capture/encode on its own thread, decoded
