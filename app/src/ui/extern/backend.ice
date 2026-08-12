@@ -123,11 +123,14 @@ extern crate::backend
   pure escape_target(logical:key, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, channel_settings_open:bool, forge_repo_menu:bool) -> str
   pure content_scroll_step(logical:key, modifiers:key-modifiers, overlay:str) -> f64
   NavItem(id:str, title:str, icon:str, badge:i64, active:bool, live:bool)
-  FsEntry(path:str, name:str, kind:str, size:i64, object:str)
+  FsEntry(key:i64, path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
   FsListing(generation:i64, path:str, entries:[FsEntry])
   FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
+  pure no_fs_entry() -> FsEntry
+  pure fs_entry_named(entries:[FsEntry], path:str) -> FsEntry
+  pure fs_directories(entries:[FsEntry]) -> [FsEntry]
   pure fs_dir_count(entries:[FsEntry]) -> i64
   pure fs_file_count(entries:[FsEntry]) -> i64
   pure fs_counts_summary(connected:bool, listed:bool, entries:[FsEntry]) -> str
@@ -236,7 +239,7 @@ extern crate::backend
   pure forge_live_hit(kind:str, module:str) -> bool
   pure forge_repo_row(repos:[ForgeRepo], name:str) -> ForgeRepo
   pure forge_stats(files:i64, additions:i64, deletions:i64) -> str
-  DiffLine(kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
+  DiffLine(key:i64, kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
   pure forge_push_command(rpc:str) -> str
   pure diff_lines(diff:str) -> [DiffLine]
   SourceLine(number:str, text:str)
@@ -298,10 +301,10 @@ extern crate::backend
   pure channel_last_read(reads:[ChannelRead], channel:str) -> i64
   pure channel_head_seq(channels:[ChatChannel], channel:str) -> i64
   pure mark_channel_read(reads:[ChannelRead], channel:str, seq:i64) -> [ChannelRead]
-  // Batched, and mirrored into `unread_channel_ids`: per row this cloned the
-  // whole read-cursor list, which is O(channels x reads) allocations a frame.
-  pure unread_channels(reads:[ChannelRead], channels:[ChatChannel]) -> [str]
-  pure is_unread_channel(unread:[str], channel:str) -> bool
+  ChatSidebarRow(channel:ChatChannel, unread:bool)
+  DmSidebarRow(peer:DmPeer, unread:bool)
+  pure chat_sidebar_rooms(channels:[ChatChannel], peers:[DmPeer], me:str, reads:[ChannelRead]) -> [ChatSidebarRow]
+  pure chat_sidebar_dms(channels:[ChatChannel], peers:[DmPeer], reads:[ChannelRead]) -> [DmSidebarRow]
   pure apply_chat_channels(channels:[ChatChannel], delta:ChatDelta) -> [ChatChannel]
   pure apply_chat_messages(messages:[ChatMessage], delta:ChatDelta, active_channel:str) -> [ChatMessage]
   pure apply_chat_thread(thread:[ChatMessage], delta:ChatDelta, active_channel:str, root:i64) -> [ChatMessage]
@@ -386,7 +389,6 @@ extern crate::backend
   load_dm_peers(rpc:str, generation:i64) -> DmPeersData ! HydrationError
   pure dm_channel_id(a:str, b:str) -> str
   pure dm_peer_of_channel(peer:str, me:str, channel:str) -> str
-  pure rooms_only(channels:[ChatChannel], peers:[DmPeer], me:str) -> [ChatChannel]
   pure dm_peer_named(peers:[DmPeer], key:str) -> DmPeer
   pure no_dm_peer() -> DmPeer
   open_dm(rpc:str, password:str, peer_key:str, generation:i64) -> ChatData ! HydrationError

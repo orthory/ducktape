@@ -1308,11 +1308,10 @@ component DiffPane(file:str, additions:i64, deletions:i64, lines:[DiffLine])
           h=1.0
           bg=separator
         space w=1.0 h=1.0
-      col w=fill
-        for line in lines
-          DiffRow line=line
-            forward
-              forge_comment_open
+      keyed line in lines by=line.key virtual-row=20.0 w=fill
+        DiffRow line=line
+          forward
+            forge_comment_open
 
 // One patch line. The kind is the whole discriminant: a file header, a hunk
 // header, or a code row whose gutter, sign and ink are its tint.

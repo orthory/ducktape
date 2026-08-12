@@ -886,18 +886,24 @@ pub(crate) fn page_blocks(wire_blocks: Vec<pages::Block>, active_page: &str) -> 
 }
 
 pub(crate) fn page_block_key(id: &str) -> i64 {
+    stable_view_key(&format!("page-block:{id}"))
+}
+
+/// Collision-free numeric identity for Ice's keyed rows. The language accepts
+/// only copyable numeric keys, while the app's durable identities are strings.
+pub(crate) fn stable_view_key(identity: &str) -> i64 {
     // ponytail: session-wide interning is collision-free; scope it per workspace
-    // only if retaining every visited block id becomes measurable.
+    // only if retaining every visited row identity becomes measurable.
     static KEYS: OnceLock<Mutex<BTreeMap<String, i64>>> = OnceLock::new();
     let mut keys = KEYS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(key) = keys.get(id) {
+    if let Some(key) = keys.get(identity) {
         return *key;
     }
     let key = count_i64(keys.len());
-    keys.insert(id.to_owned(), key);
+    keys.insert(identity.to_owned(), key);
     key
 }
 

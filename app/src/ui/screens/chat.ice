@@ -19,7 +19,7 @@
 // were briefly caller-filled slots: a sensor's show/resize route used to accept
 // only bare `_` payloads and could not carry a component event (ui-lang#239).
 
-component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:str, search_hits:[ChatSearchHit], rooms:[ChatChannel], unread_channel_ids:[str], dm_peers:[DmPeer], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
+component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
   emits
     search_chat_submit()
     clear_chat_search()
@@ -259,13 +259,13 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
           col w=fill gap=2.0
             // DMs are filtered out here, not hidden by CSS: they are real
             // channels and would otherwise list twice, once under each
-            // eyebrow. See `rooms_only`.
-            for channel in rooms
+            // eyebrow. See `chat_sidebar_rooms`.
+            for room in rooms
               ChannelButton
                 with
-                  channel
-                  selected=(channel.id == active_channel)
-                  unread=is_unread_channel(unread_channel_ids, channel.id)
+                  channel=room.channel
+                  selected=(room.channel.id == active_channel)
+                  unread=room.unread
                   // EXACTLY THE TERM `choose_channel` STILL REFUSES ON. A load
                   // no longer refuses a click — the last one wins — so a row
                   // greyed while one is in flight would put the swallowing back.
@@ -277,7 +277,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
             // one: a two-party channel, not an encrypted one. Reads
             // carry no authorization and every node replicates the
             // state, so nothing here says "private".
-            if !empty(dm_peers)
+            if !empty(dm_rows)
               box
                 with
                   w=fill
@@ -297,14 +297,14 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       font=code_semibold
                       @text-label
                   space w=fill
-                  text len(dm_peers)
+                  text len(dm_rows)
                     with
                       size=10.5
                       wrap=none
                       font=code_medium
                       @text-label
-            for peer in dm_peers
-              DmButton peer=peer selected=(peer.key == active_dm_peer) unread=is_unread_channel(unread_channel_ids, peer.channel_id) disabled=(mutation_phase != "idle")
+            for dm in dm_rows
+              DmButton peer=dm.peer selected=(dm.peer.key == active_dm_peer) unread=dm.unread disabled=(mutation_phase != "idle")
                 forward
                   choose_dm
         // No account footer: the rail's avatar and Settings already carry the

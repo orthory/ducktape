@@ -872,8 +872,8 @@ pub async fn create_channel(
 ///
 /// `channel_id` is the pair's deterministic two-party channel id
 /// (`dm_channel_id(me, key)`), computed once at load time rather than at
-/// every render — the sidebar's unread check reads `is_unread_channel`
-/// against it directly, the same lookup a room row makes.
+/// every render. The prepared DIRECT projection uses it to attach the row's
+/// scalar unread reading when channels or read cursors move.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct DmPeer {
     pub key: String,
@@ -974,7 +974,7 @@ pub fn dm_channel_id(a: String, b: String) -> String {
 /// field cannot disagree with the room again.
 ///
 /// A device with no user key derives no DM id at all, so it holds no DM — the
-/// same answer `rooms_only` gives when `me` is empty.
+/// same answer `chat_sidebar_rooms` gives when `me` is empty.
 pub fn dm_peer_of_channel(peer: String, me: String, channel: String) -> String {
     let peer_owns_the_room =
         !peer.is_empty() && !me.is_empty() && dm_channel_id(me, peer.clone()) == channel;
@@ -982,33 +982,6 @@ pub fn dm_peer_of_channel(peer: String, me: String, channel: String) -> String {
         true => peer,
         false => String::new(),
     }
-}
-
-/// The channel list MINUS this viewer's DMs. A DM *is* an ordinary chat
-/// channel, so it arrives in the same listing as the rooms and used to appear
-/// twice over — once under CHANNELS wearing its derived id as a name, and once
-/// under DIRECT wearing the peer's. The id is DERIVED, so this needs no
-/// per-channel membership (which the list projection does not carry): a
-/// channel is this viewer's DM exactly when its id is `dm_channel_id(me, peer)`
-/// for some peer in the directory. A user-created channel cannot fake the id —
-/// the module's namespace rule reserves it for the pair's own keys.
-///
-/// Mirrored into `rooms` state, not called from the view: `dm_channel_id` is a
-/// SHA-256 plus a hex encode per peer, and the sidebar called this twice a
-/// frame (the count and the list), so an idle console hashed `2 × n_peers`
-/// digests and deep-cloned four lists for a list that only moves on a delta.
-pub fn rooms_only(channels: Vec<ChatChannel>, peers: Vec<DmPeer>, me: String) -> Vec<ChatChannel> {
-    if me.is_empty() {
-        return channels;
-    }
-    let dm_ids: BTreeSet<String> = peers
-        .iter()
-        .map(|peer| dm_channel_id(me.clone(), peer.key.clone()))
-        .collect();
-    channels
-        .into_iter()
-        .filter(|channel| !dm_ids.contains(&channel.id))
-        .collect()
 }
 
 /// THE DM HEADER'S OWN ROW, resolved where `active_dm_peer` is written.

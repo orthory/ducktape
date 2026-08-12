@@ -190,7 +190,7 @@ on console_opened(id)
   mutation_phase = "idle"
   channels = []
   rooms = []
-  unread_channel_ids = []
+  dm_rows = []
   messages = []
   node_log_filter = ""
   node_log_timeline = node_log_timeline_reset()
@@ -263,12 +263,14 @@ on console_opened(id)
   block_comments_open = false
   block_comments_target = ""
   block_comment_threads = []
+  block_comment_rows = []
   block_comment_thread_total = 0
   block_comment_threads_next_from = 0
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
   active_thread_target = ""
+  active_thread_anchor = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -298,6 +300,7 @@ on console_opened(id)
   huddle_channel_name = ""
   huddle_joined_at = 0
   huddle_roster = []
+  huddle_rows = []
   call_status = ""
   call_muted = false
   call_peers = []

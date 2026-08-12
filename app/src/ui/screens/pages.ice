@@ -29,7 +29,7 @@
 // the very defect the body just lost: you had to CLICK the title to edit it.
 // As line 0 it needs no control at all, and Enter at its end / Backspace at the
 // body's start are ordinary text edits that cross the boundary for free.
-component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:str, connected:bool, connected_rpc:str, password:str, dark:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_delete_armed:bool, block_autosave_status:str, page_refusal:str, doc_tabs:[str], blocks:[PageBlock], commented_block_hits:[str], caret_comment_target:str, active_thread_target:str, orphaned_comment_drafts:[str], bind page_editor:editor, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
+component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:str, connected:bool, connected_rpc:str, password:str, dark:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_delete_armed:bool, block_autosave_status:str, page_refusal:str, doc_tabs:[str], blocks:[PageBlock], commented_block_hits:[str], caret_comment_target:str, active_thread_target:str, active_thread_anchor:str, orphaned_comment_drafts:[str], bind page_editor:editor, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_rows:[PageCommentThreadRow], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
   emits
     toggle_page_create()
     create_page_submit()
@@ -726,11 +726,11 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                           size=12.5
                           align-x=center
                           @text-muted
-                    for comment_thread in block_comment_threads
+                    for comment_row in block_comment_rows
                       PageCommentThreadButton
                         with
-                          thread=comment_thread
-                          anchor=comment_anchor_label(blocks, comment_thread.target, active_page)
+                          thread=comment_row.thread
+                          anchor=comment_row.anchor
                         forward
                           open_block_comment_thread
                     if block_comment_threads_has_more
@@ -758,7 +758,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                     active bg=transparent text=muted r=6.0
                     hovered bg=fg/9 text=fg
                     pressed bg=fg/14
-                  text comment_anchor_label(blocks, active_thread_target, active_page)
+                  text active_thread_anchor
                     with
                       w=fill
                       size=10.5

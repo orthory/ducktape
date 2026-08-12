@@ -8,7 +8,7 @@
 // leaves as a named event that `view.ice` routes back to the handler of the
 // same name.
 
-component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, delete_target:str, history_open:bool, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str)
+component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, history_open:bool, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str)
   emits
     fs_open_dir(str)
     fs_open_file(str)
@@ -215,7 +215,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
               // THIS path there is nothing to read — the node is down, or the
               // rows still describe the directory you just left — and the main
               // pane already says so.
-              if connected && listed && fs_dir_count(entries) <= 0
+              if connected && listed && empty(directories)
                 box
                   with
                     w=fill
@@ -229,15 +229,14 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
               // drawing folders from a duckfs nobody could reach — and, after
               // a navigation, folders that live somewhere else.
               if connected && listed
-                for entry in entries
-                  if entry.kind == "dir"
-                    FsTreeRow
-                      with
-                        entry
-                        selected=false
-                        depth=0.0
-                      forward
-                        fs_open_dir
+                keyed entry in directories by=entry.key virtual-row=27.0 w=fill
+                  FsTreeRow
+                    with
+                      entry
+                      selected=false
+                      depth=0.0
+                    forward
+                      fs_open_dir
       box
         with
           w=1.0
@@ -379,12 +378,11 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
                   dir=vertical
                   w=fill
                   h=fill
-                col w=fill
-                  for entry in entries
-                    ObjectRow entry=entry selected=(entry.path == preview_path)
-                      forward
-                        fs_open_dir
-                        fs_open_file
+                keyed entry in entries by=entry.key virtual-row=39.0 w=fill
+                  ObjectRow entry=entry selected=(entry.path == preview_path)
+                    forward
+                      fs_open_dir
+                      fs_open_file
             if !empty(preview_path)
               col w=fill h=300.0
                 box
@@ -479,22 +477,18 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
                                   size=12.0
                                   font=code
                                   @text-fg
-      if connected && !empty(preview_path)
-        for entry in entries
-          if entry.path == preview_path
-            // `changed_by` / `changed_height` are fed the "not answered"
-            // pair on purpose. `last_changed_at_path` exists and the
-            // panel gates its rows on `changed_height > 0`, but the
-            // walk has to fire when the selected path CHANGES, and the
-            // only place that can watch a state field is the one
-            // `subscribe` block in handlers/lifecycle.ice — which this
-            // file does not own. Wiring the load there lights these two
-            // rows with no change here.
-            ObjectPanel
-              with
-                entry
-                changed_by=""
-                changed_height=0
+      if connected
+        if !empty(preview_entry.path)
+          // `changed_by` / `changed_height` are fed the "not answered"
+          // pair on purpose. `last_changed_at_path` exists and the
+          // panel gates its rows on `changed_height > 0`; wiring that
+          // load later lights these two rows without changing the
+          // selected entry mirrored by the file handlers.
+          ObjectPanel
+            with
+              entry=preview_entry
+              changed_by=""
+              changed_height=0
 
 component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading:bool, kinds:[KindCount], kind:str, partial:str, hits:[ExplorerHit], blocks:[ExplorerBlock], selected:i64, ops:[ExplorerOp], head:i64, sync_line:str)
   emits

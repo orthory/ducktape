@@ -9,6 +9,7 @@ on fs_open_dir(path)
   fs_generation = fs_generation + 1
   fs_loading = true
   fs_preview_path = ""
+  fs_preview_entry = no_fs_entry()
   fs_preview_text = ""
   run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
 
@@ -20,12 +21,14 @@ on fs_open_parent
   fs_generation = fs_generation + 1
   fs_loading = true
   fs_preview_path = ""
+  fs_preview_entry = no_fs_entry()
   fs_preview_text = ""
   run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
 
 on fs_open_file(path)
   return if fs_loading || !connected
   fs_preview_path = path
+  fs_preview_entry = fs_entry_named(fs_entries, fs_preview_path)
   fs_generation = fs_generation + 1
   run replace lane=files_preview files_preview(connected_rpc, fs_preview_path, fs_generation) -> fs_previewed _ | fs_failed _
 
@@ -38,10 +41,11 @@ on fs_listed(next)
   fs_path = next.path
   fs_listed_path = next.path
   fs_entries = next.entries
+  fs_dirs = fs_directories(fs_entries)
+  fs_preview_entry = fs_entry_named(fs_entries, fs_preview_path)
 
 on fs_previewed(next)
   return if next.generation != fs_generation
-  fs_preview_path = next.path
   fs_preview_text = next.text
   fs_preview_truncated = next.truncated
   fs_preview_binary = next.binary

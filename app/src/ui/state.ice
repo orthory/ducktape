@@ -33,23 +33,9 @@ state
   mutation_phase = "idle"
   error = ""
   channels:[ChatChannel] = []
-  // THE SIDEBAR'S TWO DERIVED LISTS, mirrored for the reason `unread_marker_seq`
-  // below is: a `sync` extern takes every list BY VALUE, so a call in a view
-  // expression is a deep clone per frame — and these two were the worst of them.
-  // `rooms_only` ran TWICE a frame (the CHANNELS count and the list itself),
-  // each pass cloning `channels` and `dm_peers` and computing `dm_channel_id`
-  // — a SHA-256 plus a hex encode — once per DM peer. `channel_is_unread` ran
-  // once per ROW, each cloning the whole read-cursor list: O(channels × reads)
-  // String allocations per frame, growing quadratically with the workspace.
-  //
-  // Both move only where their sources move, so they are written there:
-  // `rooms` wherever `channels`, `dm_peers` or `settings_user_key` is assigned,
-  // `unread_channel_ids` wherever `channels` or `channel_reads` is. That set is
-  // the contract, so it is linted rather than remembered —
-  // `every_writer_of_a_mirrored_view_reading_refreshes_its_mirror` in
-  // app/src/tests.rs fails the build on a writer that forgets one.
-  rooms:[ChatChannel] = []
-  unread_channel_ids:[str] = []
+  // Prepared sidebar rows. Every row carries its own unread bit, so rendering
+  // never hands a list-taking extern one clone per channel or DM.
+  rooms:[ChatSidebarRow] = []
   messages:[ChatMessage] = []
   // THE LAST TWO OR THREE ROOMS, KEPT. A channel click used to empty the pane
   // and wait out the load, so alternating between two rooms paid the whole trip
@@ -330,9 +316,13 @@ state
   fs_path = "/shared"
   fs_listed_path = ""
   fs_entries:[FsEntry] = []
+  fs_dirs:[FsEntry] = []
   fs_generation:i64 = 0
   fs_loading = false
   fs_preview_path = ""
+  // Mirror the selected row when selection or its listing changes so the view
+  // never scans the full directory on every frame just to mount ObjectPanel.
+  fs_preview_entry:FsEntry = no_fs_entry()
   fs_preview_text = ""
   fs_preview_truncated = false
   fs_preview_binary = false
@@ -369,6 +359,7 @@ state
   block_comments_target = ""
   block_comments_generation:i64 = 0
   block_comment_threads:[PageCommentThread] = []
+  block_comment_rows:[PageCommentThreadRow] = []
   block_comment_thread_total:i64 = 0
   block_comment_threads_next_from:i64 = 0
   block_comment_threads_has_more = false
@@ -405,6 +396,7 @@ state
   page_link = ""
   caret_comment_target = ""
   active_thread_target = ""
+  active_thread_anchor = ""
   page_inflight_text = ""
   // Why a write was NOT attempted — see DocumentSaveResult. Cleared by the
   // next edit, because it describes an edit that has already been undone.
@@ -537,6 +529,7 @@ state
   // the mounted strip repaints itself.
   call_video_live = false
   huddle_roster:[HuddleParticipant] = []
+  huddle_rows:[HuddleTileRow] = []
   // The event inspector every finality mark opens.
   // EXPLORER — one query across every module, filtered by result kind.
   explorer_query = ""

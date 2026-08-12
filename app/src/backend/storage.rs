@@ -1,14 +1,39 @@
 use super::*;
 
 /// One files-browser row.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct FsEntry {
+    /// Session-stable identity for keyed rendering.
+    pub key: i64,
     pub path: String,
     pub name: String,
     pub kind: String,
     pub size: i64,
     /// the entry's content address — already on the ls/find wire.
     pub object: String,
+}
+
+/// Blank selection mirrored into Ice while no listed object is selected.
+pub fn no_fs_entry() -> FsEntry {
+    FsEntry::default()
+}
+
+/// Resolve a selected object when selection or its listing changes, not while
+/// the view renders every frame.
+pub fn fs_entry_named(entries: Vec<FsEntry>, path: String) -> FsEntry {
+    entries
+        .into_iter()
+        .find(|entry| entry.path == path)
+        .unwrap_or_default()
+}
+
+/// Directory rows prepared with the listing so the keyed sidebar does not
+/// filter and clone the full entry list while building every frame.
+pub fn fs_directories(entries: Vec<FsEntry>) -> Vec<FsEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.kind == "dir")
+        .collect()
 }
 
 /// What is under this crumb, counted. Ice cannot filter a list by field, so the
@@ -157,6 +182,7 @@ fn fs_entries(reply: &serde_json::Value) -> Vec<FsEntry> {
                 .unwrap_or(entry_path.as_str())
                 .to_string();
             FsEntry {
+                key: stable_view_key(&format!("duckfs:{entry_path}")),
                 name,
                 kind: entry["kind"].as_str().unwrap_or_default().to_string(),
                 size: entry["size"].as_i64().unwrap_or(0),

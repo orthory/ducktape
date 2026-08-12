@@ -1074,6 +1074,8 @@ pub async fn forge_live_refresh(
 /// `del` | `ctx` — the gutters, the sign column and the row tint all key on it.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct DiffLine {
+    /// Session-stable identity for keyed rendering.
+    pub key: i64,
     pub kind: String,
     pub old_no: String,
     pub new_no: String,
@@ -1135,6 +1137,16 @@ pub fn forge_push_command(rpc: String) -> String {
 }
 
 pub fn diff_lines(diff: String) -> Vec<DiffLine> {
+    // A patch line has no durable id. Reusing content/occurrence across two
+    // patch revisions can move focus to an identical line's comment button,
+    // while line-number keys can move it to unrelated content. Namespace the
+    // whole row set by the exact patch: unchanged rebuilds retain identity;
+    // any patch edit deliberately drops row state instead of transferring it.
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut patch_hasher = std::hash::DefaultHasher::new();
+    diff.hash(&mut patch_hasher);
+    let patch_key = patch_hasher.finish() as i64;
     let mut rows = Vec::new();
     let mut old_no = 0i64;
     let mut new_no = 0i64;
@@ -1236,6 +1248,9 @@ pub fn diff_lines(diff: String) -> Vec<DiffLine> {
             }
         }
     }
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.key = patch_key.wrapping_add(count_i64(index));
+    }
     rows
 }
 
@@ -1277,6 +1292,7 @@ fn diff_row(
     side: &str,
 ) -> DiffLine {
     DiffLine {
+        key: 0,
         kind: kind.into(),
         old_no,
         new_no,

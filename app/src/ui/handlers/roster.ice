@@ -94,7 +94,8 @@ on dm_peers_loaded(next)
   dm_peers = next.peers
   // The directory decides which channels are DMs and who the header names, so
   // both mirrors move with it — see state.ice's `rooms` note.
-  rooms = rooms_only(channels, dm_peers, settings_user_key)
+  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
 
 on dm_peers_failed(cause)

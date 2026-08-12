@@ -79,10 +79,9 @@ view
         with
           channel=huddle_channel_name
           elapsed=mmss(huddle_now - huddle_joined_at)
-          roster=huddle_roster
+          rows=huddle_rows
           status=call_status
           muted=call_muted
-          peers=call_peers
           camera=call_camera
           video_live=call_video_live
         events
@@ -174,8 +173,7 @@ view
               search_phase=chat_search_phase
               search_hits=chat_search_hits
               rooms
-              unread_channel_ids
-              dm_peers
+              dm_rows
               channel_create_open
               connected
               loading
@@ -304,10 +302,12 @@ view
               commented_block_hits
               caret_comment_target
               active_thread_target
+              active_thread_anchor
               orphaned_comment_drafts
               block_comments_open
               block_comment_thread_total
               block_comment_threads
+              block_comment_rows
               block_comment_threads_loading
               block_comment_threads_has_more
               active_block_comment_thread
@@ -345,9 +345,11 @@ view
               // reading of `entries` on that screen is gated on this.
               listed=(fs_listed_path == fs_path)
               entries=fs_entries
+              directories=fs_dirs
               connected
               loading=fs_loading
               preview_path=fs_preview_path
+              preview_entry=fs_preview_entry
               delete_target=fs_delete_target
               history_open=fs_history_open
               diff_from=fs_diff_from

@@ -45,12 +45,14 @@ on open_page_search_hit(page_id, _block_id)
   block_comments_open = false
   block_comments_target = ""
   block_comment_threads = []
+  block_comment_rows = []
   block_comment_thread_total = 0
   block_comment_threads_next_from = 0
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
   active_thread_target = ""
+  active_thread_anchor = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -97,12 +99,14 @@ on choose_page(id)
   block_comments_open = false
   block_comments_target = ""
   block_comment_threads = []
+  block_comment_rows = []
   block_comment_thread_total = 0
   block_comment_threads_next_from = 0
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
   active_thread_target = ""
+  active_thread_anchor = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -178,12 +182,14 @@ on toggle_block_comments
   block_comments_open = !block_comments_open
   block_comments_target = keep_str(block_comments_open, active_page, "")
   block_comment_threads = []
+  block_comment_rows = []
   block_comment_thread_total = 0
   block_comment_threads_next_from = 0
   block_comment_threads_has_more = false
   block_comment_threads_loading = block_comments_open
   active_block_comment_thread = ""
   active_thread_target = ""
+  active_thread_anchor = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -202,12 +208,14 @@ on close_block_comments
   block_comments_open = false
   block_comments_target = ""
   block_comment_threads = []
+  block_comment_rows = []
   block_comment_thread_total = 0
   block_comment_threads_next_from = 0
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
   active_thread_target = ""
+  active_thread_anchor = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -218,6 +226,7 @@ on close_block_comments
 on block_threads_loaded(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = next.threads
+  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
   block_comment_thread_total = next.total
   commented_block_hits = commented_targets_of(next.threads, active_page)
   block_comment_threads_next_from = next.next_from
@@ -237,6 +246,7 @@ on load_more_block_threads
 on block_threads_page_loaded(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = append_page_comment_threads(block_comment_threads, next.threads)
+  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
   block_comment_thread_total = next.total
   block_comment_threads_next_from = next.next_from
   block_comment_threads_has_more = next.has_more
@@ -256,6 +266,7 @@ on open_block_comment_thread(id, target)
   // against the thread's target, so a block-anchored thread opened with the
   // page id was refused — the rail could list it but never open it.
   active_thread_target = target
+  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -313,6 +324,7 @@ on close_block_comment_thread
   block_comments_generation = block_comments_generation + 1
   active_block_comment_thread = ""
   active_thread_target = ""
+  active_thread_anchor = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -330,6 +342,7 @@ on post_block_comment_submit
   // line (or before any edit placed the caret).
   let fresh_target = keep_str(!empty(caret_comment_target), caret_comment_target, active_page)
   active_thread_target = keep_str(!empty(active_block_comment_thread), active_thread_target, fresh_target)
+  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
   block_comments_generation = block_comments_generation + 1
   block_thread_comments_loading = true
   error = ""
@@ -362,6 +375,7 @@ on block_comment_post_failed(cause)
 on block_threads_recovered(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = next.threads
+  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
   block_comment_thread_total = next.total
   block_comment_threads_next_from = next.next_from
   block_comment_threads_has_more = next.has_more
@@ -379,12 +393,14 @@ on pages_updated(next)
   block_comments_open = false
   block_comments_target = ""
   block_comment_threads = []
+  block_comment_rows = []
   block_comment_thread_total = 0
   block_comment_threads_next_from = 0
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
   active_thread_target = ""
+  active_thread_anchor = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -440,12 +456,14 @@ on pages_mutated(next)
   block_comments_open = false
   block_comments_target = ""
   block_comment_threads = []
+  block_comment_rows = []
   block_comment_thread_total = 0
   block_comment_threads_next_from = 0
   block_comment_threads_has_more = false
   block_comment_threads_loading = false
   active_block_comment_thread = ""
   active_thread_target = ""
+  active_thread_anchor = ""
   block_thread_comments = []
   block_thread_comments_next_from = 0
   block_thread_comments_has_more = false
@@ -482,6 +500,8 @@ on close_doc_tab(id)
   return if loading || mutation_phase != "idle"
   closing_doc_tab = id
   active_page = next_doc_tab(doc_tabs, closing_doc_tab, active_page)
+  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
   doc_tabs = doc_tabs_without(doc_tabs, closing_doc_tab)
   closing_doc_tab = ""
   // The same prologue as `choose_page`: `active_page` just moved under the
@@ -576,6 +596,8 @@ on page_document_saved(next)
   return if next.generation != block_autosave_generation
   pages = next.data.pages
   blocks = next.data.blocks
+  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
   active_page_title = next.data.active_page_title
   active_page_parent = next.data.active_page_parent
   page_refusal = next.refusal
