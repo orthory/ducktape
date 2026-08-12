@@ -49,30 +49,34 @@ on bell_marked(_result)
   error = error
 
 on global_key_pressed(event)
+  // EVERY VERDICT THIS HANDLER CAN ACT ON, RESOLVED FIRST — then the press
+  // that means none of them leaves before it can cost anything.
+  //
+  // This subscription sees EVERY key, so an ordinary letter typed into the
+  // composer used to walk the whole body: the escape ladder's dozen keepers,
+  // and then THREE `editor` self-assignments. Each of those lowers to
+  // `mem::take(&mut self.<editor>)`, which leaves a `Content::default()`
+  // behind — a fresh cosmic-text buffer built under a WRITE lock on the
+  // process-global font system — so a chord that fires once in a thousand
+  // presses charged three of them per keystroke, serialized against whatever
+  // the renderer was shaping. The guard calls the SAME four decide-fns its
+  // statements do, so it cannot drift from what it guards — and it repeats them
+  // rather than naming them, because a subscription payload's fields do not
+  // type inside a `let` (E151, the same reason `plane_live_hit` is an extern).
+  // They are pure key classifications; the cost this is here for is the take.
+  //
   // THE ESCAPE LADDER — one decide-fn names the single topmost TRANSIENT
   // layer this key dismisses (the z-order lives in `escape_target`), and
   // every closable flag self-selects against the verdict: the handler
   // grammar has no branches, so the keepers ARE the routing. Sits before
   // the palette block, whose open path must end in its focus task.
   escape_key = escape_target(event.key, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, forge_repo_menu)
-  bell_open = bell_open && escape_key != "bell"
-  channel_create_open = channel_create_open && escape_key != "channel_create"
-  thread_selected_seq = keep_i64(escape_key == "thread_menu", 0, thread_selected_seq)
-  thread_selected_rev = keep_i64(escape_key == "thread_menu", 0, thread_selected_rev)
-  thread_message_action = keep_str(escape_key == "thread_menu", "toolbar", thread_message_action)
-  thread_edit_draft = keep_str(escape_key == "thread_menu", "", thread_edit_draft)
-  selected_message_seq = keep_i64(escape_key == "message_menu", 0, selected_message_seq)
-  selected_message_rev = keep_i64(escape_key == "message_menu", 0, selected_message_rev)
-  message_action = keep_str(escape_key == "message_menu", "toolbar", message_action)
-  message_edit_draft = keep_str(escape_key == "message_menu", "", message_edit_draft)
-  channel_settings_open = channel_settings_open && escape_key != "channel_settings"
-  forge_repo_menu = forge_repo_menu && escape_key != "repo_menu"
   // The composer's formatting chords (Cmd/Ctrl+B/I, +Shift+C, +Shift+9). The
   // editor lets command-letter presses bubble on purpose, so its focus is
   // still on the draft when the mark lands; an empty verdict is a no-op.
   //
   // ONE chord, TWO composers, and BOTH arms self-select on a POSITIVE match of
-  // `composer_focus` — the same keeper shape as the escape ladder above. The
+  // `composer_focus` — the same keeper shape as the escape ladder below. The
   // negation this replaced (`!reply_chord`) made the stream's composer the
   // fallback for every state, so the moment the discriminant said "the caret
   // left" the chord went right back to marking a draft nobody was in.
@@ -86,13 +90,26 @@ on global_key_pressed(event)
   // while you keep typing in the rail — so it cannot retire unconditionally.
   // This term is that route's only cover; the lint pins it by driving it.
   let reply_chord = chord_ready && composer_focus == "reply" && active_thread_seq > 0
+  // The page document's undo/redo (Cmd/Ctrl+Z, +Shift+Z) — the editor
+  // bubbles command-letter chords on purpose; an off-pages press names no move.
+  let pages_ready = connected && shell_tab == "pages" && !palette_open
+  palette_key = palette_key_action(event.key, event.physical_key, event.modifiers, palette_open)
+  return if empty(escape_key) && palette_key == "none" && empty(composer_mark_shortcut(event.key, event.physical_key, event.modifiers, message_chord || reply_chord)) && empty(page_history_shortcut(event.key, event.physical_key, event.modifiers, pages_ready))
+  bell_open = bell_open && escape_key != "bell"
+  channel_create_open = channel_create_open && escape_key != "channel_create"
+  thread_selected_seq = keep_i64(escape_key == "thread_menu", 0, thread_selected_seq)
+  thread_selected_rev = keep_i64(escape_key == "thread_menu", 0, thread_selected_rev)
+  thread_message_action = keep_str(escape_key == "thread_menu", "toolbar", thread_message_action)
+  thread_edit_draft = keep_str(escape_key == "thread_menu", "", thread_edit_draft)
+  selected_message_seq = keep_i64(escape_key == "message_menu", 0, selected_message_seq)
+  selected_message_rev = keep_i64(escape_key == "message_menu", 0, selected_message_rev)
+  message_action = keep_str(escape_key == "message_menu", "toolbar", message_action)
+  message_edit_draft = keep_str(escape_key == "message_menu", "", message_edit_draft)
+  channel_settings_open = channel_settings_open && escape_key != "channel_settings"
+  forge_repo_menu = forge_repo_menu && escape_key != "repo_menu"
   message_editor = composer_toggle_mark(message_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, message_chord))
   reply_editor = composer_toggle_mark(reply_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, reply_chord))
-  // The page document's undo/redo (Cmd/Ctrl+Z, +Shift+Z) — the editor
-  // bubbles command-letter chords on purpose; an off-pages press is the
-  // identity.
-  page_editor = page_history_key(page_editor, event.key, event.physical_key, event.modifiers, (connected && shell_tab == "pages" && !palette_open))
-  palette_key = palette_key_action(event.key, event.physical_key, event.modifiers, palette_open)
+  page_editor = page_history_key(page_editor, page_history_shortcut(event.key, event.physical_key, event.modifiers, pages_ready))
   return if palette_key == "none"
   return if palette_key == "open" && !connected
   palette_open = palette_key == "open"

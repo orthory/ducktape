@@ -82,6 +82,12 @@ on settings_loaded(next)
   settings_key_path = next.key_path
   settings_key_state = next.key_state
   settings_user_key = next.user_key
+  // THIS DEVICE'S KEY DECIDES BOTH: which channels are its own DMs, and
+  // whether it is seated in a members-only room. The facts load lands after the
+  // first chat load, so without these the sidebar listed every DM under
+  // CHANNELS and the composer stayed refused until the next delta.
+  rooms = rooms_only(channels, dm_peers, settings_user_key)
+  post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   settings_open_tabs = next.open_tabs
 
 on settings_failed(cause)

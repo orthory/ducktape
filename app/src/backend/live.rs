@@ -839,7 +839,7 @@ pub async fn create_channel(
 /// anywhere in the product, and a dot that always reads "offline" is a lie.
 ///
 /// `is_agent` is always false today — see [`load_dm_peers`].
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct DmPeer {
     pub key: String,
     pub name: String,
@@ -951,6 +951,11 @@ pub fn dm_peer_of_channel(peer: String, me: String, channel: String) -> String {
 /// channel is this viewer's DM exactly when its id is `dm_channel_id(me, peer)`
 /// for some peer in the directory. A user-created channel cannot fake the id —
 /// the module's namespace rule reserves it for the pair's own keys.
+///
+/// Mirrored into `rooms` state, not called from the view: `dm_channel_id` is a
+/// SHA-256 plus a hex encode per peer, and the sidebar called this twice a
+/// frame (the count and the list), so an idle console hashed `2 × n_peers`
+/// digests and deep-cloned four lists for a list that only moves on a delta.
 pub fn rooms_only(channels: Vec<ChatChannel>, peers: Vec<DmPeer>, me: String) -> Vec<ChatChannel> {
     if me.is_empty() {
         return channels;
@@ -963,6 +968,26 @@ pub fn rooms_only(channels: Vec<ChatChannel>, peers: Vec<DmPeer>, me: String) ->
         .into_iter()
         .filter(|channel| !dm_ids.contains(&channel.id))
         .collect()
+}
+
+/// THE DM HEADER'S OWN ROW, resolved where `active_dm_peer` is written.
+///
+/// The header used to be a filter — `for peer in dm_peers` / `if peer.key ==
+/// active_dm_peer` — which the extern-free view can express but which
+/// deep-clones every peer AND allocates a per-child scope String, per frame, so
+/// that at most one of them renders. A peer who has left the identity roster
+/// resolves to the blank row, and the header falls through to the `#` title the
+/// way the filter's no-match arm did.
+pub fn dm_peer_named(peers: Vec<DmPeer>, key: String) -> DmPeer {
+    peers
+        .into_iter()
+        .find(|peer| peer.key == key)
+        .unwrap_or_default()
+}
+
+/// The blank peer — "no DM on screen", and the state field's own default.
+pub fn no_dm_peer() -> DmPeer {
+    DmPeer::default()
 }
 
 /// Open the DM with one peer: resolve the deterministic channel when it

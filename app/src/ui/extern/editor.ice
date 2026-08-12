@@ -23,7 +23,8 @@ extern crate::pages
   sync apply_page_event(document:editor, event:PageEvent) -> editor
   sync page_link_of(event:PageEvent) -> str
   sync page_opens_comments(event:PageEvent) -> bool
-  sync page_history_key(document:editor, logical:key, physical:physical-key, modifiers:key-modifiers, ready:bool) -> editor
+  sync page_history_shortcut(logical:key, physical:physical-key, modifiers:key-modifiers, ready:bool) -> str
+  sync page_history_key(document:editor, action:str) -> editor
   sync page_text(document:editor) -> str
   sync has_unclosed_fence(text:str) -> bool
   sync block_at_line_target(blocks:[PageBlock], line:i64) -> str

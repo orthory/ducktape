@@ -74,7 +74,12 @@ fn refreshed_page_text(
     blocks: &[PageBlock],
     saved: &str,
 ) -> Option<String> {
-    let dirty = crate::pages::page_text(document.clone()) != saved;
+    // `.text()`, NOT `page_text(document.clone())`: iced's `Content: Clone` is
+    // `with_text(&self.text())` — a whole second cosmic-text buffer built under
+    // a WRITE lock on the process-global font system. This runs on every live
+    // chat delta (`on live_updated`), so the clone was a full re-shape of the
+    // open page per incoming message.
+    let dirty = document.text() != saved;
     if dirty {
         return None;
     }
@@ -96,7 +101,7 @@ pub fn install_decision(
     if current_page != next_page {
         return true;
     }
-    let clean = crate::pages::page_text(document) == saved;
+    let clean = document.text() == saved;
     // A clean, IDENTICAL buffer is left alone: a rebuilt `Content` throws the
     // caret to the origin, and there is nothing to install.
     clean && canonical != saved

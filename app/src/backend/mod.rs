@@ -28,7 +28,7 @@ pub use ::chat::client::{
     apply_chat_thread, author_display, author_name, chat_message, contains_pending_message,
     mark_message_groups, merge_message_send_result, merge_pending_messages, merge_thread_reply,
     parse_message_with_members, reply_settled_by, rollback_pending_message, send_settled_by,
-    settled_reply_id, settled_send_id, short_label, thread_offset_after_reply,
+    short_label, thread_offset_after_reply,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
@@ -87,6 +87,51 @@ const CHAT_TIMELINE_MAX_PAGES: u32 = 4;
 pub struct ChannelRead {
     pub channel: String,
     pub seq: i64,
+}
+
+/// THE SETTLE ✓, ANSWERED ONCE PER DELTA. `send_settled_by`,
+/// `settled_send_id`, `reply_settled_by` and `settled_reply_id` were four Ice
+/// externs, and the extern ABI hands every list over BY VALUE — so one incoming
+/// message deep-cloned the timeline twice and the open rail twice (plus the
+/// delta four times) before a single row was folded, on the UI thread, in a
+/// handler whose own comment already calls that cost out for the `tip` beat.
+/// One extern, one clone of each list, three answers.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+pub struct ChatSettle {
+    /// Whether this delta settles one of OUR optimistic rows, in either lane.
+    pub flashed: bool,
+    /// The timeline row the ✓ anchors to, kept through unrelated deltas.
+    pub send_id: String,
+    /// Its thread-rail twin.
+    pub reply_id: String,
+}
+
+/// The blank verdict — the scratch field's own default.
+pub fn no_chat_settle() -> ChatSettle {
+    ChatSettle::default()
+}
+
+/// Read BEFORE the delta is folded in — the match is the pending row the
+/// canonical row is about to replace.
+pub fn chat_settle(
+    messages: Vec<ChatMessage>,
+    thread: Vec<ChatMessage>,
+    delta: ChatDelta,
+    active_channel: String,
+    send_id: String,
+    reply_id: String,
+) -> ChatSettle {
+    let sent = send_settled_by(&messages, &delta, &active_channel);
+    let replied = reply_settled_by(&thread, &delta, &active_channel);
+    ChatSettle {
+        flashed: sent || replied,
+        send_id: if sent {
+            delta.message.id.clone()
+        } else {
+            send_id
+        },
+        reply_id: if replied { delta.message.id } else { reply_id },
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]

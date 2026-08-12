@@ -63,6 +63,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
 on choose_channel(id)
   return if loading || mutation_phase != "idle"
   active_dm_peer = ""
+  active_dm = no_dm_peer()
   // "Jump to latest" IS this handler, aimed at the room already on screen — so
   // the window the banner describes ends here, not at the reply.
   history_view = false
@@ -119,8 +120,9 @@ on choose_channel(id)
 on choose_dm(peer_key)
   return if loading || mutation_phase != "idle" || empty(peer_key)
   active_dm_peer = peer_key
+  active_dm = dm_peer_named(dm_peers, active_dm_peer)
   // Same visible switch as `choose_channel`: the stale room leaves the pane
-  // immediately; the DM header already derives from `dm_peers`.
+  // immediately; the DM header is resolved from `dm_peers` right above.
   messages = []
   has_older_history = false
   // Same abandoned request, same dead button — see `choose_channel`.
@@ -307,8 +309,10 @@ on chat_composer_event(event)
   message_editor = apply_composer_event(message_editor, event)
   return if !composer_submits(event)
   // Same apply-time re-read as `reply_composer_event` below: the composer's
-  // `disabled=` was decided a frame ago.
-  return if loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)) || empty(trim(editor_text(message_editor)))
+  // `disabled=` was decided a frame ago. `post_refusal` IS that re-read now —
+  // it is state written by the handlers that move the gate's four inputs, so it
+  // is as current here as a call would be, without the member-roll clone.
+  return if loading || !connected || empty(active_channel) || !empty(post_refusal) || empty(trim(editor_text(message_editor)))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   pending_message = trim(editor_text(message_editor))
@@ -358,16 +362,19 @@ on message_send_failed(cause)
 on chat_updated(next)
   history_view = false
   channels = next.channels
+  rooms = rooms_only(channels, dm_peers, settings_user_key)
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
+  unread_channel_ids = unread_channels(channel_reads, channels)
   active_channel = next.active_channel
   // A LANDING ANSWERS FOR THE PEER TOO. The DM header suppresses the `#` and
   // the channel name, so a peer that outlives the room it named leaves the room
   // on screen unnamed under someone else's face — see `dm_peer_of_channel`.
   active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
@@ -381,6 +388,7 @@ on chat_updated(next)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
+  post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   selected_message_seq = next.selected_message_seq
   selected_message_rev = next.selected_message_rev
   message_action = "toolbar"
@@ -408,15 +416,18 @@ on chat_hit_loaded(next)
   // channel you are already at the end of.
   history_view = true
   channels = next.channels
+  rooms = rooms_only(channels, dm_peers, settings_user_key)
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
+  unread_channel_ids = unread_channels(channel_reads, channels)
   active_channel = next.active_channel
   // Same landing answer as `chat_updated`: a hit in another room retires the
   // peer, a hit inside the DM keeps him.
   active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
@@ -430,6 +441,7 @@ on chat_hit_loaded(next)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
+  post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   selected_message_seq = next.selected_message_seq
   selected_message_rev = next.selected_message_rev
   message_action = "toolbar"
@@ -456,14 +468,17 @@ on channel_created(next)
   // `chat_hit_loaded`.
   history_view = false
   channels = next.channels
+  rooms = rooms_only(channels, dm_peers, settings_user_key)
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
+  unread_channel_ids = unread_channels(channel_reads, channels)
   active_channel = next.active_channel
   // Creating lands you in the new room, which is nobody's DM.
   active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
@@ -477,6 +492,7 @@ on channel_created(next)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
+  post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   selected_message_seq = next.selected_message_seq
   selected_message_rev = next.selected_message_rev
   message_action = "toolbar"
@@ -861,7 +877,7 @@ on reply_composer_event(event)
   composer_focus = "reply"
   reply_editor = apply_composer_event(reply_editor, event)
   return if !composer_submits(event)
-  return if loading || thread_loading || !connected || empty(active_channel) || active_thread_seq <= 0 || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)) || empty(trim(editor_text(reply_editor)))
+  return if loading || thread_loading || !connected || empty(active_channel) || active_thread_seq <= 0 || !empty(post_refusal) || empty(trim(editor_text(reply_editor)))
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0

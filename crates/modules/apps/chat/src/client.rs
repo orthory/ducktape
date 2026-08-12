@@ -690,11 +690,11 @@ pub fn optimistic_reaction(
 /// True when this delta settles one of OUR optimistic rows — the pop edge of
 /// the timeline's transient ✓. Read BEFORE the delta is folded in: the match
 /// is the pending row the canonical row is about to replace.
-pub fn send_settled_by(
-    messages: Vec<ChatMessage>,
-    delta: ChatDelta,
-    active_channel: String,
-) -> bool {
+///
+/// Borrowed, not owned: this is no longer an Ice extern (the app calls it
+/// through the fused `chat_settle`, which owns its arguments once), so nothing
+/// here has to pay the by-value boundary.
+pub fn send_settled_by(messages: &[ChatMessage], delta: &ChatDelta, active_channel: &str) -> bool {
     delta.kind == "posted"
         && delta.channel_id == active_channel
         && messages
@@ -705,46 +705,12 @@ pub fn send_settled_by(
 /// [`send_settled_by`] for the OPEN thread rail: a settling reply arrives as
 /// a `reply` delta, not a `posted` one, and its pending row lives in
 /// `thread_messages`. Read BEFORE `apply_chat_thread` folds the delta in.
-pub fn reply_settled_by(
-    thread: Vec<ChatMessage>,
-    delta: ChatDelta,
-    active_channel: String,
-) -> bool {
+pub fn reply_settled_by(thread: &[ChatMessage], delta: &ChatDelta, active_channel: &str) -> bool {
     delta.kind == "reply"
         && delta.channel_id == active_channel
         && thread
             .iter()
             .any(|message| message.pending && message.id == delta.message.id)
-}
-
-/// The id anchoring the thread rail's transient ✓ — the reply twin of
-/// [`settled_send_id`].
-pub fn settled_reply_id(
-    thread: Vec<ChatMessage>,
-    delta: ChatDelta,
-    active_channel: String,
-    current: String,
-) -> String {
-    if reply_settled_by(thread, delta.clone(), active_channel) {
-        delta.message.id
-    } else {
-        current
-    }
-}
-
-/// The id anchoring the transient ✓ — overwritten on each settle, kept
-/// through unrelated deltas so an in-flight fade is not torn down.
-pub fn settled_send_id(
-    messages: Vec<ChatMessage>,
-    delta: ChatDelta,
-    active_channel: String,
-    current: String,
-) -> String {
-    if send_settled_by(messages, delta.clone(), active_channel) {
-        delta.message.id
-    } else {
-        current
-    }
 }
 
 // ============================================================================

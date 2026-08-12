@@ -299,8 +299,31 @@ pub fn mark_channel_read(
 /// `initial_channel_reads` seeds every channel at connect, so a caught-up
 /// channel has `last_read == head_seq` and never lights up spuriously; the
 /// cursor only lags once new messages actually arrive.
-pub fn channel_is_unread(reads: Vec<ChannelRead>, channel: String, head_seq: i64) -> bool {
-    head_seq > last_read_of(&reads, &channel)
+fn channel_is_unread(reads: &[ChannelRead], channel: &str, head_seq: i64) -> bool {
+    head_seq > last_read_of(reads, channel)
+}
+
+/// EVERY unread channel's id, in one pass — the sidebar's badge, mirrored.
+///
+/// The by-value extern ABI is why this is a batch: called per row the way
+/// `channel_is_unread` was, it deep-cloned the whole read-cursor list once per
+/// channel, which is `O(channels × reads)` String allocations on EVERY frame
+/// (~900 at thirty rooms, and it grows quadratically with the workspace). The
+/// answer moves only where `channel_reads` or `channels` move, so it is
+/// computed there and read from `unread_channel_ids` state.
+pub fn unread_channels(reads: Vec<ChannelRead>, channels: Vec<ChatChannel>) -> Vec<String> {
+    channels
+        .into_iter()
+        .filter(|channel| channel_is_unread(&reads, &channel.id, channel.head_seq))
+        .map(|channel| channel.id)
+        .collect()
+}
+
+/// The sidebar row's own reading of that mirror. Still one clone per row, but
+/// of a list holding only the channels that ARE unread — usually empty, never
+/// wider than the room list, and carrying one String each instead of a cursor.
+pub fn is_unread_channel(unread: Vec<String>, channel: String) -> bool {
+    unread.contains(&channel)
 }
 
 /// On first connect, seed each not-yet-tracked channel's cursor to its own head

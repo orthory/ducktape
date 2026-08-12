@@ -78,6 +78,8 @@ on reconnect
   loading = true
   connected = false
   channels = []
+  rooms = []
+  unread_channel_ids = []
   messages = []
   has_older_history = false
   // Same abandoned request, same dead button — see `choose_channel`. A reconnect
@@ -89,12 +91,14 @@ on reconnect
   // The room is gone, so its two readings go with it: no peer names an empty
   // channel, and no window survives a reconnect.
   active_dm_peer = ""
+  active_dm = no_dm_peer()
   history_view = false
   active_channel_name = ""
   active_channel_archived = false
   active_channel_members_only = false
   active_channel_huddle_count = 0
   channel_members = []
+  post_refusal = ""
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
@@ -170,6 +174,8 @@ on workspace_connected(next)
   block_height = next.height
   channels = next.channels
   channel_reads = initial_channel_reads(next.channels, channel_reads)
+  rooms = rooms_only(channels, dm_peers, settings_user_key)
+  unread_channel_ids = unread_channels(channel_reads, channels)
   unread_boundary = 0
   // A connect answers with the LATEST page of whatever room it landed on, so
   // whatever window a search hit had put on screen is gone — see
@@ -182,6 +188,7 @@ on workspace_connected(next)
   // A reconnect lands on `channels.first()`, which is nobody's DM unless the
   // derivation says so — see `dm_peer_of_channel`.
   active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
@@ -195,6 +202,7 @@ on workspace_connected(next)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = next.channel_members
+  post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   pages = next.pages
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
@@ -254,12 +262,19 @@ on live_updated(next)
   block_height = keep_i64(next.height >= 0, next.height, block_height)
   return if next.kind == "tip"
   channels = apply_chat_channels(channels, next.chat)
+  rooms = rooms_only(channels, dm_peers, settings_user_key)
   // Settle-✓ choreography, read against the PRE-fold rows: the settle delta
   // pops the tick (true), any later live event — the next block at the
   // latest — starts its fade (false). Same-value writes are no-ops.
-  send_flash = (send_settled_by(messages, next.chat, active_channel)) || (reply_settled_by(thread_messages, next.chat, active_channel))
-  send_flash_id = settled_send_id(messages, next.chat, active_channel, send_flash_id)
-  thread_send_flash_id = settled_reply_id(thread_messages, next.chat, active_channel, thread_send_flash_id)
+  //
+  // ONE CALL FOR THREE ANSWERS, because the ABI charges by the argument: the
+  // four scans this replaced took `messages` and `thread_messages` by value
+  // twice each, so a busy channel deep-cloned the timeline and the open rail
+  // twice per incoming message before a single row was folded.
+  live_settle = chat_settle(messages, thread_messages, next.chat, active_channel, send_flash_id, thread_send_flash_id)
+  send_flash = live_settle.flashed
+  send_flash_id = live_settle.send_id
+  thread_send_flash_id = live_settle.reply_id
   // A HISTORY WINDOW IS A SNAPSHOT, NOT A LIVE TAIL. The rows in hand are a
   // window around one old message, so a new post's seq is past every one of
   // them and `insert_committed_root` puts it at the END of the window — a
@@ -298,7 +313,9 @@ on live_updated(next)
   active_channel_archived = channel_flag_archived(channels, active_channel, active_channel_archived)
   active_channel_members_only = channel_flag_members_only(channels, active_channel, active_channel_members_only)
   active_channel_huddle_count = channel_live_huddle_count(channels, active_channel, active_channel_huddle_count)
+  post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   channel_reads = mark_channel_read(channel_reads, live_tail_channel, channel_head_seq(channels, live_tail_channel))
+  unread_channel_ids = unread_channels(channel_reads, channels)
   // THE PAGES FOLD. A committed text edit lands in the open document's blocks
   // with no query at all — the autosave commits one per tick while a reader
   // types, and each used to buy three sequential reads of the very document
@@ -366,6 +383,7 @@ on live_resynced(next)
   hydration_retry_attempt = 0
   channels = keep_channels(next.chat_loaded, next.channels, channels)
   channel_reads = initial_channel_reads(channels, channel_reads)
+  rooms = rooms_only(channels, dm_peers, settings_user_key)
   // A resync that carried chat replaced the window with `load_chat_data`'s
   // LATEST page, so the banner it left up described rows that are no longer on
   // screen — see `chat_hit_loaded`. One that carried no chat kept the window
@@ -428,6 +446,7 @@ on live_resynced(next)
   // `loading` is true for precisely the `choose_dm` -> `chat_updated`/`failed`
   // window, and the landing it names re-derives the peer itself.
   active_dm_peer = keep_str(next.chat_loaded && !loading, dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel), active_dm_peer)
+  active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = keep_str(next.chat_loaded, next.active_channel_name, active_channel_name)
   active_channel_archived = keep_bool(next.chat_loaded, next.active_channel_archived, active_channel_archived)
   active_channel_members_only = keep_bool(next.chat_loaded, next.active_channel_members_only, active_channel_members_only)
@@ -442,9 +461,11 @@ on live_resynced(next)
   huddle_channel = keep_str(huddle_joined, active_channel, "")
   huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
   channel_members = keep_members(next.chat_loaded, next.channel_members, channel_members)
+  post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
+  unread_channel_ids = unread_channels(channel_reads, channels)
   // A resync carries whatever page was active WHEN IT WAS ISSUED and takes
   // several queries to answer, so a mutation landing in between leaves it
   // speaking for a document nobody is on — measured on a page create. The page

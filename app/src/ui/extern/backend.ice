@@ -52,7 +52,7 @@ extern crate::backend
   box-style card_style()
   box-style raised_style()
   svg-style icon_tint(tone:str)
-  sync icon(name:str) -> str
+  sync icon(name:str) -> bytes
   connect(rpc:str, attempt:i64, generation:i64) -> WorkspaceData ! HydrationError
   stream live_events(rpc:str) -> LiveUpdate
   sync resync_planes(load_chat:bool, load_pages:bool) -> str
@@ -66,10 +66,12 @@ extern crate::backend
   sync rollback_pending_message(messages:[ChatMessage], pending_id:str, committed:bool) -> [ChatMessage]
   sync contains_pending_message(messages:[ChatMessage], pending_id:str) -> bool
   sync reaction_applied(messages:[ChatMessage], seq:i64, emoji:str, added:bool) -> [ChatMessage]
-  sync send_settled_by(messages:[ChatMessage], delta:ChatDelta, active_channel:str) -> bool
-  sync settled_send_id(messages:[ChatMessage], delta:ChatDelta, active_channel:str, current:str) -> str
-  sync reply_settled_by(thread:[ChatMessage], delta:ChatDelta, active_channel:str) -> bool
-  sync settled_reply_id(thread:[ChatMessage], delta:ChatDelta, active_channel:str, current:str) -> str
+  // THE SETTLE ✓, IN ONE CALL. The four scans this replaced each took their
+  // list by value, so one incoming message deep-cloned the timeline twice and
+  // the open rail twice before a single row was folded.
+  ChatSettle(flashed:bool, send_id:str, reply_id:str)
+  sync no_chat_settle() -> ChatSettle
+  sync chat_settle(messages:[ChatMessage], thread:[ChatMessage], delta:ChatDelta, active_channel:str, send_id:str, reply_id:str) -> ChatSettle
   sync append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
   sync merge_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
   sync history_has_older(messages:[ChatMessage]) -> bool
@@ -290,7 +292,10 @@ extern crate::backend
   sync channel_last_read(reads:[ChannelRead], channel:str) -> i64
   sync channel_head_seq(channels:[ChatChannel], channel:str) -> i64
   sync mark_channel_read(reads:[ChannelRead], channel:str, seq:i64) -> [ChannelRead]
-  sync channel_is_unread(reads:[ChannelRead], channel:str, head_seq:i64) -> bool
+  // Batched, and mirrored into `unread_channel_ids`: per row this cloned the
+  // whole read-cursor list, which is O(channels x reads) allocations a frame.
+  sync unread_channels(reads:[ChannelRead], channels:[ChatChannel]) -> [str]
+  sync is_unread_channel(unread:[str], channel:str) -> bool
   sync apply_chat_channels(channels:[ChatChannel], delta:ChatDelta) -> [ChatChannel]
   sync apply_chat_messages(messages:[ChatMessage], delta:ChatDelta, active_channel:str) -> [ChatMessage]
   sync apply_chat_thread(thread:[ChatMessage], delta:ChatDelta, active_channel:str, root:i64) -> [ChatMessage]
@@ -361,6 +366,8 @@ extern crate::backend
   sync dm_channel_id(a:str, b:str) -> str
   sync dm_peer_of_channel(peer:str, me:str, channel:str) -> str
   sync rooms_only(channels:[ChatChannel], peers:[DmPeer], me:str) -> [ChatChannel]
+  sync dm_peer_named(peers:[DmPeer], key:str) -> DmPeer
+  sync no_dm_peer() -> DmPeer
   open_dm(rpc:str, password:str, peer_key:str) -> ChatData ! AppError
   sync post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str
   send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError

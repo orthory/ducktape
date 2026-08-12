@@ -171,6 +171,8 @@ on console_opened(id)
   hydration_retry_attempt = 0
   mutation_phase = "idle"
   channels = []
+  rooms = []
+  unread_channel_ids = []
   messages = []
   // Same abandoned request, same dead button — see `choose_channel`, and worse
   // here: this points the app at a DIFFERENT node, so the page requested from
@@ -184,12 +186,14 @@ on console_opened(id)
   // Same two readings of the room as `reconnect`, and this one points at a
   // DIFFERENT node: a peer from the network she left names nothing here.
   active_dm_peer = ""
+  active_dm = no_dm_peer()
   history_view = false
   active_channel_name = ""
   active_channel_archived = false
   active_channel_members_only = false
   active_channel_huddle_count = 0
   channel_members = []
+  post_refusal = ""
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""

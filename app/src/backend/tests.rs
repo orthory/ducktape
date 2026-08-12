@@ -2200,35 +2200,27 @@ fn reply_settle_flash_mirrors_the_stream_for_the_thread_rail() {
         message: settled_row,
         ..ChatDelta::default()
     };
-    assert!(reply_settled_by(
+    assert!(reply_settled_by(&pending, &settle, "general"));
+    // The fused verdict answers both lanes off one pass: a `reply` settle
+    // anchors the rail's ✓ and leaves the stream's anchor alone.
+    let verdict = chat_settle(
+        Vec::new(),
         pending.clone(),
         settle.clone(),
-        "general".into()
-    ));
-    assert_eq!(
-        settled_reply_id(
-            pending.clone(),
-            settle.clone(),
-            "general".into(),
-            String::new()
-        ),
-        "reply-a"
+        "general".into(),
+        "kept".into(),
+        String::new(),
     );
+    assert!(verdict.flashed);
+    assert_eq!(verdict.reply_id, "reply-a");
+    assert_eq!(verdict.send_id, "kept");
     // Each lane fires only on its own delta kind: a `reply` is the rail's
     // edge and never the stream's, and a `posted` is the reverse.
-    assert!(!send_settled_by(
-        pending.clone(),
-        settle.clone(),
-        "general".into()
-    ));
+    assert!(!send_settled_by(&pending, &settle, "general"));
     let mut as_post = settle.clone();
     as_post.kind = "posted".into();
-    assert!(!reply_settled_by(
-        pending.clone(),
-        as_post,
-        "general".into()
-    ));
-    assert!(!reply_settled_by(pending, settle, "other".into()));
+    assert!(!reply_settled_by(&pending, &as_post, "general"));
+    assert!(!reply_settled_by(&pending, &settle, "other"));
 }
 
 #[test]
@@ -2245,31 +2237,37 @@ fn send_settle_flash_fires_only_for_own_pending_rows() {
         ..ChatDelta::default()
     };
 
-    assert!(send_settled_by(
+    assert!(send_settled_by(&pending, &settle, "general"));
+    let verdict = chat_settle(
         pending.clone(),
+        Vec::new(),
         settle.clone(),
-        "general".into()
-    ));
-    assert_eq!(
-        settled_send_id(pending.clone(), settle.clone(), "general".into(), "".into()),
-        "message-a"
+        "general".into(),
+        String::new(),
+        "kept".into(),
     );
+    assert!(verdict.flashed);
+    assert_eq!(verdict.send_id, "message-a");
+    assert_eq!(verdict.reply_id, "kept");
     // Wrong channel, someone else's post, and a non-post delta all keep the
     // current anchor instead of flashing.
-    assert!(!send_settled_by(
-        pending.clone(),
-        settle.clone(),
-        "other".into()
-    ));
+    assert!(!send_settled_by(&pending, &settle, "other"));
     let mut foreign = settle.clone();
     foreign.message.id = "someone-else".into();
-    assert!(!send_settled_by(pending.clone(), foreign, "general".into()));
+    assert!(!send_settled_by(&pending, &foreign, "general"));
     let mut reaction = settle;
     reaction.kind = "reaction".into();
-    assert_eq!(
-        settled_send_id(pending, reaction, "general".into(), "kept".into()),
-        "kept"
+    let unrelated = chat_settle(
+        pending,
+        Vec::new(),
+        reaction,
+        "general".into(),
+        "kept".into(),
+        "kept-reply".into(),
     );
+    assert!(!unrelated.flashed);
+    assert_eq!(unrelated.send_id, "kept");
+    assert_eq!(unrelated.reply_id, "kept-reply");
 }
 
 #[test]
@@ -3326,16 +3324,19 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
         reads.len()
     );
 
-    // channel_is_unread: head past the seen cursor.
-    assert!(channel_is_unread(reads.clone(), "random".into(), 50));
-    assert!(!channel_is_unread(reads.clone(), "random".into(), 30));
-    assert!(!channel_is_unread(reads.clone(), "general".into(), 100));
+    // unread_channels: every channel whose head is past the seen cursor, in
+    // one pass — and `is_unread_channel` is the row's own reading of it.
+    let unread = unread_channels(reads.clone(), channels.clone());
+    assert_eq!(unread, vec!["random".to_owned()]);
+    assert!(is_unread_channel(unread.clone(), "random".into()));
+    assert!(!is_unread_channel(unread, "general".into()));
+    assert!(unread_channels(reads.clone(), vec![channel("random", 30)]).is_empty());
 
     // initial_channel_reads: seed absent channels to head, preserve existing.
     let seeded = initial_channel_reads(channels.clone(), vec![read("random", 30)]);
     assert_eq!(channel_last_read(seeded.clone(), "random".into()), 30);
     assert_eq!(channel_last_read(seeded.clone(), "general".into()), 100);
-    assert!(!channel_is_unread(seeded, "general".into(), 100));
+    assert!(unread_channels(seeded, vec![channel("general", 100)]).is_empty());
 
     // first_unread_seq: first message past the boundary; pending (seq -1)
     // never anchors it; 0 when caught up.
