@@ -312,7 +312,12 @@ on chat_composer_event(event)
   pending_message_id = fresh_operation_id("message")
   message_draft = ""
   message_editor = editor("")
-  messages = optimistic_message(messages, pending_message, pending_message_id)
+  // The mint does not re-mark the runs — the rail mints through the same call
+  // and its `[root] ++ replies` vec must keep the first reply's header. This
+  // vec is a plain run, so it re-marks here: the pending row groups under the
+  // reader's previous message instead of drawing a header that vanishes the
+  // moment the settle delta replaces it.
+  messages = mark_author_runs(optimistic_message(messages, pending_message, pending_message_id))
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   error = ""
   run send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _
@@ -321,14 +326,27 @@ on message_sent(next)
   return if active_channel != next.channel_id
   error = ""
 
+// A FAILED SEND IS A FACT ABOUT THE USER'S TEXT, NOT ABOUT THE PANE ON SCREEN.
+// The reader can leave the room while the write is in flight — a channel pick,
+// a search hit, or a reconnect that lands on `channels.first()` — and the whole
+// handler used to return on that, so the body, the error and every trace of it
+// went away while the last thing she saw was her message in the timeline.
+//
+// So the room check scopes the TIMELINE SURGERY only. The unsent stash and the
+// error banner are written first, unconditionally, above the guard.
+//
+// `remember_failed_draft` routes the body to the stash whenever the composer
+// cannot take it back; the composer of the room she moved to cannot, and a
+// non-empty `current` is how that is said here (`live_resynced` says it with
+// the literal "channel").
 on message_send_failed(cause)
+  error = cause.message
+  failed_message_draft = remember_failed_draft(failed_message_draft, keep_str(active_channel == cause.scope_id, trim(editor_text(message_editor)), "another room"), cause.body, cause.committed)
   return if active_channel != cause.scope_id
   messages = rollback_pending_message(messages, cause.operation_id, cause.committed)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
-  failed_message_draft = remember_failed_draft(failed_message_draft, trim(editor_text(message_editor)), cause.body, cause.committed)
   message_draft = restore_draft(trim(editor_text(message_editor)), cause.body, cause.committed)
   message_editor = editor(message_draft)
-  error = cause.message
   return if !cause.committed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -835,15 +853,18 @@ on reply_composer_event(event)
   error = ""
   run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply_id, pending_reply, channel_members) -> thread_reply_sent _ | thread_reply_send_failed _
 
+// Same rule as `message_send_failed`, and the hole is wider here: `close_thread`
+// clears `thread_messages`, so merely closing the rail under an in-flight reply
+// made the pending check fail and threw the text away with no error at all.
 on thread_reply_send_failed(cause)
+  error = cause.message
+  failed_reply_draft = remember_failed_draft(failed_reply_draft, keep_str(active_channel == cause.scope_id && contains_pending_message(thread_messages, cause.operation_id), trim(editor_text(reply_editor)), "another thread"), cause.body, cause.committed)
   return if active_channel != cause.scope_id
   return if !contains_pending_message(thread_messages, cause.operation_id)
   thread_messages = rollback_pending_message(thread_messages, cause.operation_id, cause.committed)
-  failed_reply_draft = remember_failed_draft(failed_reply_draft, trim(editor_text(reply_editor)), cause.body, cause.committed)
   reply_draft = restore_draft(trim(editor_text(reply_editor)), cause.body, cause.committed)
   reply_editor = editor(reply_draft)
   thread_next_reply_offset = thread_offset_after_reply(thread_next_reply_offset, thread_has_more, cause.committed)
-  error = cause.message
   return if !cause.committed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0

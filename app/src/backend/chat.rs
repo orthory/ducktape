@@ -18,6 +18,35 @@ pub fn reaction_applied(
     chat::client::optimistic_reaction(messages, seq, emoji, added, reactor)
 }
 
+/// The row a send paints before the block lands. Same arrangement as the
+/// reaction fold above: the client mints the row, the shell supplies the
+/// identity it must be attributed to, so the pending row groups under the
+/// reader's previous message instead of breaking the run and re-grouping when
+/// the settle delta replaces it.
+pub fn optimistic_message(
+    messages: Vec<ChatMessage>,
+    body: String,
+    message_id: String,
+) -> Vec<ChatMessage> {
+    chat::client::optimistic_message(
+        messages,
+        body,
+        message_id,
+        rpc::cached_user_key().as_deref(),
+    )
+}
+
+/// [`chat::client::mark_message_groups`] as a value fold, for the reducer.
+///
+/// The timeline calls it on the vec it just pushed an optimistic row onto. The
+/// thread rail does NOT: its vec is `[root] ++ replies` and the root renders as
+/// its own divided block, so a whole-vec pass folds the first reply under the
+/// root and swallows its header (`load_thread_data` marks the replies only).
+pub fn mark_author_runs(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    chat::client::mark_message_groups(&mut messages);
+    messages
+}
+
 pub async fn rename_channel(
     rpc: String,
     password: String,
