@@ -49,12 +49,13 @@ const FRAMES: usize = 12;
 ///
 /// Measured on `dev` after the QA sweep landed: about **16 700** allocations;
 /// the ducktape-ui a099fa6b pin's borrow-aware `for` rows brought the same
-/// fixture to **15 982**, and the ceiling moved down to keep that win locked.
-/// The count is stable inside one process but can move slightly with global
-/// font/cache initialization, so the ceiling leaves broad headroom. Deleting
-/// the stream's `virtual-row=` alone takes it above 27 000, still well beyond
-/// the budget.
-const KEYSTROKE_ALLOCATION_CEILING: u64 = 21_000;
+/// fixture to **15 982**, and the 690b84d9 keyed lazy (`by message.seq,
+/// message.render_rev` over by-reference keyed rows) to **11 377** — each
+/// ceiling move locks the win. The count is stable inside one process but can
+/// move slightly with global font/cache initialization, so the ceiling leaves
+/// broad headroom. Deleting the stream's `virtual-row=` alone takes it above
+/// 27 000, still well beyond the budget.
+const KEYSTROKE_ALLOCATION_CEILING: u64 = 15_000;
 
 struct ScreenProbe {
     label: &'static str,
@@ -73,15 +74,16 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
         fixture: console_in_page_comments,
         allocation_ceiling: 120_000,
     },
-    // 18,836 vs 54,599 for removing the quiet-arm `lazy` on the rail's
-    // replies. Removing the rail's `virtual-row=` moves build time
-    // (2.4ms -> 2.7ms median here, and every offscreen reply's layout)
-    // but few allocations, so the lazy control is the one that gates.
+    // 13,089 with the keyed (seq, render_rev) lazy vs 18,836 with the plain
+    // row-hashing lazy vs 54,599 with no quiet-arm `lazy` at all — the
+    // negative control that gates. Removing the rail's `virtual-row=` moves
+    // build time (2.4ms -> 2.7ms median here, and every offscreen reply's
+    // layout) but few allocations, so the lazy control is the one that gates.
     ScreenProbe {
         label: "chat thread rail build+layout",
         size: WINDOW,
         fixture: console_in_chat_thread,
-        allocation_ceiling: 22_000,
+        allocation_ceiling: 15_500,
     },
     // 4,947 vs 7,059 for restoring per-row peer lookup.
     ScreenProbe {
@@ -97,13 +99,15 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
         fixture: console_in_forge_code,
         allocation_ceiling: 146_000,
     },
-    // 382,671 vs 387,952 for removing discussion virtualization; removing
-    // diff virtualization is a larger regression.
+    // 318,811 with the discussion rows under the keyed (seq, render_rev)
+    // lazy vs 382,671 without one; 387,952 was removing discussion
+    // virtualization, and removing diff virtualization is a larger
+    // regression still.
     ScreenProbe {
         label: "forge PR build+layout",
         size: WINDOW,
         fixture: console_in_forge_pr,
-        allocation_ceiling: 385_300,
+        allocation_ceiling: 325_000,
     },
     // 60,437 vs 61,979 for restoring the selected-entry scan; removing the
     // directory-row virtualization reaches 61,993.
@@ -232,6 +236,7 @@ fn probe_message(seq: i64) -> backend::ChatMessage {
         height: seq,
         time: seq,
         reactions: Vec::new(),
+        render_rev: 0,
     }
 }
 
@@ -284,9 +289,9 @@ fn console_in_chat() -> (Ducktape, iced::window::Id) {
 /// page of replies. The rail is the app's one `for`-bound ChatMessage list
 /// (the stream and the forge discussion are keyed virtual columns), so this
 /// is the fixture that sees a lost `virtual-row=` or quiet-arm `lazy` on the
-/// rail — and the one that will measure the cheap-key `lazy … by` adoption
-/// when ui-lang accepts component-param chain roots (ducktape-ui#589 defers
-/// them; every screen list in this app arrives as a component prop).
+/// rail — and the one that measures the cheap-key `lazy … by` adoption
+/// (ducktape-ui#591 made component-prop chain roots legal; every screen list
+/// in this app arrives as a state-fed component prop).
 fn console_in_chat_thread() -> (Ducktape, iced::window::Id) {
     let root = probe_message(1);
     let replies = (2..=THREAD_ROWS).map(|seq| {
@@ -694,33 +699,33 @@ fn probe_large_screens() {
     }
 }
 
-fn probe_unchanged_build(
+/// Warm a fixture until it stops emitting, applying what the view emits — a
+/// first frame may PRIME it (chat's scrolls publish their initial viewport as
+/// a real `chat_scrolled` message, exactly as they do in front of a user) —
+/// and hand back the settled cache. A fixture still emitting on the last warm
+/// frame is a feedback loop the caller would measure (or screenshot) instead
+/// of an unchanged frame.
+fn warm_settled(
     label: &'static str,
-    mut app: Ducktape,
+    app: &mut Ducktape,
     window: iced::window::Id,
     size: Size,
-) -> u64 {
-    let mut renderer = headless_renderer();
+    renderer: &mut iced::Renderer,
+    mut cache: user_interface::Cache,
+) -> user_interface::Cache {
     let mut clipboard = clipboard::Null;
     let mut messages: Vec<__DucktapeMessage> = Vec::new();
-    let mut cache = user_interface::Cache::default();
     for warm_frame in 0..WARMUP_FRAMES {
-        let mut ui = UserInterface::build(app.__view(window), size, cache, &mut renderer);
+        let mut ui = UserInterface::build(app.__view(window), size, cache, renderer);
         ui.update(
             &[Event::Window(iced::window::Event::RedrawRequested(
                 iced::time::Instant::now(),
             ))],
             mouse::Cursor::Unavailable,
-            &mut renderer,
+            renderer,
             &mut clipboard,
             &mut messages,
         );
-        // A first frame may PRIME the fixture — chat's scrolls publish their
-        // initial viewport as a real `chat_scrolled` message, exactly as they
-        // do in front of a user — so warm-up applies what the view emits. It
-        // must SETTLE before measurement: a fixture still emitting on the
-        // last warm frame is a feedback loop, and the phase below would be
-        // measuring it rather than an unchanged frame.
         let settled = messages.is_empty();
         let last_warm_frame = warm_frame + 1 == WARMUP_FRAMES;
         assert!(
@@ -733,6 +738,24 @@ fn probe_unchanged_build(
             let _ = app.__update(message);
         }
     }
+    cache
+}
+
+fn probe_unchanged_build(
+    label: &'static str,
+    mut app: Ducktape,
+    window: iced::window::Id,
+    size: Size,
+) -> u64 {
+    let mut renderer = headless_renderer();
+    let mut cache = warm_settled(
+        label,
+        &mut app,
+        window,
+        size,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
 
     let mut build = Phase::new(label);
     for _ in 0..FRAMES {
@@ -742,6 +765,118 @@ fn probe_unchanged_build(
     }
     build.report();
     build.median_allocations()
+}
+
+/// One drawn console frame as raw RGBA — settle first (a state change may make
+/// the anchored scroll republish its viewport), then build, update, draw, and
+/// screenshot, exactly the runtime's own paint order.
+fn drawn_frame(
+    app: &mut Ducktape,
+    window: iced::window::Id,
+    renderer: &mut iced::Renderer,
+    cache: user_interface::Cache,
+) -> (user_interface::Cache, Vec<u8>) {
+    use iced::advanced::renderer::Headless as _;
+    use iced::theme::Base as _;
+    let theme = Theme::Dark;
+    let base = theme.base();
+    let cache = warm_settled("the repaint probe", app, window, WINDOW, renderer, cache);
+    let mut ui = UserInterface::build(app.__view(window), WINDOW, cache, renderer);
+    ui.draw(
+        renderer,
+        &theme,
+        &renderer::Style {
+            text_color: base.text_color,
+        },
+        mouse::Cursor::Unavailable,
+    );
+    let cache = ui.into_cache();
+    let physical = Size {
+        width: WINDOW.width as u32,
+        height: WINDOW.height as u32,
+    };
+    let pixels = renderer.screenshot(physical, 1.0, base.background_color);
+    (cache, pixels)
+}
+
+/// THE STALENESS GUARD. Under the keyed lazy a quiet row repaints ONLY when
+/// (seq, render_rev) moves, so a mutation path that misses its `render_rev`
+/// bump is not a perf regression but a WRONG FRAME — the reader keeps looking
+/// at the pre-mutation row. Drive the two in-place folds a reader sees most —
+/// a reaction and an edit — through the app's real live-delta path and assert
+/// each repaints the DRAWN frame, with an unchanged-frame control proving the
+/// diffs mean repaint rather than render noise.
+#[test]
+fn a_reaction_and_an_edit_repaint_the_visible_row() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_row_repaint)
+        .expect("the repaint probe thread spawns")
+        .join()
+        .expect("the repaint probe thread finishes");
+}
+
+fn probe_row_repaint() {
+    let (mut app, console) = console_in_chat();
+    let mut renderer = headless_renderer();
+
+    let cache = user_interface::Cache::default();
+    let (cache, quiet) = drawn_frame(&mut app, console, &mut renderer, cache);
+    let (cache, control) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        quiet == control,
+        "an unchanged frame must draw identical pixels — without this control \
+         the repaint assertions below prove nothing"
+    );
+
+    // A reaction lands on the BOTTOM row — visible under `anchor-y=end`, and
+    // in the quiet arm (nothing selected, nothing flashing), so the repaint
+    // must come through the keyed lazy's (seq, render_rev) move.
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "chat".into(),
+        chat: backend::ChatDelta {
+            kind: "reaction".into(),
+            channel_id: "channel-0".into(),
+            seq: ROWS,
+            emoji: "👍".into(),
+            added: true,
+            reactor: "user:repaint-probe".into(),
+            ..backend::ChatDelta::default()
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    let (cache, reacted) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        control != reacted,
+        "a reaction delta must repaint the visible row — `apply_reaction` \
+         stopped moving `render_rev` if this frame is unchanged"
+    );
+
+    // An edit of the same row, one wire revision up.
+    let body = "edited by the repaint probe";
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "chat".into(),
+        chat: backend::ChatDelta {
+            kind: "edited".into(),
+            channel_id: "channel-0".into(),
+            seq: ROWS,
+            message: backend::ChatMessage {
+                rev: 2,
+                body: body.into(),
+                blocks: backend::paragraph_blocks(body),
+                meta: format!("#{ROWS} · edited"),
+                ..backend::ChatMessage::default()
+            },
+            ..backend::ChatDelta::default()
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    let (_, edited) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        reacted != edited,
+        "an edit delta must repaint the visible row — `apply_edit_content` \
+         stopped moving `render_rev` if this frame is unchanged"
+    );
 }
 
 fn probe() {

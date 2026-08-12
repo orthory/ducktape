@@ -147,6 +147,7 @@ fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
         height: 0,
         time: 0,
         reactions: Vec::new(),
+        render_rev: 0,
     }
 }
 
@@ -3050,8 +3051,12 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     // only exist because the rows that read SCREEN state — the search target,
     // the open action menu, the settling ✓ — were split off into live arms.
     // Fold any of them back in and the reply that is selected, or flashing,
-    // renders from a cache that cannot see it.
-    assert!(chat.contains("lazy thread_message as cached_reply"));
+    // renders from a cache that cannot see it. The KEYED form is pinned too:
+    // dropping `by (seq, render_rev)` silently reverts every visible reply to
+    // a full row clone + hash per frame — the #1058 residue this collects.
+    assert!(chat.contains(
+        "lazy thread_message by thread_message.seq, thread_message.render_rev as cached_reply"
+    ));
     for live in [
         "thread_message.seq == thread_target_seq",
         "thread_message.seq == thread_selected_seq",
@@ -3467,6 +3472,7 @@ fn thread_pagination_preserves_multiple_pending_replies() {
         height: 0,
         time: 0,
         reactions: Vec::new(),
+        render_rev: 0,
     };
     let (mut app, _) = Ducktape::__boot();
     app.active_thread_seq = 1;

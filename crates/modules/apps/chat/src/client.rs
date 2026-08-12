@@ -77,6 +77,14 @@ pub struct ChatMessage {
     /// seconds: render it as a height, never as a wall clock. 0 while pending.
     pub time: i64,
     pub reactions: Vec<ChatReaction>,
+    /// CLIENT-side render revision — the view's cheap lazy key beside `seq`
+    /// (`lazy message by message.seq, message.render_rev`). Bumped by every
+    /// in-place row mutation and SEEDED from the rendered-content hash at
+    /// construction, so a wholesale replacement — a resync reloading a row
+    /// with reactions the displayed copy never saw — moves the key with no
+    /// in-place mutation having run. Identical content seeds identically,
+    /// which is the case where keeping the cached subtree is correct.
+    pub render_rev: i64,
 }
 
 /// The lazy-row dependency hash. `body` and `blocks` are deliberately NOT
@@ -107,6 +115,7 @@ impl std::hash::Hash for ChatMessage {
             height,
             time,
             reactions,
+            render_rev,
         } = self;
         id.hash(state);
         seq.hash(state);
@@ -124,6 +133,7 @@ impl std::hash::Hash for ChatMessage {
         height.hash(state);
         time.hash(state);
         reactions.hash(state);
+        render_rev.hash(state);
     }
 }
 
@@ -148,7 +158,28 @@ impl Default for ChatMessage {
             height: 0,
             time: 0,
             reactions: Vec::new(),
+            render_rev: 0,
         }
+    }
+}
+
+impl ChatMessage {
+    /// The construction seed: a deterministic hash of the rendered content
+    /// (exactly the fields the manual [`Hash`] covers, `render_rev` still at
+    /// its zero default), so a replacement row carrying content the displayed
+    /// copy never saw arrives with a moved key.
+    fn seed_render_rev(mut self) -> Self {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        self.render_rev = i64::from_ne_bytes(hasher.finish().to_ne_bytes());
+        self
+    }
+
+    /// One in-place row mutation = one bump; the keyed lazy repaints the row
+    /// exactly when this (or `seq`) moves.
+    fn bump_render_rev(&mut self) {
+        self.render_rev = self.render_rev.wrapping_add(1);
     }
 }
 
@@ -575,6 +606,7 @@ fn bump_reply_summary(mut messages: Vec<ChatMessage>, root_seq: i64) -> Vec<Chat
         // high-water); the stream delivers each op once per cursor, and a
         // reconnect runs the ready-resync which reloads the canonical count.
         root.reply_count += 1;
+        root.bump_render_rev();
     }
     messages
 }
@@ -598,6 +630,7 @@ fn apply_edit_content(
             row.rev = content.rev;
             row.edited = true;
             row.meta = content.meta.clone();
+            row.bump_render_rev();
         }
     }
     messages
@@ -613,6 +646,7 @@ fn apply_tombstone(mut messages: Vec<ChatMessage>, seq: i64) -> Vec<ChatMessage>
         row.body = "Message deleted".into();
         row.blocks = vec![deleted_block()];
         row.reactions = Vec::new();
+        row.bump_render_rev();
     }
     mark_message_groups(&mut messages);
     messages
@@ -653,9 +687,12 @@ fn apply_reaction(mut messages: Vec<ChatMessage>, delta: &ChatDelta) -> Vec<Chat
             reacted_by_me: delta.by_me,
             reactors: vec![delta.reactor.clone()],
         }),
-        None => {}
+        // a remove of an emoji the row never had touched nothing: no rescan,
+        // no bump.
+        None => return messages,
     }
     row.reactions.retain(|reaction| reaction.count > 0);
+    row.bump_render_rev();
     messages
 }
 
@@ -754,26 +791,30 @@ pub fn optimistic_message(
         .map(|message| message.seq)
         .min()
         .unwrap_or_default();
-    messages.push(ChatMessage {
-        id: message_id,
-        seq: lowest_seq.min(0) - 1,
-        author,
-        meta: "Sending…".into(),
-        body,
-        blocks,
-        pending: true,
-        rev: 0,
-        edited: false,
-        deleted: false,
-        reply_count: 0,
-        thread_seq: 0,
-        show_author: true,
-        initial,
-        avatar_kind: "human".into(),
-        height: 0,
-        time: 0,
-        reactions: Vec::new(),
-    });
+    messages.push(
+        ChatMessage {
+            id: message_id,
+            seq: lowest_seq.min(0) - 1,
+            author,
+            meta: "Sending…".into(),
+            body,
+            blocks,
+            pending: true,
+            rev: 0,
+            edited: false,
+            deleted: false,
+            reply_count: 0,
+            thread_seq: 0,
+            show_author: true,
+            initial,
+            avatar_kind: "human".into(),
+            height: 0,
+            time: 0,
+            reactions: Vec::new(),
+            render_rev: 0,
+        }
+        .seed_render_rev(),
+    );
     messages
 }
 
@@ -922,7 +963,9 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
                 }
             })
             .collect(),
+        render_rev: 0,
     }
+    .seed_render_rev()
 }
 
 /// True when the local user's rendered author string (`user:{hex}`) is among a
@@ -955,7 +998,13 @@ pub fn mark_message_groups(messages: &mut [ChatMessage]) {
         })
         .collect();
     for (message, show) in messages.iter_mut().zip(opens_run) {
-        message.show_author = show;
+        // flip-only: this re-runs on every merge, and an unmoved header must
+        // not move the row's render key.
+        let flipped = message.show_author != show;
+        if flipped {
+            message.show_author = show;
+            message.bump_render_rev();
+        }
     }
 }
 
@@ -1478,6 +1527,140 @@ pub fn dm_channel_id(a: &str, b: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn committed(seq: i64, author: &str) -> ChatMessage {
+        ChatMessage {
+            seq,
+            id: format!("g{seq}"),
+            author: author.into(),
+            ..ChatMessage::default()
+        }
+    }
+
+    /// Every in-place row mutation is a render-key move — the view's keyed
+    /// lazy (`by message.seq, message.render_rev`) repaints a row ONLY when a
+    /// key changes, so a path missing its bump is a stale row on screen.
+    #[test]
+    fn every_in_place_row_mutation_bumps_render_rev() {
+        // an edit with a newer rev bumps; its stale replay does not.
+        let messages = vec![committed(1, "a")];
+        let before = messages[0].render_rev;
+        let content = ChatMessage {
+            rev: 1,
+            body: "new".into(),
+            ..ChatMessage::default()
+        };
+        let edited = apply_edit_content(messages, 1, &content);
+        assert_ne!(edited[0].render_rev, before, "an edit bumps");
+        let replayed = apply_edit_content(edited.clone(), 1, &content);
+        assert_eq!(
+            replayed[0].render_rev, edited[0].render_rev,
+            "a stale edit replay is a no-op"
+        );
+
+        // a tombstone bumps.
+        let messages = vec![committed(2, "a")];
+        let before = messages[0].render_rev;
+        let deleted = apply_tombstone(messages, 2);
+        assert_ne!(deleted[0].render_rev, before, "a tombstone bumps");
+
+        // a reaction add bumps, its remove bumps again, and a remove of an
+        // emoji the row never had touches nothing.
+        let messages = vec![committed(3, "a")];
+        let before = messages[0].render_rev;
+        let added = optimistic_reaction(messages, 3, "👍".into(), true, "user:ab".into());
+        assert_ne!(added[0].render_rev, before, "a reaction add bumps");
+        let mid = added[0].render_rev;
+        let removed = optimistic_reaction(added, 3, "👍".into(), false, "user:ab".into());
+        assert_ne!(removed[0].render_rev, mid, "a reaction remove bumps");
+        let untouched =
+            optimistic_reaction(removed.clone(), 3, "🎉".into(), false, "user:ab".into());
+        assert_eq!(
+            untouched[0].render_rev, removed[0].render_rev,
+            "a remove of an absent emoji is a no-op"
+        );
+
+        // a reply-summary bump bumps.
+        let messages = vec![committed(4, "a")];
+        let before = messages[0].render_rev;
+        let bumped = bump_reply_summary(messages, 4);
+        assert_ne!(bumped[0].render_rev, before, "a reply summary bumps");
+
+        // a grouping flip bumps — and ONLY a flip: the re-mark that runs on
+        // every merge must not move unmoved headers.
+        let mut messages = vec![committed(5, "a"), committed(6, "a")];
+        mark_message_groups(&mut messages);
+        assert!(
+            !messages[1].show_author,
+            "the second row folds under the run"
+        );
+        let after_flip = messages[1].render_rev;
+        let first_row = messages[0].render_rev;
+        mark_message_groups(&mut messages);
+        assert_eq!(
+            messages[1].render_rev, after_flip,
+            "a re-mark without a flip does not bump"
+        );
+        assert_eq!(
+            messages[0].render_rev, first_row,
+            "an unflipped row never bumps"
+        );
+    }
+
+    /// Construction seeds `render_rev` from the rendered content, so a
+    /// wholesale replacement (a resync) moves the key exactly when the
+    /// replacement row renders differently — and keeps it when it does not.
+    #[test]
+    fn construction_seeds_render_rev_from_rendered_content() {
+        let row = |reactions: Vec<index::ReactionRow>| MsgRow {
+            channel_id: "general".into(),
+            seq: 7,
+            message_id: "m7".into(),
+            author: "user:ab".into(),
+            height: 12,
+            time: 0,
+            blocks: vec![Block::paragraph("hi")],
+            text: String::new(),
+            deleted: false,
+            edited: false,
+            rev: 0,
+            edited_at: None,
+            base_rev: None,
+            thread: None,
+            reply_count: 0,
+            last_reply_seq: None,
+            reactions,
+            tags: Vec::new(),
+        };
+        let plain = chat_message(row(Vec::new()), None);
+        let identical = chat_message(row(Vec::new()), None);
+        assert_eq!(
+            plain.render_rev, identical.render_rev,
+            "identical content seeds identically — the cached subtree is kept"
+        );
+        let reacted = chat_message(
+            row(vec![index::ReactionRow {
+                emoji: "👍".into(),
+                reactors: vec!["user:cd".into()],
+            }]),
+            None,
+        );
+        assert_ne!(
+            plain.render_rev, reacted.render_rev,
+            "a replacement row with reactions the displayed copy never saw moves the key"
+        );
+
+        // the optimistic mint seeds too. NOTE the seed follows the manual
+        // `Hash` contract, which excludes body/blocks: under ONE id a pending
+        // row's body never changes (the settle REPLACES the row and moves
+        // `seq`), and every fresh send mints a fresh id — the field that does
+        // move the seed.
+        let minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), None);
+        let re_minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), None);
+        assert_eq!(minted[0].render_rev, re_minted[0].render_rev);
+        let other = optimistic_message(Vec::new(), "hello".into(), "op2".into(), None);
+        assert_ne!(minted[0].render_rev, other[0].render_rev);
+    }
 
     #[test]
     fn a_reply_delta_bumps_the_open_thread_roots_summary() {

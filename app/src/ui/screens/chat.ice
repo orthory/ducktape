@@ -752,8 +752,15 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                       open_message_reactions
                                       open_message_actions
                                       open_message_link
+                              // KEYED BY (seq, render_rev), NOT BY THE ROW: an
+                              // unchanged frame hashes two ints instead of
+                              // cloning the message into the memo tuple. The
+                              // client bumps `render_rev` on every in-place row
+                              // mutation and seeds it from the content hash at
+                              // construction, so every repaint a reader can see
+                              // moves a key.
                               if message.seq != selected_message_seq && message.id != send_flash_id
-                                lazy message as cached_message
+                                lazy message by message.seq, message.render_rev as cached_message
                                   stack #message(cached_message.id) w=fill
                                     MessageCard
                                       with
@@ -1684,8 +1691,10 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         // open. `disabled=false` is the stream's bargain too: a
                         // cached row cannot see `loading`, and a row nobody is
                         // hovering has no button to disable.
+                        // Keyed by (seq, render_rev) exactly as the stream's
+                        // quiet arm is — see the note there.
                         if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq && thread_message.id != thread_send_flash_id
-                          lazy thread_message as cached_reply
+                          lazy thread_message by thread_message.seq, thread_message.render_rev as cached_reply
                             ThreadMessageCard
                               with
                                 message=cached_reply

@@ -788,34 +788,41 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 if empty(discussion)
                   text "No discussion yet." size=12.5 @text-caption
                 keyed message in discussion by=message.seq virtual-row=44.0 w=fill gap=9.0
-                  row
-                    with
-                      w=fill
-                      gap=9.0
-                      align=start
-                    MessageAvatar initials=message.initial kind=message.avatar_kind
-                    col w=fill gap=2.0
-                      row
-                        with
-                          w=fill
-                          gap=7.0
-                          align=center
-                        text message.author
+                  // A note is a pure function of its message, so the whole row
+                  // caches under the same (seq, render_rev) key the chat
+                  // stream's quiet arm uses — the live delta fold
+                  // (`apply_chat_messages` in lifecycle.ice) bumps `render_rev`
+                  // on every in-place mutation, and a resync's replacement rows
+                  // arrive content-seeded.
+                  lazy message by message.seq, message.render_rev as cached_note
+                    row
+                      with
+                        w=fill
+                        gap=9.0
+                        align=start
+                      MessageAvatar initials=cached_note.initial kind=cached_note.avatar_kind
+                      col w=fill gap=2.0
+                        row
                           with
-                            size=13.0
-                            wrap=none
-                            font=display
-                            @text-fg
-                        text message.meta
-                          with
-                            size=11.0
-                            wrap=none
-                            font=code_medium
-                            @text-meta
-                        space w=fill
-                      MessageBody message=message
-                        forward
-                          open_message_link
+                            w=fill
+                            gap=7.0
+                            align=center
+                          text cached_note.author
+                            with
+                              size=13.0
+                              wrap=none
+                              font=display
+                              @text-fg
+                          text cached_note.meta
+                            with
+                              size=11.0
+                              wrap=none
+                              font=code_medium
+                              @text-meta
+                          space w=fill
+                        MessageBody message=cached_note
+                          forward
+                            open_message_link
                 flex
                   with
                     w=fill

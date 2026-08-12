@@ -2420,6 +2420,7 @@ fn concurrent_optimistic_messages_settle_independently() {
         height: 0,
         time: 0,
         reactions: Vec::new(),
+        render_rev: 0,
     };
     let after_second = merge_message_send_result(
         vec![canonical("message-b", 1, "second")],
@@ -2489,6 +2490,7 @@ fn message_groups_collapse_consecutive_authors() {
         height: 0,
         time: 0,
         reactions: Vec::new(),
+        render_rev: 0,
     };
     let mut messages = vec![
         msg(1, "alice", false),
@@ -2525,6 +2527,7 @@ fn history_pagination_prepends_older_and_flags_more() {
         height: 0,
         time: 0,
         reactions: Vec::new(),
+        render_rev: 0,
     };
     // oldest loaded root is seq 3 -> older history exists.
     let loaded = vec![msg(3), msg(4), msg(5)];
@@ -3432,6 +3435,7 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
         height: 0,
         time: 0,
         reactions: Vec::new(),
+        render_rev: 0,
     };
 
     let reads = vec![read("general", 100), read("random", 30)];
